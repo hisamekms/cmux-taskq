@@ -125,6 +125,9 @@ pub struct TaskRun {
     pub receipt_path: Option<String>,
     pub log_path: Option<String>,
     pub result_commit: Option<String>,
+    pub repo_path: Option<String>,
+    pub run_dir: Option<String>,
+    pub last_error: Option<String>,
     pub created_at: String,
 }
 
@@ -144,6 +147,23 @@ pub struct TaskDetail {
     pub dependencies: Vec<i64>,
     pub runs: Vec<TaskRun>,
     pub events: Vec<RunEvent>,
+    pub processes: Vec<RunProcess>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RunProcess {
+    pub run_id: String,
+    pub role: String,
+    pub pid: u32,
+    pub heartbeat_at: i64,
+    pub exited_at: Option<i64>,
+    pub exit_code: Option<i32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SupervisorLease {
+    pub pid: u32,
+    pub heartbeat_at: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

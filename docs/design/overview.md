@@ -17,9 +17,9 @@ related:
 
 # System overview
 
-ステップ2時点でRust CLIとSQLiteキューを実装済み。以下の構成図のsupervisor、cmux adapter、provider、pluginは後続実装であり、CLIからのエージェント起動はまだ行わない。
+ステップ3時点でRust CLI、SQLiteキュー、1件を実行するsupervisor、cmux adapter、Claude providerを実装済み。以下の構成図のうち、receipt検証とworkspace終了、Codex provider、pluginは後続実装。
 
-コードは単一Cargo package内で、`domain`（型と状態遷移）、`application`（キュー操作の契約）、`infrastructure::sqlite`（トランザクションと永続化）、`main`（CLI）に分離している。利用方法は[README](../../README.md)を参照。
+コードは単一Cargo package内で、`domain`（型と状態遷移）、`application`（キュー・provider・workspaceの契約）、`infrastructure::sqlite`（キューの永続化）、`infrastructure::runtime_store`（lease・process・run状態の永続化）、`infrastructure::adapters`（Git、cmux、Claude Codeの呼び出し）、`runtime`（supervisorとsession wrapper）、`main`（CLI）に分離している。利用方法は[README](../../README.md)を参照。
 
 cmux-taskqは、依存関係を持つ開発タスクをSQLiteで管理し、着手可能なタスクをcmux workspaceとGit worktreeで実行するRust runtimeである。
 

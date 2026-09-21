@@ -17,7 +17,7 @@ related:
 
 ## Implementation status
 
-ステップ2で`Task`、`TaskDependency`、`TaskRun`、`RunEvent`を実装した。Rustの型と手動遷移規則は`src/domain.rs`、ストレージ契約は`src/application.rs`、永続化は`src/infrastructure/sqlite.rs`にある。`AgentSession`、workspace/processの独立エンティティと実行後の状態遷移はsupervisor実装時に追加する。
+ステップ2で`Task`、`TaskDependency`、`TaskRun`、`RunEvent`、ステップ3で`RunProcess`と`SupervisorLease`を実装した。Rustの型と手動遷移規則は`src/domain.rs`、ストレージとprovider/workspaceの契約は`src/application.rs`、永続化は`src/infrastructure/sqlite.rs`と`src/infrastructure/runtime_store.rs`にある。`AgentSession`と`Workspace`は独立エンティティにせず、TaskRunの`id`（Claude session ID）と`workspace_id`で表す。
 
 ## Entities
 
@@ -26,7 +26,8 @@ related:
 - `TaskRun`: 1回の実行試行。provider、worktree、branch、結果、実行statusを持つ。
 - `AgentSession`: providerが起動したセッション。プロセスとprovider固有識別子を持つ。
 - `Workspace`: cmux workspace。TaskRunと1対1で関連し、実行後に閉じる。
-- `ProcessLease`: supervisor、session wrapper、agentのPIDとheartbeatを追跡する。
+- `SupervisorLease`: キューを所有するsupervisorのPIDとheartbeat。
+- `RunProcess`: runごとのsession wrapperとagentのPID、heartbeat、終了コード。
 - `RunEvent`: 実行中に発生した永続イベント。
 
 `Task.id`はSQLiteの整数ID、`TaskRun.id`はUUID。Taskはtitle、description、acceptance、verification_commandsを保持する。TaskRunはprovider、base commitと、branch/worktree/workspace/receipt/log/result commitの任意参照を持つ。claim時のproviderは`claude`のみで、リソース参照は作成前のためnullになる。
@@ -35,6 +36,7 @@ related:
 
 - `add`でdraftを作り、`draft → ready`、`ready → draft`、`draft/ready → canceled`を手動操作できる。
 - `claim`だけが`ready → in_progress`へ遷移させる。同じトランザクションでclaimed状態のTaskRunとイベントを作る。
+- supervisorはrunを`claimed → starting`（path計画）→ `running`（agent起動）→ `validating`または`failed`（wrapper終了）へ進める。各遷移はleaseまたはwrapperの所有を要求する。
 - `in_progress`または終端状態のTaskは手動変更できない。依存の追加・削除もdraft/readyだけに許可する。
 - Taskの`completed`への遷移とrunの成功・失敗・回復はまだ公開していない。mainへの統合検証を実装してから接続する。
 - `candidates`は全依存がcompletedのready taskをID順で返す。同時実行枠の空きはclaimで再確認する。

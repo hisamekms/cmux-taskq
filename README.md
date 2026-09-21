@@ -6,9 +6,9 @@ The runtime is distributed as a binary. Claude Code and Codex integrations are d
 
 ## Current status
 
-The Rust/SQLite queue is implemented. Tasks, dependencies, state transitions, candidate selection, run reservation, and events are persisted locally. Claude Code's interactive lifecycle has been [verified separately](docs/plans/claude-lifecycle-spike.md); the supervisor and plugins are the next steps.
+The Rust/SQLite queue and a single-run supervisor are implemented. Tasks, dependencies, state transitions, candidate selection, run reservation, supervisor leases, process heartbeats, and events are persisted locally. `supervise` claims one ready task, creates a Git worktree and a cmux workspace, starts an interactive Claude Code session through a wrapper, and records the session exit. Claude Code's interactive lifecycle was [verified first](docs/plans/claude-lifecycle-spike.md).
 
-The CLI manages the queue without launching agents. Claim is currently a library operation for the upcoming supervisor. Task completion will require verified execution and integration; there is no manual `complete` command.
+Receipt validation, workspace cleanup, and `completed` transitions are the next steps. A run that exits with code 0 stays in `validating`; its workspace, worktree, and branch are kept. There is no manual `complete` command, and stale supervisor leases are never taken over automatically.
 
 ## Build and try the queue
 
@@ -42,8 +42,22 @@ Commands return JSON on stdout. Runtime errors return JSON on stderr with a nonz
 | `cancel ID` | Cancel a draft or ready task; does not satisfy its dependents |
 | `dependency add TASK PREDECESSOR` / `dependency remove TASK PREDECESSOR` | Change prerequisites of a draft or ready task |
 | `candidates` | List dependency-ready tasks in registration order without reserving them |
+| `supervise --repo PATH [--cmux EXE] [--claude EXE]` | Claim one task, run it in a cmux workspace, and wait for the session to exit |
+| `status` | Show the supervisor lease and whether its heartbeat is stale |
 
-Verification commands are stored as task instructions and are not executed by this queue CLI. Task descriptions and acceptance criteria are optional during registration. Execution preconditions belong to the upcoming supervisor.
+Verification commands are stored as task instructions and are not executed by this queue CLI yet. Task descriptions and acceptance criteria are optional during registration.
+
+## Run one task with the supervisor
+
+Requires cmux and an authenticated Claude Code on PATH (or pass `--cmux` / `--claude`). Run the supervisor in a dedicated terminal; it processes one task and exits.
+
+```sh
+target/debug/cmux-taskq --db "$taskq_demo_dir/queue.db" supervise --repo /path/to/repository
+```
+
+The base commit is the repository's `main`. Runtime files live next to the database in `<db>.runs/<run-id>/`: the prompt, a snapshot of the runtime binary, the worktree on branch `taskq/<run-id>`, Claude's debug log, the receipt, and the final terminal screen. The workspace command starts a hidden `session` wrapper that launches Claude with the run ID as its session ID and reports heartbeats and the exit code.
+
+Claude may wait for trust or permission prompts in the workspace; answer them there. A receipt does not end the session. After Claude reports completion, send `/exit` in the workspace; the supervisor then records `validating` (exit code 0) or `failed` and releases its lease. If provisioning fails, the run, its lease, and any created resources are kept for inspection; check `show ID` and `status`.
 
 ## Development checks
 

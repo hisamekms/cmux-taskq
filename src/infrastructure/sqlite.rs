@@ -17,7 +17,10 @@ use crate::{
 };
 
 const APPLICATION_ID: i64 = 0x43545131;
-const MIGRATIONS: &[&str] = &[include_str!("../../migrations/0001_queue.sql")];
+const MIGRATIONS: &[&str] = &[
+    include_str!("../../migrations/0001_queue.sql"),
+    include_str!("../../migrations/0002_supervisor.sql"),
+];
 const READY_QUERY: &str = "
     SELECT t.* FROM tasks t
     WHERE t.status = 'ready'
@@ -32,7 +35,7 @@ const READY_QUERY: &str = "
     ORDER BY t.id";
 
 pub struct SqliteQueue {
-    conn: Connection,
+    pub(super) conn: Connection,
 }
 
 impl SqliteQueue {
@@ -146,12 +149,14 @@ impl TaskQueue for SqliteQueue {
             .prepare("SELECT * FROM run_events WHERE task_id=?1 ORDER BY id")?
             .query_map([task_id], event_row)?
             .collect::<rusqlite::Result<_>>()?;
+        let processes = super::runtime_store::processes_for_task(&tx, task_id)?;
         tx.commit()?;
         Ok(TaskDetail {
             task,
             dependencies,
             runs,
             events,
+            processes,
         })
     }
 
@@ -310,7 +315,7 @@ fn touch(conn: &Connection, task_id: i64) -> Result<()> {
     Ok(())
 }
 
-fn event(
+pub(super) fn event(
     conn: &Connection,
     task_id: i64,
     run_id: Option<&str>,
@@ -359,7 +364,7 @@ fn task_row(row: &Row<'_>) -> rusqlite::Result<Task> {
     })
 }
 
-fn run_row(row: &Row<'_>) -> rusqlite::Result<TaskRun> {
+pub(super) fn run_row(row: &Row<'_>) -> rusqlite::Result<TaskRun> {
     Ok(TaskRun {
         id: row.get("id")?,
         task_id: row.get("task_id")?,
@@ -373,6 +378,9 @@ fn run_row(row: &Row<'_>) -> rusqlite::Result<TaskRun> {
         receipt_path: row.get("receipt_path")?,
         log_path: row.get("log_path")?,
         result_commit: row.get("result_commit")?,
+        repo_path: row.get("repo_path")?,
+        run_dir: row.get("run_dir")?,
+        last_error: row.get("last_error")?,
         created_at: row.get("created_at")?,
     })
 }

@@ -16,3 +16,15 @@ pub trait TaskQueue {
     /// Reserve one run atomically. Does not start a process or validate Git objects.
     fn claim(&mut self, base_commit: &str) -> Result<ClaimOutcome>;
 }
+
+/// Provider-specific CLI construction is kept outside supervisor orchestration.
+pub trait AgentProvider {
+    fn preflight(&self) -> Result<()>;
+    fn command(&self, run: &crate::domain::TaskRun, prompt: &str) -> Result<std::process::Command>;
+}
+
+pub trait WorkspaceBackend {
+    fn preflight(&self) -> Result<()>;
+    fn create(&self, run: &crate::domain::TaskRun, command: &str) -> Result<String>;
+    fn capture(&self, workspace_id: &str) -> Result<String>;
+}

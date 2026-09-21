@@ -60,6 +60,29 @@ enum Command {
     },
     /// List ready tasks whose prerequisites are all completed; does not claim.
     Candidates,
+    /// Run and monitor one task. Run this in a dedicated terminal.
+    Supervise {
+        /// Repository whose `main` becomes the base commit and worktree source.
+        #[arg(long)]
+        repo: PathBuf,
+        /// cmux executable; a bare name is resolved on PATH.
+        #[arg(long, default_value = "cmux")]
+        cmux: PathBuf,
+        /// Claude Code executable; a bare name is resolved on PATH.
+        #[arg(long, default_value = "claude")]
+        claude: PathBuf,
+    },
+    /// Inspect supervisor ownership and heartbeat without changing it.
+    Status,
+    #[command(hide = true)]
+    Session {
+        #[arg(long)]
+        run: String,
+        #[arg(long)]
+        lease: String,
+        #[arg(long)]
+        claude: PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
@@ -108,6 +131,29 @@ fn execute(cli: Cli) -> Result<Value> {
             serde_json::to_value(queue.show(id)?)?
         }
         Command::Candidates => serde_json::to_value(queue.candidates()?)?,
+        Command::Status => {
+            let lease = queue.supervisor_lease()?;
+            let stale = lease.as_ref().map(|l| {
+                cmux_taskq::runtime::unix_time() - l.heartbeat_at
+                    > cmux_taskq::infrastructure::runtime_store::HEARTBEAT_TIMEOUT_SECS
+            });
+            json!({"supervisor": lease, "heartbeat_stale": stale})
+        }
+        Command::Supervise { repo, cmux, claude } => {
+            use cmux_taskq::infrastructure::adapters::{Cmux, executable};
+            cmux_taskq::runtime::supervise(
+                &cli.db,
+                &repo,
+                &Cmux {
+                    executable: executable(&cmux)?,
+                },
+                &executable(&claude)?,
+                &std::env::current_exe()?,
+            )?
+        }
+        Command::Session { run, lease, claude } => {
+            cmux_taskq::runtime::session(&cli.db, &run, &lease, &claude)?
+        }
     })
 }
 

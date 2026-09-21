@@ -23,7 +23,7 @@ depends_on:
 
 最初の到達点を、Claude Codeから登録したタスクをcmux workspaceとGit worktreeで実行し、成果をレビューして手動でmainへ取り込むドッグフーディングとする。まずcmux-taskq自身の小さな改善に使い、その後にCodex対応と配布を進める。
 
-2026-09-22時点でステップ1の[実機検証](claude-lifecycle-spike.md)とステップ2のRust/SQLiteキューを実装した。利用可能なCLIは[README](../../README.md)に記載する。supervisor、providerの起動、実行結果の検証とpluginは未実装。
+2026-09-22時点でステップ1の[実機検証](claude-lifecycle-spike.md)、ステップ2のRust/SQLiteキュー、ステップ3の1件を実行するsupervisorを実装した。利用可能なCLIは[README](../../README.md)に記載する。receiptの検証、workspaceの終了、`completed`への遷移、復旧コマンド、pluginは未実装。
 
 ## First dogfooding scope
 
@@ -61,6 +61,10 @@ Rustプロジェクト、migration、Task/TaskRun、依存関係、イベント�
 - **完了条件:** DBを開き直して状態が復元でき、競合するclaimでも同じtaskに二つのactive runができないことをテストで確認する。
 
 ### 3. 1件を実行するsupervisorを作る
+
+状態: 完了（2026-09-22）。`supervise`がlease取得 → claim → run管理領域とworktree作成 → cmux workspace作成 → 隠しコマンド`session`のwrapper経由でClaude起動 → heartbeat監視 → セッション終了検知までを1件分行う。実装は`src/runtime.rs`、adapterは`src/infrastructure/adapters.rs`、永続化は`src/infrastructure/runtime_store.rs`とmigration `0002_supervisor.sql`。テスト用providerとworkspaceを差し替えたruntimeテスト8件を追加し、正常終了・異常終了・作成失敗時の保持・stale leaseの不奪取・v1からのmigrationを確認した。
+
+使い捨てrepositoryでの実機スモーク（cmux 0.64.25、Claude Code 2.1.278）では、専用workspaceのsupervisorからClaudeを起動し、新規worktreeの信頼確認で待機している間もsupervisorとwrapperのheartbeatが継続することを確認した。確認を進めるとClaudeが修正・unit test・commit・receipt提出を行い、receipt受領後もセッションは維持され、operatorの`/exit`で`session_exited`、`supervision_finished`が記録されrunは`validating`になった。ログはworktree外の`<db>.runs/<run-id>/`に保存され、workspace・worktree・branchは保持された。receiptの検証と`awaiting_integration`への遷移はステップ4で行う。
 
 ステップ1の経路をruntimeへ組み込む。claim → worktree作成 → cmux workspace作成 → wrapper/Claude起動 → 監視を実装する。手動で起動し、1件を処理するところから始める。
 
@@ -101,7 +105,7 @@ receiptにはrun ID、結果、commit SHA、実施したunit test/E2E/subagent r
 
 ## Ordering
 
-`1 → 2 → 3 → 4 → 5 → 6`。ステップ1の正常系検証とステップ2の最小キューは完了。次の着手単位はステップ3の1件を実行するsupervisorとする。
+`1 → 2 → 3 → 4 → 5 → 6`。ステップ1の正常系検証、ステップ2の最小キュー、ステップ3の1件を実行するsupervisorは完了。次の着手単位はステップ4の成功判定・統合待ち・障害時の扱いとする。ステップ3で未検証のClaude異常終了、supervisor再起動、heartbeat切れ後の復旧、cleanup失敗はステップ4で扱う。
 
 ## After first dogfooding
 

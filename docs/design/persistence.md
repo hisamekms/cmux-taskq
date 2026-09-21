@@ -14,16 +14,26 @@ related:
 
 # SQLite persistence
 
-SQLiteはキューの正本であり、プロセス間共有と再起動後の復旧に使う。stdoutは正本にしない。ステップ2では以下の4テーブルを実装した。
+SQLiteはキューの正本であり、プロセス間共有と再起動後の復旧に使う。stdoutは正本にしない。ステップ2で4テーブル、ステップ3で3テーブルを実装した（schema version 2）。
 
 ```text
 tasks
 task_dependencies
 task_runs
 run_events
+queue_repository     -- 0002: キューを束縛するGit common directory（1行）
+supervisor_leases    -- 0002: supervisor token、PID、heartbeat（1行）
+run_processes        -- 0002: runごとのwrapper/agentのPID、heartbeat、終了コード
 ```
 
-`task_dependencies(task_id, predecessor_id)`は依存関係を保存する。TaskRunは試行ごとに新しい行を作り、Taskに履歴を持たせる。現時点ではworkspace、worktree、receipt、logの参照列をtask_runsに置き、claim時点ではnullにする。process監視や成果物hashは未実装。
+`task_dependencies(task_id, predecessor_id)`は依存関係を保存する。TaskRunは試行ごとに新しい行を作り、Taskに履歴を持たせる。workspace、worktree、receipt、log、repo、run directory、supervisor token、last errorの参照列をtask_runsに置き、claim時点ではnullにする。成果物hashは未実装。
+
+## Runtime ownership
+
+- supervisorは`supervisor_leases`の唯一行をtokenで所有し、2秒ごとにheartbeatを更新する。run状態を変える操作はtokenと30秒以内のheartbeatを要求する。leaseは自動で奪わない。
+- `queue_repository`は最初の`supervise`でGit common directoryを記録し、以後は同じrepositoryだけを受け付ける。
+- `run_processes`は`(run_id, role)`を主キーとし、wrapperとagentの登録は1回限りにする。wrapperの操作は登録したPIDかつ未終了であることを要求する。
+- ログ本体とreceiptは`<db>.runs/<run-id>/`のファイルに置き、pathをtask_runsへ記録する。
 
 ## Transactions and constraints
 
@@ -46,8 +56,6 @@ SQLiteはrusqliteのbundled機能で同梱する。初期化でWALを有効に�
 
 ## Planned runtime persistence
 
-`run_workspaces`、`run_processes`、`run_artifacts`、`supervisor_leases`はステップ3以降で必要な操作とともに追加する。ログ本体はファイルに置き、pathとhashをDBへ記録する予定。
-
-supervisorはleaseをheartbeat付きでclaimする。一定時間heartbeatが更新されないrunは自動再実行せず、`recover`または`doctor`で確認する。
+成果物のhashやreceipt検証結果を保持する`run_artifacts`はステップ4で追加する。一定時間heartbeatが更新されないrunは自動再実行せず、`recover`または`doctor`で確認する。
 
 旧Python版の状態を読み込む移行コマンドは後続の配布段階で用意し、task ID、依存、run履歴、ログpathを保持する。
