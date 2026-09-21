@@ -4,8 +4,8 @@ type: design
 title: System overview
 status: current
 created: 2026-09-21
-updated: 2026-09-21
-last_verified: 2026-09-21
+updated: 2026-09-22
+last_verified: 2026-09-22
 scope: system
 related:
   - adr-0001
@@ -16,6 +16,10 @@ related:
 ---
 
 # System overview
+
+ステップ2時点でRust CLIとSQLiteキューを実装済み。以下の構成図のsupervisor、cmux adapter、provider、pluginは後続実装であり、CLIからのエージェント起動はまだ行わない。
+
+コードは単一Cargo package内で、`domain`（型と状態遷移）、`application`（キュー操作の契約）、`infrastructure::sqlite`（トランザクションと永続化）、`main`（CLI）に分離している。利用方法は[README](../../README.md)を参照。
 
 cmux-taskqは、依存関係を持つ開発タスクをSQLiteで管理し、着手可能なタスクをcmux workspaceとGit worktreeで実行するRust runtimeである。
 

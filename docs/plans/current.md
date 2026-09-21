@@ -23,7 +23,7 @@ depends_on:
 
 最初の到達点を、Claude Codeから登録したタスクをcmux workspaceとGit worktreeで実行し、成果をレビューして手動でmainへ取り込むドッグフーディングとする。まずcmux-taskq自身の小さな改善に使い、その後にCodex対応と配布を進める。
 
-2026-09-22時点ではRust runtimeは未実装。ステップ1の[実機検証](claude-lifecycle-spike.md)は完了し、使い捨てrepositoryで起動からworkspace終了まで確認した。この文書のruntime CLI名やreceipt項目は実装時に確定する案であり、利用可能な機能ではない。
+2026-09-22時点でステップ1の[実機検証](claude-lifecycle-spike.md)とステップ2のRust/SQLiteキューを実装した。利用可能なCLIは[README](../../README.md)に記載する。supervisor、providerの起動、実行結果の検証とpluginは未実装。
 
 ## First dogfooding scope
 
@@ -51,11 +51,13 @@ depends_on:
 
 ### 2. RustとSQLiteで最小のキューを作る
 
+状態: 完了（2026-09-22）。登録・一覧・詳細・ready/draft/cancel・依存追加/削除・候補確認をCLIとして実装。claimは後続supervisor向けのライブラリAPIとして実装し、DB再open、同時claim、依存変更との競合、イベント保存失敗時のrollbackをテストで確認した。CLIとキューの計15テスト、fmt、Clippyを通過。
+
 Rustプロジェクト、migration、Task/TaskRun、依存関係、イベントを実装する。CLIは登録、一覧、詳細、ready化、実行候補の確認を優先する。
 
 - 自己依存と循環を拒否する。
 - 依存がすべて`completed`のready taskだけをトランザクションでclaimし、TaskRunを作る。
-- TaskRunにprovider、base commit、branch、worktree、workspace、成果物の参照を保持する。provider実装はClaudeだけだがadapter境界は設ける。
+- TaskRunにprovider、base commit、branch、worktree、workspace、成果物の参照を保持する。providerはclaudeのみを記録し、provider固有の起動処理はステップ3のadapterへ閉じ込める。
 - **完了条件:** DBを開き直して状態が復元でき、競合するclaimでも同じtaskに二つのactive runができないことをテストで確認する。
 
 ### 3. 1件を実行するsupervisorを作る
@@ -99,7 +101,7 @@ receiptにはrun ID、結果、commit SHA、実施したunit test/E2E/subagent r
 
 ## Ordering
 
-`1 → 2 → 3 → 4 → 5 → 6`。ステップ1の正常系検証は完了。次の着手単位はステップ2のRustとSQLiteによる最小キューとする。
+`1 → 2 → 3 → 4 → 5 → 6`。ステップ1の正常系検証とステップ2の最小キューは完了。次の着手単位はステップ3の1件を実行するsupervisorとする。
 
 ## After first dogfooding
 
