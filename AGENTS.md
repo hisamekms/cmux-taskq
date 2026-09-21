@@ -36,5 +36,26 @@ cargo clippy --locked --all-targets -- -D warnings
 
 ## コミット
 
-- 指示があったときだけコミット・push する
+- worker は自分の branch にコミットする。main への直接コミットと push は SV だけが行う
 - メッセージは `feat:` / `fix:` / `docs:` / `test:` の接頭辞、本文は何をなぜ変えたか
+
+## 役割: SV と worker
+
+タスクは cmux workspace ごとに起動した対話モードの Claude Code session（worker）が実行し、1つの Claude Code session（SV）が起動・監視・merge を行う。
+
+### SV
+
+- ジャーナルの Open 一覧から依存が満たされたタスクを選び、同時に最大4件まで起動する
+- タスクごとに main から `git worktree add .worktrees/<NNN>-<slug> -b journal/<NNN>-<slug>` で worktree を作る。`.worktrees/` は gitignore 済み
+- `cmux workspace create --name "<NNN> <slug>" --cwd <worktree> --command claude` で workspace を作り、`cmux send` / `cmux send-key` で指示を送る。指示にはジャーナルのパス、完了マーカー、SV への質問方法を含める
+- 数分おきに `cmux read-screen --workspace <ws> --lines N` で画面を読む。権限確認は worktree 内の編集・cargo・git など安全なものは SV が応答し、それ以外とユーザーの判断が要るものはユーザーに確認する
+- worker の完了マーカーを確認したら、worktree で fmt / test / clippy を通し、差分をレビューして main へ merge（fast-forward 優先）し、push する。ジャーナルの README Open 一覧は SV が main で更新する
+- merge 後に workspace を閉じ、worktree と branch を削除する。失敗・中断時は両方を残す
+- Claude 利用制限などで worker が止まったら、ジャーナルの Log を確認して別 session で引き継ぐ
+
+### worker
+
+- 起動時の指示にあるジャーナルを `open` にし、Log に追記しながら進める。Result と Promoted を書いて `done` にしてから完了を報告する
+- worktree の外、main、`docs/journal/README.md` の Open 一覧、他タスクのジャーナルは触らない。push しない
+- 判断が要るときは terminal に質問を書いて待つ。SV が同じ terminal に返答する
+- 完了時は最終メッセージを指示された完了マーカーで終える
