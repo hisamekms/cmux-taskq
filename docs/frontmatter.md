@@ -4,8 +4,8 @@ type: design
 title: Documentation frontmatter specification
 status: current
 created: 2026-09-21
-updated: 2026-09-21
-last_verified: 2026-09-21
+updated: 2026-09-22
+last_verified: 2026-09-22
 tags:
   - documentation
   - conventions
@@ -43,8 +43,9 @@ related:
 | `adr` | `proposed`, `accepted`, `rejected`, `superseded` | `superseded_by` when replaced |
 | `design` | `draft`, `current`, `deprecated` | `last_verified`, optional `scope` |
 | `plan` | `proposed`, `active`, `blocked`, `completed`, `archived` | optional `milestone`, `target`, `depends_on` |
+| `journal` | `open`, `done`, `abandoned` | optional `plan_step`, `queue_task`, `depends_on_journal`, `verify` |
 
-An ADR is append-only. When a decision changes, create a new ADR and set the old one to `superseded` with `superseded_by`. Design documents describe the current state and may be edited. Plans describe intended work and may be edited while active.
+An ADR is append-only. When a decision changes, create a new ADR and set the old one to `superseded` with `superseded_by`. Design documents describe the current state and may be edited. Plans describe intended work and may be edited while active. Journals record one task; their `Log` section is append-only, `queue_task` links to the cmux-taskq task ID after migration, and `verify` lists commands to pass to `cmux-taskq add --verify`. Journal IDs use `journal-NNN`.
 
 ## Validation
 
@@ -54,4 +55,5 @@ Future documentation validation should check unique IDs, allowed status values, 
 docs/adr/0001-rust-runtime.md
 docs/design/supervisor-lifecycle.md
 docs/plans/rust-runtime-mvp.md
+docs/journal/003-supervisor.md
 ```

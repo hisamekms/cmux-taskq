@@ -6,7 +6,7 @@ The runtime is distributed as a binary. Claude Code and Codex integrations are d
 
 ## Current status
 
-The Rust/SQLite queue and a single-run supervisor are implemented. Tasks, dependencies, state transitions, candidate selection, run reservation, supervisor leases, process heartbeats, and events are persisted locally. `supervise` claims one ready task, creates a Git worktree and a cmux workspace, starts an interactive Claude Code session through a wrapper, and records the session exit. Claude Code's interactive lifecycle was [verified first](docs/plans/claude-lifecycle-spike.md).
+The Rust/SQLite queue and a single-run supervisor are implemented. Tasks, dependencies, state transitions, candidate selection, run reservation, supervisor leases, process heartbeats, and events are persisted locally. `supervise` claims one ready task, creates a Git worktree and a cmux workspace, starts an interactive Claude Code session through a wrapper, and records the session exit. Claude Code's interactive lifecycle was [verified first](docs/journal/001-claude-lifecycle-spike.md).
 
 Receipt validation, workspace cleanup, and `completed` transitions are the next steps. A run that exits with code 0 stays in `validating`; its workspace, worktree, and branch are kept. There is no manual `complete` command, and stale supervisor leases are never taken over automatically.
 
@@ -74,4 +74,6 @@ The tests use temporary databases and do not require cmux, Claude Code, or netwo
 - [Documentation guide](docs/README.md)
 - [Current design](docs/design/overview.md)
 - [Active plan](docs/plans/current.md)
+- [Task journals](docs/journal/README.md)
 - [Architecture decisions](docs/adr/README.md)
+- [Agent instructions](AGENTS.md)
