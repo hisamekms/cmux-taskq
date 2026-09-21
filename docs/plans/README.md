@@ -16,3 +16,4 @@ tags:
 
 - [Current plan](current.md)
 - [Milestones](milestones.md)
+- [Claude Code lifecycle spike](claude-lifecycle-spike.md)（完了）

@@ -23,7 +23,7 @@ depends_on:
 
 最初の到達点を、Claude Codeから登録したタスクをcmux workspaceとGit worktreeで実行し、成果をレビューして手動でmainへ取り込むドッグフーディングとする。まずcmux-taskq自身の小さな改善に使い、その後にCodex対応と配布を進める。
 
-2026-09-22時点では設計文書のみで、Rust runtimeは未実装。この文書のCLI名やreceipt項目は実装時に確定する案であり、利用可能な機能ではない。
+2026-09-22時点ではRust runtimeは未実装。ステップ1の[実機検証](claude-lifecycle-spike.md)は完了し、使い捨てrepositoryで起動からworkspace終了まで確認した。この文書のruntime CLI名やreceipt項目は実装時に確定する案であり、利用可能な機能ではない。
 
 ## First dogfooding scope
 
@@ -39,6 +39,8 @@ depends_on:
 ## Steps and exit criteria
 
 ### 1. 実機で起動と完了通知の経路を検証する
+
+状態: 完了（2026-09-22）。[結果と再現手順](claude-lifecycle-spike.md)。入力待ちと異常系は未検証で、ステップ3・4へ引き継ぐ。
 
 最も不確実なcmuxとClaude Codeの接続を先に確認する。使い捨てrepositoryでworktreeとworkspaceを作り、通常のClaude Codeセッションへ作業指示とrun識別子を渡す。小さな変更、テスト、コミット、完了receiptの出力まで試す。
 
@@ -97,7 +99,7 @@ receiptにはrun ID、結果、commit SHA、実施したunit test/E2E/subagent r
 
 ## Ordering
 
-`1 → 2 → 3 → 4 → 5 → 6`。最初の着手単位はステップ1の実機検証とする。大きなキュー実装に入る前に通常セッションの起動・完了通知を確定する。
+`1 → 2 → 3 → 4 → 5 → 6`。ステップ1の正常系検証は完了。次の着手単位はステップ2のRustとSQLiteによる最小キューとする。
 
 ## After first dogfooding
 
