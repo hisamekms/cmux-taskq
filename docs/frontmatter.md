@@ -43,7 +43,7 @@ related:
 | `adr` | `proposed`, `accepted`, `rejected`, `superseded` | `superseded_by` when replaced |
 | `design` | `draft`, `current`, `deprecated` | `last_verified`, optional `scope` |
 | `plan` | `proposed`, `active`, `blocked`, `completed`, `archived` | optional `milestone`, `target`, `depends_on` |
-| `journal` | `open`, `done`, `abandoned` | optional `plan_step`, `queue_task`, `depends_on_journal`, `verify` |
+| `journal` | `planned`, `open`, `done`, `abandoned` | optional `plan_step`, `queue_task`, `depends_on_journal`, `verify` |
 
 An ADR is append-only. When a decision changes, create a new ADR and set the old one to `superseded` with `superseded_by`. Design documents describe the current state and may be edited. Plans describe intended work and may be edited while active. Journals record one task; their `Log` section is append-only, `queue_task` links to the cmux-taskq task ID after migration, and `verify` lists commands to pass to `cmux-taskq add --verify`. Journal IDs use `journal-NNN`.
 

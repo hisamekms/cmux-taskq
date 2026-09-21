@@ -16,7 +16,7 @@ tags:
 
 ## Rules
 
-- タスクを始めるとき、次の連番で`status: open`のジャーナルを作り、下のOpenに追加する。
+- 決まったタスクは次の連番で`status: planned`のジャーナルをGoalだけ書いて作り、下のOpenに追加する。着手したら`open`にする。
 - 作業中はLogに追記する。一時的なpath、workspace番号、制限の復活時刻など、他の文書に書くほどでもない備忘はここに書く。
 - 閉じるときにResultとPromotedを書き、`status: done`（または`abandoned`）にしてOpenから外す。
 - Openの並びが実行順。依存は末尾に一言で書く。ready/draftのような状態は持たない。状態機械はキューだけが持つ。
@@ -30,4 +30,15 @@ tags:
 
 ## Open
 
-（なし。次はステップ4のタスクを起こす）
+1. [005 receipt validation](005-receipt-validation.md)
+2. [006 workspace close](006-workspace-close.md) — after 005
+3. [007 session exit request](007-session-exit-request.md) — after 005
+4. [008 integration confirm](008-integration-confirm.md) — after 005
+5. [009 doctor / recover](009-doctor-recover.md) — after 005
+6. [010 failure path smoke](010-failure-path-smoke.md) — after 006, 009。ステップ4の完了
+7. [011 Claude Code plugin](011-claude-code-plugin.md) — after 008。ステップ5
+8. [012 dogfood: independent task](012-dogfood-independent-task.md) — after 011。ここでopenなジャーナルをキューへ移行する
+9. [013 dogfood: dependent tasks](013-dogfood-dependent-tasks.md) — after 012
+10. [014 dogfood: failure and recovery](014-dogfood-failure-recovery.md) — after 013。ステップ6とM1の完了
+
+M2以降（Codex provider、配布、Python版からの移行）は[plans/current.md](../plans/current.md)のAfter first dogfoodingに留め、まだタスクに割らない。

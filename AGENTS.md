@@ -10,7 +10,7 @@ cmux-taskq は cmux と Git worktree で依存関係付きの開発タスクを�
 
 ## 作業中
 
-- タスクを始めるときは `docs/journal/000-template.md` から次の連番でジャーナルを作り、README の Open に追加する
+- タスクを始めるときは README の Open にある `planned` のジャーナルを `open` にする。なければ `docs/journal/000-template.md` から次の連番で作り、Open に追加する
 - ジャーナルの Log に追記する。試して駄目だったこと、一時的な path・workspace 番号・制限の復活時刻、次にやろうとしていたことを書く。中断されても次のセッションが Log だけで再開できる状態を保つ
 - Git worktree と cmux workspace のスモークは使い捨て repository で行い、この repository の queue DB や実行中の runtime バイナリを作業成果で置き換えない
 
