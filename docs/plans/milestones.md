@@ -16,14 +16,16 @@ owners:
 
 ADR、現在の設計、MVP計画を確定する。設計変更は影響範囲に応じてADRへ追記する。
 
-## M1: Local Rust runtime
+## M1: Claude Code first dogfooding
 
-SQLiteのタスク管理、依存関係、状態遷移、イベント、Supervisorの基本ライフサイクルをローカルで動かす。
+Claude Codeのみで、登録 → SQLiteによるclaim → cmux/worktreeで実行 → receipt検証 → workspace終了 → 手動統合 → 依存解放を通す。単一repository・同時実行1件から始め、最小のlease/heartbeat、障害時の保持、明示復旧、ローカルClaude Code pluginを含める。
 
-## M2: Agent providers
+完了条件は、cmux-taskq自身で独立task、依存task、失敗からの復旧をDBの手修正なしで実行できること。具体的な順序は[Active plan](current.md)に記載する。
 
-Claude Codeの通常セッションを標準経路として実行し、Codexの選択とフォールバック、完了receipt、workspace cleanupを追加する。
+## M2: Provider expansion and runtime hardening
+
+ドッグフーディングで見つかった問題を修正し、Codex provider、provider選択、Claude起動不能時のfallbackを追加する。継続運用と復旧を安定させる。
 
 ## M3: Distribution
 
-バイナリのリリースとClaude Code/Codexプラグインを整備し、既存のPythonキューからの移行手順を公開する。
+バイナリのリリースとClaude Code/Codexプラグインの配布を整備し、既存のPythonキューからの移行手順を公開する。
