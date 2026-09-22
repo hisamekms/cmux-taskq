@@ -4,8 +4,8 @@ type: design
 title: System overview
 status: current
 created: 2026-09-21
-updated: 2026-09-22
-last_verified: 2026-09-22
+updated: 2026-09-23
+last_verified: 2026-09-23
 scope: system
 related:
   - adr-0001
@@ -26,7 +26,7 @@ related:
 
 コードは単一Cargo package内で、`domain`（型と状態遷移）、`application`（キュー・provider・workspaceの契約）、`infrastructure::sqlite`（キューの永続化）、`infrastructure::runtime_store`（run単位のlease・process・run状態の永続化）、`infrastructure::adapters`（Git、cmux、Claude Codeの呼び出し）、`infrastructure::location`（cwdからのqueueの解決、[ADR-0006](../adr/0006-queue-per-repository.md)）、`runtime`（supervisorとsession wrapper）、`main`（CLI）に分離している。この構成は[ADR-0013](../adr/0013-layered-architecture-and-type-function-style.md)でレイヤー構成を再編中で、domainのカプセル化とnewtype、applicationへのユースケースとportの集約、`runtime`・`lifecycle`・`main`の役割の整理を観点ごとのタスクで段階的に進める（外部公開APIとschemaは変えない）。上の構成は再編前の現状で、タスクが着地するたびにこの段落を更新する。利用方法は[README](../../README.md)を参照。
 
-cmux-taskqは、依存関係を持つ開発タスクをSQLiteで管理し、着手可能なタスクをcmux workspaceとGit worktreeで実行するRust runtimeである。
+dagqは、依存関係を持つ開発タスクをSQLiteで管理し、着手可能なタスクをcmux workspaceとGit worktreeで実行するRust runtimeである。
 
 ## 用語集
 
@@ -34,7 +34,7 @@ cmux-taskqは、依存関係を持つ開発タスクをSQLiteで管理し、着�
 
 | 用語 | 指すもの | 旧称 |
 | --- | --- | --- |
-| **supervisor** | runtimeの`cmux-taskq supervise`プロセス。依存が解けたtaskをclaimし、runごとにworktreeとcmux workspaceを作ってworkerを起動し、receiptを検証してworkspaceを閉じる（[ADR-0003](../adr/0003-supervisor-owns-lifecycle.md)、[ADR-0007](../adr/0007-run-level-leases-parallel-execution.md)）。ADR-0010以降はlaunchdのLaunchAgentとして常駐する予定（T2で実装）。 | （変更なし） |
+| **supervisor** | runtimeの`dagq supervise`プロセス。依存が解けたtaskをclaimし、runごとにworktreeとcmux workspaceを作ってworkerを起動し、receiptを検証してworkspaceを閉じる（[ADR-0003](../adr/0003-supervisor-owns-lifecycle.md)、[ADR-0007](../adr/0007-run-level-leases-parallel-execution.md)）。ADR-0010以降はlaunchdのLaunchAgentとして常駐する予定（T2で実装）。 | （変更なし） |
 | **maintainer** | 1 repositoryに1つ常駐する対話モードのClaude Code session。taskの登録、runの監視と権限確認・質問への応答、差分と証跡のレビュー、`integrate`の呼び出し、`needs_session`のrunへの指示、`doctor`/`recover`、pushを行う。人が同じ操作をしてもよい。 | "SV"（supervisorの略。旧称）、operator（designとcodeでこの役割を指していたもの）、main session（[ADR-0003](../adr/0003-supervisor-owns-lifecycle.md)） |
 | **worker** | runごとにsupervisorが起動するClaude（将来はCodex）のsession。割り当てられたworktreeの中だけで作業し、commitしてreceiptを書く。 | agent session、run session |
 

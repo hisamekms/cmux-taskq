@@ -1,20 +1,20 @@
-# cmux-taskq
+# dagq
 
-cmux-taskq is a Rust task orchestrator for running dependency-aware development tasks in cmux workspaces and isolated Git worktrees.
+dagq is a dependency DAG queue: a Rust task orchestrator for running dependency-aware development tasks in cmux workspaces and isolated Git worktrees. The name is the shape of the work — tasks form a dependency DAG, and the queue runs the ones whose predecessors have landed. (It is unrelated to DAQ, data acquisition.)
 
 **It runs on macOS on Apple Silicon (`aarch64-apple-darwin`) only.** No other platform is built, released, or tested. It also needs cmux, which hosts a workspace per run, and an authenticated Claude Code on PATH, because every run is a Claude Code session.
 
-The runtime is distributed as a binary from [GitHub Releases](https://github.com/hisamekms/cmux-taskq/releases). The Claude Code integration is distributed as a plugin that invokes that binary, and this repository is also its marketplace. Claude Code is the only provider today; a Codex plugin is planned but does not exist yet.
+The runtime is distributed as a binary from [GitHub Releases](https://github.com/hisamekms/dagq/releases). The Claude Code integration is distributed as a plugin that invokes that binary, and this repository is also its marketplace. Claude Code is the only provider today; a Codex plugin is planned but does not exist yet.
 
 ## Getting started
 
-How to start using cmux-taskq in a repository of your own. Each step links to the section that covers it in full.
+How to start using dagq in a repository of your own. Each step links to the section that covers it in full.
 
-**1. Download the release.** Put `cmux-taskq-v<version>-aarch64-apple-darwin.tar.gz` and `SHA256SUMS` from the [latest release](https://github.com/hisamekms/cmux-taskq/releases/latest) in the same directory.
+**1. Download the release.** Put `dagq-v<version>-aarch64-apple-darwin.tar.gz` and `SHA256SUMS` from the [latest release](https://github.com/hisamekms/dagq/releases/latest) in the same directory.
 
 ```sh
-VERSION=0.1.0
-gh release download "v$VERSION" --repo hisamekms/cmux-taskq
+VERSION=0.2.0
+gh release download "v$VERSION" --repo hisamekms/dagq
 ```
 
 **2. Verify the checksum.**
@@ -25,13 +25,13 @@ shasum -a 256 -c SHA256SUMS
 
 Do not unpack an archive that does not print `OK`.
 
-**3. Install the binary into `~/.local/bin` and check your PATH.** The archive holds `cmux-taskq`, `LICENSE` and `README.md` at its top level.
+**3. Install the binary into `~/.local/bin` and check your PATH.** The archive holds `dagq`, `LICENSE` and `README.md` at its top level.
 
 ```sh
-tar -xzf "cmux-taskq-v$VERSION-aarch64-apple-darwin.tar.gz"
+tar -xzf "dagq-v$VERSION-aarch64-apple-darwin.tar.gz"
 mkdir -p ~/.local/bin
-install -m 755 cmux-taskq ~/.local/bin/cmux-taskq
-command -v cmux-taskq   # expect the ~/.local/bin one, printed expanded
+install -m 755 dagq ~/.local/bin/dagq
+command -v dagq   # expect the ~/.local/bin one, printed expanded
 ```
 
 One installed file is enough to serve the queue: it is what you type, what the plugin's launcher resolves ([Use from Claude Code](#use-from-claude-code)), and what the resident supervisor runs, since `up` starts `supervise` from the absolute path of the binary it was invoked as rather than from PATH.
@@ -39,8 +39,8 @@ One installed file is enough to serve the queue: it is what you type, what the p
 **4. Install the Claude Code plugin.** It carries the skills that drive the binary and the launcher they call, and nothing else; the binary is the one you just installed.
 
 ```sh
-claude plugin marketplace add hisamekms/cmux-taskq
-claude plugin install claude-taskq@cmux-taskq
+claude plugin marketplace add hisamekms/dagq
+claude plugin install claude-dagq@dagq
 ```
 
 See [Use from Claude Code](#use-from-claude-code) for what each skill covers.
@@ -53,7 +53,7 @@ See [Use from Claude Code](#use-from-claude-code) for what each skill covers.
 
 ```sh
 cd /path/to/your/repository
-cmux-taskq init
+dagq init
 ```
 
 `locate` shows the queue a directory resolves to without creating anything ([The queue and its commands](#the-queue-and-its-commands)).
@@ -61,19 +61,19 @@ cmux-taskq init
 **8. Start the runtime.**
 
 ```sh
-cmux-taskq up --parallel 4
+dagq up --parallel 4
 ```
 
-This keeps the supervisor resident as a launchd LaunchAgent and opens the maintainer's Claude Code session in the cmux workspace `taskq <repo> maintainer`. Running it again changes nothing ([Start the runtime with `up`](#start-the-runtime-with-up)).
+This keeps the supervisor resident as a launchd LaunchAgent and opens the maintainer's Claude Code session in the cmux workspace `dagq <repo> maintainer`. Running it again changes nothing ([Start the runtime with `up`](#start-the-runtime-with-up)).
 
 **9. Tell the maintainer session what you want done.** It registers the goal and its tasks, makes them ready, watches the runs the supervisor starts, and lands them with `integrate` one at a time ([Run tasks with the supervisor](#run-tasks-with-the-supervisor), [Land a run on main](#land-a-run-on-main)).
 
 ## Upgrade
 
-A new release is installed exactly like the first one: download the tarball and `SHA256SUMS`, check them with `shasum -a 256 -c SHA256SUMS`, and `install -m 755 cmux-taskq ~/.local/bin/cmux-taskq` over the old file. Then, from the repository:
+A new release is installed exactly like the first one: download the tarball and `SHA256SUMS`, check them with `shasum -a 256 -c SHA256SUMS`, and `install -m 755 dagq ~/.local/bin/dagq` over the old file. Then, from the repository:
 
 ```sh
-cmux-taskq up
+dagq up
 ```
 
 Nothing has to be stopped first. `up` reuses a live supervisor only while its `binary_version` matches its own, so once the file is replaced it drains the running supervisor — the agent is unloaded, the supervisor stops claiming and finishes the runs it holds — and starts one of the new binary in its place (`{"outcome": "restarted", ...}`). Use `up --no-wait` when you cannot sit through that drain: it refuses, changing nothing, whenever a run is in flight ([Updating the binary](#start-the-runtime-with-up)). A rebuild that does not bump the version reports the same `binary_version` and is reused rather than replaced, which matters only between releases.
@@ -81,11 +81,11 @@ Nothing has to be stopped first. `up` reuses a live supervisor only while its `b
 Update the plugin with Claude Code:
 
 ```sh
-claude plugin marketplace update cmux-taskq
-claude plugin update claude-taskq@cmux-taskq
+claude plugin marketplace update dagq
+claude plugin update claude-dagq@dagq
 ```
 
-The two are versioned together. When a session resolves the binary (`taskq --resolve`, which the skills run first), the launcher compares the plugin's version with the binary's and, when they differ in major.minor, writes one `{"warning": ...}` line to stderr and carries on — stdout and the exit status are untouched, so the command still works. Read it as "one of these two is out of date": update whichever is older, the plugin with `claude plugin update` and the binary from the releases page. A session that sees the warning passes it on rather than stopping.
+The two are versioned together. When a session resolves the binary (`dagq --resolve`, which the skills run first), the launcher compares the plugin's version with the binary's and, when they differ in major.minor, writes one `{"warning": ...}` line to stderr and carries on — stdout and the exit status are untouched, so the command still works. Read it as "one of these two is out of date": update whichever is older, the plugin with `claude plugin update` and the binary from the releases page. A session that sees the warning passes it on rather than stopping.
 
 ## Current status
 
@@ -95,24 +95,24 @@ A validated run stays in `awaiting_integration`; its workspace is closed, while 
 
 ## The queue and its commands
 
-Each Git repository has one queue. Run the binary from anywhere inside the repository (any worktree, including a task worktree) and it resolves the queue to `$XDG_DATA_HOME/cmux-taskq/<hash>/queue.db`, by default `~/.local/share/cmux-taskq/<hash>/queue.db`, where `<hash>` is the first 16 hex digits of the SHA-256 of the repository's canonical Git common directory. `locate` prints that resolution without opening anything; `init` creates the directory and the queue.
+Each Git repository has one queue. Run the binary from anywhere inside the repository (any worktree, including a task worktree) and it resolves the queue to `$XDG_DATA_HOME/dagq/<hash>/queue.db`, by default `~/.local/share/dagq/<hash>/queue.db`, where `<hash>` is the first 16 hex digits of the SHA-256 of the repository's canonical Git common directory. `locate` prints that resolution without opening anything; `init` creates the directory and the queue.
 
-The examples assume the installed `cmux-taskq` is on PATH ([Getting started](#getting-started)); a source build is `target/debug/cmux-taskq` ([Development](#development)).
+The examples assume the installed `dagq` is on PATH ([Getting started](#getting-started)); a source build is `target/debug/dagq` ([Development](#development)).
 
 ```sh
-taskq_demo=$(mktemp -d) && git -C "$taskq_demo" init -q -b main && cd "$taskq_demo"
-export XDG_DATA_HOME="$taskq_demo/data"   # keep the demo out of ~/.local/share
-cmux-taskq locate
-cmux-taskq init
-cmux-taskq add "Improve setup docs" \
+dagq_demo=$(mktemp -d) && git -C "$dagq_demo" init -q -b main && cd "$dagq_demo"
+export XDG_DATA_HOME="$dagq_demo/data"   # keep the demo out of ~/.local/share
+dagq locate
+dagq init
+dagq add "Improve setup docs" \
   --description "Explain the local setup procedure" \
   --acceptance "A new contributor can follow the documented commands" \
   --verify "git diff --check"
-cmux-taskq add "Check setup examples" --depends-on 1
-cmux-taskq ready 1
-cmux-taskq ready 2
-cmux-taskq candidates
-cmux-taskq show 2
+dagq add "Check setup examples" --depends-on 1
+dagq ready 1
+dagq ready 2
+dagq candidates
+dagq show 2
 ```
 
 The fresh queue assigns task IDs 1 and 2. Only task 1 is a candidate; task 2 remains blocked until task 1 is completed. Every shell inside the same repository sees the same queue. Only `init` creates a database. `--db PATH` before the subcommand uses an explicit queue file instead, for disposable repositories and tests; `init` creates its directory as well.
@@ -134,10 +134,10 @@ Commands return JSON on stdout. Runtime errors return JSON on stderr with a nonz
 | `goal edit ID [--title TEXT] [--description TEXT] [--acceptance TEXT] [--constraints TEXT] [--doc PATH]` | Replace fields (an empty `--doc` clears it); the old and new goal go into a `goal_updated` event. Runs already started keep their prompt snapshot |
 | `goal close ID --verdict achieved\|abandoned` | Record the verdict once. `achieved` is refused while a task is neither completed nor canceled; `abandoned` while a task is in progress. A closed goal accepts no more tasks |
 | `set-goal TASK GOAL` / `set-goal TASK --none` | Move a draft or ready task into an open goal, or out of its goal (same rule as dependency changes) |
-| `up [--parallel N] [--in-cmux] [--no-wait] [--plugin-dir PATH] [--repo PATH] [--cmux EXE] [--claude EXE]` | Start the queue's runtime, idempotently: prune supervisor registrations whose process is gone, keep the supervisor resident as a launchd LaunchAgent (started only when no live one of this binary's version is registered), and open the maintainer's Claude Code session in the cmux workspace `taskq <repo> maintainer` (skipped inside that session, reused if open). A live supervisor of another version is drained and replaced (`--no-wait` refuses that instead whenever a run is in flight). `--in-cmux` runs the supervisor in the cmux workspace `taskq <repo> supervisor` instead, with no launchd and no automatic restart. Reports what needs attention: unfinished runs, runs awaiting integration, runs that need a session |
+| `up [--parallel N] [--in-cmux] [--no-wait] [--plugin-dir PATH] [--repo PATH] [--cmux EXE] [--claude EXE]` | Start the queue's runtime, idempotently: prune supervisor registrations whose process is gone, keep the supervisor resident as a launchd LaunchAgent (started only when no live one of this binary's version is registered), and open the maintainer's Claude Code session in the cmux workspace `dagq <repo> maintainer` (skipped inside that session, reused if open). A live supervisor of another version is drained and replaced (`--no-wait` refuses that instead whenever a run is in flight). `--in-cmux` runs the supervisor in the cmux workspace `dagq <repo> supervisor` instead, with no launchd and no automatic restart. Reports what needs attention: unfinished runs, runs awaiting integration, runs that need a session |
 | `down [--wait] [--force] [--cmux EXE]` | Stop the supervisor: unload its LaunchAgent so it drains its runs and is not restarted, or, for an in-cmux one, SIGINT it and close its workspace once it is gone. `--wait` blocks until it has deregistered or exited, `--force` kills it and drops its registration. The maintainer workspace stays open |
 | `supervise [--parallel N] [--once] [--repo PATH] [--cmux EXE] [--claude EXE] [--log-dir DIR]` | Resident loop: claim dependency-ready tasks up to `N` (default 4), run each in its own cmux workspace, request exit once its receipt is in and Claude is idle, validate the receipt, close the workspace on success, and keep polling for new candidates (including tasks unblocked by `integrate`). `--once` exits when nothing is active or claimable. `--log-dir` adds one `supervisor-<started_at>-<pid>.log` per start. The checkout is the working directory unless `--repo` says otherwise; `up` runs it under launchd with the queue's `logs/` directory |
-| `integrate ID` / `integrate --next` `[--repo PATH]` | Land a validated run on `main`: rebase its worktree onto the current `main`, re-validate, squash into one commit with `Taskq-Task` / `Taskq-Run` trailers, mark the task `completed`, remove the worktree. `--next` takes the oldest awaiting run; `ID` also resumes a `needs_session` run. Lands in the working directory's repository unless `--repo` says otherwise |
+| `integrate ID` / `integrate --next` `[--repo PATH]` | Land a validated run on `main`: rebase its worktree onto the current `main`, re-validate, squash into one commit with `Dagq-Task` / `Dagq-Run` trailers, mark the task `completed`, remove the worktree. `--next` takes the oldest awaiting run; `ID` also resumes a `needs_session` run. Lands in the working directory's repository unless `--repo` says otherwise |
 | `status` | List every registered supervisor (PID, liveness, heartbeat age, `mode` and `workspace_id`, `binary_version`, `parallel`, the runs it holds), any other lease holder such as an `integrate` process, and the unfinished runs with their leases |
 | `doctor` | Report the same supervisors plus every unfinished run with its lease, wrapper/agent processes, heartbeats, paths, and recovery blockers without changing state |
 | `recover RUN_ID` | Mark one unfinished run `interrupted` and drop its lease once its processes and supervisor are gone; keeps its worktree and workspace, and leaves other runs alone |
@@ -146,32 +146,32 @@ Verification commands are shell lines that the supervisor runs in the worktree (
 
 ## Start the runtime with `up`
 
-Three roles share a queue: the **supervisor** is the resident `supervise` process that runs tasks, the **maintainer** is the resident Claude Code session that registers, watches, reviews and lands them, and a **worker** is the Claude session of one run. `up` starts the first two from a shell whose PATH has `cmux-taskq`, `cmux` and `claude`:
+Three roles share a queue: the **supervisor** is the resident `supervise` process that runs tasks, the **maintainer** is the resident Claude Code session that registers, watches, reviews and lands them, and a **worker** is the Claude session of one run. `up` starts the first two from a shell whose PATH has `dagq`, `cmux` and `claude`:
 
 ```sh
-cmux-taskq up --parallel 4 --plugin-dir /path/to/cmux-taskq/plugins/claude-taskq
+dagq up --parallel 4 --plugin-dir /path/to/dagq/plugins/claude-dagq
 ```
 
-`up` checks cmux (`ping`), Claude (`--version`) and the queue (`init` first), deletes supervisor registrations whose process is dead (`pruned_supervisors`), and then keeps one supervisor resident as a launchd LaunchAgent. Before it writes anything it proves that cmux will admit that supervisor (see the prerequisite below): it runs `cmux ping` the way the supervisor will run, outside cmux's process tree (orphaned, so launchd is its parent) and with the environment the agent will carry and none of the `CMUX_*` variables of the terminal it runs in, and fails with the remedies if cmux refuses. Then it writes `~/Library/LaunchAgents/com.cmux-taskq.<queue hash>.plist` (`locate` shows the path as `launch_agent`) whose `ProgramArguments` run this binary's `supervise --parallel N --log-dir <queue dir>/logs` from the repository root with your shell's PATH, `KeepAlive` and `RunAtLoad` so it restarts after any exit, and stdout/stderr in `<queue dir>/logs/launchd.log`; loads it with `launchctl bootstrap gui/<uid>`; and waits for the supervisor to register itself (`{"supervisor": {"outcome": "started", "mode": "launchd", "pid": ...}}`). A supervisor that is already registered, alive, heartbeating **and running this binary's own version** is reused and neither the plist nor launchd is touched (`"reused"`, with whichever `mode` started it, and its `version`); one of any other version is replaced instead (see below). Then it opens the maintainer session: a cmux workspace named `taskq <repo> maintainer` (`<repo>` is the repository directory's name) whose command starts `claude` with `CMUX_TASKQ_ROLE=maintainer` and `CMUX_TASKQ_QUEUE=<db>` in its environment, `--plugin-dir` if given, and a generated prompt that names the queue, the roles and the log directory and asks the session to report `status` and `doctor` through the plugin's `taskq-maintain` skill and wait for you. The workspace is `"reused"` when one with that title is open and `"skipped"` when `up` runs inside the maintainer session itself (the plugin skill calls it), so running `up` twice changes nothing the second time. The result ends with a `doctor` summary: unfinished runs (with `lease_stale`), runs `awaiting_integration`, and runs in `needs_session`.
+`up` checks cmux (`ping`), Claude (`--version`) and the queue (`init` first), deletes supervisor registrations whose process is dead (`pruned_supervisors`), and then keeps one supervisor resident as a launchd LaunchAgent. Before it writes anything it proves that cmux will admit that supervisor (see the prerequisite below): it runs `cmux ping` the way the supervisor will run, outside cmux's process tree (orphaned, so launchd is its parent) and with the environment the agent will carry and none of the `CMUX_*` variables of the terminal it runs in, and fails with the remedies if cmux refuses. Then it writes `~/Library/LaunchAgents/com.dagq.<queue hash>.plist` (`locate` shows the path as `launch_agent`) whose `ProgramArguments` run this binary's `supervise --parallel N --log-dir <queue dir>/logs` from the repository root with your shell's PATH, `KeepAlive` and `RunAtLoad` so it restarts after any exit, and stdout/stderr in `<queue dir>/logs/launchd.log`; loads it with `launchctl bootstrap gui/<uid>`; and waits for the supervisor to register itself (`{"supervisor": {"outcome": "started", "mode": "launchd", "pid": ...}}`). A supervisor that is already registered, alive, heartbeating **and running this binary's own version** is reused and neither the plist nor launchd is touched (`"reused"`, with whichever `mode` started it, and its `version`); one of any other version is replaced instead (see below). Then it opens the maintainer session: a cmux workspace named `dagq <repo> maintainer` (`<repo>` is the repository directory's name) whose command starts `claude` with `DAGQ_ROLE=maintainer` and `DAGQ_QUEUE=<db>` in its environment, `--plugin-dir` if given, and a generated prompt that names the queue, the roles and the log directory and asks the session to report `status` and `doctor` through the plugin's `dagq-maintain` skill and wait for you. The workspace is `"reused"` when one with that title is open and `"skipped"` when `up` runs inside the maintainer session itself (the plugin skill calls it), so running `up` twice changes nothing the second time. The result ends with a `doctor` summary: unfinished runs (with `lease_stale`), runs `awaiting_integration`, and runs in `needs_session`.
 
 **Prerequisite: cmux must accept a connection from outside its terminals.** cmux decides by process ancestry, not by environment: a client that descends from one of its terminals is admitted whatever its variables, and one under launchd is refused (`only processes started inside cmux can connect`, cmux 0.64.25 in its default `cmuxOnly` mode) unless a socket password admits it (`cmux --help`, Socket Auth: `--password`, then `CMUX_SOCKET_PASSWORD`, then the password saved in cmux's Settings, which its CLI uses on its own). Save a socket password in cmux's Settings once (`automation.socketControlMode: "password"` and `automation.socketPassword` in `~/.config/cmux/cmux.json`, then `cmux reload-config`), or export `CMUX_SOCKET_PASSWORD` in the shell that runs `up`; in that case, and only then, `up` stores it in the plist's `EnvironmentVariables` next to PATH (the plist is written mode 0600), so prefer the Settings-saved password. Without either, `up` stops before the plist exists: `cmux refused a connection from outside its own terminals ... save a socket password in cmux Settings ... or export CMUX_SOCKET_PASSWORD ...`, followed by cmux's own error. (A ping that cannot be run or does not answer within 60 seconds is reported as `cmux could not be asked ...` instead; that is not a password problem.) A supervisor that is already registered and alive (one you started by hand in a cmux terminal, below) is reused without this check. Where no socket password is configured, `up --in-cmux` is the fallback.
 
 **Fallback: `up --in-cmux`.** `--in-cmux` skips launchd entirely and runs the supervisor inside a cmux workspace of its own, so it is a child of a cmux terminal like any other client and needs no socket password. Nothing about launchd is touched: no plist is written, `launchctl` is not called, and the out-of-cmux ping is not run.
 
 ```sh
-cmux-taskq up --in-cmux --parallel 4 --plugin-dir /path/to/cmux-taskq/plugins/claude-taskq
+dagq up --in-cmux --parallel 4 --plugin-dir /path/to/dagq/plugins/claude-dagq
 ```
 
-`up` opens a workspace named `taskq <repo> supervisor` whose command is this binary's `supervise --parallel N --log-dir <queue dir>/logs`, waits for the supervisor to register itself, and reports `{"supervisor": {"outcome": "started", "mode": "in_cmux", "workspace_id": "...", "name": "taskq <repo> supervisor", "plist": null}}`. Everything else is the same as the launchd mode: dead registrations are pruned first, the maintainer workspace follows, and a live supervisor is reused.
+`up` opens a workspace named `dagq <repo> supervisor` whose command is this binary's `supervise --parallel N --log-dir <queue dir>/logs`, waits for the supervisor to register itself, and reports `{"supervisor": {"outcome": "started", "mode": "in_cmux", "workspace_id": "...", "name": "dagq <repo> supervisor", "plist": null}}`. Everything else is the same as the launchd mode: dead registrations are pruned first, the maintainer workspace follows, and a live supervisor is reused.
 
-**There is no automatic restart in this mode.** launchd's `KeepAlive` is what brings a launchd-mode supervisor back after a crash, a `down`-less exit or a reboot; an in-cmux supervisor has nothing watching it. If it stops — including when you quit cmux, which takes its workspace with it — no work is claimed until you run `up --in-cmux` again. cmux keeps a workspace open after its command exits, so a crashed supervisor leaves `taskq <repo> supervisor` behind with its output on screen; `up --in-cmux` will not open a second one and instead tells you to read that workspace and close it (`cmux workspace close <id>`). The same holds for a supervisor that is alive but no longer heartbeating, which `up` neither reuses nor kills.
+**There is no automatic restart in this mode.** launchd's `KeepAlive` is what brings a launchd-mode supervisor back after a crash, a `down`-less exit or a reboot; an in-cmux supervisor has nothing watching it. If it stops — including when you quit cmux, which takes its workspace with it — no work is claimed until you run `up --in-cmux` again. cmux keeps a workspace open after its command exits, so a crashed supervisor leaves `dagq <repo> supervisor` behind with its output on screen; `up --in-cmux` will not open a second one and instead tells you to read that workspace and close it (`cmux workspace close <id>`). The same holds for a supervisor that is alive but no longer heartbeating, which `up` neither reuses nor kills.
 
-`status` and `doctor` show which mode is running: each entry under `supervisors` carries `mode` (`launchd`, `in_cmux`, or `null` for one you started by hand) and, for `in_cmux`, the `workspace_id` it runs in. `up` records this on the registration when the supervisor it started comes up, so it lives and dies with that registration. Each entry also carries `binary_version`, the `cmux-taskq` version of the process itself, which the supervisor writes when it registers (`null` for a lease holder without a registration, or for a supervisor that registered before the column existed).
+`status` and `doctor` show which mode is running: each entry under `supervisors` carries `mode` (`launchd`, `in_cmux`, or `null` for one you started by hand) and, for `in_cmux`, the `workspace_id` it runs in. `up` records this on the registration when the supervisor it started comes up, so it lives and dies with that registration. Each entry also carries `binary_version`, the `dagq` version of the process itself, which the supervisor writes when it registers (`null` for a lease holder without a registration, or for a supervisor that registered before the column existed).
 
-**Updating the binary: replace the file, then run `up`.** `up` reuses a live supervisor only while its `binary_version` matches its own. When it does not — you replaced `~/.local/bin/cmux-taskq`, or the supervisor predates the column — `up` drains that supervisor and starts one of its own version in its place, so the new binary is what serves the queue from then on ([ADR-0014](docs/adr/0014-up-replaces-a-supervisor-of-another-binary-version.md)). The stop is exactly `down --wait`'s: the LaunchAgent is unloaded (its bootout carries the SIGTERM, and unloading also stops `KeepAlive` from restarting the old binary at once), an in-cmux supervisor gets SIGINT, a supervisor launchd did not signal gets SIGTERM, and `up` then waits — with no timeout — until every one of those registrations is gone, which is after they have stopped claiming and finished the runs they hold. The workspace of an in-cmux supervisor is closed once its drain is over, before a new one could need the same name. When the replacement will run under launchd, the out-of-cmux connection is proved *before* the drain and not asked again, so a cmux that refuses it stops `up` with the working supervisor still serving the queue. The result is `{"supervisor": {"outcome": "restarted", "version": "...", "previous_version": "..." | null, "replaced": [{"token", "pid", "mode", "workspace_id", "version"}], "supervisor_workspaces": [...], ...}}`. Which mode the replacement starts in is the mode you asked this `up` for, not the one being replaced.
+**Updating the binary: replace the file, then run `up`.** `up` reuses a live supervisor only while its `binary_version` matches its own. When it does not — you replaced `~/.local/bin/dagq`, or the supervisor predates the column — `up` drains that supervisor and starts one of its own version in its place, so the new binary is what serves the queue from then on ([ADR-0014](docs/adr/0014-up-replaces-a-supervisor-of-another-binary-version.md)). The stop is exactly `down --wait`'s: the LaunchAgent is unloaded (its bootout carries the SIGTERM, and unloading also stops `KeepAlive` from restarting the old binary at once), an in-cmux supervisor gets SIGINT, a supervisor launchd did not signal gets SIGTERM, and `up` then waits — with no timeout — until every one of those registrations is gone, which is after they have stopped claiming and finished the runs they hold. The workspace of an in-cmux supervisor is closed once its drain is over, before a new one could need the same name. When the replacement will run under launchd, the out-of-cmux connection is proved *before* the drain and not asked again, so a cmux that refuses it stops `up` with the working supervisor still serving the queue. The result is `{"supervisor": {"outcome": "restarted", "version": "...", "previous_version": "..." | null, "replaced": [{"token", "pid", "mode", "workspace_id", "version"}], "supervisor_workspaces": [...], ...}}`. Which mode the replacement starts in is the mode you asked this `up` for, not the one being replaced.
 
 ```sh
-cmux-taskq up --no-wait   # refuse rather than sit through a drain
+dagq up --no-wait   # refuse rather than sit through a drain
 ```
 
 `--no-wait` is for when you cannot wait: if any run is in flight (`claimed`, `starting`, `running`, `validating` or `integrating`) it stops with an error naming how many and which, and nothing is signalled, unloaded or opened — the old supervisor keeps serving the queue exactly as before. With no run in flight the replacement goes ahead, and the drain itself is bounded too (30 seconds): a supervisor can fail to stop even with nothing to finish — a loop wedged on a hung `cmux` or `git` call keeps its registration while its heartbeat thread runs on — so `up --no-wait` gives up with what is still registered rather than waiting forever. It has already asked that supervisor to stop and unloaded its agent by then, so run `up` again once `status` shows it gone. The flag does nothing when the versions already match.
@@ -179,9 +179,9 @@ cmux-taskq up --no-wait   # refuse rather than sit through a drain
 Two limits are worth knowing. `up` only replaces supervisors it considers live — alive **and** heartbeating within 30 seconds. A supervisor that is alive but silent is one `up` neither reuses nor kills (that predates this and is deliberate), so an old-binary one in that state is not replaced either: `up` starts a new supervisor beside it and `status` shows the old row as `stale`, for you to stop with `down --force`. And `binary_version` is `CARGO_PKG_VERSION`, so a rebuild that does not bump the version reports the same string and is reused: bump the version, or use `down --wait`, when you swap in a build from between releases.
 
 ```sh
-cmux-taskq down          # unload the agent; the supervisor drains and exits
-cmux-taskq down --wait   # ... and wait until it has deregistered
-cmux-taskq down --force  # ... then SIGKILL it and drop its registration
+dagq down          # unload the agent; the supervisor drains and exits
+dagq down --wait   # ... and wait until it has deregistered
+dagq down --force  # ... then SIGKILL it and drop its registration
 ```
 
 `down` unloads the LaunchAgent (`launchctl bootout`) and removes the plist, so the supervisor receives SIGTERM, stops claiming, waits for its active runs, deregisters and exits without being restarted or coming back at the next login; a signal alone would only make launchd restart it. It unloads the agent whatever mode is running, which also clears one left behind by a queue that has since moved to `--in-cmux`. A supervisor started by hand (one that is not the agent's process) gets the SIGTERM from `down` itself. An in-cmux supervisor has no service manager to signal it, so `down` sends it SIGINT — the signal Ctrl-C in its terminal would send, which the runtime drains on exactly like SIGTERM — and closes its workspace whenever it has seen the stop through: after the drain with `--wait`, after the kill with `--force`, and when nothing was running to begin with. It does not consult the PID there, because a PID outlives the stop: `kill(2)` returns before the target is reaped, so a `kill -0` right after SIGKILL still succeeds, and a supervisor that has drained removes its registration before it exits. The workspace is never closed while the supervisor may still be draining, because that would cut the drain short: the default `down` returns immediately and reports its workspace as `left_open` with `down --wait` as the remedy. The `supervisor_workspaces` field lists what happened to each one (`closed`, `left_open`, or `close_failed` with cmux's message). `--force` also drops the registrations of supervisors that were already dead, so no row is left pointing at a workspace the same call just closed. Without a live registration `down` reports `not_running` (still unloading a lingering agent, and with `--force` also dropping dead registrations). It never closes the maintainer workspace. Each supervisor start writes its own `supervisor-<started_at>-<pid>.log` under `<queue dir>/logs` with its token, PID, `--parallel`, queue and repository, the progress messages that also go to stderr, and its final result.
@@ -191,14 +191,14 @@ cmux-taskq down --force  # ... then SIGKILL it and drop its registration
 `up` is the normal way to start the supervisor. You can also run it yourself in a dedicated terminal inside the repository, with cmux and an authenticated Claude Code on PATH (or `--cmux` / `--claude`); it stays resident and runs dependency-ready tasks as they appear, up to `--parallel` at once.
 
 ```sh
-cmux-taskq supervise --parallel 4
+dagq supervise --parallel 4
 ```
 
 The supervisor registers itself in the queue when it starts (its PID, `--parallel`, and start time), refreshes that registration with its leases every 2 seconds, and removes it whenever it exits: after Ctrl-C drained its runs, after `--once` ran out of work, after a provisioning failure drained them, or on an error such as an unreadable `main`. Only a heartbeat failure keeps the row, since the database may be unreachable. `status` and `doctor` list it under `supervisors` from its first second, holding runs or not, so you can tell whether a resident loop exists before starting another. A supervisor that was killed or hangs leaves its row behind: it is shown with `alive: false` or a growing `heartbeat_age_secs` and `stale: true`; the next `up` removes the rows whose process is dead and reports them as `pruned_supervisors`, and nothing else removes them.
 
 Its runs are not lost. Before claiming, whenever it has a free slot, a supervisor looks for `running` or `validating` runs whose lease belongs to another supervisor and is stale (its PID is dead, or its heartbeat is older than 30 seconds) while the run's session wrapper is still alive and heartbeating, or has already recorded its exit. It adopts such a run in one transaction: the lease and the run's `supervisor_token` move to the adopter and a `run_adopted` event records the previous token and PID, how old the heartbeat was, and the wrapper's state. The adopter then watches the run like one it claimed, without repeating an `/exit` that was already requested, and restarts validation for a `validating` run. So after `up` replaces a killed supervisor (a binary update, a `down --force`), the runs in flight simply continue under the new one. Nothing else is adopted: a `claimed` or `starting` run, a run whose wrapper is dead or silent, a run without a lease (given up by its supervisor) and an `integrating` run are left for `recover`. Two supervisors that find the same stale lease adopt it exactly once, and a supervisor whose lease was taken from it stops watching that run without writing anything more about it.
 
-Every few seconds the supervisor looks for candidates and claims them until `--parallel` runs (default 4) are active. Each claim reads `refs/heads/main` again and uses it as the run's base commit, whichever worktree you start from, so a task released by `integrate` starts from the `main` that contains its predecessor's landing; pass `--repo PATH` to use a checkout other than the working directory. Each run gets its own lease (`lease_acquired` / `lease_released` events), a cmux workspace named `taskq <repo> <task-id> <run-id>`, and a worktree, and goes through the same state machine independently of the others. Runtime files live next to the database in `runs/<run-id>/` (see `locate`'s `runs_dir`): the prompt, a snapshot of the runtime binary, the worktree on branch `taskq/<run-id>`, Claude's per-run settings and debug log, the idle marker, the receipt, and the final terminal screen. The prompt also names the task's direct predecessors (each with the commit `integrate` landed and its receipt summary) and the other tasks in progress at claim time, so a dependent run knows what it builds on and what runs beside it. The workspace command starts a hidden `session` wrapper that launches Claude with the run ID as its session ID and reports heartbeats and the exit code.
+Every few seconds the supervisor looks for candidates and claims them until `--parallel` runs (default 4) are active. Each claim reads `refs/heads/main` again and uses it as the run's base commit, whichever worktree you start from, so a task released by `integrate` starts from the `main` that contains its predecessor's landing; pass `--repo PATH` to use a checkout other than the working directory. Each run gets its own lease (`lease_acquired` / `lease_released` events), a cmux workspace named `dagq <repo> <task-id> <run-id>`, and a worktree, and goes through the same state machine independently of the others. Runtime files live next to the database in `runs/<run-id>/` (see `locate`'s `runs_dir`): the prompt, a snapshot of the runtime binary, the worktree on branch `dagq/<run-id>`, Claude's per-run settings and debug log, the idle marker, the receipt, and the final terminal screen. The prompt also names the task's direct predecessors (each with the commit `integrate` landed and its receipt summary) and the other tasks in progress at claim time, so a dependent run knows what it builds on and what runs beside it. The workspace command starts a hidden `session` wrapper that launches Claude with the run ID as its session ID and reports heartbeats and the exit code.
 
 The loop ends in three ways. Ctrl-C (or SIGTERM) once stops claiming and waits for the active runs to finish; a second Ctrl-C terminates the process immediately and its leases go stale after 30 seconds. `--once` exits as soon as no run is active and no task is claimable, which suits a single batch or a test. A provisioning failure (worktree or workspace creation) is treated as an environment problem: the supervisor gives that run up, stops claiming, waits for its other runs, and exits with an error. The final JSON lists the runs that came to rest under `runs` and the runs it gave up under `errors`.
 
@@ -213,13 +213,13 @@ A run's `last_error` (in `show`, `doctor`, and the supervisor's final `errors`) 
 A run is orphaned when its supervisor gave it up, or was killed or lost its heartbeat while no supervisor with a free slot could adopt it (its session wrapper was dead or silent too, or it had not reached `running`). The task stays `in_progress` and the run keeps its resources; other runs, and a supervisor still running them, are unaffected. Inspect first:
 
 ```sh
-cmux-taskq doctor
+dagq doctor
 ```
 
 `doctor` lists the supervisors under `supervisors`: every registered `supervise` process (`registered: true`, with `pid`, `alive` from `kill -0`, `parallel`, `started_at`, `heartbeat_at`, `heartbeat_age_secs`, the `run_ids` it holds, and `stale` when the PID is dead or the heartbeat is older than 30 seconds) and any other process that holds a lease without a registration, such as a running `integrate` (`registered: false`). A stale registration is reported, never deleted; `recover` and `integrate` do not touch it. Then every run in `claimed`, `starting`, `running`, `validating`, or `integrating` with its workspace ID, whether its worktree and run directory exist, its own lease (or `null`), and each registered wrapper/agent process with its PID, liveness (`kill -0`), and heartbeat age. `blockers` names what would stop a recovery of that run, considering only its own lease and processes; `recoverable` is true when the list is empty. Stop the listed processes yourself, for example by exiting the session in its workspace.
 
 ```sh
-cmux-taskq recover <run id>
+dagq recover <run id>
 ```
 
 `recover` refuses while any process registered for that run is still alive, its lease heartbeat is fresh, or its lease's supervisor PID is alive. Otherwise it marks the run `interrupted`, records a `run_recovered` event with the state it checked, and deletes that run's lease only. The worktree, branch, and workspace are kept for inspection, and the task stays `in_progress`. To retry, make the task ready again with `ready ID` (or `draft ID` to edit it first); a running supervisor (or the next one) creates a new run with its own worktree. The same applies to a task whose last run `failed`.
@@ -240,14 +240,14 @@ The receipt is JSON at `<run-dir>/receipt.json`, written by atomic rename:
 
 ## Land a run on main
 
-Review the run branch `taskq/<run-id>` (`git log main..taskq/<run-id>`, `git diff main...taskq/<run-id>`, the `receipt.json` and `verify-N.log` files in the run directory). Do not merge it yourself; landing is the runtime's job, one run at a time:
+Review the run branch `dagq/<run-id>` (`git log main..dagq/<run-id>`, `git diff main...dagq/<run-id>`, the `receipt.json` and `verify-N.log` files in the run directory). Do not merge it yourself; landing is the runtime's job, one run at a time:
 
 ```sh
-cmux-taskq integrate 1        # the task's run
-cmux-taskq integrate --next   # the oldest run awaiting integration
+dagq integrate 1        # the task's run
+dagq integrate --next   # the oldest run awaiting integration
 ```
 
-`integrate` marks the run `integrating` (holding the queue's single integration slot with a lease of its own), rebases the run's worktree onto the current `refs/heads/main`, and re-validates it: the receipt must name the worktree's head and report `succeeded`, the rebased head must sit on `main` with a clean tree, and the task's verification commands are rerun (`<run-dir>/integrate-verify-N.log`). It then squashes the rebased tree into **one** commit on top of `main` whose message is the task title, the receipt's summary, and the trailers `Taskq-Task: <id>` and `Taskq-Run: <run-id>`. Where `main` is checked out the commit is fast-forwarded through that checkout so its files move too; otherwise the ref is updated directly. No merge commit and no fast-forward of the run branch: `main` stays a straight line with one commit per task, and the landed tree equals the validated worktree's tree. The run becomes `integrated` with the landed commit as its `result_commit`, the task becomes `completed` (`run_integrated` and `task_status_changed` events), the run's own history is kept under `refs/taskq/runs/<run-id>`, and the worktree and branch are removed. Dependent tasks then appear in `candidates`; a running supervisor claims them on its next poll with the landed `main` as their base. `--next` lands runs in the order their validation finished and prints `{"outcome": "no_run_awaiting"}` when none is left.
+`integrate` marks the run `integrating` (holding the queue's single integration slot with a lease of its own), rebases the run's worktree onto the current `refs/heads/main`, and re-validates it: the receipt must name the worktree's head and report `succeeded`, the rebased head must sit on `main` with a clean tree, and the task's verification commands are rerun (`<run-dir>/integrate-verify-N.log`). It then squashes the rebased tree into **one** commit on top of `main` whose message is the task title, the receipt's summary, and the trailers `Dagq-Task: <id>` and `Dagq-Run: <run-id>`. Where `main` is checked out the commit is fast-forwarded through that checkout so its files move too; otherwise the ref is updated directly. No merge commit and no fast-forward of the run branch: `main` stays a straight line with one commit per task, and the landed tree equals the validated worktree's tree. The run becomes `integrated` with the landed commit as its `result_commit`, the task becomes `completed` (`run_integrated` and `task_status_changed` events), the run's own history is kept under `refs/dagq/runs/<run-id>`, and the worktree and branch are removed. Dependent tasks then appear in `candidates`; a running supervisor claims them on its next poll with the landed `main` as their base. `--next` lands runs in the order their validation finished and prints `{"outcome": "no_run_awaiting"}` when none is left.
 
 If the rebase conflicts, `integrate` aborts it, leaves the worktree on its validated head, and parks the run as `needs_session` with the conflicting files in `last_error` (`{"outcome": "needs_session", "main": ..., "reason": ...}`). If the rebase applies but a verification command fails on the result, the run is parked the same way with the rebased tree left in place. Nothing reaches `main`. Reopen a Claude session in that worktree (`claude --resume <run-id>` in a cmux workspace whose `--cwd` is the worktree) and have it rebase onto `main` (`git rebase <main commit>` from the reason), resolve, rerun the verification commands, and rewrite `receipt.json` with the new head commit; if the change is no longer needed, have it write `"result": "failed"` with the reason in `summary`. Exit that session with `/exit` before running `integrate ID`: landing removes the worktree, so a session still working in it must not be running. Then run `integrate ID` again: it repeats the same steps from the rebase (a no-op unless `main` moved again) and lands the run, keeps it `needs_session` with a new reason if the receipt does not name the current head, or marks it `failed` (`{"outcome": "failed", ...}`) on a failed receipt so the task can be retried with `ready ID` or dropped with `cancel ID`. `--next` never picks a `needs_session` run; it is resumed explicitly. A parked or awaiting run keeps its task `in_progress`. The runtime never closes the cmux workspace of a failed or interrupted run: close it with `cmux workspace close <workspace_id>` (the ID is the run's `workspace_id` in `show ID`; `doctor` does not list finished runs) once you no longer need it.
 
@@ -257,37 +257,37 @@ The landing happens in the working directory's repository; pass `--repo PATH` to
 
 ## Use from Claude Code
 
-`plugins/claude-taskq` is a Claude Code plugin whose skills drive the binary; it has no hooks and never opens the queue database itself. This repository is also its marketplace (`.claude-plugin/marketplace.json`), so installing it takes two commands:
+`plugins/claude-dagq` is a Claude Code plugin whose skills drive the binary; it has no hooks and never opens the queue database itself. This repository is also its marketplace (`.claude-plugin/marketplace.json`), so installing it takes two commands:
 
 ```sh
-claude plugin marketplace add hisamekms/cmux-taskq
-claude plugin install claude-taskq@cmux-taskq
+claude plugin marketplace add hisamekms/dagq
+claude plugin install claude-dagq@dagq
 ```
 
-The plugin does not carry the binary: install that separately from a [release](https://github.com/hisamekms/cmux-taskq/releases) into `~/.local/bin` ([Getting started](#getting-started)), or build it here. To work on the plugin itself, load it from the checkout for a session instead of installing it:
+The plugin does not carry the binary: install that separately from a [release](https://github.com/hisamekms/dagq/releases) into `~/.local/bin` ([Getting started](#getting-started)), or build it here. To work on the plugin itself, load it from the checkout for a session instead of installing it:
 
 ```sh
 cargo build --locked
-export CMUX_TASKQ_BIN="$PWD/target/debug/cmux-taskq"   # or put it on PATH
-claude --plugin-dir "$PWD/plugins/claude-taskq"
+export DAGQ_BIN="$PWD/target/debug/dagq"   # or put it on PATH
+claude --plugin-dir "$PWD/plugins/claude-dagq"
 ```
 
-The queue is the one of the repository you run Claude Code in, resolved by the binary as described above and shared by all of its worktrees; set `CMUX_TASKQ_DB=/path/to/queue.db` to use another file, which the launcher passes as `--db`. The plugin's launcher `bin/taskq` resolves the binary and forwards any command from the current directory (`bin/taskq --resolve` shows the binary, its `binary_version`, the plugin's `plugin_version`, and `locate`'s output; when the two versions differ in major.minor it also writes a `{"warning": ...}` to stderr and still exits 0).
+The queue is the one of the repository you run Claude Code in, resolved by the binary as described above and shared by all of its worktrees; set `DAGQ_DB=/path/to/queue.db` to use another file, which the launcher passes as `--db`. The plugin's launcher `bin/dagq` resolves the binary and forwards any command from the current directory (`bin/dagq --resolve` shows the binary, its `binary_version`, the plugin's `plugin_version`, and `locate`'s output; when the two versions differ in major.minor it also writes a `{"warning": ...}` to stderr and still exits 0).
 
 | Skill | Covers |
 | --- | --- |
-| `/claude-taskq:taskq` | Locate the binary and queue, `init`, register a goal with `goal add` and decompose it into tasks with `add --goal` (description, acceptance, `--verify`, `--depends-on`, `--context`), `ready`, `list` / `show` / `candidates` / `locate` / `status` / `doctor`, how to read run states, close a goal |
-| `/claude-taskq:taskq-maintain` | The maintainer's side: start the runtime with `up`, read `status` for a stale supervisor, watch runs with `show`, judge completion from the run state and receipt rather than a Stop hook, answer a run's prompts, review and land with `integrate`, resume a `needs_session` run, close the workspace of a failed run, report a receipt's `follow_ups`, stop the runtime with `down`, and find the supervisor's logs |
-| `/claude-taskq:taskq-recover` | `doctor`, `recover RUN_ID` for one run without disturbing the others, retry with `ready` |
+| `/claude-dagq:dagq` | Locate the binary and queue, `init`, register a goal with `goal add` and decompose it into tasks with `add --goal` (description, acceptance, `--verify`, `--depends-on`, `--context`), `ready`, `list` / `show` / `candidates` / `locate` / `status` / `doctor`, how to read run states, close a goal |
+| `/claude-dagq:dagq-maintain` | The maintainer's side: start the runtime with `up`, read `status` for a stale supervisor, watch runs with `show`, judge completion from the run state and receipt rather than a Stop hook, answer a run's prompts, review and land with `integrate`, resume a `needs_session` run, close the workspace of a failed run, report a receipt's `follow_ups`, stop the runtime with `down`, and find the supervisor's logs |
+| `/claude-dagq:dagq-recover` | `doctor`, `recover RUN_ID` for one run without disturbing the others, retry with `ready` |
 
-Claude picks the skill from the request ("queue a task to …", "start the runtime", "did task 3 finish?", "the supervisor died"). `up` opens the maintainer session with this plugin loaded when it is given `--plugin-dir`. `claude plugin validate plugins/claude-taskq` checks the manifest and skills; `tests/plugin.rs` checks them and the launcher in `cargo test`.
+Claude picks the skill from the request ("queue a task to …", "start the runtime", "did task 3 finish?", "the supervisor died"). `up` opens the maintainer session with this plugin loaded when it is given `--plugin-dir`. `claude plugin validate plugins/claude-dagq` checks the manifest and skills; `tests/plugin.rs` checks them and the launcher in `cargo test`.
 
 ## Development
 
-Building from source is for working on cmux-taskq itself; to use it, install the released binary ([Getting started](#getting-started)). Requires Rust 1.93 or newer and a C compiler for bundled SQLite; no separate SQLite installation is needed.
+Building from source is for working on dagq itself; to use it, install the released binary ([Getting started](#getting-started)). Requires Rust 1.93 or newer and a C compiler for bundled SQLite; no separate SQLite installation is needed.
 
 ```sh
-cargo build --locked   # target/debug/cmux-taskq
+cargo build --locked   # target/debug/dagq
 ```
 
 Every change runs these four:
@@ -314,4 +314,4 @@ The tests use temporary databases and repositories, point `XDG_DATA_HOME` at tem
 
 ## License
 
-cmux-taskq is released under the [MIT License](LICENSE); see that file for the full text.
+dagq is released under the [MIT License](LICENSE); see that file for the full text.

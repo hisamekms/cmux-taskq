@@ -4,8 +4,8 @@ type: design
 title: Agent provider lifecycle
 status: current
 created: 2026-09-21
-updated: 2026-09-22
-last_verified: 2026-09-22
+updated: 2026-09-23
+last_verified: 2026-09-23
 scope: provider
 related:
   - adr-0004
@@ -33,7 +33,7 @@ requested providerとactual providerをTaskRunに保存する。Claudeが起動�
 
 ## Trust prompt
 
-Claude Code の folder trust dialog（`Quick safety check: Is this a project you created or one you trust?` / `Yes, I trust this folder`、既定の選択は `No, exit`）が run worktree で出るかどうかは、**worktree の親 repository（`git rev-parse --git-common-dir` の親）の root が `~/.claude.json` の `projects` に `hasTrustDialogAccepted: true` で記録されているか**で決まる（通常の対話起動の場合。下の判定 1 と 3 の例外は run worktree には当てはまらない）。worktree の置き場所（scratch でも XDG data dir でも）、adapter が渡す `--session-id` / `--debug-file` / `--add-dir` / `--settings`、`--dangerously-skip-permissions` は無関係。journal 010 で全 session が止まったのは使い捨て repository を root で一度も開かずに supervise を始めたから、012〜014 で出なかったのは `~/ghq/github.com/hisamekms/cmux-taskq` が既に信頼済みだったからで、runtime の挙動は同じだった。
+Claude Code の folder trust dialog（`Quick safety check: Is this a project you created or one you trust?` / `Yes, I trust this folder`、既定の選択は `No, exit`）が run worktree で出るかどうかは、**worktree の親 repository（`git rev-parse --git-common-dir` の親）の root が `~/.claude.json` の `projects` に `hasTrustDialogAccepted: true` で記録されているか**で決まる（通常の対話起動の場合。下の判定 1 と 3 の例外は run worktree には当てはまらない）。worktree の置き場所（scratch でも XDG data dir でも）、adapter が渡す `--session-id` / `--debug-file` / `--add-dir` / `--settings`、`--dangerously-skip-permissions` は無関係。journal 010 で全 session が止まったのは使い捨て repository を root で一度も開かずに supervise を始めたから、012〜014 で出なかったのは `~/ghq/github.com/hisamekms/dagq` が既に信頼済みだったからで、runtime の挙動は同じだった。
 
 ### 実験（2026-09-22、Claude Code 2.1.278、macOS）
 
@@ -81,6 +81,6 @@ B3 / D3 で `~/.claude.json` に残った `projects` の key は repository root
 
 ### 推奨する後続
 
-1. maintainer 手順として文書化する（runtime 変更なし、推奨）: ある repository で初めて `supervise` を流す前に、その repository の root で `claude` を一度起動して dialog を承認する（または `~/.claude.json` の `projects[<root>].hasTrustDialogAccepted` が真であることを確認する）。使い捨て repository のスモーク（journal 010 の手順）も root を先に信頼する。task 16 で `plugins/claude-taskq/skills/taskq-maintain/SKILL.md`（旧 `taskq-run`）の「every run's worktree is a directory Claude Code has never seen」という誤った本文をこの条件に書き換えた
+1. maintainer 手順として文書化する（runtime 変更なし、推奨）: ある repository で初めて `supervise` を流す前に、その repository の root で `claude` を一度起動して dialog を承認する（または `~/.claude.json` の `projects[<root>].hasTrustDialogAccepted` が真であることを確認する）。使い捨て repository のスモーク（journal 010 の手順）も root を先に信頼する。task 16 で `plugins/claude-dagq/skills/dagq-maintain/SKILL.md`（当時の名前は `taskq-run`）の「every run's worktree is a directory Claude Code has never seen」という誤った本文をこの条件に書き換えた
 2. adapter の `preflight()` で `~/.claude.json` を読み、repository root が未信頼なら warning（event か stderr）を出す。dialog を抑止する CLI flag は 2.1.278 にはないので adapter flag では解決できず、runtime が `hasTrustDialogAccepted` を書き込むのはユーザーの判断を代行することになるので採らない
-3. 未信頼の repository で `supervise` を始めてしまった場合の扱いは、task 16 で plugin の skill `taskq-maintain`（[ADR-0010](../adr/0010-maintainer-and-resident-supervisor.md) の T3）に入れた: 最初の承認より前に起動した session（最大 `--parallel` 件）はすべて dialog で止まるので、それぞれに `send-key down` + `enter` で応答する。承認後に起動した session には出ない
+3. 未信頼の repository で `supervise` を始めてしまった場合の扱いは、task 16 で plugin の skill `dagq-maintain`（[ADR-0010](../adr/0010-maintainer-and-resident-supervisor.md) の T3）に入れた: 最初の承認より前に起動した session（最大 `--parallel` 件）はすべて dialog で止まるので、それぞれに `send-key down` + `enter` で応答する。承認後に起動した session には出ない

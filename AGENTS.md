@@ -1,21 +1,21 @@
 # AGENTS.md
 
-cmux-taskq は cmux と Git worktree で依存関係付きの開発タスクを実行する Rust runtime。文書の分類は [docs/README.md](docs/README.md)。この repository 自身の開発タスクも cmux-taskq で流す（ドッグフーディング）。
+dagq は cmux と Git worktree で依存関係付きの開発タスクを実行する Rust runtime。文書の分類は [docs/README.md](docs/README.md)。この repository 自身の開発タスクも dagq で流す（ドッグフーディング）。
 
 CLI の使い方（登録・起動・監視・レビューと着地・復旧）は plugin の skill が持つ。この文書はこの repository でだけ必要な注意を書く。
 
 ## セッション開始時に読む
 
-1. `cmux-taskq list` と、担当タスクの `cmux-taskq show ID`。タスクの一覧・状態・依存・run 履歴はキューだけが持つ
+1. `dagq list` と、担当タスクの `dagq show ID`。タスクの一覧・状態・依存・run 履歴はキューだけが持つ
 2. [docs/plans/current.md](docs/plans/current.md) の現在のステップと完了条件
 3. 触る範囲の `docs/design/*.md`
 
 ## 作業中
 
-- タスクは `cmux-taskq add` で登録し、`ready` にしてから supervisor に流す。経過と次の一手はキュー（`show ID` の run 履歴と receipt）が持つ
-- 本番 queue（この repository の queue DB）の登録・参照・操作は、supervisor・maintainer・計画中の session のどれでも必ず固定バイナリ `~/.local/bin/cmux-taskq` で行う。`target/debug` や `target/release` のバイナリは queue を開いただけで schema を黙って migrate し、古い schema のまま走っている固定バイナリの supervisor と実行中の run を `unsupported queue schema version` で壊すので、本番 queue には使わない。session 開始時に `which cmux-taskq` が `~/.local/bin/cmux-taskq` に解決することを確認する
-- 新しいビルドの動作確認と、Git worktree・cmux workspace のスモークは使い捨て repository の queue で行う。この repository の queue DB や実行中の runtime バイナリ（`~/.local/bin/cmux-taskq`）を作業成果で勝手に置き換えない
-- 固定バイナリの更新は `~/.local/bin/cmux-taskq` を入れ替えてから `up` を叩けばよい。runtime が version の違う supervisor を drain して（走行中の run の完了を待って）入れ替える（[ADR-0014](docs/adr/0014-up-replaces-a-supervisor-of-another-binary-version.md)）。入替そのものはユーザーに報告してから行う。ただし version は `CARGO_PKG_VERSION` なので、`Cargo.toml` の version を上げずに build し直したバイナリは同じ version を名乗り、`up` は入れ替えずに reuse する。リリースをまたがない差し替えでは version を上げるか `down --wait` で明示的に止めてから入れ替える
+- タスクは `dagq add` で登録し、`ready` にしてから supervisor に流す。経過と次の一手はキュー（`show ID` の run 履歴と receipt）が持つ
+- 本番 queue（この repository の queue DB）の登録・参照・操作は、supervisor・maintainer・計画中の session のどれでも必ず固定バイナリ `~/.local/bin/dagq` で行う。`target/debug` や `target/release` のバイナリは queue を開いただけで schema を黙って migrate し、古い schema のまま走っている固定バイナリの supervisor と実行中の run を `unsupported queue schema version` で壊すので、本番 queue には使わない。session 開始時に `which dagq` が `~/.local/bin/dagq` に解決することを確認する
+- 新しいビルドの動作確認と、Git worktree・cmux workspace のスモークは使い捨て repository の queue で行う。この repository の queue DB や実行中の runtime バイナリ（`~/.local/bin/dagq`）を作業成果で勝手に置き換えない
+- 固定バイナリの更新は `~/.local/bin/dagq` を入れ替えてから `up` を叩けばよい。runtime が version の違う supervisor を drain して（走行中の run の完了を待って）入れ替える（[ADR-0014](docs/adr/0014-up-replaces-a-supervisor-of-another-binary-version.md)）。入替そのものはユーザーに報告してから行う。ただし version は `CARGO_PKG_VERSION` なので、`Cargo.toml` の version を上げずに build し直したバイナリは同じ version を名乗り、`up` は入れ替えずに reuse する。リリースをまたがない差し替えでは version を上げるか `down --wait` で明示的に止めてから入れ替える
 
 ## 変更後に必ず通す
 
@@ -46,7 +46,7 @@ cargo llvm-cov --locked --fail-under-lines 80
 
 ## コミット
 
-- run session は自分の run branch `taskq/<run-id>` にコミットする。main への着地は `cmux-taskq integrate` だけが行い（1 タスク 1 squash commit）、push は maintainer だけが行う
+- run session は自分の run branch `dagq/<run-id>` にコミットする。main への着地は `dagq integrate` だけが行い（1 タスク 1 squash commit）、push は maintainer だけが行う
 - メッセージは `feat:` / `fix:` / `docs:` / `test:` の接頭辞、本文は何をなぜ変えたか。着地時の commit メッセージはタスクの title と receipt の summary から runtime が作る
 
 ## 役割: supervisor と maintainer と worker
@@ -58,21 +58,21 @@ runtime の `supervise` プロセスが **supervisor**、登録・監視・レ�
 cold start は repository の中で1行。当面は in-cmux mode で運用する（cmux の socket password を設定していないので launchd mode は preflight で止まる。[ADR-0011](docs/adr/0011-cmux-socket-password-and-in-cmux-fallback.md)）。
 
 ```sh
-cmux-taskq up --in-cmux --claude ~/.local/bin/claude --plugin-dir <この repository>/plugins/claude-taskq
+dagq up --in-cmux --claude ~/.local/bin/claude --plugin-dir <この repository>/plugins/claude-dagq
 ```
 
 - `--claude` を明示するのは、cmux の terminal の PATH では session ごとの shim（`$TMPDIR/cmux-cli-shims/<surface id>/claude`）が先に解決され、`up` がそれを supervisor の `--claude` に固定してしまうため。`up` は path を実体（`~/.local/share/claude/versions/<version>`）に解決して固定するので、Claude Code を更新したら `down --wait` → 同じ `up` で解決し直す
-- in-cmux mode に自動再起動はない。supervisor が止まったら `taskq cmux-taskq supervisor` workspace の画面を読んで閉じ、同じ `up` を打ち直す（`down --wait` は drain の後に workspace を閉じるところまで行う）
-- maintainer workspace は `taskq cmux-taskq maintainer`。maintainer session の中から `up` を打つと maintainer は `skipped`、生きている supervisor は `reused` になる
-- 操作は plugin の `taskq` / `taskq-maintain` / `taskq-recover` skill に従う。CLI の外で状態を持たず、DB は手で直さない。`cmux read-screen` は当面の一次情報として認める
-- バイナリは「作業中」のとおり固定した `~/.local/bin/cmux-taskq` だけを使う（`~/.local/bin` が PATH にあるので supervisor の起動でも同じものが動く）。キューは cwd から解決されるので、コマンドは repository の中（どの worktree でもよい）で実行する
+- in-cmux mode に自動再起動はない。supervisor が止まったら `dagq dagq supervisor` workspace の画面を読んで閉じ、同じ `up` を打ち直す（`down --wait` は drain の後に workspace を閉じるところまで行う）
+- maintainer workspace は `dagq dagq maintainer`。maintainer session の中から `up` を打つと maintainer は `skipped`、生きている supervisor は `reused` になる
+- 操作は plugin の `dagq` / `dagq-maintain` / `dagq-recover` skill に従う。CLI の外で状態を持たず、DB は手で直さない。`cmux read-screen` は当面の一次情報として認める
+- バイナリは「作業中」のとおり固定した `~/.local/bin/dagq` だけを使う（`~/.local/bin` が PATH にあるので supervisor の起動でも同じものが動く）。キューは cwd から解決されるので、コマンドは repository の中（どの worktree でもよい）で実行する
 - runtime（`src/`）を変えた run は、`integrate` の前に run の worktree で `cargo test --locked --test e2e -- --ignored` を通す
 - push は maintainer だけが行う。着手と着地はユーザーに報告するが承認は待たない。ユーザーの判断が要るとき（受け入れ条件の変更、固定バイナリの更新、DB に触らずに解消できない詰まり）だけ報告して待つ
 - 権限確認は worktree 内の編集・cargo・git など安全なものは maintainer が応答し、それ以外とユーザーの判断が要るものはユーザーに確認する
 
 ### worker
 
-- runtime の prompt に従う。割り当てられた worktree（branch `taskq/<run-id>`）の中だけで作業し、main、queue DB、`runs/` 配下の runtime ファイル、他の run の worktree は触らない。merge も push も workspace の close もしない
+- runtime の prompt に従う。割り当てられた worktree（branch `dagq/<run-id>`）の中だけで作業し、main、queue DB、`runs/` 配下の runtime ファイル、他の run の worktree は触らない。merge も push も workspace の close もしない
 - 変更後は「変更後に必ず通す」のコマンドとタスクの verify コマンドを worktree で実行する。e2e と subagent review は該当するときに実行し、しないときは理由を receipt に書く
 - コミットしてから receipt を書く。receipt の commit は run branch の clean head で、base commit の上に乗っている
 - 判断が要るときは terminal に質問を書いて待つ。maintainer が `read-screen` で拾い、同じ terminal に返答する

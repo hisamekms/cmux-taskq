@@ -4,7 +4,7 @@ type: plan
 title: Rust runtime MVP
 status: completed
 created: 2026-09-22
-updated: 2026-09-22
+updated: 2026-09-23
 milestone: mvp
 target: 2026-10-31
 owners:
@@ -26,7 +26,7 @@ depends_on:
 
 ## Goal
 
-最初の到達点を、Claude Codeから登録したタスクをcmux workspaceとGit worktreeで実行し、成果をレビューしてmainへ取り込むドッグフーディングとする。まずcmux-taskq自身の小さな改善に使い、その後にCodex対応と配布を進める。
+最初の到達点を、Claude Codeから登録したタスクをcmux workspaceとGit worktreeで実行し、成果をレビューしてmainへ取り込むドッグフーディングとする。まずdagq自身の小さな改善に使い、その後にCodex対応と配布を進める。
 
 2026-09-22時点でステップ1の[実機検証](../journal/001-claude-lifecycle-spike.md)、ステップ2のRust/SQLiteキュー、ステップ3の1件を実行するsupervisor、ステップ4のreceipt検証・workspace終了・`integrate`・`doctor`/`recover`、ステップ5〜7のrepositoryごとのqueue・並列実行・merge queue、ステップ8のClaude Code pluginを実装し、ステップ4の実機の異常系確認を[010](../journal/010-failure-path-smoke.md)で終えた。利用可能なCLIは[README](../../README.md)に記載する。
 
@@ -95,9 +95,9 @@ receiptにはrun ID、結果、commit SHA、実施したunit test/E2E/subagent r
 
 ### 5. queueをrepositoryごとにユーザーDIRへ置く
 
-状態: 実装済み（2026-09-22、[016](../journal/016-queue-per-repository.md)、[ADR-0006](../adr/0006-queue-per-repository.md)）。`--db`なしでcwdのrepositoryから`$XDG_DATA_HOME/cmux-taskq/<hash>/queue.db`に解決し、run dirは`runs/<run-id>/`。`supervise --repo`と`integrate --repo`は任意のoverrideに変わり、pluginは`--db`/`--repo`を渡さない。1 repositoryに1 queue。
+状態: 実装済み（2026-09-22、[016](../journal/016-queue-per-repository.md)、[ADR-0006](../adr/0006-queue-per-repository.md)）。`--db`なしでcwdのrepositoryから`$XDG_DATA_HOME/dagq/<hash>/queue.db`に解決し、run dirは`runs/<run-id>/`。`supervise --repo`と`integrate --repo`は任意のoverrideに変わり、pluginは`--db`/`--repo`を渡さない。1 repositoryに1 queue。
 
-- DBは`~/.local/share/cmux-taskq/<Git common directoryの正規化パスのhash>/queue.db`。run dir・worktree・ログも同じ配下。
+- DBは`~/.local/share/dagq/<Git common directoryの正規化パスのhash>/queue.db`。run dir・worktree・ログも同じ配下。
 - CLIはcwdから`git rev-parse --git-common-dir`で解決する。`--db`は使い捨てrepositoryとテスト用のoverrideとして残す。`supervise --repo`と`integrate --repo`は不要になる。
 - **完了条件:** repository内の任意のworktreeから`--db`なしで同じqueueが使え、別repositoryからは別queueになることをテストで確認できる。
 
@@ -112,16 +112,16 @@ receiptにはrun ID、結果、commit SHA、実施したunit test/E2E/subagent r
 
 ### 7. merge queueでmainに直線の履歴を積む
 
-状態: 実装済み（2026-09-22、[018](../journal/018-merge-queue.md)、[ADR-0008](../adr/0008-merge-queue-squash-landing.md)）。`integrate ID` / `integrate --next`がスロット（`integrating`、schema v6）を取り、worktreeを最新mainへrebase → 再検証（receiptがHEADを指す、mainの子孫、clean、検証コマンド）→ `commit-tree`で1 commitにsquash → mainをfast-forward（checkoutがあればそこで`merge --ff-only`）→ `integrated`/`completed` → worktreeとbranch削除（履歴は`refs/taskq/runs/<run-id>`）。衝突と再検証失敗は`needs_session`で止め、`failed` receiptはrunを`failed`にする。衝突なし・FIFO・衝突後のセッション解消・rebase後の検証失敗・スロットの排他と`recover`をunit testで、1件の着地と2件同時からの`needs_session`解消をe2eで確認した。着地はruntimeの`integrate`が行う。
+状態: 実装済み（2026-09-22、[018](../journal/018-merge-queue.md)、[ADR-0008](../adr/0008-merge-queue-squash-landing.md)）。`integrate ID` / `integrate --next`がスロット（`integrating`、schema v6）を取り、worktreeを最新mainへrebase → 再検証（receiptがHEADを指す、mainの子孫、clean、検証コマンド）→ `commit-tree`で1 commitにsquash → mainをfast-forward（checkoutがあればそこで`merge --ff-only`）→ `integrated`/`completed` → worktreeとbranch削除（履歴は`refs/dagq/runs/<run-id>`）。衝突と再検証失敗は`needs_session`で止め、`failed` receiptはrunを`failed`にする。衝突なし・FIFO・衝突後のセッション解消・rebase後の検証失敗・スロットの排他と`recover`をunit testで、1件の着地と2件同時からの`needs_session`解消をe2eで確認した。着地はruntimeの`integrate`が行う。
 
-- 統合スロットは1つ、検証完了の古い順。`integrating` → 最新mainへrebase → 再検証（親がmain head、clean、検証コマンド）→ treeを1 commitにsquash（trailer `Taskq-Task` / `Taskq-Run`）してmainを進める → `integrated`。
+- 統合スロットは1つ、検証完了の古い順。`integrating` → 最新mainへrebase → 再検証（親がmain head、clean、検証コマンド）→ treeを1 commitにsquash（trailer `Dagq-Task` / `Dagq-Run`）してmainを進める → `integrated`。
 - 衝突は`rebase --abort`して`needs_session`で止め、maintainerがresumeしたセッションが解消・再検証・receiptを書き直す。
-- run branchは`refs/taskq/runs/<run-id>`に残す。初期はmaintainerが`integrate`を呼ぶ承認制。
+- run branchは`refs/dagq/runs/<run-id>`に残す。初期はmaintainerが`integrate`を呼ぶ承認制。
 - **完了条件:** 衝突なしのrunがClaudeなしで着地し、衝突したrunがセッションでの解消後に着地し、mainが直線で1 task = 1 commitになることをテスト（e2e含む）で確認できる。
 
 ### 8. Claude Codeから使う薄いローカルpluginを作る
 
-状態: 完了（2026-09-22、[011](../journal/011-claude-code-plugin.md)、ステップ9で確認）。`plugins/claude-taskq/` にlauncherと3つのskill（登録・確認 / 実行・統合 / 復旧）を置き、`claude --plugin-dir` で読み込んだセッションから登録と確認を実機確認した。実行・統合・復旧をClaude Codeから通す確認はステップ9で行い、その時点で完了にする。ステップ5〜7でCLIの引数（`--db`、`--repo`、`--parallel`、`integrate`の意味）が変わるので、skillの追従は016・017・018の各taskに含める。
+状態: 完了（2026-09-22、[011](../journal/011-claude-code-plugin.md)、ステップ9で確認）。`plugins/claude-dagq/` にlauncherと3つのskill（登録・確認 / 実行・統合 / 復旧）を置き、`claude --plugin-dir` で読み込んだセッションから登録と確認を実機確認した。実行・統合・復旧をClaude Codeから通す確認はステップ9で行い、その時点で完了にする。ステップ5〜7でCLIの引数（`--db`、`--repo`、`--parallel`、`integrate`の意味）が変わるので、skillの追従は016・017・018の各taskに含める。
 
 ローカルビルドしたバイナリとClaude Code pluginを接続する。skillはタスク登録、状態確認、実行開始の手順を提供し、エージェント向けに結果を読める形で返す。
 
@@ -130,14 +130,14 @@ receiptにはrun ID、結果、commit SHA、実施したunit test/E2E/subagent r
 - 完了通知はステップ1で検証した明示的な経路を使い、停止hookだけで成功を決めない。
 - **完了条件:** Claude Code内の依頼から登録・実行・結果確認まで操作できる。pluginがDBを直接変更しない。
 
-### 9. cmux-taskq自身でドッグフーディングする
+### 9. dagq自身でドッグフーディングする
 
 状態: 完了（2026-09-22）。固定バイナリ `18800cd` と常駐 `supervise --parallel 4` で、[012](../journal/012-dogfood-independent-task.md)（独立task）、[019](../journal/019-replace-interim-workflow.md)（AGENTS.mdの運用置き換え）、[013](../journal/013-dogfood-dependent-tasks.md)（A・C並列、BはAの着地commitから）、[014](../journal/014-dogfood-failure-recovery.md)（agent killからの再試行）を6 task・7 runで通し、6件を `integrate` で着地させた。DBの手修正なし。Claude Codeからの登録・実行・着地・復旧はmaintainer sessionがpluginと同じCLIで行い、ステップ8も完了とする。
 
 ローカルに固定したビルド済みバイナリを使い、実行中のruntimeを作業成果で置き換えない。maintainerは常駐のClaude Code sessionで、`read-screen`で完了を確認し、差分をレビューして`integrate`を呼び、`needs_session`のrunにはresumeで指示する。
 
 1. [012](../journal/012-dogfood-independent-task.md): 独立taskを1件完走し、差分と証跡をレビューして着地させる。ここでopenなジャーナルをqueueへ移行する。
-2. [019](../journal/019-replace-interim-workflow.md): AGENTS.mdのmaintainer/worker運用をcmux-taskq前提に置き換える。以降のtaskは新しい手順で流す。
+2. [019](../journal/019-replace-interim-workflow.md): AGENTS.mdのmaintainer/worker運用をdagq前提に置き換える。以降のtaskは新しい手順で流す。
 3. [013](../journal/013-dogfood-dependent-tasks.md): A → Bの依存taskと独立したCを登録し、AとCが並列に走り、Aの着地後にBがAの変更を含むmainから始まることを確認する。
 4. [014](../journal/014-dogfood-failure-recovery.md): 失敗または中断を1件起こし、リソース保持、状態確認、明示復旧、再試行を確認する。
 
@@ -145,18 +145,18 @@ receiptにはrun ID、結果、commit SHA、実施したunit test/E2E/subagent r
 
 ## Ordering
 
-`1 → 2 → 3 → 4 → 5 → 6 → 7 → 8 → 9`。全ステップ完了（2026-09-22）。M1達成。以降の開発taskはAGENTS.mdの手順でcmux-taskqに登録して流す。次はAfter first dogfoodingの項目をtaskに割る。
+`1 → 2 → 3 → 4 → 5 → 6 → 7 → 8 → 9`。全ステップ完了（2026-09-22）。M1達成。以降の開発taskはAGENTS.mdの手順でdagqに登録して流す。次はAfter first dogfoodingの項目をtaskに割る。
 
 ## After first dogfooding
 
 - 利用で見つかった詰まりを修正し、継続的な実行と復旧を安定させる。task 15の実行中にsupervisorを止めたらworkerの成果が捨てられた件は、supervisorが死んだ後もwrapperが生きている`running` / `validating`のrunを次のsupervisorが引き継ぐ（adopt）ことで直した（task 24、[ADR-0012](../adr/0012-adopt-stale-lease-of-live-wrapper.md)、2026-09-22）。`recover`はwrapperが死んだrunと`claimed` / `starting` / `integrating`のための経路として残る。
 - 複数のtaskが解く上位の課題を`Goal`として表現し、依存元のreceipt summary・result commit、同時実行中の兄弟、goalの記述と制約をworkerのpromptに流す（[ADR-0009](../adr/0009-goal-groups-tasks.md)、proposed）。段階1（依存元の情報をpromptへ）、goalエンティティ、prompt拡張、plugin skillの4 taskとして014の後に登録し、この4件を最初のgoalの実例にする。
 - 役割名をsupervisor / maintainer / workerに統一し、[ADR-0010](../adr/0010-maintainer-and-resident-supervisor.md)を追加する（journal 021のT1。docs/design・docs/plans・docs/READMEの旧称とmaintainerを指すoperatorをmaintainerにし、[overview](../design/overview.md)に用語集を足す）。
-- `cmux-taskq up` / `down`とlaunchd常駐（journal 021のT2）。supervisorをLaunchAgent（`KeepAlive`）として常駐させ、`up`がmaintainer workspace（`taskq <repo> maintainer`、`CMUX_TASKQ_ROLE` / `CMUX_TASKQ_QUEUE`付き）を初期prompt付きの`claude`で作り、PIDの死んだ`supervisors`登録を消してから起動する。`down`はbootoutしてdrain（`--wait` / `--force`）。worker workspace名を`taskq <repo> <task-id> <run-id>`にし、supervisor logを`<queue dir>/logs/supervisor-<started_at>.log`に書いて`locate`にlog dirを足す。launchd起動のsupervisorがcmuxに接続するにはcmuxのsocket passwordが要り、`up`のpreflightでの確認（task 21）とlaunchdなしの`up --in-cmux`（task 22）を[ADR-0011](../adr/0011-cmux-socket-password-and-in-cmux-fallback.md)で決めた。task 21とtask 22は着地済みで、modeは`supervisors.mode`（schema v9）に記録して`status` / `doctor` / `down`が読む。task 30（[ADR-0014](../adr/0014-up-replaces-a-supervisor-of-another-binary-version.md)）で`supervisors.binary_version`（schema v10）を足し、`up`がversionの違うliveなsupervisorをdrainして入れ替えるようにした（`--no-wait`は走行中のrunがあれば入れ替えない）。固定バイナリの更新は「ファイルを置き換えて`up`」になった。
-- plugin skillのmaintainer化（journal 021のT3）。CLIの使い方をskill `taskq-maintain`へ集め、maintainerの初期promptをruntimeが生成し、AGENTS.mdをrepository固有の注意だけにする。
+- `dagq up` / `down`とlaunchd常駐（journal 021のT2）。supervisorをLaunchAgent（`KeepAlive`）として常駐させ、`up`がmaintainer workspace（`dagq <repo> maintainer`、`DAGQ_ROLE` / `DAGQ_QUEUE`付き）を初期prompt付きの`claude`で作り、PIDの死んだ`supervisors`登録を消してから起動する。`down`はbootoutしてdrain（`--wait` / `--force`）。worker workspace名を`dagq <repo> <task-id> <run-id>`にし、supervisor logを`<queue dir>/logs/supervisor-<started_at>.log`に書いて`locate`にlog dirを足す。launchd起動のsupervisorがcmuxに接続するにはcmuxのsocket passwordが要り、`up`のpreflightでの確認（task 21）とlaunchdなしの`up --in-cmux`（task 22）を[ADR-0011](../adr/0011-cmux-socket-password-and-in-cmux-fallback.md)で決めた。task 21とtask 22は着地済みで、modeは`supervisors.mode`（schema v9）に記録して`status` / `doctor` / `down`が読む。task 30（[ADR-0014](../adr/0014-up-replaces-a-supervisor-of-another-binary-version.md)）で`supervisors.binary_version`（schema v10）を足し、`up`がversionの違うliveなsupervisorをdrainして入れ替えるようにした（`--no-wait`は走行中のrunがあれば入れ替えない）。固定バイナリの更新は「ファイルを置き換えて`up`」になった。
+- plugin skillのmaintainer化（journal 021のT3）。CLIの使い方をskill `dagq-maintain`へ集め、maintainerの初期promptをruntimeが生成し、AGENTS.mdをrepository固有の注意だけにする。
 - maintainerの操作をruntimeへ移す。`ask` / `answer`によるworkerからmaintainerへの相談経路、承認なしの自動着地、`needs_session`のrunをruntimeがresumeして定型の解消依頼を送る仕組み。
 - Codex provider、明示選択、Claude起動不能時のfallbackを追加する。
-- バイナリリリース、checksum、pluginとのバージョン互換性はgoal 2「claude-taskqを配布可能なMVP (v0.1.0)にする」で実装した（2026-09-22）。`v*`のtag pushで`aarch64-apple-darwin`のtar.gzと`SHA256SUMS`をGitHub Releaseに添付する`.github/workflows/release.yml`（task 28）、repository rootの`.claude-plugin/marketplace.json`による`claude plugin marketplace add` / `install`とlauncherのmajor.minor不一致警告（task 29）、`up`がversionの違うsupervisorをdrainして入れ替える更新手順（task 30、[ADR-0014](../adr/0014-up-replaces-a-supervisor-of-another-binary-version.md)）、READMEのGetting startedとUpgrade（task 31）。LICENSE（MIT）とmainのCIも同じgoalで入れた。Codex pluginは未着手で、goal 2の制約でも対象外。
+- バイナリリリース、checksum、pluginとのバージョン互換性はgoal 2「claude-taskqを配布可能なMVP (v0.1.0)にする」（当時の名前。現`claude-dagq`）で実装した（2026-09-22）。`v*`のtag pushで`aarch64-apple-darwin`のtar.gzと`SHA256SUMS`をGitHub Releaseに添付する`.github/workflows/release.yml`（task 28）、repository rootの`.claude-plugin/marketplace.json`による`claude plugin marketplace add` / `install`とlauncherのmajor.minor不一致警告（task 29）、`up`がversionの違うsupervisorをdrainして入れ替える更新手順（task 30、[ADR-0014](../adr/0014-up-replaces-a-supervisor-of-another-binary-version.md)）、READMEのGetting startedとUpgrade（task 31）。LICENSE（MIT）とmainのCIも同じgoalで入れた。Codex pluginは未着手で、goal 2の制約でも対象外。
 - 既存Pythonキューからtask ID、依存、run履歴、ログ参照を移行する。
 
 ## Out of scope for first dogfooding

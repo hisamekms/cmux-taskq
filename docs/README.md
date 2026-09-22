@@ -4,15 +4,15 @@ type: design
 title: Documentation guide
 status: current
 created: 2026-09-21
-updated: 2026-09-22
-last_verified: 2026-09-22
+updated: 2026-09-23
+last_verified: 2026-09-23
 tags:
   - documentation
 ---
 
 # Documentation guide
 
-cmux-taskqの文書は、決定、現在の設計、実装計画、作業記録を分けて管理する。エージェント向けの運用ルールはrepo rootの[AGENTS.md](../AGENTS.md)にある。
+dagqの文書は、決定、現在の設計、実装計画、作業記録を分けて管理する。エージェント向けの運用ルールはrepo rootの[AGENTS.md](../AGENTS.md)にある。
 
 ## 文書の種類
 
