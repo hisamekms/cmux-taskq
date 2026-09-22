@@ -18,6 +18,7 @@ depends_on:
   - adr-0006
   - adr-0007
   - adr-0008
+  - adr-0010
 ---
 
 # Rust runtime MVP
@@ -28,18 +29,18 @@ depends_on:
 
 2026-09-22時点でステップ1の[実機検証](../journal/001-claude-lifecycle-spike.md)、ステップ2のRust/SQLiteキュー、ステップ3の1件を実行するsupervisor、ステップ4のreceipt検証・workspace終了・`integrate`・`doctor`/`recover`、ステップ5〜7のrepositoryごとのqueue・並列実行・merge queue、ステップ8のClaude Code pluginを実装し、ステップ4の実機の異常系確認を[010](../journal/010-failure-path-smoke.md)で終えた。利用可能なCLIは[README](../../README.md)に記載する。
 
-同日、運用方針を次のように改めた。1 repositoryに1 queueをユーザーDIRに置く（ステップ5）。依存が解けたtaskは上限まで並列に実行する（ステップ6）。統合はruntimeのmerge queueが行い、最新mainへrebase・再検証のうえ1 task = 1 commitにsquashしてmainに直線の履歴を積む（ステップ7）。SVは常駐のClaude Code sessionとし、完了確認・レビュー・`integrate`の呼び出し・衝突時のセッションへの指示を行う。SVの操作は最初は`read-screen`起点でよく、CLIコマンド単位で切っておき、順次runtimeへ移す。ADRは各ステップの実装taskで追加する。
+同日、運用方針を次のように改めた。1 repositoryに1 queueをユーザーDIRに置く（ステップ5）。依存が解けたtaskは上限まで並列に実行する（ステップ6）。統合はruntimeのmerge queueが行い、最新mainへrebase・再検証のうえ1 task = 1 commitにsquashしてmainに直線の履歴を積む（ステップ7）。maintainer（常駐のClaude Code session。呼称は[ADR-0010](../adr/0010-maintainer-and-resident-supervisor.md)で統一した）が完了確認・レビュー・`integrate`の呼び出し・衝突時のセッションへの指示を行う。maintainerの操作は最初は`read-screen`起点でよく、CLIコマンド単位で切っておき、順次runtimeへ移す。ADRは各ステップの実装taskで追加する。
 
 ## First dogfooding scope
 
 - ローカルのmacOS、cmux、認証済みClaude Code、単一repositoryを対象にする。
 - queueはrepositoryごとに1つ、ユーザーDIR配下に置き、cwdから解決する。
-- 同時実行は`supervise --parallel N`の上限付き並列（既定4）。supervisorは常駐ループで、SV sessionとは別の専用ターミナルで動かす。
-- Claude Codeは通常の対話セッションで実行する。権限確認や入力待ちはworkspaceで人（SV）が対応できるようにする。
+- 同時実行は`supervise --parallel N`の上限付き並列（既定4）。supervisorは常駐ループで、maintainer sessionとは別の専用ターミナルで動かす。
+- Claude Codeは通常の対話セッションで実行する。権限確認や入力待ちはworkspaceで人（maintainer）が対応できるようにする。
 - Claude Codeのローカルpluginからバイナリを呼ぶ。SQLite操作とライフサイクル管理はruntimeに集約する。
 - 実行成功は`awaiting_integration`。統合はruntimeの`integrate`が1件ずつ、最新mainへのrebase → 再検証 → squash着地で行い、Taskを`completed`にする。fast-forwardやmerge commitは使わない。
-- 初期の`integrate`はSVがレビュー後に呼ぶ承認制。承認なしの自動着地は後回し。pushはSVが行う。
-- 衝突したrunは`needs_session`で止め、SVが`claude --resume <run-id>`でworkspaceを開き直してセッションに解消させる。SVは原則コードを変更しない。
+- 初期の`integrate`はmaintainerがレビュー後に呼ぶ承認制。承認なしの自動着地は後回し。pushはmaintainerが行う。
+- 衝突したrunは`needs_session`で止め、maintainerが`claude --resume <run-id>`でworkspaceを開き直してセッションに解消させる。maintainerは原則コードを変更しない。
 - workspaceの終了はsupervisorが行い、成功したworktreeとbranchは着地までは保持する。
 
 ## Steps and exit criteria
@@ -70,7 +71,7 @@ Rustプロジェクト、migration、Task/TaskRun、依存関係、イベント�
 
 状態: 完了（2026-09-22）。`supervise`がlease取得 → claim → run管理領域とworktree作成 → cmux workspace作成 → 隠しコマンド`session`のwrapper経由でClaude起動 → heartbeat監視 → セッション終了検知までを1件分行う。実装は`src/runtime.rs`、adapterは`src/infrastructure/adapters.rs`、永続化は`src/infrastructure/runtime_store.rs`とmigration `0002_supervisor.sql`。テスト用providerとworkspaceを差し替えたruntimeテスト8件を追加し、正常終了・異常終了・作成失敗時の保持・stale leaseの不奪取・v1からのmigrationを確認した。
 
-使い捨てrepositoryでの[実機スモーク](../journal/003-supervisor.md)（cmux 0.64.25、Claude Code 2.1.278）では、専用workspaceのsupervisorからClaudeを起動し、新規worktreeの信頼確認で待機している間もsupervisorとwrapperのheartbeatが継続することを確認した。確認を進めるとClaudeが修正・unit test・commit・receipt提出を行い、receipt受領後もセッションは維持され、operatorの`/exit`で`session_exited`、`supervision_finished`が記録されrunは`validating`になった。ログはworktree外の`<db>.runs/<run-id>/`に保存され、workspace・worktree・branchは保持された。
+使い捨てrepositoryでの[実機スモーク](../journal/003-supervisor.md)（cmux 0.64.25、Claude Code 2.1.278）では、専用workspaceのsupervisorからClaudeを起動し、新規worktreeの信頼確認で待機している間もsupervisorとwrapperのheartbeatが継続することを確認した。確認を進めるとClaudeが修正・unit test・commit・receipt提出を行い、receipt受領後もセッションは維持され、maintainerの`/exit`で`session_exited`、`supervision_finished`が記録されrunは`validating`になった。ログはworktree外の`<db>.runs/<run-id>/`に保存され、workspace・worktree・branchは保持された。
 
 ステップ1の経路をruntimeへ組み込む。claim → worktree作成 → cmux workspace作成 → wrapper/Claude起動 → 監視を実装する。手動で起動し、1件を処理するところから始める。
 
@@ -113,8 +114,8 @@ receiptにはrun ID、結果、commit SHA、実施したunit test/E2E/subagent r
 状態: 実装済み（2026-09-22、[018](../journal/018-merge-queue.md)、[ADR-0008](../adr/0008-merge-queue-squash-landing.md)）。`integrate ID` / `integrate --next`がスロット（`integrating`、schema v6）を取り、worktreeを最新mainへrebase → 再検証（receiptがHEADを指す、mainの子孫、clean、検証コマンド）→ `commit-tree`で1 commitにsquash → mainをfast-forward（checkoutがあればそこで`merge --ff-only`）→ `integrated`/`completed` → worktreeとbranch削除（履歴は`refs/taskq/runs/<run-id>`）。衝突と再検証失敗は`needs_session`で止め、`failed` receiptはrunを`failed`にする。衝突なし・FIFO・衝突後のセッション解消・rebase後の検証失敗・スロットの排他と`recover`をunit testで、1件の着地と2件同時からの`needs_session`解消をe2eで確認した。着地はruntimeの`integrate`が行う。
 
 - 統合スロットは1つ、検証完了の古い順。`integrating` → 最新mainへrebase → 再検証（親がmain head、clean、検証コマンド）→ treeを1 commitにsquash（trailer `Taskq-Task` / `Taskq-Run`）してmainを進める → `integrated`。
-- 衝突は`rebase --abort`して`needs_session`で止め、SVがresumeしたセッションが解消・再検証・receiptを書き直す。
-- run branchは`refs/taskq/runs/<run-id>`に残す。初期はSVが`integrate`を呼ぶ承認制。
+- 衝突は`rebase --abort`して`needs_session`で止め、maintainerがresumeしたセッションが解消・再検証・receiptを書き直す。
+- run branchは`refs/taskq/runs/<run-id>`に残す。初期はmaintainerが`integrate`を呼ぶ承認制。
 - **完了条件:** 衝突なしのrunがClaudeなしで着地し、衝突したrunがセッションでの解消後に着地し、mainが直線で1 task = 1 commitになることをテスト（e2e含む）で確認できる。
 
 ### 8. Claude Codeから使う薄いローカルpluginを作る
@@ -130,12 +131,12 @@ receiptにはrun ID、結果、commit SHA、実施したunit test/E2E/subagent r
 
 ### 9. cmux-taskq自身でドッグフーディングする
 
-状態: 完了（2026-09-22）。固定バイナリ `18800cd` と常駐 `supervise --parallel 4` で、[012](../journal/012-dogfood-independent-task.md)（独立task）、[019](../journal/019-replace-interim-workflow.md)（AGENTS.mdの運用置き換え）、[013](../journal/013-dogfood-dependent-tasks.md)（A・C並列、BはAの着地commitから）、[014](../journal/014-dogfood-failure-recovery.md)（agent killからの再試行）を6 task・7 runで通し、6件を `integrate` で着地させた。DBの手修正なし。Claude Codeからの登録・実行・着地・復旧はSV sessionがpluginと同じCLIで行い、ステップ8も完了とする。
+状態: 完了（2026-09-22）。固定バイナリ `18800cd` と常駐 `supervise --parallel 4` で、[012](../journal/012-dogfood-independent-task.md)（独立task）、[019](../journal/019-replace-interim-workflow.md)（AGENTS.mdの運用置き換え）、[013](../journal/013-dogfood-dependent-tasks.md)（A・C並列、BはAの着地commitから）、[014](../journal/014-dogfood-failure-recovery.md)（agent killからの再試行）を6 task・7 runで通し、6件を `integrate` で着地させた。DBの手修正なし。Claude Codeからの登録・実行・着地・復旧はmaintainer sessionがpluginと同じCLIで行い、ステップ8も完了とする。
 
-ローカルに固定したビルド済みバイナリを使い、実行中のruntimeを作業成果で置き換えない。SVは常駐のClaude Code sessionで、`read-screen`で完了を確認し、差分をレビューして`integrate`を呼び、`needs_session`のrunにはresumeで指示する。
+ローカルに固定したビルド済みバイナリを使い、実行中のruntimeを作業成果で置き換えない。maintainerは常駐のClaude Code sessionで、`read-screen`で完了を確認し、差分をレビューして`integrate`を呼び、`needs_session`のrunにはresumeで指示する。
 
 1. [012](../journal/012-dogfood-independent-task.md): 独立taskを1件完走し、差分と証跡をレビューして着地させる。ここでopenなジャーナルをqueueへ移行する。
-2. [019](../journal/019-replace-interim-workflow.md): AGENTS.mdのSV/worker運用をcmux-taskq前提に置き換える。以降のtaskは新しい手順で流す。
+2. [019](../journal/019-replace-interim-workflow.md): AGENTS.mdのmaintainer/worker運用をcmux-taskq前提に置き換える。以降のtaskは新しい手順で流す。
 3. [013](../journal/013-dogfood-dependent-tasks.md): A → Bの依存taskと独立したCを登録し、AとCが並列に走り、Aの着地後にBがAの変更を含むmainから始まることを確認する。
 4. [014](../journal/014-dogfood-failure-recovery.md): 失敗または中断を1件起こし、リソース保持、状態確認、明示復旧、再試行を確認する。
 
@@ -149,7 +150,10 @@ receiptにはrun ID、結果、commit SHA、実施したunit test/E2E/subagent r
 
 - 利用で見つかった詰まりを修正し、継続的な実行と復旧を安定させる。
 - 複数のtaskが解く上位の課題を`Goal`として表現し、依存元のreceipt summary・result commit、同時実行中の兄弟、goalの記述と制約をworkerのpromptに流す（[ADR-0009](../adr/0009-goal-groups-tasks.md)、proposed）。段階1（依存元の情報をpromptへ）、goalエンティティ、prompt拡張、plugin skillの4 taskとして014の後に登録し、この4件を最初のgoalの実例にする。
-- SVの操作をruntimeへ移す。`ask` / `answer`によるセッションからSVへの相談経路、承認なしの自動着地、`needs_session`のrunをruntimeがresumeして定型の解消依頼を送る仕組み。
+- 役割名をsupervisor / maintainer / workerに統一し、[ADR-0010](../adr/0010-maintainer-and-resident-supervisor.md)を追加する（journal 021のT1。docs/design・docs/plans・docs/READMEの旧称とmaintainerを指すoperatorをmaintainerにし、[overview](../design/overview.md)に用語集を足す）。
+- `cmux-taskq up` / `down`とlaunchd常駐（journal 021のT2）。supervisorをLaunchAgent（`KeepAlive`）として常駐させ、`up`がmaintainer workspace（`taskq <repo> maintainer`、`CMUX_TASKQ_ROLE` / `CMUX_TASKQ_QUEUE`付き）を初期prompt付きの`claude`で作り、PIDの死んだ`supervisors`登録を消してから起動する。`down`はbootoutしてdrain（`--wait` / `--force`）。worker workspace名を`taskq <repo> <task-id> <run-id>`にし、supervisor logを`<queue dir>/logs/supervisor-<started_at>.log`に書いて`locate`にlog dirを足す。
+- plugin skillのmaintainer化（journal 021のT3）。CLIの使い方をskill `taskq-maintain`へ集め、maintainerの初期promptをruntimeが生成し、AGENTS.mdをrepository固有の注意だけにする。
+- maintainerの操作をruntimeへ移す。`ask` / `answer`によるworkerからmaintainerへの相談経路、承認なしの自動着地、`needs_session`のrunをruntimeがresumeして定型の解消依頼を送る仕組み。
 - Codex provider、明示選択、Claude起動不能時のfallbackを追加する。
 - バイナリリリース、checksum、pluginとのバージョン互換性、Codex pluginを整備する。
 - 既存Pythonキューからtask ID、依存、run履歴、ログ参照を移行する。

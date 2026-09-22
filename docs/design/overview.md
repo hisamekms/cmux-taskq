@@ -16,6 +16,7 @@ related:
   - adr-0006
   - adr-0007
   - adr-0008
+  - adr-0010
 ---
 
 # System overview
@@ -25,6 +26,18 @@ related:
 コードは単一Cargo package内で、`domain`（型と状態遷移）、`application`（キュー・provider・workspaceの契約）、`infrastructure::sqlite`（キューの永続化）、`infrastructure::runtime_store`（run単位のlease・process・run状態の永続化）、`infrastructure::adapters`（Git、cmux、Claude Codeの呼び出し）、`infrastructure::location`（cwdからのqueueの解決、[ADR-0006](../adr/0006-queue-per-repository.md)）、`runtime`（supervisorとsession wrapper）、`main`（CLI）に分離している。利用方法は[README](../../README.md)を参照。
 
 cmux-taskqは、依存関係を持つ開発タスクをSQLiteで管理し、着手可能なタスクをcmux workspaceとGit worktreeで実行するRust runtimeである。
+
+## 用語集
+
+役割は3つで、名前は[ADR-0010](../adr/0010-maintainer-and-resident-supervisor.md)で統一した。
+
+| 用語 | 指すもの | 旧称 |
+| --- | --- | --- |
+| **supervisor** | runtimeの`cmux-taskq supervise`プロセス。依存が解けたtaskをclaimし、runごとにworktreeとcmux workspaceを作ってworkerを起動し、receiptを検証してworkspaceを閉じる（[ADR-0003](../adr/0003-supervisor-owns-lifecycle.md)、[ADR-0007](../adr/0007-run-level-leases-parallel-execution.md)）。ADR-0010以降はlaunchdのLaunchAgentとして常駐する予定（T2で実装）。 | （変更なし） |
+| **maintainer** | 1 repositoryに1つ常駐する対話モードのClaude Code session。taskの登録、runの監視と権限確認・質問への応答、差分と証跡のレビュー、`integrate`の呼び出し、`needs_session`のrunへの指示、`doctor`/`recover`、pushを行う。人が同じ操作をしてもよい。 | ＳＶ（supervisorの略。半角で書くと旧称の残りを探す検証のgrepに掛かるので、この表だけ全角で書く）、operator（designとcodeでこの役割を指していたもの）、main session（[ADR-0003](../adr/0003-supervisor-owns-lifecycle.md)） |
+| **worker** | runごとにsupervisorが起動するClaude（将来はCodex）のsession。割り当てられたworktreeの中だけで作業し、commitしてreceiptを書く。 | agent session、run session |
+
+既存のADR（0001〜0009）とjournalは書き換えないので、そこに残る旧称はこの表で読み替える。runtimeのCLI名（`supervise`）と`supervisors`表は変えない。
 
 ```text
 CLI / Claude plugin / Codex plugin

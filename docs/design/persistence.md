@@ -13,6 +13,7 @@ related:
   - adr-0007
   - adr-0008
   - adr-0009
+  - adr-0010
   - design-domain-model
 ---
 
@@ -39,7 +40,7 @@ goals                -- 0008: 複数taskが解く課題（title、description、
 ## Runtime ownership
 
 - supervisorは実行中のrunごとに`run_leases`の行（`run_id`主キー、token、PID、heartbeat）を所有する。tokenはsupervisorプロセスに1つで、2秒ごとに同じtokenの全行のheartbeatを1文で更新する。claimはrun・`task_runs.supervisor_token`・lease行を1トランザクションで作り（`claim_for_supervisor`）、所有者のないclaimed runを作らない。run状態を変える操作はそのrunのtokenと30秒以内のheartbeatを要求する。runが`awaiting_integration`または`failed`になったらlease行を削除する（`lease_released`）。runtime errorでrunを手放すとき（abandon）は`last_error`と`runtime_error`（`lease_released`）を書いてlease行だけを削除し、statusとprocessは変えない。`supervisor_token`は記録として残る。leaseは自動で奪わない。
-- `supervisors`は常駐`supervise`プロセスの登録で、runを持たないsupervisorを`status`/`doctor`から見えるようにする（leaseはrunがあるときしか存在しないため）。`supervise`は起動時、heartbeat threadを始める前に自分のtokenをキーに`pid`、`parallel`（`--parallel`、CHECKで1以上）、`started_at`を1行書く（`register_supervisor`）。heartbeatは`heartbeat(token)`が`supervisors`と`run_leases`の同じtokenの行を1トランザクションで2秒ごとに更新する。ループを抜けるとき（drain完了、`--once`の完了、provisioning失敗後のdrain、claimやGitのエラーによる終了）に行を消す（`deregister_supervisor`）。heartbeat失敗で終わるときだけは消さず（DBに書けない可能性がある）、leaseと同じくstaleになる。killされたsupervisorの行は残り、`status`/`doctor`が`stale`（PIDが死んでいるかheartbeatが30秒より古い）として報告する。runtimeは自動で削除せず、`recover`と`integrate`もこの表に触れない。`run_leases.token`と`supervisors.token`が対応し、`status`/`doctor`はtokenでleaseを登録に結び付ける。`integrate`プロセスは登録せずleaseだけを持つので、外部キーは張らない。
+- `supervisors`は常駐`supervise`プロセスの登録で、runを持たないsupervisorを`status`/`doctor`から見えるようにする（leaseはrunがあるときしか存在しないため）。`supervise`は起動時、heartbeat threadを始める前に自分のtokenをキーに`pid`、`parallel`（`--parallel`、CHECKで1以上）、`started_at`を1行書く（`register_supervisor`）。heartbeatは`heartbeat(token)`が`supervisors`と`run_leases`の同じtokenの行を1トランザクションで2秒ごとに更新する。ループを抜けるとき（drain完了、`--once`の完了、provisioning失敗後のdrain、claimやGitのエラーによる終了）に行を消す（`deregister_supervisor`）。heartbeat失敗で終わるときだけは消さず（DBに書けない可能性がある）、leaseと同じくstaleになる。killされたsupervisorの行は残り、`status`/`doctor`が`stale`（PIDが死んでいるかheartbeatが30秒より古い）として報告する。runtimeは自動で削除せず、`recover`と`integrate`もこの表に触れない。[ADR-0010](../adr/0010-maintainer-and-resident-supervisor.md)は`cmux-taskq up`がsupervisor起動の前にPIDの死んだ登録行だけを消す例外を決めた（T2で実装予定。leaseには触らない）。`run_leases.token`と`supervisors.token`が対応し、`status`/`doctor`はtokenでleaseを登録に結び付ける。`integrate`プロセスは登録せずleaseだけを持つので、外部キーは張らない。
 - `queue_repository`はqueueを束縛するGit common directoryを持つ。cwdから解決したqueueは`init`が記録し（`bind_repository`）、以後の全コマンドがopen直後に一致を検査する（`assert_repository`）。`--db`のqueueは最初の`supervise`が記録し、`supervise`と`integrate`が検査する。束縛の付け替えは行わない。
 - `run_processes`は`(run_id, role)`を主キーとし、wrapperとagentの登録は1回限りにする。wrapperの操作は登録したPIDかつ未終了であることを要求する。
 - ログ本体とreceiptはDBと同じdirの`runs/<run-id>/`のファイルに置き、pathをtask_runsへ記録する。idle marker `idle.json`とClaudeのsettingsは`run_dir`から導出し、列は持たない。
@@ -71,11 +72,12 @@ $XDG_DATA_HOME/cmux-taskq/<hash>/        XDG_DATA_HOME が未設定・空・相�
   queue.db                               SQLite（WAL の -wal / -shm も隣に置かれる）
   repository                             束縛先の Git common directory（人向けの逆引き）
   runs/<run-id>/                         prompt、runner、worktree/、claude-settings.json、idle.json、receipt.json、ログ
+  logs/supervisor-<started_at>.log       supervisor の起動ごとの log（T2 で実装予定、ADR-0010。現状は存在しない）
 ```
 
 - `<hash>`はcanonicalizeしたGit common directoryのUTF-8 bytesのSHA-256のhex先頭16文字（`repository_hash`）。symlink経由やworktreeからでも同じhashになる。
 - `--db PATH`は明示override。run dirは`dirname PATH`/`runs/`で、規則はcwd解決と同じ（`runs_dir`）。`git_common_dir`は持たず、`locate`の`source`は`db_flag`になる。
-- `locate`は解決結果（`db`、`queue_dir`、`runs_dir`、`source`、`git_common_dir`、`db_exists`）をDBを開かずに返す。
+- `locate`は解決結果（`db`、`queue_dir`、`runs_dir`、`source`、`git_common_dir`、`db_exists`）をDBを開かずに返す。log dir（`logs/`）の出力は[ADR-0010](../adr/0010-maintainer-and-resident-supervisor.md)で決め、T2で足す。
 - repositoryを移動するとhashが変わり新しいqueueに解決される。旧queueは`repository`ファイルで特定し、`--db`で開く。
 
 ## Database setup and migrations

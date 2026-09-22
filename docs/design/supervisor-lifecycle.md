@@ -14,6 +14,7 @@ related:
   - adr-0007
   - adr-0008
   - adr-0009
+  - adr-0010
   - design-persistence
   - design-provider-lifecycle
 ---
@@ -38,7 +39,7 @@ ready task (dependencies completed)
       → run integrated (result_commit = landed commit), task completed
       → worktree and branch removed; history kept at refs/taskq/runs/<run-id>
     conflict / failed re-validation → needs_session
-      → SV resumes a session in the worktree; it resolves, reruns verification,
+      → the maintainer resumes a session in the worktree; it resolves, reruns verification,
         rewrites the receipt → integrate ID again (failed receipt → run failed)
   → dependents become candidates; the resident loop claims them from the landed main
 ```
@@ -61,7 +62,7 @@ ready task (dependencies completed)
 ループ（1秒ごと）:
 
 5. **claim**: active runが上限未満で、`candidates`が空でなければ、`refs/heads/main`を読み直してbase commitにし、`claim_for_supervisor`でrun・`supervisor_token`・lease行を1トランザクションで作る。`integrate`で依存が解けたtaskは次のループで、先行taskを含む`main`から始まる。
-6. **provision**: run管理領域（DBと同じdirの`runs/<run-id>/`）のpath、branch `taskq/<run-id>`、worktree（`runs/<run-id>/worktree`）、receipt、logのpathを`run_planned`として先にDBへ保存し、ディレクトリ、`prompt.txt`、runtimeバイナリのスナップショット`runner`、worktreeを作り、cmux workspaceを`--cwd worktree --command '<runner> --db ... session --run ... --lease <token> --claude ...'`で作成して、`identify`で解決したUUIDを`workspace_created`として保存する。wrapperにはDBのpathを`--db`で明示的に渡す。provisioningの失敗は環境要因とみなし、そのrunをabandon（下記）した上で以後のclaimを止め、active runをdrainしてから非0で終了する。`prompt.txt`の内容は下記[Prompt](#prompt)。
+6. **provision**: run管理領域（DBと同じdirの`runs/<run-id>/`）のpath、branch `taskq/<run-id>`、worktree（`runs/<run-id>/worktree`）、receipt、logのpathを`run_planned`として先にDBへ保存し、ディレクトリ、`prompt.txt`、runtimeバイナリのスナップショット`runner`、worktreeを作り、cmux workspaceを`--name 'taskq <task-id> <run-id>' --cwd worktree --command '<runner> --db ... session --run ... --lease <token> --claude ...'`で作成して、`identify`で解決したUUIDを`workspace_created`として保存する。wrapperにはDBのpathを`--db`で明示的に渡す。provisioningの失敗は環境要因とみなし、そのrunをabandon（下記）した上で以後のclaimを止め、active runをdrainしてから非0で終了する。`prompt.txt`の内容は下記[Prompt](#prompt)。
 7. **監視**: runごとの`SessionWatch`が、wrapperの登録（45秒以内）、wrapper heartbeat（30秒以内）、receiptファイルの出現、idle marker、wrapperの終了を確認する。receiptの出現は`receipt_observed`（`validated: false`）として記録するだけで、セッション終了とは別に扱う。receipt観測後にidle markerがreceiptより新しければ`session_idle_observed`を記録し、`WorkspaceBackend::send_exit`で一度だけ終了を要求して`exit_requested`を記録する（下記）。
 8. wrapper終了後に画面を`terminal-final.txt`へ保存し、`supervision_finished`でrunを終了コード0なら`validating`、それ以外なら`failed`にする。非0のときは同じトランザクションで`last_error`に`session exited with code N`を書き、`show`だけで理由が分かるようにする。Taskは`in_progress`のまま残す。
 9. `validating`のrunはreceipt検証（下記）をrunごとのthread（専用SQLite接続）で行い、ループは完了を待ちながら他のrunを監視し続ける。完了したら`validation_finished`でrunを`awaiting_integration`または`failed`にする。
@@ -69,7 +70,17 @@ ready task (dependencies completed)
 11. `awaiting_integration`または`failed`になったrunのleaseを解放する（`lease_released`）。
 12. active runがなく、`--once`か停止要求（下記）か、provisioning失敗でclaimを止めていればループを抜ける。それ以外はactive runがない間2秒ごとに`candidates`を見る。ループを抜けたら（claimやGitのエラーで抜ける場合も含む）自分の登録を消す（`deregister_supervisor`）。heartbeat失敗で終わるときだけは消さない。
 
-結果は`{"outcome": "finished" | "stopped", "runs": [休止したrun], "errors": [{run_id, task_id, message}]}`。SIGINT/SIGTERMは1回目でclaimを止めてactive runの終了を待ち（graceful drain）、2回目で既定の動作（即終了）になる。即終了した（killされた）supervisorのleaseは30秒でstaleになり、登録はPIDが死んだ時点から`stale`として`status`/`doctor`に残る。登録はruntimeが自動で消さず、operatorが確認して扱う。
+結果は`{"outcome": "finished" | "stopped", "runs": [休止したrun], "errors": [{run_id, task_id, message}]}`。SIGINT/SIGTERMは1回目でclaimを止めてactive runの終了を待ち（graceful drain）、2回目で既定の動作（即終了）になる。即終了した（killされた）supervisorのleaseは30秒でstaleになり、登録はPIDが死んだ時点から`stale`として`status`/`doctor`に残る。登録はruntimeが自動で消さず、maintainerが確認して扱う（[ADR-0010](../adr/0010-maintainer-and-resident-supervisor.md)で`up`がPIDの死んだ登録行を消す例外を決めた。T2で実装予定で、現状のruntimeは消さない）。
+
+### 常駐と起動・停止（T2で実装予定、ADR-0010）
+
+現在のruntimeでは、supervisorはmaintainerが`cmux workspace create --name TASKQ-SUPERVISOR --command "cmux-taskq supervise --parallel 4"`で専用のcmux workspaceに起動し、停止はそのworkspaceでのSIGINT、logはworkspaceの画面だけにある。[ADR-0010](../adr/0010-maintainer-and-resident-supervisor.md)は次のように改めることを決めた。いずれも未実装で、T2が実装する。
+
+- `cmux-taskq up`がcold startの1コマンドになる。supervisorをlaunchdのLaunchAgent（`KeepAlive`）として常駐させ、cmux workspaceを持たせない。続けてmaintainerのcmux workspaceを、runtimeが生成した初期prompt付きの`claude`で作る。maintainer workspaceは`CMUX_TASKQ_ROLE=maintainer`と`CMUX_TASKQ_QUEUE=<queue db path>`を環境に持ち、その環境の中で打った`up`はmaintainer workspaceを作らない。
+- `up`はsupervisor起動の前に`supervisors`表のPIDが死んでいる登録行を消す。上記「登録はruntimeが自動で消さない」の唯一の例外で、leaseには触らない。
+- `cmux-taskq down`はLaunchAgentをbootoutしてsupervisorにdrainさせる。既定は即返り、`--wait`でdrainの完了まで待ち、`--force`で即殺する。maintainer workspaceは閉じない。
+- cmux workspace名は`taskq <repo> maintainer`と`taskq <repo> <task-id> <run-id>`（`<repo>`はrepository rootのbasename）。現在のworker workspace名は`taskq <task-id> <run-id>`。
+- supervisorのlogは起動ごとに`<queue dir>/logs/supervisor-<started_at>.log`に書き、`locate`がlog dirを出す。ローテーションはしない。
 
 ### Prompt
 
@@ -99,11 +110,11 @@ receiptの受領とセッション終了は別の事象である。agentはrecei
 
 receipt受領後の終了要求は次の順で自動化している。
 
-1. **idle判定**: Claude adapterがrunごとの`<run-dir>/claude-settings.json`に`Stop` hookを書き、`--settings`で渡す。hookはClaudeが応答を終えるたびにstdinのイベントJSON（`session_id`、`hook_event_name`など）を`<run-dir>/idle.json`へ一時ファイル + renameで書く。supervisorはreceiptを観測した後、`idle.json`のmtimeが`receipt.json`のmtime以上なら「receipt提出後に応答が完了した」と判定する。receiptより古いmarker（operatorへの質問で止まった以前のturnなど）は無視する。判定の根拠（両ファイルのmtime、hookのフィールド）は`session_idle_observed`に記録する。権限確認や質問で止まっているturnでは`Stop`が発火しないため、その間は終了要求を送らない。
-2. **終了要求**: `WorkspaceBackend::send_exit(workspace_id)`で、cmuxでは`cmux send --workspace <uuid> -- /exit`の後に`cmux send-key --workspace <uuid> -- enter`を送る。operatorが打つのと同じ経路で、1回だけ送り、再送やプロセスのkillはしない。`exit_requested`に`timeout_secs`を記録する。
+1. **idle判定**: Claude adapterがrunごとの`<run-dir>/claude-settings.json`に`Stop` hookを書き、`--settings`で渡す。hookはClaudeが応答を終えるたびにstdinのイベントJSON（`session_id`、`hook_event_name`など）を`<run-dir>/idle.json`へ一時ファイル + renameで書く。supervisorはreceiptを観測した後、`idle.json`のmtimeが`receipt.json`のmtime以上なら「receipt提出後に応答が完了した」と判定する。receiptより古いmarker（maintainerへの質問で止まった以前のturnなど）は無視する。判定の根拠（両ファイルのmtime、hookのフィールド）は`session_idle_observed`に記録する。権限確認や質問で止まっているturnでは`Stop`が発火しないため、その間は終了要求を送らない。
+2. **終了要求**: `WorkspaceBackend::send_exit(workspace_id)`で、cmuxでは`cmux send --workspace <uuid> -- /exit`の後に`cmux send-key --workspace <uuid> -- enter`を送る。maintainerが打つのと同じ経路で、1回だけ送り、再送やプロセスのkillはしない。`exit_requested`に`timeout_secs`を記録する。
 3. **終了確認**: wrapperの`session_exited`を待ち、通常どおり`supervision_finished`へ進む。要求から`WorkspaceBackend::exit_timeout`（cmuxは120秒）以内に終了しなければ`exit_request_timed_out`を記録し、runtime errorとして`supervise`を終える。runは`running`、workspace・worktree・leaseはそのまま残り、人が`/exit`を送るか`recover`（[009](../journal/009-doctor-recover.md)）で扱う。この場合もwrapperは後から`session_exited`を記録する。
 
-operatorの手動`/exit`はいつでも有効で、markerがない（hookが無効化されているなど）場合は従来どおり手動終了を待つ。
+maintainerの手動`/exit`はいつでも有効で、markerがない（hookが無効化されているなど）場合は従来どおり手動終了を待つ。
 
 receiptの形式は`src/domain.rs`の`Receipt`で、promptとREADMEに同じ契約を書いている。
 
@@ -128,7 +139,7 @@ receiptの形式は`src/domain.rs`の`Receipt`で、promptとREADMEに同じ契�
 
 ## `integrate`
 
-`cmux-taskq integrate ID`（taskの`awaiting_integration`または`needs_session`のrun）と`cmux-taskq integrate --next`（`awaiting_integration`のrunを検証完了の古い順に1件）は、検証済みのrunをruntimeが`main`へ着地させる操作で、SVがレビュー後にrepository内で実行する（[ADR-0008](../adr/0008-merge-queue-squash-landing.md)）。`--db PATH`と`--repo REPO`は明示override。repositoryは`GitRepository::inspect`で開き、common directoryが`queue_repository.git_common_dir`と一致することを要求する。
+`cmux-taskq integrate ID`（taskの`awaiting_integration`または`needs_session`のrun）と`cmux-taskq integrate --next`（`awaiting_integration`のrunを検証完了の古い順に1件）は、検証済みのrunをruntimeが`main`へ着地させる操作で、maintainerがレビュー後にrepository内で実行する（[ADR-0008](../adr/0008-merge-queue-squash-landing.md)）。`--db PATH`と`--repo REPO`は明示override。repositoryは`GitRepository::inspect`で開き、common directoryが`queue_repository.git_common_dir`と一致することを要求する。
 
 1. **スロット**: runを`integrating`にし、このプロセスのtokenで`run_leases`の行を作る（`begin_integration`、`integration_started`）。同時に`integrating`のrunは1件（`one_integrating_run_per_queue`）で、別のrunが着地中ならerror。leaseは`supervise`と同じthreadで2秒ごとにheartbeatし、`status`/`doctor`に`integrating`のrunとして並ぶ。`--next`の順序は`validation_finished`イベントのid順で、`needs_session`のrunは取らない。
 2. **worktreeの前処理**: worktreeが存在し、run branch `taskq/<run-id>`をcheckoutしていること。途中のrebase（`rebase-merge` / `rebase-apply`）が残っていれば`git rebase --abort`する（`integration_rebase_aborted`）。
@@ -145,7 +156,7 @@ receiptの形式は`src/domain.rs`の`Receipt`で、promptとREADMEに同じ契�
 
 衝突（4）と再検証の失敗（5）は`defer_integration`でrunを`needs_session`にし、理由を`last_error`、詳細（衝突ファイル、Gitの出力の末尾、rebase後のheadなど）を`integration_deferred`イベントに書いて、lease行を消しスロットを空ける。worktreeは衝突なら検証済みhead、再検証の失敗ならrebase済みのheadに置いたまま残す。runはTaskを占有し続け、`ready`/`cancel`はできない。
 
-SVは`cmux workspace create --cwd <worktree> --command "claude --resume <run-id>"`でセッションを開き直し、`last_error`の理由と「mainへrebaseして解消し、検証コマンドを再実行し、新しいheadでreceiptを書き直す」指示を送る。完了を確認したら`integrate ID`で再開する。手順は1から同じで、rebaseはmainが動いていなければno-op、動いていれば再びrebaseする（再衝突すれば再び`needs_session`）。receiptの`commit`が現在のHEADと一致しなければ、セッションが終わっていないものとして理由付きで`needs_session`のまま。
+maintainerは`cmux workspace create --cwd <worktree> --command "claude --resume <run-id>"`でセッションを開き直し、`last_error`の理由と「mainへrebaseして解消し、検証コマンドを再実行し、新しいheadでreceiptを書き直す」指示を送る。完了を確認したら`integrate ID`で再開する。手順は1から同じで、rebaseはmainが動いていなければno-op、動いていれば再びrebaseする（再衝突すれば再び`needs_session`）。receiptの`commit`が現在のHEADと一致しなければ、セッションが終わっていないものとして理由付きで`needs_session`のまま。
 
 セッションが変更不要と判断した場合はreceiptを`result: failed`と理由（`summary`）で書き直す。`integrate ID`は`fail_integration`でrunを`failed`にし（`integration_failed`）、mainには触れない。worktreeは残る。再試行は`ready ID`、取り消しは`cancel ID`。
 
@@ -159,7 +170,7 @@ mainを進める前のGit・ファイル・DBのerror（worktreeがない、main
 
 workspaceの終了はsupervisorが行う。leaseはrun単位で（[ADR-0007](../adr/0007-run-level-leases-parallel-execution.md)）、1 runの復旧が他のrunに影響しない。receipt検証を通った`awaiting_integration`のrunだけが対象で、workspaceだけを閉じ、worktreeとbranchは`integrate`が着地するまで残す（着地後に`integrate`が削除する）。`failed`（非0終了、検証拒否）、provisioningや検証処理のエラー、wrapper heartbeat切れの場合はworkspaceもworktreeも調査のため残し、closeを呼ばない。
 
-cmux 0.64.25の`workspace create --command`はコマンドをログインシェルに打ち込む形で起動し、wrapperが終了してもシェルとworkspaceは残る（[010](../journal/010-failure-path-smoke.md)の実機確認。[015](../journal/015-e2e-happy-path.md)が観測した「終了後1〜2秒で自動的に閉じる」挙動は010の環境では再現せず、cmuxの設定に依存するとみられる）。どちらの場合もsupervisorの手順は同じで、先にworkspaceが消えていれば`cmux workspace close`は`not_found`で失敗して`cleanup_failed`になり、wrapper終了直後の`read-screen`も`screen_capture_failed`になりうる。`failed`・`interrupted`のrunのworkspaceは誰も閉じないので、調査が済んだらoperatorが`show`の`workspace_id`を`cmux workspace close`に渡して閉じる（`doctor`は未完了runしか列挙しないので`failed`・`interrupted`のrunは出ない）。
+cmux 0.64.25の`workspace create --command`はコマンドをログインシェルに打ち込む形で起動し、wrapperが終了してもシェルとworkspaceは残る（[010](../journal/010-failure-path-smoke.md)の実機確認。[015](../journal/015-e2e-happy-path.md)が観測した「終了後1〜2秒で自動的に閉じる」挙動は010の環境では再現せず、cmuxの設定に依存するとみられる）。どちらの場合もsupervisorの手順は同じで、先にworkspaceが消えていれば`cmux workspace close`は`not_found`で失敗して`cleanup_failed`になり、wrapper終了直後の`read-screen`も`screen_capture_failed`になりうる。`failed`・`interrupted`のrunのworkspaceは誰も閉じないので、調査が済んだらmaintainerが`show`の`workspace_id`を`cmux workspace close`に渡して閉じる（`doctor`は未完了runしか列挙しないので`failed`・`interrupted`のrunは出ない）。
 
 closeの成否は`task_runs.workspace_closed_at`で表す。nullは「閉じたことを確認していない」で、closeの失敗だけでなく、cmuxが閉じた後にDBへ書けなかった場合も含む。closeの失敗は`cleanup_failed`イベントと`last_error`に残るが、run状態は変えない。閉じていないworkspaceをcleaned扱いにせず、再試行は`doctor`/`recover`（[009](../journal/009-doctor-recover.md)）で扱う。
 
