@@ -1,0 +1,76 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+env:
+  TARGET: aarch64-apple-darwin
+
+jobs:
+  release:
+    name: Build and publish ${{ github.ref_name }}
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Check that the tag matches the crate version
+        id: version
+        run: |
+          set -euo pipefail
+          tag_version="${GITHUB_REF_NAME#v}"
+          crate_version="$(awk -F '"' '/^\[package\]/ { p = 1; next }
+                                       /^\[/ { p = 0 }
+                                       p && /^version = / { print $2; exit }' Cargo.toml)"
+          if [ "$tag_version" != "$crate_version" ]; then
+            echo "tag ${GITHUB_REF_NAME} declares version ${tag_version} but Cargo.toml has ${crate_version}" >&2
+            exit 1
+          fi
+          echo "version=${crate_version}" >> "$GITHUB_OUTPUT"
+
+      - name: Install the Rust toolchain
+        run: |
+          set -euo pipefail
+          rustup update stable --no-self-update
+          rustup default stable
+          rustup target add "$TARGET"
+          cargo --version
+
+      - name: Build the release binary
+        run: |
+          set -euo pipefail
+          cargo build --release --locked --target "$TARGET"
+          "target/${TARGET}/release/cmux-taskq" --version
+
+      - name: Pack the archive and the checksums
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          archive="cmux-taskq-v${VERSION}-${TARGET}.tar.gz"
+          mkdir -p dist
+          cp "target/${TARGET}/release/cmux-taskq" LICENSE README.md dist/
+          tar -czf "dist/${archive}" -C dist cmux-taskq LICENSE README.md
+          rm dist/cmux-taskq dist/LICENSE dist/README.md
+          cd dist
+          shasum -a 256 "$archive" > SHA256SUMS
+          shasum -a 256 -c SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Create the GitHub Release
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          archive="dist/cmux-taskq-v${VERSION}-${TARGET}.tar.gz"
+          gh release create "$GITHUB_REF_NAME" \
+            --verify-tag \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes \
+            "$archive" dist/SHA256SUMS \
+            || gh release upload "$GITHUB_REF_NAME" --clobber "$archive" dist/SHA256SUMS

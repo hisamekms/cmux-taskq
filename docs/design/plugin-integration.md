@@ -27,7 +27,41 @@ cmux-taskq repository
 
 Claude Code pluginは`.claude-plugin/plugin.json`と`skills/`を持ち、Codex pluginは`.codex-plugin/plugin.json`とskills/hooks/scriptsを持つ。共通の手順はshared skillから生成または同期する。pluginのskillからPATH上の`cmux-taskq`を呼び出し、見つからなければインストール方法を案内する。
 
-platformごとのbinary release、checksum、version compatibilityをruntime側で管理する。pluginはruntimeのDB schemaを直接操作しない。
+platformごとのbinary release、checksum、version compatibilityはruntime側で管理する（[配布](#配布)）。pluginはruntimeのDB schemaを直接操作しない。
+
+## 配布
+
+binary releaseとchecksumはruntime側の責務なので（[ADR-0005](../adr/0005-binary-and-plugin-distribution.md)）、releaseはGitHub Actionsの`.github/workflows/release.yml`が作る。trigger は `v*` の tag push、runnerは`macos-14`、targetは`aarch64-apple-darwin`だけ（他のplatformは未対応）。
+
+### tagとversionの一致規則
+
+tagは`v<version>`で、`<version>`は`Cargo.toml`の`[package].version`と完全に一致する（例: version `0.1.0` には tag `v0.1.0`）。workflowはcheckoutの直後、buildより前のstepで`GITHUB_REF_NAME`から先頭の`v`を外したものと`Cargo.toml`の値を比べ、違えばそこでfailする。pluginの`.claude-plugin/plugin.json`のversionもクレートと同じ値にそろえる。
+
+### artifact
+
+Releaseには2つのファイルを添付する。
+
+| ファイル | 中身 |
+| --- | --- |
+| `cmux-taskq-v<version>-aarch64-apple-darwin.tar.gz` | `cmux-taskq`バイナリ（`cargo build --release --locked --target aarch64-apple-darwin`）、`LICENSE`、`README.md`をアーカイブ直下に平置き |
+| `SHA256SUMS` | 上のtar.gzの`shasum -a 256`出力1行 |
+
+release notes は tag からの自動生成（`gh release create --generate-notes`）でよい。
+
+### checksumの検証とインストール
+
+同じdirectoryに両方を置いて検証する。
+
+```sh
+VERSION=0.1.0
+gh release download "v$VERSION" --repo hisamekms/cmux-taskq
+shasum -a 256 -c SHA256SUMS
+tar -xzf "cmux-taskq-v$VERSION-aarch64-apple-darwin.tar.gz"
+mkdir -p ~/.local/bin
+install -m 755 cmux-taskq ~/.local/bin/cmux-taskq
+```
+
+`shasum -a 256 -c SHA256SUMS`が`OK`を出さないarchiveは展開しない。`~/.local/bin`をPATHに入れておくと、pluginのlauncherもsupervisorの起動も同じバイナリを解決する。
 
 ## Claude Code plugin (`plugins/claude-taskq`)
 
