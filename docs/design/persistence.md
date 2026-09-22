@@ -26,7 +26,7 @@ supervisor_leases    -- 0002: supervisor token、PID、heartbeat（1行）
 run_processes        -- 0002: runごとのwrapper/agentのPID、heartbeat、終了コード
 ```
 
-`task_dependencies(task_id, predecessor_id)`は依存関係を保存する。TaskRunは試行ごとに新しい行を作り、Taskに履歴を持たせる。workspace、worktree、receipt、log、repo、run directory、supervisor token、last errorの参照列をtask_runsに置き、claim時点ではnullにする。成果物hashは未実装。
+`task_dependencies(task_id, predecessor_id)`は依存関係を保存する。TaskRunは試行ごとに新しい行を作り、Taskに履歴を持たせる。workspace、worktree、receipt、log、repo、run directory、supervisor token、last errorの参照列をtask_runsに置き、claim時点ではnullにする。`result_commit`は検証で確認したcommit、`last_error`は検証の拒否理由またはruntime errorを持つ。成果物hashは未実装。
 
 ## Runtime ownership
 
@@ -34,6 +34,7 @@ run_processes        -- 0002: runごとのwrapper/agentのPID、heartbeat、終�
 - `queue_repository`は最初の`supervise`でGit common directoryを記録し、以後は同じrepositoryだけを受け付ける。
 - `run_processes`は`(run_id, role)`を主キーとし、wrapperとagentの登録は1回限りにする。wrapperの操作は登録したPIDかつ未終了であることを要求する。
 - ログ本体とreceiptは`<db>.runs/<run-id>/`のファイルに置き、pathをtask_runsへ記録する。
+- receipt検証は`validating`かつ同じsupervisor tokenのrunだけを`awaiting_integration`または`failed`へ進める。検証コマンドの結果は`verification_command`イベント、判定とreceiptの内容は`validation_finished`イベントに置き、専用テーブルは持たない。
 
 ## Transactions and constraints
 
@@ -56,6 +57,6 @@ SQLiteはrusqliteのbundled機能で同梱する。初期化でWALを有効に�
 
 ## Planned runtime persistence
 
-成果物のhashやreceipt検証結果を保持する`run_artifacts`はステップ4で追加する。一定時間heartbeatが更新されないrunは自動再実行せず、`recover`または`doctor`で確認する。
+receipt検証結果はイベントとtask_runsの列で足りたため、`run_artifacts`テーブルは追加しなかった。成果物hashが必要になった時点で検討する。一定時間heartbeatが更新されないrunは自動再実行せず、`recover`または`doctor`で確認する。
 
 旧Python版の状態を読み込む移行コマンドは後続の配布段階で用意し、task ID、依存、run履歴、ログpathを保持する。

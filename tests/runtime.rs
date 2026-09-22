@@ -9,7 +9,7 @@ use cmux_taskq::{
     runtime,
 };
 use rusqlite::Connection;
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -58,8 +58,22 @@ fn fixture() -> (TempDir, PathBuf, PathBuf) {
     (dir, repo, db)
 }
 
+/// Shell prelude for the fake agent: `receipt COMMIT [RUN_ID]` writes an
+/// atomically renamed receipt claiming success with evidence on every check.
+const AGENT_PRELUDE: &str = r#"
+test -f seed.txt || exit 99
+printf 'fixture log\n' > "$LOG"
+receipt() {
+  printf '{"run_id":"%s","result":"succeeded","commit":"%s","tests":{"status":"passed","evidence_or_reason":"ran"},"e2e":{"status":"not_applicable","evidence_or_reason":"no e2e surface"},"subagent_review":{"status":"passed","evidence_or_reason":"reviewed"},"summary":"done"}' "${2:-$RUN_ID}" "$1" > "$RECEIPT.tmp"
+  mv "$RECEIPT.tmp" "$RECEIPT"
+}
+commit() { printf 'change\n' > change.txt && git add change.txt && git commit -q -m "$1"; }
+sleep 2
+"#;
+const VALID_AGENT: &str = "commit work; receipt \"$(git rev-parse HEAD)\"";
+
 struct TestProvider {
-    exit_code: i32,
+    script: String,
 }
 impl AgentProvider for TestProvider {
     fn preflight(&self) -> Result<()> {
@@ -69,9 +83,14 @@ impl AgentProvider for TestProvider {
         assert!(prompt.contains("Acceptance criteria:"));
         assert!(prompt.contains("test -f seed.txt"));
         let mut command = Command::new("/bin/sh");
-        command.current_dir(run.worktree_path.as_ref().unwrap()).arg("-c")
-            .arg("test -f seed.txt || exit 99; printf 'fixture log\n' > \"$1\"; sleep 2; exit \"$2\"")
-            .arg("test-agent").arg(run.log_path.as_ref().unwrap()).arg(self.exit_code.to_string());
+        command
+            .current_dir(run.worktree_path.as_ref().unwrap())
+            .env("RUN_ID", &run.id)
+            .env("RECEIPT", run.receipt_path.as_ref().unwrap())
+            .env("LOG", run.log_path.as_ref().unwrap())
+            .env("BASE", &run.base_commit)
+            .arg("-c")
+            .arg(format!("{AGENT_PRELUDE}\n{}", self.script));
         Ok(command)
     }
 }
@@ -79,15 +98,15 @@ impl AgentProvider for TestProvider {
 struct TestWorkspace {
     db: PathBuf,
     fail: bool,
-    exit_code: i32,
+    script: String,
     worker: Mutex<Option<thread::JoinHandle<Result<Value>>>>,
 }
 impl TestWorkspace {
-    fn new(db: &Path, fail: bool, exit_code: i32) -> Self {
+    fn new(db: &Path, fail: bool, script: &str) -> Self {
         Self {
             db: db.into(),
             fail,
-            exit_code,
+            script: script.into(),
             worker: Mutex::new(None),
         }
     }
@@ -123,9 +142,9 @@ impl WorkspaceBackend for TestWorkspace {
         )?;
         let db = self.db.clone();
         let id = run.id.clone();
-        let code = self.exit_code;
+        let script = self.script.clone();
         *self.worker.lock().unwrap() = Some(thread::spawn(move || {
-            runtime::session_with_provider(&db, &id, &token, &TestProvider { exit_code: code })
+            runtime::session_with_provider(&db, &id, &token, &TestProvider { script })
         }));
         Ok("01234567-89ab-4def-8123-456789abcdef".into())
     }
@@ -149,18 +168,52 @@ fn supervise(db: &Path, repo: &Path, backend: &TestWorkspace) -> Result<Value> {
     )
 }
 
-#[test]
-fn successful_session_hands_off_to_validation_and_keeps_resources() {
-    let (_dir, repo, db) = fixture();
-    let backend = TestWorkspace::new(&db, false, 0);
+/// Run one fake agent script through supervise and return the task detail.
+fn run_agent(script: &str) -> (TempDir, PathBuf, cmux_taskq::domain::TaskDetail) {
+    let (dir, repo, db) = fixture();
+    let backend = TestWorkspace::new(&db, false, script);
     let outcome = supervise(&db, &repo, &backend).unwrap();
     backend.join();
-    assert_eq!(outcome["run"]["status"], "validating");
+    assert_eq!(outcome["outcome"], "finished");
     let mut queue = SqliteQueue::open(&db).unwrap();
     let detail = queue.show(1).unwrap();
     assert_eq!(detail.task.status, TaskStatus::InProgress);
+    assert!(Path::new(detail.runs[0].worktree_path.as_ref().unwrap()).exists());
+    assert!(queue.supervisor_lease().unwrap().is_none());
+    assert!(queue.candidates().unwrap().is_empty());
+    (dir, db, detail)
+}
+
+fn rejection_reason(detail: &cmux_taskq::domain::TaskDetail) -> String {
     let run = &detail.runs[0];
-    assert!(Path::new(run.worktree_path.as_ref().unwrap()).exists());
+    assert_eq!(run.status, RunStatus::Failed);
+    let event = detail
+        .events
+        .iter()
+        .find(|e| e.kind == "validation_finished")
+        .unwrap();
+    assert_eq!(event.payload["status"], "failed");
+    assert_eq!(event.payload["accepted"], false);
+    let reason = event.payload["reason"].as_str().unwrap().to_owned();
+    assert_eq!(run.last_error.as_deref(), Some(reason.as_str()));
+    reason
+}
+
+#[test]
+fn valid_receipt_is_verified_and_awaits_integration() {
+    let (_dir, db, detail) = run_agent(VALID_AGENT);
+    let run = &detail.runs[0];
+    assert_eq!(run.status, RunStatus::AwaitingIntegration);
+    assert!(run.last_error.is_none());
+    let commit = run.result_commit.as_ref().unwrap();
+    assert_ne!(commit, &run.base_commit);
+    let head = Command::new("git")
+        .arg("-C")
+        .arg(run.worktree_path.as_ref().unwrap())
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .unwrap();
+    assert_eq!(String::from_utf8(head.stdout).unwrap().trim(), commit);
     assert_eq!(
         fs::read_to_string(run.log_path.as_ref().unwrap()).unwrap(),
         "fixture log\n"
@@ -177,18 +230,148 @@ fn successful_session_hands_off_to_validation_and_keeps_resources() {
             .iter()
             .all(|p| p.exited_at.is_some() && p.exit_code == Some(0))
     );
-    assert!(queue.supervisor_lease().unwrap().is_none());
-    assert!(detail.events.iter().any(|e| e.kind == "agent_started"));
-    assert!(supervise(&db, &repo, &backend).is_err()); // No unvalidated-run bypass.
+    let kinds: Vec<&str> = detail.events.iter().map(|e| e.kind.as_str()).collect();
+    assert!(kinds.contains(&"agent_started"));
+    assert!(kinds.contains(&"receipt_observed"));
+    let verification = detail
+        .events
+        .iter()
+        .find(|e| e.kind == "verification_command")
+        .unwrap();
+    assert_eq!(verification.payload["command"], "test -f seed.txt");
+    assert_eq!(verification.payload["exit_code"], 0);
+    assert!(Path::new(verification.payload["log_path"].as_str().unwrap()).exists());
+    let finished = detail
+        .events
+        .iter()
+        .find(|e| e.kind == "validation_finished")
+        .unwrap();
+    assert_eq!(finished.payload["status"], "awaiting_integration");
+    assert_eq!(finished.payload["result_commit"], json!(commit));
+    assert_eq!(
+        finished.payload["receipt"]["e2e"]["status"],
+        "not_applicable"
+    );
+    // The task still owns its slot until integration; no second run starts.
+    let mut queue = SqliteQueue::open(&db).unwrap();
+    assert_eq!(queue.show(1).unwrap().runs.len(), 1);
+    assert!(queue.candidates().unwrap().is_empty());
+}
+
+#[test]
+fn missing_receipt_fails_validation() {
+    let (_dir, _db, detail) = run_agent("commit work");
+    assert!(rejection_reason(&detail).contains("receipt was not submitted"));
+    assert!(detail.runs[0].result_commit.is_none());
+    assert!(
+        !detail
+            .events
+            .iter()
+            .any(|e| e.kind == "verification_command")
+    );
+}
+
+#[test]
+fn run_id_mismatch_fails_validation() {
+    let (_dir, _db, detail) = run_agent("commit work; receipt \"$(git rev-parse HEAD)\" other-run");
+    assert!(rejection_reason(&detail).contains("run_id other-run does not match"));
+    assert!(detail.runs[0].result_commit.is_none());
+}
+
+#[test]
+fn receipt_without_new_commit_fails_validation() {
+    let (_dir, _db, detail) = run_agent("receipt \"$BASE\"");
+    assert!(rejection_reason(&detail).contains("no commit was made"));
+}
+
+#[test]
+fn receipt_commit_that_is_not_branch_head_fails_validation() {
+    let (_dir, _db, detail) = run_agent("commit work; receipt \"$BASE\"");
+    assert!(rejection_reason(&detail).contains("is not the head of taskq/"));
+}
+
+#[test]
+fn dirty_worktree_fails_validation() {
+    let (_dir, _db, detail) = run_agent(
+        "commit work; printf 'scratch\n' > untracked.txt; receipt \"$(git rev-parse HEAD)\"",
+    );
+    let reason = rejection_reason(&detail);
+    assert!(reason.contains("worktree is not clean"));
+    assert!(reason.contains("untracked.txt"));
+    // The verified commit is still recorded for inspection.
+    assert!(detail.runs[0].result_commit.is_some());
+}
+
+#[test]
+fn failing_verification_command_fails_validation_despite_receipt_claims() {
+    let (_dir, _db, detail) = run_agent(
+        "git rm -q seed.txt && git commit -q -m 'drop seed'; receipt \"$(git rev-parse HEAD)\"",
+    );
+    let reason = rejection_reason(&detail);
+    assert!(reason.contains("verification command \"test -f seed.txt\" exited with 1"));
+    let verification = detail
+        .events
+        .iter()
+        .find(|e| e.kind == "verification_command")
+        .unwrap();
+    assert_eq!(verification.payload["exit_code"], 1);
+    assert!(detail.runs[0].result_commit.is_some());
+}
+
+#[test]
+fn receipt_structure_is_checked_before_git() {
+    use cmux_taskq::domain::Receipt;
+    let valid = r#"{"run_id":"r","result":"succeeded","commit":"0123456789abcdef0123456789abcdef01234567",
+        "tests":{"status":"passed","evidence_or_reason":"cargo test"},
+        "e2e":{"status":"not_applicable","evidence_or_reason":"library only"},
+        "subagent_review":{"status":"passed","evidence_or_reason":"no findings"},"summary":"ok"}"#;
+    Receipt::parse(valid).unwrap().check("r").unwrap();
+    let cases = [
+        (valid.replace("\"r\"", "\"other\""), "does not match"),
+        (
+            valid.replace("succeeded", "failed"),
+            "agent reported result failed",
+        ),
+        (
+            valid.replace("library only", " "),
+            "e2e is not_applicable without evidence or reason",
+        ),
+        (
+            valid.replace(
+                "\"passed\",\"evidence_or_reason\":\"no findings\"",
+                "\"failed\",\"evidence_or_reason\":\"bug\"",
+            ),
+            "subagent_review as failed: bug",
+        ),
+        (
+            valid.replace("0123456789abcdef0123456789abcdef01234567", "0123456"),
+            "receipt commit",
+        ),
+    ];
+    for (text, expected) in cases {
+        let error = format!(
+            "{:#}",
+            Receipt::parse(&text).unwrap().check("r").unwrap_err()
+        );
+        assert!(error.contains(expected), "{error}");
+    }
+    assert!(Receipt::parse("{\"run_id\":\"r\"}").is_err());
+    assert!(Receipt::parse(&valid.replace("passed", "maybe")).is_err());
 }
 
 #[test]
 fn failed_agent_retains_worktree_and_does_not_complete_task() {
     let (_dir, repo, db) = fixture();
-    let backend = TestWorkspace::new(&db, false, 7);
+    let backend = TestWorkspace::new(
+        &db,
+        false,
+        "commit work; receipt \"$(git rev-parse HEAD)\"; exit 7",
+    );
     let outcome = supervise(&db, &repo, &backend).unwrap();
     backend.join();
     assert_eq!(outcome["run"]["status"], "failed");
+    // A nonzero session exit is final; the receipt is not validated.
+    assert_eq!(outcome["run"]["result_commit"], Value::Null);
     let mut queue = SqliteQueue::open(&db).unwrap();
     let detail = queue.show(1).unwrap();
     assert_eq!(detail.task.status, TaskStatus::InProgress);
@@ -200,7 +383,7 @@ fn failed_agent_retains_worktree_and_does_not_complete_task() {
 #[test]
 fn ambiguous_provisioning_failure_keeps_lease_and_planned_paths() {
     let (_dir, repo, db) = fixture();
-    let backend = TestWorkspace::new(&db, true, 0);
+    let backend = TestWorkspace::new(&db, true, VALID_AGENT);
     assert!(supervise(&db, &repo, &backend).is_err());
     let mut queue = SqliteQueue::open(&db).unwrap();
     let detail = queue.show(1).unwrap();
@@ -274,7 +457,10 @@ fn migration_from_v1_preserves_task_and_initializes_runtime_tables() {
 
 #[test]
 fn wrapper_registration_is_one_shot_and_rejects_stale_owners() {
-    use cmux_taskq::{domain::ClaimOutcome, infrastructure::runtime_store::RunPlan};
+    use cmux_taskq::{
+        domain::ClaimOutcome,
+        infrastructure::runtime_store::{RunPlan, Validation},
+    };
     let (_dir, _repo, db) = fixture();
     let mut queue = SqliteQueue::open(&db).unwrap();
     queue.acquire_supervisor("owner", "/test/.git").unwrap();
@@ -319,6 +505,30 @@ fn wrapper_registration_is_one_shot_and_rejects_stale_owners() {
         queue.finish_supervision(&run.id, "owner").unwrap().status,
         RunStatus::Validating
     );
+    let validation = Validation {
+        accepted: false,
+        result_commit: None,
+        reason: Some("receipt was not submitted".into()),
+        receipt: Value::Null,
+    };
+    assert!(
+        queue
+            .finish_validation(&run.id, "other-owner", &validation)
+            .is_err()
+    );
+    let failed = queue
+        .finish_validation(&run.id, "owner", &validation)
+        .unwrap();
+    assert_eq!(failed.status, RunStatus::Failed);
+    assert_eq!(
+        failed.last_error.as_deref(),
+        Some("receipt was not submitted")
+    );
+    assert!(
+        queue
+            .finish_validation(&run.id, "owner", &validation)
+            .is_err()
+    ); // Terminal.
 }
 
 #[test]
@@ -326,7 +536,7 @@ fn no_ready_task_releases_lease_without_creating_a_run() {
     let (_dir, repo, db) = fixture();
     let mut queue = SqliteQueue::open(&db).unwrap();
     queue.transition(1, TaskAction::Draft).unwrap();
-    let backend = TestWorkspace::new(&db, true, 0);
+    let backend = TestWorkspace::new(&db, true, VALID_AGENT);
     assert_eq!(
         supervise(&db, &repo, &backend).unwrap()["outcome"],
         "no_ready_task"

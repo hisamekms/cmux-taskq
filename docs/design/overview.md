@@ -17,7 +17,7 @@ related:
 
 # System overview
 
-ステップ3時点でRust CLI、SQLiteキュー、1件を実行するsupervisor、cmux adapter、Claude providerを実装済み。以下の構成図のうち、receipt検証とworkspace終了、Codex provider、pluginは後続実装。
+ステップ4の途中時点でRust CLI、SQLiteキュー、1件を実行してreceiptを検証するsupervisor、cmux adapter、Claude providerを実装済み。以下の構成図のうち、workspace終了、統合確認、Codex provider、pluginは後続実装。
 
 コードは単一Cargo package内で、`domain`（型と状態遷移）、`application`（キュー・provider・workspaceの契約）、`infrastructure::sqlite`（キューの永続化）、`infrastructure::runtime_store`（lease・process・run状態の永続化）、`infrastructure::adapters`（Git、cmux、Claude Codeの呼び出し）、`runtime`（supervisorとsession wrapper）、`main`（CLI）に分離している。利用方法は[README](../../README.md)を参照。
 

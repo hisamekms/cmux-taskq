@@ -9,6 +9,16 @@ use crate::domain::{RunProcess, SupervisorLease, TaskRun};
 
 pub const HEARTBEAT_TIMEOUT_SECS: i64 = 30;
 
+/// Outcome of supervisor-side receipt validation. `result_commit` is kept on
+/// rejection too when the commit itself was verified, so inspection can start there.
+#[derive(Debug, Serialize)]
+pub struct Validation {
+    pub accepted: bool,
+    pub result_commit: Option<String>,
+    pub reason: Option<String>,
+    pub receipt: serde_json::Value,
+}
+
 #[derive(Debug, Serialize)]
 pub struct RunPlan {
     pub repo_path: String,
@@ -262,6 +272,44 @@ impl SqliteQueue {
             json!({"status": status, "exit_code": code}),
         )?;
         // Completion and dependency release belong to the next validation stage.
+        let result = tx.query_row("SELECT * FROM task_runs WHERE id=?1", [id], run_row)?;
+        tx.commit()?;
+        Ok(result)
+    }
+
+    pub fn finish_validation(
+        &mut self,
+        id: &str,
+        token: &str,
+        validation: &Validation,
+    ) -> Result<TaskRun> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        assert_lease(&tx, token)?;
+        let status = if validation.accepted {
+            "awaiting_integration"
+        } else {
+            "failed"
+        };
+        ensure!(
+            tx.execute(
+                "UPDATE task_runs SET status=?3,result_commit=?4,last_error=COALESCE(?5,last_error)
+                 WHERE id=?1 AND supervisor_token=?2 AND status='validating'",
+                params![
+                    id,
+                    token,
+                    status,
+                    validation.result_commit,
+                    validation.reason
+                ]
+            )? == 1,
+            "run is not validating under this supervisor"
+        );
+        let mut payload = serde_json::to_value(validation)?;
+        payload["status"] = json!(status);
+        run_event(&tx, id, "validation_finished", payload)?;
+        // Task completion still waits for integration into main.
         let result = tx.query_row("SELECT * FROM task_runs WHERE id=?1", [id], run_row)?;
         tx.commit()?;
         Ok(result)

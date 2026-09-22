@@ -1,4 +1,4 @@
-use anyhow::{Result, bail, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 
 macro_rules! string_enum {
@@ -46,6 +46,17 @@ string_enum!(RunStatus {
 });
 
 string_enum!(Provider { Claude => "claude" });
+
+string_enum!(ReceiptResult {
+    Succeeded => "succeeded",
+    Failed => "failed",
+});
+
+string_enum!(CheckStatus {
+    Passed => "passed",
+    Failed => "failed",
+    NotApplicable => "not_applicable",
+});
 
 /// User operations cannot mark a task in progress or completed.
 #[derive(Debug, Clone, Copy)]
@@ -174,10 +185,74 @@ pub enum ClaimOutcome {
     NoReadyTask,
 }
 
+/// Completion receipt written by the agent. Its claims are cross-checked by
+/// the supervisor; the receipt alone never marks a run successful.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Receipt {
+    pub run_id: String,
+    pub result: ReceiptResult,
+    pub commit: String,
+    pub tests: ReceiptCheck,
+    pub e2e: ReceiptCheck,
+    pub subagent_review: ReceiptCheck,
+    #[serde(default)]
+    pub summary: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReceiptCheck {
+    pub status: CheckStatus,
+    #[serde(default)]
+    pub evidence_or_reason: String,
+}
+
+impl Receipt {
+    pub fn parse(text: &str) -> Result<Self> {
+        serde_json::from_str(text).context("receipt is not a valid completion receipt")
+    }
+
+    /// Structural consistency only; Git state and verification commands are checked by the supervisor.
+    pub fn check(&self, run_id: &str) -> Result<()> {
+        ensure!(
+            self.run_id == run_id,
+            "receipt run_id {} does not match run {run_id}",
+            self.run_id
+        );
+        ensure!(
+            self.result == ReceiptResult::Succeeded,
+            "agent reported result {}: {}",
+            self.result.as_str(),
+            self.summary
+        );
+        for (name, check) in [
+            ("tests", &self.tests),
+            ("e2e", &self.e2e),
+            ("subagent_review", &self.subagent_review),
+        ] {
+            ensure!(
+                check.status != CheckStatus::Failed,
+                "receipt reports {name} as failed: {}",
+                check.evidence_or_reason
+            );
+            ensure!(
+                !check.evidence_or_reason.trim().is_empty(),
+                "receipt {name} is {} without evidence or reason",
+                check.status.as_str()
+            );
+        }
+        validate_commit(&self.commit).context("receipt commit")?;
+        Ok(())
+    }
+}
+
 pub fn validate_base_commit(commit: &str) -> Result<()> {
+    validate_commit(commit).context("base commit")
+}
+
+fn validate_commit(commit: &str) -> Result<()> {
     ensure!(
         matches!(commit.len(), 40 | 64) && commit.bytes().all(|c| c.is_ascii_hexdigit()),
-        "base commit must be a full 40- or 64-character hexadecimal Git object ID"
+        "must be a full 40- or 64-character hexadecimal Git object ID"
     );
     Ok(())
 }

@@ -8,7 +8,7 @@ use std::{
     env, fs,
     io::Read,
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::{Child, Command, ExitStatus, Stdio},
     thread,
     time::{Duration, Instant},
 };
@@ -43,6 +43,17 @@ pub fn executable(path: &Path) -> Result<PathBuf> {
 }
 
 pub fn output(command: &mut Command) -> Result<String> {
+    let (status, stdout, stderr) = capture(command, Duration::from_secs(30))?;
+    ensure!(
+        status.success(),
+        "{:?} failed ({status}): {stderr}",
+        command.get_program()
+    );
+    Ok(stdout)
+}
+
+/// Run to completion with a deadline; the caller interprets the exit status.
+pub fn capture(command: &mut Command, timeout: Duration) -> Result<(ExitStatus, String, String)> {
     let label = format!("{:?}", command.get_program());
     let mut child = command
         .stdout(Stdio::piped())
@@ -60,10 +71,25 @@ pub fn output(command: &mut Command) -> Result<String> {
         let mut bytes = Vec::new();
         stderr.read_to_end(&mut bytes).map(|_| bytes)
     });
-    let deadline = Instant::now() + Duration::from_secs(30);
-    let status = loop {
+    let status = wait_with_deadline(&mut child, &label, timeout)?;
+    let stdout = out
+        .join()
+        .map_err(|_| anyhow::anyhow!("stdout reader failed"))??;
+    let stderr = err
+        .join()
+        .map_err(|_| anyhow::anyhow!("stderr reader failed"))??;
+    Ok((
+        status,
+        String::from_utf8(stdout).context("command output is not UTF-8")?,
+        String::from_utf8_lossy(&stderr).into_owned(),
+    ))
+}
+
+fn wait_with_deadline(child: &mut Child, label: &str, timeout: Duration) -> Result<ExitStatus> {
+    let deadline = Instant::now() + timeout;
+    loop {
         if let Some(status) = child.try_wait()? {
-            break status;
+            return Ok(status);
         }
         if Instant::now() >= deadline {
             let _ = child.kill();
@@ -71,19 +97,29 @@ pub fn output(command: &mut Command) -> Result<String> {
             bail!("{label} timed out; external resources may have been created");
         }
         thread::sleep(Duration::from_millis(20));
-    };
-    let stdout = out
-        .join()
-        .map_err(|_| anyhow::anyhow!("stdout reader failed"))??;
-    let stderr = err
-        .join()
-        .map_err(|_| anyhow::anyhow!("stderr reader failed"))??;
-    ensure!(
-        status.success(),
-        "{label} failed ({status}): {}",
-        String::from_utf8_lossy(&stderr)
-    );
-    String::from_utf8(stdout).context("command output is not UTF-8")
+    }
+}
+
+/// Verification commands are task-defined shell lines whose full output belongs
+/// in the run directory, not in the event payload.
+pub const VERIFICATION_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+
+pub fn run_shell_to_log(script: &str, cwd: &Path, log: &Path) -> Result<ExitStatus> {
+    let file = fs::File::create(log).with_context(|| format!("create {}", log.display()))?;
+    let mut child = Command::new("/bin/sh")
+        .arg("-c")
+        .arg(script)
+        .current_dir(cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(file.try_clone()?))
+        .stderr(Stdio::from(file))
+        .spawn()
+        .with_context(|| format!("start verification command {script:?}"))?;
+    wait_with_deadline(
+        &mut child,
+        &format!("verification command {script:?}"),
+        VERIFICATION_TIMEOUT,
+    )
 }
 
 pub struct GitRepository {
@@ -128,6 +164,61 @@ impl GitRepository {
             base_commit,
             git,
         })
+    }
+
+    /// Symbolic HEAD of a worktree, or None when detached.
+    pub fn current_branch(&self, worktree: &Path) -> Result<Option<String>> {
+        let (status, stdout, stderr) = capture(
+            Command::new(&self.git).arg("-C").arg(worktree).args([
+                "symbolic-ref",
+                "--quiet",
+                "HEAD",
+            ]),
+            Duration::from_secs(30),
+        )?;
+        match status.code() {
+            Some(0) => Ok(Some(stdout.trim().to_owned())),
+            Some(1) => Ok(None),
+            _ => bail!("git symbolic-ref failed ({status}): {stderr}"),
+        }
+    }
+
+    pub fn head(&self, worktree: &Path) -> Result<String> {
+        Ok(
+            output(Command::new(&self.git).arg("-C").arg(worktree).args([
+                "rev-parse",
+                "--verify",
+                "HEAD^{commit}",
+            ]))?
+            .trim()
+            .to_owned(),
+        )
+    }
+
+    pub fn is_ancestor(&self, ancestor: &str, descendant: &str) -> Result<bool> {
+        let (status, _, stderr) = capture(
+            Command::new(&self.git).arg("-C").arg(&self.root).args([
+                "merge-base",
+                "--is-ancestor",
+                ancestor,
+                descendant,
+            ]),
+            Duration::from_secs(30),
+        )?;
+        match status.code() {
+            Some(0) => Ok(true),
+            Some(1) => Ok(false),
+            _ => bail!("git merge-base failed ({status}): {stderr}"),
+        }
+    }
+
+    /// Porcelain status including untracked files; empty means clean.
+    pub fn status(&self, worktree: &Path) -> Result<String> {
+        output(Command::new(&self.git).arg("-C").arg(worktree).args([
+            "status",
+            "--porcelain",
+            "--untracked-files=all",
+        ]))
     }
 
     pub fn create_worktree(&self, run: &TaskRun) -> Result<String> {
