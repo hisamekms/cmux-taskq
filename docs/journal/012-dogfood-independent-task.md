@@ -2,11 +2,11 @@
 id: journal-012
 type: journal
 title: Dogfooding: one independent task
-status: draft
+status: open
 created: 2026-09-22
 updated: 2026-09-22
 plan_step: 9
-queue_task: null
+queue_task: 1
 depends_on_journal: [10]
 related:
   - plan-rust-runtime-mvp
@@ -45,6 +45,13 @@ SVがユーザーの指示を待たずに実行する。開始条件は、[READM
 9. 失敗・中断したrunは`doctor`で状態を確認し、`recover RUN`のあと`ready ID`で再試行する。DBを手で直さない。詰まったらこのジャーナルのLogに書き、ユーザーに報告して待つ。
 
 ## Log
+
+### 2026-09-22 13:49 claude (SV)
+
+- Openのplanned/openが無くなったので手順1〜4を開始。`status: open`
+- 手順2: main `18800cd` で `cargo build --release --locked`、`~/.local/bin/cmux-taskq` にコピー。`cmux-taskq --version` → `cmux-taskq 0.1.0`
+- 手順3: `cmux-taskq init` → `/Users/shinnosukeooyama/.local/share/cmux-taskq/e0f87c3b33a10073/queue.db`、schema 6、`git_common_dir` = このrepositoryの `.git`
+- 手順4 T1（このジャーナルの実task、010のFound 4・5から選定）: READMEの "Recover an interrupted run" と "Land a run on main" に、(a) 失敗・中断したrunのcmux workspaceはruntimeが閉じないのでoperatorが `cmux workspace close <workspace_id>` で閉じること、(b) `needs_session` を `claude --resume <run-id>` で解消した後は `integrate ID` の前にそのセッションを `/exit` すること（着地でworktreeが削除されるため）を追記する。受け入れ条件: 両節にその記述があり `git diff --check` が通る。verify: `grep -q 'cmux workspace close' README.md`、`grep -q -- '--resume' README.md`。依存なし
 
 ## Result
 

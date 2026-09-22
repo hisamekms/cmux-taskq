@@ -6,7 +6,7 @@ status: draft
 created: 2026-09-22
 updated: 2026-09-22
 plan_step: 9
-queue_task: null
+queue_task: 2
 depends_on_journal: [12]
 related:
   - plan-rust-runtime-mvp

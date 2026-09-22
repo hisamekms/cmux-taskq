@@ -6,7 +6,7 @@ status: draft
 created: 2026-09-22
 updated: 2026-09-22
 plan_step: 9
-queue_task: null
+queue_task: 6
 depends_on_journal: [13]
 related:
   - plan-rust-runtime-mvp
@@ -21,6 +21,11 @@ related:
 完了条件: 復旧と再試行がDBの手修正なしで通り、次の小さな開発taskを同じ手順で流せる文書がある。plans/current.mdのステップ9とM1を完了にできる。
 
 ## Log
+
+### 2026-09-22 13:49 claude (SV)
+
+- T6（`--depends-on` B, C）: tests/cli.rs に `cmux-taskq --version` がクレートのバージョンを出し、queueなしで動くテストを追加する。verify: fmt / test / clippy
+- 失敗のさせ方: runが `running` になったらagentプロセスを `kill -KILL` して `failed` にし、`doctor` → `recover RUN` → `ready ID` で再試行する。再試行のrunはそのまま完走させて着地する
 
 ## Result
 
