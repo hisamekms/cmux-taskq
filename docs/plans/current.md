@@ -156,7 +156,7 @@ receiptにはrun ID、結果、commit SHA、実施したunit test/E2E/subagent r
 - plugin skillのmaintainer化（journal 021のT3）。CLIの使い方をskill `taskq-maintain`へ集め、maintainerの初期promptをruntimeが生成し、AGENTS.mdをrepository固有の注意だけにする。
 - maintainerの操作をruntimeへ移す。`ask` / `answer`によるworkerからmaintainerへの相談経路、承認なしの自動着地、`needs_session`のrunをruntimeがresumeして定型の解消依頼を送る仕組み。
 - Codex provider、明示選択、Claude起動不能時のfallbackを追加する。
-- バイナリリリース、checksum、pluginとのバージョン互換性、Codex pluginを整備する。
+- バイナリリリース、checksum、pluginとのバージョン互換性はgoal 2「claude-taskqを配布可能なMVP (v0.1.0)にする」で実装した（2026-09-22）。`v*`のtag pushで`aarch64-apple-darwin`のtar.gzと`SHA256SUMS`をGitHub Releaseに添付する`.github/workflows/release.yml`（task 28）、repository rootの`.claude-plugin/marketplace.json`による`claude plugin marketplace add` / `install`とlauncherのmajor.minor不一致警告（task 29）、`up`がversionの違うsupervisorをdrainして入れ替える更新手順（task 30、[ADR-0014](../adr/0014-up-replaces-a-supervisor-of-another-binary-version.md)）、READMEのGetting startedとUpgrade（task 31）。LICENSE（MIT）とmainのCIも同じgoalで入れた。Codex pluginは未着手で、goal 2の制約でも対象外。
 - 既存Pythonキューからtask ID、依存、run履歴、ログ参照を移行する。
 
 ## Out of scope for first dogfooding

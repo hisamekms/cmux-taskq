@@ -2,7 +2,90 @@
 
 cmux-taskq is a Rust task orchestrator for running dependency-aware development tasks in cmux workspaces and isolated Git worktrees.
 
-The runtime is distributed as a binary. Claude Code and Codex integrations are distributed as plugins that invoke the binary.
+**It runs on macOS on Apple Silicon (`aarch64-apple-darwin`) only.** No other platform is built, released, or tested. It also needs cmux, which hosts a workspace per run, and an authenticated Claude Code on PATH, because every run is a Claude Code session.
+
+The runtime is distributed as a binary from [GitHub Releases](https://github.com/hisamekms/cmux-taskq/releases). The Claude Code integration is distributed as a plugin that invokes that binary, and this repository is also its marketplace. Claude Code is the only provider today; a Codex plugin is planned but does not exist yet.
+
+## Getting started
+
+How to start using cmux-taskq in a repository of your own. Each step links to the section that covers it in full.
+
+**1. Download the release.** Put `cmux-taskq-v<version>-aarch64-apple-darwin.tar.gz` and `SHA256SUMS` from the [latest release](https://github.com/hisamekms/cmux-taskq/releases/latest) in the same directory.
+
+```sh
+VERSION=0.1.0
+gh release download "v$VERSION" --repo hisamekms/cmux-taskq
+```
+
+**2. Verify the checksum.**
+
+```sh
+shasum -a 256 -c SHA256SUMS
+```
+
+Do not unpack an archive that does not print `OK`.
+
+**3. Install the binary into `~/.local/bin` and check your PATH.** The archive holds `cmux-taskq`, `LICENSE` and `README.md` at its top level.
+
+```sh
+tar -xzf "cmux-taskq-v$VERSION-aarch64-apple-darwin.tar.gz"
+mkdir -p ~/.local/bin
+install -m 755 cmux-taskq ~/.local/bin/cmux-taskq
+command -v cmux-taskq   # expect the ~/.local/bin one, printed expanded
+```
+
+One installed file is enough to serve the queue: it is what you type, what the plugin's launcher resolves ([Use from Claude Code](#use-from-claude-code)), and what the resident supervisor runs, since `up` starts `supervise` from the absolute path of the binary it was invoked as rather than from PATH.
+
+**4. Install the Claude Code plugin.** It carries the skills that drive the binary and the launcher they call, and nothing else; the binary is the one you just installed.
+
+```sh
+claude plugin marketplace add hisamekms/cmux-taskq
+claude plugin install claude-taskq@cmux-taskq
+```
+
+See [Use from Claude Code](#use-from-claude-code) for what each skill covers.
+
+**5. Save a cmux socket password in cmux's Settings.** The supervisor runs under launchd, and cmux refuses a connection from outside its own terminals unless a socket password admits it, so `up` stops before it writes anything without one. Set `automation.socketControlMode: "password"` and `automation.socketPassword` in `~/.config/cmux/cmux.json`, then `cmux reload-config` ([Prerequisite: cmux must accept a connection from outside its terminals](#start-the-runtime-with-up)). Where that is not possible, `up --in-cmux` runs the supervisor inside a cmux workspace instead, without launchd and without an automatic restart.
+
+**6. Trust the repository in Claude Code once.** Claude's folder-trust prompt is decided by the repository root, not the worktree, so run `claude` in the repository root and accept it once; every run worktree then starts without it ([Trust prompt](docs/design/provider-lifecycle.md#trust-prompt)).
+
+**7. Create the queue.** Each Git repository has one, resolved from wherever you run the binary inside it.
+
+```sh
+cd /path/to/your/repository
+cmux-taskq init
+```
+
+`locate` shows the queue a directory resolves to without creating anything ([The queue and its commands](#the-queue-and-its-commands)).
+
+**8. Start the runtime.**
+
+```sh
+cmux-taskq up --parallel 4
+```
+
+This keeps the supervisor resident as a launchd LaunchAgent and opens the maintainer's Claude Code session in the cmux workspace `taskq <repo> maintainer`. Running it again changes nothing ([Start the runtime with `up`](#start-the-runtime-with-up)).
+
+**9. Tell the maintainer session what you want done.** It registers the goal and its tasks, makes them ready, watches the runs the supervisor starts, and lands them with `integrate` one at a time ([Run tasks with the supervisor](#run-tasks-with-the-supervisor), [Land a run on main](#land-a-run-on-main)).
+
+## Upgrade
+
+A new release is installed exactly like the first one: download the tarball and `SHA256SUMS`, check them with `shasum -a 256 -c SHA256SUMS`, and `install -m 755 cmux-taskq ~/.local/bin/cmux-taskq` over the old file. Then, from the repository:
+
+```sh
+cmux-taskq up
+```
+
+Nothing has to be stopped first. `up` reuses a live supervisor only while its `binary_version` matches its own, so once the file is replaced it drains the running supervisor — the agent is unloaded, the supervisor stops claiming and finishes the runs it holds — and starts one of the new binary in its place (`{"outcome": "restarted", ...}`). Use `up --no-wait` when you cannot sit through that drain: it refuses, changing nothing, whenever a run is in flight ([Updating the binary](#start-the-runtime-with-up)). A rebuild that does not bump the version reports the same `binary_version` and is reused rather than replaced, which matters only between releases.
+
+Update the plugin with Claude Code:
+
+```sh
+claude plugin marketplace update cmux-taskq
+claude plugin update claude-taskq@cmux-taskq
+```
+
+The two are versioned together. When a session resolves the binary (`taskq --resolve`, which the skills run first), the launcher compares the plugin's version with the binary's and, when they differ in major.minor, writes one `{"warning": ...}` line to stderr and carries on — stdout and the exit status are untouched, so the command still works. Read it as "one of these two is out of date": update whichever is older, the plugin with `claude plugin update` and the binary from the releases page. A session that sees the warning passes it on rather than stopping.
 
 ## Current status
 
@@ -10,13 +93,11 @@ The Rust/SQLite queue and a parallel supervisor are implemented. Tasks, dependen
 
 A validated run stays in `awaiting_integration`; its workspace is closed, while its worktree and branch are kept until `integrate` lands it. A run whose rebase conflicts, or whose verification fails after the rebase, waits as `needs_session` for a resumed Claude session to fix it. One run's failure never touches another: each run has its own lease, and `doctor` / `recover` judge and release one run at a time. A supervisor that dies while a run's session is still alive does not lose the run: the next supervisor with a free slot adopts the stale lease and finishes the run; every other stale lease waits for `recover`.
 
-## Build and try the queue
-
-Requires Rust 1.93 or newer and a C compiler for bundled SQLite. No separate SQLite installation is required.
+## The queue and its commands
 
 Each Git repository has one queue. Run the binary from anywhere inside the repository (any worktree, including a task worktree) and it resolves the queue to `$XDG_DATA_HOME/cmux-taskq/<hash>/queue.db`, by default `~/.local/share/cmux-taskq/<hash>/queue.db`, where `<hash>` is the first 16 hex digits of the SHA-256 of the repository's canonical Git common directory. `locate` prints that resolution without opening anything; `init` creates the directory and the queue.
 
-The examples assume `target/debug/cmux-taskq` is on PATH after `cargo build --locked`.
+The examples assume the installed `cmux-taskq` is on PATH ([Getting started](#getting-started)); a source build is `target/debug/cmux-taskq` ([Development](#development)).
 
 ```sh
 taskq_demo=$(mktemp -d) && git -C "$taskq_demo" init -q -b main && cd "$taskq_demo"
@@ -183,7 +264,7 @@ claude plugin marketplace add hisamekms/cmux-taskq
 claude plugin install claude-taskq@cmux-taskq
 ```
 
-The plugin does not carry the binary: install that separately from a [release](https://github.com/hisamekms/cmux-taskq/releases) into `~/.local/bin`, or build it here. To work on the plugin itself, load it from the checkout for a session instead of installing it:
+The plugin does not carry the binary: install that separately from a [release](https://github.com/hisamekms/cmux-taskq/releases) into `~/.local/bin` ([Getting started](#getting-started)), or build it here. To work on the plugin itself, load it from the checkout for a session instead of installing it:
 
 ```sh
 cargo build --locked
@@ -201,7 +282,15 @@ The queue is the one of the repository you run Claude Code in, resolved by the b
 
 Claude picks the skill from the request ("queue a task to …", "start the runtime", "did task 3 finish?", "the supervisor died"). `up` opens the maintainer session with this plugin loaded when it is given `--plugin-dir`. `claude plugin validate plugins/claude-taskq` checks the manifest and skills; `tests/plugin.rs` checks them and the launcher in `cargo test`.
 
-## Development checks
+## Development
+
+Building from source is for working on cmux-taskq itself; to use it, install the released binary ([Getting started](#getting-started)). Requires Rust 1.93 or newer and a C compiler for bundled SQLite; no separate SQLite installation is needed.
+
+```sh
+cargo build --locked   # target/debug/cmux-taskq
+```
+
+Every change runs these four:
 
 ```sh
 cargo fmt --all --check
