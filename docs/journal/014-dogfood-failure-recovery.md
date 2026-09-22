@@ -2,7 +2,7 @@
 id: journal-014
 type: journal
 title: Dogfooding: failure, recovery, and procedures
-status: open
+status: done
 created: 2026-09-22
 updated: 2026-09-22
 plan_step: 9
@@ -37,6 +37,17 @@ related:
 - `ready 6` → 次のpollで新run `9a897435`（base `82b8a6c` = 最新main）。失敗runは `failed` のまま履歴に残る
 - 中断（supervisor kill → doctor → recover）の経路は010で実機確認済みなので、ここでは「失敗 → 再試行」のみ
 
+### 2026-09-22 16:40 claude (SV)
+
+- 再試行run `9a897435` は人の介入なしに receipt → 検証3件（fmt / test / clippy）→ close → `awaiting_integration`。差分は tests/cli.rs のみ。`integrate 6` → `fbebec4`、push。task 6 は `completed`、失敗run `4d58d1e8` は `failed` のまま履歴に残る
+- 手順の文書: AGENTS.md（019）にSVの準備・登録・起動・監視・レビューと着地・`needs_session`・失敗と中断の各操作をCLIコマンド単位で記載済み。READMEに supervise / recover / integrate / plugin の節がある
+
 ## Result
+
+実taskで失敗（agentの `kill -KILL` → `failed`）を起こし、リソース保持（worktree・run dir・workspace）、状態確認（`show`、`doctor`、`recover` の正しい拒否）、失敗runのworkspace close、`ready` による再試行、再試行runの着地まで、DBの手修正なしで通った。中断（supervisor kill → `recover`）の経路は010で実機確認済み。セットアップ・実行・着地・復旧の手順はAGENTS.mdとREADMEにあり、次の開発taskを同じ手順で流せる。
+
+ドッグフーディング全体（012〜014、019）: 6 task、7 run（失敗1、着地6）、登録から最後の着地まで約3時間。mainは1 task = 1 squash commit（`88012c4`、`fedff3d`、`7e184d8`、`e862843`、`dfaac7b`、`fbebec4`）。
+
+残課題（後続taskの候補）: 固定バイナリが `18800cd` のままでT3の `last_error` 修正を含まない（更新はユーザー判断）。READMEとsupervisor-lifecycle.mdの「`doctor` が失敗runのworkspace IDを出す」は誤り（T5のreceiptより）。active runのない常駐supervisorが `status` に見えない（010 Found 2）。
 
 ## Promoted

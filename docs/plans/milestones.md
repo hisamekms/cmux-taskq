@@ -22,6 +22,8 @@ Claude Codeのみで、登録 → SQLiteによるclaim → cmux/worktreeで実�
 
 完了条件は、cmux-taskq自身で独立task、依存task、失敗からの復旧をDBの手修正なしで実行できること。具体的な順序は[Active plan](current.md)に記載する。
 
+達成（2026-09-22）。[current.md](current.md) ステップ1〜9。
+
 ## M2: Provider expansion and runtime hardening
 
 ドッグフーディングで見つかった問題を修正し、Codex provider、provider選択、Claude起動不能時のfallbackを追加する。継続運用と復旧を安定させる。

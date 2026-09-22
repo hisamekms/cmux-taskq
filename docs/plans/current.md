@@ -2,7 +2,7 @@
 id: plan-rust-runtime-mvp
 type: plan
 title: Rust runtime MVP
-status: active
+status: completed
 created: 2026-09-22
 updated: 2026-09-22
 milestone: mvp
@@ -119,7 +119,7 @@ receiptにはrun ID、結果、commit SHA、実施したunit test/E2E/subagent r
 
 ### 8. Claude Codeから使う薄いローカルpluginを作る
 
-状態: 実装済み（2026-09-22、[011](../journal/011-claude-code-plugin.md)）。`plugins/claude-taskq/` にlauncherと3つのskill（登録・確認 / 実行・統合 / 復旧）を置き、`claude --plugin-dir` で読み込んだセッションから登録と確認を実機確認した。実行・統合・復旧をClaude Codeから通す確認はステップ9で行い、その時点で完了にする。ステップ5〜7でCLIの引数（`--db`、`--repo`、`--parallel`、`integrate`の意味）が変わるので、skillの追従は016・017・018の各taskに含める。
+状態: 完了（2026-09-22、[011](../journal/011-claude-code-plugin.md)、ステップ9で確認）。`plugins/claude-taskq/` にlauncherと3つのskill（登録・確認 / 実行・統合 / 復旧）を置き、`claude --plugin-dir` で読み込んだセッションから登録と確認を実機確認した。実行・統合・復旧をClaude Codeから通す確認はステップ9で行い、その時点で完了にする。ステップ5〜7でCLIの引数（`--db`、`--repo`、`--parallel`、`integrate`の意味）が変わるので、skillの追従は016・017・018の各taskに含める。
 
 ローカルビルドしたバイナリとClaude Code pluginを接続する。skillはタスク登録、状態確認、実行開始の手順を提供し、エージェント向けに結果を読める形で返す。
 
@@ -129,6 +129,8 @@ receiptにはrun ID、結果、commit SHA、実施したunit test/E2E/subagent r
 - **完了条件:** Claude Code内の依頼から登録・実行・結果確認まで操作できる。pluginがDBを直接変更しない。
 
 ### 9. cmux-taskq自身でドッグフーディングする
+
+状態: 完了（2026-09-22）。固定バイナリ `18800cd` と常駐 `supervise --parallel 4` で、[012](../journal/012-dogfood-independent-task.md)（独立task）、[019](../journal/019-replace-interim-workflow.md)（AGENTS.mdの運用置き換え）、[013](../journal/013-dogfood-dependent-tasks.md)（A・C並列、BはAの着地commitから）、[014](../journal/014-dogfood-failure-recovery.md)（agent killからの再試行）を6 task・7 runで通し、6件を `integrate` で着地させた。DBの手修正なし。Claude Codeからの登録・実行・着地・復旧はSV sessionがpluginと同じCLIで行い、ステップ8も完了とする。
 
 ローカルに固定したビルド済みバイナリを使い、実行中のruntimeを作業成果で置き換えない。SVは常駐のClaude Code sessionで、`read-screen`で完了を確認し、差分をレビューして`integrate`を呼び、`needs_session`のrunにはresumeで指示する。
 
@@ -141,7 +143,7 @@ receiptにはrun ID、結果、commit SHA、実施したunit test/E2E/subagent r
 
 ## Ordering
 
-`1 → 2 → 3 → 4 → 5 → 6 → 7 → 8 → 9`。ステップ1〜7は実装済みで、4の実機確認（010）も並列とmerge queueを含めて完了した。ステップ8のpluginは実装済みで、Claude Codeからの実行・統合・復旧の確認をステップ9に含める。次の着手単位は012（ドッグフーディングへの移行）。012・013・014・019のジャーナルは`draft`で置き、暫定運用のSVは起動しない。016・017・018・010がdoneになった時点で`cmux-taskq add`へ登録し、013・014・019はcmux-taskqで流す。
+`1 → 2 → 3 → 4 → 5 → 6 → 7 → 8 → 9`。全ステップ完了（2026-09-22）。M1達成。以降の開発taskはAGENTS.mdの手順でcmux-taskqに登録して流す。次はAfter first dogfoodingの項目をtaskに割る。
 
 ## After first dogfooding
 
