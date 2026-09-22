@@ -1,6 +1,7 @@
-//! End-to-end happy path through the real binary, real Git, and real cmux.
-//! Claude is replaced by a stub script that does what the prompt asks: change,
-//! commit, write the receipt. Requires a running cmux, so it is ignored by default:
+//! End-to-end happy path through the real binary, real Git, and real cmux,
+//! from `add` to the squash landing by `integrate`. Claude is replaced by a
+//! stub script that does what the prompt asks: change, commit, write the
+//! receipt; the test itself plays the session that resolves a conflict. Requires a running cmux, so it is ignored by default:
 //! `cargo test --locked --test e2e -- --ignored --nocapture`.
 use serde_json::Value;
 use std::{
@@ -234,7 +235,7 @@ fn fixture() -> Fixture {
         data_home: dir.path().join("data"),
     };
     let init = taskq(&env, &["init"]);
-    assert_eq!(init["schema_version"], 5);
+    assert_eq!(init["schema_version"], 6);
     let db = PathBuf::from(init["db"].as_str().unwrap());
     assert!(db.starts_with(env.data_home.join("cmux-taskq")));
     assert_eq!(taskq(&env, &["locate"])["db_exists"], true);
@@ -365,7 +366,7 @@ fn supervise_once(
 
 #[test]
 #[ignore = "needs a running cmux; run with --ignored"]
-fn happy_path_runs_a_stub_agent_through_cmux_and_awaits_integration() {
+fn happy_path_runs_a_stub_agent_through_cmux_and_lands_on_main() {
     let fixture = fixture();
     let Fixture {
         cmux,
@@ -533,31 +534,57 @@ fn happy_path_runs_a_stub_agent_through_cmux_and_awaits_integration() {
     assert_eq!(status["supervisors"], Value::Array(vec![]), "{status}");
     assert_eq!(status["runs"], Value::Array(vec![]), "{status}");
 
-    // Integration is manual: nothing happens until main contains the commit.
-    let not_yet = taskq(env, &["integrate", &task_id]);
-    assert_eq!(not_yet["outcome"], "not_integrated", "{not_yet}");
-    assert_eq!(not_yet["main"], base);
-    assert_eq!(
-        taskq(env, &["show", &task_id])["task"]["status"],
-        "in_progress"
-    );
-    git(repo, &["merge", "--ff-only", &format!("taskq/{run_id}")]);
-    assert_eq!(git(repo, &["rev-parse", "main"]), head);
+    // Landing is the runtime's job: one squash commit on main with the run's tree.
     let integrated = taskq(env, &["integrate", &task_id]);
     assert_eq!(integrated["outcome"], "integrated", "{integrated}");
     assert_eq!(integrated["task"]["status"], "completed");
     assert_eq!(integrated["run"]["status"], "integrated");
+    let main = git(repo, &["rev-parse", "main"]);
+    assert_ne!(main, head);
+    assert_eq!(integrated["run"]["result_commit"], main.as_str());
+    assert_eq!(git(repo, &["rev-parse", "main^"]), base);
+    assert_eq!(
+        git(repo, &["rev-parse", "main^{tree}"]),
+        git(repo, &["rev-parse", &format!("{head}^{{tree}}")])
+    );
+    assert_eq!(
+        git(repo, &["log", "-1", "--format=%B", "main"]),
+        format!("e2e stub task\n\nadded e2e.txt\n\nTaskq-Task: {task_id}\nTaskq-Run: {run_id}")
+    );
+    assert_eq!(git(repo, &["status", "--porcelain"]), ""); // The checkout moved with main.
+    assert!(repo.join("e2e.txt").exists());
+    assert_eq!(
+        git(repo, &["rev-parse", &format!("refs/taskq/runs/{run_id}")]),
+        head
+    );
+    assert!(!worktree.exists(), "landed worktree was not removed");
+    assert_eq!(
+        git(repo, &["branch", "--list", &format!("taskq/{run_id}")]),
+        ""
+    );
     let detail = taskq(env, &["show", &task_id]);
     assert_eq!(detail["task"]["status"], "completed");
     assert_eq!(detail["runs"][0]["status"], "integrated");
-    assert!(
-        detail["events"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|e| e["kind"] == "run_integrated")
+    let kinds: Vec<&str> = detail["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["kind"].as_str().unwrap())
+        .collect();
+    for expected in [
+        "integration_started",
+        "integration_rebased",
+        "run_integrated",
+        "worktree_removed",
+    ] {
+        assert!(kinds.contains(&expected), "missing {expected} in {kinds:?}");
+    }
+    assert!(!kinds.contains(&"cleanup_failed"), "{kinds:?}");
+    assert_eq!(
+        taskq(env, &["integrate", "--next"])["outcome"],
+        "no_run_awaiting"
     );
-    assert!(worktree.exists()); // Kept until the operator removes it.
+    assert_eq!(taskq(env, &["status"])["runs"], Value::Array(vec![]));
 }
 
 /// Two independent tasks run in two cmux workspaces at once; the task that
@@ -621,20 +648,104 @@ fn two_independent_tasks_run_concurrently_and_a_dependent_follows_integration() 
     assert_eq!(taskq(env, &["candidates"]).as_array().unwrap().len(), 0);
     assert_eq!(taskq(env, &["doctor"])["runs"], Value::Array(vec![]));
 
-    // Integrate the first task; the dependent becomes claimable from the new main.
+    // Land the first task; the dependent becomes claimable from the landed main.
     let first_run = taskq(env, &["show", &first])["runs"][0].clone();
     let first_commit = first_run["result_commit"].as_str().unwrap().to_owned();
-    git(
-        repo,
-        &["merge", "--ff-only", first_run["branch"].as_str().unwrap()],
-    );
     assert_eq!(taskq(env, &["integrate", &first])["outcome"], "integrated");
+    let first_landed = git(repo, &["rev-parse", "main"]);
+    assert_ne!(first_landed, first_commit);
+    assert_eq!(git(repo, &["rev-parse", "main^"]), base.as_str());
     assert_eq!(taskq(env, &["candidates"])[0]["id"].to_string(), third);
     let pass = supervise_once(&fixture, &["--parallel", "2"], &[&third], &mut guard);
     assert_eq!(pass.outcome["runs"].as_array().unwrap().len(), 1);
     let run = taskq(env, &["show", &third])["runs"][0].clone();
     assert_eq!(run["status"], "awaiting_integration", "{run}");
-    assert_eq!(run["base_commit"], first_commit.as_str());
-    assert_eq!(git(repo, &["rev-parse", "main"]), first_commit);
+    assert_eq!(run["base_commit"], first_landed.as_str());
+    assert_eq!(git(repo, &["rev-parse", "main"]), first_landed);
     assert_eq!(taskq(env, &["status"])["supervisors"], Value::Array(vec![]));
+
+    // The merge queue is FIFO by validation time: --next takes the second
+    // task first. It rewrote the same file as the first, so the runtime
+    // cannot rebase it and parks it for a session; the next --next lands the
+    // dependent, which sits on the first landing.
+    let parked = taskq(env, &["integrate", "--next"]);
+    assert_eq!(parked["outcome"], "needs_session", "{parked}");
+    assert_eq!(parked["run"]["task_id"].to_string(), second);
+    assert!(
+        parked["reason"]
+            .as_str()
+            .unwrap()
+            .contains("conflicted in e2e.txt"),
+        "{parked}"
+    );
+    let next = taskq(env, &["integrate", "--next"]);
+    assert_eq!(next["outcome"], "integrated", "{next}");
+    assert_eq!(next["task"]["id"].to_string(), third);
+    let third_landed = git(repo, &["rev-parse", "main"]);
+    assert_eq!(git(repo, &["rev-parse", "main^"]), first_landed);
+
+    // The session resolves the parked run on top of main and rewrites its receipt.
+    let run = taskq(env, &["show", &second])["runs"][0].clone();
+    assert_eq!(run["status"], "needs_session");
+    let worktree = Path::new(run["worktree_path"].as_str().unwrap());
+    assert_eq!(
+        git(worktree, &["rev-parse", "HEAD"]),
+        run["result_commit"].as_str().unwrap()
+    );
+    assert_eq!(
+        taskq(env, &["integrate", "--next"])["outcome"],
+        "no_run_awaiting"
+    );
+    let rebase = Command::new("git")
+        .arg("-C")
+        .arg(worktree)
+        .args(["rebase", &third_landed])
+        .output()
+        .unwrap();
+    assert!(!rebase.status.success());
+    fs::write(worktree.join("e2e.txt"), "resolved by the session\n").unwrap();
+    git(worktree, &["add", "e2e.txt"]);
+    assert!(
+        Command::new("git")
+            .arg("-C")
+            .arg(worktree)
+            .env("GIT_EDITOR", "true")
+            .args(["rebase", "--continue"])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let resolved = git(worktree, &["rev-parse", "HEAD"]);
+    let receipt_path = Path::new(run["receipt_path"].as_str().unwrap());
+    let mut receipt: Value =
+        serde_json::from_str(&fs::read_to_string(receipt_path).unwrap()).unwrap();
+    receipt["commit"] = Value::String(resolved.clone());
+    receipt["summary"] = Value::String("resolved e2e.txt".into());
+    fs::write(receipt_path.with_extension("tmp"), receipt.to_string()).unwrap();
+    fs::rename(receipt_path.with_extension("tmp"), receipt_path).unwrap();
+    let landed = taskq(env, &["integrate", &second]);
+    assert_eq!(landed["outcome"], "integrated", "{landed}");
+    assert_eq!(git(repo, &["rev-parse", "main^"]), third_landed);
+    assert_eq!(
+        git(repo, &["rev-list", "--count", &format!("{base}..main")]),
+        "3"
+    );
+    assert_eq!(
+        fs::read_to_string(repo.join("e2e.txt")).unwrap(),
+        "resolved by the session\n"
+    );
+    for task in [&first, &second, &third] {
+        let detail = taskq(env, &["show", task]);
+        assert_eq!(detail["task"]["status"], "completed", "{task}");
+        assert!(
+            !Path::new(detail["runs"][0]["worktree_path"].as_str().unwrap()).exists(),
+            "{task}"
+        );
+    }
+    assert_eq!(
+        git(repo, &["for-each-ref", "refs/taskq/runs/"])
+            .lines()
+            .count(),
+        3
+    );
 }

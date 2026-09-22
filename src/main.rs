@@ -88,10 +88,15 @@ enum Command {
         #[arg(long, default_value = "claude")]
         claude: PathBuf,
     },
-    /// Confirm that a task's awaiting run was merged into main and complete the task.
+    /// Land a validated run on main: rebase, re-validate, squash into one commit, complete the task.
     Integrate {
-        id: i64,
-        /// Checkout of the repository to check; defaults to the working directory.
+        /// Task whose run awaits integration or comes back from a session.
+        #[arg(required_unless_present = "next", conflicts_with = "next")]
+        id: Option<i64>,
+        /// Land the oldest run awaiting integration instead of naming a task.
+        #[arg(long)]
+        next: bool,
+        /// Checkout of the repository to land in; defaults to the working directory.
         /// Must be the repository the queue is bound to.
         #[arg(long)]
         repo: Option<PathBuf>,
@@ -218,8 +223,13 @@ fn execute(cli: Cli) -> Result<Value> {
                 &options,
             )?
         }
-        Command::Integrate { id, repo } => {
-            cmux_taskq::runtime::integrate(&db, id, &checkout(repo))?
+        Command::Integrate { id, next, repo } => {
+            use cmux_taskq::runtime::IntegrateTarget;
+            let target = match (id, next) {
+                (Some(id), false) => IntegrateTarget::Task(id),
+                _ => IntegrateTarget::Next,
+            };
+            cmux_taskq::runtime::integrate(&db, target, &checkout(repo))?
         }
         Command::Doctor => cmux_taskq::runtime::doctor(&db)?,
         Command::Recover { run } => cmux_taskq::runtime::recover(&db, &run)?,

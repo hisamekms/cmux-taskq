@@ -1,18 +1,19 @@
 //! Execute claimed tasks in parallel, validate their receipts, close the
-//! workspaces of accepted runs, confirm integration into main, and recover
+//! workspaces of accepted runs, land them on main one at a time, and recover
 //! orphaned runs. One run's state machine is unchanged from the single-run
 //! supervisor; the loop multiplexes independent slots and isolates failures.
 use crate::{
     application::{AgentProvider, TaskQueue, WorkspaceBackend},
     domain::{
-        ClaimOutcome, IntegrationOutcome, Receipt, RunLease, RunProcess, RunStatus, Task, TaskRun,
+        ClaimOutcome, IntegrationOutcome, Receipt, ReceiptResult, RunLease, RunProcess, RunStatus,
+        Task, TaskRun,
     },
     infrastructure::{
         adapters::{
             ClaudeCode, GitRepository, path_text, process_alive, run_shell_to_log, shell_join,
         },
         location::runs_dir,
-        runtime_store::{HEARTBEAT_TIMEOUT_SECS, RunPlan, Validation},
+        runtime_store::{HEARTBEAT_TIMEOUT_SECS, Landing, RunPlan, Validation},
         sqlite::SqliteQueue,
     },
 };
@@ -735,28 +736,29 @@ fn check_receipt(
     Ok(Ok((receipt, commit)))
 }
 
-/// Confirm that the task's awaiting run was merged into `main` by hand and
-/// complete the task. Only merge and fast-forward count: the result commit
-/// itself must be an ancestor of `refs/heads/main`. A squash or cherry-pick
-/// is reported as not integrated and nothing changes. `repo` is any checkout
-/// of the repository the queue is bound to.
-pub fn integrate(db: &Path, task_id: i64, repo: &Path) -> Result<Value> {
-    let mut queue = SqliteQueue::open(db)?;
-    let detail = queue.show(task_id)?;
-    let run = detail
-        .runs
-        .iter()
-        .find(|r| r.status == RunStatus::AwaitingIntegration)
-        .with_context(|| {
-            format!(
-                "task {task_id} ({}) has no run awaiting integration",
-                detail.task.status.as_str()
-            )
-        })?;
-    let commit = run
-        .result_commit
-        .as_deref()
-        .context("run has no verified result commit")?;
+/// Which run `integrate` lands.
+#[derive(Debug, Clone, Copy)]
+pub enum IntegrateTarget {
+    /// The task's run that awaits integration or comes back from a session.
+    Task(i64),
+    /// The oldest run awaiting integration by validation time (FIFO).
+    Next,
+}
+
+/// Land one validated run on `main`: take the single integration slot,
+/// rebase the run worktree onto the current `refs/heads/main`, re-validate
+/// (receipt, descent from main, clean tree, verification commands), squash
+/// the tree into one commit with `Taskq-Task` / `Taskq-Run` trailers and
+/// fast-forward `main` to it. Never a merge commit, never a fast-forward of
+/// the run branch itself. A conflict or a failed re-validation parks the run
+/// as `needs_session` for a resumed session to fix; a rewritten receipt that
+/// reports `failed` ends the run. `repo` is any checkout of the repository
+/// the queue is bound to.
+pub fn integrate(db: &Path, target: IntegrateTarget, repo: &Path) -> Result<Value> {
+    let db = db
+        .canonicalize()
+        .context("queue must already be initialized")?;
+    let mut queue = SqliteQueue::open(&db)?;
     let repository = GitRepository::inspect(repo)?;
     let common_dir = path_text(&repository.common_dir)?;
     let bound = queue
@@ -767,22 +769,331 @@ pub fn integrate(db: &Path, task_id: i64, repo: &Path) -> Result<Value> {
         "{} belongs to {common_dir}, but the queue is bound to {bound}",
         repo.display()
     );
-    let main = repository.base_commit.clone();
-    if !repository.is_ancestor(commit, &main)? {
-        return Ok(serde_json::to_value(IntegrationOutcome::NotIntegrated {
-            run: Box::new(run.clone()),
-            main: main.clone(),
-            reason: format!(
-                "commit {commit} is not an ancestor of refs/heads/main ({main}); \
-                 merge or fast-forward the run branch (squash and cherry-pick are not recognized)"
-            ),
-        })?);
+    let run = match target {
+        IntegrateTarget::Task(task_id) => {
+            let detail = queue.show(task_id)?;
+            if let Some(busy) = detail
+                .runs
+                .iter()
+                .find(|r| r.status == RunStatus::Integrating)
+            {
+                bail!(
+                    "run {} of task {task_id} is already integrating (see doctor if it is stuck)",
+                    busy.id
+                );
+            }
+            detail
+                .runs
+                .iter()
+                .find(|r| {
+                    matches!(
+                        r.status,
+                        RunStatus::AwaitingIntegration | RunStatus::NeedsSession
+                    )
+                })
+                .cloned()
+                .with_context(|| {
+                    format!(
+                        "task {task_id} ({}) has no run awaiting integration or a session",
+                        detail.task.status.as_str()
+                    )
+                })?
+        }
+        IntegrateTarget::Next => match queue.next_awaiting_integration()? {
+            Some(run) => run,
+            None => return Ok(serde_json::to_value(IntegrationOutcome::NoRunAwaiting)?),
+        },
+    };
+    let previous = run.status;
+    let token = Uuid::new_v4().to_string();
+    let main = repository.main_head()?;
+    let run = queue.begin_integration(&run.id, &token, &main)?;
+    let heartbeat = Heartbeat::start(db.clone(), token.clone());
+    let task = queue.show(run.task_id)?.task;
+    eprintln!(
+        "run {} integrating task {} onto main {main}",
+        run.id, run.task_id
+    );
+    let verdict = match land(&mut queue, &repository, &task, &run, &main) {
+        Ok(verdict) => verdict,
+        Err(error) => {
+            // Nothing reached main: give the slot back and keep the run where it was.
+            let message = format!("integration stopped before main moved: {error:#}");
+            if let Err(record) =
+                queue.abort_integration(&run.id, &token, previous.as_str(), &message)
+            {
+                eprintln!("run {}: could not record the error: {record:#}", run.id);
+            }
+            return Err(error.context(format!("run {} returned to {}", run.id, previous.as_str())));
+        }
+    };
+    let outcome = match verdict {
+        Verdict::Landed(landing) => {
+            let (task, run) = queue
+                .finish_integration(&run.id, &token, &landing, &common_dir)
+                .with_context(|| {
+                    format!(
+                        "main advanced to {} but run {} could not be completed; inspect show and doctor",
+                        landing.commit, run.id
+                    )
+                })?;
+            eprintln!(
+                "task {} landed as {} on main; run {} integrated",
+                task.id, landing.commit, run.id
+            );
+            remove_landed_worktree(&mut queue, &repository, &run);
+            IntegrationOutcome::Integrated {
+                task,
+                run: Box::new(run),
+            }
+        }
+        Verdict::Deferred { reason, detail } => {
+            eprintln!("run {} needs a session: {reason}", run.id);
+            let run = queue.defer_integration(&run.id, &token, &reason, detail)?;
+            IntegrationOutcome::NeedsSession {
+                run: Box::new(run),
+                main,
+                reason,
+            }
+        }
+        Verdict::ReceiptFailed(reason) => {
+            eprintln!("run {} failed: {reason}", run.id);
+            let run = queue.fail_integration(&run.id, &token, &reason)?;
+            IntegrationOutcome::Failed {
+                run: Box::new(run),
+                reason,
+            }
+        }
+    };
+    drop(heartbeat); // Stops the lease heartbeat before this process reports.
+    Ok(serde_json::to_value(outcome)?)
+}
+
+enum Verdict {
+    Landed(Landing),
+    /// Re-validation did not pass; the worktree is left for a session.
+    Deferred {
+        reason: String,
+        detail: Value,
+    },
+    /// The session's rewritten receipt reports `failed`.
+    ReceiptFailed(String),
+}
+
+/// Rebase, re-validate and land one run. `Ok(Deferred)` and
+/// `Ok(ReceiptFailed)` are verdicts on the run; `Err` is a failure of the
+/// landing itself (Git, files) before `main` moved.
+fn land(
+    queue: &mut SqliteQueue,
+    repository: &GitRepository,
+    task: &Task,
+    run: &TaskRun,
+    main: &str,
+) -> Result<Verdict> {
+    let defer = |reason: String, detail: Value| Ok(Verdict::Deferred { reason, detail });
+    let worktree = Path::new(run.worktree_path.as_ref().context("missing worktree")?);
+    ensure!(
+        worktree.is_dir(),
+        "worktree {} is missing",
+        worktree.display()
+    );
+    let branch = run.branch.as_ref().context("missing branch")?;
+    let run_dir = Path::new(run.run_dir.as_ref().context("missing run directory")?);
+    // A rebase left behind by a crashed landing or an unfinished session is undone first.
+    if repository.rebase_in_progress(worktree)? {
+        repository.rebase_abort(worktree)?;
+        queue.record_runtime_event(
+            &run.id,
+            "integration_rebase_aborted",
+            json!({"reason": "a rebase was left in progress"}),
+        )?;
     }
-    let (task, run) = queue.finish_integration(&run.id, &main, &common_dir)?;
-    Ok(serde_json::to_value(IntegrationOutcome::Integrated {
-        task,
-        run: Box::new(run),
-    })?)
+    let expected_ref = format!("refs/heads/{branch}");
+    match repository.current_branch(worktree)? {
+        Some(current) if current == expected_ref => (),
+        current => {
+            return defer(
+                format!(
+                    "worktree is on {} instead of {expected_ref}",
+                    current.as_deref().unwrap_or("a detached HEAD")
+                ),
+                json!({}),
+            );
+        }
+    }
+    let head = repository.head(worktree)?;
+    // The receipt must describe this head: the validated one for a fresh run,
+    // the one the session rewrote after resolving otherwise. A stale receipt
+    // means the session is not done.
+    let receipt_path = Path::new(run.receipt_path.as_ref().context("missing receipt path")?);
+    let receipt = match fs::read_to_string(receipt_path) {
+        Ok(text) => match Receipt::parse(&text) {
+            Ok(receipt) => receipt,
+            Err(error) => return defer(format!("{error:#}"), json!({})),
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return defer(
+                format!("receipt is missing at {}", receipt_path.display()),
+                json!({}),
+            );
+        }
+        Err(error) => return Err(error).context("read receipt"),
+    };
+    if receipt.result == ReceiptResult::Failed {
+        return Ok(Verdict::ReceiptFailed(format!(
+            "session reported the run as failed: {}",
+            receipt.summary
+        )));
+    }
+    if let Err(error) = receipt.check(&run.id) {
+        return defer(format!("{error:#}"), json!({}));
+    }
+    if head != receipt.commit.to_ascii_lowercase() {
+        return defer(
+            format!(
+                "receipt commit {} is not the head of {branch} ({head}); rerun the verification commands and rewrite the receipt for the current head",
+                receipt.commit
+            ),
+            json!({"head": head}),
+        );
+    }
+    let status = repository.status(worktree)?;
+    if !status.trim().is_empty() {
+        return defer(
+            format!("worktree is not clean:\n{}", status.trim_end()),
+            json!({"head": head}),
+        );
+    }
+    // Onto the current main. A no-op when the run already sits on it.
+    if let Err(output) = repository.rebase(worktree, main)? {
+        let conflicts = repository.conflicted_files(worktree).unwrap_or_default();
+        if repository.rebase_in_progress(worktree)? {
+            repository.rebase_abort(worktree)?;
+        }
+        return defer(
+            format!(
+                "rebase onto main {main} conflicted in {}; resolve it in the worktree (git rebase {main}), rerun the verification commands, and rewrite the receipt with the new head",
+                if conflicts.is_empty() {
+                    "the run branch".to_owned()
+                } else {
+                    conflicts.join(", ")
+                }
+            ),
+            json!({
+                "main": main,
+                "head": head,
+                "conflicts": conflicts,
+                "output_tail": tail(&output, 2000),
+                "aborted": true,
+            }),
+        );
+    }
+    let rebased = repository.head(worktree)?;
+    queue.record_runtime_event(
+        &run.id,
+        "integration_rebased",
+        json!({"main": main, "head_before": head, "head_after": rebased}),
+    )?;
+    if rebased == main {
+        return defer(
+            format!(
+                "no commit remains on top of main {main} after the rebase; if the change is no longer needed, write a failed receipt with the reason"
+            ),
+            json!({"main": main, "head": rebased}),
+        );
+    }
+    ensure!(
+        repository.is_ancestor(main, &rebased)?,
+        "rebased head {rebased} does not descend from main {main}"
+    );
+    let status = repository.status(worktree)?;
+    if !status.trim().is_empty() {
+        return defer(
+            format!(
+                "worktree is not clean after the rebase:\n{}",
+                status.trim_end()
+            ),
+            json!({"main": main, "head": rebased}),
+        );
+    }
+    // The task's verification commands run again on the rebased tree.
+    for (index, command) in task.verification_commands.iter().enumerate() {
+        let log = run_dir.join(format!("integrate-verify-{}.log", index + 1));
+        let status = run_shell_to_log(command, worktree, &log)?;
+        let exit_code = status.code().unwrap_or(128);
+        let output = fs::read_to_string(&log).unwrap_or_default();
+        queue.record_runtime_event(
+            &run.id,
+            "verification_command",
+            json!({
+                "phase": "integration",
+                "index": index + 1,
+                "command": command,
+                "exit_code": exit_code,
+                "log_path": path_text(&log)?,
+                "output_tail": tail(&output, 2000),
+            }),
+        )?;
+        if exit_code != 0 {
+            return defer(
+                format!(
+                    "verification command {command:?} exited with {exit_code} after the rebase onto {main}; see {}",
+                    log.display()
+                ),
+                json!({"main": main, "head": rebased, "command": command, "exit_code": exit_code}),
+            );
+        }
+    }
+    // One commit on main with the rebased tree; the run's own history stays
+    // reachable under refs/taskq/runs/<run-id>.
+    let paragraphs = commit_message(task, run, &receipt);
+    let tree = repository.tree_of(&rebased)?;
+    let commit = repository.commit_tree(&tree, main, &paragraphs)?;
+    let history_ref = format!("refs/taskq/runs/{}", run.id);
+    repository.update_ref(&history_ref, &rebased)?;
+    repository.advance_main(main, &commit)?;
+    Ok(Verdict::Landed(Landing {
+        commit,
+        source_commit: rebased,
+        main_before: main.to_owned(),
+        history_ref,
+        message: paragraphs.join("\n\n"),
+    }))
+}
+
+/// Title, the receipt's summary, and the trailers that tie the commit to
+/// the queue, as paragraphs.
+fn commit_message(task: &Task, run: &TaskRun, receipt: &Receipt) -> Vec<String> {
+    let mut paragraphs = vec![task.title.trim().to_owned()];
+    let summary = receipt.summary.trim();
+    if !summary.is_empty() {
+        paragraphs.push(summary.to_owned());
+    }
+    paragraphs.push(format!("Taskq-Task: {}\nTaskq-Run: {}", task.id, run.id));
+    paragraphs
+}
+
+/// Drop the landed run's worktree and branch. The result is already on
+/// `main` and under the history ref, so a failure here is only recorded.
+fn remove_landed_worktree(queue: &mut SqliteQueue, repository: &GitRepository, run: &TaskRun) {
+    let (Some(worktree), Some(branch)) = (&run.worktree_path, &run.branch) else {
+        return;
+    };
+    let recorded = match repository.remove_worktree_and_branch(Path::new(worktree), branch) {
+        Ok(()) => queue.record_runtime_event(
+            &run.id,
+            "worktree_removed",
+            json!({"path": worktree, "branch": branch}),
+        ),
+        Err(error) => {
+            let message = format!("landed worktree {worktree} could not be removed: {error:#}");
+            eprintln!("run {}: {message}", run.id);
+            queue.record_cleanup_failure(&run.id, &message)
+        }
+    };
+    if let Err(error) = recorded {
+        eprintln!("run {}: could not record the cleanup: {error:#}", run.id);
+    }
 }
 
 fn tail(text: &str, max_bytes: usize) -> &str {
@@ -938,7 +1249,8 @@ pub fn doctor(db: &Path) -> Result<Value> {
     })?)
 }
 
-/// Mark an orphaned run `interrupted` and drop its lease, after checking that
+/// Mark an orphaned run `interrupted` (or a run whose `integrate` process
+/// died `awaiting_integration` again) and drop its lease, after checking that
 /// nothing registered for it is still alive. Never reruns, never deletes the
 /// worktree or workspace, leaves the task `in_progress`, and does not touch
 /// any other run.
@@ -948,7 +1260,11 @@ pub fn recover(db: &Path, id: &str) -> Result<Value> {
     ensure!(
         matches!(
             run.status,
-            RunStatus::Claimed | RunStatus::Starting | RunStatus::Running | RunStatus::Validating
+            RunStatus::Claimed
+                | RunStatus::Starting
+                | RunStatus::Running
+                | RunStatus::Validating
+                | RunStatus::Integrating
         ),
         "run {id} is {}; only unfinished runs can be recovered",
         run.status.as_str()

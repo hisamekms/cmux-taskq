@@ -7,7 +7,7 @@ description: Register and inspect cmux-taskq tasks through the locally built cmu
 
 cmux-taskq runs development tasks in cmux workspaces and isolated Git worktrees. This skill drives the `cmux-taskq` binary; every command prints JSON on stdout, and a runtime error prints `{"error": ...}` on stderr with exit status 1. Never read or modify the SQLite queue file directly (no `sqlite3`, no editing); the binary is the only interface.
 
-Starting a run and confirming integration are in the `taskq-run` skill; recovering an interrupted run is in `taskq-recover`.
+Starting a run, landing it on `main` with `integrate`, and resuming a `needs_session` run are in the `taskq-run` skill; recovering an interrupted run is in `taskq-recover`.
 
 ## 1. Locate the binary and the queue
 
@@ -60,12 +60,12 @@ The task is registered as `draft` and the JSON includes its `id`. Then make it r
 | `"$TASKQ" show ID` | `task`, `dependencies`, `runs`, `events`, `processes` |
 | `"$TASKQ" candidates` | What the next `supervise` would pick |
 | `"$TASKQ" locate` | The queue this directory resolves to (`db`, `runs_dir`, `git_common_dir`, `db_exists`) without opening it |
-| `"$TASKQ" status` | Live supervisors (`supervisors`, empty when none owns a run) and unfinished runs with their leases |
+| `"$TASKQ" status` | Live supervisors and `integrate` processes (`supervisors`, empty when none owns a run) and unfinished runs with their leases |
 | `"$TASKQ" doctor` | Per run: lease liveness, processes, worktree/receipt existence, `blockers`, `recoverable` |
 
 Task `status`: `draft` → `ready` → `in_progress` → `completed`, or `canceled`. A task stays `in_progress` while any run is unfinished or awaiting integration.
 
-Run `status` in `runs` (latest last): `claimed`, `starting`, `running`, `validating` are unfinished; `awaiting_integration` means the receipt and verification passed and the branch waits for a manual merge into `main`; `integrated` means the merge was confirmed and the task is `completed`; `failed` and `interrupted` keep their worktree and workspace for inspection, with the reason in `last_error`. Dependency-free tasks run in parallel (up to the supervisor's `--parallel`), each in its own workspace and worktree; a dependent task waits until every predecessor is `completed`.
+Run `status` in `runs` (latest last): `claimed`, `starting`, `running`, `validating` are unfinished; `awaiting_integration` means the receipt and verification passed and the run waits for `integrate` to land it on `main`; `integrating` means an `integrate` process is landing it right now; `needs_session` means the landing hit a rebase conflict or a failed verification and a resumed session must fix it (`last_error` says what); `integrated` means the run was squashed onto `main` (`result_commit` is the landed commit) and the task is `completed`; `failed` and `interrupted` keep their worktree and workspace for inspection, with the reason in `last_error`. Dependency-free tasks run in parallel (up to the supervisor's `--parallel`), each in its own workspace and worktree; a dependent task waits until every predecessor is `completed`.
 
 Useful run fields: `branch` (`taskq/<run-id>`), `worktree_path`, `workspace_id` (cmux), `run_dir` (prompt, logs, `receipt.json`, `verify-N.log`), `receipt_path`, `result_commit`, `last_error`, `workspace_closed_at`.
 

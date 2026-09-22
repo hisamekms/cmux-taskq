@@ -23,6 +23,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../../migrations/0003_workspace_close.sql"),
     include_str!("../../migrations/0004_integration.sql"),
     include_str!("../../migrations/0005_run_leases.sql"),
+    include_str!("../../migrations/0006_merge_queue.sql"),
 ];
 const READY_QUERY: &str = "
     SELECT t.* FROM tasks t
@@ -33,7 +34,8 @@ const READY_QUERY: &str = "
       )
       AND NOT EXISTS (
         SELECT 1 FROM task_runs r WHERE r.task_id = t.id
-          AND r.status IN ('claimed','starting','running','validating','awaiting_integration')
+          AND r.status IN ('claimed','starting','running','validating','awaiting_integration',
+                           'integrating','needs_session')
       )
     ORDER BY t.id";
 
@@ -288,11 +290,13 @@ pub(super) fn claim_task(tx: &Connection, base_commit: &str) -> Result<ClaimOutc
     Ok(ClaimOutcome::Claimed { run: Box::new(run) })
 }
 
-/// Executing or awaiting integration; the same set as `one_unfinished_run_per_task`.
+/// Executing, awaiting or undergoing integration, or waiting for a session;
+/// the same set as `one_unfinished_run_per_task`.
 fn has_unfinished_run(conn: &Connection, task_id: i64) -> Result<bool> {
     Ok(conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM task_runs WHERE task_id=?1
-         AND status IN ('claimed','starting','running','validating','awaiting_integration'))",
+         AND status IN ('claimed','starting','running','validating','awaiting_integration',
+                        'integrating','needs_session'))",
         [task_id],
         |r| r.get(0),
     )?)

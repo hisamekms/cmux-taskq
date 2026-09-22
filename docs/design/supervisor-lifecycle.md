@@ -12,6 +12,7 @@ related:
   - adr-0003
   - adr-0006
   - adr-0007
+  - adr-0008
   - design-persistence
   - design-provider-lifecycle
 ---
@@ -31,14 +32,19 @@ ready task (dependencies completed)
   → close cmux workspace             │
   → release run lease               ─┘
   → awaiting_integration / succeeded
-  → (manual merge into main)
-  → integrate: run integrated, task completed
-  → dependents become candidates; the resident loop claims them from the new main
+  → integrate (one at a time, FIFO by validation):
+      integrating → rebase onto main → re-validate → squash-land on main
+      → run integrated (result_commit = landed commit), task completed
+      → worktree and branch removed; history kept at refs/taskq/runs/<run-id>
+    conflict / failed re-validation → needs_session
+      → SV resumes a session in the worktree; it resolves, reruns verification,
+        rewrites the receipt → integrate ID again (failed receipt → run failed)
+  → dependents become candidates; the resident loop claims them from the landed main
 ```
 
 ## Implementation status
 
-ステップ3で`claim`から`running`、セッション終了検知までを、ステップ4の[005](../journal/005-receipt-validation.md)でreceiptの検証と`awaiting_integration`への遷移を、[006](../journal/006-workspace-close.md)で受理後のworkspace終了を、[007](../journal/007-session-exit-request.md)でreceipt受領後の終了要求を、[009](../journal/009-doctor-recover.md)で`doctor`/`recover`を、[008](../journal/008-integration-confirm.md)で統合確認`integrate`と`completed`への遷移を`src/runtime.rs`に実装した。ステップ6の[017](../journal/017-parallel-runs.md)（[ADR-0007](../adr/0007-run-level-leases-parallel-execution.md)）でleaseをrun単位にし、`supervise`を上限付き並列の常駐ループにした。
+ステップ3で`claim`から`running`、セッション終了検知までを、ステップ4の[005](../journal/005-receipt-validation.md)でreceiptの検証と`awaiting_integration`への遷移を、[006](../journal/006-workspace-close.md)で受理後のworkspace終了を、[007](../journal/007-session-exit-request.md)でreceipt受領後の終了要求を、[009](../journal/009-doctor-recover.md)で`doctor`/`recover`を、[008](../journal/008-integration-confirm.md)で統合確認`integrate`と`completed`への遷移を`src/runtime.rs`に実装した。ステップ6の[017](../journal/017-parallel-runs.md)（[ADR-0007](../adr/0007-run-level-leases-parallel-execution.md)）でleaseをrun単位にし、`supervise`を上限付き並列の常駐ループにした。ステップ7の[018](../journal/018-merge-queue.md)（[ADR-0008](../adr/0008-merge-queue-squash-landing.md)）で`integrate`を手動mergeの確認からruntimeによる着地（rebase → 再検証 → squash）に置き換えた。
 
 ## `supervise`
 
@@ -112,18 +118,36 @@ receiptの形式は`src/domain.rs`の`Receipt`で、promptとREADMEに同じ契�
 
 ## `integrate`
 
-`cmux-taskq integrate ID`は、人がrun branch `taskq/<run-id>`をmainへmergeした後にrepository内で実行する。supervisorとは独立した操作で、leaseを取らない。`--db PATH`と`--repo REPO`は明示override。
+`cmux-taskq integrate ID`（taskの`awaiting_integration`または`needs_session`のrun）と`cmux-taskq integrate --next`（`awaiting_integration`のrunを検証完了の古い順に1件）は、検証済みのrunをruntimeが`main`へ着地させる操作で、SVがレビュー後にrepository内で実行する（[ADR-0008](../adr/0008-merge-queue-squash-landing.md)）。`--db PATH`と`--repo REPO`は明示override。repositoryは`GitRepository::inspect`で開き、common directoryが`queue_repository.git_common_dir`と一致することを要求する。
 
-1. taskの`awaiting_integration`のrunを取る。なければerror（`integrated`済みのtaskも同じ）。同じtaskにこの状態のrunは制約で高々1件。
-2. repositoryは既定でcwd、`--repo`があればそのpathを`GitRepository::inspect`で開き、common directoryが`queue_repository.git_common_dir`と一致することを要求する。`task_runs.repo_path`は記録として残るが既定には使わない（[016](../journal/016-queue-per-repository.md)）。
-3. `git merge-base --is-ancestor <result_commit> refs/heads/main`で確認する。merge commitでもfast-forwardでもresult commit自体がmainの祖先になる。squash / cherry-pickは別のSHAになるため祖先にならず、`{"outcome":"not_integrated","run":…,"main":…,"reason":…}`を返してDBは変えない（同等性判定は後回し）。
-4. 祖先なら1トランザクションでrunを`integrated`、Taskを`completed`にし、`run_integrated`（`result_commit`、`main`、`git_common_dir`）と`task_status_changed`を記録する。statusを条件にしたUPDATEで、二重実行や同時実行は0行更新のerrorになる。
+1. **スロット**: runを`integrating`にし、このプロセスのtokenで`run_leases`の行を作る（`begin_integration`、`integration_started`）。同時に`integrating`のrunは1件（`one_integrating_run_per_queue`）で、別のrunが着地中ならerror。leaseは`supervise`と同じthreadで2秒ごとにheartbeatし、`status`/`doctor`に`integrating`のrunとして並ぶ。`--next`の順序は`validation_finished`イベントのid順で、`needs_session`のrunは取らない。
+2. **worktreeの前処理**: worktreeが存在し、run branch `taskq/<run-id>`をcheckoutしていること。途中のrebase（`rebase-merge` / `rebase-apply`）が残っていれば`git rebase --abort`する（`integration_rebase_aborted`）。
+3. **receiptの検査**: `<run-dir>/receipt.json`がparseでき、`result`が`succeeded`で（`failed`ならrunを`failed`にして終わる。下記）、`Receipt::check`を通り、`commit`がworktreeの現在のHEADに一致する。衝突なしのrunではHEAD = `result_commit`なので検証済みのreceiptがそのまま通る。`needs_session`から戻るrunでは、セッションが新しいheadでreceiptを書き直したことの検出になる。worktreeはcleanであること。
+4. **rebase**: `git rebase --no-autostash --no-verify <main head>`（main headは着地開始時に読んだ`refs/heads/main`）。すでにmainの上にあればno-op。衝突したら`git diff --name-only --diff-filter=U`とGitの出力を取り、`rebase --abort`でworktreeを検証済みheadに戻して`needs_session`にする。成功したら`integration_rebased`（`head_before`、`head_after`）を記録する。
+5. **再検証**: rebase後のHEADがmain headと異なり（同じなら「commitが残らない」として`needs_session`。変更が不要ならセッションが`failed` receiptを書く）、main headの子孫であること。`git status --porcelain --untracked-files=all`が空であること。taskの`verification_commands`を順に`/bin/sh -c`でworktree内で再実行し、出力を`<run-dir>/integrate-verify-N.log`、結果を`verification_command`イベント（`phase: integration`）に残す。1件でも非0なら`needs_session`。
+6. **着地**: `git commit-tree <HEAD>^{tree} -p <main head>`で1 commitを作る。messageはtaskのtitle、receiptの`summary`（空なら省略）、trailer `Taskq-Task: <task id>` / `Taskq-Run: <run id>`。`refs/taskq/runs/<run-id>`をrebase後のHEADに向けてから、mainをcheckoutしているworktree（`git worktree list --porcelain`）があればそこで`git merge --ff-only <commit>`、なければ`git update-ref refs/heads/main <commit> <main head>`でmainを進める。
+7. **完了**: 1トランザクションでrunを`integrated`、`result_commit`を着地commit、`last_error`をnull、Taskを`completed`にし、lease行を消して`run_integrated`（`result_commit`、`source_commit`、`main_before`、`history_ref`、`message`、`git_common_dir`）、`lease_released`、`task_status_changed`を記録する（`finish_integration`）。
+8. **後始末**: `git worktree remove --force <worktree>`と`git branch -D taskq/<run-id>`（`worktree_removed`）。失敗は`cleanup_failed`イベントと`last_error`に残し、statusは変えない。
 
-worktreeとbranchは削除しない。統合確認後の削除は人が行う。
+結果は`IntegrationOutcome`: `{"outcome":"integrated","task":…,"run":…}`、`{"outcome":"needs_session","run":…,"main":…,"reason":…}`、`{"outcome":"failed","run":…,"reason":…}`、`--next`で対象がなければ`{"outcome":"no_run_awaiting"}`。
+
+### `needs_session`
+
+衝突（4）と再検証の失敗（5）は`defer_integration`でrunを`needs_session`にし、理由を`last_error`、詳細（衝突ファイル、Gitの出力の末尾、rebase後のheadなど）を`integration_deferred`イベントに書いて、lease行を消しスロットを空ける。worktreeは衝突なら検証済みhead、再検証の失敗ならrebase済みのheadに置いたまま残す。runはTaskを占有し続け、`ready`/`cancel`はできない。
+
+SVは`cmux workspace create --cwd <worktree> --command "claude --resume <run-id>"`でセッションを開き直し、`last_error`の理由と「mainへrebaseして解消し、検証コマンドを再実行し、新しいheadでreceiptを書き直す」指示を送る。完了を確認したら`integrate ID`で再開する。手順は1から同じで、rebaseはmainが動いていなければno-op、動いていれば再びrebaseする（再衝突すれば再び`needs_session`）。receiptの`commit`が現在のHEADと一致しなければ、セッションが終わっていないものとして理由付きで`needs_session`のまま。
+
+セッションが変更不要と判断した場合はreceiptを`result: failed`と理由（`summary`）で書き直す。`integrate ID`は`fail_integration`でrunを`failed`にし（`integration_failed`）、mainには触れない。worktreeは残る。再試行は`ready ID`、取り消しは`cancel ID`。
+
+### errorと復旧
+
+mainを進める前のGit・ファイル・DBのerror（worktreeがない、mainのcheckoutにローカル変更があって`--ff-only`が失敗する、など）は`abort_integration`で`integration_error`イベントと`last_error`を書き、runを着地開始時のstatus（`awaiting_integration` / `needs_session`）に戻してleaseを解放する。`integrate`は非0で終わり、原因を直して再実行する。
+
+`integrate`プロセスが途中で死ぬとrunは`integrating`のまま、leaseはstaleになる。`doctor`が`integrating`のrunをlease付きで報告し、leaseのPIDが死んでheartbeatが30秒以上古ければ`recover RUN_ID`が`awaiting_integration`に戻す（`run_recovered`の`previous_status: integrating`）。次の`integrate`は途中のrebaseをabortしてやり直す。mainを進めた後にDBの更新が失敗した場合はrunを戻さず、error messageに着地commitを含める（[ADR-0008](../adr/0008-merge-queue-squash-landing.md)のConsequences）。
 
 ## Cleanup and recovery
 
-workspaceの終了はsupervisorが行う。leaseはrun単位で（[ADR-0007](../adr/0007-run-level-leases-parallel-execution.md)）、1 runの復旧が他のrunに影響しない。receipt検証を通った`awaiting_integration`のrunだけが対象で、workspaceだけを閉じ、worktreeとbranchはmainへの反映まで残す。`failed`（非0終了、検証拒否）、provisioningや検証処理のエラー、wrapper heartbeat切れの場合はworkspaceもworktreeも調査のため残し、closeを呼ばない。
+workspaceの終了はsupervisorが行う。leaseはrun単位で（[ADR-0007](../adr/0007-run-level-leases-parallel-execution.md)）、1 runの復旧が他のrunに影響しない。receipt検証を通った`awaiting_integration`のrunだけが対象で、workspaceだけを閉じ、worktreeとbranchは`integrate`が着地するまで残す（着地後に`integrate`が削除する）。`failed`（非0終了、検証拒否）、provisioningや検証処理のエラー、wrapper heartbeat切れの場合はworkspaceもworktreeも調査のため残し、closeを呼ばない。
 
 cmux 0.64.25は`--command`のプロセスが終了すると1〜2秒後にworkspaceを自ら閉じる。supervisorのcloseはこれと競合し、先にcmuxが閉じていると`cmux workspace close`は`not_found`で失敗して`cleanup_failed`になる（[015](../journal/015-e2e-happy-path.md)のe2eでは、wrapper終了から検証・closeまでが1秒以内に収まるため通常はsupervisorのcloseが先に成功する）。wrapper終了直後の`read-screen`も同じ競合で`screen_capture_failed`になりうる。
 
@@ -133,22 +157,22 @@ supervisorの再起動ではrunごとのleaseとheartbeatを確認し、孤児�
 
 ### `status`
 
-`cmux-taskq status`はprocessを調べずにleaseだけを返す。`supervisors`はleaseのPIDごとに`pid`、`alive`、`run_ids`、`heartbeat_age_secs`、`stale`。`runs`は未完了runごとに`run_id`、`task_id`、`status`、`workspace_id`、`lease`（なければnull）。
+`cmux-taskq status`はprocessを調べずにleaseだけを返す。`supervisors`はleaseのPIDごとに`pid`、`alive`、`run_ids`、`heartbeat_age_secs`、`stale`（着地中の`integrate`プロセスも1つとして並ぶ）。`runs`は未完了run（`claimed`/`starting`/`running`/`validating`/`integrating`）ごとに`run_id`、`task_id`、`status`、`workspace_id`、`lease`（なければnull）。`awaiting_integration`と`needs_session`はプロセスを持たないので並ばない。
 
 ### `doctor`
 
 `cmux-taskq doctor`は状態を変えずにJSONで報告する。
 
 - `supervisors`: `status`と同じ。
-- `runs`: `claimed`/`starting`/`running`/`validating`のrunごとに、`workspace_id`、worktreeとrun directoryとreceiptの存在、`last_error`、そのrunの`lease`（PID、`kill -0`による生存、heartbeatの経過秒数、30秒を超えた`stale`。なければnull）、登録済みwrapper/agentプロセスのPID・生存・heartbeat経過秒数・終了コード。`exited_at`が記録済みのプロセスはPIDが再利用されうるため生存確認せず`alive: null`にする。
+- `runs`: `claimed`/`starting`/`running`/`validating`/`integrating`のrunごとに、`workspace_id`、worktreeとrun directoryとreceiptの存在、`last_error`、そのrunの`lease`（PID、`kill -0`による生存、heartbeatの経過秒数、30秒を超えた`stale`。なければnull）、登録済みwrapper/agentプロセスのPID・生存・heartbeat経過秒数・終了コード。`exited_at`が記録済みのプロセスはPIDが再利用されうるため生存確認せず`alive: null`にする。
 - `blockers`: そのrunの`recover`を拒む理由の一覧。そのrunのprocessとleaseだけを見る。空なら`recoverable: true`。
 
 cmux workspaceの存在は確認しない（cmuxなしで動く）。IDを見てユーザーが`cmux workspace list`で確認する。
 
 ### `recover RUN_ID`
 
-1. runが`claimed`/`starting`/`running`/`validating`でなければ拒否する。
+1. runが`claimed`/`starting`/`running`/`validating`/`integrating`でなければ拒否する。
 2. `doctor`と同じ確認を行い、未終了として登録されたプロセスのPIDが生きている、そのrunのleaseのheartbeatが30秒以内、leaseのPIDが生きている、のいずれかなら拒否する。heartbeatが止まったまま生きているsupervisorはleaseを奪わず、ユーザーが止める。supervisorがabandonしたrunはleaseがないので、processが止まれば復旧できる。
-3. `BEGIN IMMEDIATE`の中でそのrunのleaseが新鮮でないことと`run_processes`の行数が確認時と同じことを再検査し、runを`interrupted`にし、確認した内容を`run_recovered`イベント（`previous_status`、`lease_deleted`、`run`）に記録し、そのrunのleaseだけを削除する。
+3. `BEGIN IMMEDIATE`の中でそのrunのleaseが新鮮でないことと`run_processes`の行数が確認時と同じことを再検査し、runを`interrupted`（`integrating`なら`awaiting_integration`: 検証済みの成果は残っており、次の`integrate`が途中のrebaseをabortしてやり直す）にし、確認した内容を`run_recovered`イベント（`previous_status`、`status`、`lease_deleted`、`run`）に記録し、そのrunのleaseだけを削除する。
 
 他のrun、そのlease・process、`run_processes`、worktree、branch、workspace、run directoryは触らない。Taskは`in_progress`のまま残る。再試行は`ready ID`（編集するなら`draft ID`）で行い、動いているsupervisor（または次のsupervisor）が新しいTaskRunと新しいworktreeを作る。`recover`はTaskを`ready`に戻さない: 復旧と再実行は別の判断であり、`failed`で止まったTaskの再試行と同じ経路にまとめるため。

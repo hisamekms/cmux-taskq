@@ -11,12 +11,13 @@ related:
   - adr-0003
   - adr-0006
   - adr-0007
+  - adr-0008
   - design-domain-model
 ---
 
 # SQLite persistence
 
-SQLiteはキューの正本であり、プロセス間共有と再起動後の復旧に使う。stdoutは正本にしない。ステップ2で4テーブル、ステップ3で3テーブル、ステップ4で`task_runs.workspace_closed_at`列を実装し、[008](../journal/008-integration-confirm.md)で`task_runs`を作り直して`integrated`を加え（schema version 4）、[017](../journal/017-parallel-runs.md)でleaseをrun単位の`run_leases`に移してqueue全体の実行枠を外した（schema version 5、[ADR-0007](../adr/0007-run-level-leases-parallel-execution.md)）。
+SQLiteはキューの正本であり、プロセス間共有と再起動後の復旧に使う。stdoutは正本にしない。ステップ2で4テーブル、ステップ3で3テーブル、ステップ4で`task_runs.workspace_closed_at`列を実装し、[008](../journal/008-integration-confirm.md)で`task_runs`を作り直して`integrated`を加え（schema version 4）、[017](../journal/017-parallel-runs.md)でleaseをrun単位の`run_leases`に移してqueue全体の実行枠を外し（schema version 5、[ADR-0007](../adr/0007-run-level-leases-parallel-execution.md)）、[018](../journal/018-merge-queue.md)で`task_runs`を再び作り直して`integrating`と`needs_session`を加え、統合スロットの部分UNIQUE indexを足した（schema version 6、[ADR-0008](../adr/0008-merge-queue-squash-landing.md)）。
 
 ```text
 tasks
@@ -28,7 +29,7 @@ run_processes        -- 0002: runごとのwrapper/agentのPID、heartbeat、終�
 run_leases           -- 0005: runごとのsupervisor token、PID、heartbeat（0002のsupervisor_leasesを置き換え）
 ```
 
-`task_dependencies(task_id, predecessor_id)`は依存関係を保存する。TaskRunは試行ごとに新しい行を作り、Taskに履歴を持たせる。workspace、worktree、receipt、log、repo、run directory、supervisor token、last errorの参照列をtask_runsに置き、claim時点ではnullにする。`result_commit`は検証で確認したcommit、`last_error`は検証の拒否理由、cleanup失敗、またはruntime errorを持つ。`workspace_closed_at`（0003）はcmuxがcloseを確認した時刻で、nullの間はworkspaceを開いているものとして扱う。成果物hashは未実装。
+`task_dependencies(task_id, predecessor_id)`は依存関係を保存する。TaskRunは試行ごとに新しい行を作り、Taskに履歴を持たせる。workspace、worktree、receipt、log、repo、run directory、supervisor token、last errorの参照列をtask_runsに置き、claim時点ではnullにする。`result_commit`は検証で確認したcommitで、着地後は`main`に積んだsquash commitに置き換わる（rebase後のrun headは`refs/taskq/runs/<run-id>`と`run_integrated`イベントの`source_commit`が持つ）。`last_error`は検証の拒否理由、`needs_session`の理由、cleanup失敗、またはruntime errorを持ち、着地で消える。`workspace_closed_at`（0003）はcmuxがcloseを確認した時刻で、nullの間はworkspaceを開いているものとして扱う。成果物hashは未実装。
 
 ## Runtime ownership
 
@@ -39,16 +40,17 @@ run_leases           -- 0005: runごとのsupervisor token、PID、heartbeat（0
 - receipt受領後の終了要求は`session_idle_observed`（markerとreceiptのmtime、hookのフィールド）、`exit_requested`、`exit_request_timed_out`のイベントだけで表し、runのstatusは変えない。
 - receipt検証は`validating`かつ同じsupervisor tokenのrunだけを`awaiting_integration`または`failed`へ進める。検証コマンドの結果は`verification_command`イベント、判定とreceiptの内容は`validation_finished`イベントに置き、専用テーブルは持たない。
 - workspaceのcloseは`awaiting_integration`かつ同じtokenで`workspace_closed_at`がnullのrunだけに記録でき、`workspace_closed`イベントと一緒に一度だけ書く。失敗は`cleanup_failed`イベントと`last_error`に残し、列はnullのままにする。イベントから導出せず列に持つのは、`doctor`/`recover`や統合確認が閉じていないworkspaceを1クエリで拾えるようにし、失敗後の再試行で`cleanup_failed`と`workspace_closed`の順序を追わずに済ませるため。
-- `recover`だけがtokenなしで未完了runを`interrupted`にし、そのrunのlease行を削除する。同じトランザクションでそのrunのheartbeatが30秒以内のleaseがないことと`run_processes`の行数が事前確認と一致することを再検査する。確認したプロセス・leaseの状態は`run_recovered`イベントに残し、`run_processes`と他のrunのleaseは変更しない。
-- 統合確認はleaseを要求しない。`awaiting_integration`のrunを`integrated`、そのTaskを`in_progress`から`completed`へ、statusを条件にした2つのUPDATEと`run_integrated`・`task_status_changed`イベントで1トランザクションに進める。Git上の判定はトランザクションの外で行い、不一致なら何も書かない。
+- `recover`だけがtokenなしで未完了runを`interrupted`（`integrating`なら`awaiting_integration`）にし、そのrunのlease行を削除する。同じトランザクションでそのrunのheartbeatが30秒以内のleaseがないことと`run_processes`の行数が事前確認と一致することを再検査する。確認したプロセス・leaseの状態は`run_recovered`イベントに残し、`run_processes`と他のrunのleaseは変更しない。
+- 着地（`integrate`）は`integrate`プロセスのtokenでlease行を持つ。`begin_integration`は`awaiting_integration`または`needs_session`のrunを`integrating`にし、lease行と`integration_started`を1トランザクションで書く。`integrating`のrunはqueue全体で高々1件（`one_integrating_run_per_queue`）。`integrating`から出る遷移はすべてそのtokenの新鮮なleaseを要求し、lease行を消して`lease_released`を書く: `finish_integration`（`integrated`、`result_commit`を着地commit、`last_error`をnull、Taskを`completed`、`run_integrated`と`task_status_changed`）、`defer_integration`（`needs_session`、`last_error`に理由、`integration_deferred`）、`fail_integration`（`failed`、`integration_failed`）、`abort_integration`（着地開始時のstatusへ戻す、`integration_error`）。Gitの操作はトランザクションの外で行い、mainを進める前のerrorではDBを元のstatusに戻す。着地後のworktree削除の失敗は`cleanup_failed`イベントと`last_error`だけに残す（`record_cleanup_failure`）。
 
 ## Transactions and constraints
 
 - `BEGIN IMMEDIATE`で状態変更、依存グラフ検証、claimを直列化する。ロック待機は最大5秒で、タイムアウトはエラーとして呼び出し元へ返す。
 - claimは候補選択、Task更新、TaskRun作成、イベント保存（supervisorからはlease行も）を一つのトランザクションにまとめる。途中エラーでは全体をrollbackする。同時claimは`BEGIN IMMEDIATE`で直列化され、別々のtaskを取る。
 - キュー全体の実行枠はない（0005で`one_executing_run_per_queue`を削除）。同時実行数は`supervise --parallel`が決める。
-- 部分UNIQUE index `one_unfinished_run_per_task`で、Taskごとの未完了run（awaiting_integrationを含む）を1件に制限する。
+- 部分UNIQUE index `one_unfinished_run_per_task`で、Taskごとの未完了run（`awaiting_integration`、`integrating`、`needs_session`を含む）を1件に制限する。
 - 部分UNIQUE index `one_integrated_run_per_task`で、Taskごとの`integrated` runを1件に制限する。
+- 部分UNIQUE index `one_integrating_run_per_queue`で、queue全体の`integrating` runを1件に制限する（統合スロット）。
 - foreign key、statusのCHECK制約、依存の複合主キーを設ける。自己依存はDBとapplicationの両方で拒否し、循環はトランザクション内の再帰CTEで検証する。
 - Task詳細は一つのread transactionで読むため、Task・run・イベント間のスナップショットが揃う。
 
@@ -78,7 +80,7 @@ SQLiteはrusqliteのbundled機能で同梱する。初期化でWALを有効に�
 
 `application_id = 0x43545131`でcmux-taskqのDBを識別する。未知の新しいschemaや他アプリのDBは書き換えずに拒否する。`init`の再実行では登録済みデータを保持する。バイナリ更新時は既存DBをopenする際にも未適用migrationを確認する。
 
-SQLiteはCHECK制約を変更できないため、statusの追加はtableの作り直し（`CREATE ... _vN` → `INSERT ... SELECT`（rowidも複写） → `DROP` → `RENAME` → index再作成）で行う。`DROP TABLE`はforeign keyが有効だと参照元の行があるとき失敗するので、migration実行中はトランザクションの外で`foreign_keys=OFF`にし、commit前に`pragma_foreign_key_check`が0件であることを確認してからONに戻す。`0004_integration.sql`がこの形の最初の例。`0005_run_leases.sql`は`run_leases`を作り、v4の`supervisor_leases`の行を`supervisor_token`が一致する実行中runへ移してから`supervisor_leases`と`one_executing_run_per_queue`を落とす（tableの作り直しは不要）。
+SQLiteはCHECK制約を変更できないため、statusの追加はtableの作り直し（`CREATE ... _vN` → `INSERT ... SELECT`（rowidも複写） → `DROP` → `RENAME` → index再作成）で行う。`DROP TABLE`はforeign keyが有効だと参照元の行があるとき失敗するので、migration実行中はトランザクションの外で`foreign_keys=OFF`にし、commit前に`pragma_foreign_key_check`が0件であることを確認してからONに戻す。`0004_integration.sql`がこの形の最初の例。`0005_run_leases.sql`は`run_leases`を作り、v4の`supervisor_leases`の行を`supervisor_token`が一致する実行中runへ移してから`supervisor_leases`と`one_executing_run_per_queue`を落とす（tableの作り直しは不要）。`0006_merge_queue.sql`は0004と同じ手順で`task_runs`を作り直して`integrating`と`needs_session`をCHECKに加え、`one_unfinished_run_per_task`を2状態込みで作り直し、`one_integrating_run_per_queue`を足す。`run_leases`の外部キーは`task_runs`を名前で参照しているので作り直し後もそのまま有効で、`foreign_key_check`で確認する。
 
 ## Planned runtime persistence
 

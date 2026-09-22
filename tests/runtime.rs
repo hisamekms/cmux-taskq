@@ -6,7 +6,7 @@ use cmux_taskq::{
         adapters::{shell_join, workspace_handle},
         sqlite::SqliteQueue,
     },
-    runtime::{self, SuperviseOptions},
+    runtime::{self, IntegrateTarget, SuperviseOptions},
 };
 use rusqlite::Connection;
 use serde_json::{Value, json};
@@ -104,7 +104,7 @@ impl AgentProvider for TestProvider {
     }
     fn command(&self, run: &TaskRun, prompt: &str) -> Result<Command> {
         assert!(prompt.contains("Acceptance criteria:"));
-        assert!(prompt.contains("test -f seed.txt"));
+        assert!(prompt.contains("Verification commands (run in the worktree):"));
         let mut command = Command::new("/bin/sh");
         command
             .current_dir(run.worktree_path.as_ref().unwrap())
@@ -944,7 +944,7 @@ fn migration_from_v1_preserves_task_and_initializes_runtime_tables() {
     raw.pragma_update(None, "user_version", 1).unwrap();
     raw.execute("INSERT INTO tasks(title,description,acceptance,verification_commands) VALUES ('preserved','','','[]')", []).unwrap();
     let mut queue = SqliteQueue::open(&db).unwrap();
-    assert_eq!(queue.schema_version().unwrap(), 5);
+    assert_eq!(queue.schema_version().unwrap(), 6);
     assert_eq!(queue.show(1).unwrap().task.title, "preserved");
     assert!(queue.run_leases().unwrap().is_empty());
 }
@@ -1318,7 +1318,106 @@ fn recover_ignores_exited_processes_and_tolerates_a_missing_lease() {
     assert!(runtime::recover(&db, "no-such-run").is_err());
 }
 
-/// A validated run plus a ready dependent task, before any merge into main.
+fn git_out(repo: &Path, args: &[&str]) -> String {
+    let result = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    String::from_utf8(result.stdout).unwrap().trim().to_owned()
+}
+
+fn integrate(db: &Path, task_id: i64, repo: &Path) -> Result<Value> {
+    runtime::integrate(db, IntegrateTarget::Task(task_id), repo)
+}
+
+fn integrate_next(db: &Path, repo: &Path) -> Value {
+    runtime::integrate(db, IntegrateTarget::Next, repo).unwrap()
+}
+
+/// A task whose fake agent commits `file` with `content`; verification
+/// commands default to the fixture's `test -f seed.txt`.
+fn add_file_task(
+    queue: &mut SqliteQueue,
+    backend: &TestWorkspace,
+    title: &str,
+    file: &str,
+    content: &str,
+    verify: &[&str],
+) -> i64 {
+    let task = queue
+        .add(NewTask {
+            title: title.into(),
+            description: "small change".into(),
+            acceptance: "works".into(),
+            verification_commands: verify.iter().map(|v| (*v).to_owned()).collect(),
+            dependencies: vec![],
+        })
+        .unwrap();
+    queue.transition(task.id, TaskAction::Ready).unwrap();
+    backend.script_for(
+        task.id,
+        &format!(
+            "printf '{content}\\n' > '{file}' && git add '{file}' && git commit -q -m '{title}'; receipt \"$(git rev-parse HEAD)\""
+        ),
+    );
+    task.id
+}
+
+/// Rewrite the run's receipt the way a resumed session would after its work.
+fn write_receipt(run: &TaskRun, commit: &str, result: &str, summary: &str) {
+    let path = Path::new(run.receipt_path.as_ref().unwrap());
+    let text = json!({
+        "run_id": run.id, "result": result, "commit": commit,
+        "tests": {"status": "passed", "evidence_or_reason": "reran"},
+        "e2e": {"status": "not_applicable", "evidence_or_reason": "none"},
+        "subagent_review": {"status": "not_applicable", "evidence_or_reason": "session"},
+        "summary": summary,
+    });
+    fs::write(path.with_extension("tmp"), text.to_string()).unwrap();
+    fs::rename(path.with_extension("tmp"), path).unwrap();
+}
+
+/// Assert that `main` is linear, `commits` long on top of `seed`, and that
+/// its head carries the landing of `run` with the same tree as `source`.
+fn assert_landed(repo: &Path, run: &TaskRun, task_title: &str, expected_parent: &str) {
+    let main = git_out(repo, &["rev-parse", "main"]);
+    assert_eq!(run.status, RunStatus::Integrated);
+    assert_eq!(run.result_commit.as_deref(), Some(main.as_str()));
+    assert_eq!(git_out(repo, &["rev-parse", "main^"]), expected_parent);
+    assert_eq!(
+        git_out(repo, &["rev-list", "--parents", "-1", "main"])
+            .split(' ')
+            .count(),
+        2
+    );
+    let history = format!("refs/taskq/runs/{}", run.id);
+    let source = git_out(repo, &["rev-parse", &history]);
+    assert_eq!(
+        git_out(repo, &["rev-parse", "main^{tree}"]),
+        git_out(repo, &["rev-parse", &format!("{source}^{{tree}}")])
+    );
+    let message = git_out(repo, &["log", "-1", "--format=%B", "main"]);
+    assert!(message.starts_with(task_title), "{message}");
+    assert!(message.contains("\n\nTaskq-Task: "), "{message}");
+    assert!(
+        message.ends_with(&format!("Taskq-Run: {}", run.id)),
+        "{message}"
+    );
+    // Worktree and branch are gone; the run's history stays under the ref.
+    assert!(!Path::new(run.worktree_path.as_ref().unwrap()).exists());
+    assert!(
+        !git_out(repo, &["branch", "--list", run.branch.as_deref().unwrap()]).contains("taskq/")
+    );
+}
+
+/// A validated run plus a ready dependent task, before any landing.
 fn awaiting_run() -> (TempDir, PathBuf, PathBuf, TaskRun) {
     let (dir, db, detail) = run_agent(VALID_AGENT);
     let run = detail.runs[0].clone();
@@ -1339,46 +1438,71 @@ fn awaiting_run() -> (TempDir, PathBuf, PathBuf, TaskRun) {
     (dir, repo, db, run)
 }
 
-fn assert_not_integrated(db: &Path, outcome: &Value, run: &TaskRun, events_before: usize) {
-    assert_eq!(outcome["outcome"], "not_integrated");
-    assert_eq!(outcome["run"]["id"], json!(run.id));
-    assert!(
-        outcome["reason"]
-            .as_str()
-            .unwrap()
-            .contains("is not an ancestor of refs/heads/main")
-    );
-    let mut queue = SqliteQueue::open(db).unwrap();
-    let detail = queue.show(1).unwrap();
-    assert_eq!(detail.task.status, TaskStatus::InProgress);
-    assert_eq!(detail.runs[0].status, RunStatus::AwaitingIntegration);
-    assert_eq!(detail.events.len(), events_before);
-    assert!(queue.candidates().unwrap().is_empty());
-}
-
 #[test]
-fn fast_forward_into_main_completes_task_and_releases_dependents() {
-    let (_dir, repo, db, run) = awaiting_run();
-    let branch = run.branch.as_deref().unwrap();
-    let events_before = SqliteQueue::open(&db)
-        .unwrap()
-        .show(1)
-        .unwrap()
-        .events
-        .len();
-    let outcome = runtime::integrate(&db, 1, &repo).unwrap();
-    assert_not_integrated(&db, &outcome, &run, events_before);
-    assert_eq!(outcome["main"], json!(run.base_commit));
+fn conflict_free_run_lands_as_one_squash_commit_and_releases_dependents() {
+    let (dir, repo, db, run) = awaiting_run();
+    let seed = git_out(&repo, &["rev-parse", "main"]);
+    assert_eq!(seed, run.base_commit);
+    let source = run.result_commit.clone().unwrap();
+    // Another repository is refused even though it also has a main branch.
+    let other = dir.path().join("other");
+    fs::create_dir(&other).unwrap();
+    git(&other, &["init", "-b", "main"]);
+    git(&other, &["config", "user.name", "test"]);
+    git(&other, &["config", "user.email", "test@example.invalid"]);
+    git(&other, &["commit", "--allow-empty", "-m", "unrelated"]);
+    let error = format!("{:#}", integrate(&db, 1, &other).unwrap_err());
+    assert!(error.contains("the queue is bound to"), "{error}");
+    assert!(integrate(&db, 1, &dir.path().join("missing")).is_err());
 
-    git(&repo, &["merge", "--ff-only", branch]);
-    let outcome = runtime::integrate(&db, 1, &repo).unwrap();
-    assert_eq!(outcome["outcome"], "integrated");
+    // Landing from the run's own worktree resolves the same repository.
+    let worktree = PathBuf::from(run.worktree_path.as_ref().unwrap());
+    let outcome = integrate(&db, 1, &worktree).unwrap();
+    assert_eq!(outcome["outcome"], "integrated", "{outcome}");
     assert_eq!(outcome["task"]["status"], "completed");
     assert_eq!(outcome["run"]["status"], "integrated");
     let mut queue = SqliteQueue::open(&db).unwrap();
     let detail = queue.show(1).unwrap();
     assert_eq!(detail.task.status, TaskStatus::Completed);
-    assert_eq!(detail.runs[0].status, RunStatus::Integrated);
+    let landed = detail.runs[0].clone();
+    assert_landed(&repo, &landed, "test task", &seed);
+    assert!(landed.last_error.is_none());
+    // No rebase was needed: the landed tree is the validated tree, and the
+    // history ref points at the validated commit.
+    assert_eq!(
+        git_out(
+            &repo,
+            &["rev-parse", &format!("refs/taskq/runs/{}", run.id)]
+        ),
+        source
+    );
+    assert_eq!(
+        git_out(&repo, &["rev-parse", "main^{tree}"]),
+        git_out(&repo, &["rev-parse", &format!("{source}^{{tree}}")])
+    );
+    let message = git_out(&repo, &["log", "-1", "--format=%B", "main"]);
+    assert_eq!(
+        message,
+        format!("test task\n\ndone\n\nTaskq-Task: 1\nTaskq-Run: {}", run.id)
+    );
+    // The main checkout moved with the ref.
+    assert_eq!(
+        git_out(&repo, &["rev-parse", "HEAD"]),
+        landed.result_commit.clone().unwrap()
+    );
+    assert_eq!(git_out(&repo, &["status", "--porcelain"]), "");
+    assert_eq!(
+        fs::read_to_string(repo.join("change.txt")).unwrap(),
+        format!("change by {}\n", run.id)
+    );
+    let kinds = event_kinds(&detail);
+    let position = |kind: &str| kinds.iter().rposition(|k| *k == kind).unwrap();
+    assert!(position("validation_finished") < position("integration_started"));
+    assert!(position("integration_started") < position("integration_rebased"));
+    assert!(position("integration_rebased") < position("verification_command"));
+    assert!(position("verification_command") < position("run_integrated"));
+    assert!(position("run_integrated") < position("worktree_removed"));
+    assert!(!kinds.contains(&"cleanup_failed"));
     let integrated = detail
         .events
         .iter()
@@ -1387,12 +1511,34 @@ fn fast_forward_into_main_completes_task_and_releases_dependents() {
     assert_eq!(integrated.run_id.as_deref(), Some(run.id.as_str()));
     assert_eq!(
         integrated.payload["result_commit"],
-        json!(run.result_commit)
+        json!(landed.result_commit)
     );
-    assert_eq!(integrated.payload["main"], json!(run.result_commit));
-    let changed = detail.events.last().unwrap();
-    assert_eq!(changed.kind, "task_status_changed");
-    assert_eq!(changed.payload["to"], "completed");
+    assert_eq!(integrated.payload["source_commit"], json!(source));
+    assert_eq!(integrated.payload["main_before"], json!(seed));
+    assert_eq!(
+        integrated.payload["history_ref"],
+        json!(format!("refs/taskq/runs/{}", run.id))
+    );
+    let verification = detail
+        .events
+        .iter()
+        .rev()
+        .find(|e| e.kind == "verification_command")
+        .unwrap();
+    assert_eq!(verification.payload["phase"], "integration");
+    assert!(
+        verification.payload["log_path"]
+            .as_str()
+            .unwrap()
+            .ends_with("integrate-verify-1.log")
+    );
+    let changed = detail
+        .events
+        .iter()
+        .find(|e| e.kind == "task_status_changed" && e.payload["to"] == "completed")
+        .unwrap();
+    assert_eq!(changed.run_id.as_deref(), Some(run.id.as_str()));
+    assert!(queue.run_leases().unwrap().is_empty());
     assert_eq!(
         queue
             .candidates()
@@ -1402,20 +1548,15 @@ fn fast_forward_into_main_completes_task_and_releases_dependents() {
             .collect::<Vec<_>>(),
         [2]
     );
-    // Worktree and branch are left for the operator to remove.
-    assert!(Path::new(run.worktree_path.as_ref().unwrap()).exists());
 
     // Integration is one-shot, at every layer.
-    let error = format!("{:#}", runtime::integrate(&db, 1, &repo).unwrap_err());
+    let error = format!("{:#}", integrate(&db, 1, &repo).unwrap_err());
     assert!(error.contains("no run awaiting integration"), "{error}");
-    assert!(
-        queue
-            .finish_integration(&run.id, &run.base_commit, "/x")
-            .is_err()
-    );
-    let error = format!("{:#}", runtime::integrate(&db, 2, &repo).unwrap_err());
+    assert!(queue.begin_integration(&run.id, "x", &seed).is_err());
+    let error = format!("{:#}", integrate(&db, 2, &repo).unwrap_err());
     assert!(error.contains("task 2 (ready) has no run"), "{error}");
-    assert!(runtime::integrate(&db, 99, &repo).is_err());
+    assert!(integrate(&db, 99, &repo).is_err());
+    assert_eq!(integrate_next(&db, &repo)["outcome"], "no_run_awaiting");
     let raw = Connection::open(&db).unwrap();
     assert!(
         raw.execute(
@@ -1428,51 +1569,486 @@ fn fast_forward_into_main_completes_task_and_releases_dependents() {
     assert_eq!(queue.show(1).unwrap().runs.len(), 1);
 }
 
+/// Two accepted runs land in the order their validation finished; the
+/// second is rebased onto the first landing and main stays linear with one
+/// commit per task, whether or not a checkout has main checked out.
 #[test]
-fn merge_commit_integrates_and_repository_must_match_binding() {
-    let (dir, repo, db, run) = awaiting_run();
-    let branch = run.branch.as_deref().unwrap();
-    git(&repo, &["merge", "--no-ff", "-m", "merge run", branch]);
-    // Another repository is refused even though it also has a main branch.
-    let other = dir.path().join("other");
-    fs::create_dir(&other).unwrap();
-    git(&other, &["init", "-b", "main"]);
-    git(&other, &["config", "user.name", "test"]);
-    git(&other, &["config", "user.email", "test@example.invalid"]);
-    git(&other, &["commit", "--allow-empty", "-m", "unrelated"]);
-    let error = format!("{:#}", runtime::integrate(&db, 1, &other).unwrap_err());
-    assert!(error.contains("the queue is bound to"), "{error}");
-    assert!(runtime::integrate(&db, 1, &dir.path().join("missing")).is_err());
+fn runs_land_fifo_by_validation_time_and_later_ones_are_rebased() {
+    let (_dir, repo, db) = fixture();
     let mut queue = SqliteQueue::open(&db).unwrap();
-    assert_eq!(queue.show(1).unwrap().task.status, TaskStatus::InProgress);
+    queue.transition(1, TaskAction::Draft).unwrap();
+    let backend = TestWorkspace::new(&db, false, VALID_AGENT);
+    let a = add_file_task(
+        &mut queue,
+        &backend,
+        "task a",
+        "a.txt",
+        "a",
+        &["test -f seed.txt"],
+    );
+    let b = add_file_task(
+        &mut queue,
+        &backend,
+        "task b",
+        "b.txt",
+        "b",
+        &["test -f seed.txt"],
+    );
+    let outcome = supervise(&db, &repo, &backend).unwrap();
+    backend.join();
+    assert_eq!(outcome["runs"].as_array().unwrap().len(), 2);
+    let seed = git_out(&repo, &["rev-parse", "main"]);
+    let run_a = queue.show(a).unwrap().runs[0].clone();
+    let run_b = queue.show(b).unwrap().runs[0].clone();
+    // FIFO is by validation time, not task id.
+    let mut validated_at = |run: &TaskRun| {
+        queue
+            .show(run.task_id)
+            .unwrap()
+            .events
+            .iter()
+            .find(|e| e.kind == "validation_finished")
+            .unwrap()
+            .id
+    };
+    let (first, second) = if validated_at(&run_a) < validated_at(&run_b) {
+        (run_a.clone(), run_b.clone())
+    } else {
+        (run_b.clone(), run_a.clone())
+    };
+    assert_eq!(
+        queue.next_awaiting_integration().unwrap().unwrap().id,
+        first.id
+    );
 
-    // The run's worktree resolves to the same repository as its root checkout.
-    let worktree = PathBuf::from(run.worktree_path.as_ref().unwrap());
-    let outcome = runtime::integrate(&db, 1, &worktree).unwrap();
-    assert_eq!(outcome["outcome"], "integrated");
-    assert_ne!(outcome["run"]["result_commit"], json!(run.base_commit));
-    let detail = queue.show(1).unwrap();
-    assert_eq!(detail.task.status, TaskStatus::Completed);
-    assert_eq!(detail.runs[0].status, RunStatus::Integrated);
-    assert_eq!(queue.candidates().unwrap()[0].id, 2);
+    let outcome = integrate_next(&db, &repo);
+    assert_eq!(outcome["outcome"], "integrated", "{outcome}");
+    assert_eq!(outcome["run"]["id"], json!(first.id));
+    let first_landed = git_out(&repo, &["rev-parse", "main"]);
+    assert_eq!(
+        queue.next_awaiting_integration().unwrap().unwrap().id,
+        second.id
+    );
+
+    // No checkout has main now: the ref is updated directly.
+    git(&repo, &["checkout", "-q", "--detach"]);
+    let outcome = integrate_next(&db, &repo);
+    assert_eq!(outcome["outcome"], "integrated", "{outcome}");
+    assert_eq!(outcome["run"]["id"], json!(second.id));
+    assert_eq!(integrate_next(&db, &repo)["outcome"], "no_run_awaiting");
+    let second_landed = git_out(&repo, &["rev-parse", "main"]);
+    assert_eq!(git_out(&repo, &["rev-parse", "HEAD"]), first_landed); // Detached HEAD untouched.
+    git(&repo, &["checkout", "-q", "main"]);
+
+    let landed_second = queue.show(second.task_id).unwrap().runs[0].clone();
+    assert_landed(&repo, &landed_second, "task ", &first_landed);
+    let landed_first = queue.show(first.task_id).unwrap().runs[0].clone();
+    assert_eq!(
+        landed_first.result_commit.as_deref(),
+        Some(first_landed.as_str())
+    );
+    // Linear: seed → first → second, one commit per task, both files present.
+    assert_eq!(
+        git_out(&repo, &["rev-list", "--first-parent", "main"])
+            .lines()
+            .collect::<Vec<_>>(),
+        [second_landed.as_str(), first_landed.as_str(), seed.as_str()]
+    );
+    assert!(repo.join("a.txt").exists() && repo.join("b.txt").exists());
+    // The second run was rebased: its history ref sits on the first landing.
+    let history = git_out(
+        &repo,
+        &["rev-parse", &format!("refs/taskq/runs/{}", second.id)],
+    );
+    assert_ne!(history, second.result_commit.clone().unwrap());
+    assert_eq!(
+        git_out(&repo, &["rev-parse", &format!("{history}^")]),
+        first_landed
+    );
+    let rebased = queue
+        .show(second.task_id)
+        .unwrap()
+        .events
+        .into_iter()
+        .find(|e| e.kind == "integration_rebased")
+        .unwrap();
+    assert_eq!(rebased.payload["main"], json!(first_landed));
+    assert_eq!(rebased.payload["head_before"], json!(second.result_commit));
+    assert_eq!(rebased.payload["head_after"], json!(history));
+    for task in [a, b] {
+        assert_eq!(queue.show(task).unwrap().task.status, TaskStatus::Completed);
+    }
+    assert!(queue.run_leases().unwrap().is_empty());
 }
 
+/// Both runs change the same file: the second cannot be rebased by the
+/// runtime and waits for a session, which resolves, reruns verification and
+/// rewrites the receipt; then it lands like any other run.
 #[test]
-fn squash_merge_is_not_recognized_as_integration() {
-    let (_dir, repo, db, run) = awaiting_run();
-    let branch = run.branch.as_deref().unwrap();
-    git(&repo, &["merge", "--squash", branch]);
-    git(&repo, &["commit", "-m", "squashed run"]);
-    let events_before = SqliteQueue::open(&db)
+fn conflicting_run_needs_a_session_and_lands_after_the_session_resolves_it() {
+    let (_dir, repo, db) = fixture();
+    let mut queue = SqliteQueue::open(&db).unwrap();
+    add_ready_task(&mut queue, "second", &[]);
+    let backend = TestWorkspace::new(&db, false, VALID_AGENT);
+    supervise(&db, &repo, &backend).unwrap();
+    backend.join();
+    let seed = git_out(&repo, &["rev-parse", "main"]);
+    assert_eq!(integrate(&db, 1, &repo).unwrap()["outcome"], "integrated");
+    let first_landed = git_out(&repo, &["rev-parse", "main"]);
+
+    let run = queue.show(2).unwrap().runs[0].clone();
+    let source = run.result_commit.clone().unwrap();
+    let worktree = PathBuf::from(run.worktree_path.as_ref().unwrap());
+    let outcome = integrate(&db, 2, &repo).unwrap();
+    assert_eq!(outcome["outcome"], "needs_session", "{outcome}");
+    assert_eq!(outcome["main"], json!(first_landed));
+    let reason = outcome["reason"].as_str().unwrap();
+    assert!(reason.contains("conflicted in change.txt"), "{reason}");
+    assert!(
+        reason.contains(&format!("git rebase {first_landed}")),
+        "{reason}"
+    );
+    let parked = queue.show(2).unwrap().runs[0].clone();
+    assert_eq!(parked.status, RunStatus::NeedsSession);
+    assert_eq!(parked.last_error.as_deref(), Some(reason));
+    assert_eq!(parked.result_commit.as_deref(), Some(source.as_str()));
+    // The rebase was aborted: the worktree is back on its validated head, clean.
+    assert_eq!(git_out(&worktree, &["rev-parse", "HEAD"]), source);
+    assert_eq!(git_out(&worktree, &["status", "--porcelain"]), "");
+    assert!(!worktree.join(".git").join("rebase-merge").exists());
+    assert_eq!(git_out(&repo, &["rev-parse", "main"]), first_landed);
+    let detail = queue.show(2).unwrap();
+    let deferred = detail
+        .events
+        .iter()
+        .find(|e| e.kind == "integration_deferred")
+        .unwrap();
+    assert_eq!(deferred.payload["status"], "needs_session");
+    assert_eq!(deferred.payload["conflicts"], json!(["change.txt"]));
+    assert_eq!(deferred.payload["aborted"], true);
+    assert!(
+        deferred.payload["output_tail"]
+            .as_str()
+            .unwrap()
+            .contains("CONFLICT")
+    );
+    assert_eq!(detail.task.status, TaskStatus::InProgress);
+    assert!(queue.run_leases().unwrap().is_empty());
+    // A parked run still owns its task and is not picked by --next.
+    assert!(queue.transition(2, TaskAction::Ready).is_err());
+    assert_eq!(integrate_next(&db, &repo)["outcome"], "no_run_awaiting");
+    assert!(queue.candidates().unwrap().is_empty());
+    assert_eq!(runtime::doctor(&db).unwrap()["runs"], json!([]));
+
+    // Nothing changed in the worktree: the runtime tries again and parks it again.
+    let outcome = integrate(&db, 2, &repo).unwrap();
+    assert_eq!(outcome["outcome"], "needs_session", "{outcome}");
+
+    // The session resolves the conflict on top of main.
+    let rebase = Command::new("git")
+        .arg("-C")
+        .arg(&worktree)
+        .args(["rebase", &first_landed])
+        .output()
+        .unwrap();
+    assert!(!rebase.status.success());
+    fs::write(worktree.join("change.txt"), "resolved by the session\n").unwrap();
+    git(&worktree, &["add", "change.txt"]);
+    let status = Command::new("git")
+        .arg("-C")
+        .arg(&worktree)
+        .env("GIT_EDITOR", "true")
+        .args(["rebase", "--continue"])
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let resolved = git_out(&worktree, &["rev-parse", "HEAD"]);
+    assert_ne!(resolved, source);
+
+    // Until the receipt names the new head, the session is not done.
+    let outcome = integrate(&db, 2, &repo).unwrap();
+    assert_eq!(outcome["outcome"], "needs_session", "{outcome}");
+    let reason = outcome["reason"].as_str().unwrap();
+    assert!(
+        reason.contains(&format!("receipt commit {source} is not the head")),
+        "{reason}"
+    );
+    assert_eq!(git_out(&worktree, &["rev-parse", "HEAD"]), resolved); // Left as the session made it.
+    assert_eq!(git_out(&repo, &["rev-parse", "main"]), first_landed);
+
+    write_receipt(&parked, &resolved, "succeeded", "resolved");
+    let outcome = integrate(&db, 2, &repo).unwrap();
+    assert_eq!(outcome["outcome"], "integrated", "{outcome}");
+    let landed = queue.show(2).unwrap().runs[0].clone();
+    assert_landed(&repo, &landed, "second", &first_landed);
+    assert_eq!(
+        git_out(
+            &repo,
+            &["rev-parse", &format!("refs/taskq/runs/{}", run.id)]
+        ),
+        resolved
+    );
+    assert_eq!(
+        fs::read_to_string(repo.join("change.txt")).unwrap(),
+        "resolved by the session\n"
+    );
+    assert_eq!(
+        git_out(&repo, &["rev-list", "--count", &format!("{seed}..main")]),
+        "2"
+    );
+    assert_eq!(
+        git_out(&repo, &["log", "-1", "--format=%b", "main"])
+            .lines()
+            .next(),
+        Some("resolved")
+    );
+    assert_eq!(queue.show(2).unwrap().task.status, TaskStatus::Completed);
+    // The parked attempts were before the landing; the reason is cleared.
+    assert!(landed.last_error.is_none());
+    let detail = queue.show(2).unwrap();
+    let kinds = event_kinds(&detail);
+    assert_eq!(
+        kinds
+            .iter()
+            .filter(|k| **k == "integration_deferred")
+            .count(),
+        3
+    );
+    assert_eq!(
+        kinds
+            .iter()
+            .filter(|k| **k == "integration_started")
+            .count(),
+        4
+    );
+    assert_eq!(kinds.iter().filter(|k| **k == "run_integrated").count(), 1);
+}
+
+/// A session that finds the change no longer needed writes a failed receipt
+/// with the reason; the run ends without touching main and the task can be
+/// retried or canceled.
+#[test]
+fn failed_receipt_from_a_session_ends_the_run_without_landing() {
+    let (_dir, repo, db) = fixture();
+    let mut queue = SqliteQueue::open(&db).unwrap();
+    add_ready_task(&mut queue, "second", &[]);
+    let backend = TestWorkspace::new(&db, false, VALID_AGENT);
+    supervise(&db, &repo, &backend).unwrap();
+    backend.join();
+    assert_eq!(integrate(&db, 1, &repo).unwrap()["outcome"], "integrated");
+    let main = git_out(&repo, &["rev-parse", "main"]);
+    assert_eq!(
+        integrate(&db, 2, &repo).unwrap()["outcome"],
+        "needs_session"
+    );
+    let run = queue.show(2).unwrap().runs[0].clone();
+    write_receipt(
+        &run,
+        run.result_commit.as_deref().unwrap(),
+        "failed",
+        "already covered by task 1",
+    );
+    let outcome = integrate(&db, 2, &repo).unwrap();
+    assert_eq!(outcome["outcome"], "failed", "{outcome}");
+    let reason = outcome["reason"].as_str().unwrap();
+    assert!(reason.contains("already covered by task 1"), "{reason}");
+    let failed = queue.show(2).unwrap().runs[0].clone();
+    assert_eq!(failed.status, RunStatus::Failed);
+    assert_eq!(failed.last_error.as_deref(), Some(reason));
+    assert!(Path::new(failed.worktree_path.as_ref().unwrap()).exists());
+    assert_eq!(git_out(&repo, &["rev-parse", "main"]), main);
+    assert!(
+        git_out(&repo, &["for-each-ref", "refs/taskq/runs/"])
+            .lines()
+            .count()
+            == 1
+    );
+    assert_eq!(queue.show(2).unwrap().task.status, TaskStatus::InProgress);
+    assert!(queue.run_leases().unwrap().is_empty());
+    assert!(event_kinds(&queue.show(2).unwrap()).contains(&"integration_failed"));
+    // Retry or give up is the operator's call, as after any failed run.
+    queue.transition(2, TaskAction::Cancel).unwrap();
+}
+
+/// The rebase applies cleanly but the earlier landing broke this run's
+/// verification (a semantic conflict): the run is parked with the rebased
+/// tree in place so a session can fix it on top of main.
+#[test]
+fn verification_failure_after_rebase_needs_a_session_and_keeps_the_rebased_tree() {
+    let (_dir, repo, db) = fixture();
+    let mut queue = SqliteQueue::open(&db).unwrap();
+    queue.transition(1, TaskAction::Draft).unwrap();
+    let backend = TestWorkspace::new(&db, false, VALID_AGENT);
+    let breaker = queue
+        .add(NewTask {
+            title: "drop seed".into(),
+            description: String::new(),
+            acceptance: String::new(),
+            verification_commands: vec!["true".into()],
+            dependencies: vec![],
+        })
         .unwrap()
+        .id;
+    queue.transition(breaker, TaskAction::Ready).unwrap();
+    backend.script_for(
+        breaker,
+        "git rm -q seed.txt && git commit -q -m 'drop seed'; receipt \"$(git rev-parse HEAD)\"",
+    );
+    let victim = add_file_task(
+        &mut queue,
+        &backend,
+        "needs seed",
+        "v.txt",
+        "v",
+        &["test -f seed.txt"],
+    );
+    supervise(&db, &repo, &backend).unwrap();
+    backend.join();
+    assert_eq!(
+        integrate(&db, breaker, &repo).unwrap()["outcome"],
+        "integrated"
+    );
+    let main = git_out(&repo, &["rev-parse", "main"]);
+    assert!(!repo.join("seed.txt").exists());
+
+    let run = queue.show(victim).unwrap().runs[0].clone();
+    let outcome = integrate(&db, victim, &repo).unwrap();
+    assert_eq!(outcome["outcome"], "needs_session", "{outcome}");
+    let reason = outcome["reason"].as_str().unwrap();
+    assert!(
+        reason.contains("\"test -f seed.txt\" exited with 1 after the rebase"),
+        "{reason}"
+    );
+    let worktree = PathBuf::from(run.worktree_path.as_ref().unwrap());
+    let head = git_out(&worktree, &["rev-parse", "HEAD"]);
+    assert_ne!(head, run.result_commit.clone().unwrap());
+    assert_eq!(git_out(&worktree, &["rev-parse", "HEAD^"]), main);
+    assert_eq!(git_out(&worktree, &["status", "--porcelain"]), "");
+    assert!(
+        Path::new(run.run_dir.as_ref().unwrap())
+            .join("integrate-verify-1.log")
+            .exists()
+    );
+    let parked = queue.show(victim).unwrap().runs[0].clone();
+    assert_eq!(parked.status, RunStatus::NeedsSession);
+    assert_eq!(git_out(&repo, &["rev-parse", "main"]), main);
+    // The session restores what the verification needs and reports the new head.
+    fs::write(worktree.join("seed.txt"), "restored\n").unwrap();
+    git(&worktree, &["add", "seed.txt"]);
+    git(&worktree, &["commit", "-q", "-m", "restore seed"]);
+    write_receipt(
+        &parked,
+        &git_out(&worktree, &["rev-parse", "HEAD"]),
+        "succeeded",
+        "restored seed",
+    );
+    assert_eq!(
+        integrate(&db, victim, &repo).unwrap()["outcome"],
+        "integrated"
+    );
+    let landed = queue.show(victim).unwrap().runs[0].clone();
+    assert_landed(&repo, &landed, "needs seed", &main);
+    assert!(repo.join("seed.txt").exists() && repo.join("v.txt").exists());
+}
+
+/// One run lands at a time. An `integrate` process that dies leaves the run
+/// `integrating` with a stale lease; `recover` puts it back in the queue
+/// instead of interrupting it, and the next `integrate` lands it. A landing
+/// that cannot fast-forward the main checkout gives the slot back too.
+#[test]
+fn integration_slot_is_exclusive_and_an_abandoned_landing_is_recoverable() {
+    let (_dir, repo, db) = fixture();
+    let mut queue = SqliteQueue::open(&db).unwrap();
+    let backend = TestWorkspace::new(&db, false, VALID_AGENT);
+    let other = add_file_task(
+        &mut queue,
+        &backend,
+        "other",
+        "o.txt",
+        "o",
+        &["test -f seed.txt"],
+    );
+    supervise(&db, &repo, &backend).unwrap();
+    backend.join();
+    let run = queue.show(1).unwrap().runs[0].clone();
+    let seed = git_out(&repo, &["rev-parse", "main"]);
+
+    // Take the slot by hand, as a crashed `integrate` would have.
+    let taken = queue.begin_integration(&run.id, "crashed", &seed).unwrap();
+    assert_eq!(taken.status, RunStatus::Integrating);
+    assert!(queue.transition(1, TaskAction::Ready).is_err());
+    let error = format!("{:#}", integrate(&db, other, &repo).unwrap_err());
+    assert!(
+        error.contains(&format!("run {} is integrating", run.id)),
+        "{error}"
+    );
+    let error = format!("{:#}", integrate(&db, 1, &repo).unwrap_err());
+    assert!(error.contains("is already integrating"), "{error}");
+    assert!(queue.begin_integration(&run.id, "again", &seed).is_err());
+    assert_eq!(
+        queue.show(other).unwrap().runs[0].status,
+        RunStatus::AwaitingIntegration
+    );
+    // It is visible while alive, and recoverable once its process is gone.
+    let report = runtime::doctor(&db).unwrap();
+    assert_eq!(report["runs"][0]["run_id"], json!(run.id));
+    assert_eq!(report["runs"][0]["status"], "integrating");
+    assert_eq!(report["runs"][0]["recoverable"], false);
+    assert!(runtime::recover(&db, &run.id).is_err());
+    Connection::open(&db)
+        .unwrap()
+        .execute("UPDATE run_leases SET heartbeat_at=0, pid=?1", [dead_pid()])
+        .unwrap();
+    assert_eq!(
+        runtime::doctor(&db).unwrap()["runs"][0]["recoverable"],
+        true
+    );
+    let recovered = runtime::recover(&db, &run.id).unwrap();
+    assert_eq!(recovered["run"]["status"], "awaiting_integration");
+    let event = queue
         .show(1)
         .unwrap()
         .events
-        .len();
-    let outcome = runtime::integrate(&db, 1, &repo).unwrap();
-    assert_not_integrated(&db, &outcome, &run, events_before);
-    assert_ne!(outcome["main"], json!(run.base_commit));
-    assert_ne!(outcome["main"], json!(run.result_commit));
+        .into_iter()
+        .find(|e| e.kind == "run_recovered")
+        .unwrap();
+    assert_eq!(event.payload["previous_status"], "integrating");
+    assert_eq!(event.payload["status"], "awaiting_integration");
+    assert!(queue.run_leases().unwrap().is_empty());
+
+    // A local change in the main checkout that collides with the landing
+    // makes the fast-forward fail; the run goes back to the queue.
+    fs::write(repo.join("change.txt"), "uncommitted local edit\n").unwrap();
+    let error = format!("{:#}", integrate(&db, 1, &repo).unwrap_err());
+    assert!(error.contains("fast-forward main"), "{error}");
+    assert!(
+        error.contains("returned to awaiting_integration"),
+        "{error}"
+    );
+    let returned = queue.show(1).unwrap().runs[0].clone();
+    assert_eq!(returned.status, RunStatus::AwaitingIntegration);
+    assert!(
+        returned
+            .last_error
+            .as_ref()
+            .unwrap()
+            .contains("before main moved")
+    );
+    assert!(event_kinds(&queue.show(1).unwrap()).contains(&"integration_error"));
+    assert_eq!(git_out(&repo, &["rev-parse", "main"]), seed);
+    assert!(queue.run_leases().unwrap().is_empty());
+    fs::remove_file(repo.join("change.txt")).unwrap();
+    assert_eq!(integrate(&db, 1, &repo).unwrap()["outcome"], "integrated");
+    let landed = queue.show(1).unwrap().runs[0].clone();
+    assert_landed(&repo, &landed, "test task", &seed);
+    assert_eq!(
+        integrate(&db, other, &repo).unwrap()["outcome"],
+        "integrated"
+    );
+    assert_eq!(
+        git_out(&repo, &["rev-list", "--count", &format!("{seed}..main")]),
+        "2"
+    );
 }
 
 const IDLE_AGENT: &str = "commit work; receipt \"$(git rev-parse HEAD)\"; idle; await_exit";
@@ -1544,14 +2120,13 @@ fn independent_tasks_run_concurrently_and_a_dependent_starts_after_integration()
     assert_eq!(first.base_commit, second.base_commit);
     assert!(queue.run_leases().unwrap().is_empty());
 
-    // Integration unblocks the dependent; the resident loop claims it from the new main.
-    git(
-        &repo,
-        &["merge", "--ff-only", first.branch.as_deref().unwrap()],
-    );
+    // Landing unblocks the dependent; the resident loop claims it from the landed main.
+    assert_eq!(integrate(&db, 1, &repo).unwrap()["outcome"], "integrated");
+    let landed = git_out(&repo, &["rev-parse", "main"]);
+    assert_ne!(landed, first.result_commit.clone().unwrap());
     assert_eq!(
-        runtime::integrate(&db, 1, &repo).unwrap()["outcome"],
-        "integrated"
+        queue.show(1).unwrap().runs[0].result_commit.as_deref(),
+        Some(landed.as_str())
     );
     wait_until(&db, Duration::from_secs(30), |queue| {
         queue
@@ -1562,7 +2137,7 @@ fn independent_tasks_run_concurrently_and_a_dependent_starts_after_integration()
             .is_some_and(|r| r.status == RunStatus::AwaitingIntegration)
     });
     let third = queue.show(3).unwrap().runs[0].clone();
-    assert_eq!(third.base_commit, first.result_commit.clone().unwrap());
+    assert_eq!(third.base_commit, landed);
     assert_ne!(third.base_commit, second.base_commit);
 
     // A graceful stop ends the loop once nothing is active.
@@ -1577,6 +2152,17 @@ fn independent_tasks_run_concurrently_and_a_dependent_starts_after_integration()
     closed.sort();
     assert_eq!(closed, [workspace_id(0), workspace_id(1), workspace_id(2)]);
     assert_eq!(runtime::doctor(&db).unwrap()["runs"], json!([]));
+    // The independent second run conflicts with the first (same file) and
+    // waits for a session; the dependent, built on the landing, lands cleanly.
+    assert_eq!(
+        integrate(&db, 2, &repo).unwrap()["outcome"],
+        "needs_session"
+    );
+    assert_eq!(integrate(&db, 3, &repo).unwrap()["outcome"], "integrated");
+    assert_eq!(
+        git_out(&repo, &["rev-list", "--count", &format!("{landed}..main")]),
+        "1"
+    );
     drop(dir);
 }
 

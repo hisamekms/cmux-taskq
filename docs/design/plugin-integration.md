@@ -50,9 +50,9 @@ skillはすべて`${CLAUDE_PLUGIN_ROOT}/bin/taskq`を呼ぶ。launcherはバイ�
 
 ### skillの契約
 
-- 完了はStop hookやreceiptファイルの存在ではなく、`show`のrun `status`（`awaiting_integration` / `integrated`）、`result_commit`、`last_error`、`validation_finished`イベントで判定する。
+- 完了はStop hookやreceiptファイルの存在ではなく、`show`のrun `status`（`awaiting_integration` / `needs_session` / `integrated`）、`result_commit`、`last_error`、`validation_finished`イベントで判定する。
 - `supervise`は常駐ループなのでClaude Codeのshellでは実行せず、`cmux workspace create --cwd <repo> --command "<bin> supervise --parallel 4"`で専用workspaceに起動する。既に生きているsupervisorがあれば起動せず、次のpollで拾わせる（[017](../journal/017-parallel-runs.md)）。`--cwd`がrepositoryなのでqueueは同じものに解決される。workspaceのshellはsessionの環境変数を継承しないため絶対pathを渡し、`CMUX_TASKQ_DB`を使っているときだけ`--db <db>`を付ける。
-- mainへのmergeは手動。skillは`integrate ID`の`outcome`を読んで結果を伝える。
+- mainへの着地はruntimeの`integrate ID` / `integrate --next`が行う（rebase → 再検証 → squash、[ADR-0008](../adr/0008-merge-queue-squash-landing.md)）。skillはSVのレビュー後にこれを呼び、`outcome`（`integrated` / `needs_session` / `failed` / `no_run_awaiting`）を読んで結果を伝える。`needs_session`のrunはSVが`claude --resume <run-id>`でworktreeに開き直すセッションが解消する。
 - `recover`はバイナリが拒否条件を判定する。skillはプロセスをkillせず、`doctor`の`blockers`をユーザーに示す。
 
 ### 読み込みと検証

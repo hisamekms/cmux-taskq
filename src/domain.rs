@@ -40,6 +40,8 @@ string_enum!(RunStatus {
     Running => "running",
     Validating => "validating",
     AwaitingIntegration => "awaiting_integration",
+    Integrating => "integrating",
+    NeedsSession => "needs_session",
     Integrated => "integrated",
     Succeeded => "succeeded",
     Failed => "failed",
@@ -68,8 +70,8 @@ pub enum TaskAction {
 }
 
 impl TaskStatus {
-    /// `unfinished_run` is whether the task still owns a run that is executing or
-    /// awaiting integration. An in-progress task whose runs have all failed or
+    /// `unfinished_run` is whether the task still owns a run that is executing,
+    /// awaiting or undergoing integration, or waiting for a session. An in-progress task whose runs have all failed or
     /// been interrupted may be retried or canceled by hand; a retry is a new run.
     pub fn transition(self, action: TaskAction, unfinished_run: bool) -> Result<Self> {
         match (self, action) {
@@ -211,8 +213,10 @@ pub enum ClaimOutcome {
     NoReadyTask,
 }
 
-/// Result of confirming that an awaiting run's commit reached `main`.
-/// `NotIntegrated` changes nothing; the run stays `awaiting_integration`.
+/// Result of one `integrate` invocation. `Integrated` landed the run on
+/// `main` (`run.result_commit` is the landed commit). `NeedsSession` parked
+/// the run for a session to resolve; `Failed` ended it because its rewritten
+/// receipt reported `failed`. `NoRunAwaiting` is `--next` on an empty queue.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "outcome", rename_all = "snake_case")]
 pub enum IntegrationOutcome {
@@ -220,11 +224,16 @@ pub enum IntegrationOutcome {
         task: Task,
         run: Box<TaskRun>,
     },
-    NotIntegrated {
+    NeedsSession {
         run: Box<TaskRun>,
         main: String,
         reason: String,
     },
+    Failed {
+        run: Box<TaskRun>,
+        reason: String,
+    },
+    NoRunAwaiting,
 }
 
 /// Completion receipt written by the agent. Its claims are cross-checked by

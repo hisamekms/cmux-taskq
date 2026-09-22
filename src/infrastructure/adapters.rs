@@ -267,6 +267,199 @@ impl GitRepository {
                 .arg(&run.base_commit),
         )
     }
+
+    /// Whether a `git rebase` was left half-done in the worktree (by a
+    /// crashed landing or an unfinished session).
+    pub fn rebase_in_progress(&self, worktree: &Path) -> Result<bool> {
+        let paths = output(Command::new(&self.git).arg("-C").arg(worktree).args([
+            "rev-parse",
+            "--git-path",
+            "rebase-merge",
+            "--git-path",
+            "rebase-apply",
+        ]))?;
+        Ok(paths.lines().any(|p| worktree.join(p.trim()).exists()))
+    }
+
+    pub fn rebase_abort(&self, worktree: &Path) -> Result<()> {
+        output(
+            Command::new(&self.git)
+                .arg("-C")
+                .arg(worktree)
+                .args(["rebase", "--abort"]),
+        )?;
+        Ok(())
+    }
+
+    /// Rebase the worktree's branch onto `onto`. `Ok(Err(output))` is a
+    /// conflict (or any other rebase failure) with the rebase still in
+    /// progress if Git left one; the caller decides whether to abort it.
+    pub fn rebase(&self, worktree: &Path, onto: &str) -> Result<std::result::Result<(), String>> {
+        let (status, stdout, stderr) = capture(
+            Command::new(&self.git)
+                .arg("-C")
+                .arg(worktree)
+                .env("GIT_TERMINAL_PROMPT", "0")
+                .args(["rebase", "--no-autostash", "--no-verify", onto]),
+            Duration::from_secs(10 * 60),
+        )?;
+        Ok(if status.success() {
+            Ok(())
+        } else {
+            Err(format!("{stdout}{stderr}"))
+        })
+    }
+
+    /// Paths with unresolved conflicts in the worktree.
+    pub fn conflicted_files(&self, worktree: &Path) -> Result<Vec<String>> {
+        Ok(
+            output(Command::new(&self.git).arg("-C").arg(worktree).args([
+                "diff",
+                "--name-only",
+                "--diff-filter=U",
+            ]))?
+            .lines()
+            .map(str::to_owned)
+            .collect(),
+        )
+    }
+
+    pub fn tree_of(&self, commit: &str) -> Result<String> {
+        Ok(
+            output(Command::new(&self.git).arg("-C").arg(&self.root).args([
+                "rev-parse",
+                "--verify",
+                &format!("{commit}^{{tree}}"),
+            ]))?
+            .trim()
+            .to_owned(),
+        )
+    }
+
+    /// One commit with `tree` on top of `parent`; `paragraphs` become the
+    /// message separated by blank lines. No hook runs and no checkout changes.
+    pub fn commit_tree(&self, tree: &str, parent: &str, paragraphs: &[String]) -> Result<String> {
+        let mut command = Command::new(&self.git);
+        command
+            .arg("-C")
+            .arg(&self.root)
+            .args(["commit-tree", tree, "-p", parent]);
+        for paragraph in paragraphs {
+            command.arg("-m").arg(paragraph);
+        }
+        Ok(output(&mut command)?.trim().to_owned())
+    }
+
+    pub fn update_ref(&self, name: &str, value: &str) -> Result<()> {
+        output(Command::new(&self.git).arg("-C").arg(&self.root).args([
+            "update-ref",
+            name,
+            value,
+        ]))?;
+        Ok(())
+    }
+
+    pub fn ref_exists(&self, name: &str) -> Result<Option<String>> {
+        let (status, stdout, stderr) = capture(
+            Command::new(&self.git).arg("-C").arg(&self.root).args([
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                &format!("{name}^{{commit}}"),
+            ]),
+            Duration::from_secs(30),
+        )?;
+        match status.code() {
+            Some(0) => Ok(Some(stdout.trim().to_owned())),
+            Some(1) => Ok(None),
+            _ => bail!("git rev-parse failed ({status}): {stderr}"),
+        }
+    }
+
+    /// `git worktree list --porcelain` as (path, block) pairs, the main
+    /// working tree first.
+    fn worktrees(&self) -> Result<Vec<(PathBuf, String)>> {
+        let listing = output(Command::new(&self.git).arg("-C").arg(&self.root).args([
+            "worktree",
+            "list",
+            "--porcelain",
+        ]))?;
+        Ok(listing
+            .split("\n\n")
+            .filter_map(|block| {
+                let path = block.lines().next()?.strip_prefix("worktree ")?;
+                Some((PathBuf::from(path), block.to_owned()))
+            })
+            .collect())
+    }
+
+    /// The worktree that has `main` checked out, if any.
+    pub fn main_checkout(&self) -> Result<Option<PathBuf>> {
+        Ok(self
+            .worktrees()?
+            .into_iter()
+            .find(|(_, block)| block.lines().any(|line| line == "branch refs/heads/main"))
+            .map(|(path, _)| path))
+    }
+
+    /// The main working tree, from which linked worktrees are administered;
+    /// `root` may itself be the linked worktree being removed.
+    fn primary_worktree(&self) -> Result<PathBuf> {
+        Ok(self
+            .worktrees()?
+            .into_iter()
+            .next()
+            .map(|(path, _)| path)
+            .unwrap_or_else(|| self.root.clone()))
+    }
+
+    /// Fast-forward `refs/heads/main` from `from` to `to`. Where `main` is
+    /// checked out the merge goes through that worktree so its index and
+    /// files move with the ref (local changes that collide make it fail);
+    /// otherwise the ref is updated with `from` as the expected old value.
+    pub fn advance_main(&self, from: &str, to: &str) -> Result<()> {
+        match self.main_checkout()? {
+            Some(checkout) => {
+                output(
+                    Command::new(&self.git)
+                        .arg("-C")
+                        .arg(&checkout)
+                        .env("GIT_TERMINAL_PROMPT", "0")
+                        .args(["merge", "--ff-only", to]),
+                )
+                .with_context(|| format!("fast-forward main in {}", checkout.display()))?;
+            }
+            None => {
+                output(Command::new(&self.git).arg("-C").arg(&self.root).args([
+                    "update-ref",
+                    "refs/heads/main",
+                    to,
+                    from,
+                ]))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Remove a landed run's worktree and branch. Administered from the
+    /// main working tree, since `root` may be the worktree being removed.
+    pub fn remove_worktree_and_branch(&self, worktree: &Path, branch: &str) -> Result<()> {
+        let primary = self.primary_worktree()?;
+        output(
+            Command::new(&self.git)
+                .arg("-C")
+                .arg(&primary)
+                .args(["worktree", "remove", "--force"])
+                .arg(worktree),
+        )?;
+        output(
+            Command::new(&self.git)
+                .arg("-C")
+                .arg(&primary)
+                .args(["branch", "-D", branch]),
+        )?;
+        Ok(())
+    }
 }
 
 pub struct Cmux {

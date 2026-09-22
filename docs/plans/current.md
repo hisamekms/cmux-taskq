@@ -17,6 +17,7 @@ depends_on:
   - adr-0005
   - adr-0006
   - adr-0007
+  - adr-0008
 ---
 
 # Rust runtime MVP
@@ -25,7 +26,7 @@ depends_on:
 
 最初の到達点を、Claude Codeから登録したタスクをcmux workspaceとGit worktreeで実行し、成果をレビューしてmainへ取り込むドッグフーディングとする。まずcmux-taskq自身の小さな改善に使い、その後にCodex対応と配布を進める。
 
-2026-09-22時点でステップ1の[実機検証](../journal/001-claude-lifecycle-spike.md)、ステップ2のRust/SQLiteキュー、ステップ3の1件を実行するsupervisor、ステップ4のreceipt検証・workspace終了・`integrate`・`doctor`/`recover`、ステップ8のClaude Code pluginを実装した（実機の異常系確認は[010](../journal/010-failure-path-smoke.md)に残る）。利用可能なCLIは[README](../../README.md)に記載する。
+2026-09-22時点でステップ1の[実機検証](../journal/001-claude-lifecycle-spike.md)、ステップ2のRust/SQLiteキュー、ステップ3の1件を実行するsupervisor、ステップ4のreceipt検証・workspace終了・`integrate`・`doctor`/`recover`、ステップ5〜7のrepositoryごとのqueue・並列実行・merge queue、ステップ8のClaude Code pluginを実装した（実機の異常系確認は[010](../journal/010-failure-path-smoke.md)に残る）。利用可能なCLIは[README](../../README.md)に記載する。
 
 同日、運用方針を次のように改めた。1 repositoryに1 queueをユーザーDIRに置く（ステップ5）。依存が解けたtaskは上限まで並列に実行する（ステップ6）。統合はruntimeのmerge queueが行い、最新mainへrebase・再検証のうえ1 task = 1 commitにsquashしてmainに直線の履歴を積む（ステップ7）。SVは常駐のClaude Code sessionとし、完了確認・レビュー・`integrate`の呼び出し・衝突時のセッションへの指示を行う。SVの操作は最初は`read-screen`起点でよく、CLIコマンド単位で切っておき、順次runtimeへ移す。ADRは各ステップの実装taskで追加する。
 
@@ -109,7 +110,7 @@ receiptにはrun ID、結果、commit SHA、実施したunit test/E2E/subagent r
 
 ### 7. merge queueでmainに直線の履歴を積む
 
-[018](../journal/018-merge-queue.md)。着地はruntimeの`integrate`が行う。
+状態: 実装済み（2026-09-22、[018](../journal/018-merge-queue.md)、[ADR-0008](../adr/0008-merge-queue-squash-landing.md)）。`integrate ID` / `integrate --next`がスロット（`integrating`、schema v6）を取り、worktreeを最新mainへrebase → 再検証（receiptがHEADを指す、mainの子孫、clean、検証コマンド）→ `commit-tree`で1 commitにsquash → mainをfast-forward（checkoutがあればそこで`merge --ff-only`）→ `integrated`/`completed` → worktreeとbranch削除（履歴は`refs/taskq/runs/<run-id>`）。衝突と再検証失敗は`needs_session`で止め、`failed` receiptはrunを`failed`にする。衝突なし・FIFO・衝突後のセッション解消・rebase後の検証失敗・スロットの排他と`recover`をunit testで、1件の着地と2件同時からの`needs_session`解消をe2eで確認した。着地はruntimeの`integrate`が行う。
 
 - 統合スロットは1つ、検証完了の古い順。`integrating` → 最新mainへrebase → 再検証（親がmain head、clean、検証コマンド）→ treeを1 commitにsquash（trailer `Taskq-Task` / `Taskq-Run`）してmainを進める → `integrated`。
 - 衝突は`rebase --abort`して`needs_session`で止め、SVがresumeしたセッションが解消・再検証・receiptを書き直す。
@@ -140,7 +141,7 @@ receiptにはrun ID、結果、commit SHA、実施したunit test/E2E/subagent r
 
 ## Ordering
 
-`1 → 2 → 3 → 4 → 5 → 6 → 7 → 8 → 9`。ステップ1〜6は実装済みで、4の実機確認（010）は7の後に並列とmerge queueを含めて行う。ステップ8のpluginは実装済みで、Claude Codeからの実行・統合・復旧の確認をステップ9に含める。次の着手単位はステップ7（018）。ドッグフーディングへの移行は010の直後、012から。012・013・014・019のジャーナルは`draft`で置き、暫定運用のSVは起動しない。016・017・018・010がdoneになった時点で`cmux-taskq add`へ登録し、013・014・019はcmux-taskqで流す。
+`1 → 2 → 3 → 4 → 5 → 6 → 7 → 8 → 9`。ステップ1〜7は実装済みで、4の実機確認（010）は並列とmerge queueを含めて行う。ステップ8のpluginは実装済みで、Claude Codeからの実行・統合・復旧の確認をステップ9に含める。次の着手単位は010。ドッグフーディングへの移行は010の直後、012から。012・013・014・019のジャーナルは`draft`で置き、暫定運用のSVは起動しない。016・017・018・010がdoneになった時点で`cmux-taskq add`へ登録し、013・014・019はcmux-taskqで流す。
 
 ## After first dogfooding
 

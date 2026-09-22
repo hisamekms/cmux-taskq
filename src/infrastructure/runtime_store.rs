@@ -1,5 +1,5 @@
 //! Durable per-run supervisor ownership and one-shot wrapper registration.
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
 use serde::Serialize;
 use serde_json::json;
@@ -17,6 +17,18 @@ pub struct Validation {
     pub result_commit: Option<String>,
     pub reason: Option<String>,
     pub receipt: serde_json::Value,
+}
+
+/// What `integrate` put on `main`: the squash `commit` whose tree is that of
+/// `source_commit` (the rebased run head kept under `history_ref`), on top of
+/// `main_before`.
+#[derive(Debug, Serialize)]
+pub struct Landing {
+    pub commit: String,
+    pub source_commit: String,
+    pub main_before: String,
+    pub history_ref: String,
+    pub message: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -337,11 +349,12 @@ impl SqliteQueue {
         Ok(())
     }
 
-    /// Runs that hold the execution slot, oldest first.
+    /// Runs a process is responsible for right now (executing under a
+    /// supervisor, or being landed by `integrate`), oldest first.
     pub fn active_runs(&self) -> Result<Vec<TaskRun>> {
         Ok(self
             .conn
-            .prepare("SELECT * FROM task_runs WHERE status IN ('claimed','starting','running','validating') ORDER BY rowid")?
+            .prepare("SELECT * FROM task_runs WHERE status IN ('claimed','starting','running','validating','integrating') ORDER BY rowid")?
             .query_map([], run_row)?
             .collect::<rusqlite::Result<_>>()?)
     }
@@ -350,7 +363,9 @@ impl SqliteQueue {
     /// registered processes are dead; `checked_processes` guards against a
     /// registration that happened in between, and a fresh lease is refused here
     /// again. Only this run's lease is deleted; other runs, their leases,
-    /// resources and the task's `in_progress` status are left untouched.
+    /// resources and the task's `in_progress` status are left untouched. An
+    /// executing run becomes `interrupted`; a run abandoned mid-integration
+    /// goes back to `awaiting_integration`, since its validated result is intact.
     pub fn recover_run(
         &mut self,
         id: &str,
@@ -381,16 +396,22 @@ impl SqliteQueue {
             })
             .optional()?
             .with_context(|| format!("run {id} does not exist"))?;
+        let next = if previous == "integrating" {
+            "awaiting_integration"
+        } else {
+            "interrupted"
+        };
         ensure!(
             tx.execute(
-                "UPDATE task_runs SET status='interrupted' WHERE id=?1
-                 AND status IN ('claimed','starting','running','validating')",
-                [id]
+                "UPDATE task_runs SET status=?2 WHERE id=?1
+                 AND status IN ('claimed','starting','running','validating','integrating')",
+                params![id, next]
             )? == 1,
             "run {id} is {previous}; only unfinished runs can be recovered"
         );
         let leases_deleted = tx.execute("DELETE FROM run_leases WHERE run_id=?1", [id])?;
         report["previous_status"] = json!(previous);
+        report["status"] = json!(next);
         report["lease_deleted"] = json!(leases_deleted == 1);
         run_event(&tx, id, "run_recovered", report)?;
         // The task stays in_progress; a retry is an explicit `ready` and a new run.
@@ -469,25 +490,180 @@ impl SqliteQueue {
         Ok(result)
     }
 
-    /// Complete the task once its awaiting run was confirmed in `main`. No lease
-    /// is involved: the run stopped executing when validation finished. The status
-    /// predicates make a repeated or concurrent confirmation fail without effect.
+    /// The oldest run awaiting integration by validation time: the FIFO
+    /// order of the merge queue. Runs waiting for a session are skipped;
+    /// they are resumed explicitly by `integrate ID`.
+    pub fn next_awaiting_integration(&self) -> Result<Option<TaskRun>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT r.* FROM task_runs r WHERE r.status='awaiting_integration'
+                 ORDER BY (SELECT MIN(e.id) FROM run_events e
+                           WHERE e.run_id=r.id AND e.kind='validation_finished') NULLS LAST,
+                          r.rowid
+                 LIMIT 1",
+                [],
+                run_row,
+            )
+            .optional()?)
+    }
+
+    /// Take the single integration slot for an awaiting run or one coming
+    /// back from a session: the run becomes `integrating` and this process
+    /// owns it through a lease row for the duration, so `doctor` can see who
+    /// is landing what. `one_integrating_run_per_queue` backs the explicit check.
+    pub fn begin_integration(&mut self, id: &str, token: &str, main: &str) -> Result<TaskRun> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let busy: Option<String> = tx
+            .query_row(
+                "SELECT id FROM task_runs WHERE status='integrating'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(other) = busy {
+            ensure!(
+                other == id,
+                "run {other} is integrating; one run lands at a time (see doctor if it is stuck)"
+            );
+            bail!("run {id} is already integrating (see doctor if it is stuck)");
+        }
+        let previous: String = tx
+            .query_row("SELECT status FROM task_runs WHERE id=?1", [id], |r| {
+                r.get(0)
+            })
+            .optional()?
+            .with_context(|| format!("run {id} does not exist"))?;
+        ensure!(
+            tx.execute(
+                "UPDATE task_runs SET status='integrating' WHERE id=?1
+                 AND status IN ('awaiting_integration','needs_session')",
+                [id]
+            )? == 1,
+            "run {id} is {previous}; only a run awaiting integration or a session can be integrated"
+        );
+        tx.execute(
+            "INSERT INTO run_leases(run_id,token,pid) VALUES (?1,?2,?3)",
+            params![id, token, std::process::id()],
+        )
+        .context("run is still leased")?;
+        run_event(
+            &tx,
+            id,
+            "integration_started",
+            json!({"main": main, "previous_status": previous, "pid": std::process::id()}),
+        )?;
+        let result = tx.query_row("SELECT * FROM task_runs WHERE id=?1", [id], run_row)?;
+        tx.commit()?;
+        Ok(result)
+    }
+
+    /// Park an integrating run for a session: `needs_session` with the reason
+    /// in `last_error`; the slot and lease are released. The worktree is left
+    /// as the landing attempt left it.
+    pub fn defer_integration(
+        &mut self,
+        id: &str,
+        token: &str,
+        reason: &str,
+        detail: serde_json::Value,
+    ) -> Result<TaskRun> {
+        self.leave_integration(
+            id,
+            token,
+            "needs_session",
+            reason,
+            "integration_deferred",
+            detail,
+        )
+    }
+
+    /// End an integrating run whose rewritten receipt reports `failed`.
+    pub fn fail_integration(&mut self, id: &str, token: &str, reason: &str) -> Result<TaskRun> {
+        self.leave_integration(id, token, "failed", reason, "integration_failed", json!({}))
+    }
+
+    /// Give the slot back after an error before `main` moved: the run returns
+    /// to the status it had when the landing started.
+    pub fn abort_integration(
+        &mut self,
+        id: &str,
+        token: &str,
+        revert_to: &str,
+        message: &str,
+    ) -> Result<TaskRun> {
+        self.leave_integration(
+            id,
+            token,
+            revert_to,
+            message,
+            "integration_error",
+            json!({}),
+        )
+    }
+
+    fn leave_integration(
+        &mut self,
+        id: &str,
+        token: &str,
+        status: &str,
+        reason: &str,
+        kind: &str,
+        mut detail: serde_json::Value,
+    ) -> Result<TaskRun> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        assert_lease(&tx, id, token)?;
+        ensure!(
+            tx.execute(
+                "UPDATE task_runs SET status=?2,last_error=?3 WHERE id=?1 AND status='integrating'",
+                params![id, status, reason]
+            )? == 1,
+            "run {id} is not integrating"
+        );
+        tx.execute(
+            "DELETE FROM run_leases WHERE run_id=?1 AND token=?2",
+            params![id, token],
+        )?;
+        detail["status"] = json!(status);
+        detail["reason"] = json!(reason);
+        run_event(&tx, id, kind, detail)?;
+        run_event(&tx, id, "lease_released", json!({"reason": kind}))?;
+        let result = tx.query_row("SELECT * FROM task_runs WHERE id=?1", [id], run_row)?;
+        tx.commit()?;
+        Ok(result)
+    }
+
+    /// Complete the task once its run landed on `main`: the run becomes
+    /// `integrated` with the landed commit as `result_commit`, the task
+    /// `completed`, and the slot and lease are released. The status
+    /// predicates make a repeated or concurrent completion fail without effect.
     pub fn finish_integration(
         &mut self,
         id: &str,
-        main: &str,
+        token: &str,
+        landing: &Landing,
         common_dir: &str,
     ) -> Result<(Task, TaskRun)> {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        assert_lease(&tx, id, token)?;
         ensure!(
             tx.execute(
-                "UPDATE task_runs SET status='integrated' WHERE id=?1 AND status='awaiting_integration'",
-                [id]
+                "UPDATE task_runs SET status='integrated',result_commit=?2,last_error=NULL
+                 WHERE id=?1 AND status='integrating'",
+                params![id, landing.commit]
             )? == 1,
-            "run {id} is no longer awaiting integration"
+            "run {id} is not integrating"
         );
+        tx.execute(
+            "DELETE FROM run_leases WHERE run_id=?1 AND token=?2",
+            params![id, token],
+        )?;
         let run = tx.query_row("SELECT * FROM task_runs WHERE id=?1", [id], run_row)?;
         ensure!(
             tx.execute(
@@ -498,12 +674,11 @@ impl SqliteQueue {
             "task {} is not in progress",
             run.task_id
         );
-        run_event(
-            &tx,
-            id,
-            "run_integrated",
-            json!({"result_commit": run.result_commit, "main": main, "git_common_dir": common_dir}),
-        )?;
+        let mut payload = serde_json::to_value(landing)?;
+        payload["result_commit"] = json!(landing.commit);
+        payload["git_common_dir"] = json!(common_dir);
+        run_event(&tx, id, "run_integrated", payload)?;
+        run_event(&tx, id, "lease_released", json!({"reason": "integrated"}))?;
         event(
             &tx,
             run.task_id,
@@ -514,6 +689,24 @@ impl SqliteQueue {
         let task = read_task(&tx, run.task_id)?;
         tx.commit()?;
         Ok((task, run))
+    }
+
+    /// Note a post-landing cleanup failure (worktree or branch removal) on a
+    /// run whose status no longer changes.
+    pub fn record_cleanup_failure(&mut self, id: &str, message: &str) -> Result<()> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        ensure!(
+            tx.execute(
+                "UPDATE task_runs SET last_error=?2 WHERE id=?1",
+                params![id, message]
+            )? == 1,
+            "run does not exist"
+        );
+        run_event(&tx, id, "cleanup_failed", json!({"message": message}))?;
+        tx.commit()?;
+        Ok(())
     }
 }
 

@@ -28,7 +28,7 @@ fn ok(db: &Path, args: &[&str]) -> Value {
 fn cli_persists_across_processes_and_reports_dependency_errors_as_json() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("queue with spaces.db");
-    assert_eq!(ok(&db, &["init"])["schema_version"], 5);
+    assert_eq!(ok(&db, &["init"])["schema_version"], 6);
     let first = ok(
         &db,
         &[
@@ -85,13 +85,17 @@ fn reads_do_not_create_a_queue_and_unknown_tasks_fail() {
     assert!(!invoke(&db, &["add", "  "]).status.success());
     assert_eq!(ok(&db, &["list"]), serde_json::json!([]));
     ok(&db, &["add", "never run"]);
+    // A `--db` queue that was never supervised is bound to no repository, so
+    // there is nothing to land in; the run lookup comes first for a task.
     let output = invoke(&db, &["integrate", "1"]);
     assert!(!output.status.success());
     let error: Value = serde_json::from_slice(&output.stderr).unwrap();
+    let message = error["error"].as_str().unwrap();
     assert!(
-        error["error"]
-            .as_str()
-            .unwrap()
-            .contains("no run awaiting integration")
+        message.contains("not bound to a repository") || message.contains("not inside a Git"),
+        "{message}"
     );
+    // `integrate` needs exactly one of a task ID or --next.
+    assert!(!invoke(&db, &["integrate"]).status.success());
+    assert!(!invoke(&db, &["integrate", "1", "--next"]).status.success());
 }

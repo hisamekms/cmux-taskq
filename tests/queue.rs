@@ -328,7 +328,7 @@ fn initialization_is_repeatable_and_preserves_existing_tasks() {
     queue.add(new_task("preserved")).unwrap();
     drop(queue);
     let queue = SqliteQueue::init(dir.path().join("queue.db")).unwrap();
-    assert_eq!(queue.schema_version().unwrap(), 5);
+    assert_eq!(queue.schema_version().unwrap(), 6);
     assert_eq!(queue.list().unwrap().len(), 1);
     assert!(SqliteQueue::open(dir.path().join("typo.db")).is_err());
     assert!(!dir.path().join("typo.db").exists());
@@ -471,7 +471,7 @@ fn migration_to_v5_rebuilds_runs_moves_the_lease_and_keeps_foreign_keys() {
     .unwrap();
     drop(raw);
     let mut queue = SqliteQueue::open(&path).unwrap();
-    assert_eq!(queue.schema_version().unwrap(), 5);
+    assert_eq!(queue.schema_version().unwrap(), 6);
     // The queue-wide lease became the orphaned run's lease; the slot index is gone.
     let leases = queue.run_leases().unwrap();
     assert_eq!(leases.len(), 1);
@@ -525,4 +525,110 @@ fn migration_to_v5_rebuilds_runs_moves_the_lease_and_keeps_foreign_keys() {
         )
         .is_ok()
     );
+}
+
+#[test]
+fn migration_to_v6_adds_the_integration_statuses_and_the_single_slot() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("v5.db");
+    let raw = Connection::open(&path).unwrap();
+    for migration in [
+        include_str!("../migrations/0001_queue.sql"),
+        include_str!("../migrations/0002_supervisor.sql"),
+        include_str!("../migrations/0003_workspace_close.sql"),
+        include_str!("../migrations/0004_integration.sql"),
+        include_str!("../migrations/0005_run_leases.sql"),
+    ] {
+        raw.execute_batch(migration).unwrap();
+    }
+    raw.pragma_update(None, "application_id", 0x43545131)
+        .unwrap();
+    raw.pragma_update(None, "user_version", 5).unwrap();
+    raw.execute_batch(&format!(
+        "INSERT INTO tasks(title,description,acceptance,verification_commands,status)
+         VALUES ('awaiting','','','[]','in_progress');
+         INSERT INTO task_runs(id,task_id,status,requested_provider,actual_provider,base_commit,result_commit)
+         VALUES ('run-awaiting',1,'awaiting_integration','claude','claude','{BASE}','{BASE}');
+         INSERT INTO run_events(task_id,run_id,kind,payload) VALUES (1,'run-awaiting','validation_finished','{{}}');
+         INSERT INTO tasks(title,description,acceptance,verification_commands,status)
+         VALUES ('running','','','[]','in_progress');
+         INSERT INTO task_runs(id,task_id,status,requested_provider,actual_provider,base_commit,supervisor_token)
+         VALUES ('run-running',2,'running','claude','claude','{BASE}','tok');
+         INSERT INTO run_leases(run_id,token,pid,heartbeat_at) VALUES ('run-running','tok',4242,1700000000);
+         INSERT INTO tasks(title,description,acceptance,verification_commands,status)
+         VALUES ('other','','','[]','in_progress');
+         INSERT INTO task_runs(id,task_id,status,requested_provider,actual_provider,base_commit,result_commit)
+         VALUES ('run-other',3,'awaiting_integration','claude','claude','{BASE}','{BASE}');"
+    ))
+    .unwrap();
+    drop(raw);
+    let mut queue = SqliteQueue::open(&path).unwrap();
+    assert_eq!(queue.schema_version().unwrap(), 6);
+    assert_eq!(
+        queue.show(1).unwrap().runs[0].status,
+        RunStatus::AwaitingIntegration
+    );
+    assert_eq!(queue.show(2).unwrap().runs[0].status, RunStatus::Running);
+    let leases = queue.run_leases().unwrap();
+    assert_eq!(leases.len(), 1);
+    assert_eq!(leases[0].run_id, "run-running");
+    assert_eq!(
+        queue.next_awaiting_integration().unwrap().unwrap().id,
+        "run-awaiting"
+    );
+    let raw = Connection::open(&path).unwrap();
+    raw.pragma_update(None, "foreign_keys", true).unwrap();
+    let objects: Vec<String> = raw
+        .prepare(
+            "SELECT name FROM sqlite_master WHERE type='index' AND name LIKE 'one_%' ORDER BY name",
+        )
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert_eq!(
+        objects,
+        [
+            "one_integrated_run_per_task",
+            "one_integrating_run_per_queue",
+            "one_unfinished_run_per_task"
+        ]
+    );
+    // The new statuses are accepted; only one run may integrate at a time.
+    raw.execute(
+        "UPDATE task_runs SET status='integrating' WHERE id='run-awaiting'",
+        [],
+    )
+    .unwrap();
+    assert!(
+        raw.execute(
+            "UPDATE task_runs SET status='integrating' WHERE id='run-other'",
+            []
+        )
+        .is_err()
+    );
+    raw.execute(
+        "UPDATE task_runs SET status='needs_session' WHERE id='run-other'",
+        [],
+    )
+    .unwrap();
+    // A parked run still owns its task.
+    assert!(
+        raw.execute(
+            "INSERT INTO task_runs(id,task_id,status,requested_provider,actual_provider,base_commit)
+             VALUES ('extra',3,'claimed','claude','claude',?1)",
+            [BASE],
+        )
+        .is_err()
+    );
+    assert!(
+        raw.execute(
+            "INSERT INTO run_events(task_id,run_id,kind,payload) VALUES (1,'ghost','x','{}')",
+            [],
+        )
+        .is_err()
+    );
+    assert!(queue.candidates().unwrap().is_empty());
+    assert!(queue.transition(3, TaskAction::Cancel).is_err());
 }

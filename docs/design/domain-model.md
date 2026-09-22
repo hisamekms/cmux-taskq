@@ -11,6 +11,7 @@ related:
   - adr-0003
   - adr-0004
   - adr-0007
+  - adr-0008
   - design-persistence
 ---
 
@@ -18,7 +19,7 @@ related:
 
 ## Implementation status
 
-ステップ2で`Task`、`TaskDependency`、`TaskRun`、`RunEvent`、ステップ3で`RunProcess`と`SupervisorLease`、ステップ4で`Receipt`を実装した。ステップ6（[017](../journal/017-parallel-runs.md)）で`SupervisorLease`を`RunLease`に置き換えた。Rustの型と手動遷移規則は`src/domain.rs`、ストレージとprovider/workspaceの契約は`src/application.rs`、永続化は`src/infrastructure/sqlite.rs`と`src/infrastructure/runtime_store.rs`にある。`AgentSession`と`Workspace`は独立エンティティにせず、TaskRunの`id`（Claude session ID）と`workspace_id`で表す。
+ステップ2で`Task`、`TaskDependency`、`TaskRun`、`RunEvent`、ステップ3で`RunProcess`と`SupervisorLease`、ステップ4で`Receipt`を実装した。ステップ6（[017](../journal/017-parallel-runs.md)）で`SupervisorLease`を`RunLease`に置き換え、ステップ7（[018](../journal/018-merge-queue.md)）でrunの`integrating`と`needs_session`、`IntegrationOutcome`の`needs_session` / `failed` / `no_run_awaiting`を加えた。Rustの型と手動遷移規則は`src/domain.rs`、ストレージとprovider/workspaceの契約は`src/application.rs`、永続化は`src/infrastructure/sqlite.rs`と`src/infrastructure/runtime_store.rs`にある。`AgentSession`と`Workspace`は独立エンティティにせず、TaskRunの`id`（Claude session ID）と`workspace_id`で表す。
 
 ## Entities
 
@@ -27,7 +28,7 @@ related:
 - `TaskRun`: 1回の実行試行。provider、worktree、branch、結果、実行statusを持つ。
 - `AgentSession`: providerが起動したセッション。プロセスとprovider固有識別子を持つ。
 - `Workspace`: cmux workspace。TaskRunと1対1で関連し、receipt検証を通った後にsupervisorが閉じる。閉じたことの確認は`TaskRun.workspace_closed_at`で持つ。
-- `RunLease`: 1つのrunを所有するsupervisorのPIDとheartbeat。runごとに高々1つで、supervisorが監視している間だけ存在する。
+- `RunLease`: 1つのrunを所有するプロセス（実行中はsupervisor、着地中は`integrate`）のPIDとheartbeat。runごとに高々1つで、そのプロセスがrunを扱っている間だけ存在する。
 - `RunProcess`: runごとのsession wrapperとagentのPID、heartbeat、終了コード。
 - `RunEvent`: 実行中に発生した永続イベント。
 - `Receipt`: agentが提出する完了レシート。run ID、結果、commit、tests/e2e/subagent_reviewの状態と証跡または理由、要約を持つ。構造の整合性は`Receipt::check`、Gitと検証コマンドの確認はsupervisorが行う。
@@ -39,12 +40,12 @@ related:
 - `add`でdraftを作り、`draft → ready`、`ready → draft`、`draft/ready → canceled`を手動操作できる。
 - `claim`だけが`ready → in_progress`へ遷移させる。同じトランザクションでclaimed状態のTaskRunとイベントを作り、supervisorからのclaimはそのrunの`RunLease`も作る。キュー全体の実行枠はなく、依存が解けたtaskは`supervise --parallel N`の上限まで同時に実行される。
 - supervisorはrunを`claimed → starting`（path計画）→ `running`（agent起動）→ `validating`または`failed`（wrapper終了）→ `awaiting_integration`または`failed`（receipt検証）へ進め、`awaiting_integration`のworkspaceを閉じて`workspace_closed_at`を記録し、休止したrunの`RunLease`を解放する。各遷移はそのrunのleaseまたはwrapperの所有を要求する。runtime errorではsupervisorがそのrunだけを手放す（statusは変えず、`last_error`を書き、leaseを消す）。
-- `integrate`だけが`awaiting_integration → integrated`とTaskの`in_progress → completed`を同時に行う。result commitが`refs/heads/main`の祖先であることを条件にし、結果は`IntegrationOutcome`（`integrated` / `not_integrated`）で返す。`not_integrated`は何も変えない。
-- `in_progress`のTaskは、未完了run（claimed/starting/running/validating/awaiting_integration）がある間は手動変更できない。すべてのrunが`failed`または`interrupted`になった`in_progress`は`ready`/`draft`/`canceled`へ手動で戻せる。再試行は新しいTaskRunになる。終端状態は変更できない。依存の追加・削除はdraft/readyだけに許可する。
-- `recover`は未完了runを、そのrunの登録プロセスとleaseの所有者が停止していることを確認してから`interrupted`にする。他のrunには触れない。Taskは`in_progress`のままで、`ready`への復帰は別操作。
+- `integrate`だけが`awaiting_integration | needs_session → integrating`と、そこからの`→ integrated`（Taskは`in_progress → completed`、`result_commit`は`main`に積んだsquash commit）、`→ needs_session`（rebaseの衝突、再検証の失敗）、`→ failed`（セッションが書き直したreceiptが`failed`）、`→ 元のstatus`（mainを進める前のerror）を行う。`integrating`はqueue全体で1件。結果は`IntegrationOutcome`（`integrated` / `needs_session` / `failed` / `no_run_awaiting`）で返す。`integrate --next`は`awaiting_integration`のrunを検証完了の古い順に取り、`needs_session`は`integrate ID`で明示的に再開する。
+- `in_progress`のTaskは、未完了run（claimed/starting/running/validating/awaiting_integration/integrating/needs_session）がある間は手動変更できない。すべてのrunが`failed`または`interrupted`になった`in_progress`は`ready`/`draft`/`canceled`へ手動で戻せる。再試行は新しいTaskRunになる。終端状態は変更できない。依存の追加・削除はdraft/readyだけに許可する。
+- `recover`は未完了runを、そのrunの登録プロセスとleaseの所有者が停止していることを確認してから`interrupted`にする（`integrating`なら`awaiting_integration`へ戻す）。他のrunには触れない。Taskは`in_progress`のままで、`ready`への復帰は別操作。
 - `succeeded`（統合を待たずに成功とする運用）への遷移はまだ公開していない。
 - `candidates`は全依存がcompletedのready taskをID順で返す。claimはTaskごとの未完了run 1件の制約だけを再確認する。
-- canceled、失敗、中断、統合待ちは依存の完了条件を満たさない。awaiting_integrationのTaskはin_progressのまま保持し、integratedになった時点でcompletedになる。
+- canceled、失敗、中断、統合待ち、着地中、セッション待ちは依存の完了条件を満たさない。awaiting_integration / integrating / needs_sessionのTaskはin_progressのまま保持し、integratedになった時点でcompletedになる。
 - `RunEvent.run_id`はtask登録・依存変更などrun作成前のイベントではnullになる。
 
 ## Invariants
@@ -53,7 +54,9 @@ related:
 - 依存グラフは循環しない。
 - `in_progress`はschedulerがclaimしたTaskだけが持つ。
 - TaskRunが成功するには完了レシート、base commitの上に積まれたbranch headのコミット、clean worktree、supervisorが再実行した検証コマンドの成功が必要。receiptの自己申告だけでは成功しない。
-- Taskが`completed`になるのは、その`integrated` runのresult commitがmainの祖先だと確認できたときだけ。`integrated` runはTaskごとに1件。
+- Taskが`completed`になるのは、その`integrated` runを`integrate`がmainへ着地させたときだけ。着地commitのtreeは再検証したworktreeのtreeに等しく、messageは`Taskq-Task` / `Taskq-Run` trailerでrunに結び付く。`integrated` runはTaskごとに1件、`integrating` runはqueueごとに1件。
+- mainはtaskごとに1つのsquash commitの直線で、merge commitとrun branchのfast-forwardは作らない。runの詳細履歴は`refs/taskq/runs/<run-id>`に残る。
+- `needs_session`のrunはruntimeが変更しない。解消・検証コマンドの再実行・receiptの書き直しはセッションが行い、`integrate ID`が同じ手順で再検証する。
 - workspaceを閉じる前にTaskRunをcleanedにしない。閉じたことをcmuxの応答で確認して`workspace_closed_at`に記録するまでは開いている扱いで、close失敗はrun状態を変えない。
 - agentの異常終了だけでTaskを自動再実行しない。孤児runの復旧と再試行はどちらも明示操作。
 - 実装途中のprovider fallbackは行わず、起動不能など安全に判定できる場合だけfallbackする。
