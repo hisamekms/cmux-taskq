@@ -30,7 +30,6 @@ tags:
 
 ## Open
 
-1. [006 workspace close](006-workspace-close.md) — after 005
 2. [007 session exit request](007-session-exit-request.md) — after 005
 3. [008 integration confirm](008-integration-confirm.md) — after 005
 4. [009 doctor / recover](009-doctor-recover.md) — after 005
