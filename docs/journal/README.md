@@ -30,12 +30,11 @@ tags:
 
 ## Open
 
-1. [008 integration confirm](008-integration-confirm.md) — after 005
-2. [015 e2e happy path](015-e2e-happy-path.md) — 実cmux + stub agentの自動e2e。close/integrateの確認は006, 008の後に追記
-3. [010 failure path smoke](010-failure-path-smoke.md) — after 006, 009, 015。ステップ4の完了
-4. [011 Claude Code plugin](011-claude-code-plugin.md) — after 008。ステップ5
-5. [012 dogfood: independent task](012-dogfood-independent-task.md) — after 011。ここでopenなジャーナルをキューへ移行する
-6. [013 dogfood: dependent tasks](013-dogfood-dependent-tasks.md) — after 012
-7. [014 dogfood: failure and recovery](014-dogfood-failure-recovery.md) — after 013。ステップ6とM1の完了
+1. [015 e2e happy path](015-e2e-happy-path.md) — 実cmux + stub agentの自動e2e。close/integrateの確認は006, 008の後に追記
+2. [010 failure path smoke](010-failure-path-smoke.md) — after 006, 009, 015。ステップ4の完了
+3. [011 Claude Code plugin](011-claude-code-plugin.md) — after 008。ステップ5
+4. [012 dogfood: independent task](012-dogfood-independent-task.md) — after 011。ここでopenなジャーナルをキューへ移行する
+5. [013 dogfood: dependent tasks](013-dogfood-dependent-tasks.md) — after 012
+6. [014 dogfood: failure and recovery](014-dogfood-failure-recovery.md) — after 013。ステップ6とM1の完了
 
 M2以降（Codex provider、配布、Python版からの移行）は[plans/current.md](../plans/current.md)のAfter first dogfoodingに留め、まだタスクに割らない。
