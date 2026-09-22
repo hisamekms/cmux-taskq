@@ -5,8 +5,8 @@
 use crate::{
     application::{AgentProvider, TaskQueue, WorkspaceBackend},
     domain::{
-        ClaimOutcome, IntegrationOutcome, Receipt, ReceiptResult, RunLease, RunProcess, RunStatus,
-        Task, TaskRun,
+        ClaimOutcome, IntegrationOutcome, Predecessor, Receipt, ReceiptResult, RunLease,
+        RunProcess, RunStatus, Task, TaskRun,
     },
     infrastructure::{
         adapters::{
@@ -388,7 +388,22 @@ impl Supervisor<'_> {
         fs::create_dir(&run_dir).context("run directory must be new")?;
         let run = self.queue.run(&claimed.id)?;
         let task = self.queue.show(run.task_id)?.task;
-        fs::write(run_dir.join("prompt.txt"), prompt(&task, &run)?)?;
+        let predecessors: Vec<PredecessorSummary> = self
+            .queue
+            .predecessors(task.id)?
+            .iter()
+            .map(PredecessorSummary::from_predecessor)
+            .collect();
+        let in_progress: Vec<Task> = self
+            .queue
+            .tasks_in_progress()?
+            .into_iter()
+            .filter(|other| other.id != task.id)
+            .collect();
+        fs::write(
+            run_dir.join("prompt.txt"),
+            prompt(&task, &run, &predecessors, &in_progress)?,
+        )?;
         // A running wrapper must not change when the development binary is rebuilt.
         fs::copy(self.runner, run_dir.join("runner")).context("snapshot runtime binary")?;
         let git_output = self.repository.create_worktree(&run)?;
@@ -1107,8 +1122,99 @@ fn tail(text: &str, max_bytes: usize) -> &str {
     &text[start..]
 }
 
-pub fn prompt(task: &Task, run: &TaskRun) -> Result<String> {
+/// What the prompt says about one direct predecessor: the task, the squash
+/// commit `integrate` put on `main` for it, and the summary its agent wrote.
+#[derive(Debug, Clone, Serialize)]
+pub struct PredecessorSummary {
+    pub task_id: i64,
+    pub title: String,
+    /// `result_commit` of the integrated run; `(not landed)` without one.
+    pub result_commit: String,
+    /// `summary` of the integrated run's receipt, whitespace collapsed;
+    /// `(receipt unavailable)` when the receipt cannot be read or parsed.
+    pub summary: String,
+}
+
+impl PredecessorSummary {
+    /// The receipt is read where the run left it after landing (its planned
+    /// `receipt_path`, else `<run_dir>/receipt.json`); a missing or
+    /// unreadable one is described, never an error, so the successor still starts.
+    pub fn from_predecessor(predecessor: &Predecessor) -> Self {
+        let run = predecessor.integrated_run.as_ref();
+        let summary = run
+            .and_then(|run| {
+                run.receipt_path.as_deref().map(PathBuf::from).or_else(|| {
+                    run.run_dir
+                        .as_deref()
+                        .map(|dir| Path::new(dir).join("receipt.json"))
+                })
+            })
+            .and_then(|path| fs::read_to_string(path).ok())
+            .and_then(|text| Receipt::parse(&text).ok())
+            .map(|receipt| {
+                receipt
+                    .summary
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .map(|summary| {
+                if summary.is_empty() {
+                    "(no summary)".to_owned()
+                } else {
+                    summary
+                }
+            })
+            .unwrap_or_else(|| "(receipt unavailable)".to_owned());
+        Self {
+            task_id: predecessor.task.id,
+            title: predecessor.task.title.clone(),
+            result_commit: run
+                .and_then(|run| run.result_commit.clone())
+                .unwrap_or_else(|| "(not landed)".to_owned()),
+            summary,
+        }
+    }
+}
+
+/// Text of `prompt.txt`. `predecessors` are the task's direct dependencies
+/// and `in_progress` the other tasks executing at claim time (the task
+/// itself excluded); both sections are always present, `none` when empty,
+/// so the prompt keeps one shape.
+pub fn prompt(
+    task: &Task,
+    run: &TaskRun,
+    predecessors: &[PredecessorSummary],
+    in_progress: &[Task],
+) -> Result<String> {
     let receipt = run.receipt_path.as_ref().context("missing receipt path")?;
+    let predecessors = if predecessors.is_empty() {
+        "Predecessor tasks: none\n".to_owned()
+    } else {
+        let mut text =
+            "Predecessor tasks (their changes are already in your base commit):\n".to_owned();
+        for predecessor in predecessors {
+            text.push_str(&format!(
+                "- task {}: {}; result commit {}; summary: {}\n",
+                predecessor.task_id,
+                predecessor.title,
+                predecessor.result_commit,
+                predecessor.summary
+            ));
+        }
+        text
+    };
+    let in_progress = if in_progress.is_empty() {
+        "Tasks in progress: none\n".to_owned()
+    } else {
+        let mut text =
+            "Tasks in progress (other tasks executing now; stay within your own task's scope):\n"
+                .to_owned();
+        for other in in_progress {
+            text.push_str(&format!("- task {}: {}\n", other.id, other.title));
+        }
+        text
+    };
     Ok(format!(
         "You are executing cmux-taskq task {task_id}, run {run_id}.\n\
          Work only in the assigned Git worktree. Read its repository instructions.\n\
@@ -1117,6 +1223,7 @@ pub fn prompt(task: &Task, run: &TaskRun) -> Result<String> {
          Perform applicable unit tests, E2E, and subagent review. Record evidence or an explicit reason when not applicable.\n\
          Task title: {title}\nDescription:\n{description}\nAcceptance criteria:\n{acceptance}\n\
          Verification commands (run in the worktree):\n{verification}\n\
+         {predecessors}{in_progress}\
          Write a completion receipt to {receipt} using a temporary file in the same directory and atomic rename.\n\
          Receipt JSON: {{\"run_id\":\"{run_id}\",\"result\":\"succeeded or failed\",\"commit\":\"full Git SHA of the branch head\",\"tests\":{{\"status\":\"passed, failed or not_applicable\",\"evidence_or_reason\":\"...\"}},\"e2e\":{{\"status\":\"...\",\"evidence_or_reason\":\"...\"}},\"subagent_review\":{{\"status\":\"...\",\"evidence_or_reason\":\"...\"}},\"summary\":\"...\"}}\n\
          Each of tests, e2e and subagent_review needs evidence when passed and a reason when not_applicable.\n\

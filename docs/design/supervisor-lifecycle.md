@@ -13,6 +13,7 @@ related:
   - adr-0006
   - adr-0007
   - adr-0008
+  - adr-0009
   - design-persistence
   - design-provider-lifecycle
 ---
@@ -60,7 +61,7 @@ ready task (dependencies completed)
 ループ（1秒ごと）:
 
 5. **claim**: active runが上限未満で、`candidates`が空でなければ、`refs/heads/main`を読み直してbase commitにし、`claim_for_supervisor`でrun・`supervisor_token`・lease行を1トランザクションで作る。`integrate`で依存が解けたtaskは次のループで、先行taskを含む`main`から始まる。
-6. **provision**: run管理領域（DBと同じdirの`runs/<run-id>/`）のpath、branch `taskq/<run-id>`、worktree（`runs/<run-id>/worktree`）、receipt、logのpathを`run_planned`として先にDBへ保存し、ディレクトリ、`prompt.txt`、runtimeバイナリのスナップショット`runner`、worktreeを作り、cmux workspaceを`--cwd worktree --command '<runner> --db ... session --run ... --lease <token> --claude ...'`で作成して、`identify`で解決したUUIDを`workspace_created`として保存する。wrapperにはDBのpathを`--db`で明示的に渡す。provisioningの失敗は環境要因とみなし、そのrunをabandon（下記）した上で以後のclaimを止め、active runをdrainしてから非0で終了する。
+6. **provision**: run管理領域（DBと同じdirの`runs/<run-id>/`）のpath、branch `taskq/<run-id>`、worktree（`runs/<run-id>/worktree`）、receipt、logのpathを`run_planned`として先にDBへ保存し、ディレクトリ、`prompt.txt`、runtimeバイナリのスナップショット`runner`、worktreeを作り、cmux workspaceを`--cwd worktree --command '<runner> --db ... session --run ... --lease <token> --claude ...'`で作成して、`identify`で解決したUUIDを`workspace_created`として保存する。wrapperにはDBのpathを`--db`で明示的に渡す。provisioningの失敗は環境要因とみなし、そのrunをabandon（下記）した上で以後のclaimを止め、active runをdrainしてから非0で終了する。`prompt.txt`の内容は下記[Prompt](#prompt)。
 7. **監視**: runごとの`SessionWatch`が、wrapperの登録（45秒以内）、wrapper heartbeat（30秒以内）、receiptファイルの出現、idle marker、wrapperの終了を確認する。receiptの出現は`receipt_observed`（`validated: false`）として記録するだけで、セッション終了とは別に扱う。receipt観測後にidle markerがreceiptより新しければ`session_idle_observed`を記録し、`WorkspaceBackend::send_exit`で一度だけ終了を要求して`exit_requested`を記録する（下記）。
 8. wrapper終了後に画面を`terminal-final.txt`へ保存し、`supervision_finished`でrunを終了コード0なら`validating`、それ以外なら`failed`にする。非0のときは同じトランザクションで`last_error`に`session exited with code N`を書き、`show`だけで理由が分かるようにする。Taskは`in_progress`のまま残す。
 9. `validating`のrunはreceipt検証（下記）をrunごとのthread（専用SQLite接続）で行い、ループは完了を待ちながら他のrunを監視し続ける。完了したら`validation_finished`でrunを`awaiting_integration`または`failed`にする。
@@ -69,6 +70,15 @@ ready task (dependencies completed)
 12. active runがなく、`--once`か停止要求（下記）か、provisioning失敗でclaimを止めていればループを抜ける。それ以外はactive runがない間2秒ごとに`candidates`を見る。
 
 結果は`{"outcome": "finished" | "stopped", "runs": [休止したrun], "errors": [{run_id, task_id, message}]}`。SIGINT/SIGTERMは1回目でclaimを止めてactive runの終了を待ち（graceful drain）、2回目で既定の動作（即終了）になる。即終了したsupervisorのleaseは30秒でstaleになる。
+
+### Prompt
+
+`prompt.txt`は`src/runtime.rs`の`prompt(task, run, predecessors, in_progress)`が生成するclaim時点のスナップショットで、run中にqueueが変わっても書き換えない。task単体の情報（ID、run ID、title、description、acceptance、verification_commands）、receiptの契約（pathとJSONの形）に加えて、[ADR-0009](../adr/0009-goal-groups-tasks.md)の段階1として次の2節を検証コマンドとreceiptの契約の間に載せる。どちらも常に書き、該当がなければ`none`にして、promptの形を依存や並列の有無で変えない。
+
+- **Predecessor tasks**: taskの直接の依存元（`task_dependencies`のpredecessor）ごとに1行、`- task <ID>: <title>; result commit <sha>; summary: <text>`。`result commit`は依存元の`integrated` runの`result_commit`（`integrate`がmainに積んだsquash commit）、`summary`はそのrunのreceipt（`receipt_path`。なければ`<run-dir>/receipt.json`）の`summary`（空白を1つに畳む。空なら`(no summary)`）。receiptが読めない・parseできない・pathが不明なら`(receipt unavailable)`、integrated runがなければ（手で`completed`にしたなど）`result commit (not landed)`と書き、いずれもprovisionを止めない。取得はqueueの読み取り専用操作`TaskQueue::predecessors(task_id)`（ID順。依存元の`Task`と`integrated` runの`Option<TaskRun>`）で、summaryの読み取りはruntime側（`PredecessorSummary::from_predecessor`）が行う。依存元がなければ`Predecessor tasks: none`。
+- **Tasks in progress**: `TaskQueue::tasks_in_progress()`が返す`in_progress`のtask（ID順）から自分のtaskを除いたものを`- task <ID>: <title>`で並べ、自分のtaskの範囲に留まるよう指示する。claimは`fill_slots`で1件ずつ順に行うので、同じpassで後にclaimされたtaskのpromptには先にclaimされたtaskが載り、その逆は載らない。`awaiting_integration`や`needs_session`のrunを持つtaskも`in_progress`なので載る。なければ`Tasks in progress: none`。
+
+schemaとCLIは変えない。`tests/e2e.rs`のstubはpromptの1行目とreceipt pathの行だけを読むので、節の追加に影響されない。
 
 ### 1 runの異常（abandon）
 

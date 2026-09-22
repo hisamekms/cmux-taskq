@@ -157,6 +157,65 @@ fn candidates_require_every_predecessor_to_be_completed() {
     assert_eq!(run.task_id, c);
 }
 
+/// The read-only views the worker prompt is built from: direct predecessors
+/// with their integrated run, and every task in progress.
+#[test]
+fn predecessors_carry_the_integrated_run_and_in_progress_tasks_are_listed() {
+    let (dir, mut queue) = fixture();
+    let a = queue.add(new_task("a")).unwrap().id;
+    let b = queue.add(new_task("b")).unwrap().id;
+    let c = queue.add(new_task("c")).unwrap().id;
+    queue.add_dependency(c, b).unwrap();
+    queue.add_dependency(c, a).unwrap();
+    assert!(queue.predecessors(a).unwrap().is_empty());
+    assert!(queue.tasks_in_progress().unwrap().is_empty());
+
+    // a landed through a run; b was completed without one (no integrated run).
+    queue.transition(a, TaskAction::Ready).unwrap();
+    let ClaimOutcome::Claimed { run } = queue.claim(BASE).unwrap() else {
+        panic!()
+    };
+    assert_eq!(
+        queue
+            .tasks_in_progress()
+            .unwrap()
+            .iter()
+            .map(|t| t.id)
+            .collect::<Vec<_>>(),
+        vec![a]
+    );
+    let raw = Connection::open(dir.path().join("queue.db")).unwrap();
+    raw.execute(
+        "UPDATE task_runs SET status='integrated', result_commit=?2, run_dir='/nowhere' WHERE id=?1",
+        rusqlite::params![run.id, BASE],
+    )
+    .unwrap();
+    raw.execute(
+        "UPDATE tasks SET status='completed' WHERE id IN (?1, ?2)",
+        [a, b],
+    )
+    .unwrap();
+    assert!(queue.tasks_in_progress().unwrap().is_empty());
+
+    // Predecessors come in ID order regardless of the order the edges were added.
+    let predecessors = queue.predecessors(c).unwrap();
+    assert_eq!(
+        predecessors
+            .iter()
+            .map(|p| (p.task.id, p.task.title.as_str()))
+            .collect::<Vec<_>>(),
+        vec![(a, "a"), (b, "b")]
+    );
+    let landed = predecessors[0].integrated_run.as_ref().unwrap();
+    assert_eq!(landed.id, run.id);
+    assert_eq!(landed.status, RunStatus::Integrated);
+    assert_eq!(landed.result_commit.as_deref(), Some(BASE));
+    assert_eq!(landed.run_dir.as_deref(), Some("/nowhere"));
+    assert!(predecessors[1].integrated_run.is_none());
+    // A task that does not exist has no predecessors rather than an error.
+    assert!(queue.predecessors(99).unwrap().is_empty());
+}
+
 #[test]
 fn manual_transitions_cannot_change_claimed_or_terminal_tasks() {
     let (_dir, mut queue) = fixture();

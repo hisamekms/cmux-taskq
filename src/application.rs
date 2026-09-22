@@ -2,7 +2,7 @@
 
 use anyhow::Result;
 
-use crate::domain::{ClaimOutcome, NewTask, Task, TaskAction, TaskDetail};
+use crate::domain::{ClaimOutcome, NewTask, Predecessor, Task, TaskAction, TaskDetail};
 
 pub trait TaskQueue {
     fn add(&mut self, task: NewTask) -> Result<Task>;
@@ -15,6 +15,10 @@ pub trait TaskQueue {
     fn candidates(&self) -> Result<Vec<Task>>;
     /// Reserve one run atomically, without a lease. Does not start a process or validate Git objects.
     fn claim(&mut self, base_commit: &str) -> Result<ClaimOutcome>;
+    /// Direct predecessors of a task, each with the run that landed it, in ID order.
+    fn predecessors(&self, task_id: i64) -> Result<Vec<Predecessor>>;
+    /// Tasks that are `in_progress` right now, in ID order.
+    fn tasks_in_progress(&self) -> Result<Vec<Task>>;
 }
 
 /// Provider-specific CLI construction is kept outside supervisor orchestration.

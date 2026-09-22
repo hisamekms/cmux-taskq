@@ -167,6 +167,16 @@ impl TaskRun {
     }
 }
 
+/// A direct dependency of a task as the worker's prompt describes it: the
+/// predecessor and the run that landed it on `main`. A claimed task's
+/// predecessors are all completed, so the run is absent only when the task
+/// was completed by hand or its integrated run is gone.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Predecessor {
+    pub task: Task,
+    pub integrated_run: Option<TaskRun>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunEvent {
     pub id: i64,

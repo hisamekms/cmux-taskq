@@ -11,7 +11,7 @@ use uuid::Uuid;
 use crate::{
     application::TaskQueue,
     domain::{
-        ClaimOutcome, NewTask, RunEvent, Task, TaskAction, TaskDetail, TaskRun,
+        ClaimOutcome, NewTask, Predecessor, RunEvent, Task, TaskAction, TaskDetail, TaskRun,
         validate_base_commit,
     },
 };
@@ -258,6 +258,43 @@ impl TaskQueue for SqliteQueue {
         let outcome = claim_task(&tx, base_commit)?;
         tx.commit()?;
         Ok(outcome)
+    }
+
+    fn predecessors(&self, task_id: i64) -> Result<Vec<Predecessor>> {
+        let tasks: Vec<Task> = self
+            .conn
+            .prepare(
+                "SELECT p.* FROM task_dependencies d JOIN tasks p ON p.id = d.predecessor_id
+                 WHERE d.task_id = ?1 ORDER BY p.id",
+            )?
+            .query_map([task_id], task_row)?
+            .collect::<rusqlite::Result<_>>()?;
+        tasks
+            .into_iter()
+            .map(|task| {
+                // At most one run per task is integrated (`one_integrated_run_per_task`).
+                let integrated_run = self
+                    .conn
+                    .query_row(
+                        "SELECT * FROM task_runs WHERE task_id = ?1 AND status = 'integrated'",
+                        [task.id],
+                        run_row,
+                    )
+                    .optional()?;
+                Ok(Predecessor {
+                    task,
+                    integrated_run,
+                })
+            })
+            .collect()
+    }
+
+    fn tasks_in_progress(&self) -> Result<Vec<Task>> {
+        Ok(self
+            .conn
+            .prepare("SELECT * FROM tasks WHERE status = 'in_progress' ORDER BY id")?
+            .query_map([], task_row)?
+            .collect::<rusqlite::Result<_>>()?)
     }
 }
 

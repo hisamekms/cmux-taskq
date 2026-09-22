@@ -105,6 +105,9 @@ impl AgentProvider for TestProvider {
     fn command(&self, run: &TaskRun, prompt: &str) -> Result<Command> {
         assert!(prompt.contains("Acceptance criteria:"));
         assert!(prompt.contains("Verification commands (run in the worktree):"));
+        // Both context sections are present whether or not they have entries.
+        assert!(prompt.contains("Predecessor tasks"));
+        assert!(prompt.contains("Tasks in progress"));
         let mut command = Command::new("/bin/sh");
         command
             .current_dir(run.worktree_path.as_ref().unwrap())
@@ -368,6 +371,11 @@ fn run_agent_with(
     assert!(queue.candidates().unwrap().is_empty());
     (dir, db, detail)
 }
+/// The prompt the run's agent was started with, as `provision` wrote it.
+fn read_prompt(run: &TaskRun) -> String {
+    fs::read_to_string(Path::new(run.run_dir.as_ref().unwrap()).join("prompt.txt")).unwrap()
+}
+
 fn rejection_reason(detail: &cmux_taskq::domain::TaskDetail) -> String {
     let run = &detail.runs[0];
     assert_eq!(run.status, RunStatus::Failed);
@@ -417,6 +425,10 @@ fn valid_receipt_is_verified_and_awaits_integration() {
     let kinds: Vec<&str> = detail.events.iter().map(|e| e.kind.as_str()).collect();
     assert!(kinds.contains(&"agent_started"));
     assert!(kinds.contains(&"receipt_observed"));
+    // The only task has no predecessor and nothing else was in progress.
+    let prompt = read_prompt(run);
+    assert!(prompt.contains("Predecessor tasks: none\n"), "{prompt}");
+    assert!(prompt.contains("Tasks in progress: none\n"), "{prompt}");
     let verification = detail
         .events
         .iter()
@@ -1575,6 +1587,133 @@ fn conflict_free_run_lands_as_one_squash_commit_and_releases_dependents() {
         .is_err()
     );
     assert_eq!(queue.show(1).unwrap().runs.len(), 1);
+}
+
+/// A dependent's prompt names each predecessor with the commit `integrate`
+/// landed and the summary its receipt carried, and lists the other tasks in
+/// progress at claim time without the task itself.
+#[test]
+fn prompt_describes_landed_predecessors_and_tasks_in_progress() {
+    let (_dir, repo, db, run) = awaiting_run();
+    assert_eq!(integrate(&db, 1, &repo).unwrap()["outcome"], "integrated");
+    let mut queue = SqliteQueue::open(&db).unwrap();
+    let landed = queue.show(1).unwrap().runs[0].clone();
+    assert_eq!(landed.status, RunStatus::Integrated);
+    let landed_commit = landed.result_commit.clone().unwrap();
+    assert_eq!(landed_commit, git_out(&repo, &["rev-parse", "main"]));
+    // The squash commit, not the run's validated head, is what the prompt names.
+    assert_ne!(landed_commit, run.result_commit.unwrap());
+    add_ready_task(&mut queue, "independent", &[]);
+
+    // The queue's read-only view the prompt is built from.
+    let predecessors = queue.predecessors(2).unwrap();
+    assert_eq!(predecessors.len(), 1);
+    assert_eq!(predecessors[0].task.id, 1);
+    assert_eq!(predecessors[0].task.title, "test task");
+    let integrated = predecessors[0].integrated_run.as_ref().unwrap();
+    assert_eq!(integrated.id, run.id);
+    assert_eq!(
+        integrated.result_commit.as_deref(),
+        Some(landed_commit.as_str())
+    );
+    assert!(queue.predecessors(3).unwrap().is_empty());
+    assert!(queue.tasks_in_progress().unwrap().is_empty());
+
+    // The dependent (task 2) is claimed before the independent task 3.
+    let backend = TestWorkspace::new(&db, false, VALID_AGENT);
+    let outcome = supervise(&db, &repo, &backend).unwrap();
+    backend.join();
+    assert_eq!(outcome["outcome"], "finished");
+    assert_eq!(outcome["errors"], json!([]));
+    assert_eq!(outcome["runs"].as_array().unwrap().len(), 2);
+
+    let dependent = queue.show(2).unwrap().runs[0].clone();
+    assert_eq!(dependent.status, RunStatus::AwaitingIntegration);
+    assert_eq!(dependent.base_commit, landed_commit);
+    let prompt = read_prompt(&dependent);
+    assert!(
+        prompt.contains(&format!(
+            "Predecessor tasks (their changes are already in your base commit):\n\
+             - task 1: test task; result commit {landed_commit}; summary: done\n"
+        )),
+        "{prompt}"
+    );
+    assert!(!prompt.contains("Predecessor tasks: none"), "{prompt}");
+    // Nothing else was in progress when task 2 was claimed; it is not listed itself.
+    assert!(prompt.contains("Tasks in progress: none\n"), "{prompt}");
+    assert!(!prompt.contains("- task 2: dependent"), "{prompt}");
+
+    let independent = queue.show(3).unwrap().runs[0].clone();
+    assert_eq!(independent.status, RunStatus::AwaitingIntegration);
+    let prompt = read_prompt(&independent);
+    assert!(prompt.contains("Predecessor tasks: none\n"), "{prompt}");
+    assert!(
+        prompt.contains(
+            "Tasks in progress (other tasks executing now; stay within your own task's scope):\n\
+             - task 2: dependent\n"
+        ),
+        "{prompt}"
+    );
+    assert!(!prompt.contains("- task 3: independent"), "{prompt}");
+    // A completed task is not in progress.
+    assert!(!prompt.contains("- task 1: test task"), "{prompt}");
+    // The sections sit between the verification commands and the receipt contract.
+    let position = |needle: &str| prompt.find(needle).unwrap();
+    assert!(position("Verification commands") < position("Predecessor tasks"));
+    assert!(position("Predecessor tasks") < position("Tasks in progress"));
+    assert!(position("Tasks in progress") < position("Write a completion receipt"));
+}
+
+/// A predecessor whose receipt is gone from its run directory is still
+/// named in the prompt; the successor's run starts and runs as usual.
+#[test]
+fn successor_starts_when_the_predecessor_receipt_is_unavailable() {
+    let (_dir, repo, db, run) = awaiting_run();
+    assert_eq!(integrate(&db, 1, &repo).unwrap()["outcome"], "integrated");
+    let receipt = Path::new(run.receipt_path.as_ref().unwrap());
+    assert_eq!(
+        receipt,
+        Path::new(run.run_dir.as_ref().unwrap()).join("receipt.json")
+    );
+    fs::remove_file(receipt).unwrap();
+
+    let backend = TestWorkspace::new(&db, false, VALID_AGENT);
+    let outcome = supervise(&db, &repo, &backend).unwrap();
+    backend.join();
+    assert_eq!(outcome["outcome"], "finished");
+    assert_eq!(outcome["errors"], json!([]));
+    let mut queue = SqliteQueue::open(&db).unwrap();
+    let detail = queue.show(2).unwrap();
+    let dependent = &detail.runs[0];
+    assert_eq!(dependent.status, RunStatus::AwaitingIntegration);
+    let kinds = event_kinds(&detail);
+    assert!(kinds.contains(&"agent_started"), "{kinds:?}");
+    let landed_commit = queue.show(1).unwrap().runs[0]
+        .result_commit
+        .clone()
+        .unwrap();
+    let prompt = read_prompt(dependent);
+    assert!(
+        prompt.contains(&format!(
+            "- task 1: test task; result commit {landed_commit}; summary: (receipt unavailable)\n"
+        )),
+        "{prompt}"
+    );
+    // A corrupt receipt is described the same way.
+    let corrupt = queue.predecessors(2).unwrap();
+    fs::write(receipt, "not json").unwrap();
+    let summary = runtime::PredecessorSummary::from_predecessor(&corrupt[0]);
+    assert_eq!(summary.summary, "(receipt unavailable)");
+    assert_eq!(summary.result_commit, landed_commit);
+    assert_eq!((summary.task_id, summary.title.as_str()), (1, "test task"));
+    // A predecessor completed without an integrated run has neither.
+    let by_hand = cmux_taskq::domain::Predecessor {
+        task: corrupt[0].task.clone(),
+        integrated_run: None,
+    };
+    let summary = runtime::PredecessorSummary::from_predecessor(&by_hand);
+    assert_eq!(summary.result_commit, "(not landed)");
+    assert_eq!(summary.summary, "(receipt unavailable)");
 }
 
 /// Two accepted runs land in the order their validation finished; the
