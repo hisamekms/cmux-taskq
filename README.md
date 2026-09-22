@@ -181,6 +181,8 @@ cargo clippy --locked --all-targets -- -D warnings
 cargo llvm-cov --locked --fail-under-lines 80
 ```
 
+GitHub Actions runs the same four commands on a macOS runner for every push to `main` and every pull request ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)).
+
 The tests use temporary databases and repositories, point `XDG_DATA_HOME` at temporary directories, and do not require cmux, Claude Code, or network access after dependencies have been fetched. Line coverage must stay at or above 80% (`cargo install cargo-llvm-cov`). The end-to-end happy paths in `tests/e2e.rs` (one task landed by `integrate`; two tasks in parallel followed by a dependent one, with a conflicting run parked as `needs_session` and landed after the test resolves it; and `up` → `status` → `down --wait` against the real launchd, with the plist under a disposable `HOME`) drive the real binary through cmux with a stub agent, resolving the queue from the disposable repository's working directory, and are ignored by default; run them with `cargo test --locked --test e2e -- --ignored` where cmux is available. The `up` / `down` test needs cmux to accept the launchd-run supervisor's connection (a socket password in cmux's Settings). The fourth e2e kills a `supervise` process while its stub worker runs and checks that the next `supervise --once` adopts and lands the run. `tests/lifecycle.rs` covers `up` and `down` against fakes for launchd, cmux and process signals.
 
 ## Documentation
