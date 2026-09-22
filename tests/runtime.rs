@@ -1,7 +1,7 @@
 use anyhow::{Result, bail};
 use cmux_taskq::{
     application::{AgentProvider, TaskQueue, WorkspaceBackend},
-    domain::{NewTask, RunStatus, TaskAction, TaskRun, TaskStatus},
+    domain::{GoalEdit, NewGoal, NewTask, RunStatus, TaskAction, TaskRun, TaskStatus},
     infrastructure::{
         adapters::{shell_join, workspace_handle},
         sqlite::SqliteQueue,
@@ -107,9 +107,11 @@ impl AgentProvider for TestProvider {
     fn command(&self, run: &TaskRun, prompt: &str) -> Result<Command> {
         assert!(prompt.contains("Acceptance criteria:"));
         assert!(prompt.contains("Verification commands (run in the worktree):"));
-        // Both context sections are present whether or not they have entries.
+        // Every context section is present whether or not it has entries.
+        assert!(prompt.contains("Goal"));
+        assert!(prompt.contains("Context"));
         assert!(prompt.contains("Predecessor tasks"));
-        assert!(prompt.contains("Tasks in progress"));
+        assert!(prompt.contains("Sibling tasks in progress"));
         let mut command = Command::new("/bin/sh");
         command
             .current_dir(run.worktree_path.as_ref().unwrap())
@@ -434,10 +436,18 @@ fn valid_receipt_is_verified_and_awaits_integration() {
     let kinds: Vec<&str> = detail.events.iter().map(|e| e.kind.as_str()).collect();
     assert!(kinds.contains(&"agent_started"));
     assert!(kinds.contains(&"receipt_observed"));
-    // The only task has no predecessor and nothing else was in progress.
+    // The only task has no goal, no context, no predecessor, and nothing else was in progress.
     let prompt = read_prompt(run);
+    assert!(
+        prompt.contains("Goal: none, this task stands alone\n"),
+        "{prompt}"
+    );
+    assert!(prompt.contains("Context: none\n"), "{prompt}");
     assert!(prompt.contains("Predecessor tasks: none\n"), "{prompt}");
-    assert!(prompt.contains("Tasks in progress: none\n"), "{prompt}");
+    assert!(
+        prompt.contains("Sibling tasks in progress: none\n"),
+        "{prompt}"
+    );
     let verification = detail
         .events
         .iter()
@@ -1919,7 +1929,7 @@ fn conflict_free_run_lands_as_one_squash_commit_and_releases_dependents() {
 /// landed and the summary its receipt carried, and lists the other tasks in
 /// progress at claim time without the task itself.
 #[test]
-fn prompt_describes_landed_predecessors_and_tasks_in_progress() {
+fn prompt_describes_landed_predecessors_and_sibling_tasks_in_progress() {
     let (_dir, repo, db, run) = awaiting_run();
     assert_eq!(integrate(&db, 1, &repo).unwrap()["outcome"], "integrated");
     let mut queue = SqliteQueue::open(&db).unwrap();
@@ -1966,7 +1976,10 @@ fn prompt_describes_landed_predecessors_and_tasks_in_progress() {
     );
     assert!(!prompt.contains("Predecessor tasks: none"), "{prompt}");
     // Nothing else was in progress when task 2 was claimed; it is not listed itself.
-    assert!(prompt.contains("Tasks in progress: none\n"), "{prompt}");
+    assert!(
+        prompt.contains("Sibling tasks in progress: none\n"),
+        "{prompt}"
+    );
     assert!(!prompt.contains("- task 2: dependent"), "{prompt}");
 
     let independent = queue.show(3).unwrap().runs[0].clone();
@@ -1975,7 +1988,7 @@ fn prompt_describes_landed_predecessors_and_tasks_in_progress() {
     assert!(prompt.contains("Predecessor tasks: none\n"), "{prompt}");
     assert!(
         prompt.contains(
-            "Tasks in progress (other tasks executing now; stay within your own task's scope):\n\
+            "Sibling tasks in progress (other tasks executing now, each owning its own scope):\n\
              - task 2: dependent\n"
         ),
         "{prompt}"
@@ -1986,8 +1999,267 @@ fn prompt_describes_landed_predecessors_and_tasks_in_progress() {
     // The sections sit between the verification commands and the receipt contract.
     let position = |needle: &str| prompt.find(needle).unwrap();
     assert!(position("Verification commands") < position("Predecessor tasks"));
-    assert!(position("Predecessor tasks") < position("Tasks in progress"));
-    assert!(position("Tasks in progress") < position("Write a completion receipt"));
+    assert!(position("Predecessor tasks") < position("Sibling tasks in progress"));
+    assert!(position("Sibling tasks in progress") < position("Write a completion receipt"));
+}
+
+/// A ready task with a goal and a context, registered on the queue.
+fn add_ready_task_in(
+    queue: &mut SqliteQueue,
+    title: &str,
+    goal_id: Option<i64>,
+    context: &str,
+) -> i64 {
+    let task = queue
+        .add(NewTask {
+            title: title.into(),
+            description: "small change".into(),
+            acceptance: "works".into(),
+            verification_commands: vec!["test -f seed.txt".into()],
+            dependencies: vec![],
+            goal_id,
+            context: context.into(),
+        })
+        .unwrap();
+    queue.transition(task.id, TaskAction::Ready).unwrap();
+    task.id
+}
+
+/// The section headings of a prompt in order of appearance, so tests can
+/// compare the shape of prompts with and without a goal.
+fn section_order(prompt: &str) -> Vec<usize> {
+    [
+        "Task title:",
+        "Verification commands",
+        "Goal",
+        "Context",
+        "Predecessor tasks",
+        "Sibling tasks in progress",
+        "Your assignment is this task only.",
+        "Write a completion receipt",
+    ]
+    .iter()
+    .map(|heading| {
+        prompt
+            .find(heading)
+            .unwrap_or_else(|| panic!("{heading}: {prompt}"))
+    })
+    .collect()
+}
+
+/// A task's prompt carries its goal as a Goal section (ID, title,
+/// description, acceptance, constraints and the doc path, unread) and its
+/// context as a Context section; a task without either says so in the same
+/// place, so both prompts have the same sequence of sections.
+#[test]
+fn prompt_describes_the_goal_and_the_context_and_keeps_one_shape_without_them() {
+    let (_dir, repo, db) = fixture();
+    let mut queue = SqliteQueue::open(&db).unwrap();
+    let goal = queue
+        .add_goal(NewGoal {
+            title: "goal title".into(),
+            description: "goal description\nsecond line".into(),
+            acceptance: "goal acceptance".into(),
+            constraints: "goal constraints".into(),
+            doc: Some("docs/plans/goal.md".into()),
+        })
+        .unwrap();
+    fs::write(repo.join("unrelated.md"), "not read\n").unwrap();
+    add_ready_task_in(
+        &mut queue,
+        "grouped",
+        Some(goal.id),
+        "why this task exists\nread docs/design/x.md first",
+    );
+    let backend = TestWorkspace::new(&db, false, VALID_AGENT);
+    let outcome = supervise(&db, &repo, &backend).unwrap();
+    backend.join();
+    assert_eq!(outcome["errors"], json!([]));
+    assert_eq!(outcome["runs"].as_array().unwrap().len(), 2);
+
+    let alone = read_prompt(&queue.show(1).unwrap().runs[0]);
+    assert!(
+        alone.contains("Goal: none, this task stands alone\n"),
+        "{alone}"
+    );
+    assert!(alone.contains("Context: none\n"), "{alone}");
+    assert!(!alone.contains("goal title"), "{alone}");
+
+    let grouped = read_prompt(&queue.show(2).unwrap().runs[0]);
+    assert!(
+        grouped.contains(&format!(
+            "Goal (the higher-level problem this task and its sibling tasks solve together):\n\
+             Goal ID: {}\nGoal title: goal title\nGoal description:\ngoal description\nsecond line\n\
+             Goal acceptance:\ngoal acceptance\nGoal constraints:\ngoal constraints\n\
+             Goal doc: docs/plans/goal.md (a path in the repository; read it for the full picture)\n",
+            goal.id
+        )),
+        "{grouped}"
+    );
+    // The doc is named by path only; the prompt never embeds its content.
+    assert!(!grouped.contains("not read"), "{grouped}");
+    assert!(
+        grouped.contains(
+            "Context (why this task exists and what to read first):\n\
+             why this task exists\nread docs/design/x.md first\n"
+        ),
+        "{grouped}"
+    );
+    assert!(!grouped.contains("Goal: none"), "{grouped}");
+    assert!(!grouped.contains("Context: none"), "{grouped}");
+    // Both prompts have the same sections in the same order.
+    let order = section_order(&grouped);
+    assert!(order.windows(2).all(|pair| pair[0] < pair[1]), "{grouped}");
+    let order = section_order(&alone);
+    assert!(order.windows(2).all(|pair| pair[0] < pair[1]), "{alone}");
+    // The receipt example shows the optional follow_ups, and the scope rule names it.
+    for prompt in [&alone, &grouped] {
+        assert!(
+            prompt.contains(
+                "\"summary\":\"...\",\"follow_ups\":[{\"title\":\"...\",\"description\":\"...\"}]}\n"
+            ),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains(
+                "Your assignment is this task only. Do not change what a sibling task owns; \
+                 if you find work outside this task, record it in the receipt as follow_ups instead of doing it.\n"
+            ),
+            "{prompt}"
+        );
+        assert!(prompt.contains("follow_ups is optional"), "{prompt}");
+    }
+}
+
+/// The Sibling section of a task with a goal lists only the in-progress
+/// tasks of that goal; a task without a goal still sees every task in
+/// progress. Claims in one pass go in ID order, so a prompt lists the
+/// siblings claimed before it.
+#[test]
+fn prompt_lists_only_the_siblings_of_the_same_goal_in_progress() {
+    let (_dir, repo, db) = fixture();
+    let backend = TestWorkspace::new(&db, false, VALID_AGENT);
+    // Task 1 (no goal) is in progress before the grouped tasks are claimed.
+    assert_eq!(
+        supervise(&db, &repo, &backend).unwrap()["errors"],
+        json!([])
+    );
+    backend.join();
+    let mut queue = SqliteQueue::open(&db).unwrap();
+    assert_eq!(queue.show(1).unwrap().task.status, TaskStatus::InProgress);
+    let a = queue
+        .add_goal(NewGoal {
+            title: "goal a".into(),
+            ..NewGoal::default()
+        })
+        .unwrap();
+    let b = queue
+        .add_goal(NewGoal {
+            title: "goal b".into(),
+            ..NewGoal::default()
+        })
+        .unwrap();
+    assert_eq!(add_ready_task_in(&mut queue, "a first", Some(a.id), ""), 2);
+    assert_eq!(add_ready_task_in(&mut queue, "b only", Some(b.id), ""), 3);
+    assert_eq!(add_ready_task_in(&mut queue, "a second", Some(a.id), ""), 4);
+    assert_eq!(add_ready_task_in(&mut queue, "alone", None, ""), 5);
+    let outcome = supervise(&db, &repo, &backend).unwrap();
+    backend.join();
+    assert_eq!(outcome["errors"], json!([]));
+    assert_eq!(outcome["runs"].as_array().unwrap().len(), 4);
+
+    let mut prompt_of = |task_id: i64| read_prompt(&queue.show(task_id).unwrap().runs[0]);
+    // Task 2: task 1 is in progress but belongs to no goal, so it is not a sibling.
+    let first = prompt_of(2);
+    assert!(
+        first.contains("Sibling tasks in progress: none\n"),
+        "{first}"
+    );
+    assert!(!first.contains("- task 1: test task"), "{first}");
+    // Task 3: nothing of goal b is in progress; goal a's task 2 is not listed.
+    let only = prompt_of(3);
+    assert!(only.contains("Sibling tasks in progress: none\n"), "{only}");
+    assert!(!only.contains("- task 2: a first"), "{only}");
+    // Task 4: its sibling task 2 is listed, task 3 of goal b and task 1 are not.
+    let second = prompt_of(4);
+    assert!(
+        second.contains(
+            "Sibling tasks in progress (other tasks executing now, each owning its own scope):\n\
+             - task 2: a first\n"
+        ),
+        "{second}"
+    );
+    assert!(!second.contains("- task 3: b only"), "{second}");
+    assert!(!second.contains("- task 1: test task"), "{second}");
+    assert!(!second.contains("- task 4: a second"), "{second}");
+    // Task 5 has no goal and sees every task in progress except itself.
+    let alone = prompt_of(5);
+    assert!(
+        alone.contains(
+            "Sibling tasks in progress (other tasks executing now, each owning its own scope):\n\
+             - task 1: test task\n- task 2: a first\n- task 3: b only\n- task 4: a second\n"
+        ),
+        "{alone}"
+    );
+    assert!(!alone.contains("- task 5: alone"), "{alone}");
+}
+
+/// `prompt.txt` is a snapshot taken at claim time: a run claimed before a
+/// goal edit keeps the old wording, and a run claimed after it gets the new.
+#[test]
+fn prompt_snapshots_the_goal_at_claim_time() {
+    let (_dir, repo, db) = fixture();
+    let mut queue = SqliteQueue::open(&db).unwrap();
+    let goal = queue
+        .add_goal(NewGoal {
+            title: "before edit".into(),
+            acceptance: "old acceptance".into(),
+            ..NewGoal::default()
+        })
+        .unwrap();
+    add_ready_task_in(&mut queue, "early", Some(goal.id), "");
+    let backend = TestWorkspace::new(&db, false, VALID_AGENT);
+    assert_eq!(
+        supervise(&db, &repo, &backend).unwrap()["errors"],
+        json!([])
+    );
+    backend.join();
+    let early = queue.show(2).unwrap().runs[0].clone();
+    let before = read_prompt(&early);
+    assert!(before.contains("Goal title: before edit\n"), "{before}");
+    assert!(
+        before.contains("Goal acceptance:\nold acceptance\n"),
+        "{before}"
+    );
+
+    queue
+        .edit_goal(
+            goal.id,
+            GoalEdit {
+                title: Some("after edit".into()),
+                acceptance: Some("new acceptance".into()),
+                ..GoalEdit::default()
+            },
+        )
+        .unwrap();
+    add_ready_task_in(&mut queue, "late", Some(goal.id), "");
+    assert_eq!(
+        supervise(&db, &repo, &backend).unwrap()["errors"],
+        json!([])
+    );
+    backend.join();
+    let late = queue.show(3).unwrap().runs[0].clone();
+    let after = read_prompt(&late);
+    assert!(after.contains("Goal title: after edit\n"), "{after}");
+    assert!(
+        after.contains("Goal acceptance:\nnew acceptance\n"),
+        "{after}"
+    );
+    assert!(!after.contains("before edit"), "{after}");
+    // The earlier run's prompt was not rewritten by the edit or the later claim.
+    assert_eq!(read_prompt(&early), before);
+    // The late run also sees the early one as a sibling still in progress.
+    assert!(after.contains("- task 2: early\n"), "{after}");
 }
 
 /// A predecessor whose receipt is gone from its run directory is still

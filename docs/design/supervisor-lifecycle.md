@@ -115,12 +115,16 @@ cmux workspaceの名前は複数repositoryで同じcmuxを使うためrepository
 
 ### Prompt
 
-`prompt.txt`は`src/runtime.rs`の`prompt(task, run, predecessors, in_progress)`が生成するclaim時点のスナップショットで、run中にqueueが変わっても書き換えない。task単体の情報（ID、run ID、title、description、acceptance、verification_commands）、receiptの契約（pathとJSONの形）に加えて、[ADR-0009](../adr/0009-goal-groups-tasks.md)の段階1として次の2節を検証コマンドとreceiptの契約の間に載せる。どちらも常に書き、該当がなければ`none`にして、promptの形を依存や並列の有無で変えない。
+`prompt.txt`は`src/runtime.rs`の`prompt(task, run, goal, predecessors, siblings)`が生成するclaim時点のスナップショットで、run中にqueueが変わっても書き換えない。goalの`goal edit`も、兄弟taskの状態変化も、走行中のrunには届かず、次のclaimのpromptから反映される。task単体の情報（ID、run ID、title、description、acceptance、verification_commands）、receiptの契約（pathとJSONの形）に加えて、[ADR-0009](../adr/0009-goal-groups-tasks.md)の次の4節をこの順で検証コマンドとreceiptの契約の間に載せる。どれも常に書き、該当がなければ`none`にして、promptの節構成をgoal・context・依存・並列の有無で変えない。
 
+- **Goal**: taskに`goal_id`があれば、claim時点の`TaskQueue::show_goal()`のgoalを`Goal ID` / `Goal title` / `Goal description` / `Goal acceptance` / `Goal constraints` / `Goal doc`の行で載せる。`doc`はrepository内のpathをそのまま書き、内容は読まない（なければ`Goal doc: none`）。goalのないtaskは`Goal: none, this task stands alone`。
+- **Context**: taskの`context`が空白でなければ本文をそのまま載せ、空なら`Context: none`。
 - **Predecessor tasks**: taskの直接の依存元（`task_dependencies`のpredecessor）ごとに1行、`- task <ID>: <title>; result commit <sha>; summary: <text>`。`result commit`は依存元の`integrated` runの`result_commit`（`integrate`がmainに積んだsquash commit）、`summary`はそのrunのreceipt（`receipt_path`。なければ`<run-dir>/receipt.json`）の`summary`（空白を1つに畳む。空なら`(no summary)`）。receiptが読めない・parseできない・pathが不明なら`(receipt unavailable)`、integrated runがなければ（手で`completed`にしたなど）`result commit (not landed)`と書き、いずれもprovisionを止めない。取得はqueueの読み取り専用操作`TaskQueue::predecessors(task_id)`（ID順。依存元の`Task`と`integrated` runの`Option<TaskRun>`）で、summaryの読み取りはruntime側（`PredecessorSummary::from_predecessor`）が行う。依存元がなければ`Predecessor tasks: none`。
-- **Tasks in progress**: `TaskQueue::tasks_in_progress()`が返す`in_progress`のtask（ID順）から自分のtaskを除いたものを`- task <ID>: <title>`で並べ、自分のtaskの範囲に留まるよう指示する。claimは`fill_slots`で1件ずつ順に行うので、同じpassで後にclaimされたtaskのpromptには先にclaimされたtaskが載り、その逆は載らない。`awaiting_integration`や`needs_session`のrunを持つtaskも`in_progress`なので載る。なければ`Tasks in progress: none`。
+- **Sibling tasks in progress**: `TaskQueue::tasks_in_progress()`が返す`in_progress`のtask（ID順）から自分のtaskを除き、taskにgoalがあれば同じ`goal_id`のtaskに限定したものを`- task <ID>: <title>`で並べる（`siblings_in_progress`）。goalのないtaskはgoalの有無を問わず全`in_progress` taskを見る。claimは`fill_slots`で1件ずつ順に行うので、同じpassで後にclaimされたtaskのpromptには先にclaimされたtaskが載り、その逆は載らない。`awaiting_integration`や`needs_session`のrunを持つtaskも`in_progress`なので載る。なければ`Sibling tasks in progress: none`。
 
-schemaとCLIは変えない。`tests/e2e.rs`のstubはpromptの1行目とreceipt pathの行だけを読むので、節の追加に影響されない。
+4節の後に「担当はこのtaskだけ。兄弟taskの範囲を変えず、範囲外の仕事を見つけたら受け持たずにreceiptの`follow_ups`に書く」の一文を置き、receipt JSONの例に任意の`follow_ups`（`{title, description}`の配列。`Receipt::check`は配列であることだけを見る）を含める。
+
+schemaとCLIは変えない。`tests/e2e.rs`のstubはpromptの1行目とreceipt pathの行だけを読み、`follow_ups`のないreceiptを書くので、節の追加に影響されない。
 
 ### 1 runの異常（abandon）
 

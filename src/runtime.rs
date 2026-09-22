@@ -5,7 +5,7 @@
 use crate::{
     application::{AgentProvider, TaskQueue, WorkspaceBackend},
     domain::{
-        ClaimOutcome, IntegrationOutcome, Predecessor, Receipt, ReceiptResult, RunLease,
+        ClaimOutcome, Goal, IntegrationOutcome, Predecessor, Receipt, ReceiptResult, RunLease,
         RunProcess, RunStatus, SupervisorRegistration, Task, TaskRun,
     },
     infrastructure::{
@@ -499,15 +499,14 @@ impl Supervisor<'_> {
             .iter()
             .map(PredecessorSummary::from_predecessor)
             .collect();
-        let in_progress: Vec<Task> = self
-            .queue
-            .tasks_in_progress()?
-            .into_iter()
-            .filter(|other| other.id != task.id)
-            .collect();
+        let goal = match task.goal_id {
+            Some(goal_id) => Some(self.queue.show_goal(goal_id)?.goal),
+            None => None,
+        };
+        let siblings = siblings_in_progress(&task, self.queue.tasks_in_progress()?);
         fs::write(
             run_dir.join("prompt.txt"),
-            prompt(&task, &run, &predecessors, &in_progress)?,
+            prompt(&task, &run, goal.as_ref(), &predecessors, &siblings)?,
         )?;
         // A running wrapper must not change when the development binary is rebuilt.
         fs::copy(self.runner, run_dir.join("runner")).context("snapshot runtime binary")?;
@@ -1304,17 +1303,60 @@ impl PredecessorSummary {
     }
 }
 
-/// Text of `prompt.txt`. `predecessors` are the task's direct dependencies
-/// and `in_progress` the other tasks executing at claim time (the task
-/// itself excluded); both sections are always present, `none` when empty,
-/// so the prompt keeps one shape.
+/// The other tasks a worker is told are executing alongside it: of the
+/// `in_progress` tasks (ID order), those sharing the task's goal, or all of
+/// them when the task has no goal; the task itself is never listed.
+pub fn siblings_in_progress(task: &Task, in_progress: Vec<Task>) -> Vec<Task> {
+    in_progress
+        .into_iter()
+        .filter(|other| other.id != task.id)
+        .filter(|other| task.goal_id.is_none() || other.goal_id == task.goal_id)
+        .collect()
+}
+
+/// Text of `prompt.txt`. `goal` is the task's goal as it reads at claim
+/// time, `predecessors` the task's direct dependencies and `siblings` the
+/// other tasks executing at claim time (`siblings_in_progress`). The Goal,
+/// Context, Predecessor and Sibling sections are always present, `none`
+/// when empty, so the prompt keeps one shape whether or not a task has a
+/// goal, a context, dependencies or company.
 pub fn prompt(
     task: &Task,
     run: &TaskRun,
+    goal: Option<&Goal>,
     predecessors: &[PredecessorSummary],
-    in_progress: &[Task],
+    siblings: &[Task],
 ) -> Result<String> {
     let receipt = run.receipt_path.as_ref().context("missing receipt path")?;
+    let goal = match goal {
+        None => "Goal: none, this task stands alone\n".to_owned(),
+        Some(goal) => format!(
+            "Goal (the higher-level problem this task and its sibling tasks solve together):\n\
+             Goal ID: {id}\nGoal title: {title}\nGoal description:\n{description}\n\
+             Goal acceptance:\n{acceptance}\nGoal constraints:\n{constraints}\n\
+             Goal doc: {doc}\n",
+            id = goal.id,
+            title = goal.title,
+            description = goal.description,
+            acceptance = goal.acceptance,
+            constraints = goal.constraints,
+            doc = goal
+                .doc
+                .as_deref()
+                .map(|doc| format!(
+                    "{doc} (a path in the repository; read it for the full picture)"
+                ))
+                .unwrap_or_else(|| "none".to_owned()),
+        ),
+    };
+    let context = if task.context.trim().is_empty() {
+        "Context: none\n".to_owned()
+    } else {
+        format!(
+            "Context (why this task exists and what to read first):\n{}\n",
+            task.context
+        )
+    };
     let predecessors = if predecessors.is_empty() {
         "Predecessor tasks: none\n".to_owned()
     } else {
@@ -1331,13 +1373,13 @@ pub fn prompt(
         }
         text
     };
-    let in_progress = if in_progress.is_empty() {
-        "Tasks in progress: none\n".to_owned()
+    let siblings = if siblings.is_empty() {
+        "Sibling tasks in progress: none\n".to_owned()
     } else {
         let mut text =
-            "Tasks in progress (other tasks executing now; stay within your own task's scope):\n"
+            "Sibling tasks in progress (other tasks executing now, each owning its own scope):\n"
                 .to_owned();
-        for other in in_progress {
+        for other in siblings {
             text.push_str(&format!("- task {}: {}\n", other.id, other.title));
         }
         text
@@ -1350,10 +1392,12 @@ pub fn prompt(
          Perform applicable unit tests, E2E, and subagent review. Record evidence or an explicit reason when not applicable.\n\
          Task title: {title}\nDescription:\n{description}\nAcceptance criteria:\n{acceptance}\n\
          Verification commands (run in the worktree):\n{verification}\n\
-         {predecessors}{in_progress}\
+         {goal}{context}{predecessors}{siblings}\
+         Your assignment is this task only. Do not change what a sibling task owns; if you find work outside this task, record it in the receipt as follow_ups instead of doing it.\n\
          Write a completion receipt to {receipt} using a temporary file in the same directory and atomic rename.\n\
-         Receipt JSON: {{\"run_id\":\"{run_id}\",\"result\":\"succeeded or failed\",\"commit\":\"full Git SHA of the branch head\",\"tests\":{{\"status\":\"passed, failed or not_applicable\",\"evidence_or_reason\":\"...\"}},\"e2e\":{{\"status\":\"...\",\"evidence_or_reason\":\"...\"}},\"subagent_review\":{{\"status\":\"...\",\"evidence_or_reason\":\"...\"}},\"summary\":\"...\"}}\n\
+         Receipt JSON: {{\"run_id\":\"{run_id}\",\"result\":\"succeeded or failed\",\"commit\":\"full Git SHA of the branch head\",\"tests\":{{\"status\":\"passed, failed or not_applicable\",\"evidence_or_reason\":\"...\"}},\"e2e\":{{\"status\":\"...\",\"evidence_or_reason\":\"...\"}},\"subagent_review\":{{\"status\":\"...\",\"evidence_or_reason\":\"...\"}},\"summary\":\"...\",\"follow_ups\":[{{\"title\":\"...\",\"description\":\"...\"}}]}}\n\
          Each of tests, e2e and subagent_review needs evidence when passed and a reason when not_applicable.\n\
+         follow_ups is optional: an array of work you found outside this task, each with a title and a description, for the maintainer to register; omit it when there is none.\n\
          You may write this receipt outside the worktree. Keep the worktree clean after committing.\n\
          The supervisor rejects the run unless the commit is the clean head of your branch on top of the base commit, and it reruns the verification commands itself.\n\
          After submitting, report the outcome briefly and stop; do not run /exit yourself. Once you are idle the supervisor ends the session, and the maintainer can still send /exit. A receipt does not itself end the session.\n",
