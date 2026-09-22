@@ -15,6 +15,7 @@ related:
   - adr-0008
   - adr-0009
   - adr-0010
+  - adr-0011
   - design-persistence
   - design-provider-lifecycle
   - design-plugin-integration
@@ -71,6 +72,8 @@ runtimeの中で人が打つ`/exit`や復旧を指す語はすべてmaintainer�
 5. **結果**: `{"supervisor": {"outcome": "started"|"reused", "pid", "token", "plist", "log_dir"}, "maintainer": {"outcome": "created"|"reused"|"skipped", "workspace_id", "name"}, "pruned_supervisors": [{"token","pid"}], "doctor": {"unfinished_runs": [{"run_id","task_id","status","lease_stale"}], "awaiting_integration": [{"run_id","task_id","last_error"}], "needs_session": [...]}}`。`lease_stale`はleaseのPIDが死んでいるかheartbeatが30秒より古いとき`true`、leaseがなければnull。
 
 前提: launchdが起動したsupervisorはcmuxのterminalの外で動くので、cmuxのsocketがcmux外のプロセスからの接続を受け付ける必要がある。開発環境のcmux 0.64.25は「アクセスが拒否されました。cmux内で起動されたプロセスのみ接続できます」で`cmux ping`を拒み、supervisorはpreflightで落ちて登録に現れなかった（`launchd.log`にそのerrorが残り、`up`は30秒でerrorになり、KeepAliveで再起動が続くので`down`で外す）。`cmux --help`のSocket Authはpasswordによる認証（`--password`、`CMUX_SOCKET_PASSWORD`、Settingsに保存したpassword）を載せているが、保存したpasswordでlaunchd起動のsupervisorが通るかは未確認（journal 021）。確認できるまでは、supervisorはcmuxのterminalで手で起動し、`up`はそれを`reused`にしてmaintainer workspaceだけを作る使い方になる。passwordはplistに書かない。
+
+前提とfallbackは[ADR-0011](../adr/0011-cmux-socket-password-and-in-cmux-fallback.md)で決めた: launchd modeはcmuxのsocket password（Settings保存、または`up`を打ったshellがexportした`CMUX_SOCKET_PASSWORD`）を前提にして`up`がcmux外からの`ping`をpreflightで確かめ（task 21）、`up --in-cmux`がlaunchdなし・自動再起動なしで`taskq <repo> supervisor` workspaceにsupervisorを起動する（task 22）。どちらもtask 21 / 22で実装予定で、本文書はその着地時に更新する。
 
 `cmux-taskq down [--wait] [--force]`はsupervisorを止める。PIDの生きている登録が1件もなければ`{"outcome":"not_running"}`（それでもagentが残っていればbootoutして`launch_agent_unloaded: true`。登録できないまま再起動を繰り返すagentを外すため。`--force`ならPIDの死んだ登録行も消して`pruned_supervisors`に出す）。あれば`launchctl print`でagentの有無とそのPIDを読み、`launchctl bootout gui/<uid>/<label>`でagentを外し、plistも消す（`RunAtLoad`のため残すと次のloginで復活する）。bootoutでagentのsupervisorはlaunchdからSIGTERMを受け、claimを止めてactive runをdrainしてから登録を消して終わる。KeepAliveのためsignalだけでは再起動されるので、必ずbootoutを通す。agentのプロセスでない生きた登録（手で起動したsupervisor）には`down`がSIGTERMを直接送る。agentのプロセスにはもう送らない: runtimeは1回目のSIGTERMでdispositionを既定に戻すので、2回目は即死になる。agentがloadされているのにPIDが読めないときは誰にも送らない。既定は`{"outcome":"draining","pid":…,"pids":[…]}`で即返る（bootout自体が即返る）。`--wait`はその登録が消えるかPIDが死ぬまで2秒ごとに待って`stopped`。`--force`はbootoutの後にSIGKILLを送って登録行を消し`killed`（leaseは30秒でstaleになり、runは`doctor` / `recover`で扱う）。maintainer workspaceは閉じない。
 
