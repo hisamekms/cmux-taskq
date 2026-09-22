@@ -12,12 +12,13 @@ related:
   - adr-0006
   - adr-0007
   - adr-0008
+  - adr-0009
   - design-domain-model
 ---
 
 # SQLite persistence
 
-SQLiteはキューの正本であり、プロセス間共有と再起動後の復旧に使う。stdoutは正本にしない。ステップ2で4テーブル、ステップ3で3テーブル、ステップ4で`task_runs.workspace_closed_at`列を実装し、[008](../journal/008-integration-confirm.md)で`task_runs`を作り直して`integrated`を加え（schema version 4）、[017](../journal/017-parallel-runs.md)でleaseをrun単位の`run_leases`に移してqueue全体の実行枠を外し（schema version 5、[ADR-0007](../adr/0007-run-level-leases-parallel-execution.md)）、[018](../journal/018-merge-queue.md)で`task_runs`を再び作り直して`integrating`と`needs_session`を加え、統合スロットの部分UNIQUE indexを足した（schema version 6、[ADR-0008](../adr/0008-merge-queue-squash-landing.md)）。`0007_supervisors.sql`は常駐supervisorの登録表`supervisors`を足した（schema version 7）。
+SQLiteはキューの正本であり、プロセス間共有と再起動後の復旧に使う。stdoutは正本にしない。ステップ2で4テーブル、ステップ3で3テーブル、ステップ4で`task_runs.workspace_closed_at`列を実装し、[008](../journal/008-integration-confirm.md)で`task_runs`を作り直して`integrated`を加え（schema version 4）、[017](../journal/017-parallel-runs.md)でleaseをrun単位の`run_leases`に移してqueue全体の実行枠を外し（schema version 5、[ADR-0007](../adr/0007-run-level-leases-parallel-execution.md)）、[018](../journal/018-merge-queue.md)で`task_runs`を再び作り直して`integrating`と`needs_session`を加え、統合スロットの部分UNIQUE indexを足した（schema version 6、[ADR-0008](../adr/0008-merge-queue-squash-landing.md)）。`0007_supervisors.sql`は常駐supervisorの登録表`supervisors`を足した（schema version 7）。`0008_goals.sql`は`goals`、`tasks.goal_id` / `tasks.context`を足し、`run_events`を作り直してgoal単位のイベントを持てるようにした（schema version 8、[ADR-0009](../adr/0009-goal-groups-tasks.md)。ADRの「schema v6」は7がsupervisorsに使われたためv8と読み替える）。
 
 ```text
 tasks
@@ -28,9 +29,12 @@ queue_repository     -- 0002: キューを束縛するGit common directory（1�
 run_processes        -- 0002: runごとのwrapper/agentのPID、heartbeat、終了コード
 run_leases           -- 0005: runごとのsupervisor token、PID、heartbeat（0002のsupervisor_leasesを置き換え）
 supervisors          -- 0007: 常駐superviseプロセスの登録（token主キー、PID、parallel、started_at、heartbeat_at）
+goals                -- 0008: 複数taskが解く課題（title、description、acceptance、constraints、doc、closed_at、verdict）
 ```
 
 `task_dependencies(task_id, predecessor_id)`は依存関係を保存する。TaskRunは試行ごとに新しい行を作り、Taskに履歴を持たせる。workspace、worktree、receipt、log、repo、run directory、supervisor token、last errorの参照列をtask_runsに置き、claim時点ではnullにする。`result_commit`は検証で確認したcommitで、着地後は`main`に積んだsquash commitに置き換わる（rebase後のrun headは`refs/taskq/runs/<run-id>`と`run_integrated`イベントの`source_commit`が持つ）。`last_error`は検証の拒否理由、`needs_session`の理由、cleanup失敗、またはruntime errorを持ち、着地で消える。`workspace_closed_at`（0003）はcmuxがcloseを確認した時刻で、nullの間はworkspaceを開いているものとして扱う。成果物hashは未実装。
+
+`goals`（0008）はgoalを1行で持つ。`title`は空でなく、`description` / `acceptance` / `constraints`は既定`''`、`doc`はnull可。`verdict`は`'achieved'` | `'abandoned'` | nullで、CHECK `(closed_at IS NULL) = (verdict IS NULL)`により閉じたgoalだけがverdictを持つ。`tasks.goal_id`は`goals(id)`への外部キー（null可、index `tasks_by_goal`）、`tasks.context`は`TEXT NOT NULL DEFAULT ''`で、v7以前のtaskは移行後に`goal_id = NULL`、`context = ''`になる。`run_events`は0008で作り直し、`task_id`をnull可にして`goal_id`（`goals(id)`への外部キー、index `events_by_goal`）を足した。CHECKで`task_id`と`goal_id`の少なくとも一方が非null、`run_id`があれば`task_id`も非nullとし、`(run_id, task_id) → task_runs(id, task_id)`の複合外部キーは残す。goal単位のイベント（`goal_created`、`goal_updated`、`goal_closed`）は`goal_id`だけを持ち、`task_goal_changed`はtaskのイベントとして`task_id`を持つ。goalの操作（`add_goal` / `edit_goal` / `close_goal` / `set_goal`と`add --goal`）は他の状態変更と同じく`BEGIN IMMEDIATE`で直列化し、closeの判定（status別件数）とverdictの書き込み、set-goalのtask statusとgoalの開閉の確認を同じトランザクションで行う。
 
 ## Runtime ownership
 
@@ -82,7 +86,7 @@ SQLiteはrusqliteのbundled機能で同梱する。初期化でWALを有効に�
 
 `application_id = 0x43545131`でcmux-taskqのDBを識別する。未知の新しいschemaや他アプリのDBは書き換えずに拒否する。`init`の再実行では登録済みデータを保持する。バイナリ更新時は既存DBをopenする際にも未適用migrationを確認する。
 
-SQLiteはCHECK制約を変更できないため、statusの追加はtableの作り直し（`CREATE ... _vN` → `INSERT ... SELECT`（rowidも複写） → `DROP` → `RENAME` → index再作成）で行う。`DROP TABLE`はforeign keyが有効だと参照元の行があるとき失敗するので、migration実行中はトランザクションの外で`foreign_keys=OFF`にし、commit前に`pragma_foreign_key_check`が0件であることを確認してからONに戻す。`0004_integration.sql`がこの形の最初の例。`0005_run_leases.sql`は`run_leases`を作り、v4の`supervisor_leases`の行を`supervisor_token`が一致する実行中runへ移してから`supervisor_leases`と`one_executing_run_per_queue`を落とす（tableの作り直しは不要）。`0006_merge_queue.sql`は0004と同じ手順で`task_runs`を作り直して`integrating`と`needs_session`をCHECKに加え、`one_unfinished_run_per_task`を2状態込みで作り直し、`one_integrating_run_per_queue`を足す。`run_leases`の外部キーは`task_runs`を名前で参照しているので作り直し後もそのまま有効で、`foreign_key_check`で確認する。`0007_supervisors.sql`は`supervisors`を作るだけで、既存の行には触れない。v6のsupervisorが動いている最中にmigrationが走っても、そのsupervisorは登録を持たないままleaseだけで`status`/`doctor`に並ぶ。
+SQLiteはCHECK制約を変更できないため、statusの追加はtableの作り直し（`CREATE ... _vN` → `INSERT ... SELECT`（rowidも複写） → `DROP` → `RENAME` → index再作成）で行う。`DROP TABLE`はforeign keyが有効だと参照元の行があるとき失敗するので、migration実行中はトランザクションの外で`foreign_keys=OFF`にし、commit前に`pragma_foreign_key_check`が0件であることを確認してからONに戻す。`0004_integration.sql`がこの形の最初の例。`0005_run_leases.sql`は`run_leases`を作り、v4の`supervisor_leases`の行を`supervisor_token`が一致する実行中runへ移してから`supervisor_leases`と`one_executing_run_per_queue`を落とす（tableの作り直しは不要）。`0006_merge_queue.sql`は0004と同じ手順で`task_runs`を作り直して`integrating`と`needs_session`をCHECKに加え、`one_unfinished_run_per_task`を2状態込みで作り直し、`one_integrating_run_per_queue`を足す。`run_leases`の外部キーは`task_runs`を名前で参照しているので作り直し後もそのまま有効で、`foreign_key_check`で確認する。`0007_supervisors.sql`は`supervisors`を作るだけで、既存の行には触れない。v6のsupervisorが動いている最中にmigrationが走っても、そのsupervisorは登録を持たないままleaseだけで`status`/`doctor`に並ぶ。`0008_goals.sql`は`goals`を作り、`tasks`に`goal_id`と`context`を`ALTER TABLE ADD COLUMN`で足し（既定がnull / `''`なので作り直し不要）、`run_events`を0004と同じ手順で作り直す（`id`（AUTOINCREMENT）も複写するので、イベントIDと順序、`sqlite_sequence`の続きが保たれる）。`SqliteQueue::SCHEMA_VERSION`（`MIGRATIONS`の長さ）が最新の`user_version`で、testはこの定数と比較する。
 
 ## Planned runtime persistence
 

@@ -15,7 +15,7 @@ use serde_json::{Value, json};
 
 use cmux_taskq::{
     application::TaskQueue,
-    domain::{NewTask, TaskAction},
+    domain::{GoalEdit, GoalVerdict, NewGoal, NewTask, TaskAction},
     infrastructure::{adapters::path_text, location::QueueLocation, sqlite::SqliteQueue},
 };
 
@@ -50,6 +50,12 @@ enum Command {
         verification_commands: Vec<String>,
         #[arg(long = "depends-on")]
         dependencies: Vec<i64>,
+        /// Open goal the task belongs to.
+        #[arg(long = "goal")]
+        goal_id: Option<i64>,
+        /// Why the task exists and what to read first; shown to the worker.
+        #[arg(long, default_value = "")]
+        context: String,
     },
     /// List all tasks in registration order.
     List,
@@ -65,6 +71,22 @@ enum Command {
     Dependency {
         #[command(subcommand)]
         command: DependencyCommand,
+    },
+    /// Manage goals: the higher-level problems that groups of tasks solve.
+    Goal {
+        #[command(subcommand)]
+        command: GoalCommand,
+    },
+    /// Move a draft or ready task to an open goal, or out of its goal with --none.
+    SetGoal {
+        /// Draft or ready task to move.
+        task: i64,
+        /// Open goal to join; omit it and pass --none to leave the current goal.
+        #[arg(required_unless_present = "none", conflicts_with = "none")]
+        goal: Option<i64>,
+        /// Remove the task from its goal.
+        #[arg(long)]
+        none: bool,
     },
     /// List ready tasks whose prerequisites are all completed; does not claim.
     Candidates,
@@ -127,6 +149,50 @@ enum DependencyCommand {
     Remove { task: i64, predecessor: i64 },
 }
 
+#[derive(Subcommand)]
+enum GoalCommand {
+    /// Register a goal; it has no state machine and no verification commands.
+    Add {
+        title: String,
+        #[arg(long, default_value = "")]
+        description: String,
+        #[arg(long, default_value = "")]
+        acceptance: String,
+        /// Naming, boundaries, and what not to do, shared by every task of the goal.
+        #[arg(long, default_value = "")]
+        constraints: String,
+        /// Path of a reference document inside the repository.
+        #[arg(long)]
+        doc: Option<String>,
+    },
+    /// List goals with their task counts by status.
+    List,
+    /// Show a goal, its tasks, and its events.
+    Show { id: i64 },
+    /// Replace fields of a goal; runs already started keep their prompt.
+    #[command(group = clap::ArgGroup::new("field").multiple(true).required(true))]
+    Edit {
+        id: i64,
+        #[arg(long, group = "field")]
+        title: Option<String>,
+        #[arg(long, group = "field")]
+        description: Option<String>,
+        #[arg(long, group = "field")]
+        acceptance: Option<String>,
+        #[arg(long, group = "field")]
+        constraints: Option<String>,
+        /// New document path; an empty value clears it.
+        #[arg(long, group = "field")]
+        doc: Option<String>,
+    },
+    /// Record the verdict once. `achieved` needs every task completed or canceled; `abandoned` needs no task in progress.
+    Close {
+        id: i64,
+        #[arg(long, value_parser = ["achieved", "abandoned"])]
+        verdict: String,
+    },
+}
+
 fn execute(cli: Cli) -> Result<Value> {
     let cwd = env::current_dir().context("working directory is unavailable")?;
     let location = QueueLocation::resolve(cli.db.as_deref(), &cwd)?;
@@ -171,12 +237,16 @@ fn execute(cli: Cli) -> Result<Value> {
             acceptance,
             verification_commands,
             dependencies,
+            goal_id,
+            context,
         } => serde_json::to_value(queue.add(NewTask {
             title,
             description,
             acceptance,
             verification_commands,
             dependencies,
+            goal_id,
+            context,
         })?)?,
         Command::List => serde_json::to_value(queue.list()?)?,
         Command::Show { id } => serde_json::to_value(queue.show(id)?)?,
@@ -196,6 +266,48 @@ fn execute(cli: Cli) -> Result<Value> {
             };
             serde_json::to_value(queue.show(id)?)?
         }
+        Command::Goal { command } => match command {
+            GoalCommand::Add {
+                title,
+                description,
+                acceptance,
+                constraints,
+                doc,
+            } => serde_json::to_value(queue.add_goal(NewGoal {
+                title,
+                description,
+                acceptance,
+                constraints,
+                doc,
+            })?)?,
+            GoalCommand::List => serde_json::to_value(queue.list_goals()?)?,
+            GoalCommand::Show { id } => serde_json::to_value(queue.show_goal(id)?)?,
+            GoalCommand::Edit {
+                id,
+                title,
+                description,
+                acceptance,
+                constraints,
+                doc,
+            } => serde_json::to_value(queue.edit_goal(
+                id,
+                GoalEdit {
+                    title,
+                    description,
+                    acceptance,
+                    constraints,
+                    doc,
+                },
+            )?)?,
+            GoalCommand::Close { id, verdict } => {
+                serde_json::to_value(queue.close_goal(id, verdict.parse::<GoalVerdict>()?)?)?
+            }
+        },
+        Command::SetGoal {
+            task,
+            goal,
+            none: _,
+        } => serde_json::to_value(queue.set_goal(task, goal)?)?,
         Command::Candidates => serde_json::to_value(queue.candidates()?)?,
         Command::Status => cmux_taskq::runtime::status(&db)?,
         Command::Supervise {

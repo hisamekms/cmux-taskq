@@ -16,7 +16,7 @@ tags:
 
 ## Rules
 
-- 決まったタスクは`cmux-taskq add`で登録する。人が関わるタスクは次の連番でジャーナルをGoalだけ書いて作り、返ったIDを`queue_task`に書く。
+- 決まったタスクは`cmux-taskq add`で登録する。人が関わるタスクは次の連番でジャーナルをScopeだけ書いて作り、返ったIDを`queue_task`に書く。
 - `status: draft`のジャーナルは登録待ち。登録したら`planned`、セッションが触り始めたら`open`にする。SVがジャーナルを直接起動することはなく、実行は常に`cmux-taskq supervise`が行う。
 - 作業中はLogに追記する。一時的なpath、workspace番号、制限の復活時刻など、他の文書に書くほどでもない備忘はここに書く。
 - 閉じるときにResultとPromotedを書き、`status: done`（または`abandoned`）にする。

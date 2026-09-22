@@ -2,7 +2,10 @@ use std::sync::{Arc, Barrier};
 
 use cmux_taskq::{
     application::TaskQueue,
-    domain::{ClaimOutcome, NewTask, Provider, RunStatus, TaskAction, TaskStatus},
+    domain::{
+        ClaimOutcome, GoalEdit, GoalVerdict, NewGoal, NewTask, Provider, RunStatus, TaskAction,
+        TaskStatus,
+    },
     infrastructure::sqlite::SqliteQueue,
 };
 use rusqlite::Connection;
@@ -17,6 +20,18 @@ fn new_task(title: &str) -> NewTask {
         acceptance: "The regression test passes".into(),
         verification_commands: vec!["cargo test".into()],
         dependencies: vec![],
+        goal_id: None,
+        context: String::new(),
+    }
+}
+
+fn new_goal(title: &str) -> NewGoal {
+    NewGoal {
+        title: title.into(),
+        description: "One problem several tasks solve".into(),
+        acceptance: "Every task landed and the feature works end to end".into(),
+        constraints: "Keep the module boundary".into(),
+        doc: Some("docs/adr/0009-goal-groups-tasks.md".into()),
     }
 }
 
@@ -387,7 +402,7 @@ fn initialization_is_repeatable_and_preserves_existing_tasks() {
     queue.add(new_task("preserved")).unwrap();
     drop(queue);
     let queue = SqliteQueue::init(dir.path().join("queue.db")).unwrap();
-    assert_eq!(queue.schema_version().unwrap(), 7);
+    assert_eq!(queue.schema_version().unwrap(), SqliteQueue::SCHEMA_VERSION);
     assert_eq!(queue.list().unwrap().len(), 1);
     assert!(SqliteQueue::open(dir.path().join("typo.db")).is_err());
     assert!(!dir.path().join("typo.db").exists());
@@ -530,7 +545,7 @@ fn migration_to_v5_rebuilds_runs_moves_the_lease_and_keeps_foreign_keys() {
     .unwrap();
     drop(raw);
     let mut queue = SqliteQueue::open(&path).unwrap();
-    assert_eq!(queue.schema_version().unwrap(), 7);
+    assert_eq!(queue.schema_version().unwrap(), SqliteQueue::SCHEMA_VERSION);
     // The queue-wide lease became the orphaned run's lease; the slot index is gone.
     let leases = queue.run_leases().unwrap();
     assert_eq!(leases.len(), 1);
@@ -622,7 +637,7 @@ fn migration_to_v6_adds_the_integration_statuses_and_the_single_slot() {
     .unwrap();
     drop(raw);
     let mut queue = SqliteQueue::open(&path).unwrap();
-    assert_eq!(queue.schema_version().unwrap(), 7);
+    assert_eq!(queue.schema_version().unwrap(), SqliteQueue::SCHEMA_VERSION);
     assert_eq!(
         queue.show(1).unwrap().runs[0].status,
         RunStatus::AwaitingIntegration
@@ -721,7 +736,7 @@ fn migration_to_v7_adds_the_supervisor_registry_and_keeps_leases() {
     assert!(raw.execute("SELECT count(*) FROM supervisors", []).is_err());
     drop(raw);
     let mut queue = SqliteQueue::open(&path).unwrap();
-    assert_eq!(queue.schema_version().unwrap(), 7);
+    assert_eq!(queue.schema_version().unwrap(), SqliteQueue::SCHEMA_VERSION);
     // A v6 supervisor that was running has no registration; its lease is intact.
     assert!(queue.supervisors().unwrap().is_empty());
     let leases = queue.run_leases().unwrap();
@@ -764,4 +779,298 @@ fn migration_to_v7_adds_the_supervisor_registry_and_keeps_leases() {
     assert!(!queue.deregister_supervisor("sv").unwrap());
     assert!(queue.supervisors().unwrap().is_empty());
     assert_eq!(queue.run_leases().unwrap().len(), 1);
+}
+
+#[test]
+fn migration_from_v6_adds_goals_and_keeps_tasks_runs_and_events() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("v6.db");
+    let raw = Connection::open(&path).unwrap();
+    for migration in [
+        include_str!("../migrations/0001_queue.sql"),
+        include_str!("../migrations/0002_supervisor.sql"),
+        include_str!("../migrations/0003_workspace_close.sql"),
+        include_str!("../migrations/0004_integration.sql"),
+        include_str!("../migrations/0005_run_leases.sql"),
+        include_str!("../migrations/0006_merge_queue.sql"),
+    ] {
+        raw.execute_batch(migration).unwrap();
+    }
+    raw.pragma_update(None, "application_id", 0x43545131)
+        .unwrap();
+    raw.pragma_update(None, "user_version", 6).unwrap();
+    raw.execute_batch(&format!(
+        "INSERT INTO tasks(title,description,acceptance,verification_commands,status)
+         VALUES ('landed','why','done','[\"cargo test\"]','completed');
+         INSERT INTO task_runs(id,task_id,status,requested_provider,actual_provider,base_commit,result_commit)
+         VALUES ('run-landed',1,'integrated','claude','claude','{BASE}','{BASE}');
+         INSERT INTO run_events(task_id,run_id,kind,payload) VALUES (1,NULL,'task_created','{{}}');
+         INSERT INTO run_events(task_id,run_id,kind,payload) VALUES (1,'run-landed','run_claimed','{{}}');
+         INSERT INTO tasks(title,description,acceptance,verification_commands,status)
+         VALUES ('waiting','','','[]','ready');
+         INSERT INTO task_dependencies(task_id,predecessor_id) VALUES (2,1);
+         INSERT INTO run_events(task_id,run_id,kind,payload) VALUES (2,NULL,'task_created','{{}}');"
+    ))
+    .unwrap();
+    drop(raw);
+    let mut queue = SqliteQueue::open(&path).unwrap();
+    // 0007 (supervisors) and 0008 (goals) are applied together.
+    assert_eq!(SqliteQueue::SCHEMA_VERSION, 8);
+    assert_eq!(queue.schema_version().unwrap(), 8);
+    let landed = queue.show(1).unwrap();
+    assert_eq!(landed.task.title, "landed");
+    assert_eq!(landed.task.description, "why");
+    assert_eq!(landed.task.goal_id, None);
+    assert_eq!(landed.task.context, "");
+    assert_eq!(landed.task.status, TaskStatus::Completed);
+    assert_eq!(landed.runs.len(), 1);
+    assert_eq!(landed.runs[0].status, RunStatus::Integrated);
+    // Events keep their IDs, order and run reference across the rebuild.
+    assert_eq!(
+        landed
+            .events
+            .iter()
+            .map(|e| (e.id, e.task_id, e.run_id.as_deref()))
+            .collect::<Vec<_>>(),
+        [(1, Some(1), None), (2, Some(1), Some("run-landed"))]
+    );
+    let waiting = queue.show(2).unwrap();
+    assert_eq!(waiting.task.goal_id, None);
+    assert_eq!(waiting.task.context, "");
+    assert_eq!(waiting.dependencies, [1]);
+    assert_eq!(waiting.events[0].id, 3);
+    assert_eq!(queue.candidates().unwrap()[0].id, 2);
+    assert!(queue.list_goals().unwrap().is_empty());
+    // New goals and events continue the sequences; foreign keys are enforced.
+    let goal = queue.add_goal(new_goal("after")).unwrap();
+    assert_eq!(goal.id, 1);
+    assert_eq!(queue.show_goal(goal.id).unwrap().events[0].id, 4);
+    let raw = Connection::open(&path).unwrap();
+    raw.pragma_update(None, "foreign_keys", true).unwrap();
+    assert!(
+        raw.execute("UPDATE tasks SET goal_id=99 WHERE id=2", [])
+            .is_err()
+    );
+    assert!(
+        raw.execute(
+            "INSERT INTO run_events(kind,payload) VALUES ('orphan','{}')",
+            []
+        )
+        .is_err()
+    );
+    assert!(
+        raw.execute(
+            "INSERT INTO run_events(goal_id,run_id,kind,payload) VALUES (1,'run-landed','x','{}')",
+            []
+        )
+        .is_err()
+    );
+    assert!(
+        raw.execute("UPDATE goals SET verdict='achieved' WHERE id=1", [])
+            .is_err()
+    );
+}
+
+#[test]
+fn goal_close_verdicts_depend_on_task_statuses() {
+    let (dir, mut queue) = fixture();
+    let goal = queue.add_goal(new_goal("feature")).unwrap();
+    assert!(!goal.is_closed());
+    assert_eq!(
+        goal.doc.as_deref(),
+        Some("docs/adr/0009-goal-groups-tasks.md")
+    );
+    let mut spec = new_task("first");
+    spec.goal_id = Some(goal.id);
+    let a = queue.add(spec).unwrap();
+    assert_eq!(a.goal_id, Some(goal.id));
+    let mut spec = new_task("second");
+    spec.goal_id = Some(goal.id);
+    let b = queue.add(spec).unwrap().id;
+    // Draft tasks block `achieved` but not `abandoned`.
+    assert!(queue.close_goal(goal.id, GoalVerdict::Achieved).is_err());
+    queue.transition(a.id, TaskAction::Ready).unwrap();
+    queue.claim(BASE).unwrap();
+    // An in-progress task blocks both verdicts.
+    let error = format!(
+        "{:#}",
+        queue
+            .close_goal(goal.id, GoalVerdict::Abandoned)
+            .unwrap_err()
+    );
+    assert!(error.contains("1 task(s) in_progress"), "{error}");
+    assert!(queue.close_goal(goal.id, GoalVerdict::Achieved).is_err());
+    assert!(!queue.show_goal(goal.id).unwrap().closed);
+    let raw = Connection::open(dir.path().join("queue.db")).unwrap();
+    raw.execute("UPDATE tasks SET status='completed' WHERE id=?1", [a.id])
+        .unwrap();
+    assert!(queue.close_goal(goal.id, GoalVerdict::Achieved).is_err());
+    queue.transition(b, TaskAction::Cancel).unwrap();
+    let closed = queue.close_goal(goal.id, GoalVerdict::Achieved).unwrap();
+    assert!(closed.is_closed());
+    assert_eq!(closed.verdict, Some(GoalVerdict::Achieved));
+    assert!(closed.closed_at.is_some());
+    assert!(queue.close_goal(goal.id, GoalVerdict::Abandoned).is_err());
+    let summary = &queue.list_goals().unwrap()[0];
+    assert!(summary.closed);
+    assert_eq!(summary.verdict, Some(GoalVerdict::Achieved));
+    assert_eq!(
+        (
+            summary.tasks.total,
+            summary.tasks.completed,
+            summary.tasks.canceled
+        ),
+        (2, 1, 1)
+    );
+
+    // Nothing running: an untouched goal may be abandoned with draft tasks left.
+    let other = queue.add_goal(new_goal("dropped")).unwrap();
+    let mut spec = new_task("never started");
+    spec.goal_id = Some(other.id);
+    let c = queue.add(spec).unwrap().id;
+    queue.transition(c, TaskAction::Ready).unwrap();
+    let abandoned = queue.close_goal(other.id, GoalVerdict::Abandoned).unwrap();
+    assert_eq!(abandoned.verdict, Some(GoalVerdict::Abandoned));
+    assert_eq!(queue.show(c).unwrap().task.status, TaskStatus::Ready);
+    assert!(queue.show_goal(99).is_err());
+    assert!(queue.close_goal(99, GoalVerdict::Achieved).is_err());
+    assert!(
+        queue
+            .add_goal(NewGoal {
+                title: " ".into(),
+                ..NewGoal::default()
+            })
+            .is_err()
+    );
+}
+
+#[test]
+fn set_goal_and_add_with_goal_follow_the_dependency_rules() {
+    let (_dir, mut queue) = fixture();
+    let open = queue.add_goal(new_goal("open")).unwrap().id;
+    let closed = queue.add_goal(new_goal("closed")).unwrap().id;
+    queue.close_goal(closed, GoalVerdict::Achieved).unwrap();
+    let mut spec = new_task("into closed goal");
+    spec.goal_id = Some(closed);
+    assert!(queue.add(spec).is_err());
+    let mut spec = new_task("into missing goal");
+    spec.goal_id = Some(99);
+    assert!(queue.add(spec).is_err());
+    let mut spec = new_task("invalid goal id");
+    spec.goal_id = Some(0);
+    assert!(queue.add(spec).is_err());
+    assert!(queue.list().unwrap().is_empty());
+
+    let task = queue.add(new_task("movable")).unwrap().id;
+    assert_eq!(
+        queue.set_goal(task, Some(open)).unwrap().goal_id,
+        Some(open)
+    );
+    assert!(queue.set_goal(task, Some(closed)).is_err());
+    assert!(queue.set_goal(task, Some(99)).is_err());
+    assert_eq!(queue.show(task).unwrap().task.goal_id, Some(open));
+    queue.transition(task, TaskAction::Ready).unwrap();
+    assert_eq!(queue.set_goal(task, None).unwrap().goal_id, None);
+    assert_eq!(
+        queue.set_goal(task, Some(open)).unwrap().goal_id,
+        Some(open)
+    );
+    queue.claim(BASE).unwrap();
+    assert!(queue.set_goal(task, None).is_err());
+    assert!(queue.set_goal(task, Some(open)).is_err());
+    assert_eq!(queue.show(task).unwrap().task.goal_id, Some(open));
+    assert!(queue.set_goal(99, Some(open)).is_err());
+    let canceled = queue.add(new_task("canceled")).unwrap().id;
+    queue.transition(canceled, TaskAction::Cancel).unwrap();
+    assert!(queue.set_goal(canceled, Some(open)).is_err());
+    // The goal's task list and counts follow the moves.
+    let detail = queue.show_goal(open).unwrap();
+    assert_eq!(
+        detail
+            .tasks
+            .iter()
+            .map(|t| (t.id, t.title.as_str(), t.status))
+            .collect::<Vec<_>>(),
+        [(task, "movable", TaskStatus::InProgress)]
+    );
+    assert_eq!(queue.list_goals().unwrap()[0].tasks.in_progress, 1);
+}
+
+#[test]
+fn goal_events_are_recorded_without_a_run() {
+    let (_dir, mut queue) = fixture();
+    let goal = queue.add_goal(new_goal("tracked")).unwrap();
+    assert!(queue.edit_goal(goal.id, GoalEdit::default()).is_err());
+    assert!(
+        queue
+            .edit_goal(
+                goal.id,
+                GoalEdit {
+                    title: Some(" ".into()),
+                    ..GoalEdit::default()
+                }
+            )
+            .is_err()
+    );
+    let edited = queue
+        .edit_goal(
+            goal.id,
+            GoalEdit {
+                title: Some("renamed".into()),
+                doc: Some(String::new()),
+                ..GoalEdit::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(edited.title, "renamed");
+    assert_eq!(edited.doc, None);
+    assert_eq!(edited.acceptance, goal.acceptance);
+    let task = queue.add(new_task("member")).unwrap().id;
+    queue.set_goal(task, Some(goal.id)).unwrap();
+    queue.set_goal(task, Some(goal.id)).unwrap(); // Unchanged: no event.
+    queue.set_goal(task, None).unwrap();
+    queue.close_goal(goal.id, GoalVerdict::Achieved).unwrap();
+    assert!(queue.edit_goal(99, GoalEdit::default()).is_err());
+
+    let detail = queue.show_goal(goal.id).unwrap();
+    assert!(detail.closed);
+    assert!(detail.tasks.is_empty());
+    assert_eq!(
+        detail
+            .events
+            .iter()
+            .map(|e| (e.kind.as_str(), e.goal_id, e.task_id, e.run_id.clone()))
+            .collect::<Vec<_>>(),
+        [
+            ("goal_created", Some(goal.id), None, None),
+            ("goal_updated", Some(goal.id), None, None),
+            ("goal_closed", Some(goal.id), None, None),
+        ]
+    );
+    assert_eq!(detail.events[0].payload["goal"]["title"], "tracked");
+    let updated = &detail.events[1].payload;
+    assert_eq!(updated["old"]["title"], "tracked");
+    assert_eq!(updated["new"]["title"], "renamed");
+    assert_eq!(updated["old"]["doc"], "docs/adr/0009-goal-groups-tasks.md");
+    assert!(updated["new"]["doc"].is_null());
+    assert_eq!(detail.events[2].payload["verdict"], "achieved");
+    assert_eq!(detail.events[2].payload["tasks"]["total"], 0);
+
+    let task_events = queue.show(task).unwrap().events;
+    assert_eq!(
+        task_events
+            .iter()
+            .map(|e| (e.kind.as_str(), e.task_id, e.goal_id, e.run_id.clone()))
+            .collect::<Vec<_>>(),
+        [
+            ("task_created", Some(task), None, None),
+            ("task_goal_changed", Some(task), None, None),
+            ("task_goal_changed", Some(task), None, None),
+        ]
+    );
+    assert!(task_events[0].payload["goal_id"].is_null());
+    assert_eq!(task_events[1].payload["from"], serde_json::Value::Null);
+    assert_eq!(task_events[1].payload["to"], goal.id);
+    assert_eq!(task_events[2].payload["from"], goal.id);
+    assert!(task_events[2].payload["to"].is_null());
 }

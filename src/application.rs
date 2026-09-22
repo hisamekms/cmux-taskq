@@ -2,7 +2,10 @@
 
 use anyhow::Result;
 
-use crate::domain::{ClaimOutcome, NewTask, Predecessor, Task, TaskAction, TaskDetail};
+use crate::domain::{
+    ClaimOutcome, Goal, GoalDetail, GoalEdit, GoalSummary, GoalVerdict, NewGoal, NewTask,
+    Predecessor, Task, TaskAction, TaskDetail,
+};
 
 pub trait TaskQueue {
     fn add(&mut self, task: NewTask) -> Result<Task>;
@@ -19,6 +22,17 @@ pub trait TaskQueue {
     fn predecessors(&self, task_id: i64) -> Result<Vec<Predecessor>>;
     /// Tasks that are `in_progress` right now, in ID order.
     fn tasks_in_progress(&self) -> Result<Vec<Task>>;
+    fn add_goal(&mut self, goal: NewGoal) -> Result<Goal>;
+    /// Every goal in ID order with its task counts by status.
+    fn list_goals(&self) -> Result<Vec<GoalSummary>>;
+    fn show_goal(&mut self, goal_id: i64) -> Result<GoalDetail>;
+    /// Replace the given fields; running runs keep their prompt snapshot.
+    fn edit_goal(&mut self, goal_id: i64, edit: GoalEdit) -> Result<Goal>;
+    /// Record the verdict once. `achieved` is refused while a task is not
+    /// completed or canceled; `abandoned` while a task is in progress.
+    fn close_goal(&mut self, goal_id: i64, verdict: GoalVerdict) -> Result<Goal>;
+    /// Move a draft or ready task to an open goal, or to none.
+    fn set_goal(&mut self, task_id: i64, goal_id: Option<i64>) -> Result<Task>;
 }
 
 /// Provider-specific CLI construction is kept outside supervisor orchestration.

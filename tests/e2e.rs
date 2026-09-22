@@ -235,7 +235,10 @@ fn fixture() -> Fixture {
         data_home: dir.path().join("data"),
     };
     let init = taskq(&env, &["init"]);
-    assert_eq!(init["schema_version"], 7);
+    assert_eq!(
+        init["schema_version"],
+        cmux_taskq::infrastructure::sqlite::SqliteQueue::SCHEMA_VERSION
+    );
     let db = PathBuf::from(init["db"].as_str().unwrap());
     assert!(db.starts_with(env.data_home.join("cmux-taskq")));
     assert_eq!(taskq(&env, &["locate"])["db_exists"], true);

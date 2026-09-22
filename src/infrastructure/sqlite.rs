@@ -11,8 +11,9 @@ use uuid::Uuid;
 use crate::{
     application::TaskQueue,
     domain::{
-        ClaimOutcome, NewTask, Predecessor, RunEvent, Task, TaskAction, TaskDetail, TaskRun,
-        validate_base_commit,
+        ClaimOutcome, Goal, GoalDetail, GoalEdit, GoalSummary, GoalTask, GoalVerdict, NewGoal,
+        NewTask, Predecessor, RunEvent, Task, TaskAction, TaskDetail, TaskRun, TaskStatus,
+        TaskStatusCounts, validate_base_commit,
     },
 };
 
@@ -25,6 +26,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../../migrations/0005_run_leases.sql"),
     include_str!("../../migrations/0006_merge_queue.sql"),
     include_str!("../../migrations/0007_supervisors.sql"),
+    include_str!("../../migrations/0008_goals.sql"),
 ];
 const READY_QUERY: &str = "
     SELECT t.* FROM tasks t
@@ -45,6 +47,9 @@ pub struct SqliteQueue {
 }
 
 impl SqliteQueue {
+    /// `user_version` a fully migrated queue reports.
+    pub const SCHEMA_VERSION: i64 = MIGRATIONS.len() as i64;
+
     /// Explicit initialization is the only operation that creates a database file.
     pub fn init(path: impl AsRef<Path>) -> Result<Self> {
         let mut queue = Self::connect(path.as_ref(), true)?;
@@ -136,12 +141,23 @@ impl TaskQueue for SqliteQueue {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(goal_id) = task.goal_id {
+            ensure_goal_open(&tx, goal_id)?;
+        }
         tx.execute(
-            "INSERT INTO tasks(title, description, acceptance, verification_commands) VALUES (?1,?2,?3,?4)",
-            params![task.title, task.description, task.acceptance, serde_json::to_string(&task.verification_commands)?],
+            "INSERT INTO tasks(title, description, acceptance, verification_commands, goal_id, context)
+             VALUES (?1,?2,?3,?4,?5,?6)",
+            params![task.title, task.description, task.acceptance, serde_json::to_string(&task.verification_commands)?,
+                task.goal_id, task.context],
         )?;
         let id = tx.last_insert_rowid();
-        event(&tx, id, None, "task_created", json!({}))?;
+        event(
+            &tx,
+            id,
+            None,
+            "task_created",
+            json!({"goal_id": task.goal_id}),
+        )?;
         for predecessor in task.dependencies {
             insert_dependency(&tx, id, predecessor)?;
         }
@@ -297,6 +313,225 @@ impl TaskQueue for SqliteQueue {
             .query_map([], task_row)?
             .collect::<rusqlite::Result<_>>()?)
     }
+
+    fn add_goal(&mut self, goal: NewGoal) -> Result<Goal> {
+        goal.validate()?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute(
+            "INSERT INTO goals(title, description, acceptance, constraints, doc) VALUES (?1,?2,?3,?4,?5)",
+            params![
+                goal.title,
+                goal.description,
+                goal.acceptance,
+                goal.constraints,
+                goal.doc.filter(|d| !d.trim().is_empty())
+            ],
+        )?;
+        let id = tx.last_insert_rowid();
+        let result = read_goal(&tx, id)?;
+        goal_event(&tx, id, "goal_created", json!({"goal": result}))?;
+        tx.commit()?;
+        Ok(result)
+    }
+
+    fn list_goals(&self) -> Result<Vec<GoalSummary>> {
+        let goals: Vec<Goal> = self
+            .conn
+            .prepare("SELECT * FROM goals ORDER BY id")?
+            .query_map([], goal_row)?
+            .collect::<rusqlite::Result<_>>()?;
+        goals
+            .into_iter()
+            .map(|goal| {
+                Ok(GoalSummary {
+                    id: goal.id,
+                    closed: goal.is_closed(),
+                    verdict: goal.verdict,
+                    tasks: task_counts(&self.conn, goal.id)?,
+                    title: goal.title,
+                })
+            })
+            .collect()
+    }
+
+    fn show_goal(&mut self, goal_id: i64) -> Result<GoalDetail> {
+        let tx = self.conn.transaction()?;
+        let goal = read_goal(&tx, goal_id)?;
+        let tasks = tx
+            .prepare("SELECT id, title, status FROM tasks WHERE goal_id=?1 ORDER BY id")?
+            .query_map([goal_id], |row| {
+                Ok(GoalTask {
+                    id: row.get("id")?,
+                    title: row.get("title")?,
+                    status: enum_col(row, "status")?,
+                })
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        let events = tx
+            .prepare("SELECT * FROM run_events WHERE goal_id=?1 ORDER BY id")?
+            .query_map([goal_id], event_row)?
+            .collect::<rusqlite::Result<_>>()?;
+        tx.commit()?;
+        Ok(GoalDetail {
+            closed: goal.is_closed(),
+            goal,
+            tasks,
+            events,
+        })
+    }
+
+    fn edit_goal(&mut self, goal_id: i64, edit: GoalEdit) -> Result<Goal> {
+        ensure!(!edit.is_empty(), "goal edit changes nothing");
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let old = read_goal(&tx, goal_id)?;
+        let new = edit.apply(&old)?;
+        tx.execute(
+            "UPDATE goals SET title=?1, description=?2, acceptance=?3, constraints=?4, doc=?5,
+             updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?6",
+            params![
+                new.title,
+                new.description,
+                new.acceptance,
+                new.constraints,
+                new.doc,
+                goal_id
+            ],
+        )?;
+        goal_event(
+            &tx,
+            goal_id,
+            "goal_updated",
+            json!({"old": old, "new": new}),
+        )?;
+        let result = read_goal(&tx, goal_id)?;
+        tx.commit()?;
+        Ok(result)
+    }
+
+    fn close_goal(&mut self, goal_id: i64, verdict: GoalVerdict) -> Result<Goal> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let goal = read_goal(&tx, goal_id)?;
+        ensure!(
+            !goal.is_closed(),
+            "goal {goal_id} is already closed as {}",
+            goal.verdict.map_or("?", GoalVerdict::as_str)
+        );
+        let counts = task_counts(&tx, goal_id)?;
+        let blocking: Vec<(TaskStatus, usize)> = [
+            (TaskStatus::Draft, counts.draft),
+            (TaskStatus::Ready, counts.ready),
+            (TaskStatus::InProgress, counts.in_progress),
+        ]
+        .into_iter()
+        .filter(|(status, n)| *n > 0 && !verdict.allows(*status))
+        .collect();
+        ensure!(
+            blocking.is_empty(),
+            "goal {goal_id} cannot be closed as {}: {}",
+            verdict.as_str(),
+            blocking
+                .iter()
+                .map(|(status, n)| format!("{n} task(s) {}", status.as_str()))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        tx.execute(
+            "UPDATE goals SET closed_at=strftime('%Y-%m-%dT%H:%M:%fZ','now'), verdict=?1,
+             updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?2",
+            params![verdict.as_str(), goal_id],
+        )?;
+        goal_event(
+            &tx,
+            goal_id,
+            "goal_closed",
+            json!({"verdict": verdict, "tasks": counts}),
+        )?;
+        let result = read_goal(&tx, goal_id)?;
+        tx.commit()?;
+        Ok(result)
+    }
+
+    fn set_goal(&mut self, task_id: i64, goal_id: Option<i64>) -> Result<Task> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let task = read_task(&tx, task_id)?;
+        ensure!(
+            task.status.dependencies_editable(),
+            "the goal can only be changed for draft or ready tasks"
+        );
+        if let Some(goal_id) = goal_id {
+            ensure_goal_open(&tx, goal_id)?;
+        }
+        if task.goal_id != goal_id {
+            tx.execute(
+                "UPDATE tasks SET goal_id=?1, updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?2",
+                params![goal_id, task_id],
+            )?;
+            event(
+                &tx,
+                task_id,
+                None,
+                "task_goal_changed",
+                json!({"from": task.goal_id, "to": goal_id}),
+            )?;
+        }
+        let result = read_task(&tx, task_id)?;
+        tx.commit()?;
+        Ok(result)
+    }
+}
+
+fn read_goal(conn: &Connection, goal_id: i64) -> Result<Goal> {
+    conn.query_row("SELECT * FROM goals WHERE id=?1", [goal_id], goal_row)
+        .optional()?
+        .with_context(|| format!("goal {goal_id} does not exist"))
+}
+
+/// Tasks join and move between open goals only; a closed goal is a record.
+fn ensure_goal_open(conn: &Connection, goal_id: i64) -> Result<()> {
+    let goal = read_goal(conn, goal_id)?;
+    ensure!(
+        !goal.is_closed(),
+        "goal {goal_id} is closed as {}; create a new goal for further work",
+        goal.verdict.map_or("?", GoalVerdict::as_str)
+    );
+    Ok(())
+}
+
+fn task_counts(conn: &Connection, goal_id: i64) -> Result<TaskStatusCounts> {
+    let mut counts = TaskStatusCounts::default();
+    let mut rows =
+        conn.prepare("SELECT status, count(*) AS n FROM tasks WHERE goal_id=?1 GROUP BY status")?;
+    for row in rows.query_map([goal_id], |row| {
+        Ok((
+            enum_col::<TaskStatus>(row, "status")?,
+            row.get::<_, i64>("n")?,
+        ))
+    })? {
+        let (status, n) = row?;
+        counts.count(status, usize::try_from(n)?);
+    }
+    Ok(counts)
+}
+
+fn goal_event(
+    conn: &Connection,
+    goal_id: i64,
+    kind: &str,
+    payload: serde_json::Value,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO run_events(goal_id,kind,payload) VALUES (?1,?2,?3)",
+        params![goal_id, kind, serde_json::to_string(&payload)?],
+    )?;
+    Ok(())
 }
 
 /// Reserve the first dependency-ready task inside the caller's write
@@ -435,6 +670,26 @@ fn task_row(row: &Row<'_>) -> rusqlite::Result<Task> {
         acceptance: row.get("acceptance")?,
         verification_commands: json_col(row, "verification_commands")?,
         status: enum_col(row, "status")?,
+        goal_id: row.get("goal_id")?,
+        context: row.get("context")?,
+        created_at: row.get("created_at")?,
+        updated_at: row.get("updated_at")?,
+    })
+}
+
+fn goal_row(row: &Row<'_>) -> rusqlite::Result<Goal> {
+    let verdict: Option<String> = row.get("verdict")?;
+    Ok(Goal {
+        id: row.get("id")?,
+        title: row.get("title")?,
+        description: row.get("description")?,
+        acceptance: row.get("acceptance")?,
+        constraints: row.get("constraints")?,
+        doc: row.get("doc")?,
+        closed_at: row.get("closed_at")?,
+        verdict: verdict
+            .map(|_| enum_col::<GoalVerdict>(row, "verdict"))
+            .transpose()?,
         created_at: row.get("created_at")?,
         updated_at: row.get("updated_at")?,
     })
@@ -466,6 +721,7 @@ fn event_row(row: &Row<'_>) -> rusqlite::Result<RunEvent> {
     Ok(RunEvent {
         id: row.get("id")?,
         task_id: row.get("task_id")?,
+        goal_id: row.get("goal_id")?,
         run_id: row.get("run_id")?,
         kind: row.get("kind")?,
         payload: json_col(row, "payload")?,

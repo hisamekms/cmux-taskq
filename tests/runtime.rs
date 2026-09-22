@@ -62,6 +62,8 @@ fn add_ready_task(queue: &mut SqliteQueue, title: &str, dependencies: &[i64]) ->
             acceptance: "works".into(),
             verification_commands: vec!["test -f seed.txt".into()],
             dependencies: dependencies.to_vec(),
+            goal_id: None,
+            context: String::new(),
         })
         .unwrap();
     queue.transition(task.id, TaskAction::Ready).unwrap();
@@ -604,6 +606,40 @@ fn receipt_structure_is_checked_before_git() {
     }
     assert!(Receipt::parse("{\"run_id\":\"r\"}").is_err());
     assert!(Receipt::parse(&valid.replace("passed", "maybe")).is_err());
+    // follow_ups is optional and only its shape is checked.
+    let without = Receipt::parse(valid).unwrap();
+    assert!(without.follow_ups.is_none());
+    assert!(
+        !serde_json::to_string(&without)
+            .unwrap()
+            .contains("follow_ups")
+    );
+    let with = valid.replace(
+        "\"summary\":\"ok\"",
+        "\"summary\":\"ok\",\"follow_ups\":[{\"title\":\"next\",\"description\":\"later\"}]",
+    );
+    let receipt = Receipt::parse(&with).unwrap();
+    receipt.check("r").unwrap();
+    assert_eq!(receipt.follow_ups.as_ref().unwrap()[0]["title"], "next");
+    assert_eq!(
+        serde_json::to_value(&receipt).unwrap()["follow_ups"][0]["description"],
+        "later"
+    );
+    Receipt::parse(&valid.replace("\"summary\":\"ok\"", "\"summary\":\"ok\",\"follow_ups\":[]"))
+        .unwrap()
+        .check("r")
+        .unwrap();
+    let error = format!(
+        "{:#}",
+        Receipt::parse(&valid.replace(
+            "\"summary\":\"ok\"",
+            "\"summary\":\"ok\",\"follow_ups\":{\"title\":\"next\"}"
+        ))
+        .unwrap()
+        .check("r")
+        .unwrap_err()
+    );
+    assert!(error.contains("follow_ups must be an array"), "{error}");
 }
 
 fn event_kinds(detail: &cmux_taskq::domain::TaskDetail) -> Vec<&str> {
@@ -965,7 +1001,7 @@ fn migration_from_v1_preserves_task_and_initializes_runtime_tables() {
     raw.pragma_update(None, "user_version", 1).unwrap();
     raw.execute("INSERT INTO tasks(title,description,acceptance,verification_commands) VALUES ('preserved','','','[]')", []).unwrap();
     let mut queue = SqliteQueue::open(&db).unwrap();
-    assert_eq!(queue.schema_version().unwrap(), 7);
+    assert_eq!(queue.schema_version().unwrap(), SqliteQueue::SCHEMA_VERSION);
     assert_eq!(queue.show(1).unwrap().task.title, "preserved");
     assert!(queue.run_leases().unwrap().is_empty());
 }
@@ -1552,6 +1588,8 @@ fn add_file_task(
             acceptance: "works".into(),
             verification_commands: verify.iter().map(|v| (*v).to_owned()).collect(),
             dependencies: vec![],
+            goal_id: None,
+            context: String::new(),
         })
         .unwrap();
     queue.transition(task.id, TaskAction::Ready).unwrap();
@@ -1624,6 +1662,8 @@ fn awaiting_run() -> (TempDir, PathBuf, PathBuf, TaskRun) {
             acceptance: String::new(),
             verification_commands: vec![],
             dependencies: vec![1],
+            goal_id: None,
+            context: String::new(),
         })
         .unwrap();
     queue.transition(dependent.id, TaskAction::Ready).unwrap();
@@ -2207,6 +2247,8 @@ fn verification_failure_after_rebase_needs_a_session_and_keeps_the_rebased_tree(
             acceptance: String::new(),
             verification_commands: vec!["true".into()],
             dependencies: vec![],
+            goal_id: None,
+            context: String::new(),
         })
         .unwrap()
         .id;

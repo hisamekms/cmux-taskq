@@ -50,6 +50,13 @@ string_enum!(RunStatus {
 
 string_enum!(Provider { Claude => "claude" });
 
+// How a goal was closed. A goal has no state machine: it is open until one
+// close records the verdict, and its progress derives from its tasks.
+string_enum!(GoalVerdict {
+    Achieved => "achieved",
+    Abandoned => "abandoned",
+});
+
 string_enum!(ReceiptResult {
     Succeeded => "succeeded",
     Failed => "failed",
@@ -88,8 +95,24 @@ impl TaskStatus {
         }
     }
 
+    /// Dependencies and the goal may change only before the task is claimed.
     pub fn dependencies_editable(self) -> bool {
         matches!(self, Self::Draft | Self::Ready)
+    }
+
+    pub fn is_terminal(self) -> bool {
+        matches!(self, Self::Completed | Self::Canceled)
+    }
+}
+
+impl GoalVerdict {
+    /// `achieved` needs every task finished; `abandoned` only needs nothing
+    /// executing, so unstarted tasks stay in the queue as they are.
+    pub fn allows(self, task: TaskStatus) -> bool {
+        match self {
+            Self::Achieved => task.is_terminal(),
+            Self::Abandoned => task != TaskStatus::InProgress,
+        }
     }
 }
 
@@ -100,6 +123,10 @@ pub struct NewTask {
     pub acceptance: String,
     pub verification_commands: Vec<String>,
     pub dependencies: Vec<i64>,
+    /// Goal the task belongs to; must be open at registration.
+    pub goal_id: Option<i64>,
+    /// Why the task exists and what to read first; carried into the prompt.
+    pub context: String,
 }
 
 impl NewTask {
@@ -118,6 +145,10 @@ impl NewTask {
             self.dependencies.iter().all(|id| *id > 0),
             "dependency IDs must be positive"
         );
+        ensure!(
+            self.goal_id.is_none_or(|id| id > 0),
+            "goal ID must be positive"
+        );
         Ok(())
     }
 }
@@ -130,8 +161,146 @@ pub struct Task {
     pub acceptance: String,
     pub verification_commands: Vec<String>,
     pub status: TaskStatus,
+    pub goal_id: Option<i64>,
+    pub context: String,
     pub created_at: String,
     pub updated_at: String,
+}
+
+/// A higher-level problem that several tasks solve together (ADR-0009). The
+/// description, acceptance and constraints align the judgement of sibling
+/// tasks; `doc` is a path inside the repository. There are no verification
+/// commands: machine checks belong to a task that depends on the others.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Goal {
+    pub id: i64,
+    pub title: String,
+    pub description: String,
+    pub acceptance: String,
+    pub constraints: String,
+    pub doc: Option<String>,
+    pub closed_at: Option<String>,
+    pub verdict: Option<GoalVerdict>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+impl Goal {
+    pub fn is_closed(&self) -> bool {
+        self.closed_at.is_some()
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct NewGoal {
+    pub title: String,
+    pub description: String,
+    pub acceptance: String,
+    pub constraints: String,
+    pub doc: Option<String>,
+}
+
+impl NewGoal {
+    pub fn validate(&self) -> Result<()> {
+        ensure!(
+            !self.title.trim().is_empty(),
+            "goal title must not be blank"
+        );
+        Ok(())
+    }
+}
+
+/// Fields of a goal to replace; `None` keeps the current value. An empty
+/// `doc` clears the reference.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct GoalEdit {
+    pub title: Option<String>,
+    pub description: Option<String>,
+    pub acceptance: Option<String>,
+    pub constraints: Option<String>,
+    pub doc: Option<String>,
+}
+
+impl GoalEdit {
+    pub fn is_empty(&self) -> bool {
+        self.title.is_none()
+            && self.description.is_none()
+            && self.acceptance.is_none()
+            && self.constraints.is_none()
+            && self.doc.is_none()
+    }
+
+    /// The goal as it would be after this edit.
+    pub fn apply(&self, goal: &Goal) -> Result<Goal> {
+        let mut next = goal.clone();
+        if let Some(title) = &self.title {
+            ensure!(!title.trim().is_empty(), "goal title must not be blank");
+            next.title = title.clone();
+        }
+        if let Some(description) = &self.description {
+            next.description = description.clone();
+        }
+        if let Some(acceptance) = &self.acceptance {
+            next.acceptance = acceptance.clone();
+        }
+        if let Some(constraints) = &self.constraints {
+            next.constraints = constraints.clone();
+        }
+        if let Some(doc) = &self.doc {
+            next.doc = Some(doc.clone()).filter(|d| !d.trim().is_empty());
+        }
+        Ok(next)
+    }
+}
+
+/// Number of a goal's tasks in each status; progress is derived from these.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskStatusCounts {
+    pub total: usize,
+    pub draft: usize,
+    pub ready: usize,
+    pub in_progress: usize,
+    pub completed: usize,
+    pub canceled: usize,
+}
+
+impl TaskStatusCounts {
+    pub fn count(&mut self, status: TaskStatus, n: usize) {
+        self.total += n;
+        *match status {
+            TaskStatus::Draft => &mut self.draft,
+            TaskStatus::Ready => &mut self.ready,
+            TaskStatus::InProgress => &mut self.in_progress,
+            TaskStatus::Completed => &mut self.completed,
+            TaskStatus::Canceled => &mut self.canceled,
+        } += n;
+    }
+}
+
+/// One row of `goal list`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GoalSummary {
+    pub id: i64,
+    pub title: String,
+    pub closed: bool,
+    pub verdict: Option<GoalVerdict>,
+    pub tasks: TaskStatusCounts,
+}
+
+/// A task as `goal show` lists it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GoalTask {
+    pub id: i64,
+    pub title: String,
+    pub status: TaskStatus,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GoalDetail {
+    pub goal: Goal,
+    pub closed: bool,
+    pub tasks: Vec<GoalTask>,
+    pub events: Vec<RunEvent>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -180,7 +349,9 @@ pub struct Predecessor {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunEvent {
     pub id: i64,
-    pub task_id: i64,
+    /// Absent only for goal-level events (`goal_created`, `goal_updated`, `goal_closed`).
+    pub task_id: Option<i64>,
+    pub goal_id: Option<i64>,
     pub run_id: Option<String>,
     pub kind: String,
     pub payload: serde_json::Value,
@@ -274,6 +445,11 @@ pub struct Receipt {
     pub subagent_review: ReceiptCheck,
     #[serde(default)]
     pub summary: String,
+    /// Follow-up tasks the agent proposes, as `{"title", "description"}`
+    /// objects. Only its shape (an array) is checked; the supervisor reads it
+    /// from `show` and decides what to register.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub follow_ups: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -318,6 +494,10 @@ impl Receipt {
             );
         }
         validate_commit(&self.commit).context("receipt commit")?;
+        ensure!(
+            self.follow_ups.as_ref().is_none_or(|f| f.is_array()),
+            "receipt follow_ups must be an array"
+        );
         Ok(())
     }
 }

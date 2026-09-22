@@ -15,7 +15,7 @@ related:
 
 # NNN: 短いタスク名
 
-## Goal
+## Scope
 
 何を達成したら閉じるか。1〜3行。`cmux-taskq add`の`--description`と`--acceptance`に写せるよう、完了条件は「〜できる」「〜がテストで確認できる」の形で書く。
 

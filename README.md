@@ -42,12 +42,17 @@ Commands return JSON on stdout. Runtime errors return JSON on stderr with a nonz
 | --- | --- |
 | `locate` | Show the queue this directory resolves to: `db`, `queue_dir`, `runs_dir`, `source` (`repository` or `db_flag`), `git_common_dir`, `db_exists` |
 | `init` | Create or migrate the queue and bind it to this repository; preserves existing tasks |
-| `add TITLE [--description TEXT] [--acceptance TEXT] [--verify COMMAND] [--depends-on ID]` | Register a draft; `--verify` and `--depends-on` can be repeated |
-| `list` / `show ID` | Inspect tasks; `show` includes dependencies, runs and events |
+| `add TITLE [--description TEXT] [--acceptance TEXT] [--verify COMMAND] [--depends-on ID] [--goal ID] [--context TEXT]` | Register a draft; `--verify` and `--depends-on` can be repeated. `--goal` joins an open goal, `--context` records why the task exists and what to read first |
+| `list` / `show ID` | Inspect tasks; `show` includes dependencies, runs and events, and the task's `goal_id` and `context` |
 | `ready ID` / `draft ID` | Move between draft and ready; also allowed from `in_progress` once every run has failed or been interrupted |
 | `cancel ID` | Cancel a draft, ready, or retryable in-progress task; does not satisfy its dependents |
 | `dependency add TASK PREDECESSOR` / `dependency remove TASK PREDECESSOR` | Change prerequisites of a draft or ready task |
 | `candidates` | List dependency-ready tasks in registration order without reserving them |
+| `goal add TITLE [--description TEXT] [--acceptance TEXT] [--constraints TEXT] [--doc PATH]` | Register a goal: the higher-level problem a group of tasks solves. A goal has no state machine and no verification commands |
+| `goal list` / `goal show ID` | `list` gives each goal's `closed`, `verdict` and task counts by status; `show` adds the goal's tasks (id, title, status) and its events |
+| `goal edit ID [--title TEXT] [--description TEXT] [--acceptance TEXT] [--constraints TEXT] [--doc PATH]` | Replace fields (an empty `--doc` clears it); the old and new goal go into a `goal_updated` event. Runs already started keep their prompt snapshot |
+| `goal close ID --verdict achieved\|abandoned` | Record the verdict once. `achieved` is refused while a task is neither completed nor canceled; `abandoned` while a task is in progress. A closed goal accepts no more tasks |
+| `set-goal TASK GOAL` / `set-goal TASK --none` | Move a draft or ready task into an open goal, or out of its goal (same rule as dependency changes) |
 | `supervise [--parallel N] [--once] [--repo PATH] [--cmux EXE] [--claude EXE]` | Resident loop: claim dependency-ready tasks up to `N` (default 4), run each in its own cmux workspace, request exit once its receipt is in and Claude is idle, validate the receipt, close the workspace on success, and keep polling for new candidates (including tasks unblocked by `integrate`). `--once` exits when nothing is active or claimable. The checkout is the working directory unless `--repo` says otherwise |
 | `integrate ID` / `integrate --next` `[--repo PATH]` | Land a validated run on `main`: rebase its worktree onto the current `main`, re-validate, squash into one commit with `Taskq-Task` / `Taskq-Run` trailers, mark the task `completed`, remove the worktree. `--next` takes the oldest awaiting run; `ID` also resumes a `needs_session` run. Lands in the working directory's repository unless `--repo` says otherwise |
 | `status` | List every registered supervisor (PID, liveness, heartbeat age, `parallel`, the runs it holds), any other lease holder such as an `integrate` process, and the unfinished runs with their leases |
