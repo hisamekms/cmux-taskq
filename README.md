@@ -191,3 +191,7 @@ The tests use temporary databases and repositories, point `XDG_DATA_HOME` at tem
 - [Task journals](docs/journal/README.md)
 - [Architecture decisions](docs/adr/README.md)
 - [Agent instructions](AGENTS.md)
+
+## License
+
+cmux-taskq is released under the [MIT License](LICENSE); see that file for the full text.

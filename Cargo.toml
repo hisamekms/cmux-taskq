@@ -8,6 +8,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.93"
 description = "A dependency-aware task queue for cmux and isolated Git worktrees"
+license = "MIT"
 publish = false
 
 [dependencies]
