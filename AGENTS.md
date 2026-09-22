@@ -7,14 +7,12 @@ CLI の使い方（登録・起動・監視・レビューと着地・復旧）�
 ## セッション開始時に読む
 
 1. `cmux-taskq list` と、担当タスクの `cmux-taskq show ID`。タスクの一覧・状態・依存・run 履歴はキューだけが持つ
-2. タスクにジャーナル（`docs/journal/`、frontmatter の `queue_task` が一致するもの）があればその Log。前のセッションの状態と次の一手はここにある
-3. [docs/plans/current.md](docs/plans/current.md) の現在のステップと完了条件
-4. 触る範囲の `docs/design/*.md`
+2. [docs/plans/current.md](docs/plans/current.md) の現在のステップと完了条件
+3. 触る範囲の `docs/design/*.md`
 
 ## 作業中
 
-- タスクは `cmux-taskq add` で登録し、`ready` にしてから supervisor に流す。ジャーナルは人が関わったセッションの経過と判断を残す場所で、エージェントが完走するタスクには作らなくてよい。作るときは `docs/journal/000-template.md` から次の連番で作り、登録後に返った ID を `queue_task` に書く
-- ジャーナルのある作業では Log に追記する。試して駄目だったこと、一時的な path・workspace 番号・run ID・制限の復活時刻、次にやろうとしていたことを書く。中断されても次のセッションが Log だけで再開できる状態を保つ
+- タスクは `cmux-taskq add` で登録し、`ready` にしてから supervisor に流す。経過と次の一手はキュー（`show ID` の run 履歴と receipt）が持つ
 - Git worktree と cmux workspace のスモークは使い捨て repository で行い、この repository の queue DB や実行中の runtime バイナリ（`~/.local/bin/cmux-taskq`）を作業成果で置き換えない。バイナリの更新は maintainer がユーザーに報告してから行う
 
 ## 変更後に必ず通す
@@ -34,6 +32,7 @@ cargo llvm-cov --locked --fail-under-lines 80
 
 ## 文書のルール
 
+- 人の判断は ADR・Goal の記述・`Task.context`・receipt の `summary` に残す（`docs/journal/` は凍結済みで、新しいジャーナルは作らない）
 - 決定は `docs/adr/` に追加する。既存 ADR は書き換えない
 - 実装を変えたら `docs/design/` の該当文書と `updated` / `last_verified` を更新する
 - ステップの状態が変わったら `docs/plans/current.md` を更新する
@@ -42,8 +41,6 @@ cargo llvm-cov --locked --fail-under-lines 80
 ## タスクを閉じるとき
 
 - タスクの完了はキューが持つ。`integrate` が run を `integrated`、タスクを `completed` にする
-- ジャーナルがあれば Result と Promoted を書き、`status: done` にする
-- Log にある事実のうち普遍的なものを design / ADR へ昇格させる
 
 ## コミット
 
@@ -74,5 +71,4 @@ cmux-taskq up --plugin-dir <この repository>/plugins/claude-taskq
 - 変更後は「変更後に必ず通す」のコマンドとタスクの verify コマンドを worktree で実行する。e2e と subagent review は該当するときに実行し、しないときは理由を receipt に書く
 - コミットしてから receipt を書く。receipt の commit は run branch の clean head で、base commit の上に乗っている
 - 判断が要るときは terminal に質問を書いて待つ。maintainer が `read-screen` で拾い、同じ terminal に返答する
-- タスクにジャーナルがある（prompt にパスがある）ときだけそのジャーナルを更新する。Log に追記し、閉じるなら Result と Promoted を書いて `done` にする。他のタスクのジャーナルは触らない
 - receipt を書いたら結果を短く報告して止まる。`/exit` は自分で打たない。supervisor が idle を見て送る
