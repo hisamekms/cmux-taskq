@@ -30,7 +30,6 @@ tags:
 
 ## Open
 
-1. [005 receipt validation](005-receipt-validation.md)
 2. [006 workspace close](006-workspace-close.md) — after 005
 3. [007 session exit request](007-session-exit-request.md) — after 005
 4. [008 integration confirm](008-integration-confirm.md) — after 005
