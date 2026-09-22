@@ -76,14 +76,21 @@ fn reads_do_not_create_a_queue_and_unknown_tasks_fail() {
     assert!(!invoke(&db, &["list"]).status.success());
     assert!(!db.exists());
     ok(&db, &["init"]);
-    assert_eq!(
-        ok(&db, &["doctor"]),
-        serde_json::json!({"checked_at": ok(&db, &["doctor"])["checked_at"], "supervisors": [], "runs": []})
-    );
-    assert_eq!(
-        ok(&db, &["status"]),
-        serde_json::json!({"checked_at": ok(&db, &["status"])["checked_at"], "supervisors": [], "runs": []})
-    );
+    // `doctor` and `status` stamp `checked_at` with the current unix second,
+    // so the timestamp is checked for its type and dropped before comparing.
+    for command in ["doctor", "status"] {
+        let mut report = ok(&db, &[command]);
+        let checked_at = report.as_object_mut().unwrap().remove("checked_at");
+        assert!(
+            checked_at.is_some_and(|value| value.is_u64()),
+            "{command} reports checked_at as unix seconds"
+        );
+        assert_eq!(
+            report,
+            serde_json::json!({"supervisors": [], "runs": []}),
+            "{command}"
+        );
+    }
     assert!(!invoke(&db, &["recover", "missing-run"]).status.success());
     assert!(!invoke(&db, &["show", "1"]).status.success());
     assert!(!invoke(&db, &["add", "  "]).status.success());
