@@ -17,7 +17,7 @@ tags:
 ## Rules
 
 - 決まったタスクは次の連番で`status: planned`のジャーナルをGoalだけ書いて作り、下のOpenに追加する。着手したら`open`にする。
-- `status: draft`のジャーナルはSVが起動しない。ドッグフーディング開始後にcmux-taskqで流すタスクはdraftで置き、Openの先行タスクがすべてdoneになった時点で`cmux-taskq add`に登録して`planned`相当の扱いに移す。
+- `status: draft`のジャーナルはSVが起動しない。ドッグフーディング開始後にcmux-taskqで流すタスクはdraftで置き、Openに`planned` / `open`が残らなくなった時点でSVがユーザーの指示を待たずに[012のProcedure](012-dogfood-independent-task.md)に従って`cmux-taskq add`に登録する。
 - 作業中はLogに追記する。一時的なpath、workspace番号、制限の復活時刻など、他の文書に書くほどでもない備忘はここに書く。
 - 閉じるときにResultとPromotedを書き、`status: done`（または`abandoned`）にしてOpenから外す。
 - Openの並びが実行順。依存は末尾に一言で書く。ready/draftのような状態は持たない。状態機械はキューだけが持つ。

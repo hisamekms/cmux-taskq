@@ -18,6 +18,8 @@ related:
 
 [plans/current.md](../plans/current.md) ステップ9。A → Bの依存taskと、依存のないCを登録し、依存解放が着地に紐づくこと、依存のないtask同士は並列に走ることを確認する。
 
+A・B・Cの実taskはSVが[012のProcedure](012-dogfood-independent-task.md)に従って選び、登録内容をこのジャーナルのLogに書く。
+
 完了条件: AとCが同時に走り、Aの実行成功（`awaiting_integration`）だけではBが始まらず、Aの着地後にBがAの変更を含むmainから作られたworktreeで始まる。
 
 ## Log
