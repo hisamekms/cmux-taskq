@@ -817,10 +817,18 @@ fn failed_agent_retains_worktree_and_does_not_complete_task() {
     // workspace stays open for inspection.
     assert_eq!(outcome["runs"][0]["result_commit"], Value::Null);
     assert_eq!(outcome["runs"][0]["workspace_closed_at"], Value::Null);
+    assert_eq!(
+        outcome["runs"][0]["last_error"],
+        "session exited with code 7"
+    );
     assert!(backend.closed().is_empty());
     let mut queue = SqliteQueue::open(&db).unwrap();
     let detail = queue.show(1).unwrap();
     assert_eq!(detail.task.status, TaskStatus::InProgress);
+    assert_eq!(
+        detail.runs[0].last_error.as_deref(),
+        Some("session exited with code 7")
+    );
     assert!(Path::new(detail.runs[0].worktree_path.as_ref().unwrap()).exists());
     assert!(queue.run_leases().unwrap().is_empty());
     assert!(queue.candidates().unwrap().is_empty());

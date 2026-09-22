@@ -438,8 +438,9 @@ impl SqliteQueue {
             [id], |r| r.get(0)
         ).context("wrapper has not reported session exit")?;
         let status = if code == 0 { "validating" } else { "failed" };
-        ensure!(tx.execute("UPDATE task_runs SET status=?3 WHERE id=?1 AND supervisor_token=?2 AND status IN ('starting','running')",
-            params![id,token,status])? == 1, "run is not owned by this supervisor");
+        let error = (code != 0).then(|| format!("session exited with code {code}"));
+        ensure!(tx.execute("UPDATE task_runs SET status=?3,last_error=COALESCE(?4,last_error) WHERE id=?1 AND supervisor_token=?2 AND status IN ('starting','running')",
+            params![id,token,status,error])? == 1, "run is not owned by this supervisor");
         run_event(
             &tx,
             id,
