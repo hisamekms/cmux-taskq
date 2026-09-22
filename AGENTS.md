@@ -10,7 +10,7 @@ cmux-taskq は cmux と Git worktree で依存関係付きの開発タスクを�
 
 ## 作業中
 
-- タスクを始めるときは README の Open にある `planned` のジャーナルを `open` にする。なければ `docs/journal/000-template.md` から次の連番で作り、Open に追加する
+- タスクを始めるときは README の Open にある `planned` のジャーナルを `open` にする。`draft` のジャーナルは起動しない（ドッグフーディング開始後に cmux-taskq で流す）。なければ `docs/journal/000-template.md` から次の連番で作り、Open に追加する
 - ジャーナルの Log に追記する。試して駄目だったこと、一時的な path・workspace 番号・制限の復活時刻、次にやろうとしていたことを書く。中断されても次のセッションが Log だけで再開できる状態を保つ
 - Git worktree と cmux workspace のスモークは使い捨て repository で行い、この repository の queue DB や実行中の runtime バイナリを作業成果で置き換えない
 
@@ -52,7 +52,8 @@ cargo llvm-cov --locked --fail-under-lines 80
 
 ### SV
 
-- ジャーナルの Open 一覧から依存が満たされたタスクを選び、同時に最大4件まで起動する
+- ジャーナルの Open 一覧から依存が満たされた `planned` のタスクを選び、同時に最大4件まで起動する。`draft` は起動しない
+- Open に `planned` / `open` が残らなくなったら、ユーザーの指示を待たずに [journal 012](docs/journal/012-dogfood-independent-task.md) の Procedure に従ってドッグフーディングへ移行する。移行の開始と完了はユーザーに報告するが、承認は待たない。移行後は 012 の Procedure がこの節より優先し、019 が完了した時点でこの節は書き換わる
 - タスクごとに main から `git worktree add .worktrees/<NNN>-<slug> -b journal/<NNN>-<slug>` で worktree を作る。`.worktrees/` は gitignore 済み
 - `cmux workspace create --name "TASKQ-<NNN> <slug>" --cwd <worktree> --command "claude --model opus"` で workspace を作り、worker は常に Opus で起動する。`cmux send` / `cmux send-key` で指示を送る。指示にはジャーナルのパス、完了マーカー、SV への質問方法を含める
 - 数分おきに `cmux read-screen --workspace <ws> --lines N` で画面を読む。権限確認は worktree 内の編集・cargo・git など安全なものは SV が応答し、それ以外とユーザーの判断が要るものはユーザーに確認する
