@@ -2,7 +2,7 @@
 id: journal-013
 type: journal
 title: Dogfooding: dependent tasks A then B
-status: open
+status: done
 created: 2026-09-22
 updated: 2026-09-22
 plan_step: 9
@@ -38,6 +38,14 @@ A・B・Cの実taskはSVが[012のProcedure](012-dogfood-independent-task.md)に
 - C が先に `awaiting_integration`（検証: `cargo test --test plugin`、grep）。差分はskillのみ、subagent review済み。`integrate 5` → `7e184d8`、push。receiptの注記: READMEとsupervisor-lifecycle.mdの「`doctor` が失敗runのworkspace IDを出す」は誤り（doctorは未完了runのみ）→ 後続task候補
 - A は実行中。Aの着地後にBがAの変更を含むmainから始まることを確認する
 
+### 2026-09-22 15:40 claude (SV)
+
+- A（run `a5076f4a`）が `awaiting_integration`。runtime変更なので着地前にrun worktreeで llvm-cov（87.11%）と e2e 2件を実行。`integrate 3` → `e862843`、push
+- 着地の次のpollでB（T4）がclaimされ、run `033dea4b` の base commit = `e862843`（Aの着地commit）。Aが `awaiting_integration` の間はBが候補に出なかった
+- B が `awaiting_integration` → `integrate 4` → `dfaac7b`、push。mainは seed から 1 task = 1 commit の直線（88012c4, fedff3d, 7e184d8, e862843, dfaac7b とSVのdocsコミット）
+
 ## Result
+
+AとCが同時に走り（並列claim）、Aの実行成功だけではBが始まらず、Aの着地後にBがAの変更を含むmain（`e862843`）から作られたworktreeで始まった。3件とも人の介入なしにreceipt→検証→closeまで進み、`integrate` で着地した。DBの手修正なし。
 
 ## Promoted
