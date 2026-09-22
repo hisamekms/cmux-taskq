@@ -7,6 +7,7 @@ use std::{
         Arc, OnceLock,
         atomic::{AtomicBool, Ordering},
     },
+    time::Duration,
 };
 
 use anyhow::{Context, Result};
@@ -109,6 +110,37 @@ enum Command {
         /// Claude Code executable; a bare name is resolved on PATH.
         #[arg(long, default_value = "claude")]
         claude: PathBuf,
+        /// Write one supervisor-<started_at>-<pid>.log per start into this
+        /// directory (created if missing) in addition to stderr.
+        #[arg(long)]
+        log_dir: Option<PathBuf>,
+    },
+    /// Start the queue's runtime: a launchd-resident supervisor and the maintainer's cmux workspace. Idempotent.
+    Up {
+        /// Maximum number of runs the supervisor executes at once.
+        #[arg(long, default_value_t = 4, value_parser = clap::value_parser!(u16).range(1..))]
+        parallel: u16,
+        /// Claude Code plugin directory the maintainer session loads (`claude --plugin-dir`).
+        #[arg(long)]
+        plugin_dir: Option<PathBuf>,
+        /// Checkout of the repository; defaults to the working directory.
+        #[arg(long)]
+        repo: Option<PathBuf>,
+        /// cmux executable; a bare name is resolved on PATH.
+        #[arg(long, default_value = "cmux")]
+        cmux: PathBuf,
+        /// Claude Code executable; a bare name is resolved on PATH.
+        #[arg(long, default_value = "claude")]
+        claude: PathBuf,
+    },
+    /// Stop the queue's supervisor: unload its launchd agent so it drains and is not restarted. Leaves the maintainer workspace open.
+    Down {
+        /// Wait until the supervisor's registration is gone or its process exited.
+        #[arg(long)]
+        wait: bool,
+        /// Kill the supervisor after the unload and drop its registration.
+        #[arg(long, conflicts_with = "wait")]
+        force: bool,
     },
     /// Land a validated run on main: rebase, re-validate, squash into one commit, complete the task.
     Integrate {
@@ -316,6 +348,7 @@ fn execute(cli: Cli) -> Result<Value> {
             once,
             cmux,
             claude,
+            log_dir,
         } => {
             use cmux_taskq::infrastructure::adapters::{Cmux, executable};
             use cmux_taskq::runtime::SuperviseOptions;
@@ -323,6 +356,7 @@ fn execute(cli: Cli) -> Result<Value> {
                 parallel: usize::from(parallel),
                 once,
                 stop: install_stop_signal()?,
+                log_dir,
             };
             cmux_taskq::runtime::supervise(
                 &db,
@@ -333,6 +367,58 @@ fn execute(cli: Cli) -> Result<Value> {
                 &executable(&claude)?,
                 &env::current_exe()?,
                 &options,
+            )?
+        }
+        Command::Up {
+            parallel,
+            plugin_dir,
+            repo,
+            cmux,
+            claude,
+        } => {
+            use cmux_taskq::infrastructure::{
+                adapters::{Cmux, SystemProcesses, executable},
+                launchd::Launchctl,
+            };
+            use cmux_taskq::lifecycle::{QUEUE_ENV, ROLE_ENV, UpEnvironment, UpOptions};
+            let environment = UpEnvironment {
+                role: env::var(ROLE_ENV).ok(),
+                queue: env::var_os(QUEUE_ENV).map(PathBuf::from),
+                path: env::var("PATH").context("PATH is unset")?,
+                current_exe: env::current_exe()?,
+            };
+            let options = UpOptions {
+                parallel,
+                plugin_dir,
+                cmux: executable(&cmux)?,
+                claude: executable(&claude)?,
+                startup_timeout: Duration::from_secs(30),
+                poll: Duration::from_millis(500),
+            };
+            cmux_taskq::lifecycle::up(
+                &location,
+                &checkout(repo),
+                &Cmux {
+                    executable: options.cmux.clone(),
+                },
+                &Launchctl { uid: current_uid() },
+                &SystemProcesses,
+                &environment,
+                &options,
+            )?
+        }
+        Command::Down { wait, force } => {
+            use cmux_taskq::infrastructure::{adapters::SystemProcesses, launchd::Launchctl};
+            use cmux_taskq::lifecycle::DownOptions;
+            cmux_taskq::lifecycle::down(
+                &location,
+                &Launchctl { uid: current_uid() },
+                &SystemProcesses,
+                &DownOptions {
+                    wait,
+                    force,
+                    poll: Duration::from_secs(2),
+                },
             )?
         }
         Command::Integrate { id, next, repo } => {
@@ -349,6 +435,11 @@ fn execute(cli: Cli) -> Result<Value> {
             cmux_taskq::runtime::session(&db, &run, &lease, &claude)?
         }
     })
+}
+
+fn current_uid() -> u32 {
+    // SAFETY: getuid has no preconditions and cannot fail.
+    unsafe { libc::getuid() }
 }
 
 static STOP: OnceLock<Arc<AtomicBool>> = OnceLock::new();

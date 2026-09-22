@@ -1,5 +1,5 @@
 use crate::{
-    application::{AgentProvider, WorkspaceBackend},
+    application::{AgentProvider, ProcessControl, WorkspaceBackend},
     domain::TaskRun,
 };
 use anyhow::{Context, Result, bail, ensure};
@@ -56,6 +56,34 @@ pub fn process_alive(pid: u32) -> bool {
         return true;
     }
     std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+}
+
+/// Signals through `libc::kill`, the way `process_alive` checks liveness.
+pub struct SystemProcesses;
+
+impl ProcessControl for SystemProcesses {
+    fn alive(&self, pid: u32) -> bool {
+        process_alive(pid)
+    }
+
+    fn terminate(&self, pid: u32) -> Result<()> {
+        signal(pid, libc::SIGTERM)
+    }
+
+    fn kill(&self, pid: u32) -> Result<()> {
+        signal(pid, libc::SIGKILL)
+    }
+}
+
+fn signal(pid: u32, signal: libc::c_int) -> Result<()> {
+    let pid = libc::pid_t::try_from(pid).context("pid does not fit a pid_t")?;
+    // SAFETY: kill(2) with a valid pid and signal has no memory effects here.
+    ensure!(
+        unsafe { libc::kill(pid, signal) } == 0,
+        "signal {signal} to pid {pid}: {}",
+        std::io::Error::last_os_error()
+    );
+    Ok(())
 }
 
 pub fn output(command: &mut Command) -> Result<String> {
@@ -477,16 +505,10 @@ impl WorkspaceBackend for Cmux {
     }
 
     fn create(&self, run: &TaskRun, command: &str) -> Result<String> {
-        let raw = output(
-            Command::new(&self.executable)
-                .arg("new-workspace")
-                .arg("--name")
-                .arg(format!("taskq {} {}", run.task_id, run.id))
-                .arg("--cwd")
-                .arg(run.worktree_path.as_ref().context("missing worktree")?)
-                .arg("--command")
-                .arg(command)
-                .args(["--focus", "false"]),
+        let raw = self.create_workspace(
+            &run_workspace_name(run)?,
+            Path::new(run.worktree_path.as_ref().context("missing worktree")?),
+            command,
         )?;
         // Persist the returned handle before resolving its stable UUID.
         fs::write(
@@ -494,20 +516,7 @@ impl WorkspaceBackend for Cmux {
                 .join("workspace-create.txt"),
             &raw,
         )?;
-        let handle = workspace_handle(&raw)?;
-        let identity = output(
-            Command::new(&self.executable)
-                .args(["--json", "--id-format", "uuids", "identify", "--workspace"])
-                .arg(handle),
-        )?;
-        let identity: Value =
-            serde_json::from_str(&identity).context("decode cmux workspace identity")?;
-        let id = identity
-            .pointer("/caller/workspace_id")
-            .and_then(Value::as_str)
-            .context("cmux did not return the requested workspace UUID")?;
-        uuid::Uuid::parse_str(id).context("invalid cmux workspace UUID")?;
-        Ok(id.into())
+        self.identify(workspace_handle(&raw)?)
     }
 
     fn capture(&self, workspace_id: &str) -> Result<String> {
@@ -531,7 +540,7 @@ impl WorkspaceBackend for Cmux {
         Ok(())
     }
 
-    /// Type `/exit` at Claude's prompt exactly as an operator would.
+    /// Type `/exit` at Claude's prompt exactly as the maintainer would.
     fn send_exit(&self, workspace_id: &str) -> Result<()> {
         output(Command::new(&self.executable).args([
             "send",
@@ -549,6 +558,91 @@ impl WorkspaceBackend for Cmux {
         ]))?;
         Ok(())
     }
+
+    fn find_named(&self, name: &str) -> Result<Option<String>> {
+        let listing = output(Command::new(&self.executable).args([
+            "--json",
+            "--id-format",
+            "uuids",
+            "workspace",
+            "list",
+        ]))?;
+        let listing: Value =
+            serde_json::from_str(&listing).context("decode cmux workspace list")?;
+        Ok(workspace_named(&listing, name).map(str::to_owned))
+    }
+
+    fn create_named(&self, name: &str, cwd: &Path, command: &str) -> Result<String> {
+        let raw = self.create_workspace(name, cwd, command)?;
+        self.identify(workspace_handle(&raw)?)
+    }
+}
+
+impl Cmux {
+    /// `cmux workspace create`; the raw reply carries the `OK workspace:N` handle.
+    fn create_workspace(&self, name: &str, cwd: &Path, command: &str) -> Result<String> {
+        output(
+            Command::new(&self.executable)
+                .args(["workspace", "create", "--name", name, "--cwd"])
+                .arg(cwd)
+                .args(["--command", command, "--focus", "false"]),
+        )
+    }
+
+    /// Resolve a numeric handle to the workspace's stable UUID.
+    fn identify(&self, handle: &str) -> Result<String> {
+        let identity = output(
+            Command::new(&self.executable)
+                .args(["--json", "--id-format", "uuids", "identify", "--workspace"])
+                .arg(handle),
+        )?;
+        let identity: Value =
+            serde_json::from_str(&identity).context("decode cmux workspace identity")?;
+        let id = identity
+            .pointer("/caller/workspace_id")
+            .and_then(Value::as_str)
+            .context("cmux did not return the requested workspace UUID")?;
+        uuid::Uuid::parse_str(id).context("invalid cmux workspace UUID")?;
+        Ok(id.into())
+    }
+}
+
+/// The ID of the workspace titled exactly `name` in a `cmux --json workspace
+/// list` reply, if any. Titles are what `--name` set, so a match is a
+/// workspace this runtime opened (or a human named the same way on purpose).
+pub fn workspace_named<'a>(listing: &'a Value, name: &str) -> Option<&'a str> {
+    listing
+        .get("workspaces")?
+        .as_array()?
+        .iter()
+        .find(|workspace| workspace.get("title").and_then(Value::as_str) == Some(name))
+        .and_then(|workspace| workspace.get("id"))
+        .and_then(Value::as_str)
+}
+
+/// Workspaces are named per repository because one cmux serves several
+/// queues: `taskq <repo> <task-id> <run-id>` for a worker, where `<repo>`
+/// is the basename of the repository root the run was planned from.
+pub fn run_workspace_name(run: &TaskRun) -> Result<String> {
+    let repo = Path::new(run.repo_path.as_ref().context("missing repository path")?);
+    Ok(format!(
+        "taskq {} {} {}",
+        repository_name(repo),
+        run.task_id,
+        run.id
+    ))
+}
+
+/// `taskq <repo> maintainer`: the one resident Claude session of a repository's queue.
+pub fn maintainer_workspace_name(repo_root: &Path) -> String {
+    format!("taskq {} maintainer", repository_name(repo_root))
+}
+
+fn repository_name(root: &Path) -> String {
+    root.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| root.to_string_lossy().into_owned())
 }
 
 pub fn workspace_handle(raw: &str) -> Result<&str> {
@@ -621,4 +715,80 @@ pub fn stop_hook_settings(idle_marker: &Path) -> Result<String> {
             }]
         }
     }))?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::{Provider, RunStatus};
+
+    fn run(repo_path: Option<&str>) -> TaskRun {
+        TaskRun {
+            id: "0d8e3f1a-7c1b-4e35-9a11-3f6d2c9b8e47".into(),
+            task_id: 15,
+            status: RunStatus::Claimed,
+            requested_provider: Provider::Claude,
+            actual_provider: Provider::Claude,
+            base_commit: "a".repeat(40),
+            branch: None,
+            worktree_path: None,
+            workspace_id: None,
+            receipt_path: None,
+            log_path: None,
+            result_commit: None,
+            repo_path: repo_path.map(str::to_owned),
+            run_dir: None,
+            last_error: None,
+            workspace_closed_at: None,
+            created_at: "2026-09-22 00:00:00".into(),
+        }
+    }
+
+    /// One cmux serves several repositories, so every workspace name
+    /// carries the repository (the basename of its root).
+    #[test]
+    fn workspace_names_carry_the_repository_the_task_and_the_run() {
+        assert_eq!(
+            run_workspace_name(&run(Some("/home/u/ghq/cmux-taskq"))).unwrap(),
+            "taskq cmux-taskq 15 0d8e3f1a-7c1b-4e35-9a11-3f6d2c9b8e47"
+        );
+        assert_eq!(
+            run_workspace_name(&run(Some("/tmp/my repo/"))).unwrap(),
+            "taskq my repo 15 0d8e3f1a-7c1b-4e35-9a11-3f6d2c9b8e47"
+        );
+        assert!(
+            run_workspace_name(&run(None))
+                .unwrap_err()
+                .to_string()
+                .contains("missing repository path")
+        );
+        assert_eq!(
+            maintainer_workspace_name(Path::new("/home/u/ghq/cmux-taskq")),
+            "taskq cmux-taskq maintainer"
+        );
+        // A root with no basename falls back to the path itself.
+        assert_eq!(
+            maintainer_workspace_name(Path::new("/")),
+            "taskq / maintainer"
+        );
+    }
+
+    #[test]
+    fn workspace_named_matches_the_exact_title_only() {
+        let listing = serde_json::json!({
+            "window_id": "W",
+            "workspaces": [
+                {"id": "AAAA", "title": "taskq repo maintainer extra"},
+                {"id": "BBBB", "title": "taskq repo maintainer"},
+                {"id": "CCCC", "title": "taskq repo maintainer"},
+                {"id": "DDDD"}
+            ]
+        });
+        assert_eq!(
+            workspace_named(&listing, "taskq repo maintainer"),
+            Some("BBBB")
+        );
+        assert_eq!(workspace_named(&listing, "taskq other maintainer"), None);
+        assert_eq!(workspace_named(&serde_json::json!({}), "x"), None);
+    }
 }

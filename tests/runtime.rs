@@ -272,6 +272,13 @@ impl WorkspaceBackend for TestWorkspace {
     fn exit_timeout(&self) -> Duration {
         self.exit_timeout
     }
+    // The maintainer workspace is `up`'s business; the supervisor never asks.
+    fn find_named(&self, _: &str) -> Result<Option<String>> {
+        bail!("not used by the supervisor")
+    }
+    fn create_named(&self, _: &str, _: &Path, _: &str) -> Result<String> {
+        bail!("not used by the supervisor")
+    }
 }
 
 /// /bin/sh --version is not portable; a tiny standalone provider preflight stub.
@@ -330,7 +337,7 @@ fn run_agent_with(
     let mut backend = TestWorkspace::new(&db, false, script);
     backend.close_fail = close_fail;
     let outcome = supervise(&db, &repo, &backend).unwrap();
-    // These scripts exit on their own, like an operator's /exit; nothing was requested.
+    // These scripts exit on their own, like a maintainer's /exit; nothing was requested.
     assert_eq!(backend.exits_sent.load(Ordering::SeqCst), 0);
     backend.join();
     assert_eq!(outcome["outcome"], "finished");
@@ -698,7 +705,7 @@ fn idle_marker_after_receipt_triggers_exit_request_and_run_finishes() {
 #[test]
 fn missing_or_stale_idle_marker_does_not_request_exit() {
     // No marker at all, then a marker older than the receipt (an earlier turn).
-    // Both sessions end by themselves, as with an operator's /exit.
+    // Both sessions end by themselves, as with a maintainer's /exit.
     for script in [
         "commit work; receipt \"$(git rev-parse HEAD)\"; sleep 3",
         "idle; sleep 1.1; commit work; receipt \"$(git rev-parse HEAD)\"; sleep 3",
@@ -880,7 +887,7 @@ fn failed_agent_retains_worktree_and_does_not_complete_task() {
     assert!(Path::new(detail.runs[0].worktree_path.as_ref().unwrap()).exists());
     assert!(queue.run_leases().unwrap().is_empty());
     assert!(queue.candidates().unwrap().is_empty());
-    // A failed run does not free the task automatically, but the operator may give up on it.
+    // A failed run does not free the task automatically, but the maintainer may give up on it.
     assert_eq!(runtime::doctor(&db).unwrap()["runs"], json!([]));
     queue.transition(1, TaskAction::Cancel).unwrap();
     assert_eq!(queue.show(1).unwrap().task.status, TaskStatus::Canceled);
@@ -1247,8 +1254,95 @@ fn resident_supervisor_without_runs_is_listed_until_it_stops() {
     assert!(queue.show(1).unwrap().runs.is_empty());
 }
 
+/// `--log-dir` adds one file per supervisor start, named by the
+/// registration's `started_at` and the PID, with the startup facts, the
+/// progress messages that also go to stderr, and the final result.
+#[test]
+fn supervise_log_dir_records_each_start_in_its_own_file() {
+    let (dir, repo, db) = fixture();
+    let log_dir = dir.path().join("logs").join("nested");
+    let mut options = SuperviseOptions::new(2, true);
+    options.log_dir = Some(log_dir.clone());
+    let backend = TestWorkspace::new(&db, false, VALID_AGENT);
+    let before = runtime::unix_time();
+    let outcome = supervise_with(&db, &repo, &backend, &options).unwrap();
+    backend.join();
+    assert_eq!(outcome["outcome"], "finished");
+    let pid = std::process::id();
+    let logs = |pid: u32| -> Vec<PathBuf> {
+        let mut logs: Vec<PathBuf> = fs::read_dir(&log_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                let name = path.file_name().unwrap().to_str().unwrap();
+                name.starts_with("supervisor-") && name.ends_with(&format!("-{pid}.log"))
+            })
+            .collect();
+        logs.sort();
+        logs
+    };
+    let first = logs(pid);
+    assert_eq!(first.len(), 1, "{first:?}");
+    let name = first[0].file_name().unwrap().to_str().unwrap();
+    let started_at: i64 = name
+        .strip_prefix("supervisor-")
+        .unwrap()
+        .strip_suffix(&format!("-{pid}.log"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(started_at >= before && started_at <= runtime::unix_time());
+    let text = fs::read_to_string(&first[0]).unwrap();
+    let mut queue = SqliteQueue::open(&db).unwrap();
+    let run = queue.show(1).unwrap().runs.remove(0);
+    let token: String = Connection::open(&db)
+        .unwrap()
+        .query_row(
+            "SELECT supervisor_token FROM task_runs WHERE id=?1",
+            [&run.id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(
+        text.contains(&format!(
+            "] supervisor {token} started: pid {pid}, parallel 2, db {}, repository {}",
+            db.canonicalize().unwrap().display(),
+            repo.canonicalize().unwrap().display()
+        )),
+        "{text}"
+    );
+    assert!(text.contains(&format!(
+        "task 1 running in workspace {WORKSPACE_ID}; run {}",
+        run.id
+    )));
+    assert!(text.contains(&format!("receipt received for {}", run.id)));
+    assert!(text.contains(&format!("run {} is awaiting_integration", run.id)));
+    assert!(text.contains(&format!(
+        "] supervisor {token} exiting: {{\"errors\":[],\"outcome\":\"finished\""
+    )));
+
+    // A second start gets its own file (same second or not, the name differs by token order at worst).
+    thread::sleep(Duration::from_millis(1100));
+    let outcome = supervise_with(&db, &repo, &backend, &options).unwrap();
+    assert_eq!(outcome["outcome"], "finished");
+    assert_eq!(outcome["runs"], json!([]));
+    let second = logs(pid);
+    assert_eq!(second.len(), 2, "{second:?}");
+    let text = fs::read_to_string(second.iter().find(|p| *p != &first[0]).unwrap()).unwrap();
+    assert!(text.contains("started: pid"));
+    assert!(!text.contains("task 1 running"));
+
+    // A log directory that cannot be created is a startup failure that
+    // leaves no registration behind (launchd would retry forever).
+    options.log_dir = Some(dir.path().join("seed-file-as-dir"));
+    fs::write(options.log_dir.as_ref().unwrap(), "not a directory").unwrap();
+    let error = supervise_with(&db, &repo, &backend, &options).unwrap_err();
+    assert!(format!("{error:#}").contains("create"), "{error:#}");
+    assert!(queue.supervisors().unwrap().is_empty());
+}
+
 /// A registration whose process died, or whose heartbeat stopped, is
-/// reported as stale by `status` and `doctor` and left for an operator;
+/// reported as stale by `status` and `doctor` and left for the maintainer;
 /// neither a later supervisor nor `recover` removes it, and an `integrate`
 /// or orphaned lease holder is listed next to it without a registration.
 #[test]
@@ -2302,7 +2396,7 @@ fn failed_receipt_from_a_session_ends_the_run_without_landing() {
     // A failed receipt is not a receipt for a landing: only the first
     // (conflicting) attempt recorded one.
     assert_eq!(integration_receipts(&detail).len(), 1);
-    // Retry or give up is the operator's call, as after any failed run.
+    // Retry or give up is the maintainer's call, as after any failed run.
     queue.transition(2, TaskAction::Cancel).unwrap();
 }
 

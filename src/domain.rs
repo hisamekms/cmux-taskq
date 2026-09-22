@@ -392,8 +392,8 @@ pub struct RunLease {
 
 /// A resident `supervise` process as it registered itself, whether or not it
 /// holds any lease. The row is heartbeated with the leases and deleted on a
-/// graceful exit; a row left by a killed supervisor stays until an operator
-/// deals with it.
+/// graceful exit; a row left by a killed supervisor stays until `up` prunes
+/// it or the maintainer deals with it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SupervisorRegistration {
     pub token: String,

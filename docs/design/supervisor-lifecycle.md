@@ -17,6 +17,7 @@ related:
   - adr-0010
   - design-persistence
   - design-provider-lifecycle
+  - design-plugin-integration
 ---
 
 # Supervisor and workspace lifecycle
@@ -46,11 +47,48 @@ ready task (dependencies completed)
 
 ## Implementation status
 
-ステップ3で`claim`から`running`、セッション終了検知までを、ステップ4の[005](../journal/005-receipt-validation.md)でreceiptの検証と`awaiting_integration`への遷移を、[006](../journal/006-workspace-close.md)で受理後のworkspace終了を、[007](../journal/007-session-exit-request.md)でreceipt受領後の終了要求を、[009](../journal/009-doctor-recover.md)で`doctor`/`recover`を、[008](../journal/008-integration-confirm.md)で統合確認`integrate`と`completed`への遷移を`src/runtime.rs`に実装した。ステップ6の[017](../journal/017-parallel-runs.md)（[ADR-0007](../adr/0007-run-level-leases-parallel-execution.md)）でleaseをrun単位にし、`supervise`を上限付き並列の常駐ループにした。ステップ7の[018](../journal/018-merge-queue.md)（[ADR-0008](../adr/0008-merge-queue-squash-landing.md)）で`integrate`を手動mergeの確認からruntimeによる着地（rebase → 再検証 → squash）に置き換えた。
+ステップ3で`claim`から`running`、セッション終了検知までを、ステップ4の[005](../journal/005-receipt-validation.md)でreceiptの検証と`awaiting_integration`への遷移を、[006](../journal/006-workspace-close.md)で受理後のworkspace終了を、[007](../journal/007-session-exit-request.md)でreceipt受領後の終了要求を、[009](../journal/009-doctor-recover.md)で`doctor`/`recover`を、[008](../journal/008-integration-confirm.md)で統合確認`integrate`と`completed`への遷移を`src/runtime.rs`に実装した。ステップ6の[017](../journal/017-parallel-runs.md)（[ADR-0007](../adr/0007-run-level-leases-parallel-execution.md)）でleaseをrun単位にし、`supervise`を上限付き並列の常駐ループにした。ステップ7の[018](../journal/018-merge-queue.md)（[ADR-0008](../adr/0008-merge-queue-squash-landing.md)）で`integrate`を手動mergeの確認からruntimeによる着地（rebase → 再検証 → squash）に置き換えた。[021](../journal/021-maintainer-up-down.md)で`up` / `down`（`src/lifecycle.rs`）、launchdによる常駐、`supervise --log-dir`、maintainer promptを足した。
+
+## Roles
+
+- **supervisor**: runtimeの`supervise`プロセス。taskをclaimし、runごとにworktreeとworkspaceを作って監視し、receiptを検証する。`up`がlaunchdのLaunchAgentとして常駐させる。
+- **maintainer**: 常駐のClaude Code session（旧称SV / operator）。登録・監視・レビュー・着地を行う。`up`が`taskq <repo> maintainer`のcmux workspaceで、runtimeが生成した初期prompt付きで起動する。CLIの使い方はpluginの`taskq-maintain` skillが持つ。
+- **worker**: run session。runごとのcmux workspace `taskq <repo> <task-id> <run-id>`で動くClaude session。
+
+runtimeの中で人が打つ`/exit`や復旧を指す語はすべてmaintainerに寄せた（`src/`に`operator`は残らない）。
+
+## `up` / `down`
+
+`cmux-taskq up [--parallel N] [--plugin-dir PATH] [--repo PATH] [--cmux EXE] [--claude EXE]`はqueueのruntimeをcold startする1コマンドで、`src/lifecycle.rs`の`up`が行う。冪等で、続けて2回叩けば2回目は全部`reused` / `skipped`になる。外部（launchctl、cmux、PIDの生存とsignal）は`LaunchAgent`、`WorkspaceBackend`、`ProcessControl`のtrait越しに呼び、`tests/lifecycle.rs`はfakeで判定を、`tests/e2e.rs`は実launchdと実cmuxで`up → status → down --wait`を確認する。
+
+1. **preflight**: queueが`init`済み（DBが存在する。`--db`がなければcwdのrepositoryから解決）、repositoryのroot、cmux（`ping`）、Claude（`--version`）。`--plugin-dir`は絶対pathに正規化する。
+2. **stale登録の削除**: `supervisors`表のうちPIDが死んでいる行を`deregister_supervisor`で消し、消したtokenとpidを結果の`pruned_supervisors`に出す。`run_leases`は触らない（そのrunの復旧は`doctor` / `recover`の仕事）。PIDが生きていてheartbeatが30秒より古い登録（hang）は消さず、reuseもしない。
+3. **supervisor**: 生きていてheartbeatが新しい登録があれば`{"outcome":"reused","pid":…}`で、plistにもlaunchctlにも触らない。なければLaunchAgentを書いて起動し、登録が現れるまで（30秒）待って`{"outcome":"started","pid":…}`。
+   - plist: `~/Library/LaunchAgents/com.cmux-taskq.<queue hash>.plist`。`Label`は同名、`ProgramArguments`は`[up自身の絶対path, --db <db>, supervise, --parallel N, --log-dir <queue dir>/logs, --cmux <resolved>, --claude <resolved>]`（cmuxとclaudeは`up`がpreflightした実行ファイルの絶対path。launchdのPATHに頼らないため）、`WorkingDirectory`はrepository root、`EnvironmentVariables.PATH`は`up`を叩いたshellのPATH、`KeepAlive` true、`RunAtLoad` true、`StandardOutPath` / `StandardErrorPath`は`<queue dir>/logs/launchd.log`、`ExitTimeOut` 86400（launchdの既定20秒ではdrainが待てない）。生成は`src/infrastructure/launchd.rs`の`LaunchAgentSpec::xml`。
+   - 起動: `launchctl bootout gui/<uid>/<label>`（未loadなら無視）の後に`launchctl bootstrap gui/<uid> <plist>`。既にbootstrap済みでも定義を差し替えるためbootoutしてからbootstrapし直す。bootoutは即返り、serviceは旧プロセスが終わるまで`launchctl print`に残り、その間のbootstrapはexit 5で失敗する（実機確認）ので、`print`が消えるまで0.5秒ごとに待つ。60秒で消えなければ`launchctl kill SIGKILL`を送り、さらに60秒待って諦める（hangしたsupervisorがlabelを`ExitTimeOut`の間占有しないため）。
+   - 登録が30秒以内に現れなければerrorで止め、agentはそのまま残す（`launchd.log`を見る）。preflightに通らない環境ではKeepAliveで再起動を繰り返すので、`down`で外す。
+4. **maintainer workspace**: `up`自身の環境に`CMUX_TASKQ_ROLE=maintainer`があり`CMUX_TASKQ_QUEUE`が同じqueue DB（正規化して比較）なら`skipped`（maintainer sessionのskillから`up`を呼んでも二重にならない。cmuxには問い合わせない）。そうでなければ`cmux --json workspace list`のtitleが`taskq <repo> maintainer`（`<repo>`はrepository rootのbasename）のworkspaceがあれば`reused`、なければ`cmux workspace create --name "taskq <repo> maintainer" --cwd <repository root> --command "env CMUX_TASKQ_ROLE=maintainer CMUX_TASKQ_QUEUE=<db> <claude> [--plugin-dir PATH] -- '<maintainer prompt>'" --focus false`で作り、`identify`でUUIDを得て`created`。引数は`shell_join`で個別にquoteする（promptの改行はquoteの中に収まり、cmuxがログインシェルに打ち込んでも1コマンドになる。[010](../journal/010-failure-path-smoke.md)）。
+5. **結果**: `{"supervisor": {"outcome": "started"|"reused", "pid", "token", "plist", "log_dir"}, "maintainer": {"outcome": "created"|"reused"|"skipped", "workspace_id", "name"}, "pruned_supervisors": [{"token","pid"}], "doctor": {"unfinished_runs": [{"run_id","task_id","status","lease_stale"}], "awaiting_integration": [{"run_id","task_id","last_error"}], "needs_session": [...]}}`。`lease_stale`はleaseのPIDが死んでいるかheartbeatが30秒より古いとき`true`、leaseがなければnull。
+
+前提: launchdが起動したsupervisorはcmuxのterminalの外で動くので、cmuxのsocketがcmux外のプロセスからの接続を受け付ける必要がある。開発環境のcmux 0.64.25は「アクセスが拒否されました。cmux内で起動されたプロセスのみ接続できます」で`cmux ping`を拒み、supervisorはpreflightで落ちて登録に現れなかった（`launchd.log`にそのerrorが残り、`up`は30秒でerrorになり、KeepAliveで再起動が続くので`down`で外す）。`cmux --help`のSocket Authはpasswordによる認証（`--password`、`CMUX_SOCKET_PASSWORD`、Settingsに保存したpassword）を載せているが、保存したpasswordでlaunchd起動のsupervisorが通るかは未確認（journal 021）。確認できるまでは、supervisorはcmuxのterminalで手で起動し、`up`はそれを`reused`にしてmaintainer workspaceだけを作る使い方になる。passwordはplistに書かない。
+
+`cmux-taskq down [--wait] [--force]`はsupervisorを止める。PIDの生きている登録が1件もなければ`{"outcome":"not_running"}`（それでもagentが残っていればbootoutして`launch_agent_unloaded: true`。登録できないまま再起動を繰り返すagentを外すため。`--force`ならPIDの死んだ登録行も消して`pruned_supervisors`に出す）。あれば`launchctl print`でagentの有無とそのPIDを読み、`launchctl bootout gui/<uid>/<label>`でagentを外し、plistも消す（`RunAtLoad`のため残すと次のloginで復活する）。bootoutでagentのsupervisorはlaunchdからSIGTERMを受け、claimを止めてactive runをdrainしてから登録を消して終わる。KeepAliveのためsignalだけでは再起動されるので、必ずbootoutを通す。agentのプロセスでない生きた登録（手で起動したsupervisor）には`down`がSIGTERMを直接送る。agentのプロセスにはもう送らない: runtimeは1回目のSIGTERMでdispositionを既定に戻すので、2回目は即死になる。agentがloadされているのにPIDが読めないときは誰にも送らない。既定は`{"outcome":"draining","pid":…,"pids":[…]}`で即返る（bootout自体が即返る）。`--wait`はその登録が消えるかPIDが死ぬまで2秒ごとに待って`stopped`。`--force`はbootoutの後にSIGKILLを送って登録行を消し`killed`（leaseは30秒でstaleになり、runは`doctor` / `recover`で扱う）。maintainer workspaceは閉じない。
+
+### Logs
+
+`supervise --log-dir DIR`はDIRを作り、`supervisor-<started_at unix>-<pid>.log`に起動時のtoken / pid / parallel / db / repositoryと、従来stderrに出していた進行メッセージ（claim、workspace、receipt受領、終了要求、run終了、abandon、rejection）と最後の結果JSON（またはerror）を`[unix time] message`の形で追記する。stderrにも従来どおり出す（`SupervisorLog`）。`up`が作るagentは`--log-dir <queue dir>/logs`で起動し、launchdが拾うstdout / stderrは同じdirの`launchd.log`に溜まる（起動ごとのファイルはruntimeが分け、`launchd.log`は分けない。ローテーションはしない）。`locate`は`log_dir`、`label`、`launch_agent`（plistのpath。存在しなくても出す）を返す。
+
+### Naming
+
+cmux workspaceの名前は複数repositoryで同じcmuxを使うためrepository名を含む: workerは`taskq <repo> <task-id> <run-id>`（`run_workspace_name`。`<repo>`はrunの`repo_path`のbasename）、maintainerは`taskq <repo> maintainer`（`maintainer_workspace_name`）。`up`はtitleの完全一致でmaintainer workspaceを探す。
+
+### Maintainer prompt
+
+`src/runtime.rs`の`maintainer_prompt(db, log_dir)`がworker promptの隣で生成する。内容: この queue（db path）のmaintainer sessionであること、役割名の1行（supervisor / maintainer / worker）、supervisorのlog dir、taskq pluginの`taskq-maintain` skillで`status`と`doctor`を確認し、staleなsupervisor・未完了run・`awaiting_integration`・`needs_session`を報告してユーザーの指示を待つこと、skillが無ければそう報告すること、queue DBを直接触らずCLIだけを使うこと。CLIの手順はpromptに書かずskillに置くので、skillを変えてもpromptは変わらない。
 
 ## `supervise`
 
-`cmux-taskq supervise [--parallel N] [--once]`はrepository内の専用ターミナルで実行する常駐ループで、依存が解けたtaskを上限N（既定4）まで同時に実行する。queueはcwdから解決し（[persistence](persistence.md)のQueue location）、repositoryのcheckoutもcwdを使う。`--db PATH`と`--repo REPO`はそれぞれの明示override（[016](../journal/016-queue-per-repository.md)）。
+`cmux-taskq supervise [--parallel N] [--once] [--log-dir DIR]`はrepository内で実行する常駐ループ（通常は`up`がlaunchdで起動する。手で専用ターミナルから起動してもよい）で、依存が解けたtaskを上限N（既定4）まで同時に実行する。queueはcwdから解決し（[persistence](persistence.md)のQueue location）、repositoryのcheckoutもcwdを使う。`--db PATH`と`--repo REPO`はそれぞれの明示override（[016](../journal/016-queue-per-repository.md)）。
 
 起動時:
 
@@ -62,7 +100,7 @@ ready task (dependencies completed)
 ループ（1秒ごと）:
 
 5. **claim**: active runが上限未満で、`candidates`が空でなければ、`refs/heads/main`を読み直してbase commitにし、`claim_for_supervisor`でrun・`supervisor_token`・lease行を1トランザクションで作る。`integrate`で依存が解けたtaskは次のループで、先行taskを含む`main`から始まる。
-6. **provision**: run管理領域（DBと同じdirの`runs/<run-id>/`）のpath、branch `taskq/<run-id>`、worktree（`runs/<run-id>/worktree`）、receipt、logのpathを`run_planned`として先にDBへ保存し、ディレクトリ、`prompt.txt`、runtimeバイナリのスナップショット`runner`、worktreeを作り、cmux workspaceを`--name 'taskq <task-id> <run-id>' --cwd worktree --command '<runner> --db ... session --run ... --lease <token> --claude ...'`で作成して、`identify`で解決したUUIDを`workspace_created`として保存する。wrapperにはDBのpathを`--db`で明示的に渡す。provisioningの失敗は環境要因とみなし、そのrunをabandon（下記）した上で以後のclaimを止め、active runをdrainしてから非0で終了する。`prompt.txt`の内容は下記[Prompt](#prompt)。
+6. **provision**: run管理領域（DBと同じdirの`runs/<run-id>/`）のpath、branch `taskq/<run-id>`、worktree（`runs/<run-id>/worktree`）、receipt、logのpathを`run_planned`として先にDBへ保存し、ディレクトリ、`prompt.txt`、runtimeバイナリのスナップショット`runner`、worktreeを作り、cmux workspaceを`--name "taskq <repo> <task-id> <run-id>" --cwd worktree --command '<runner> --db ... session --run ... --lease <token> --claude ...'`で作成して、`identify`で解決したUUIDを`workspace_created`として保存する。wrapperにはDBのpathを`--db`で明示的に渡す。provisioningの失敗は環境要因とみなし、そのrunをabandon（下記）した上で以後のclaimを止め、active runをdrainしてから非0で終了する。`prompt.txt`の内容は下記[Prompt](#prompt)。
 7. **監視**: runごとの`SessionWatch`が、wrapperの登録（45秒以内）、wrapper heartbeat（30秒以内）、receiptファイルの出現、idle marker、wrapperの終了を確認する。receiptの出現は`receipt_observed`（`validated: false`）として記録するだけで、セッション終了とは別に扱う。receipt観測後にidle markerがreceiptより新しければ`session_idle_observed`を記録し、`WorkspaceBackend::send_exit`で一度だけ終了を要求して`exit_requested`を記録する（下記）。
 8. wrapper終了後に画面を`terminal-final.txt`へ保存し、`supervision_finished`でrunを終了コード0なら`validating`、それ以外なら`failed`にする。非0のときは同じトランザクションで`last_error`に`session exited with code N`を書き、`show`だけで理由が分かるようにする。Taskは`in_progress`のまま残す。
 9. `validating`のrunはreceipt検証（下記）をrunごとのthread（専用SQLite接続）で行い、ループは完了を待ちながら他のrunを監視し続ける。完了したら`validation_finished`でrunを`awaiting_integration`または`failed`にする。
@@ -70,17 +108,7 @@ ready task (dependencies completed)
 11. `awaiting_integration`または`failed`になったrunのleaseを解放する（`lease_released`）。
 12. active runがなく、`--once`か停止要求（下記）か、provisioning失敗でclaimを止めていればループを抜ける。それ以外はactive runがない間2秒ごとに`candidates`を見る。ループを抜けたら（claimやGitのエラーで抜ける場合も含む）自分の登録を消す（`deregister_supervisor`）。heartbeat失敗で終わるときだけは消さない。
 
-結果は`{"outcome": "finished" | "stopped", "runs": [休止したrun], "errors": [{run_id, task_id, message}]}`。SIGINT/SIGTERMは1回目でclaimを止めてactive runの終了を待ち（graceful drain）、2回目で既定の動作（即終了）になる。即終了した（killされた）supervisorのleaseは30秒でstaleになり、登録はPIDが死んだ時点から`stale`として`status`/`doctor`に残る。登録はruntimeが自動で消さず、maintainerが確認して扱う（[ADR-0010](../adr/0010-maintainer-and-resident-supervisor.md)で`up`がPIDの死んだ登録行を消す例外を決めた。T2で実装予定で、現状のruntimeは消さない）。
-
-### 常駐と起動・停止（T2で実装予定、ADR-0010）
-
-現在のruntimeでは、supervisorはmaintainerが`cmux workspace create --name TASKQ-SUPERVISOR --command "cmux-taskq supervise --parallel 4"`で専用のcmux workspaceに起動し、停止はそのworkspaceでのSIGINT、logはworkspaceの画面だけにある。[ADR-0010](../adr/0010-maintainer-and-resident-supervisor.md)は次のように改めることを決めた。いずれも未実装で、T2が実装する。
-
-- `cmux-taskq up`がcold startの1コマンドになる。supervisorをlaunchdのLaunchAgent（`KeepAlive`）として常駐させ、cmux workspaceを持たせない。続けてmaintainerのcmux workspaceを、runtimeが生成した初期prompt付きの`claude`で作る。maintainer workspaceは`CMUX_TASKQ_ROLE=maintainer`と`CMUX_TASKQ_QUEUE=<queue db path>`を環境に持ち、その環境の中で打った`up`はmaintainer workspaceを作らない。
-- `up`はsupervisor起動の前に`supervisors`表のPIDが死んでいる登録行を消す。上記「登録はruntimeが自動で消さない」の唯一の例外で、leaseには触らない。
-- `cmux-taskq down`はLaunchAgentをbootoutしてsupervisorにdrainさせる。既定は即返り、`--wait`でdrainの完了まで待ち、`--force`で即殺する。maintainer workspaceは閉じない。
-- cmux workspace名は`taskq <repo> maintainer`と`taskq <repo> <task-id> <run-id>`（`<repo>`はrepository rootのbasename）。現在のworker workspace名は`taskq <task-id> <run-id>`。
-- supervisorのlogは起動ごとに`<queue dir>/logs/supervisor-<started_at>.log`に書き、`locate`がlog dirを出す。ローテーションはしない。
+結果は`{"outcome": "finished" | "stopped", "runs": [休止したrun], "errors": [{run_id, task_id, message}]}`。SIGINT/SIGTERMは1回目でclaimを止めてactive runの終了を待ち（graceful drain）、2回目で既定の動作（即終了）になる。即終了した（killされた）supervisorのleaseは30秒でstaleになり、登録はPIDが死んだ時点から`stale`として`status`/`doctor`に残る。`status` / `doctor` / `recover` / `integrate`は登録を消さず、次の`up`がPIDの死んだ登録だけを消す（[`up` / `down`](#up--down)）。
 
 ### Prompt
 

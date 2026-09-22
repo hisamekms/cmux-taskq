@@ -1,8 +1,9 @@
-//! End-to-end happy path through the real binary, real Git, and real cmux,
-//! from `add` to the squash landing by `integrate`. Claude is replaced by a
-//! stub script that does what the prompt asks: change, commit, write the
-//! receipt; the test itself plays the session that resolves a conflict. Requires a running cmux, so it is ignored by default:
-//! `cargo test --locked --test e2e -- --ignored --nocapture`.
+//! End-to-end happy paths through the real binary, real Git, real cmux and
+//! real launchd, from `add` to the squash landing by `integrate`, and from
+//! `up` to `down`. Claude is replaced by a stub script that does what the
+//! prompt asks: change, commit, write the receipt; the test itself plays the
+//! session that resolves a conflict. Requires a running cmux, so it is
+//! ignored by default: `cargo test --locked --test e2e -- --ignored --nocapture`.
 use serde_json::Value;
 use std::{
     env, fs,
@@ -120,12 +121,19 @@ struct Env {
 }
 
 fn taskq(env: &Env, args: &[&str]) -> Value {
-    let output = Command::new(BIN)
+    taskq_with(env, &[], args)
+}
+
+fn taskq_with(env: &Env, extra: &[(&str, &Path)], args: &[&str]) -> Value {
+    let mut command = Command::new(BIN);
+    command
         .current_dir(&env.repo)
         .env("XDG_DATA_HOME", &env.data_home)
-        .args(args)
-        .output()
-        .unwrap();
+        .args(args);
+    for (key, value) in extra {
+        command.env(key, value);
+    }
+    let output = command.output().unwrap();
     assert!(
         output.status.success(),
         "cmux-taskq {args:?}: {}",
@@ -751,4 +759,211 @@ fn two_independent_tasks_run_concurrently_and_a_dependent_follows_integration() 
             .count(),
         3
     );
+}
+
+/// Unloads the LaunchAgent the test bootstrapped if it is still there when
+/// the test ends, so a failed assertion does not leave a supervisor
+/// restarting forever against a deleted queue.
+struct AgentGuard {
+    label: String,
+    plist: PathBuf,
+}
+
+impl AgentGuard {
+    fn loaded(&self) -> bool {
+        Command::new("launchctl")
+            .args(["print", &format!("gui/{}/{}", uid(), self.label)])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    }
+}
+
+impl Drop for AgentGuard {
+    fn drop(&mut self) {
+        if self.loaded() {
+            let output = Command::new("launchctl")
+                .args(["bootout", &format!("gui/{}/{}", uid(), self.label)])
+                .output()
+                .unwrap();
+            eprintln!(
+                "booted out {} ({}): {}",
+                self.label,
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        if self.plist.exists() {
+            let _ = fs::remove_file(&self.plist);
+            eprintln!("removed {}", self.plist.display());
+        }
+    }
+}
+
+fn uid() -> u32 {
+    // SAFETY: getuid has no preconditions.
+    unsafe { libc::getuid() }
+}
+
+fn pid_alive(pid: u32) -> bool {
+    Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .output()
+        .unwrap()
+        .status
+        .success()
+}
+
+/// `up` bootstraps the supervisor as a LaunchAgent of the real launchd and
+/// opens the maintainer workspace in the real cmux; `status` lists the
+/// supervisor through its registration; `down --wait` unloads the agent
+/// and returns once the supervisor has drained and deregistered.
+#[test]
+#[ignore = "needs a running cmux and launchd; run with --ignored"]
+fn up_starts_a_launchd_supervisor_that_status_lists_and_down_wait_stops_it() {
+    let fixture = fixture();
+    let Fixture {
+        cmux,
+        repo,
+        stub,
+        db,
+        env,
+        ..
+    } = &fixture;
+    // The agent's plist goes under a disposable HOME, not the developer's.
+    let home = fixture._dir.path().join("home");
+    fs::create_dir(&home).unwrap();
+    let located = taskq_with(env, &[("HOME", home.as_path())], &["locate"]);
+    let label = located["label"].as_str().unwrap().to_owned();
+    let plist = PathBuf::from(located["launch_agent"].as_str().unwrap());
+    assert!(plist.starts_with(&home));
+    let log_dir = PathBuf::from(located["log_dir"].as_str().unwrap());
+    let agent = AgentGuard {
+        label: label.clone(),
+        plist: plist.clone(),
+    };
+    let mut workspaces = WorkspaceGuard {
+        cmux: cmux.clone(),
+        ids: Vec::new(),
+    };
+
+    let up_args = [
+        "up",
+        "--parallel",
+        "2",
+        "--cmux",
+        cmux.to_str().unwrap(),
+        "--claude",
+        stub.to_str().unwrap(),
+    ];
+    let started = Instant::now();
+    // A supervisor that never registers is diagnosed from launchd.log,
+    // which `up` names in its error; show it before failing.
+    let output = {
+        let mut command = Command::new(BIN);
+        command
+            .current_dir(&env.repo)
+            .env("XDG_DATA_HOME", &env.data_home)
+            .env("HOME", &home)
+            .args(up_args);
+        command.output().unwrap()
+    };
+    if !output.status.success() {
+        let launchd_log = log_dir.join("launchd.log");
+        eprintln!(
+            "launchd.log:\n{}",
+            fs::read_to_string(&launchd_log).unwrap_or_else(|_| "(not written)".into())
+        );
+        panic!("cmux-taskq up: {}", String::from_utf8_lossy(&output.stderr));
+    }
+    let first: Value = serde_json::from_slice(&output.stdout).unwrap();
+    eprintln!("up took {:?}: {first}", started.elapsed());
+    assert_eq!(first["supervisor"]["outcome"], "started", "{first}");
+    let pid = u32::try_from(first["supervisor"]["pid"].as_u64().unwrap()).unwrap();
+    assert!(pid_alive(pid));
+    assert_eq!(first["supervisor"]["plist"], plist.to_str().unwrap());
+    assert_eq!(first["supervisor"]["log_dir"], log_dir.to_str().unwrap());
+    assert_eq!(first["pruned_supervisors"], Value::Array(vec![]));
+    assert_eq!(first["maintainer"]["outcome"], "created", "{first}");
+    let maintainer = first["maintainer"]["workspace_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    uuid::Uuid::parse_str(&maintainer).expect("workspace id is a UUID");
+    workspaces.ids.push(maintainer.clone());
+    assert!(workspace_listed(cmux, &maintainer));
+    let repo_name = repo.file_name().unwrap().to_str().unwrap();
+    assert_eq!(
+        first["maintainer"]["name"],
+        format!("taskq {repo_name} maintainer")
+    );
+    // launchd knows the agent, and the plist is what `up` described.
+    assert!(
+        agent.loaded(),
+        "launchctl print gui/{}/{label} failed",
+        uid()
+    );
+    let contents = fs::read_to_string(&plist).unwrap();
+    assert!(contents.contains(&format!("<string>{label}</string>")));
+    assert!(contents.contains("<string>supervise</string>"));
+    assert!(contents.contains(&format!("<string>{}</string>", db.display())));
+    assert!(contents.contains("<key>KeepAlive</key>\n\t<true/>"));
+    // The launchd-run supervisor wrote its own log.
+    let logs: Vec<PathBuf> = fs::read_dir(&log_dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| {
+            path.file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .ends_with(&format!("-{pid}.log"))
+        })
+        .collect();
+    assert_eq!(logs.len(), 1, "{logs:?}");
+    let log = fs::read_to_string(&logs[0]).unwrap();
+    assert!(
+        log.contains(&format!("started: pid {pid}, parallel 2")),
+        "{log}"
+    );
+
+    let status = taskq(env, &["status"]);
+    let supervisors = status["supervisors"].as_array().unwrap();
+    assert_eq!(supervisors.len(), 1, "{status}");
+    assert_eq!(supervisors[0]["pid"], pid);
+    assert_eq!(supervisors[0]["registered"], true);
+    assert_eq!(supervisors[0]["alive"], true);
+    assert_eq!(supervisors[0]["stale"], false);
+    assert_eq!(supervisors[0]["parallel"], 2);
+    assert_eq!(status["runs"], Value::Array(vec![]));
+
+    // Idempotent: nothing is started or opened twice.
+    let second = taskq_with(env, &[("HOME", home.as_path())], &up_args);
+    assert_eq!(second["supervisor"]["outcome"], "reused", "{second}");
+    assert_eq!(second["supervisor"]["pid"], pid);
+    assert_eq!(second["maintainer"]["outcome"], "reused", "{second}");
+    assert_eq!(second["maintainer"]["workspace_id"], maintainer.as_str());
+    assert_eq!(second["pruned_supervisors"], Value::Array(vec![]));
+
+    let started = Instant::now();
+    let down = taskq_with(env, &[("HOME", home.as_path())], &["down", "--wait"]);
+    eprintln!("down --wait took {:?}: {down}", started.elapsed());
+    assert_eq!(down["outcome"], "stopped", "{down}");
+    assert_eq!(down["pid"], pid);
+    assert_eq!(down["launch_agent_unloaded"], true);
+    assert!(!pid_alive(pid), "supervisor {pid} is still alive");
+    assert!(!agent.loaded(), "the agent is still loaded");
+    assert!(!plist.exists(), "the plist was not removed");
+    let status = taskq(env, &["status"]);
+    assert_eq!(status["supervisors"], Value::Array(vec![]), "{status}");
+    let log = fs::read_to_string(&logs[0]).unwrap();
+    assert!(
+        log.contains("exiting: {\"errors\":[],\"outcome\":\"stopped\""),
+        "{log}"
+    );
+    // The maintainer workspace is left open by `down`; the guard closes it.
+    assert!(workspace_listed(cmux, &maintainer));
+    let again = taskq_with(env, &[("HOME", home.as_path())], &["down"]);
+    assert_eq!(again["outcome"], "not_running", "{again}");
 }

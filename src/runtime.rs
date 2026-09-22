@@ -22,10 +22,10 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use std::{
     fs,
-    io::IsTerminal,
+    io::{IsTerminal, Write},
     path::{Path, PathBuf},
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
         mpsc,
     },
@@ -51,6 +51,9 @@ pub struct SuperviseOptions {
     /// polling for new work.
     pub once: bool,
     pub stop: Arc<AtomicBool>,
+    /// Directory for one `supervisor-<started_at>-<pid>.log` per start,
+    /// created if missing; `None` keeps the messages on stderr only.
+    pub log_dir: Option<PathBuf>,
 }
 
 impl SuperviseOptions {
@@ -59,6 +62,44 @@ impl SuperviseOptions {
             parallel,
             once,
             stop: Arc::new(AtomicBool::new(false)),
+            log_dir: None,
+        }
+    }
+}
+
+/// Where the supervisor's progress messages go: stderr as always and, with
+/// `--log-dir`, a file per start so a launchd-resident supervisor (whose
+/// stderr is one shared `launchd.log`) leaves a record per process.
+#[derive(Clone, Default)]
+pub struct SupervisorLog {
+    file: Option<Arc<Mutex<fs::File>>>,
+    pub path: Option<PathBuf>,
+}
+
+impl SupervisorLog {
+    /// `<dir>/supervisor-<started_at>-<pid>.log`, appended to if it exists.
+    pub fn open(dir: &Path, started_at: i64, pid: u32) -> Result<Self> {
+        fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+        let path = dir.join(format!("supervisor-{started_at}-{pid}.log"));
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .with_context(|| format!("open {}", path.display()))?;
+        Ok(Self {
+            file: Some(Arc::new(Mutex::new(file))),
+            path: Some(path),
+        })
+    }
+
+    /// One line on stderr and, timestamped, in the file. A file that stops
+    /// accepting writes does not stop the supervisor.
+    pub fn note(&self, message: &str) {
+        eprintln!("{message}");
+        if let Some(file) = &self.file
+            && let Ok(mut file) = file.lock()
+        {
+            let _ = writeln!(file, "[{}] {message}", unix_time());
         }
     }
 }
@@ -160,7 +201,24 @@ pub fn supervise(
     // `status` from its first second, runs or not.
     let parallel =
         u32::try_from(options.parallel).context("parallel does not fit a registration")?;
-    queue.register_supervisor(&token, std::process::id(), parallel)?;
+    let pid = std::process::id();
+    let registration = queue.register_supervisor(&token, pid, parallel)?;
+    let log = match &options.log_dir {
+        Some(dir) => match SupervisorLog::open(dir, registration.started_at, pid) {
+            Ok(log) => log,
+            Err(error) => {
+                // Not a supervisor after all: leave no row for `status`.
+                let _ = queue.deregister_supervisor(&token);
+                return Err(error);
+            }
+        },
+        None => SupervisorLog::default(),
+    };
+    log.note(&format!(
+        "supervisor {token} started: pid {pid}, parallel {parallel}, db {}, repository {}",
+        db.display(),
+        repository.root.display()
+    ));
     let heartbeat = Heartbeat::start(db.clone(), token.clone());
     let mut supervisor = Supervisor {
         queue,
@@ -171,13 +229,22 @@ pub fn supervise(
         runner,
         token,
         heartbeat,
+        log: log.clone(),
         slots: Vec::new(),
         finished: Vec::new(),
         errors: Vec::new(),
         claiming: true,
         provisioning_error: None,
     };
-    supervisor.run_loop(options)
+    let result = supervisor.run_loop(options);
+    match &result {
+        Ok(value) => log.note(&format!("supervisor {} exiting: {value}", supervisor.token)),
+        Err(error) => log.note(&format!(
+            "supervisor {} failed: {error:#}",
+            supervisor.token
+        )),
+    }
+    result
 }
 
 const IDLE_POLL: Duration = Duration::from_secs(2);
@@ -192,6 +259,7 @@ struct Supervisor<'a> {
     runner: &'a Path,
     token: String,
     heartbeat: Heartbeat,
+    log: SupervisorLog,
     slots: Vec<Slot>,
     finished: Vec<TaskRun>,
     errors: Vec<RunError>,
@@ -229,7 +297,9 @@ impl Supervisor<'_> {
         if self.heartbeat.check().is_ok()
             && let Err(error) = self.queue.deregister_supervisor(&self.token)
         {
-            eprintln!("supervisor registration could not be removed: {error:#}");
+            self.log.note(&format!(
+                "supervisor registration could not be removed: {error:#}"
+            ));
         }
         result
     }
@@ -298,7 +368,8 @@ impl Supervisor<'_> {
                 }
                 Err(error) => {
                     let message = format!("run {} provisioning failed: {error:#}", run.id);
-                    eprintln!("{message}; no further tasks will be claimed");
+                    self.log
+                        .note(&format!("{message}; no further tasks will be claimed"));
                     self.abandon(&run, message.clone());
                     self.claiming = false;
                     self.provisioning_error = Some(message);
@@ -319,7 +390,8 @@ impl Supervisor<'_> {
                     index += 1;
                 }
                 Ok(Step::Done(run)) => {
-                    eprintln!("run {} is {}", run.id, run.status.as_str());
+                    self.log
+                        .note(&format!("run {} is {}", run.id, run.status.as_str()));
                     self.finished.push(*run);
                 }
                 Err(error) => {
@@ -327,10 +399,10 @@ impl Supervisor<'_> {
                     // session may be alive. Disown the run, delete nothing,
                     // and keep serving the other slots.
                     let message = format!("{error:#}");
-                    eprintln!(
+                    self.log.note(&format!(
                         "run {} retained for inspection: {message}; see show {} and doctor",
                         slot.run.id, slot.run.task_id
-                    );
+                    ));
                     self.abandon(&slot.run, message);
                 }
             }
@@ -339,7 +411,10 @@ impl Supervisor<'_> {
 
     fn abandon(&mut self, run: &TaskRun, message: String) {
         if let Err(error) = self.queue.abandon_run(&run.id, &self.token, &message) {
-            eprintln!("run {}: could not record the error: {error:#}", run.id);
+            self.log.note(&format!(
+                "run {}: could not record the error: {error:#}",
+                run.id
+            ));
         }
         self.errors.push(RunError {
             run_id: run.id.clone(),
@@ -351,7 +426,13 @@ impl Supervisor<'_> {
     fn step(&mut self, slot: &mut Slot) -> Result<Step> {
         match &mut slot.phase {
             Phase::Session(watch) => {
-                let Some(run) = watch.poll(&mut self.queue, self.cmux, &self.token, &slot.run)?
+                let Some(run) = watch.poll(
+                    &mut self.queue,
+                    self.cmux,
+                    &self.token,
+                    &slot.run,
+                    &self.log,
+                )?
                 else {
                     return Ok(Step::Continue);
                 };
@@ -359,8 +440,12 @@ impl Supervisor<'_> {
                     self.queue.release_lease(&run.id, &self.token)?;
                     return Ok(Step::Done(Box::new(run)));
                 }
-                let handle =
-                    spawn_validation(self.db.clone(), self.repository.clone(), run.clone());
+                let handle = spawn_validation(
+                    self.db.clone(),
+                    self.repository.clone(),
+                    run.clone(),
+                    self.log.clone(),
+                );
                 slot.run = run;
                 slot.phase = Phase::Validating(Some(handle));
                 Ok(Step::Continue)
@@ -379,7 +464,7 @@ impl Supervisor<'_> {
                     .finish_validation(&slot.run.id, &self.token, &validation)?;
                 // Only an accepted run gives up its workspace; failures keep it for inspection.
                 let run = if run.status == RunStatus::AwaitingIntegration {
-                    close_workspace(&mut self.queue, self.cmux, &self.token, &run)?
+                    close_workspace(&mut self.queue, self.cmux, &self.token, &run, &self.log)?
                 } else {
                     run
                 };
@@ -448,10 +533,10 @@ impl Supervisor<'_> {
         let workspace = self.cmux.create(&run, &command)?;
         self.queue
             .workspace_created(&run.id, &self.token, &workspace)?;
-        eprintln!(
+        self.log.note(&format!(
             "task {} running in workspace {}; run {}",
             run.task_id, workspace, run.id
-        );
+        ));
         Ok(SessionWatch {
             workspace,
             run_dir,
@@ -485,6 +570,7 @@ impl SessionWatch {
         cmux: &dyn WorkspaceBackend,
         token: &str,
         run: &TaskRun,
+        log: &SupervisorLog,
     ) -> Result<Option<TaskRun>> {
         let processes = queue.processes(&run.id)?;
         if !self.receipt_seen && self.receipt_path.is_file() {
@@ -494,17 +580,17 @@ impl SessionWatch {
                 "receipt_observed",
                 json!({"path": path_text(&self.receipt_path)?, "validated": false}),
             )?;
-            eprintln!(
-                "receipt received for {}; waiting for the session to go idle (or an operator /exit)",
+            log.note(&format!(
+                "receipt received for {}; waiting for the session to go idle (or a maintainer /exit)",
                 run.id
-            );
+            ));
         }
         if self.receipt_seen
             && self.exit_requested.is_none()
             && let Some(evidence) = idle_after_receipt(&self.receipt_path, &self.idle_marker)?
         {
             queue.record_runtime_event(&run.id, "session_idle_observed", evidence)?;
-            // Ask once, the way an operator would; never kill the session.
+            // Ask once, the way the maintainer would; never kill the session.
             cmux.send_exit(&self.workspace)?;
             let timeout = cmux.exit_timeout();
             queue.record_runtime_event(
@@ -512,7 +598,10 @@ impl SessionWatch {
                 "exit_requested",
                 json!({"workspace_id": self.workspace, "timeout_secs": timeout.as_secs()}),
             )?;
-            eprintln!("exit requested for {}; waiting for session exit", run.id);
+            log.note(&format!(
+                "exit requested for {}; waiting for session exit",
+                run.id
+            ));
             self.exit_requested = Some(Instant::now());
         }
         if let Some(wrapper) = processes.iter().find(|p| p.role == "wrapper") {
@@ -559,7 +648,7 @@ impl SessionWatch {
 
 /// Evidence that the agent finished a response after publishing the receipt: an
 /// idle marker written by the provider's stop hook no older than the receipt.
-/// Markers from earlier turns (for example a question to the operator) do not count.
+/// Markers from earlier turns (for example a question to the maintainer) do not count.
 fn idle_after_receipt(receipt: &Path, marker: &Path) -> Result<Option<Value>> {
     let marker_meta = match fs::metadata(marker) {
         Ok(meta) => meta,
@@ -597,6 +686,7 @@ fn spawn_validation(
     db: PathBuf,
     repository: GitRepository,
     run: TaskRun,
+    log: SupervisorLog,
 ) -> thread::JoinHandle<Result<Validation>> {
     thread::spawn(move || {
         let mut queue = SqliteQueue::open(&db)?;
@@ -610,7 +700,7 @@ fn spawn_validation(
                 receipt: serde_json::to_value(receipt)?,
             },
             Err(rejection) => {
-                eprintln!("run {} rejected: {}", run.id, rejection.reason);
+                log.note(&format!("run {} rejected: {}", run.id, rejection.reason));
                 Validation {
                     accepted: false,
                     result_commit: rejection.commit,
@@ -634,13 +724,14 @@ fn close_workspace(
     cmux: &dyn WorkspaceBackend,
     token: &str,
     run: &TaskRun,
+    log: &SupervisorLog,
 ) -> Result<TaskRun> {
     let workspace = run.workspace_id.as_ref().context("missing workspace")?;
     match cmux.close(workspace) {
         Ok(()) => queue.workspace_closed(&run.id, token),
         Err(error) => {
             let message = format!("workspace {workspace} could not be closed: {error:#}");
-            eprintln!("run {}: {message}", run.id);
+            log.note(&format!("run {}: {message}", run.id));
             queue.cleanup_failed(&run.id, token, &message)
         }
     }
@@ -1265,13 +1356,31 @@ pub fn prompt(
          Each of tests, e2e and subagent_review needs evidence when passed and a reason when not_applicable.\n\
          You may write this receipt outside the worktree. Keep the worktree clean after committing.\n\
          The supervisor rejects the run unless the commit is the clean head of your branch on top of the base commit, and it reruns the verification commands itself.\n\
-         After submitting, report the outcome briefly and stop; do not run /exit yourself. Once you are idle the supervisor ends the session, and an operator can still send /exit. A receipt does not itself end the session.\n",
+         After submitting, report the outcome briefly and stop; do not run /exit yourself. Once you are idle the supervisor ends the session, and the maintainer can still send /exit. A receipt does not itself end the session.\n",
         task_id = task.id,
         run_id = run.id,
         title = task.title,
         description = task.description,
         acceptance = task.acceptance,
         verification = serde_json::to_string_pretty(&task.verification_commands)?,
+    ))
+}
+
+/// The initial prompt of the maintainer session that `up` opens in the
+/// `taskq <repo> maintainer` workspace. It names the queue and the roles,
+/// points at the supervisor's logs, and asks for a first report through the
+/// plugin's `taskq-maintain` skill; the CLI itself is documented there, not
+/// here, so the prompt stays stable across skill revisions.
+pub fn maintainer_prompt(db: &Path, log_dir: &Path) -> Result<String> {
+    Ok(format!(
+        "You are the maintainer session of the cmux-taskq queue at {db}.\n\
+         Roles: supervisor is the resident `cmux-taskq supervise` process that runs tasks; maintainer is this session, which registers, watches, reviews and lands them; worker is the Claude session of one run.\n\
+         The supervisor writes its logs to {log_dir} (one supervisor-<started_at>-<pid>.log per start, launchd output in launchd.log).\n\
+         Start by using the taskq-maintain skill of the taskq plugin to run status and doctor. Report stale supervisors, unfinished runs, runs awaiting_integration and runs in needs_session, then wait for the user's instructions.\n\
+         If the taskq-maintain skill is not available in this session, say so and wait.\n\
+         Never open or edit the queue database directly; go through the cmux-taskq CLI only.\n",
+        db = path_text(db)?,
+        log_dir = path_text(log_dir)?,
     ))
 }
 

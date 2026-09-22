@@ -131,7 +131,8 @@ impl SqliteQueue {
 
     /// Remove the registration on a graceful exit. Leases are untouched; a
     /// missing row (already removed, or never written) is not an error, so a
-    /// crashed supervisor's row is only ever removed by an operator.
+    /// crashed supervisor's row is only ever removed by `up`, `down --force`
+    /// or the maintainer.
     pub fn deregister_supervisor(&self, token: &str) -> Result<bool> {
         Ok(self
             .conn
@@ -427,7 +428,7 @@ impl SqliteQueue {
             .collect::<rusqlite::Result<_>>()?)
     }
 
-    /// Operator recovery of an orphaned run. The caller has checked that the
+    /// Maintainer recovery of an orphaned run. The caller has checked that the
     /// registered processes are dead; `checked_processes` guards against a
     /// registration that happened in between, and a fresh lease is refused here
     /// again. Only this run's lease is deleted; other runs, their leases,
@@ -557,6 +558,16 @@ impl SqliteQueue {
         let result = tx.query_row("SELECT * FROM task_runs WHERE id=?1", [id], run_row)?;
         tx.commit()?;
         Ok(result)
+    }
+
+    /// Every run in one status, oldest first; `up` reports the runs that
+    /// wait for the maintainer (`awaiting_integration`, `needs_session`).
+    pub fn runs_with_status(&self, status: crate::domain::RunStatus) -> Result<Vec<TaskRun>> {
+        Ok(self
+            .conn
+            .prepare("SELECT * FROM task_runs WHERE status=?1 ORDER BY rowid")?
+            .query_map([status.as_str()], run_row)?
+            .collect::<rusqlite::Result<_>>()?)
     }
 
     /// The oldest run awaiting integration by validation time: the FIFO

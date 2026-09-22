@@ -96,6 +96,31 @@ fn every_worktree_of_a_repository_shares_one_queue_under_the_data_home() {
     assert_eq!(located["git_common_dir"], common_dir.to_str().unwrap());
     assert_eq!(located["queue_dir"], db.parent().unwrap().to_str().unwrap());
     assert_eq!(
+        located["log_dir"],
+        db.parent().unwrap().join("logs").to_str().unwrap()
+    );
+    // The LaunchAgent is named after the queue, lives under HOME, and is
+    // reported before `up` writes it.
+    let hash = db.parent().unwrap().file_name().unwrap().to_str().unwrap();
+    assert_eq!(located["label"], format!("com.cmux-taskq.{hash}"));
+    let home = dir.path().join("home");
+    let with_home = ok(
+        &repo,
+        &[
+            ("XDG_DATA_HOME", data_home.as_path()),
+            ("HOME", home.as_path()),
+        ],
+        &["locate"],
+    );
+    assert_eq!(
+        with_home["launch_agent"],
+        home.join("Library/LaunchAgents")
+            .join(format!("com.cmux-taskq.{hash}.plist"))
+            .to_str()
+            .unwrap()
+    );
+    assert!(!Path::new(with_home["launch_agent"].as_str().unwrap()).exists());
+    assert_eq!(
         located["runs_dir"],
         db.parent().unwrap().join("runs").to_str().unwrap()
     );

@@ -47,11 +47,46 @@ pub trait WorkspaceBackend {
     fn capture(&self, workspace_id: &str) -> Result<String>;
     /// Close the workspace; the worktree and branch are not touched.
     fn close(&self, workspace_id: &str) -> Result<()>;
-    /// Ask the agent session to end the way an operator would, without killing it.
+    /// Ask the agent session to end the way the maintainer would, without killing it.
     fn send_exit(&self, workspace_id: &str) -> Result<()>;
+    /// The workspace whose title is exactly `name`, if one is open.
+    fn find_named(&self, name: &str) -> Result<Option<String>>;
+    /// Open a workspace that is not tied to a run (the maintainer session)
+    /// and return its stable ID.
+    fn create_named(&self, name: &str, cwd: &std::path::Path, command: &str) -> Result<String>;
     /// How long the session may take to exit after the request before the
     /// supervisor stops waiting and leaves the run to a human.
     fn exit_timeout(&self) -> std::time::Duration {
         std::time::Duration::from_secs(120)
     }
+}
+
+/// What the service manager had under a label when `uninstall` ran.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AgentState {
+    pub loaded: bool,
+    /// The agent's process, when it was loaded and running.
+    pub pid: Option<u32>,
+}
+
+/// The service manager that keeps the supervisor resident (launchd on
+/// macOS). `up` writes the agent's definition and loads it; `down` unloads
+/// it, which is what makes the supervisor stop without being restarted.
+pub trait LaunchAgent {
+    /// Write `contents` to `path` and (re)load the agent under `label`: an
+    /// agent already loaded is unloaded first, and its process waited for,
+    /// so the new definition takes.
+    fn install(&self, label: &str, path: &std::path::Path, contents: &str) -> Result<()>;
+    /// Unload the agent without waiting for its process (which drains) and
+    /// remove its definition so it does not come back at the next login.
+    fn uninstall(&self, label: &str, path: &std::path::Path) -> Result<AgentState>;
+}
+
+/// Liveness and signals for the supervisor's PID, replaceable in tests.
+pub trait ProcessControl {
+    fn alive(&self, pid: u32) -> bool;
+    /// Ask the process to drain (SIGTERM); used when no agent is loaded for it.
+    fn terminate(&self, pid: u32) -> Result<()>;
+    /// End the process immediately (SIGKILL).
+    fn kill(&self, pid: u32) -> Result<()>;
 }

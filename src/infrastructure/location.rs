@@ -1,7 +1,9 @@
 //! Where a queue lives. Without `--db`, the queue of the repository containing
 //! the working directory is `<data home>/cmux-taskq/<hash>/queue.db`, where the
 //! hash identifies the repository's Git common directory. Runs, worktrees and
-//! logs live next to the database in `runs/`.
+//! their logs live next to the database in `runs/`, the supervisor's logs in
+//! `logs/`, and the LaunchAgent that keeps the supervisor resident is named
+//! after the queue under `~/Library/LaunchAgents`.
 use anyhow::{Context, Result};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -17,6 +19,10 @@ use super::adapters::git_common_dir;
 pub const DATA_DIR_NAME: &str = "cmux-taskq";
 pub const DB_FILE_NAME: &str = "queue.db";
 pub const RUNS_DIR_NAME: &str = "runs";
+/// Supervisor logs (`supervisor-<started_at>-<pid>.log`, `launchd.log`).
+pub const LOGS_DIR_NAME: &str = "logs";
+/// LaunchAgent labels are `com.cmux-taskq.<queue hash>`.
+pub const LAUNCH_AGENT_PREFIX: &str = "com.cmux-taskq";
 /// Human-readable pointer back from a hashed queue directory to its repository.
 pub const REPOSITORY_FILE_NAME: &str = "repository";
 const HASH_HEX_LEN: usize = 16;
@@ -35,6 +41,11 @@ pub struct QueueLocation {
     pub db: PathBuf,
     pub queue_dir: PathBuf,
     pub runs_dir: PathBuf,
+    pub log_dir: PathBuf,
+    /// launchd label of the queue's supervisor agent.
+    pub label: String,
+    /// The agent's plist, whether or not `up` has written it yet.
+    pub launch_agent: PathBuf,
     pub source: QueueSource,
     /// Canonical Git common directory the queue belongs to. Set only when
     /// resolved from the repository; `--db` queues are bound by `supervise`.
@@ -54,10 +65,22 @@ impl QueueLocation {
         }
     }
 
+    /// An explicit queue file is identified by the hash of its own path.
     pub fn explicit(db: &Path) -> Self {
+        Self::explicit_in(db, &home_dir())
+    }
+
+    pub fn explicit_in(db: &Path, home: &Path) -> Self {
         let queue_dir = db.parent().map(Path::to_path_buf).unwrap_or_default();
+        // `up` and `down` must agree on the label however the path was
+        // spelled, so the hash is of the canonical path (of the directory
+        // plus the file name when the file does not exist yet).
+        let label = format!("{LAUNCH_AGENT_PREFIX}.{}", repository_hash(&canonical(db)));
         Self {
             runs_dir: queue_dir.join(RUNS_DIR_NAME),
+            log_dir: queue_dir.join(LOGS_DIR_NAME),
+            launch_agent: launch_agent_path(home, &label),
+            label,
             db: db.to_path_buf(),
             queue_dir,
             source: QueueSource::DbFlag,
@@ -68,12 +91,19 @@ impl QueueLocation {
     /// `common_dir` must already be canonical so the hash is stable across
     /// symlinks and worktrees.
     pub fn for_repository(common_dir: &Path, data_home: &Path) -> Self {
-        let queue_dir = data_home
-            .join(DATA_DIR_NAME)
-            .join(repository_hash(common_dir));
+        Self::for_repository_in(common_dir, data_home, &home_dir())
+    }
+
+    pub fn for_repository_in(common_dir: &Path, data_home: &Path, home: &Path) -> Self {
+        let hash = repository_hash(common_dir);
+        let queue_dir = data_home.join(DATA_DIR_NAME).join(&hash);
+        let label = format!("{LAUNCH_AGENT_PREFIX}.{hash}");
         Self {
             db: queue_dir.join(DB_FILE_NAME),
             runs_dir: queue_dir.join(RUNS_DIR_NAME),
+            log_dir: queue_dir.join(LOGS_DIR_NAME),
+            launch_agent: launch_agent_path(home, &label),
+            label,
             queue_dir,
             source: QueueSource::Repository,
             git_common_dir: Some(common_dir.to_path_buf()),
@@ -101,6 +131,33 @@ impl QueueLocation {
 /// Runs of the queue at `db` live in `runs/` next to it.
 pub fn runs_dir(db: &Path) -> PathBuf {
     QueueLocation::explicit(db).runs_dir
+}
+
+/// The canonical form of `path` when it exists, else of its nearest existing
+/// parent joined with the rest; the path itself when nothing exists.
+fn canonical(path: &Path) -> PathBuf {
+    if let Ok(canonical) = path.canonicalize() {
+        return canonical;
+    }
+    match (path.parent(), path.file_name()) {
+        (Some(parent), Some(name)) if !parent.as_os_str().is_empty() => {
+            canonical(parent).join(name)
+        }
+        _ => path.to_path_buf(),
+    }
+}
+
+/// `~/Library/LaunchAgents/<label>.plist`, where launchd looks for per-user agents.
+pub fn launch_agent_path(home: &Path, label: &str) -> PathBuf {
+    home.join("Library")
+        .join("LaunchAgents")
+        .join(format!("{label}.plist"))
+}
+
+/// `$HOME`, or an empty path when it is unset: the LaunchAgent path is then
+/// relative, and `up` refuses to write it.
+pub fn home_dir() -> PathBuf {
+    env::var_os("HOME").map(PathBuf::from).unwrap_or_default()
 }
 
 /// SHA-256 of the canonical common directory, shortened; stable across
@@ -182,6 +239,20 @@ mod tests {
             location.git_common_dir.as_deref(),
             Some(Path::new("/repo/.git"))
         );
+        let location = QueueLocation::for_repository_in(
+            Path::new("/repo/.git"),
+            Path::new("/data"),
+            Path::new("/home/u"),
+        );
+        assert_eq!(
+            location.log_dir,
+            Path::new("/data/cmux-taskq").join(&hash).join("logs")
+        );
+        assert_eq!(location.label, format!("com.cmux-taskq.{hash}"));
+        assert_eq!(
+            location.launch_agent,
+            Path::new("/home/u/Library/LaunchAgents").join(format!("com.cmux-taskq.{hash}.plist"))
+        );
     }
 
     #[test]
@@ -192,9 +263,42 @@ mod tests {
         assert_eq!(runs_dir(Path::new("/x/y/other.db")), Path::new("/x/y/runs"));
         assert_eq!(location.source, QueueSource::DbFlag);
         assert!(location.git_common_dir.is_none());
+        assert_eq!(location.log_dir, Path::new("/x/y/logs"));
         assert_eq!(
             QueueLocation::explicit(Path::new("bare.db")).runs_dir,
             Path::new("runs")
+        );
+        // The agent of an explicit queue is named after the file, not a repository.
+        let explicit = QueueLocation::explicit_in(Path::new("/x/y/other.db"), Path::new("/home/u"));
+        let hash = repository_hash(Path::new("/x/y/other.db"));
+        assert_eq!(explicit.label, format!("com.cmux-taskq.{hash}"));
+        assert_eq!(
+            explicit.launch_agent,
+            Path::new("/home/u/Library/LaunchAgents").join(format!("com.cmux-taskq.{hash}.plist"))
+        );
+        assert_ne!(
+            explicit.label,
+            QueueLocation::explicit_in(Path::new("/x/z/other.db"), Path::new("/home/u")).label
+        );
+        // The label does not depend on how the path was spelled.
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("q").join("queue.db");
+        fs::create_dir_all(real.parent().unwrap()).unwrap();
+        let via_dots = dir.path().join("q").join("..").join("q").join("queue.db");
+        assert_eq!(
+            QueueLocation::explicit_in(&real, Path::new("/home/u")).label,
+            QueueLocation::explicit_in(&via_dots, Path::new("/home/u")).label
+        );
+        fs::write(&real, "").unwrap();
+        assert_eq!(
+            QueueLocation::explicit_in(&real, Path::new("/home/u")).label,
+            QueueLocation::explicit_in(&via_dots, Path::new("/home/u")).label
+        );
+        // Without HOME the plist path is relative; `up` refuses to write it.
+        assert!(
+            !QueueLocation::explicit_in(Path::new("/x/y/other.db"), Path::new(""))
+                .launch_agent
+                .is_absolute()
         );
     }
 

@@ -54,7 +54,7 @@ skillはすべて`${CLAUDE_PLUGIN_ROOT}/bin/taskq`を呼ぶ。launcherはバイ�
 ### skillの契約
 
 - 完了はStop hookやreceiptファイルの存在ではなく、`show`のrun `status`（`awaiting_integration` / `needs_session` / `integrated`）、`result_commit`、`last_error`、`validation_finished`イベントで判定する。
-- `supervise`は常駐ループなのでClaude Codeのshellでは実行せず、`cmux workspace create --cwd <repo> --command "<bin> supervise --parallel 4"`で専用workspaceに起動する。既に生きているsupervisorがあれば起動せず、次のpollで拾わせる（[017](../journal/017-parallel-runs.md)）。`--cwd`がrepositoryなのでqueueは同じものに解決される。workspaceのshellはsessionの環境変数を継承しないため絶対pathを渡し、`CMUX_TASKQ_DB`を使っているときだけ`--db <db>`を付ける。
+- supervisorの起動はskillが`cmux-taskq up [--parallel N] [--plugin-dir PATH]`を呼ぶ（[021](../journal/021-maintainer-up-down.md)、[supervisor-lifecycle](supervisor-lifecycle.md#up--down)）。`up`がlaunchdのLaunchAgentとしてsupervisorを常駐させ、maintainer workspaceの有無を判定し、生きているsupervisorがあれば`reused`を返すので、skillは重複起動の判定もworkspaceの作成も自分では行わない。maintainer session（`CMUX_TASKQ_ROLE=maintainer`）の中から呼ぶと`maintainer`は`skipped`になる。停止は`cmux-taskq down [--wait] [--force]`。現在の`taskq-run` skillはまだ`cmux workspace create --command "<bin> supervise"`で起動する旧手順を書いており、T3（task 16、`taskq-maintain` skillとAGENTS.mdの縮小）で`up` / `down`に書き換える予定。
 - mainへの着地はruntimeの`integrate ID` / `integrate --next`が行う（rebase → 再検証 → squash、[ADR-0008](../adr/0008-merge-queue-squash-landing.md)）。skillはmaintainerのレビュー後にこれを呼び、`outcome`（`integrated` / `needs_session` / `failed` / `no_run_awaiting`）を読んで結果を伝える。`needs_session`のrunはmaintainerが`claude --resume <run-id>`でworktreeに開き直すセッションが解消する。
 - `recover`はバイナリが拒否条件を判定する。skillはプロセスをkillせず、`doctor`の`blockers`をユーザーに示す。
 
