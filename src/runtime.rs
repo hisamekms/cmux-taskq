@@ -2,6 +2,8 @@
 //! workspaces of accepted runs, land them on main one at a time, and recover
 //! orphaned runs. One run's state machine is unchanged from the single-run
 //! supervisor; the loop multiplexes independent slots and isolates failures.
+//! A run whose supervisor died while its session lives on is adopted by a
+//! supervisor with a free slot instead of being rerun (ADR-0012).
 use crate::{
     application::{AgentProvider, TaskQueue, WorkspaceBackend},
     domain::{
@@ -13,7 +15,9 @@ use crate::{
             ClaudeCode, GitRepository, path_text, process_alive, run_shell_to_log, shell_join,
         },
         location::runs_dir,
-        runtime_store::{HEARTBEAT_TIMEOUT_SECS, Landing, RunPlan, Validation},
+        runtime_store::{
+            HEARTBEAT_TIMEOUT_SECS, Landing, LeasedRun, RunPlan, Validation, lease_is_stale,
+        },
         sqlite::SqliteQueue,
     },
 };
@@ -285,6 +289,9 @@ enum Phase {
 enum Step {
     Continue,
     Done(Box<TaskRun>),
+    /// The lease now carries another token (an adopter took the run, or
+    /// `recover` released it): this process must not touch the run again.
+    Disowned,
 }
 
 impl Supervisor<'_> {
@@ -345,10 +352,14 @@ impl Supervisor<'_> {
         Ok(json!({"outcome": outcome, "runs": self.finished, "errors": self.errors}))
     }
 
-    /// Claim and provision candidates until every slot is taken or nothing is
-    /// claimable. `main` is reread per claim so a task released by `integrate`
-    /// starts from the main that contains its predecessor.
+    /// Adopt the runs other supervisors left behind, then claim and
+    /// provision candidates until every slot is taken or nothing is
+    /// claimable. `main` is reread per claim so a task released by
+    /// `integrate` starts from the main that contains its predecessor.
     fn fill_slots(&mut self, parallel: usize) -> Result<()> {
+        if self.slots.len() < parallel {
+            self.adopt_stale_runs(parallel)?;
+        }
         while self.slots.len() < parallel {
             if self.queue.candidates()?.is_empty() {
                 break;
@@ -394,6 +405,18 @@ impl Supervisor<'_> {
                         .note(&format!("run {} is {}", run.id, run.status.as_str()));
                     self.finished.push(*run);
                 }
+                Ok(Step::Disowned) => self.disown(&slot),
+                // A lease-guarded write that failed because the lease
+                // changed hands mid-step (this process was stalled and
+                // adopted from) is the other owner's run to describe.
+                Err(_)
+                    if !self
+                        .queue
+                        .holds_lease(&slot.run.id, &self.token)
+                        .unwrap_or(true) =>
+                {
+                    self.disown(&slot)
+                }
                 Err(error) => {
                     // Creation/communication failures can be ambiguous: the
                     // session may be alive. Disown the run, delete nothing,
@@ -407,6 +430,25 @@ impl Supervisor<'_> {
                 }
             }
         }
+    }
+
+    /// Drop a slot whose lease another process holds now, writing nothing
+    /// about the run: the new owner's record is the record.
+    fn disown(&mut self, slot: &Slot) {
+        let mut message = format!(
+            "lease of run {} is held by another process; this supervisor stopped watching it",
+            slot.run.id
+        );
+        if matches!(slot.phase, Phase::Validating(Some(_))) {
+            // Its checks finish on their own; the new owner runs its own.
+            message.push_str("; a validation already in progress runs to completion unrecorded");
+        }
+        self.log.note(&message);
+        self.errors.push(RunError {
+            run_id: slot.run.id.clone(),
+            task_id: slot.run.task_id,
+            message,
+        });
     }
 
     fn abandon(&mut self, run: &TaskRun, message: String) {
@@ -424,6 +466,9 @@ impl Supervisor<'_> {
     }
 
     fn step(&mut self, slot: &mut Slot) -> Result<Step> {
+        if !self.queue.holds_lease(&slot.run.id, &self.token)? {
+            return Ok(Step::Disowned);
+        }
         match &mut slot.phase {
             Phase::Session(watch) => {
                 let Some(run) = watch.poll(
@@ -472,6 +517,119 @@ impl Supervisor<'_> {
                 Ok(Step::Done(Box::new(run)))
             }
         }
+    }
+
+    /// Take over `running` / `validating` runs whose lease went stale under
+    /// another token while their wrapper is alive (heartbeat within the
+    /// lease TTL) or has already reported its exit (ADR-0012). A wrapper
+    /// that is dead or silent is `recover`'s business; a run without a
+    /// lease was abandoned or recovered on purpose and is never adopted.
+    /// The staleness is judged here and again inside `adopt_run`, so two
+    /// supervisors racing for one run take it exactly once.
+    fn adopt_stale_runs(&mut self, parallel: usize) -> Result<()> {
+        for candidate in self.queue.runs_leased_by_others(&self.token)? {
+            if self.slots.len() >= parallel {
+                break;
+            }
+            let now = unix_time();
+            let LeasedRun {
+                run,
+                lease,
+                wrapper,
+            } = candidate;
+            if !lease_is_stale(&lease, now) {
+                continue;
+            }
+            let Some(wrapper) = wrapper else {
+                continue;
+            };
+            let alive = wrapper.exited_at.is_none().then(|| {
+                process_alive(wrapper.pid) && now - wrapper.heartbeat_at <= HEARTBEAT_TIMEOUT_SECS
+            });
+            if alive == Some(false) {
+                continue;
+            }
+            let observed = json!({
+                "pid": wrapper.pid,
+                "alive": alive,
+                "exited_at": wrapper.exited_at,
+            });
+            let pid = std::process::id();
+            let Some(run) =
+                self.queue
+                    .adopt_run(&run.id, &lease.token, &self.token, pid, observed)?
+            else {
+                self.log.note(&format!(
+                    "run {} was not adopted: its lease changed while judging it",
+                    run.id
+                ));
+                continue;
+            };
+            self.log.note(&format!(
+                "run {} adopted from supervisor {} (pid {}, heartbeat {}s old; wrapper pid {} {}): task {} in workspace {}",
+                run.id,
+                lease.token,
+                lease.pid,
+                now - lease.heartbeat_at,
+                wrapper.pid,
+                match wrapper.exited_at {
+                    Some(at) => format!("exited at {at}"),
+                    None => "alive".to_owned(),
+                },
+                run.task_id,
+                run.workspace_id.as_deref().unwrap_or("?")
+            ));
+            match self.resume(&run) {
+                Ok(phase) => self.slots.push(Slot { run, phase }),
+                Err(error) => {
+                    // The lease is this process's now; give it up like any
+                    // other runtime error so `recover` can judge the run.
+                    let message = format!("run {} could not be resumed: {error:#}", run.id);
+                    self.log.note(&message);
+                    self.abandon(&run, message);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Rebuild the slot of an adopted run from what the queue and the run
+    /// directory hold: the planned paths, whether the receipt is already on
+    /// disk and whether `/exit` was already requested (never sent twice; its
+    /// timeout restarts now). The wrapper is registered, so no registration
+    /// timeout applies. A `validating` run restarts validation from the
+    /// beginning: it is a function of the receipt and the worktree alone.
+    fn resume(&self, run: &TaskRun) -> Result<Phase> {
+        Ok(match run.status {
+            RunStatus::Validating => Phase::Validating(Some(spawn_validation(
+                self.db.clone(),
+                self.repository.clone(),
+                run.clone(),
+                self.log.clone(),
+            ))),
+            _ => {
+                let receipt_path =
+                    PathBuf::from(run.receipt_path.as_ref().context("missing receipt path")?);
+                let receipt_seen = receipt_path.is_file()
+                    && self.queue.has_run_event(&run.id, "receipt_observed")?;
+                let exit_requested = self
+                    .queue
+                    .has_run_event(&run.id, "exit_requested")?
+                    .then(Instant::now);
+                Phase::Session(SessionWatch {
+                    workspace: run
+                        .workspace_id
+                        .clone()
+                        .context("adopted run has no workspace")?,
+                    run_dir: PathBuf::from(run.run_dir.as_ref().context("missing run directory")?),
+                    receipt_path,
+                    idle_marker: run.idle_marker_path()?,
+                    startup: Instant::now(),
+                    receipt_seen,
+                    exit_requested,
+                })
+            }
+        })
     }
 
     /// Plan paths, create the run directory, worktree and workspace. Any
@@ -584,8 +742,13 @@ impl SessionWatch {
                 run.id
             ));
         }
+        let wrapper = processes.iter().find(|p| p.role == "wrapper");
+        // A session that already ended (on its own, by a maintainer's /exit,
+        // or before this supervisor adopted the run) is not asked to exit.
+        let session_ended = wrapper.is_some_and(|w| w.exited_at.is_some());
         if self.receipt_seen
             && self.exit_requested.is_none()
+            && !session_ended
             && let Some(evidence) = idle_after_receipt(&self.receipt_path, &self.idle_marker)?
         {
             queue.record_runtime_event(&run.id, "session_idle_observed", evidence)?;
@@ -603,7 +766,7 @@ impl SessionWatch {
             ));
             self.exit_requested = Some(Instant::now());
         }
-        if let Some(wrapper) = processes.iter().find(|p| p.role == "wrapper") {
+        if let Some(wrapper) = wrapper {
             if wrapper.exited_at.is_some() {
                 match cmux.capture(&self.workspace) {
                     Ok(screen) => fs::write(self.run_dir.join("terminal-final.txt"), screen)?,

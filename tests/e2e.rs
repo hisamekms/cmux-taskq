@@ -1,9 +1,10 @@
 //! End-to-end happy paths through the real binary, real Git, real cmux and
-//! real launchd, from `add` to the squash landing by `integrate`, and from
-//! `up` to `down`. Claude is replaced by a stub script that does what the
-//! prompt asks: change, commit, write the receipt; the test itself plays the
-//! session that resolves a conflict. Requires a running cmux, so it is
-//! ignored by default: `cargo test --locked --test e2e -- --ignored --nocapture`.
+//! real launchd, from `add` to the squash landing by `integrate`, from
+//! `up` to `down`, and from a killed supervisor to the adoption of its run.
+//! Claude is replaced by a stub script that does what the prompt asks:
+//! change, commit, write the receipt; the test itself plays the session
+//! that resolves a conflict. Requires a running cmux, so it is ignored by
+//! default: `cargo test --locked --test e2e -- --ignored --nocapture`.
 use serde_json::Value;
 use std::{
     env, fs,
@@ -758,6 +759,167 @@ fn two_independent_tasks_run_concurrently_and_a_dependent_follows_integration() 
             .lines()
             .count(),
         3
+    );
+}
+
+/// The supervisor is killed while the stub worker is running (the task 15
+/// incident: a binary update or a `kill` took the resident supervisor with
+/// it). The wrapper keeps heartbeating in its cmux workspace and the stub
+/// writes its receipt regardless. The next `supervise --once` adopts the
+/// run from the dead supervisor's stale lease (ADR-0012), sends `/exit`
+/// once, validates it, and `integrate` lands it: nothing is redone.
+#[test]
+#[ignore = "needs a running cmux; run with --ignored"]
+fn killed_supervisor_run_is_adopted_by_the_next_supervisor_and_lands() {
+    let fixture = fixture();
+    let Fixture {
+        cmux, repo, env, ..
+    } = &fixture;
+    let task_id = add_ready_task(env, "e2e adopted task", &[]);
+    let mut guard = WorkspaceGuard {
+        cmux: cmux.clone(),
+        ids: Vec::new(),
+    };
+
+    // A resident supervisor starts the run; it is killed once the worker runs.
+    let mut victim = ChildGuard(
+        Command::new(BIN)
+            .current_dir(&fixture.repo)
+            .env("XDG_DATA_HOME", &fixture.env.data_home)
+            .args(["supervise", "--parallel", "1"])
+            .arg("--cmux")
+            .arg(&fixture.cmux)
+            .arg("--claude")
+            .arg(&fixture.stub)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let victim_stderr = reader(victim.0.stderr.take().unwrap());
+    let victim_pid = victim.0.id();
+    let started = Instant::now();
+    let run = loop {
+        assert!(
+            victim.0.try_wait().unwrap().is_none(),
+            "the supervisor exited before the worker started"
+        );
+        assert!(
+            started.elapsed() < SUPERVISE_TIMEOUT,
+            "the worker did not start within {SUPERVISE_TIMEOUT:?}"
+        );
+        let detail = taskq(env, &["show", &task_id]);
+        if let Some(run) = detail["runs"].as_array().unwrap().last()
+            && run["status"] == "running"
+        {
+            break run.clone();
+        }
+        thread::sleep(Duration::from_millis(200));
+    };
+    let run_id = run["id"].as_str().unwrap().to_owned();
+    let workspace = run["workspace_id"].as_str().unwrap().to_owned();
+    guard.ids.push(workspace.clone());
+    eprintln!(
+        "worker of run {run_id} started after {:?}; killing supervisor {victim_pid}",
+        started.elapsed()
+    );
+    victim.0.kill().unwrap();
+    victim.0.wait().unwrap();
+    eprintln!(
+        "killed supervisor stderr:\n{}",
+        victim_stderr.join().unwrap()
+    );
+    assert!(!pid_alive(victim_pid));
+
+    // What the maintainer sees before anyone adopts: the registration and
+    // the lease are stale by pid, the wrapper is alive, and the run keeps going.
+    let status = taskq(env, &["status"]);
+    let supervisors = status["supervisors"].as_array().unwrap();
+    assert_eq!(supervisors.len(), 1, "{status}");
+    assert_eq!(supervisors[0]["pid"], victim_pid);
+    assert_eq!(supervisors[0]["alive"], false);
+    assert_eq!(supervisors[0]["stale"], true);
+    assert_eq!(
+        supervisors[0]["run_ids"],
+        Value::Array(vec![Value::String(run_id.clone())])
+    );
+    assert_eq!(status["runs"][0]["run_id"], run_id.as_str());
+    assert_eq!(status["runs"][0]["lease"]["pid"], victim_pid);
+    assert_eq!(status["runs"][0]["lease"]["alive"], false);
+    let doctor = taskq(env, &["doctor"]);
+    assert_eq!(doctor["runs"][0]["recoverable"], false, "{doctor}");
+    let wrapper = doctor["runs"][0]["processes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["role"] == "wrapper")
+        .unwrap()
+        .clone();
+    assert_eq!(wrapper["alive"], true, "{doctor}");
+    assert!(workspace_listed(cmux, &workspace));
+
+    // The next supervisor adopts the run instead of leaving it to recover.
+    let pass = supervise_once(&fixture, &["--parallel", "1"], &[&task_id], &mut guard);
+    let outcome = &pass.outcome;
+    assert_eq!(outcome["errors"], Value::Array(vec![]), "{outcome}");
+    assert_eq!(outcome["runs"].as_array().unwrap().len(), 1, "{outcome}");
+    assert_eq!(outcome["runs"][0]["id"], run_id.as_str());
+    assert_eq!(outcome["runs"][0]["status"], "awaiting_integration");
+    assert!(
+        pass.stderr
+            .contains(&format!("run {run_id} adopted from supervisor")),
+        "{}",
+        pass.stderr
+    );
+    assert_eq!(pass.workspaces, vec![(task_id.clone(), workspace.clone())]);
+
+    let detail = taskq(env, &["show", &task_id]);
+    assert_eq!(detail["runs"].as_array().unwrap().len(), 1); // Not rerun.
+    let run = &detail["runs"][0];
+    assert_eq!(run["status"], "awaiting_integration");
+    assert_eq!(run["workspace_id"], workspace.as_str());
+    assert!(run["last_error"].is_null(), "{run}");
+    assert!(run["workspace_closed_at"].is_number(), "{run}");
+    assert!(!workspace_listed(cmux, &workspace));
+    let events = detail["events"].as_array().unwrap();
+    let kinds: Vec<&str> = events.iter().map(|e| e["kind"].as_str().unwrap()).collect();
+    let count = |kind: &str| kinds.iter().filter(|k| **k == kind).count();
+    assert_eq!(count("run_adopted"), 1, "{kinds:?}");
+    assert_eq!(count("exit_requested"), 1, "{kinds:?}");
+    assert_eq!(count("session_exited"), 1, "{kinds:?}");
+    assert_eq!(count("validation_finished"), 1, "{kinds:?}");
+    assert!(!kinds.contains(&"run_recovered"), "{kinds:?}");
+    assert!(!kinds.contains(&"runtime_error"), "{kinds:?}");
+    let adopted = events.iter().find(|e| e["kind"] == "run_adopted").unwrap();
+    assert_eq!(adopted["payload"]["previous_pid"], victim_pid);
+    assert_eq!(adopted["payload"]["wrapper"]["pid"], wrapper["pid"]);
+    assert_eq!(adopted["payload"]["wrapper"]["alive"], true);
+    let position = |kind: &str| kinds.iter().position(|k| *k == kind).unwrap();
+    assert!(position("agent_started") < position("run_adopted"));
+    assert!(position("run_adopted") < position("exit_requested"));
+    assert!(position("exit_requested") < position("session_exited"));
+    // The adopter deregistered on exit; the killed one's row stays for `up` to prune.
+    let status = taskq(env, &["status"]);
+    let supervisors = status["supervisors"].as_array().unwrap();
+    assert_eq!(supervisors.len(), 1, "{status}");
+    assert_eq!(supervisors[0]["pid"], victim_pid);
+    assert_eq!(supervisors[0]["run_ids"], Value::Array(vec![]));
+    assert_eq!(status["runs"], Value::Array(vec![]));
+
+    let integrated = taskq(env, &["integrate", &task_id]);
+    assert_eq!(integrated["outcome"], "integrated", "{integrated}");
+    assert_eq!(integrated["task"]["status"], "completed");
+    assert_eq!(
+        fs::read_to_string(repo.join("e2e.txt")).unwrap(),
+        format!("written by the stub agent for {run_id}\n")
+    );
+    assert_eq!(
+        git(
+            repo,
+            &["rev-list", "--count", &format!("{}..main", fixture.base)]
+        ),
+        "1"
     );
 }
 

@@ -3166,3 +3166,750 @@ fn recovering_one_orphaned_run_leaves_the_other_running() {
     );
     assert!(queue.run_leases().unwrap().is_empty());
 }
+
+/// Provision and start a run under `token` exactly as `supervise` does
+/// (claim, plan, prompt, worktree, workspace with the wrapper thread of the
+/// test backend), but with no loop or heartbeat behind the token: the state
+/// a supervisor leaves when it is killed after the session started. Returns
+/// the `running` run once the wrapper registered its agent.
+fn start_run_under_dead_supervisor(
+    repo: &Path,
+    db: &Path,
+    backend: &TestWorkspace,
+    token: &str,
+) -> TaskRun {
+    use cmux_taskq::{
+        domain::ClaimOutcome,
+        infrastructure::{
+            adapters::{GitRepository, path_text},
+            location::runs_dir,
+            runtime_store::RunPlan,
+        },
+    };
+    let repository = GitRepository::inspect(repo).unwrap();
+    let mut queue = SqliteQueue::open(db).unwrap();
+    queue
+        .bind_repository(&path_text(&repository.common_dir).unwrap())
+        .unwrap();
+    let ClaimOutcome::Claimed { run } = queue
+        .claim_for_supervisor(&repository.main_head().unwrap(), token)
+        .unwrap()
+    else {
+        panic!("no candidate to claim")
+    };
+    let run_dir = runs_dir(&db.canonicalize().unwrap()).join(&run.id);
+    queue
+        .plan_run(
+            &run.id,
+            token,
+            &RunPlan {
+                repo_path: path_text(&repository.root).unwrap(),
+                run_dir: path_text(&run_dir).unwrap(),
+                branch: format!("taskq/{}", run.id),
+                worktree_path: path_text(&run_dir.join("worktree")).unwrap(),
+                receipt_path: path_text(&run_dir.join("receipt.json")).unwrap(),
+                log_path: path_text(&run_dir.join("claude.debug.log")).unwrap(),
+            },
+        )
+        .unwrap();
+    fs::create_dir_all(&run_dir).unwrap();
+    let run = queue.run(&run.id).unwrap();
+    let task = queue.show(run.task_id).unwrap().task;
+    fs::write(
+        run_dir.join("prompt.txt"),
+        runtime::prompt(&task, &run, None, &[], &[]).unwrap(),
+    )
+    .unwrap();
+    repository.create_worktree(&run).unwrap();
+    let command = shell_join(&[
+        "runner".into(),
+        "--db".into(),
+        path_text(db).unwrap(),
+        "session".into(),
+    ]);
+    let workspace = backend.create(&run, &command).unwrap();
+    queue.workspace_created(&run.id, token, &workspace).unwrap();
+    wait_until(db, Duration::from_secs(10), |queue| {
+        queue.run(&run.id).unwrap().status == RunStatus::Running
+    });
+    queue.run(&run.id).unwrap()
+}
+
+/// Age the lease of `run` so it is stale by heartbeat while its pid (this
+/// test process) is alive, like a supervisor that stopped heartbeating.
+fn age_lease(db: &Path, run: &TaskRun, seconds: i64) {
+    Connection::open(db)
+        .unwrap()
+        .execute(
+            "UPDATE run_leases SET heartbeat_at=unixepoch()-?2 WHERE run_id=?1",
+            rusqlite::params![run.id, seconds],
+        )
+        .unwrap();
+}
+
+fn adoption_events(detail: &cmux_taskq::domain::TaskDetail) -> Vec<&Value> {
+    detail
+        .events
+        .iter()
+        .filter(|e| e.kind == "run_adopted")
+        .map(|e| &e.payload)
+        .collect()
+}
+
+fn supervisor_token_of(db: &Path, run: &TaskRun) -> String {
+    Connection::open(db)
+        .unwrap()
+        .query_row(
+            "SELECT supervisor_token FROM task_runs WHERE id=?1",
+            [&run.id],
+            |r| r.get(0),
+        )
+        .unwrap()
+}
+
+/// A `running` run whose supervisor stopped heartbeating (lease 31 s old)
+/// while its wrapper keeps heartbeating is adopted by the next supervisor
+/// with a free slot: the lease and `supervisor_token` move to the adopter,
+/// `run_adopted` records what was taken over, and the adopter drives the
+/// run through receipt, idle, one exit request, validation and close.
+#[test]
+fn stale_lease_of_a_live_wrapper_is_adopted_and_driven_to_awaiting_integration() {
+    let (_dir, repo, db) = fixture();
+    let backend = TestWorkspace::new(&db, false, IDLE_AGENT);
+    let run = start_run_under_dead_supervisor(&repo, &db, &backend, "dead-supervisor");
+    age_lease(&db, &run, 31);
+    let mut queue = SqliteQueue::open(&db).unwrap();
+    // Nothing else is claimable: the pass exists only for the adoption.
+    assert!(queue.candidates().unwrap().is_empty());
+    assert_eq!(
+        runtime::status(&db).unwrap()["runs"][0]["lease"]["stale"],
+        true
+    );
+
+    let outcome = supervise(&db, &repo, &backend).unwrap();
+    backend.join();
+    assert_eq!(outcome["outcome"], "finished", "{outcome}");
+    assert_eq!(outcome["errors"], json!([]));
+    assert_eq!(outcome["runs"][0]["id"], json!(run.id));
+    assert_eq!(outcome["runs"][0]["status"], "awaiting_integration");
+    assert_eq!(backend.exits_sent.load(Ordering::SeqCst), 1);
+    assert_eq!(backend.closed(), vec![WORKSPACE_ID.to_owned()]);
+
+    let detail = queue.show(1).unwrap();
+    let adopted_run = &detail.runs[0];
+    assert_eq!(adopted_run.status, RunStatus::AwaitingIntegration);
+    assert!(adopted_run.last_error.is_none());
+    assert!(adopted_run.result_commit.is_some());
+    assert!(adopted_run.workspace_closed_at.is_some());
+    assert!(queue.run_leases().unwrap().is_empty());
+    let adopted = adoption_events(&detail);
+    assert_eq!(adopted.len(), 1, "{adopted:?}");
+    let payload = adopted[0];
+    assert_eq!(payload["previous_token"], "dead-supervisor");
+    assert_eq!(payload["previous_pid"], json!(std::process::id()));
+    let age = payload["previous_heartbeat_age_secs"].as_i64().unwrap();
+    assert!(age >= 31, "{payload}");
+    assert_eq!(payload["wrapper"]["pid"], json!(std::process::id()));
+    assert_eq!(payload["wrapper"]["alive"], true);
+    assert_eq!(payload["wrapper"]["exited_at"], Value::Null);
+    assert_eq!(payload["pid"], json!(std::process::id()));
+    // The adopter's token replaced the claimer's on the run.
+    let adopter = payload["token"].as_str().unwrap();
+    assert_ne!(adopter, "dead-supervisor");
+    assert_eq!(supervisor_token_of(&db, &run), adopter);
+    let kinds = event_kinds(&detail);
+    let position = |kind: &str| kinds.iter().position(|k| *k == kind).unwrap();
+    assert!(position("lease_acquired") < position("run_adopted"));
+    assert!(position("run_adopted") < position("receipt_observed"));
+    assert!(position("receipt_observed") < position("session_idle_observed"));
+    assert!(position("session_idle_observed") < position("exit_requested"));
+    assert!(position("exit_requested") < position("session_exited"));
+    assert!(position("session_exited") < position("supervision_finished"));
+    assert!(position("supervision_finished") < position("validation_finished"));
+    assert!(position("validation_finished") < position("workspace_closed"));
+    assert!(position("workspace_closed") < position("lease_released"));
+    assert_eq!(kinds.iter().filter(|k| **k == "exit_requested").count(), 1);
+    assert!(!kinds.contains(&"runtime_error"));
+    assert!(!kinds.contains(&"run_recovered"));
+    // The adoption is a fact of this run's history, not a second run.
+    assert_eq!(detail.runs.len(), 1);
+    let event = detail
+        .events
+        .iter()
+        .find(|e| e.kind == "run_adopted")
+        .unwrap();
+    assert_eq!(event.run_id.as_deref(), Some(run.id.as_str()));
+}
+
+/// The incident of task 15: the supervisor was killed a moment ago, so its
+/// lease pid is dead while its heartbeat is still fresh. The pid rule alone
+/// makes the lease stale, and the run is adopted without waiting for the TTL.
+#[test]
+fn dead_supervisor_pid_with_a_fresh_heartbeat_is_adopted() {
+    let (_dir, repo, db) = fixture();
+    let backend = TestWorkspace::new(&db, false, IDLE_AGENT);
+    let run = start_run_under_dead_supervisor(&repo, &db, &backend, "killed");
+    Connection::open(&db)
+        .unwrap()
+        .execute(
+            "UPDATE run_leases SET pid=?2, heartbeat_at=unixepoch() WHERE run_id=?1",
+            rusqlite::params![run.id, dead_pid()],
+        )
+        .unwrap();
+    let outcome = supervise(&db, &repo, &backend).unwrap();
+    backend.join();
+    assert_eq!(
+        outcome["runs"][0]["status"], "awaiting_integration",
+        "{outcome}"
+    );
+    assert_eq!(outcome["errors"], json!([]));
+    let mut queue = SqliteQueue::open(&db).unwrap();
+    let detail = queue.show(1).unwrap();
+    let adopted = adoption_events(&detail);
+    assert_eq!(adopted.len(), 1);
+    assert_eq!(adopted[0]["previous_token"], "killed");
+    assert_ne!(adopted[0]["previous_pid"], json!(std::process::id()));
+    assert!(adopted[0]["previous_heartbeat_age_secs"].as_i64().unwrap() < 30);
+    assert_eq!(backend.exits_sent.load(Ordering::SeqCst), 1);
+}
+
+/// Everything adoption must leave alone: a fresh lease; a stale lease whose
+/// wrapper is dead or silent (that is `recover`'s case, and `doctor` still
+/// says so); `claimed` / `starting` runs; runs without a lease row; and an
+/// `integrating` run. A supervisor pass over them adopts nothing and writes
+/// no `run_adopted` event.
+#[test]
+fn fresh_leases_dead_wrappers_early_runs_leaseless_and_integrating_runs_are_not_adopted() {
+    let (_dir, repo, db) = fixture();
+    let mut queue = SqliteQueue::open(&db).unwrap();
+    queue.transition(1, TaskAction::Draft).unwrap();
+    for title in [
+        "fresh",
+        "dead wrapper",
+        "silent wrapper",
+        "starting",
+        "leaseless",
+        "claimed",
+    ] {
+        add_ready_task(&mut queue, title, &[]);
+    }
+    let raw = Connection::open(&db).unwrap();
+    // Fresh lease, live wrapper (children that heartbeat nothing but are alive; the
+    // lease is what decides here).
+    let mut children: Vec<std::process::Child> = Vec::new();
+    let mut spawn = || {
+        let child = Command::new("sleep").arg("60").spawn().unwrap();
+        let pid = child.id();
+        children.push(child);
+        pid
+    };
+    let fresh = orphan_run(&repo, &db, "fresh-owner", spawn(), spawn());
+    // Stale lease, wrapper dead: recoverable, never adopted.
+    let dead_wrapper = orphan_run(&repo, &db, "gone", dead_pid(), dead_pid());
+    // Stale lease, wrapper alive but silent for longer than the TTL.
+    let silent_wrapper = orphan_run(&repo, &db, "gone", spawn(), spawn());
+    raw.execute(
+        "UPDATE run_leases SET heartbeat_at=unixepoch()-31, pid=?1 WHERE token='gone'",
+        [dead_pid()],
+    )
+    .unwrap();
+    raw.execute(
+        "UPDATE run_processes SET heartbeat_at=unixepoch()-31 WHERE run_id IN (?1, ?2)",
+        [&dead_wrapper.id, &silent_wrapper.id],
+    )
+    .unwrap();
+    // `starting` with a stale lease: register_wrapper needs the claimer's token.
+    use cmux_taskq::{domain::ClaimOutcome, infrastructure::runtime_store::RunPlan};
+    let base = queue.run(&fresh.id).unwrap().base_commit;
+    let ClaimOutcome::Claimed { run: starting } =
+        queue.claim_for_supervisor(&base, "gone-early").unwrap()
+    else {
+        panic!()
+    };
+    queue
+        .plan_run(
+            &starting.id,
+            "gone-early",
+            &RunPlan {
+                repo_path: "/test".into(),
+                run_dir: "/run".into(),
+                branch: "taskq/starting".into(),
+                worktree_path: "/run/worktree".into(),
+                receipt_path: "/run/receipt.json".into(),
+                log_path: "/run/log".into(),
+            },
+        )
+        .unwrap();
+    let starting = queue.run(&starting.id).unwrap();
+    assert_eq!(starting.status, RunStatus::Starting);
+    // `running` without a lease: abandoned by a runtime error or recovered.
+    let leaseless = orphan_run(&repo, &db, "abandoned", spawn(), spawn());
+    queue
+        .abandon_run(&leaseless.id, "abandoned", "exit request timed out")
+        .unwrap();
+    assert!(queue.run_lease(&leaseless.id).unwrap().is_none());
+    // `claimed` with a stale lease.
+    let ClaimOutcome::Claimed { run: claimed } =
+        queue.claim_for_supervisor(&base, "gone-early").unwrap()
+    else {
+        panic!()
+    };
+    raw.execute(
+        "UPDATE run_leases SET heartbeat_at=0, pid=?1 WHERE token='gone-early'",
+        [dead_pid()],
+    )
+    .unwrap();
+    assert!(queue.candidates().unwrap().is_empty());
+    let before = runtime::doctor(&db).unwrap();
+    let health = |report: &Value, run: &TaskRun| -> Value {
+        report["runs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["run_id"] == json!(run.id))
+            .cloned()
+            .unwrap()
+    };
+    assert_eq!(health(&before, &dead_wrapper)["recoverable"], true);
+    assert_eq!(health(&before, &silent_wrapper)["recoverable"], false);
+    assert_eq!(health(&before, &fresh)["recoverable"], false);
+    assert_eq!(health(&before, &starting)["recoverable"], true);
+    assert_eq!(health(&before, &claimed)["recoverable"], true);
+
+    let backend = TestWorkspace::new(&db, true, VALID_AGENT);
+    let outcome = supervise(&db, &repo, &backend).unwrap();
+    assert_eq!(outcome["outcome"], "finished", "{outcome}");
+    assert_eq!(outcome["runs"], json!([]));
+    assert_eq!(outcome["errors"], json!([]));
+    for run in [
+        &fresh,
+        &dead_wrapper,
+        &silent_wrapper,
+        &starting,
+        &leaseless,
+        &claimed,
+    ] {
+        let detail = queue.show(run.task_id).unwrap();
+        assert!(
+            adoption_events(&detail).is_empty(),
+            "run {} of task {} was adopted",
+            run.id,
+            run.task_id
+        );
+        assert_eq!(queue.run(&run.id).unwrap().status, run.status);
+    }
+    // Leases, tokens and doctor's verdicts are exactly as before the pass.
+    assert_eq!(
+        queue.run_lease(&fresh.id).unwrap().unwrap().token,
+        "fresh-owner"
+    );
+    assert_eq!(
+        queue.run_lease(&dead_wrapper.id).unwrap().unwrap().token,
+        "gone"
+    );
+    assert_eq!(
+        queue.run_lease(&silent_wrapper.id).unwrap().unwrap().token,
+        "gone"
+    );
+    assert_eq!(
+        queue.run_lease(&starting.id).unwrap().unwrap().token,
+        "gone-early"
+    );
+    assert_eq!(
+        queue.run_lease(&claimed.id).unwrap().unwrap().token,
+        "gone-early"
+    );
+    assert!(queue.run_lease(&leaseless.id).unwrap().is_none());
+    let after = runtime::doctor(&db).unwrap();
+    for run in [&fresh, &dead_wrapper, &silent_wrapper, &starting, &claimed] {
+        assert_eq!(
+            health(&after, run)["recoverable"],
+            health(&before, run)["recoverable"]
+        );
+        assert_eq!(
+            health(&after, run)["lease"]["stale"],
+            health(&before, run)["lease"]["stale"]
+        );
+    }
+    assert_eq!(health(&after, &dead_wrapper)["recoverable"], true);
+    assert_eq!(
+        runtime::recover(&db, &dead_wrapper.id).unwrap()["run"]["status"],
+        "interrupted"
+    );
+    for child in &mut children {
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
+}
+
+/// An `integrating` run is never adopted, however stale its lease: a
+/// crashed landing is `recover`'s case and goes back to the merge queue.
+#[test]
+fn integrating_run_with_a_stale_lease_is_not_adopted() {
+    let (_dir, repo, db, run) = awaiting_run();
+    let mut queue = SqliteQueue::open(&db).unwrap();
+    let main = git_out(&repo, &["rev-parse", "main"]);
+    queue.begin_integration(&run.id, "crashed", &main).unwrap();
+    Connection::open(&db)
+        .unwrap()
+        .execute("UPDATE run_leases SET heartbeat_at=0, pid=?1", [dead_pid()])
+        .unwrap();
+    assert!(queue.candidates().unwrap().is_empty()); // The dependent still waits.
+    let backend = TestWorkspace::new(&db, true, VALID_AGENT);
+    let outcome = supervise(&db, &repo, &backend).unwrap();
+    assert_eq!(outcome["runs"], json!([]), "{outcome}");
+    assert_eq!(outcome["errors"], json!([]));
+    assert_eq!(queue.run(&run.id).unwrap().status, RunStatus::Integrating);
+    assert_eq!(queue.run_lease(&run.id).unwrap().unwrap().token, "crashed");
+    assert!(adoption_events(&queue.show(1).unwrap()).is_empty());
+    assert_eq!(
+        runtime::recover(&db, &run.id).unwrap()["run"]["status"],
+        "awaiting_integration"
+    );
+}
+
+/// The previous supervisor already asked the session to exit: the adopter
+/// rebuilds that from the `exit_requested` event and does not send `/exit`
+/// again, and its receipt observation is not repeated either.
+#[test]
+fn adopter_does_not_repeat_an_exit_request_the_previous_supervisor_sent() {
+    let (_dir, repo, db) = fixture();
+    // The session ends on its own a few seconds after going idle, as it
+    // would after the /exit that was already typed.
+    let backend = TestWorkspace::new(
+        &db,
+        false,
+        "commit work; receipt \"$(git rev-parse HEAD)\"; idle; sleep 4",
+    );
+    let run = start_run_under_dead_supervisor(&repo, &db, &backend, "dead-supervisor");
+    let receipt = PathBuf::from(run.receipt_path.as_ref().unwrap());
+    wait_until(&db, Duration::from_secs(10), |_| receipt.is_file());
+    // What the previous supervisor recorded before it died.
+    let mut queue = SqliteQueue::open(&db).unwrap();
+    queue
+        .record_runtime_event(
+            &run.id,
+            "receipt_observed",
+            json!({"path": run.receipt_path, "validated": false}),
+        )
+        .unwrap();
+    queue
+        .record_runtime_event(&run.id, "session_idle_observed", json!({}))
+        .unwrap();
+    queue
+        .record_runtime_event(
+            &run.id,
+            "exit_requested",
+            json!({"workspace_id": WORKSPACE_ID, "timeout_secs": 120}),
+        )
+        .unwrap();
+    age_lease(&db, &run, 31);
+    let outcome = supervise(&db, &repo, &backend).unwrap();
+    backend.join();
+    assert_eq!(
+        outcome["runs"][0]["status"], "awaiting_integration",
+        "{outcome}"
+    );
+    assert_eq!(backend.exits_sent.load(Ordering::SeqCst), 0);
+    let detail = queue.show(1).unwrap();
+    assert_eq!(adoption_events(&detail).len(), 1);
+    let kinds = event_kinds(&detail);
+    assert_eq!(kinds.iter().filter(|k| **k == "exit_requested").count(), 1);
+    assert_eq!(
+        kinds.iter().filter(|k| **k == "receipt_observed").count(),
+        1
+    );
+    assert_eq!(
+        kinds
+            .iter()
+            .filter(|k| **k == "session_idle_observed")
+            .count(),
+        1
+    );
+    assert!(!kinds.contains(&"exit_request_timed_out"));
+}
+
+/// The exit timeout of an adopted run restarts at adoption: a session that
+/// still ignores the earlier request is given up after the adopter's own
+/// timeout, with one `exit_requested` event in total.
+#[test]
+fn adopted_exit_request_times_out_from_the_adoption() {
+    let (_dir, repo, db) = fixture();
+    let mut backend = TestWorkspace::new(&db, false, IDLE_AGENT);
+    backend.exit_timeout = Duration::from_secs(2);
+    let run = start_run_under_dead_supervisor(&repo, &db, &backend, "dead-supervisor");
+    let mut queue = SqliteQueue::open(&db).unwrap();
+    queue
+        .record_runtime_event(
+            &run.id,
+            "exit_requested",
+            json!({"workspace_id": WORKSPACE_ID, "timeout_secs": 120}),
+        )
+        .unwrap();
+    age_lease(&db, &run, 31);
+    let outcome = supervise(&db, &repo, &backend).unwrap();
+    assert_eq!(outcome["runs"], json!([]), "{outcome}");
+    let error = outcome["errors"][0]["message"].as_str().unwrap();
+    assert!(error.contains("did not exit within 2s"), "{error}");
+    assert_eq!(backend.exits_sent.load(Ordering::SeqCst), 0);
+    let detail = queue.show(1).unwrap();
+    assert_eq!(adoption_events(&detail).len(), 1);
+    let kinds = event_kinds(&detail);
+    assert_eq!(kinds.iter().filter(|k| **k == "exit_requested").count(), 1);
+    assert!(kinds.contains(&"exit_request_timed_out"));
+    assert_eq!(queue.run(&run.id).unwrap().status, RunStatus::Running);
+    assert!(queue.run_leases().unwrap().is_empty());
+    // Let the fake session out; nothing adopts a lease-less run afterwards.
+    fs::write(exit_request_path(run.run_dir.as_ref().unwrap()), "").unwrap();
+    backend.join();
+    let again = supervise(&db, &repo, &backend).unwrap();
+    assert_eq!(again["runs"], json!([]));
+    assert_eq!(adoption_events(&queue.show(1).unwrap()).len(), 1);
+}
+
+/// The supervisor died after the wrapper reported its exit but before
+/// `supervision_finished`, and, separately, while a run was `validating`.
+/// Both are adopted: the first finishes supervision from the recorded exit,
+/// the second restarts validation from the receipt and worktree.
+#[test]
+fn exited_wrapper_and_validating_runs_are_adopted_and_validated() {
+    let (_dir, repo, db) = fixture();
+    let mut queue = SqliteQueue::open(&db).unwrap();
+    add_ready_task(&mut queue, "validating", &[]);
+    let backend = TestWorkspace::new(&db, false, VALID_AGENT);
+    // The first session goes idle after its receipt and then ends on its own
+    // (a maintainer's /exit by the old procedure): the adopter must not
+    // send /exit to a session that already exited.
+    backend.script_for(
+        1,
+        "commit work; receipt \"$(git rev-parse HEAD)\"; idle; sleep 1",
+    );
+    let exited = start_run_under_dead_supervisor(&repo, &db, &backend, "dead-a");
+    let validating = start_run_under_dead_supervisor(&repo, &db, &backend, "dead-b");
+    backend.join(); // Both sessions end by themselves.
+    for run in [&exited, &validating] {
+        assert!(event_kinds(&queue.show(run.task_id).unwrap()).contains(&"session_exited"));
+        assert_eq!(queue.run(&run.id).unwrap().status, RunStatus::Running);
+    }
+    queue.finish_supervision(&validating.id, "dead-b").unwrap();
+    assert_eq!(
+        queue.run(&validating.id).unwrap().status,
+        RunStatus::Validating
+    );
+    age_lease(&db, &exited, 31);
+    age_lease(&db, &validating, 31);
+
+    let outcome = supervise(&db, &repo, &backend).unwrap();
+    assert_eq!(outcome["errors"], json!([]), "{outcome}");
+    assert_eq!(outcome["runs"].as_array().unwrap().len(), 2);
+    assert_eq!(backend.exits_sent.load(Ordering::SeqCst), 0);
+    let mut closed = backend.closed();
+    closed.sort();
+    assert_eq!(closed, [workspace_id(0), workspace_id(1)]);
+    for run in [&exited, &validating] {
+        let detail = queue.show(run.task_id).unwrap();
+        let after = &detail.runs[0];
+        assert_eq!(after.status, RunStatus::AwaitingIntegration, "{}", run.id);
+        assert!(after.last_error.is_none(), "{after:?}");
+        assert!(!event_kinds(&detail).contains(&"exit_requested"));
+        assert!(after.result_commit.is_some());
+        assert!(after.workspace_closed_at.is_some());
+        let adopted = adoption_events(&detail);
+        assert_eq!(adopted.len(), 1);
+        assert_eq!(adopted[0]["wrapper"]["alive"], Value::Null);
+        assert!(adopted[0]["wrapper"]["exited_at"].is_number());
+        let kinds = event_kinds(&detail);
+        assert_eq!(
+            kinds
+                .iter()
+                .filter(|k| **k == "supervision_finished")
+                .count(),
+            1
+        );
+        assert_eq!(
+            kinds
+                .iter()
+                .filter(|k| **k == "validation_finished")
+                .count(),
+            1
+        );
+        assert!(kinds.contains(&"verification_command"));
+    }
+    let detail = queue.show(exited.task_id).unwrap();
+    let kinds = event_kinds(&detail);
+    let position = |kind: &str| kinds.iter().position(|k| *k == kind).unwrap();
+    assert!(position("session_exited") < position("run_adopted"));
+    assert!(position("run_adopted") < position("supervision_finished"));
+    let detail = queue.show(validating.task_id).unwrap();
+    let kinds = event_kinds(&detail);
+    let position = |kind: &str| kinds.iter().position(|k| *k == kind).unwrap();
+    assert!(position("supervision_finished") < position("run_adopted"));
+    assert!(position("run_adopted") < position("validation_finished"));
+    assert!(queue.run_leases().unwrap().is_empty());
+}
+
+/// Two supervisors with free slots find the same stale lease at once: the
+/// transaction lets exactly one of them adopt, the other sees no lease
+/// under the old token and moves on. One `run_adopted` event, one owner.
+#[test]
+fn two_supervisors_racing_for_one_stale_lease_adopt_it_once() {
+    let (_dir, repo, db) = fixture();
+    let backend = Arc::new(TestWorkspace::new(&db, false, IDLE_AGENT));
+    let run = start_run_under_dead_supervisor(&repo, &db, &backend, "dead-supervisor");
+    age_lease(&db, &run, 31);
+    let racers: Vec<_> = (0..2)
+        .map(|_| {
+            let (db, repo, backend) = (db.clone(), repo.clone(), backend.clone());
+            thread::spawn(move || supervise(&db, &repo, &backend))
+        })
+        .collect();
+    let outcomes: Vec<Value> = racers
+        .into_iter()
+        .map(|racer| racer.join().unwrap().unwrap())
+        .collect();
+    backend.join();
+    let driven: Vec<&Value> = outcomes
+        .iter()
+        .filter(|o| !o["runs"].as_array().unwrap().is_empty())
+        .collect();
+    assert_eq!(driven.len(), 1, "{outcomes:?}");
+    assert_eq!(driven[0]["runs"][0]["status"], "awaiting_integration");
+    assert!(outcomes.iter().all(|o| o["errors"] == json!([])));
+    assert_eq!(backend.exits_sent.load(Ordering::SeqCst), 1);
+    let mut queue = SqliteQueue::open(&db).unwrap();
+    let detail = queue.show(1).unwrap();
+    let adopted = adoption_events(&detail);
+    assert_eq!(adopted.len(), 1, "{adopted:?}");
+    assert_eq!(supervisor_token_of(&db, &run), adopted[0]["token"]);
+    assert_eq!(detail.runs[0].status, RunStatus::AwaitingIntegration);
+
+    // The queue method itself: a second adoption under the old token, or
+    // one against a fresh lease, takes nothing.
+    add_ready_task(&mut queue, "second", &[]);
+    add_ready_task(&mut queue, "early", &[]);
+    let second = orphan_run(&repo, &db, "fresh", std::process::id(), std::process::id());
+    assert!(
+        queue
+            .adopt_run(&second.id, "fresh", "eager", 1, json!({}))
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(queue.run_lease(&second.id).unwrap().unwrap().token, "fresh");
+    age_lease(&db, &second, 31);
+    let taken = queue
+        .adopt_run(&second.id, "fresh", "first", 1, json!({"pid": 1}))
+        .unwrap()
+        .unwrap();
+    assert_eq!(taken.status, RunStatus::Running);
+    assert!(
+        queue
+            .adopt_run(&second.id, "fresh", "second", 2, json!({}))
+            .unwrap()
+            .is_none()
+    );
+    let lease = queue.run_lease(&second.id).unwrap().unwrap();
+    assert_eq!((lease.token.as_str(), lease.pid), ("first", 1));
+    assert!(runtime::unix_time() - lease.heartbeat_at <= 5);
+    assert_eq!(supervisor_token_of(&db, &second), "first");
+    assert!(queue.holds_lease(&second.id, "first").unwrap());
+    assert!(!queue.holds_lease(&second.id, "fresh").unwrap());
+    assert!(queue.has_run_event(&second.id, "run_adopted").unwrap());
+    assert!(!queue.has_run_event(&second.id, "receipt_observed").unwrap());
+    let payload = &adoption_events(&queue.show(second.task_id).unwrap())[0].clone();
+    assert_eq!(payload["wrapper"], json!({"pid": 1}));
+    assert_eq!(payload["previous_token"], "fresh");
+    assert_eq!(payload["previous_pid"], json!(std::process::id()));
+    // A `starting` run is refused by the method too, stale or not.
+    use cmux_taskq::domain::ClaimOutcome;
+    let ClaimOutcome::Claimed { run: early } = queue
+        .claim_for_supervisor(&second.base_commit, "early")
+        .unwrap()
+    else {
+        panic!()
+    };
+    age_lease(&db, &early, 31);
+    assert!(
+        queue
+            .adopt_run(&early.id, "early", "eager", 1, json!({}))
+            .unwrap()
+            .is_none()
+    );
+    // The status/doctor lists the adopted run under the adopter's token like any other.
+    let status = runtime::status(&db).unwrap();
+    let holders: Vec<&Value> = status["supervisors"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|s| s["run_ids"].as_array().unwrap().contains(&json!(second.id)))
+        .collect();
+    assert_eq!(holders.len(), 1);
+    assert_eq!(holders[0]["pid"], 1);
+}
+
+/// A resident supervisor whose lease was taken over (here by hand, as an
+/// adopter or `recover` would) drops the run from its slots without writing
+/// anything more about it, while the adopter drives the run to the end.
+#[test]
+fn a_supervisor_that_lost_its_lease_stops_touching_the_run() {
+    let (_dir, repo, db) = fixture();
+    let backend = Arc::new(TestWorkspace::new(&db, false, IDLE_AGENT));
+    let options = SuperviseOptions::new(2, false);
+    let original = {
+        let (db, repo, backend, options) =
+            (db.clone(), repo.clone(), backend.clone(), options.clone());
+        thread::spawn(move || supervise_with(&db, &repo, &backend, &options))
+    };
+    wait_until(&db, Duration::from_secs(20), |queue| {
+        queue
+            .active_runs()
+            .unwrap()
+            .first()
+            .is_some_and(|r| r.status == RunStatus::Running)
+    });
+    let mut queue = SqliteQueue::open(&db).unwrap();
+    let run = queue.active_runs().unwrap().remove(0);
+    // Draining: the original keeps driving its run but adopts and claims
+    // nothing more, so it cannot take the lease back once it loses it.
+    options.stop.store(true, Ordering::SeqCst);
+    // The lease changes hands: another token, stale, as a killed
+    // supervisor's would look to an adopter.
+    Connection::open(&db)
+        .unwrap()
+        .execute(
+            "UPDATE run_leases SET token='taken', heartbeat_at=unixepoch()-31 WHERE run_id=?1",
+            [&run.id],
+        )
+        .unwrap();
+    // The original notices within a tick, drops the run and, draining with
+    // nothing active, exits.
+    let outcome = original.join().unwrap().unwrap();
+    assert_eq!(queue.run(&run.id).unwrap().status, RunStatus::Running);
+    assert_eq!(queue.run_lease(&run.id).unwrap().unwrap().token, "taken");
+    let adopter = supervise(&db, &repo, &backend).unwrap();
+    backend.join();
+    assert_eq!(
+        adopter["runs"][0]["status"], "awaiting_integration",
+        "{adopter}"
+    );
+    assert_eq!(backend.exits_sent.load(Ordering::SeqCst), 1);
+    assert_eq!(outcome["outcome"], "stopped");
+    assert_eq!(outcome["runs"], json!([]));
+    assert_eq!(outcome["errors"][0]["run_id"], json!(run.id));
+    assert!(
+        outcome["errors"][0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("held by another process"),
+        "{outcome}"
+    );
+    let detail = queue.show(1).unwrap();
+    assert_eq!(detail.runs[0].status, RunStatus::AwaitingIntegration);
+    assert!(detail.runs[0].last_error.is_none());
+    let kinds = event_kinds(&detail);
+    assert!(!kinds.contains(&"runtime_error"), "{kinds:?}");
+    assert_eq!(kinds.iter().filter(|k| **k == "exit_requested").count(), 1);
+    let adopted = adoption_events(&detail);
+    assert_eq!(adopted.len(), 1);
+    assert_eq!(adopted[0]["previous_token"], "taken");
+    assert!(queue.supervisors().unwrap().is_empty());
+}

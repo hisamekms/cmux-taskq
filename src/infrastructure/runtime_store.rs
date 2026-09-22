@@ -4,12 +4,31 @@ use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
 use serde::Serialize;
 use serde_json::json;
 
-use super::sqlite::{SqliteQueue, claim_task, event, read_task, run_row};
+use super::{
+    adapters::process_alive,
+    sqlite::{SqliteQueue, claim_task, event, read_task, run_row},
+};
 use crate::domain::{
     ClaimOutcome, RunLease, RunProcess, SupervisorRegistration, Task, TaskRun, validate_base_commit,
 };
 
 pub const HEARTBEAT_TIMEOUT_SECS: i64 = 30;
+
+/// Whether a lease no longer has a working process behind it: its pid is
+/// dead or its heartbeat is older than `HEARTBEAT_TIMEOUT_SECS`. The rule
+/// `status` / `doctor` report as `stale` and the one adoption re-checks.
+pub fn lease_is_stale(lease: &RunLease, now: i64) -> bool {
+    !process_alive(lease.pid) || now - lease.heartbeat_at > HEARTBEAT_TIMEOUT_SECS
+}
+
+/// A run some other process leases, with its wrapper registration: what a
+/// supervisor with a free slot judges for adoption (ADR-0012).
+#[derive(Debug, Clone)]
+pub struct LeasedRun {
+    pub run: TaskRun,
+    pub lease: RunLease,
+    pub wrapper: Option<RunProcess>,
+}
 
 /// Outcome of supervisor-side receipt validation. `result_commit` is kept on
 /// rejection too when the commit itself was verified, so inspection can start there.
@@ -166,6 +185,139 @@ impl SqliteQueue {
         run_event(&tx, id, "lease_released", json!({"reason": "finished"}))?;
         tx.commit()?;
         Ok(())
+    }
+
+    /// `running` and `validating` runs whose lease carries a token other
+    /// than `token`, oldest run first, each with its wrapper registration.
+    /// Runs in other statuses and runs without a lease are not adoptable,
+    /// so they are not listed.
+    pub fn runs_leased_by_others(&self, token: &str) -> Result<Vec<LeasedRun>> {
+        let mut statement = self.conn.prepare(
+            "SELECT r.*, l.token, l.pid, l.heartbeat_at FROM task_runs r
+             JOIN run_leases l ON l.run_id=r.id
+             WHERE r.status IN ('running','validating') AND l.token<>?1
+             ORDER BY r.rowid",
+        )?;
+        let rows = statement
+            .query_map([token], |r| {
+                let run = run_row(r)?;
+                let lease = RunLease {
+                    run_id: run.id.clone(),
+                    token: r.get("token")?,
+                    pid: r.get("pid")?,
+                    heartbeat_at: r.get("heartbeat_at")?,
+                };
+                Ok((run, lease))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows.into_iter()
+            .map(|(run, lease)| {
+                let wrapper = self
+                    .conn
+                    .query_row(
+                        "SELECT * FROM run_processes WHERE run_id=?1 AND role='wrapper'",
+                        [&run.id],
+                        process_row,
+                    )
+                    .optional()?;
+                Ok(LeasedRun {
+                    run,
+                    lease,
+                    wrapper,
+                })
+            })
+            .collect()
+    }
+
+    /// Take over a `running` or `validating` run whose supervisor is gone
+    /// (ADR-0012): the lease row keeps its run but gets this process's
+    /// `token`, `pid` and a fresh heartbeat, `task_runs.supervisor_token`
+    /// follows so the lease-guarded transitions accept the adopter, and a
+    /// `run_adopted` event keeps the claimer's token and pid, the age of the
+    /// heartbeat it left behind, and `wrapper` as the caller observed it.
+    /// The staleness of the lease under `previous_token` is re-checked
+    /// inside the transaction. `Ok(None)` means nothing was taken: the lease
+    /// is fresh again, released, or already carries another token (a second
+    /// adopter won the race). The wrapper registration and every other row
+    /// are untouched.
+    pub fn adopt_run(
+        &mut self,
+        id: &str,
+        previous_token: &str,
+        token: &str,
+        pid: u32,
+        wrapper: serde_json::Value,
+    ) -> Result<Option<TaskRun>> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let now: i64 = tx.query_row("SELECT unixepoch()", [], |r| r.get(0))?;
+        let lease = tx
+            .query_row(
+                "SELECT l.run_id,l.token,l.pid,l.heartbeat_at FROM run_leases l
+                 JOIN task_runs r ON r.id=l.run_id
+                 WHERE l.run_id=?1 AND l.token=?2 AND r.status IN ('running','validating')",
+                params![id, previous_token],
+                lease_row,
+            )
+            .optional()?;
+        let Some(lease) = lease else {
+            return Ok(None);
+        };
+        if !lease_is_stale(&lease, now) {
+            return Ok(None);
+        }
+        let updated = tx.execute(
+            "UPDATE run_leases SET token=?3,pid=?4,heartbeat_at=unixepoch()
+             WHERE run_id=?1 AND token=?2",
+            params![id, previous_token, token, pid],
+        )?;
+        if updated == 0 {
+            return Ok(None);
+        }
+        ensure!(
+            tx.execute(
+                "UPDATE task_runs SET supervisor_token=?2 WHERE id=?1",
+                params![id, token]
+            )? == 1,
+            "run does not exist"
+        );
+        run_event(
+            &tx,
+            id,
+            "run_adopted",
+            json!({
+                "previous_token": lease.token,
+                "previous_pid": lease.pid,
+                "previous_heartbeat_age_secs": now - lease.heartbeat_at,
+                "wrapper": wrapper,
+                "token": token,
+                "pid": pid,
+            }),
+        )?;
+        let result = tx.query_row("SELECT * FROM task_runs WHERE id=?1", [id], run_row)?;
+        tx.commit()?;
+        Ok(Some(result))
+    }
+
+    /// Whether this process still holds the run's lease. An adopted-away or
+    /// recovered run answers `false`, and its former owner must not touch it.
+    pub fn holds_lease(&self, id: &str, token: &str) -> Result<bool> {
+        Ok(self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM run_leases WHERE run_id=?1 AND token=?2)",
+            params![id, token],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// Whether the run has recorded at least one event of `kind`; an
+    /// adopter rebuilds what the previous supervisor already did from these.
+    pub fn has_run_event(&self, id: &str, kind: &str) -> Result<bool> {
+        Ok(self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM run_events WHERE run_id=?1 AND kind=?2)",
+            params![id, kind],
+            |r| r.get(0),
+        )?)
     }
 
     /// Record a runtime error and disown the run without changing its status
