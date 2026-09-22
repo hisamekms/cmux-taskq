@@ -111,6 +111,8 @@ worktreeとbranchは削除しない。統合確認後の削除は人が行う。
 
 workspaceの終了はsupervisorが行う。receipt検証を通った`awaiting_integration`のrunだけが対象で、workspaceだけを閉じ、worktreeとbranchはmainへの反映まで残す。`failed`（非0終了、検証拒否）、provisioningや検証処理のエラー、wrapper heartbeat切れの場合はworkspaceもworktreeも調査のため残し、closeを呼ばない。
 
+cmux 0.64.25は`--command`のプロセスが終了すると1〜2秒後にworkspaceを自ら閉じる。supervisorのcloseはこれと競合し、先にcmuxが閉じていると`cmux workspace close`は`not_found`で失敗して`cleanup_failed`になる（[015](../journal/015-e2e-happy-path.md)のe2eでは、wrapper終了から検証・closeまでが1秒以内に収まるため通常はsupervisorのcloseが先に成功する）。wrapper終了直後の`read-screen`も同じ競合で`screen_capture_failed`になりうる。
+
 closeの成否は`task_runs.workspace_closed_at`で表す。nullは「閉じたことを確認していない」で、closeの失敗だけでなく、cmuxが閉じた後にDBへ書けなかった場合も含む。closeの失敗は`cleanup_failed`イベントと`last_error`に残るが、run状態は変えない。閉じていないworkspaceをcleaned扱いにせず、再試行は`doctor`/`recover`（[009](../journal/009-doctor-recover.md)）で扱う。
 
 supervisorの再起動ではleaseとheartbeatを確認し、孤児プロセスを勝手に再実行しない。ユーザーが`recover`で明示的に復旧した後に新しいTaskRunを作る。
