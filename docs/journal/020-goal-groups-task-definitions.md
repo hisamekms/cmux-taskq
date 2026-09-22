@@ -105,7 +105,7 @@ cmux-taskq add "plugin: taskq skill registers a goal and decomposes it into task
 - 019 は journal テンプレートの `## Goal` 節を変えなかったので、`## Scope` への改名を T2 に含めた
 - T1 の「Tasks in progress」（全 in_progress task）は T3 で「Sibling tasks in progress」（同じ goal に限定）に置き換わる。T1 単独で並列の衝突回避に効かせるため、段階1で全 task を載せる
 - T4 の受け入れ条件 2 は plugin の skill を実 CLI に対して通す手動確認で、run session が worktree でビルドしたバイナリと `--db` の使い捨て queue で行う。固定バイナリは v6 なので使えない
-- 登録した task ID: T1 = 未登録、T2 = 未登録、T3 = 未登録、T4 = 未登録（SV が記入）
+- 登録した task ID: T1 = 10、T2 = 11、T3 = 12、T4 = 13（SV が 2026-09-22 に登録。10・11 は ready、12・13 は T2 着地後に goal を付けてから ready にするため draft のまま）
 
 ## Result
 
