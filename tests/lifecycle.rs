@@ -5,6 +5,7 @@
 //! launchd and cmux path is `tests/e2e.rs`.
 use anyhow::{Result, bail};
 use cmux_taskq::{
+    VERSION,
     application::{
         AgentState, DetachedRefusal, LaunchAgent, ProcessControl, SupervisorEnvironment, TaskQueue,
         WorkspaceBackend,
@@ -96,6 +97,7 @@ fn fixture() -> Fixture {
         options: UpOptions {
             parallel: 2,
             in_cmux: false,
+            no_wait: false,
             plugin_dir: Some(dir.path().to_path_buf()),
             cmux,
             claude,
@@ -147,6 +149,7 @@ impl LaunchAgent for FakeLaunchd {
                 &uuid::Uuid::new_v4().to_string(),
                 std::process::id(),
                 2,
+                VERSION,
             )?;
         }
         Ok(())
@@ -277,7 +280,12 @@ impl WorkspaceBackend for FakeCmux {
             for registration in queue.supervisors()? {
                 queue.heartbeat(&registration.token)?;
             }
-            queue.register_supervisor(&uuid::Uuid::new_v4().to_string(), std::process::id(), 2)?;
+            queue.register_supervisor(
+                &uuid::Uuid::new_v4().to_string(),
+                std::process::id(),
+                2,
+                VERSION,
+            )?;
         }
         Ok(id)
     }
@@ -299,6 +307,76 @@ fn up(
         &fixture.options,
     )
     .unwrap()
+}
+
+fn try_up(
+    fixture: &Fixture,
+    cmux: &FakeCmux,
+    launchd: &FakeLaunchd,
+    processes: &FakeProcesses,
+) -> Result<Value> {
+    lifecycle::up(
+        &fixture.location,
+        &fixture.repo,
+        cmux,
+        launchd,
+        processes,
+        &fixture.environment,
+        &fixture.options,
+    )
+}
+
+/// Rewrite the version a registration recorded, standing in for a
+/// supervisor of another build (`Some`) or one that registered before the
+/// column existed (`None`).
+fn set_binary_version(db: &Path, token: &str, version: Option<&str>) {
+    Connection::open(db)
+        .unwrap()
+        .execute(
+            "UPDATE supervisors SET binary_version=?2 WHERE token=?1",
+            rusqlite::params![token, version],
+        )
+        .unwrap();
+}
+
+/// Poll `condition` until it holds. On the deadline the supervisor's pid
+/// is marked dead before the panic: `up`'s drain loop is otherwise
+/// unbounded, so a helper thread that merely panicked would leave the main
+/// thread waiting for a registration nothing is going to remove, and
+/// `thread::scope` would never join.
+fn wait_until(processes: &FakeProcesses, pid: u32, condition: impl Fn() -> bool) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !condition() {
+        if std::time::Instant::now() >= deadline {
+            processes.dead.lock().unwrap().insert(pid);
+            panic!("the condition never held; released the drain so the test can fail");
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// A ready task claimed by `token`, so the queue has a run in flight.
+fn claim_a_run(fixture: &Fixture, queue: &mut SqliteQueue, token: &str) -> String {
+    let task = queue
+        .add(NewTask {
+            title: "in flight".into(),
+            description: String::new(),
+            acceptance: String::new(),
+            verification_commands: vec![],
+            dependencies: vec![],
+            goal_id: None,
+            context: String::new(),
+        })
+        .unwrap();
+    queue.transition(task.id, TaskAction::Ready).unwrap();
+    let repository = GitRepository::inspect(&fixture.repo).unwrap();
+    match queue
+        .claim_for_supervisor(&repository.base_commit, token)
+        .unwrap()
+    {
+        cmux_taskq::domain::ClaimOutcome::Claimed { run } => run.id,
+        outcome => panic!("expected a claim, got {outcome:?}"),
+    }
 }
 
 /// The mode recorded on a registration, read straight from the queue.
@@ -779,10 +857,14 @@ fn up_prunes_dead_registrations_and_keeps_live_ones_and_leases() {
     let fixture = fixture();
     let mut queue = SqliteQueue::open(&fixture.location.db).unwrap();
     let dead = [dead_pid(), dead_pid()];
-    queue.register_supervisor("dead-1", dead[0], 4).unwrap();
-    queue.register_supervisor("dead-2", dead[1], 1).unwrap();
     queue
-        .register_supervisor("live", std::process::id(), 3)
+        .register_supervisor("dead-1", dead[0], 4, VERSION)
+        .unwrap();
+    queue
+        .register_supervisor("dead-2", dead[1], 1, VERSION)
+        .unwrap();
+    queue
+        .register_supervisor("live", std::process::id(), 3, VERSION)
         .unwrap();
     let task = queue
         .add(NewTask {
@@ -1136,7 +1218,7 @@ fn up_in_cmux_does_not_mistake_a_silent_supervisor_for_the_one_it_started() {
     // Registered before `up`, alive, last heartbeat far in the past, and
     // first in `started_at` order.
     queue
-        .register_supervisor("silent", std::process::id(), 4)
+        .register_supervisor("silent", std::process::id(), 4, VERSION)
         .unwrap();
     Connection::open(&fixture.location.db)
         .unwrap()
@@ -1231,7 +1313,9 @@ fn down_interrupts_an_in_cmux_supervisor_and_closes_its_workspace_once_it_is_gon
     let workspace = cmux
         .create_named("taskq my repo supervisor", &fixture.repo, "supervise")
         .unwrap();
-    queue.register_supervisor("in-cmux", pid, 2).unwrap();
+    queue
+        .register_supervisor("in-cmux", pid, 2, VERSION)
+        .unwrap();
     queue
         .set_supervisor_mode("in-cmux", SupervisorMode::InCmux, Some(&workspace))
         .unwrap();
@@ -1303,7 +1387,9 @@ fn down_force_kills_an_in_cmux_supervisor_and_closes_or_reports_its_workspace() 
     let workspace = cmux
         .create_named("taskq my repo supervisor", &fixture.repo, "supervise")
         .unwrap();
-    queue.register_supervisor("in-cmux", pid, 2).unwrap();
+    queue
+        .register_supervisor("in-cmux", pid, 2, VERSION)
+        .unwrap();
     queue
         .set_supervisor_mode("in-cmux", SupervisorMode::InCmux, Some(&workspace))
         .unwrap();
@@ -1321,7 +1407,7 @@ fn down_force_kills_an_in_cmux_supervisor_and_closes_or_reports_its_workspace() 
 
     // cmux refusing the close (the workspace is already gone) leaves the
     // reason in the report; the supervisor is stopped either way.
-    queue.register_supervisor("again", pid, 2).unwrap();
+    queue.register_supervisor("again", pid, 2, VERSION).unwrap();
     queue
         .set_supervisor_mode("again", SupervisorMode::InCmux, Some(&workspace))
         .unwrap();
@@ -1377,7 +1463,7 @@ fn down_reports_not_running_without_a_live_registration_and_still_unloads_the_ag
     // agent with no registered process (a crash loop) is unloaded.
     let mut queue = SqliteQueue::open(&fixture.location.db).unwrap();
     let dead = dead_pid();
-    queue.register_supervisor("dead", dead, 1).unwrap();
+    queue.register_supervisor("dead", dead, 1, VERSION).unwrap();
     processes.dead.lock().unwrap().insert(dead);
     launchd.load(None);
     let report = down(&fixture, &cmux, &launchd, &processes, true, false);
@@ -1427,12 +1513,14 @@ fn down_stops_a_launchd_and_an_in_cmux_supervisor_in_one_call() {
     let workspace = cmux
         .create_named("taskq my repo supervisor", &fixture.repo, "supervise")
         .unwrap();
-    queue.register_supervisor("agent", agent_pid, 4).unwrap();
+    queue
+        .register_supervisor("agent", agent_pid, 4, VERSION)
+        .unwrap();
     queue
         .set_supervisor_mode("agent", SupervisorMode::Launchd, None)
         .unwrap();
     queue
-        .register_supervisor("in-cmux", in_cmux_pid, 2)
+        .register_supervisor("in-cmux", in_cmux_pid, 2, VERSION)
         .unwrap();
     queue
         .set_supervisor_mode("in-cmux", SupervisorMode::InCmux, Some(&workspace))
@@ -1464,7 +1552,9 @@ fn down_unloads_the_agent_and_returns_while_the_supervisor_drains() {
     let fixture = fixture();
     let mut queue = SqliteQueue::open(&fixture.location.db).unwrap();
     let pid = std::process::id();
-    queue.register_supervisor("resident", pid, 4).unwrap();
+    queue
+        .register_supervisor("resident", pid, 4, VERSION)
+        .unwrap();
     let launchd = FakeLaunchd::new(&fixture.location.db);
     let cmux = FakeCmux::default();
     launchd.load(Some(pid));
@@ -1496,7 +1586,9 @@ fn down_unloads_the_agent_and_returns_while_the_supervisor_drains() {
     // Both at once: the agent's own process is left to launchd's SIGTERM
     // (a second one would end its drain), the hand-started one is signalled.
     let by_hand = dead_pid(); // any pid the fake treats as alive
-    queue.register_supervisor("by-hand", by_hand, 1).unwrap();
+    queue
+        .register_supervisor("by-hand", by_hand, 1, VERSION)
+        .unwrap();
     launchd.load(Some(pid));
     let processes = FakeProcesses::default();
     let report = down(&fixture, &cmux, &launchd, &processes, false, false);
@@ -1515,7 +1607,9 @@ fn down_wait_returns_stopped_once_the_registration_is_gone_or_the_process_died()
     let fixture = fixture();
     let mut queue = SqliteQueue::open(&fixture.location.db).unwrap();
     let pid = std::process::id();
-    queue.register_supervisor("resident", pid, 4).unwrap();
+    queue
+        .register_supervisor("resident", pid, 4, VERSION)
+        .unwrap();
     let launchd = FakeLaunchd::new(&fixture.location.db);
     let cmux = FakeCmux::default();
     launchd.load(Some(pid));
@@ -1540,7 +1634,9 @@ fn down_wait_returns_stopped_once_the_registration_is_gone_or_the_process_died()
 
     // A supervisor killed by launchd's ExitTimeOut leaves its row; the dead
     // PID ends the wait just the same (and `up` prunes the row later).
-    queue.register_supervisor("second", pid, 4).unwrap();
+    queue
+        .register_supervisor("second", pid, 4, VERSION)
+        .unwrap();
     launchd.load(Some(pid));
     struct DiesLater {
         polls: AtomicUsize,
@@ -1587,7 +1683,9 @@ fn down_force_kills_after_the_unload_and_drops_the_registration() {
     let fixture = fixture();
     let mut queue = SqliteQueue::open(&fixture.location.db).unwrap();
     let pid = std::process::id();
-    queue.register_supervisor("resident", pid, 4).unwrap();
+    queue
+        .register_supervisor("resident", pid, 4, VERSION)
+        .unwrap();
     let launchd = FakeLaunchd::new(&fixture.location.db);
     let cmux = FakeCmux::default();
     launchd.load(Some(pid));
@@ -1650,4 +1748,478 @@ fn maintainer_prompt_names_the_queue_the_logs_the_skill_and_the_rules() {
     .unwrap();
     assert!(!bare.contains("--plugin-dir"));
     assert!(bare.contains("'/opt/claude' '--' 'You are the maintainer session"));
+}
+
+/// A live supervisor of another build is not reused: `up` unloads its
+/// agent, waits for the drain and starts one of its own version in its
+/// place (ADR-0014). A registration older than the `binary_version` column
+/// has no version at all, which is not this one either, so it is replaced
+/// the same way.
+#[test]
+fn up_drains_and_replaces_a_launchd_supervisor_of_another_version() {
+    for previous in [Some("0.0.1"), None] {
+        let fixture = fixture();
+        let mut queue = SqliteQueue::open(&fixture.location.db).unwrap();
+        let pid = std::process::id();
+        queue.register_supervisor("old", pid, 4, VERSION).unwrap();
+        queue
+            .set_supervisor_mode("old", SupervisorMode::Launchd, None)
+            .unwrap();
+        set_binary_version(&fixture.location.db, "old", previous);
+        let cmux = FakeCmux::default();
+        let launchd = FakeLaunchd::new(&fixture.location.db);
+        // The agent is loaded and its process is the registered one, so
+        // launchd's bootout carries the SIGTERM and `up` sends none.
+        launchd.load(Some(pid));
+        let processes = FakeProcesses::default();
+
+        let report = thread::scope(|scope| {
+            scope.spawn(|| {
+                // The supervisor stops claiming once the bootout's SIGTERM
+                // reaches it, finishes its runs and removes its own row at
+                // the end of the drain.
+                wait_until(&processes, pid, || {
+                    !launchd.uninstalls.lock().unwrap().is_empty()
+                });
+                SqliteQueue::open(&fixture.location.db)
+                    .unwrap()
+                    .deregister_supervisor("old")
+                    .unwrap();
+            });
+            up(&fixture, &cmux, &launchd, &processes)
+        });
+
+        let supervisor = &report["supervisor"];
+        assert_eq!(supervisor["outcome"], "restarted", "{report}");
+        assert_eq!(supervisor["version"], VERSION, "{report}");
+        assert_eq!(supervisor["previous_version"], json!(previous), "{report}");
+        assert_eq!(supervisor["mode"], "launchd");
+        assert_ne!(supervisor["token"], "old", "{report}");
+        assert_eq!(
+            supervisor["replaced"],
+            json!([{
+                "token": "old",
+                "pid": pid,
+                "mode": "launchd",
+                "workspace_id": Value::Null,
+                "version": previous,
+            }])
+        );
+        // No in-cmux supervisor was replaced, so nothing was closed.
+        assert_eq!(supervisor["supervisor_workspaces"], json!([]));
+        // The old agent went before the new one was written, and the
+        // SIGTERM bootout already delivered was not repeated.
+        assert_eq!(launchd.uninstalls.lock().unwrap().len(), 1);
+        assert_eq!(launchd.installs.lock().unwrap().len(), 1);
+        // Asked once, before the drain, and not asked again by the start.
+        assert_eq!(cmux.detached_preflights.lock().unwrap().len(), 1);
+        assert!(processes.terminated.lock().unwrap().is_empty());
+        assert!(processes.interrupted.lock().unwrap().is_empty());
+        assert!(processes.killed.lock().unwrap().is_empty());
+        // Only the started supervisor is registered, carrying the version
+        // the fake `supervise` recorded for itself (the real write is
+        // covered by tests/queue.rs and the e2e).
+        let registrations = queue.supervisors().unwrap();
+        assert_eq!(registrations.len(), 1, "{registrations:?}");
+        assert_eq!(registrations[0].binary_version.as_deref(), Some(VERSION));
+        assert_eq!(registrations[0].mode, Some(SupervisorMode::Launchd));
+        assert_eq!(registrations[0].token, supervisor["token"]);
+    }
+}
+
+/// A supervisor that was not signalled by launchd's bootout (one started
+/// by hand, so the agent holds no process) gets the SIGTERM from `up`
+/// itself, the way `down` sends it.
+#[test]
+fn up_terminates_a_replaced_supervisor_that_launchd_did_not_signal() {
+    let fixture = fixture();
+    let mut queue = SqliteQueue::open(&fixture.location.db).unwrap();
+    let pid = std::process::id();
+    queue
+        .register_supervisor("by-hand", pid, 1, VERSION)
+        .unwrap();
+    set_binary_version(&fixture.location.db, "by-hand", Some("0.0.1"));
+    let cmux = FakeCmux::default();
+    let launchd = FakeLaunchd::new(&fixture.location.db);
+    let processes = FakeProcesses::default();
+
+    let report = thread::scope(|scope| {
+        scope.spawn(|| {
+            wait_until(&processes, pid, || {
+                !processes.terminated.lock().unwrap().is_empty()
+            });
+            SqliteQueue::open(&fixture.location.db)
+                .unwrap()
+                .deregister_supervisor("by-hand")
+                .unwrap();
+        });
+        up(&fixture, &cmux, &launchd, &processes)
+    });
+    assert_eq!(report["supervisor"]["outcome"], "restarted", "{report}");
+    // It had no mode of its own, and the replacement reports it as such.
+    assert_eq!(report["supervisor"]["replaced"][0]["mode"], Value::Null);
+    assert_eq!(processes.terminated.lock().unwrap().as_slice(), &[pid]);
+    assert!(processes.interrupted.lock().unwrap().is_empty());
+}
+
+/// `--in-cmux` replaces an in-cmux supervisor the way `down` stops one:
+/// SIGINT, wait for the drain, close the workspace — and only then open a
+/// new one, which needs the same name.
+#[test]
+fn up_in_cmux_replaces_an_in_cmux_supervisor_of_another_version() {
+    let mut fixture = fixture();
+    fixture.options.in_cmux = true;
+    let mut queue = SqliteQueue::open(&fixture.location.db).unwrap();
+    let pid = std::process::id();
+    let cmux = FakeCmux {
+        registers_supervisor_in: Some(fixture.location.db.clone()),
+        ..FakeCmux::default()
+    };
+    // The workspace the replaced supervisor runs in, put there directly:
+    // going through `create_named` would register a supervisor for it.
+    let workspace = "01234567-89ab-4def-8123-0000000000ff".to_owned();
+    cmux.workspaces.lock().unwrap().push((
+        "taskq my repo supervisor".into(),
+        fixture.repo.clone(),
+        workspace.clone(),
+        "supervise".into(),
+    ));
+    queue.register_supervisor("old", pid, 2, VERSION).unwrap();
+    queue
+        .set_supervisor_mode("old", SupervisorMode::InCmux, Some(&workspace))
+        .unwrap();
+    set_binary_version(&fixture.location.db, "old", Some("0.0.1"));
+    let launchd = FakeLaunchd::new(&fixture.location.db);
+    let processes = FakeProcesses::default();
+
+    let report = thread::scope(|scope| {
+        scope.spawn(|| {
+            // SIGINT is the only signal an in-cmux supervisor gets.
+            wait_until(&processes, pid, || {
+                !processes.interrupted.lock().unwrap().is_empty()
+            });
+            SqliteQueue::open(&fixture.location.db)
+                .unwrap()
+                .deregister_supervisor("old")
+                .unwrap();
+        });
+        up(&fixture, &cmux, &launchd, &processes)
+    });
+
+    let supervisor = &report["supervisor"];
+    assert_eq!(supervisor["outcome"], "restarted", "{report}");
+    assert_eq!(supervisor["mode"], "in_cmux", "{report}");
+    assert_eq!(supervisor["previous_version"], "0.0.1");
+    assert_eq!(supervisor["version"], VERSION);
+    assert_eq!(processes.interrupted.lock().unwrap().as_slice(), &[pid]);
+    assert!(processes.terminated.lock().unwrap().is_empty());
+    assert_eq!(
+        supervisor["supervisor_workspaces"],
+        json!([{"workspace_id": workspace, "outcome": "closed"}])
+    );
+    // The old workspace was closed before the new one was opened, so the
+    // name was free and `up` did not refuse it.
+    assert_eq!(
+        cmux.closed.lock().unwrap().as_slice(),
+        std::slice::from_ref(&workspace)
+    );
+    assert_ne!(supervisor["workspace_id"], json!(workspace), "{report}");
+    let started = queue
+        .supervisors()
+        .unwrap()
+        .into_iter()
+        .find(|registration| registration.token != "old")
+        .expect("the started supervisor is registered");
+    assert_eq!(started.mode, Some(SupervisorMode::InCmux));
+    assert_eq!(started.binary_version.as_deref(), Some(VERSION));
+    assert_eq!(
+        started.workspace_id.as_deref(),
+        supervisor["workspace_id"].as_str()
+    );
+    // launchd was left alone apart from clearing any agent of this queue.
+    assert!(launchd.installs.lock().unwrap().is_empty());
+}
+
+/// `up --no-wait` will not sit through a drain: with runs in flight it
+/// refuses, naming them, and leaves the old supervisor and its agent
+/// exactly as they were. With nothing in flight there is nothing to wait
+/// for and the replacement goes ahead.
+#[test]
+fn up_no_wait_refuses_to_replace_while_runs_are_in_flight() {
+    let mut fixture = fixture();
+    fixture.options.no_wait = true;
+    let mut queue = SqliteQueue::open(&fixture.location.db).unwrap();
+    let pid = std::process::id();
+    queue.register_supervisor("old", pid, 4, VERSION).unwrap();
+    queue
+        .set_supervisor_mode("old", SupervisorMode::Launchd, None)
+        .unwrap();
+    set_binary_version(&fixture.location.db, "old", Some("0.0.1"));
+    let run_id = claim_a_run(&fixture, &mut queue, "old");
+    let cmux = FakeCmux::default();
+    let launchd = FakeLaunchd::new(&fixture.location.db);
+    launchd.load(Some(pid));
+    let processes = FakeProcesses::default();
+
+    let error = format!(
+        "{:#}",
+        try_up(&fixture, &cmux, &launchd, &processes).unwrap_err()
+    );
+    assert!(error.contains("1 run(s) are still in flight"), "{error}");
+    assert!(error.contains(&run_id), "{error}");
+    assert!(
+        error.contains("0.0.1") && error.contains(VERSION),
+        "{error}"
+    );
+    // Nothing was stopped, signalled, written or opened.
+    assert!(launchd.uninstalls.lock().unwrap().is_empty());
+    assert!(launchd.installs.lock().unwrap().is_empty());
+    assert!(processes.terminated.lock().unwrap().is_empty());
+    assert!(processes.interrupted.lock().unwrap().is_empty());
+    assert!(cmux.workspaces.lock().unwrap().is_empty());
+    let registrations = queue.supervisors().unwrap();
+    assert_eq!(registrations.len(), 1);
+    assert_eq!(registrations[0].token, "old");
+
+    // The run comes to rest; now the drain is immediate and `--no-wait`
+    // replaces the supervisor without waiting for anything.
+    Connection::open(&fixture.location.db)
+        .unwrap()
+        .execute_batch(&format!(
+            "UPDATE task_runs SET status='interrupted' WHERE id='{run_id}';
+             DELETE FROM run_leases WHERE run_id='{run_id}';"
+        ))
+        .unwrap();
+    let report = thread::scope(|scope| {
+        scope.spawn(|| {
+            wait_until(&processes, pid, || {
+                !launchd.uninstalls.lock().unwrap().is_empty()
+            });
+            SqliteQueue::open(&fixture.location.db)
+                .unwrap()
+                .deregister_supervisor("old")
+                .unwrap();
+        });
+        up(&fixture, &cmux, &launchd, &processes)
+    });
+    assert_eq!(report["supervisor"]["outcome"], "restarted", "{report}");
+    assert_eq!(report["supervisor"]["previous_version"], "0.0.1");
+}
+
+/// The version is what decides: a live supervisor of this binary's own
+/// build is reused, with nothing stopped, signalled or written.
+#[test]
+fn up_reuses_a_supervisor_of_this_binary_version() {
+    let fixture = fixture();
+    let mut queue = SqliteQueue::open(&fixture.location.db).unwrap();
+    let pid = std::process::id();
+    queue.register_supervisor("live", pid, 4, VERSION).unwrap();
+    queue
+        .set_supervisor_mode("live", SupervisorMode::Launchd, None)
+        .unwrap();
+    let cmux = FakeCmux::default();
+    let launchd = FakeLaunchd::new(&fixture.location.db);
+    launchd.load(Some(pid));
+    let processes = FakeProcesses::default();
+
+    let report = up(&fixture, &cmux, &launchd, &processes);
+    let supervisor = &report["supervisor"];
+    assert_eq!(supervisor["outcome"], "reused", "{report}");
+    assert_eq!(supervisor["token"], "live");
+    assert_eq!(supervisor["version"], VERSION);
+    // Nothing was replaced, so the replacement fields are absent rather
+    // than null (indexing a missing key would read as null either way).
+    let supervisor = supervisor.as_object().unwrap();
+    assert!(!supervisor.contains_key("previous_version"), "{report}");
+    assert!(!supervisor.contains_key("replaced"), "{report}");
+    assert!(launchd.uninstalls.lock().unwrap().is_empty());
+    assert!(launchd.installs.lock().unwrap().is_empty());
+    assert!(processes.terminated.lock().unwrap().is_empty());
+    assert!(processes.interrupted.lock().unwrap().is_empty());
+    assert_eq!(queue.supervisors().unwrap().len(), 1);
+}
+
+/// The replacement asks cmux whether it will admit the new supervisor
+/// before it stops the old one. A refusal there must leave the working
+/// supervisor alone: draining it first and failing afterwards would leave
+/// the queue with nothing serving it.
+#[test]
+fn up_proves_the_detached_connection_before_draining_the_old_supervisor() {
+    let fixture = fixture();
+    let mut queue = SqliteQueue::open(&fixture.location.db).unwrap();
+    let pid = std::process::id();
+    queue.register_supervisor("old", pid, 4, VERSION).unwrap();
+    queue
+        .set_supervisor_mode("old", SupervisorMode::Launchd, None)
+        .unwrap();
+    set_binary_version(&fixture.location.db, "old", Some("0.0.1"));
+    let cmux = FakeCmux {
+        refuses_detached: true,
+        ..FakeCmux::default()
+    };
+    let launchd = FakeLaunchd::new(&fixture.location.db);
+    launchd.load(Some(pid));
+    let processes = FakeProcesses::default();
+
+    let error = format!(
+        "{:#}",
+        try_up(&fixture, &cmux, &launchd, &processes).unwrap_err()
+    );
+    assert!(error.contains(lifecycle::DETACHED_CMUX_HINT), "{error}");
+    assert_eq!(cmux.detached_preflights.lock().unwrap().len(), 1);
+    assert!(launchd.uninstalls.lock().unwrap().is_empty());
+    assert!(launchd.installs.lock().unwrap().is_empty());
+    assert!(processes.terminated.lock().unwrap().is_empty());
+    assert!(processes.interrupted.lock().unwrap().is_empty());
+    let registrations = queue.supervisors().unwrap();
+    assert_eq!(registrations.len(), 1);
+    assert_eq!(registrations[0].token, "old");
+}
+
+/// `--in-cmux` needs the name `taskq <repo> supervisor`, and a workspace
+/// the replacement will not close holds it: a crashed in-cmux supervisor
+/// whose registration an earlier `up` pruned leaves one behind. That has
+/// to be found before the drain, or a working supervisor is spent and the
+/// queue is left with nothing serving it.
+#[test]
+fn up_in_cmux_refuses_a_leftover_supervisor_workspace_before_draining() {
+    let mut fixture = fixture();
+    fixture.options.in_cmux = true;
+    let mut queue = SqliteQueue::open(&fixture.location.db).unwrap();
+    let pid = std::process::id();
+    let cmux = FakeCmux::default();
+    // Left by a supervisor that is no longer registered at all.
+    let orphan = "01234567-89ab-4def-8123-0000000000aa".to_owned();
+    cmux.workspaces.lock().unwrap().push((
+        "taskq my repo supervisor".into(),
+        fixture.repo.clone(),
+        orphan.clone(),
+        "supervise".into(),
+    ));
+    // The supervisor being replaced runs under launchd, so the drain would
+    // close nothing and the name would still be taken.
+    queue.register_supervisor("old", pid, 4, VERSION).unwrap();
+    queue
+        .set_supervisor_mode("old", SupervisorMode::Launchd, None)
+        .unwrap();
+    set_binary_version(&fixture.location.db, "old", Some("0.0.1"));
+    let launchd = FakeLaunchd::new(&fixture.location.db);
+    launchd.load(Some(pid));
+    let processes = FakeProcesses::default();
+
+    let error = format!(
+        "{:#}",
+        try_up(&fixture, &cmux, &launchd, &processes).unwrap_err()
+    );
+    assert!(error.contains(&orphan), "{error}");
+    assert!(error.contains("cmux workspace close"), "{error}");
+    // The working supervisor and its agent are untouched.
+    assert!(launchd.uninstalls.lock().unwrap().is_empty());
+    assert!(processes.terminated.lock().unwrap().is_empty());
+    assert!(processes.interrupted.lock().unwrap().is_empty());
+    assert!(cmux.closed.lock().unwrap().is_empty());
+    let registrations = queue.supervisors().unwrap();
+    assert_eq!(registrations.len(), 1);
+    assert_eq!(registrations[0].token, "old");
+}
+
+/// `--no-wait` bounds the drain instead of waiting forever: the runs were
+/// the reason a drain is long and there were none, but a supervisor can
+/// still fail to stop. It errors with what is still registered, and says
+/// the stop is already under way.
+#[test]
+fn up_no_wait_gives_up_on_a_supervisor_that_does_not_stop() {
+    let mut fixture = fixture();
+    fixture.options.no_wait = true;
+    fixture.options.startup_timeout = Duration::from_millis(300);
+    let mut queue = SqliteQueue::open(&fixture.location.db).unwrap();
+    let pid = std::process::id();
+    queue
+        .register_supervisor("wedged", pid, 4, VERSION)
+        .unwrap();
+    queue
+        .set_supervisor_mode("wedged", SupervisorMode::Launchd, None)
+        .unwrap();
+    set_binary_version(&fixture.location.db, "wedged", Some("0.0.1"));
+    let cmux = FakeCmux::default();
+    let launchd = FakeLaunchd::new(&fixture.location.db);
+    launchd.load(Some(pid));
+    let processes = FakeProcesses::default();
+
+    // Nothing ever removes the registration, the way a loop wedged on a
+    // hung cmux or git call keeps its row while its heartbeat runs on.
+    let error = format!(
+        "{:#}",
+        try_up(&fixture, &cmux, &launchd, &processes).unwrap_err()
+    );
+    assert!(error.contains("did not stop within"), "{error}");
+    assert!(error.contains("wedged"), "{error}");
+    assert!(error.contains(&format!("pid {pid}")), "{error}");
+    // It was asked to stop before `up` gave up, so the message tells the
+    // operator to come back rather than pretending nothing happened.
+    assert_eq!(launchd.uninstalls.lock().unwrap().len(), 1);
+    assert!(error.contains("run `up` again"), "{error}");
+    assert!(launchd.installs.lock().unwrap().is_empty());
+}
+
+/// A supervisor can die with its row intact: launchd's `ExitTimeOut`
+/// SIGKILL, or the heartbeat failure the runtime deliberately leaves the
+/// row for. The replacement drops those rows, so none is left pointing at
+/// the in-cmux workspace it has just closed (the next `down` would retry
+/// that close and report `close_failed`).
+#[test]
+fn up_drops_the_row_of_a_replaced_supervisor_that_died_without_deregistering() {
+    let mut fixture = fixture();
+    fixture.options.in_cmux = true;
+    let mut queue = SqliteQueue::open(&fixture.location.db).unwrap();
+    // A pid of its own, so killing it does not also kill the supervisor
+    // the fake cmux registers (which runs as this process).
+    let pid = 424_242;
+    let cmux = FakeCmux {
+        registers_supervisor_in: Some(fixture.location.db.clone()),
+        ..FakeCmux::default()
+    };
+    let workspace = "01234567-89ab-4def-8123-0000000000bb".to_owned();
+    cmux.workspaces.lock().unwrap().push((
+        "taskq my repo supervisor".into(),
+        fixture.repo.clone(),
+        workspace.clone(),
+        "supervise".into(),
+    ));
+    queue
+        .register_supervisor("killed", pid, 2, VERSION)
+        .unwrap();
+    queue
+        .set_supervisor_mode("killed", SupervisorMode::InCmux, Some(&workspace))
+        .unwrap();
+    set_binary_version(&fixture.location.db, "killed", Some("0.0.1"));
+    let launchd = FakeLaunchd::new(&fixture.location.db);
+    let processes = FakeProcesses::default();
+
+    let report = thread::scope(|scope| {
+        scope.spawn(|| {
+            wait_until(&processes, pid, || {
+                !processes.interrupted.lock().unwrap().is_empty()
+            });
+            // It dies without removing its own row.
+            processes.dead.lock().unwrap().insert(pid);
+        });
+        up(&fixture, &cmux, &launchd, &processes)
+    });
+    assert_eq!(report["supervisor"]["outcome"], "restarted", "{report}");
+    assert_eq!(
+        report["supervisor"]["supervisor_workspaces"],
+        json!([{"workspace_id": workspace, "outcome": "closed"}])
+    );
+    // Only the started supervisor is left; no row points at the workspace
+    // this `up` closed.
+    let registrations = queue.supervisors().unwrap();
+    assert_eq!(registrations.len(), 1, "{registrations:?}");
+    assert_ne!(registrations[0].token, "killed");
+    assert_eq!(
+        registrations[0].workspace_id,
+        report["supervisor"]["workspace_id"]
+            .as_str()
+            .map(str::to_owned)
+    );
 }

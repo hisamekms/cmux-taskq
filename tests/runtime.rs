@@ -1,5 +1,6 @@
 use anyhow::{Result, bail};
 use cmux_taskq::{
+    VERSION,
     application::{AgentProvider, SupervisorEnvironment, TaskQueue, WorkspaceBackend},
     domain::{GoalEdit, NewGoal, NewTask, RunStatus, TaskAction, TaskRun, TaskStatus},
     infrastructure::{
@@ -1318,7 +1319,7 @@ fn supervise_log_dir_records_each_start_in_its_own_file() {
         .unwrap();
     assert!(
         text.contains(&format!(
-            "] supervisor {token} started: pid {pid}, parallel 2, db {}, repository {}",
+            "] supervisor {token} started: version {VERSION}, pid {pid}, parallel 2, db {}, repository {}",
             db.canonicalize().unwrap().display(),
             repo.canonicalize().unwrap().display()
         )),
@@ -1342,7 +1343,7 @@ fn supervise_log_dir_records_each_start_in_its_own_file() {
     let second = logs(pid);
     assert_eq!(second.len(), 2, "{second:?}");
     let text = fs::read_to_string(second.iter().find(|p| *p != &first[0]).unwrap()).unwrap();
-    assert!(text.contains("started: pid"));
+    assert!(text.contains(&format!("started: version {VERSION}, pid")));
     assert!(!text.contains("task 1 running"));
 
     // A log directory that cannot be created is a startup failure that
@@ -1363,7 +1364,9 @@ fn killed_supervisor_registration_is_reported_stale_and_never_deleted() {
     let (_dir, repo, db) = fixture();
     let mut queue = SqliteQueue::open(&db).unwrap();
     let dead = dead_pid();
-    let killed = queue.register_supervisor("killed", dead, 4).unwrap();
+    let killed = queue
+        .register_supervisor("killed", dead, 4, VERSION)
+        .unwrap();
     // Killed a moment ago: the heartbeat is fresh, the pid is gone.
     let status = runtime::status(&db).unwrap();
     assert_eq!(status["runs"], json!([]));
@@ -1373,11 +1376,13 @@ fn killed_supervisor_registration_is_reported_stale_and_never_deleted() {
     assert_eq!(entry["stale"], true);
     assert_eq!(entry["registered"], true);
     assert_eq!(entry["parallel"], 4);
+    // The build the process ran, which `up` compares against its own.
+    assert_eq!(entry["binary_version"], VERSION);
     assert_eq!(entry["heartbeat_at"], json!(killed.heartbeat_at));
     assert!(entry["heartbeat_age_secs"].as_i64().unwrap() <= 5);
     // Alive but silent: stale by heartbeat age alone.
     queue
-        .register_supervisor("hung", std::process::id(), 1)
+        .register_supervisor("hung", std::process::id(), 1, VERSION)
         .unwrap();
     let raw = Connection::open(&db).unwrap();
     raw.execute(
@@ -1402,6 +1407,8 @@ fn killed_supervisor_registration_is_reported_stale_and_never_deleted() {
     assert_eq!(supervisors.len(), 3);
     assert_eq!(supervisors[2]["registered"], false);
     assert_eq!(supervisors[2]["parallel"], Value::Null);
+    // A lease holder without a registration recorded no version either.
+    assert_eq!(supervisors[2]["binary_version"], Value::Null);
     assert_eq!(supervisors[2]["started_at"], Value::Null);
     assert_eq!(supervisors[2]["pid"], json!(std::process::id()));
     assert_eq!(supervisors[2]["alive"], true);
@@ -1410,7 +1417,7 @@ fn killed_supervisor_registration_is_reported_stale_and_never_deleted() {
     assert_eq!(status["runs"][0]["lease"]["pid"], json!(std::process::id()));
     // A registered supervisor's leases join it by token rather than by pid.
     queue
-        .register_supervisor("owner", std::process::id(), 2)
+        .register_supervisor("owner", std::process::id(), 2, VERSION)
         .unwrap();
     let status = runtime::status(&db).unwrap();
     let supervisors = status["supervisors"].as_array().unwrap();

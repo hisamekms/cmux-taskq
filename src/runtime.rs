@@ -206,7 +206,7 @@ pub fn supervise(
     let parallel =
         u32::try_from(options.parallel).context("parallel does not fit a registration")?;
     let pid = std::process::id();
-    let registration = queue.register_supervisor(&token, pid, parallel)?;
+    let registration = queue.register_supervisor(&token, pid, parallel, crate::VERSION)?;
     let log = match &options.log_dir {
         Some(dir) => match SupervisorLog::open(dir, registration.started_at, pid) {
             Ok(log) => log,
@@ -219,7 +219,8 @@ pub fn supervise(
         None => SupervisorLog::default(),
     };
     log.note(&format!(
-        "supervisor {token} started: pid {pid}, parallel {parallel}, db {}, repository {}",
+        "supervisor {token} started: version {}, pid {pid}, parallel {parallel}, db {}, repository {}",
+        crate::VERSION,
         db.display(),
         repository.root.display()
     ));
@@ -1618,6 +1619,10 @@ pub struct SupervisorHealth {
     pub registered: bool,
     pub mode: Option<SupervisorMode>,
     pub workspace_id: Option<String>,
+    /// The `cmux-taskq` version the registered process runs; `None` for a
+    /// lease holder without a registration, or a registration older than
+    /// the column (ADR-0014).
+    pub binary_version: Option<String>,
     pub parallel: Option<u32>,
     pub started_at: Option<i64>,
     pub heartbeat_at: i64,
@@ -1786,6 +1791,7 @@ fn supervisors(
             registered: registration.is_some(),
             mode: registration.and_then(|r| r.mode),
             workspace_id: registration.and_then(|r| r.workspace_id.clone()),
+            binary_version: registration.and_then(|r| r.binary_version.clone()),
             parallel: registration.map(|r| r.parallel),
             started_at: registration.map(|r| r.started_at),
             heartbeat_at,

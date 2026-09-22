@@ -1,6 +1,7 @@
 use std::sync::{Arc, Barrier};
 
 use cmux_taskq::{
+    VERSION,
     application::TaskQueue,
     domain::{
         ClaimOutcome, GoalEdit, GoalVerdict, NewGoal, NewTask, Provider, RunStatus, SupervisorMode,
@@ -751,14 +752,17 @@ fn migration_to_v7_adds_the_supervisor_registry_and_keeps_leases() {
     // heartbeat refreshed with the leases, removed only by deregistration.
     let before = queue.heartbeat("tok").unwrap();
     assert_eq!(before, 1);
-    let registered = queue.register_supervisor("sv", 4243, 2).unwrap();
+    let registered = queue.register_supervisor("sv", 4243, 2, VERSION).unwrap();
     assert_eq!(registered.token, "sv");
     assert_eq!(registered.pid, 4243);
     assert_eq!(registered.parallel, 2);
     assert!(registered.started_at > 1700000000);
     assert_eq!(registered.heartbeat_at, registered.started_at);
-    assert!(queue.register_supervisor("sv", 4243, 2).is_err());
-    assert!(queue.register_supervisor("zero", 4244, 0).is_err());
+    // The process records its own build; `up` reads it back to decide
+    // whether that supervisor is one of its own (ADR-0014).
+    assert_eq!(registered.binary_version.as_deref(), Some(VERSION));
+    assert!(queue.register_supervisor("sv", 4243, 2, VERSION).is_err());
+    assert!(queue.register_supervisor("zero", 4244, 0, VERSION).is_err());
     let raw = Connection::open(&path).unwrap();
     raw.execute("UPDATE supervisors SET heartbeat_at=0 WHERE token='sv'", [])
         .unwrap();
@@ -774,6 +778,7 @@ fn migration_to_v7_adds_the_supervisor_registry_and_keeps_leases() {
     let listed = queue.supervisors().unwrap();
     assert_eq!(listed.len(), 1);
     assert!(listed[0].heartbeat_at >= registered.started_at);
+    assert_eq!(listed[0].binary_version.as_deref(), Some(VERSION));
     assert_eq!(queue.heartbeat("nobody").unwrap(), 0);
 
     // The mode is `up`'s to record once the process has registered; a
@@ -803,6 +808,25 @@ fn migration_to_v7_adds_the_supervisor_registry_and_keeps_leases() {
             .is_err()
     );
     drop(raw);
+
+    // A registration a pre-0010 binary wrote has no version at all, which
+    // is not this binary's version either, so `up` replaces it like any
+    // other mismatch.
+    let raw = Connection::open(&path).unwrap();
+    raw.execute(
+        "INSERT INTO supervisors(token,pid,parallel) VALUES ('old',4245,1)",
+        [],
+    )
+    .unwrap();
+    drop(raw);
+    let old = queue
+        .supervisors()
+        .unwrap()
+        .into_iter()
+        .find(|registration| registration.token == "old")
+        .unwrap();
+    assert_eq!(old.binary_version, None);
+    assert!(queue.deregister_supervisor("old").unwrap());
 
     assert!(queue.deregister_supervisor("sv").unwrap());
     assert!(!queue.deregister_supervisor("sv").unwrap());
@@ -843,10 +867,10 @@ fn migration_from_v6_adds_goals_and_keeps_tasks_runs_and_events() {
     .unwrap();
     drop(raw);
     let mut queue = SqliteQueue::open(&path).unwrap();
-    // 0007 (supervisors), 0008 (goals) and 0009 (supervisor mode) are
-    // applied together.
-    assert_eq!(SqliteQueue::SCHEMA_VERSION, 9);
-    assert_eq!(queue.schema_version().unwrap(), 9);
+    // 0007 (supervisors), 0008 (goals), 0009 (supervisor mode) and 0010
+    // (supervisor binary version) are applied together.
+    assert_eq!(SqliteQueue::SCHEMA_VERSION, 10);
+    assert_eq!(queue.schema_version().unwrap(), 10);
     let landed = queue.show(1).unwrap();
     assert_eq!(landed.task.title, "landed");
     assert_eq!(landed.task.description, "why");

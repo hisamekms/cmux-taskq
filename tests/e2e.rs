@@ -16,6 +16,8 @@ use std::{
 };
 
 const BIN: &str = env!("CARGO_BIN_EXE_cmux-taskq");
+/// The version the binary under test records on its registration.
+const VERSION: &str = cmux_taskq::VERSION;
 /// Longer than the supervisor's own 120 s exit-request timeout so its error
 /// surfaces first.
 const SUPERVISE_TIMEOUT: Duration = Duration::from_secs(180);
@@ -1099,7 +1101,9 @@ fn up_starts_a_launchd_supervisor_that_status_lists_and_down_wait_stops_it() {
     assert_eq!(logs.len(), 1, "{logs:?}");
     let log = fs::read_to_string(&logs[0]).unwrap();
     assert!(
-        log.contains(&format!("started: pid {pid}, parallel 2")),
+        log.contains(&format!(
+            "started: version {VERSION}, pid {pid}, parallel 2"
+        )),
         "{log}"
     );
 
@@ -1111,11 +1115,15 @@ fn up_starts_a_launchd_supervisor_that_status_lists_and_down_wait_stops_it() {
     assert_eq!(supervisors[0]["alive"], true);
     assert_eq!(supervisors[0]["stale"], false);
     assert_eq!(supervisors[0]["parallel"], 2);
+    // The supervisor recorded the build it runs, which is what the next
+    // `up` compares itself against (ADR-0014).
+    assert_eq!(supervisors[0]["binary_version"], VERSION, "{status}");
     assert_eq!(status["runs"], Value::Array(vec![]));
 
     // Idempotent: nothing is started or opened twice.
     let second = taskq_with(env, &[("HOME", home.as_path())], &up_args);
     assert_eq!(second["supervisor"]["outcome"], "reused", "{second}");
+    assert_eq!(second["supervisor"]["version"], VERSION, "{second}");
     assert_eq!(second["supervisor"]["pid"], pid);
     assert_eq!(second["maintainer"]["outcome"], "reused", "{second}");
     assert_eq!(second["maintainer"]["workspace_id"], maintainer.as_str());
@@ -1233,11 +1241,9 @@ fn up_in_cmux_starts_a_supervisor_in_a_workspace_that_down_wait_stops_and_closes
         })
         .collect();
     assert_eq!(logs.len(), 1, "{logs:?} in {}", log_dir.display());
-    assert!(
-        fs::read_to_string(&logs[0])
-            .unwrap()
-            .contains(&format!("started: pid {pid}, parallel 2"))
-    );
+    assert!(fs::read_to_string(&logs[0]).unwrap().contains(&format!(
+        "started: version {VERSION}, pid {pid}, parallel 2"
+    )));
 
     let status = taskq(env, &["status"]);
     let supervisors = status["supervisors"].as_array().unwrap();
@@ -1251,10 +1257,16 @@ fn up_in_cmux_starts_a_supervisor_in_a_workspace_that_down_wait_stops_and_closes
     assert_eq!(supervisors[0]["stale"], false);
     let doctor = taskq(env, &["doctor"]);
     assert_eq!(doctor["supervisors"][0]["mode"], "in_cmux", "{doctor}");
+    assert_eq!(
+        doctor["supervisors"][0]["binary_version"], VERSION,
+        "{doctor}"
+    );
 
-    // Idempotent: the live supervisor is reused with its mode and workspace.
+    // Idempotent: the live supervisor is of this binary's own version, so
+    // it is reused with its mode and workspace and nothing is replaced.
     let second = taskq_with(env, &[("HOME", home.as_path())], &up_args);
     assert_eq!(second["supervisor"]["outcome"], "reused", "{second}");
+    assert_eq!(second["supervisor"]["version"], VERSION, "{second}");
     assert_eq!(second["supervisor"]["mode"], "in_cmux");
     assert_eq!(
         second["supervisor"]["workspace_id"],

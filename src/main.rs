@@ -115,7 +115,7 @@ enum Command {
         #[arg(long)]
         log_dir: Option<PathBuf>,
     },
-    /// Start the queue's runtime: a launchd-resident supervisor and the maintainer's cmux workspace. Idempotent.
+    /// Start the queue's runtime: a launchd-resident supervisor and the maintainer's cmux workspace. Idempotent; replaces a live supervisor of another version.
     Up {
         /// Maximum number of runs the supervisor executes at once.
         #[arg(long, default_value_t = 4, value_parser = clap::value_parser!(u16).range(1..))]
@@ -125,6 +125,10 @@ enum Command {
         /// restarts it if it stops.
         #[arg(long)]
         in_cmux: bool,
+        /// Do not wait for a supervisor of another version to drain: stop
+        /// with an error instead when any run is still in flight.
+        #[arg(long)]
+        no_wait: bool,
         /// Claude Code plugin directory the maintainer session loads (`claude --plugin-dir`).
         #[arg(long)]
         plugin_dir: Option<PathBuf>,
@@ -380,6 +384,7 @@ fn execute(cli: Cli) -> Result<Value> {
         Command::Up {
             parallel,
             in_cmux,
+            no_wait,
             plugin_dir,
             repo,
             cmux,
@@ -403,6 +408,7 @@ fn execute(cli: Cli) -> Result<Value> {
             let options = UpOptions {
                 parallel,
                 in_cmux,
+                no_wait,
                 plugin_dir,
                 cmux: executable(&cmux)?,
                 claude: executable(&claude)?,

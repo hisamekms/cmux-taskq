@@ -402,8 +402,9 @@ pub struct RunLease {
 /// A resident `supervise` process as it registered itself, whether or not it
 /// holds any lease. The row is heartbeated with the leases and deleted on a
 /// graceful exit; a row left by a killed supervisor stays until `up` prunes
-/// it or the maintainer deals with it. `mode` and `workspace_id` describe
-/// how the process was started, so they share the row's lifetime.
+/// it or the maintainer deals with it. `mode`, `workspace_id` and
+/// `binary_version` describe the process itself, so they share the row's
+/// lifetime.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SupervisorRegistration {
     pub token: String,
@@ -417,6 +418,11 @@ pub struct SupervisorRegistration {
     /// The cmux workspace `supervise` runs in, in [`SupervisorMode::InCmux`]
     /// only; `down` closes it when the supervisor is gone.
     pub workspace_id: Option<String>,
+    /// The `cmux-taskq` version of the process, written by that process
+    /// itself when it registers. `None` is a supervisor that registered
+    /// before the column existed; `up` treats it as a version that is not
+    /// its own (ADR-0014).
+    pub binary_version: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

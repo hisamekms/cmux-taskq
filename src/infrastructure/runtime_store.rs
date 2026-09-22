@@ -125,19 +125,23 @@ impl SqliteQueue {
 
     /// Register a resident `supervise` process before it claims anything,
     /// so `status` and `doctor` can list it while it holds no run.
+    /// `binary_version` is the running binary's own `CARGO_PKG_VERSION`,
+    /// which only this process knows; `up` reads it back to decide whether
+    /// a live supervisor is of its own build (ADR-0014).
     pub fn register_supervisor(
         &mut self,
         token: &str,
         pid: u32,
         parallel: u32,
+        binary_version: &str,
     ) -> Result<SupervisorRegistration> {
         ensure!(parallel >= 1, "parallel must be at least 1");
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         tx.execute(
-            "INSERT INTO supervisors(token,pid,parallel) VALUES (?1,?2,?3)",
-            params![token, pid, parallel],
+            "INSERT INTO supervisors(token,pid,parallel,binary_version) VALUES (?1,?2,?3,?4)",
+            params![token, pid, parallel, binary_version],
         )
         .context("supervisor token is already registered")?;
         let result = tx.query_row(
@@ -1060,6 +1064,7 @@ fn supervisor_row(r: &Row<'_>) -> rusqlite::Result<SupervisorRegistration> {
             .map(|_| enum_col(r, "mode"))
             .transpose()?,
         workspace_id: r.get("workspace_id")?,
+        binary_version: r.get("binary_version")?,
     })
 }
 
