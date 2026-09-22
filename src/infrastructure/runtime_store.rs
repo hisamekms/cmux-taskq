@@ -4,8 +4,8 @@ use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
 use serde::Serialize;
 use serde_json::json;
 
-use super::sqlite::{SqliteQueue, event, run_row};
-use crate::domain::{RunProcess, SupervisorLease, TaskRun};
+use super::sqlite::{SqliteQueue, event, read_task, run_row};
+use crate::domain::{RunProcess, SupervisorLease, Task, TaskRun};
 
 pub const HEARTBEAT_TIMEOUT_SECS: i64 = 30;
 
@@ -93,6 +93,18 @@ impl SqliteQueue {
             "supervisor lease was lost"
         );
         Ok(())
+    }
+
+    /// Git common directory recorded by the first `supervise`, if any.
+    pub fn repository_binding(&self) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT git_common_dir FROM queue_repository WHERE singleton=1",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?)
     }
 
     pub fn supervisor_lease(&self) -> Result<Option<SupervisorLease>> {
@@ -374,6 +386,53 @@ impl SqliteQueue {
         let result = tx.query_row("SELECT * FROM task_runs WHERE id=?1", [id], run_row)?;
         tx.commit()?;
         Ok(result)
+    }
+
+    /// Complete the task once its awaiting run was confirmed in `main`. No lease
+    /// is involved: the run stopped executing when validation finished. The status
+    /// predicates make a repeated or concurrent confirmation fail without effect.
+    pub fn finish_integration(
+        &mut self,
+        id: &str,
+        main: &str,
+        common_dir: &str,
+    ) -> Result<(Task, TaskRun)> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        ensure!(
+            tx.execute(
+                "UPDATE task_runs SET status='integrated' WHERE id=?1 AND status='awaiting_integration'",
+                [id]
+            )? == 1,
+            "run {id} is no longer awaiting integration"
+        );
+        let run = tx.query_row("SELECT * FROM task_runs WHERE id=?1", [id], run_row)?;
+        ensure!(
+            tx.execute(
+                "UPDATE tasks SET status='completed', updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+                 WHERE id=?1 AND status='in_progress'",
+                [run.task_id]
+            )? == 1,
+            "task {} is not in progress",
+            run.task_id
+        );
+        run_event(
+            &tx,
+            id,
+            "run_integrated",
+            json!({"result_commit": run.result_commit, "main": main, "git_common_dir": common_dir}),
+        )?;
+        event(
+            &tx,
+            run.task_id,
+            Some(id),
+            "task_status_changed",
+            json!({"from": "in_progress", "to": "completed"}),
+        )?;
+        let task = read_task(&tx, run.task_id)?;
+        tx.commit()?;
+        Ok((task, run))
     }
 }
 

@@ -72,6 +72,14 @@ enum Command {
         #[arg(long, default_value = "claude")]
         claude: PathBuf,
     },
+    /// Confirm that a task's awaiting run was merged into main and complete the task.
+    Integrate {
+        id: i64,
+        /// Repository to check; defaults to the run's recorded checkout. Must be the
+        /// repository the queue is bound to.
+        #[arg(long)]
+        repo: Option<PathBuf>,
+    },
     /// Inspect supervisor ownership and heartbeat without changing it.
     Status,
     /// Report the lease, unfinished runs, their processes, heartbeats and paths without changing state.
@@ -157,6 +165,9 @@ fn execute(cli: Cli) -> Result<Value> {
                 &executable(&claude)?,
                 &std::env::current_exe()?,
             )?
+        }
+        Command::Integrate { id, repo } => {
+            cmux_taskq::runtime::integrate(&cli.db, id, repo.as_deref())?
         }
         Command::Doctor => cmux_taskq::runtime::doctor(&cli.db)?,
         Command::Recover { run } => cmux_taskq::runtime::recover(&cli.db, &run)?,

@@ -21,6 +21,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../../migrations/0001_queue.sql"),
     include_str!("../../migrations/0002_supervisor.sql"),
     include_str!("../../migrations/0003_workspace_close.sql"),
+    include_str!("../../migrations/0004_integration.sql"),
 ];
 const READY_QUERY: &str = "
     SELECT t.* FROM tasks t
@@ -73,6 +74,16 @@ impl SqliteQueue {
     }
 
     fn migrate(&mut self, allow_initialize: bool) -> Result<()> {
+        // Table rebuilds drop and rename tables that other rows reference, so
+        // enforcement is off during migration (a no-op inside a transaction)
+        // and integrity is checked explicitly before commit.
+        self.conn.pragma_update(None, "foreign_keys", false)?;
+        let result = self.apply_migrations(allow_initialize);
+        self.conn.pragma_update(None, "foreign_keys", true)?;
+        result
+    }
+
+    fn apply_migrations(&mut self, allow_initialize: bool) -> Result<()> {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -102,6 +113,14 @@ impl SqliteQueue {
         if app != APPLICATION_ID {
             tx.pragma_update(None, "application_id", APPLICATION_ID)?;
         }
+        let violations: i64 =
+            tx.query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |r| {
+                r.get(0)
+            })?;
+        ensure!(
+            violations == 0,
+            "queue migration would break {violations} foreign key references"
+        );
         tx.commit()?;
         Ok(())
     }
@@ -277,7 +296,7 @@ fn has_unfinished_run(conn: &Connection, task_id: i64) -> Result<bool> {
     )?)
 }
 
-fn read_task(conn: &Connection, task_id: i64) -> Result<Task> {
+pub(super) fn read_task(conn: &Connection, task_id: i64) -> Result<Task> {
     conn.query_row("SELECT * FROM tasks WHERE id=?1", [task_id], task_row)
         .optional()?
         .with_context(|| format!("task {task_id} does not exist"))

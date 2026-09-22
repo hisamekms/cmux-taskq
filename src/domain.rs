@@ -40,6 +40,7 @@ string_enum!(RunStatus {
     Running => "running",
     Validating => "validating",
     AwaitingIntegration => "awaiting_integration",
+    Integrated => "integrated",
     Succeeded => "succeeded",
     Failed => "failed",
     Interrupted => "interrupted",
@@ -205,6 +206,22 @@ pub enum ClaimOutcome {
     Claimed { run: Box<TaskRun> },
     Busy { run_id: String },
     NoReadyTask,
+}
+
+/// Result of confirming that an awaiting run's commit reached `main`.
+/// `NotIntegrated` changes nothing; the run stays `awaiting_integration`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum IntegrationOutcome {
+    Integrated {
+        task: Task,
+        run: Box<TaskRun>,
+    },
+    NotIntegrated {
+        run: Box<TaskRun>,
+        main: String,
+        reason: String,
+    },
 }
 
 /// Completion receipt written by the agent. Its claims are cross-checked by

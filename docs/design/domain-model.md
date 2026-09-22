@@ -38,11 +38,12 @@ related:
 - `add`でdraftを作り、`draft → ready`、`ready → draft`、`draft/ready → canceled`を手動操作できる。
 - `claim`だけが`ready → in_progress`へ遷移させる。同じトランザクションでclaimed状態のTaskRunとイベントを作る。
 - supervisorはrunを`claimed → starting`（path計画）→ `running`（agent起動）→ `validating`または`failed`（wrapper終了）→ `awaiting_integration`または`failed`（receipt検証）へ進め、`awaiting_integration`のworkspaceを閉じて`workspace_closed_at`を記録する。各遷移はleaseまたはwrapperの所有を要求する。
+- `integrate`だけが`awaiting_integration → integrated`とTaskの`in_progress → completed`を同時に行う。result commitが`refs/heads/main`の祖先であることを条件にし、結果は`IntegrationOutcome`（`integrated` / `not_integrated`）で返す。`not_integrated`は何も変えない。
 - `in_progress`のTaskは、未完了run（claimed/starting/running/validating/awaiting_integration）がある間は手動変更できない。すべてのrunが`failed`または`interrupted`になった`in_progress`は`ready`/`draft`/`canceled`へ手動で戻せる。再試行は新しいTaskRunになる。終端状態は変更できない。依存の追加・削除はdraft/readyだけに許可する。
 - `recover`は未完了runを、登録プロセスとsupervisorが停止していることを確認してから`interrupted`にする。Taskは`in_progress`のままで、`ready`への復帰は別操作。
-- Taskの`completed`への遷移と`awaiting_integration`以降のrunの遷移はまだ公開していない。mainへの統合検証を実装してから接続する。
+- `succeeded`（統合を待たずに成功とする運用）への遷移はまだ公開していない。
 - `candidates`は全依存がcompletedのready taskをID順で返す。同時実行枠の空きはclaimで再確認する。
-- canceled、失敗、中断、統合待ちは依存の完了条件を満たさない。awaiting_integrationのTaskはin_progressのまま保持する。
+- canceled、失敗、中断、統合待ちは依存の完了条件を満たさない。awaiting_integrationのTaskはin_progressのまま保持し、integratedになった時点でcompletedになる。
 - `RunEvent.run_id`はtask登録・依存変更などrun作成前のイベントではnullになる。
 
 ## Invariants
@@ -51,6 +52,7 @@ related:
 - 依存グラフは循環しない。
 - `in_progress`はschedulerがclaimしたTaskだけが持つ。
 - TaskRunが成功するには完了レシート、base commitの上に積まれたbranch headのコミット、clean worktree、supervisorが再実行した検証コマンドの成功が必要。receiptの自己申告だけでは成功しない。
+- Taskが`completed`になるのは、その`integrated` runのresult commitがmainの祖先だと確認できたときだけ。`integrated` runはTaskごとに1件。
 - workspaceを閉じる前にTaskRunをcleanedにしない。閉じたことをcmuxの応答で確認して`workspace_closed_at`に記録するまでは開いている扱いで、close失敗はrun状態を変えない。
 - agentの異常終了だけでTaskを自動再実行しない。孤児runの復旧と再試行はどちらも明示操作。
 - 実装途中のprovider fallbackは行わず、起動不能など安全に判定できる場合だけfallbackする。

@@ -28,11 +28,13 @@ ready task
   → validate commit, tests, clean state
   → close cmux workspace
   → awaiting_integration / succeeded
+  → (manual merge into main)
+  → integrate: run integrated, task completed
 ```
 
 ## Implementation status
 
-ステップ3で`claim`から`running`、セッション終了検知までを、ステップ4の[005](../journal/005-receipt-validation.md)でreceiptの検証と`awaiting_integration`への遷移を、[006](../journal/006-workspace-close.md)で受理後のworkspace終了を、[007](../journal/007-session-exit-request.md)でreceipt受領後の終了要求を、[009](../journal/009-doctor-recover.md)で`doctor`/`recover`を`src/runtime.rs`に実装した。統合確認はステップ4の残りで追加する。
+ステップ3で`claim`から`running`、セッション終了検知までを、ステップ4の[005](../journal/005-receipt-validation.md)でreceiptの検証と`awaiting_integration`への遷移を、[006](../journal/006-workspace-close.md)で受理後のworkspace終了を、[007](../journal/007-session-exit-request.md)でreceipt受領後の終了要求を、[009](../journal/009-doctor-recover.md)で`doctor`/`recover`を、[008](../journal/008-integration-confirm.md)で統合確認`integrate`と`completed`への遷移を`src/runtime.rs`に実装した。
 
 ## `supervise`
 
@@ -92,7 +94,18 @@ receiptの形式は`src/domain.rs`の`Receipt`で、promptとREADMEに同じ契�
 5. `git status --porcelain --untracked-files=all`が空である。untracked fileもdirtyとみなす。
 6. taskの`verification_commands`を順に`/bin/sh -c`でworktree内で実行する。出力は`<run-dir>/verify-N.log`、終了コードと末尾は`verification_command`イベントに記録する。1件でも非0なら失敗。各コマンドは30分でタイムアウトし、その場合は検証処理のエラーとして扱う。
 
-結果は`validation_finished`イベント（`status`、`result_commit`、`reason`、receiptの内容）と`task_runs.result_commit`/`last_error`に保存する。4以降で拒否した場合もcommitは確認済みなので`result_commit`を残す。成功しても`awaiting_integration`はTaskを`in_progress`のまま保持し、統合確認（[008](../journal/008-integration-confirm.md)）まで依存taskを解放しない。
+結果は`validation_finished`イベント（`status`、`result_commit`、`reason`、receiptの内容）と`task_runs.result_commit`/`last_error`に保存する。4以降で拒否した場合もcommitは確認済みなので`result_commit`を残す。成功しても`awaiting_integration`はTaskを`in_progress`のまま保持し、下記の統合確認まで依存taskを解放しない。
+
+## `integrate`
+
+`cmux-taskq --db PATH integrate ID [--repo REPO]`は、人がrun branch `taskq/<run-id>`をmainへmergeした後に実行する。supervisorとは独立した操作で、leaseを取らない。
+
+1. taskの`awaiting_integration`のrunを取る。なければerror（`integrated`済みのtaskも同じ）。同じtaskにこの状態のrunは制約で高々1件。
+2. repositoryは既定で`task_runs.repo_path`、`--repo`があればそのpathを`GitRepository::inspect`で開き、common directoryが`queue_repository.git_common_dir`と一致することを要求する。
+3. `git merge-base --is-ancestor <result_commit> refs/heads/main`で確認する。merge commitでもfast-forwardでもresult commit自体がmainの祖先になる。squash / cherry-pickは別のSHAになるため祖先にならず、`{"outcome":"not_integrated","run":…,"main":…,"reason":…}`を返してDBは変えない（同等性判定は後回し）。
+4. 祖先なら1トランザクションでrunを`integrated`、Taskを`completed`にし、`run_integrated`（`result_commit`、`main`、`git_common_dir`）と`task_status_changed`を記録する。statusを条件にしたUPDATEで、二重実行や同時実行は0行更新のerrorになる。
+
+worktreeとbranchは削除しない。統合確認後の削除は人が行う。
 
 ## Cleanup and recovery
 

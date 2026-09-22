@@ -325,7 +325,7 @@ fn initialization_is_repeatable_and_preserves_existing_tasks() {
     queue.add(new_task("preserved")).unwrap();
     drop(queue);
     let queue = SqliteQueue::init(dir.path().join("queue.db")).unwrap();
-    assert_eq!(queue.schema_version().unwrap(), 3);
+    assert_eq!(queue.schema_version().unwrap(), 4);
     assert_eq!(queue.list().unwrap().len(), 1);
     assert!(SqliteQueue::open(dir.path().join("typo.db")).is_err());
     assert!(!dir.path().join("typo.db").exists());
@@ -418,4 +418,83 @@ fn database_constraints_guard_execution_slot_and_integration_ownership() {
         .unwrap();
     assert!(insert(a).is_err());
     assert!(insert(b).is_ok());
+    raw.execute("DELETE FROM task_runs WHERE id='extra'", [])
+        .unwrap();
+    raw.execute("UPDATE task_runs SET status='integrated'", [])
+        .unwrap();
+    // One integrated run per task; a later attempt may still be claimed.
+    assert!(insert(a).is_ok());
+    assert!(
+        raw.execute(
+            "UPDATE task_runs SET status='integrated' WHERE id='extra'",
+            []
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn migration_to_v4_rebuilds_runs_with_history_and_keeps_foreign_keys() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("v3.db");
+    let raw = Connection::open(&path).unwrap();
+    raw.execute_batch(include_str!("../migrations/0001_queue.sql"))
+        .unwrap();
+    raw.execute_batch(include_str!("../migrations/0002_supervisor.sql"))
+        .unwrap();
+    raw.execute_batch(include_str!("../migrations/0003_workspace_close.sql"))
+        .unwrap();
+    raw.pragma_update(None, "application_id", 0x43545131)
+        .unwrap();
+    raw.pragma_update(None, "user_version", 3).unwrap();
+    raw.execute_batch(&format!(
+        "INSERT INTO tasks(title,description,acceptance,verification_commands,status)
+         VALUES ('rebuilt','','','[]','in_progress');
+         INSERT INTO task_runs(id,task_id,status,requested_provider,actual_provider,base_commit,result_commit,last_error)
+         VALUES ('run-failed',1,'failed','claude','claude','{BASE}',NULL,'rejected');
+         INSERT INTO task_runs(id,task_id,status,requested_provider,actual_provider,base_commit,result_commit,workspace_closed_at)
+         VALUES ('run-awaiting',1,'awaiting_integration','claude','claude','{BASE}','{BASE}',1700000000);
+         INSERT INTO run_events(task_id,run_id,kind,payload) VALUES (1,'run-failed','validation_finished','{{}}');
+         INSERT INTO run_processes(run_id,role,pid,exited_at,exit_code) VALUES ('run-awaiting','wrapper',1,1,0);"
+    ))
+    .unwrap();
+    drop(raw);
+    let mut queue = SqliteQueue::open(&path).unwrap();
+    assert_eq!(queue.schema_version().unwrap(), 4);
+    let detail = queue.show(1).unwrap();
+    assert_eq!(
+        detail
+            .runs
+            .iter()
+            .map(|r| r.id.as_str())
+            .collect::<Vec<_>>(),
+        ["run-failed", "run-awaiting"]
+    );
+    assert_eq!(detail.runs[0].last_error.as_deref(), Some("rejected"));
+    assert_eq!(detail.runs[1].status, RunStatus::AwaitingIntegration);
+    assert_eq!(detail.runs[1].workspace_closed_at, Some(1700000000));
+    assert_eq!(detail.events[0].run_id.as_deref(), Some("run-failed"));
+    assert_eq!(detail.processes[0].exit_code, Some(0));
+    assert!(queue.candidates().unwrap().is_empty());
+    // Enforcement is back on and the rebuilt table is the referenced one.
+    let raw = Connection::open(&path).unwrap();
+    raw.pragma_update(None, "foreign_keys", true).unwrap();
+    assert!(
+        raw.execute(
+            "INSERT INTO run_events(task_id,run_id,kind,payload) VALUES (1,'ghost','x','{}')",
+            [],
+        )
+        .is_err()
+    );
+    assert!(
+        raw.execute("DELETE FROM task_runs WHERE id='run-failed'", [])
+            .is_err()
+    );
+    assert!(
+        raw.execute(
+            "UPDATE task_runs SET status='integrated' WHERE id='run-awaiting'",
+            []
+        )
+        .is_ok()
+    );
 }

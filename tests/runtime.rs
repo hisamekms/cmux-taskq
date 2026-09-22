@@ -772,7 +772,7 @@ fn migration_from_v1_preserves_task_and_initializes_runtime_tables() {
     raw.pragma_update(None, "user_version", 1).unwrap();
     raw.execute("INSERT INTO tasks(title,description,acceptance,verification_commands) VALUES ('preserved','','','[]')", []).unwrap();
     let mut queue = SqliteQueue::open(&db).unwrap();
-    assert_eq!(queue.schema_version().unwrap(), 3);
+    assert_eq!(queue.schema_version().unwrap(), 4);
     assert_eq!(queue.show(1).unwrap().task.title, "preserved");
     assert!(queue.supervisor_lease().unwrap().is_none());
 }
@@ -1137,4 +1137,164 @@ fn recover_ignores_exited_processes_and_tolerates_a_missing_lease() {
     queue.transition(1, TaskAction::Draft).unwrap();
     assert_eq!(queue.show(1).unwrap().task.status, TaskStatus::Draft);
     assert!(runtime::recover(&db, "no-such-run").is_err());
+}
+
+/// A validated run plus a ready dependent task, before any merge into main.
+fn awaiting_run() -> (TempDir, PathBuf, PathBuf, TaskRun) {
+    let (dir, db, detail) = run_agent(VALID_AGENT);
+    let run = detail.runs[0].clone();
+    assert_eq!(run.status, RunStatus::AwaitingIntegration);
+    let mut queue = SqliteQueue::open(&db).unwrap();
+    let dependent = queue
+        .add(NewTask {
+            title: "dependent".into(),
+            description: String::new(),
+            acceptance: String::new(),
+            verification_commands: vec![],
+            dependencies: vec![1],
+        })
+        .unwrap();
+    queue.transition(dependent.id, TaskAction::Ready).unwrap();
+    assert!(queue.candidates().unwrap().is_empty());
+    let repo = dir.path().join("repo's directory");
+    (dir, repo, db, run)
+}
+
+fn assert_not_integrated(db: &Path, outcome: &Value, run: &TaskRun, events_before: usize) {
+    assert_eq!(outcome["outcome"], "not_integrated");
+    assert_eq!(outcome["run"]["id"], json!(run.id));
+    assert!(
+        outcome["reason"]
+            .as_str()
+            .unwrap()
+            .contains("is not an ancestor of refs/heads/main")
+    );
+    let mut queue = SqliteQueue::open(db).unwrap();
+    let detail = queue.show(1).unwrap();
+    assert_eq!(detail.task.status, TaskStatus::InProgress);
+    assert_eq!(detail.runs[0].status, RunStatus::AwaitingIntegration);
+    assert_eq!(detail.events.len(), events_before);
+    assert!(queue.candidates().unwrap().is_empty());
+}
+
+#[test]
+fn fast_forward_into_main_completes_task_and_releases_dependents() {
+    let (_dir, repo, db, run) = awaiting_run();
+    let branch = run.branch.as_deref().unwrap();
+    let events_before = SqliteQueue::open(&db)
+        .unwrap()
+        .show(1)
+        .unwrap()
+        .events
+        .len();
+    let outcome = runtime::integrate(&db, 1, None).unwrap();
+    assert_not_integrated(&db, &outcome, &run, events_before);
+    assert_eq!(outcome["main"], json!(run.base_commit));
+
+    git(&repo, &["merge", "--ff-only", branch]);
+    let outcome = runtime::integrate(&db, 1, None).unwrap();
+    assert_eq!(outcome["outcome"], "integrated");
+    assert_eq!(outcome["task"]["status"], "completed");
+    assert_eq!(outcome["run"]["status"], "integrated");
+    let mut queue = SqliteQueue::open(&db).unwrap();
+    let detail = queue.show(1).unwrap();
+    assert_eq!(detail.task.status, TaskStatus::Completed);
+    assert_eq!(detail.runs[0].status, RunStatus::Integrated);
+    let integrated = detail
+        .events
+        .iter()
+        .find(|e| e.kind == "run_integrated")
+        .unwrap();
+    assert_eq!(integrated.run_id.as_deref(), Some(run.id.as_str()));
+    assert_eq!(
+        integrated.payload["result_commit"],
+        json!(run.result_commit)
+    );
+    assert_eq!(integrated.payload["main"], json!(run.result_commit));
+    let changed = detail.events.last().unwrap();
+    assert_eq!(changed.kind, "task_status_changed");
+    assert_eq!(changed.payload["to"], "completed");
+    assert_eq!(
+        queue
+            .candidates()
+            .unwrap()
+            .iter()
+            .map(|t| t.id)
+            .collect::<Vec<_>>(),
+        [2]
+    );
+    // Worktree and branch are left for the operator to remove.
+    assert!(Path::new(run.worktree_path.as_ref().unwrap()).exists());
+
+    // Integration is one-shot, at every layer.
+    let error = format!("{:#}", runtime::integrate(&db, 1, None).unwrap_err());
+    assert!(error.contains("no run awaiting integration"), "{error}");
+    assert!(
+        queue
+            .finish_integration(&run.id, &run.base_commit, "/x")
+            .is_err()
+    );
+    let error = format!("{:#}", runtime::integrate(&db, 2, None).unwrap_err());
+    assert!(error.contains("task 2 (ready) has no run"), "{error}");
+    assert!(runtime::integrate(&db, 99, None).is_err());
+    let raw = Connection::open(&db).unwrap();
+    assert!(
+        raw.execute(
+            "INSERT INTO task_runs(id,task_id,status,requested_provider,actual_provider,base_commit)
+             VALUES ('again',1,'integrated','claude','claude',?1)",
+            [&run.base_commit],
+        )
+        .is_err()
+    );
+    assert_eq!(queue.show(1).unwrap().runs.len(), 1);
+}
+
+#[test]
+fn merge_commit_integrates_and_repository_must_match_binding() {
+    let (dir, repo, db, run) = awaiting_run();
+    let branch = run.branch.as_deref().unwrap();
+    git(&repo, &["merge", "--no-ff", "-m", "merge run", branch]);
+    // Another repository is refused even though it also has a main branch.
+    let other = dir.path().join("other");
+    fs::create_dir(&other).unwrap();
+    git(&other, &["init", "-b", "main"]);
+    git(&other, &["config", "user.name", "test"]);
+    git(&other, &["config", "user.email", "test@example.invalid"]);
+    git(&other, &["commit", "--allow-empty", "-m", "unrelated"]);
+    let error = format!(
+        "{:#}",
+        runtime::integrate(&db, 1, Some(&other)).unwrap_err()
+    );
+    assert!(error.contains("the queue is bound to"), "{error}");
+    assert!(runtime::integrate(&db, 1, Some(&dir.path().join("missing"))).is_err());
+    let mut queue = SqliteQueue::open(&db).unwrap();
+    assert_eq!(queue.show(1).unwrap().task.status, TaskStatus::InProgress);
+
+    // The run's worktree resolves to the same repository as its root checkout.
+    let worktree = PathBuf::from(run.worktree_path.as_ref().unwrap());
+    let outcome = runtime::integrate(&db, 1, Some(&worktree)).unwrap();
+    assert_eq!(outcome["outcome"], "integrated");
+    assert_ne!(outcome["run"]["result_commit"], json!(run.base_commit));
+    let detail = queue.show(1).unwrap();
+    assert_eq!(detail.task.status, TaskStatus::Completed);
+    assert_eq!(detail.runs[0].status, RunStatus::Integrated);
+    assert_eq!(queue.candidates().unwrap()[0].id, 2);
+}
+
+#[test]
+fn squash_merge_is_not_recognized_as_integration() {
+    let (_dir, repo, db, run) = awaiting_run();
+    let branch = run.branch.as_deref().unwrap();
+    git(&repo, &["merge", "--squash", branch]);
+    git(&repo, &["commit", "-m", "squashed run"]);
+    let events_before = SqliteQueue::open(&db)
+        .unwrap()
+        .show(1)
+        .unwrap()
+        .events
+        .len();
+    let outcome = runtime::integrate(&db, 1, Some(&repo)).unwrap();
+    assert_not_integrated(&db, &outcome, &run, events_before);
+    assert_ne!(outcome["main"], json!(run.base_commit));
+    assert_ne!(outcome["main"], json!(run.result_commit));
 }

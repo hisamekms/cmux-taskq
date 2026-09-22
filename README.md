@@ -6,9 +6,9 @@ The runtime is distributed as a binary. Claude Code and Codex integrations are d
 
 ## Current status
 
-The Rust/SQLite queue and a single-run supervisor are implemented. Tasks, dependencies, state transitions, candidate selection, run reservation, supervisor leases, process heartbeats, and events are persisted locally. `supervise` claims one ready task, creates a Git worktree and a cmux workspace, starts an interactive Claude Code session through a wrapper, records the session exit, validates the completion receipt against Git and the task's verification commands, and closes the workspace of an accepted run. Claude Code's interactive lifecycle was [verified first](docs/journal/001-claude-lifecycle-spike.md).
+The Rust/SQLite queue and a single-run supervisor are implemented. Tasks, dependencies, state transitions, candidate selection, run reservation, supervisor leases, process heartbeats, and events are persisted locally. `supervise` claims one ready task, creates a Git worktree and a cmux workspace, starts an interactive Claude Code session through a wrapper, records the session exit, validates the completion receipt against Git and the task's verification commands, and closes the workspace of an accepted run. `integrate` confirms that the validated commit was merged into `main` and completes the task. Claude Code's interactive lifecycle was [verified first](docs/journal/001-claude-lifecycle-spike.md).
 
-Integration confirmation and `completed` transitions are the next steps. A validated run stays in `awaiting_integration`; its workspace is closed, while its worktree and branch are kept until the result is merged into `main` by hand. There is no manual `complete` command, and stale supervisor leases are never taken over automatically: `doctor` reports an interrupted supervisor and `recover` releases its run once nothing is left running.
+A validated run stays in `awaiting_integration`; its workspace is closed, while its worktree and branch are kept until the result is merged into `main` by hand and confirmed with `integrate`. Stale supervisor leases are never taken over automatically: `doctor` reports an interrupted supervisor and `recover` releases its run once nothing is left running.
 
 ## Build and try the queue
 
@@ -43,6 +43,7 @@ Commands return JSON on stdout. Runtime errors return JSON on stderr with a nonz
 | `dependency add TASK PREDECESSOR` / `dependency remove TASK PREDECESSOR` | Change prerequisites of a draft or ready task |
 | `candidates` | List dependency-ready tasks in registration order without reserving them |
 | `supervise --repo PATH [--cmux EXE] [--claude EXE]` | Claim one task, run it in a cmux workspace, request exit once the receipt is in and Claude is idle, validate the receipt, and close the workspace on success |
+| `integrate ID [--repo PATH]` | Confirm that the task's awaiting run was merged into `main` (merge or fast-forward) and mark the task `completed` |
 | `status` | Show the supervisor lease and whether its heartbeat is stale |
 | `doctor` | Report the lease, unfinished runs, their wrapper/agent processes, heartbeats, and paths without changing state |
 | `recover RUN_ID` | Mark an unfinished run `interrupted` and drop the stale lease once its processes and supervisor are gone; keeps its worktree and workspace |
@@ -88,6 +89,18 @@ The receipt is JSON at `<run-dir>/receipt.json`, written by atomic rename:
 ```
 
 `status` is `passed`, `failed`, or `not_applicable`; `result` is `succeeded` or `failed`. The receipt's claims never make a run succeed on their own.
+
+## Complete a task after merging
+
+Review the run branch `taskq/<run-id>` and merge it into `main` yourself (merge commit or fast-forward). Then confirm it:
+
+```sh
+target/debug/cmux-taskq --db "$taskq_demo_dir/queue.db" integrate 1
+```
+
+`integrate` checks with Git that the run's `result_commit` is an ancestor of `refs/heads/main`. If it is, the run becomes `integrated`, the task becomes `completed`, `run_integrated` and `task_status_changed` events are recorded, and tasks depending on it can appear in `candidates`. If it is not, the command prints `{"outcome": "not_integrated", ...}` with the current `main` commit and changes nothing; a squash merge or cherry-pick produces a different commit and is therefore not recognized. A task with no run awaiting integration is an error, so a task cannot be integrated twice.
+
+The repository defaults to the checkout recorded when the run was supervised; pass `--repo PATH` if it moved. Either way it must be the repository the queue is bound to. The worktree and branch are left for you to remove.
 
 ## Development checks
 

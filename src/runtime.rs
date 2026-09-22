@@ -1,8 +1,11 @@
 //! Execute one reserved task, validate its receipt, close the workspace of an
-//! accepted run, and recover orphaned runs.
+//! accepted run, confirm its integration into main, and recover orphaned runs.
 use crate::{
     application::{AgentProvider, TaskQueue, WorkspaceBackend},
-    domain::{ClaimOutcome, Receipt, RunProcess, RunStatus, SupervisorLease, Task, TaskRun},
+    domain::{
+        ClaimOutcome, IntegrationOutcome, Receipt, RunProcess, RunStatus, SupervisorLease, Task,
+        TaskRun,
+    },
     infrastructure::{
         adapters::{
             ClaudeCode, GitRepository, path_text, process_alive, run_shell_to_log, shell_join,
@@ -520,6 +523,65 @@ fn check_receipt(
         }
     }
     Ok(Ok((receipt, commit)))
+}
+
+/// Confirm that the task's awaiting run was merged into `main` by hand and
+/// complete the task. Only merge and fast-forward count: the result commit
+/// itself must be an ancestor of `refs/heads/main`. A squash or cherry-pick
+/// is reported as not integrated and nothing changes.
+pub fn integrate(db: &Path, task_id: i64, repo: Option<&Path>) -> Result<Value> {
+    let mut queue = SqliteQueue::open(db)?;
+    let detail = queue.show(task_id)?;
+    let run = detail
+        .runs
+        .iter()
+        .find(|r| r.status == RunStatus::AwaitingIntegration)
+        .with_context(|| {
+            format!(
+                "task {task_id} ({}) has no run awaiting integration",
+                detail.task.status.as_str()
+            )
+        })?;
+    let commit = run
+        .result_commit
+        .as_deref()
+        .context("run has no verified result commit")?;
+    // The run's recorded checkout is enough by default; --repo covers a moved
+    // repository. Either way it must be the repository the queue is bound to.
+    let repo = match repo {
+        Some(repo) => repo.to_owned(),
+        None => PathBuf::from(
+            run.repo_path
+                .as_deref()
+                .context("run has no repository path; pass --repo")?,
+        ),
+    };
+    let repository = GitRepository::inspect(&repo)?;
+    let common_dir = path_text(&repository.common_dir)?;
+    let bound = queue
+        .repository_binding()?
+        .context("queue is not bound to a repository; no run was supervised")?;
+    ensure!(
+        bound == common_dir,
+        "{} belongs to {common_dir}, but the queue is bound to {bound}",
+        repo.display()
+    );
+    let main = repository.base_commit.clone();
+    if !repository.is_ancestor(commit, &main)? {
+        return Ok(serde_json::to_value(IntegrationOutcome::NotIntegrated {
+            run: Box::new(run.clone()),
+            main: main.clone(),
+            reason: format!(
+                "commit {commit} is not an ancestor of refs/heads/main ({main}); \
+                 merge or fast-forward the run branch (squash and cherry-pick are not recognized)"
+            ),
+        })?);
+    }
+    let (task, run) = queue.finish_integration(&run.id, &main, &common_dir)?;
+    Ok(serde_json::to_value(IntegrationOutcome::Integrated {
+        task,
+        run: Box::new(run),
+    })?)
 }
 
 fn tail(text: &str, max_bytes: usize) -> &str {
