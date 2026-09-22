@@ -7,7 +7,7 @@ description: Register and inspect cmux-taskq goals and tasks through the locally
 
 cmux-taskq runs development tasks in cmux workspaces and isolated Git worktrees. This skill drives the `cmux-taskq` binary; every command prints JSON on stdout, and a runtime error prints `{"error": ...}` on stderr with exit status 1. Never read or modify the SQLite queue file directly (no `sqlite3`, no editing); the binary is the only interface.
 
-A goal is the problem several tasks solve together; a task is one unit of work a session executes in its own worktree. Register the goal first, then its tasks. Starting a run, landing it on `main` with `integrate`, and resuming a `needs_session` run are in the `taskq-run` skill; recovering an interrupted run is in `taskq-recover`.
+A goal is the problem several tasks solve together; a task is one unit of work a session executes in its own worktree. Register the goal first, then its tasks. Starting the runtime with `up`, watching the runs, landing one on `main` with `integrate`, and resuming a `needs_session` run are in the `taskq-maintain` skill; recovering an interrupted run is in `taskq-recover`.
 
 ## 1. Locate the binary and the queue
 
@@ -118,7 +118,7 @@ Useful run fields: `branch` (`taskq/<run-id>`), `worktree_path`, `workspace_id` 
 
 ## 4. Report results
 
-Judge completion only from `show`: the run's `status`, `result_commit`, `last_error`, and the `validation_finished` event. Neither a Stop hook firing, an idle session, nor the receipt file's existence means success; the supervisor validates the receipt against Git and the verification commands before a run becomes `awaiting_integration`. Summarize for the user: task status, latest run status, branch and commit to review, and the next step (`taskq-run` to start or integrate, `taskq-recover` if the run is stuck).
+Judge completion only from `show`: the run's `status`, `result_commit`, `last_error`, and the `validation_finished` event. Neither a Stop hook firing, an idle session, nor the receipt file's existence means success; the supervisor validates the receipt against Git and the verification commands before a run becomes `awaiting_integration`. Summarize for the user: task status, latest run status, branch and commit to review, and the next step (`taskq-maintain` to start the runtime or integrate, `taskq-recover` if the run is stuck).
 
 ### Close a goal
 

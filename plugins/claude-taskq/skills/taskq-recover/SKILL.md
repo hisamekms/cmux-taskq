@@ -31,7 +31,7 @@ Recovery is refused while any process registered for that run is alive, its leas
 "$TASKQ" recover RUN_ID
 ```
 
-`RUN_ID` comes from `doctor` or `show ID`. On success it prints `{"outcome": "recovered", "run": ...}`: the run is `interrupted` (an `integrating` run goes back to `awaiting_integration` instead, because its validated result is intact; land it again with the `taskq-run` skill), a `run_recovered` event records what was checked, and that run's lease (if any) is deleted. Other runs, their leases and processes are untouched, so a supervisor running other tasks keeps going. The worktree, branch, cmux workspace, and run directory are kept for inspection, and the task stays `in_progress`. Nothing is rerun automatically.
+`RUN_ID` comes from `doctor` or `show ID`. On success it prints `{"outcome": "recovered", "run": ...}`: the run is `interrupted` (an `integrating` run goes back to `awaiting_integration` instead, because its validated result is intact; land it again with the `taskq-maintain` skill), a `run_recovered` event records what was checked, and that run's lease (if any) is deleted. Other runs, their leases and processes are untouched, so a supervisor running other tasks keeps going. The worktree, branch, cmux workspace, and run directory are kept for inspection, and the task stays `in_progress`. Nothing is rerun automatically.
 
 ## 4. Retry or give up
 

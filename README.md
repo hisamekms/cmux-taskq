@@ -166,11 +166,11 @@ The queue is the one of the repository you run Claude Code in, resolved by the b
 
 | Skill | Covers |
 | --- | --- |
-| `/claude-taskq:taskq` | Locate the binary and queue, `init`, register with `add` (description, acceptance, `--verify`, `--depends-on`), `ready`, `list` / `show` / `candidates` / `locate` / `status` / `doctor`, how to read run states |
-| `/claude-taskq:taskq-run` | Start the runtime, watch runs with `show` and `status`, judge completion from the run state and receipt rather than a Stop hook, review and land with `integrate`, resume a `needs_session` run. It still describes launching `supervise` in a cmux workspace by hand; the `taskq-maintain` skill that calls `up` / `down` instead replaces it next |
+| `/claude-taskq:taskq` | Locate the binary and queue, `init`, register a goal with `goal add` and decompose it into tasks with `add --goal` (description, acceptance, `--verify`, `--depends-on`, `--context`), `ready`, `list` / `show` / `candidates` / `locate` / `status` / `doctor`, how to read run states, close a goal |
+| `/claude-taskq:taskq-maintain` | The maintainer's side: start the runtime with `up`, read `status` for a stale supervisor, watch runs with `show`, judge completion from the run state and receipt rather than a Stop hook, answer a run's prompts, review and land with `integrate`, resume a `needs_session` run, close the workspace of a failed run, report a receipt's `follow_ups`, stop the runtime with `down`, and find the supervisor's logs |
 | `/claude-taskq:taskq-recover` | `doctor`, `recover RUN_ID` for one run without disturbing the others, retry with `ready` |
 
-Claude picks the skill from the request ("queue a task to …", "did task 3 finish?", "the supervisor died"). `claude plugin validate plugins/claude-taskq` checks the manifest and skills; `tests/plugin.rs` checks them and the launcher in `cargo test`.
+Claude picks the skill from the request ("queue a task to …", "start the runtime", "did task 3 finish?", "the supervisor died"). `up` opens the maintainer session with this plugin loaded when it is given `--plugin-dir`. `claude plugin validate plugins/claude-taskq` checks the manifest and skills; `tests/plugin.rs` checks them and the launcher in `cargo test`.
 
 ## Development checks
 

@@ -73,7 +73,7 @@ fn every_skill_has_valid_frontmatter_and_uses_the_launcher() {
         .iter()
         .map(|d| d.file_name().unwrap().to_string_lossy().into_owned())
         .collect();
-    assert_eq!(names, ["taskq", "taskq-recover", "taskq-run"]);
+    assert_eq!(names, ["taskq", "taskq-maintain", "taskq-recover"]);
     for dir in &dirs {
         let skill = fs::read_to_string(dir.join("SKILL.md")).unwrap();
         let fields = frontmatter(&skill);
