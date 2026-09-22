@@ -1,6 +1,6 @@
 ---
 name: taskq-run
-description: Start the cmux-taskq supervisor (a resident loop that runs dependency-ready tasks in parallel, each in its own cmux workspace) in a dedicated cmux workspace, watch runs through the binary's JSON, judge completion from the run state and receipt, land a validated run on main with integrate (the runtime rebases, re-validates and squashes it), and resume a run that needs a session after a conflict. Use when the user asks to run, start, supervise, or launch queued tasks, to check whether a run finished, to integrate or land a finished task, or to deal with a run in needs_session.
+description: Start the cmux-taskq supervisor (a resident loop that runs dependency-ready tasks in parallel, each in its own cmux workspace) in a dedicated cmux workspace, watch runs through the binary's JSON, judge completion from the run state and receipt, land a validated run on main with integrate (the runtime rebases, re-validates and squashes it), answer the trust prompt a real session stops at in each run's workspace, resume a run that needs a session after a conflict, and close the workspace of a failed or interrupted run. Use when the user asks to run, start, supervise, or launch queued tasks, to check whether a run finished, to integrate or land a finished task, to deal with a run in needs_session, or to clean up a run that failed.
 ---
 
 # cmux-taskq: run a task and land it on main
@@ -27,7 +27,18 @@ cmux workspace create --name "taskq supervise" --cwd "<repo>" \
 
 `--parallel N` (default 4) caps how many runs execute at once. The base commit of every run is the repository's `refs/heads/main` at claim time, whichever checkout `--cwd` names. Only if `CMUX_TASKQ_DB` is set in this session, add `--db '<db>'` before `supervise` with the `db` value from `--resolve`, because the workspace does not see the variable. Pass `--cmux EXE` / `--claude EXE` after `supervise` if those executables are not on the workspace's PATH. If cmux is missing, tell the user the supervisor needs cmux and Claude Code installed and cannot be started from here; the same command can be run by hand in any dedicated terminal inside the repository.
 
-The supervisor claims candidates up to the limit, creates `<runs_dir>/<run-id>/` (next to the queue database, see `--resolve`) for each, a worktree on branch `taskq/<run-id>` inside it, and a cmux workspace per run where Claude Code works on the task interactively. Trust and permission prompts are answered in those workspaces by a person. It keeps polling for new candidates every few seconds, including tasks that `integrate` unblocks, until it is stopped: the first Ctrl-C in its workspace stops claiming and waits for the active runs to finish; a second one kills it. `supervise --once` instead exits as soon as nothing is active and nothing is claimable, which suits a single batch.
+The supervisor claims candidates up to the limit, creates `<runs_dir>/<run-id>/` (next to the queue database, see `--resolve`) for each, a worktree on branch `taskq/<run-id>` inside it, and a cmux workspace per run where Claude Code works on the task interactively. It keeps polling for new candidates every few seconds, including tasks that `integrate` unblocks, until it is stopped: the first Ctrl-C in its workspace stops claiming and waits for the active runs to finish; a second one kills it. `supervise --once` instead exits as soon as nothing is active and nothing is claimable, which suits a single batch.
+
+### Answer the trust prompt of every run
+
+A real Claude Code session stops at a trust prompt for each new run worktree, because every run's worktree is a directory Claude Code has never seen; the runtime does not answer it. Until it is answered the run stays `running` after `agent_started` and nothing happens in the worktree. Answer it in the run's cmux workspace: take `workspace_id` from `"$TASKQ" show ID` (the workspace is named `taskq <task-id> <run-id>`), read the screen, and send the keys that accept the prompt:
+
+```sh
+cmux read-screen --workspace <workspace_id> --lines 40
+cmux send-key --workspace <workspace_id> enter      # after `down` if the accepting choice is not highlighted
+```
+
+Do this for every run the supervisor starts, including runs of dependent tasks claimed later, and check the screen again afterwards: the session may stop at a permission prompt next (answer it the same way when it concerns the worktree, and ask the user otherwise). A run whose session never left the trust prompt has no receipt and no commit, so it is not a runtime failure; do not recover it, answer the prompt.
 
 ## 3. Watch the runs
 
@@ -39,9 +50,17 @@ Poll with `"$TASKQ" show ID` (and `"$TASKQ" status`), not by reading the workspa
 - `integrating`: an `integrate` process holds the queue's single integration slot for this run (its lease shows in `status`). Wait for it; if its process died (`doctor` shows the lease stale and its PID dead), the `taskq-recover` skill returns the run to `awaiting_integration`.
 - `needs_session`: `integrate` could not land it (rebase conflict, or a verification command failed after the rebase); `last_error` says why. See step 5.
 - `integrated`: landed on `main`; `result_commit` is the landed commit and the task is `completed`.
-- `failed`: rejected or exited nonzero; `last_error` says why (missing or inconsistent receipt, dirty worktree, verification command failure). Workspace and worktree are kept. Retry with `"$TASKQ" ready ID` after fixing the cause; the running supervisor makes a new run.
+- `failed`: rejected or exited nonzero; `last_error` says why (missing or inconsistent receipt, dirty worktree, verification command failure). Workspace and worktree are kept for inspection; close the workspace yourself afterwards (below). Retry with `"$TASKQ" ready ID` after fixing the cause; the running supervisor makes a new run.
 - unfinished with `last_error` set and no lease in `status` (a `runtime_error` event with `lease_released: true`): the supervisor gave this run up (wrapper heartbeat lost, exit request timed out, provisioning or validation error) and kept serving the others; use the `taskq-recover` skill. After a provisioning failure the supervisor stops claiming, finishes its active runs and exits nonzero; fix the cause (cmux, Git) and start it again.
-- `interrupted`: recovered; retry with `ready ID`.
+- `interrupted`: recovered; retry with `ready ID`. Its workspace is kept too; close it yourself (below).
+
+The runtime closes only the workspace of an accepted run (`awaiting_integration`). It never closes the workspace of a `failed` or `interrupted` run, so once the user has inspected its screen, worktree, and `last_error`, close it:
+
+```sh
+cmux workspace close <workspace_id>
+```
+
+`workspace_id` is the run's `workspace_id` in `"$TASKQ" show ID` (`doctor` lists only unfinished runs, so a `failed` run is not there). The session in it has already exited (both states require that), so only the shell is left; closing the workspace discards its screen, so read it first if `last_error` is not enough. The worktree, branch, and run directory stay on disk for the user's manual cleanup, as the `taskq-recover` skill describes.
 
 One run's failure never changes another run: each is judged, closed and released on its own. Completion is decided only by these states. A Stop hook, an idle session, or a `receipt.json` appearing in `run_dir` is not success: the receipt's claims are cross-checked by the supervisor, and `validation_finished` in `events` records the verdict and reason. If a run stays `running` after the supervisor logged `exit_request_timed_out`, tell the user to send `/exit` in that task's workspace themselves.
 
