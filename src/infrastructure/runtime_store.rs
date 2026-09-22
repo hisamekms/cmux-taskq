@@ -245,6 +245,67 @@ impl SqliteQueue {
         Ok(())
     }
 
+    /// Runs that hold the execution slot, oldest first.
+    pub fn active_runs(&self) -> Result<Vec<TaskRun>> {
+        Ok(self
+            .conn
+            .prepare("SELECT * FROM task_runs WHERE status IN ('claimed','starting','running','validating') ORDER BY rowid")?
+            .query_map([], run_row)?
+            .collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Operator recovery of an orphaned run. The caller has checked that the
+    /// registered processes are dead; `checked_processes` guards against a
+    /// registration that happened in between, and a fresh lease is refused here
+    /// again. Resources and the task's `in_progress` status are left untouched.
+    pub fn recover_run(
+        &mut self,
+        id: &str,
+        checked_processes: usize,
+        mut report: serde_json::Value,
+    ) -> Result<TaskRun> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let fresh: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM supervisor_leases WHERE heartbeat_at >= unixepoch()-?1)",
+            [HEARTBEAT_TIMEOUT_SECS],
+            |r| r.get(0),
+        )?;
+        ensure!(!fresh, "supervisor lease heartbeat is fresh");
+        let registered: i64 = tx.query_row(
+            "SELECT count(*) FROM run_processes WHERE run_id=?1",
+            [id],
+            |r| r.get(0),
+        )?;
+        ensure!(
+            usize::try_from(registered).ok() == Some(checked_processes),
+            "run processes changed during recovery; inspect doctor again"
+        );
+        let previous: String = tx
+            .query_row("SELECT status FROM task_runs WHERE id=?1", [id], |r| {
+                r.get(0)
+            })
+            .optional()?
+            .with_context(|| format!("run {id} does not exist"))?;
+        ensure!(
+            tx.execute(
+                "UPDATE task_runs SET status='interrupted' WHERE id=?1
+                 AND status IN ('claimed','starting','running','validating')",
+                [id]
+            )? == 1,
+            "run {id} is {previous}; only unfinished runs can be recovered"
+        );
+        let leases_deleted = tx.execute("DELETE FROM supervisor_leases", [])?;
+        report["previous_status"] = json!(previous);
+        report["lease_deleted"] = json!(leases_deleted == 1);
+        run_event(&tx, id, "run_recovered", report)?;
+        // The task stays in_progress; a retry is an explicit `ready` and a new run.
+        let result = tx.query_row("SELECT * FROM task_runs WHERE id=?1", [id], run_row)?;
+        tx.commit()?;
+        Ok(result)
+    }
+
     pub fn processes(&self, id: &str) -> Result<Vec<RunProcess>> {
         Ok(self
             .conn

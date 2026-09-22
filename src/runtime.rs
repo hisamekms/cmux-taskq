@@ -1,14 +1,18 @@
-//! Execute one reserved task, validate its receipt, and close the workspace of an accepted run.
+//! Execute one reserved task, validate its receipt, close the workspace of an
+//! accepted run, and recover orphaned runs.
 use crate::{
     application::{AgentProvider, TaskQueue, WorkspaceBackend},
-    domain::{ClaimOutcome, Receipt, RunStatus, Task, TaskRun},
+    domain::{ClaimOutcome, Receipt, RunProcess, RunStatus, SupervisorLease, Task, TaskRun},
     infrastructure::{
-        adapters::{ClaudeCode, GitRepository, path_text, run_shell_to_log, shell_join},
+        adapters::{
+            ClaudeCode, GitRepository, path_text, process_alive, run_shell_to_log, shell_join,
+        },
         runtime_store::{HEARTBEAT_TIMEOUT_SECS, RunPlan, Validation},
         sqlite::SqliteQueue,
     },
 };
 use anyhow::{Context, Result, ensure};
+use serde::Serialize;
 use serde_json::{Value, json};
 use std::{
     fs,
@@ -486,6 +490,178 @@ pub fn prompt(task: &Task, run: &TaskRun) -> Result<String> {
         acceptance = task.acceptance,
         verification = serde_json::to_string_pretty(&task.verification_commands)?,
     ))
+}
+
+/// Health of the supervisor lease as `doctor` reports it.
+#[derive(Debug, Clone, Serialize)]
+pub struct LeaseHealth {
+    pub pid: u32,
+    pub alive: bool,
+    pub heartbeat_at: i64,
+    pub heartbeat_age_secs: i64,
+    pub stale: bool,
+}
+
+/// Health of one registered wrapper/agent process. `alive` is only checked
+/// while the wrapper has not reported an exit, because a dead PID may be reused.
+#[derive(Debug, Clone, Serialize)]
+pub struct ProcessHealth {
+    pub role: String,
+    pub pid: u32,
+    pub alive: Option<bool>,
+    pub heartbeat_at: i64,
+    pub heartbeat_age_secs: i64,
+    pub heartbeat_stale: bool,
+    pub exited_at: Option<i64>,
+    pub exit_code: Option<i32>,
+}
+
+/// One run holding the execution slot. `blockers` lists why `recover` would
+/// refuse it; an empty list means it is recoverable now.
+#[derive(Debug, Clone, Serialize)]
+pub struct RunHealth {
+    pub run_id: String,
+    pub task_id: i64,
+    pub status: RunStatus,
+    pub workspace_id: Option<String>,
+    pub worktree_path: Option<String>,
+    pub worktree_exists: Option<bool>,
+    pub run_dir: Option<String>,
+    pub run_dir_exists: Option<bool>,
+    pub receipt_exists: Option<bool>,
+    pub last_error: Option<String>,
+    pub processes: Vec<ProcessHealth>,
+    pub blockers: Vec<String>,
+    pub recoverable: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DoctorReport {
+    pub checked_at: i64,
+    pub supervisor: Option<LeaseHealth>,
+    pub runs: Vec<RunHealth>,
+}
+
+/// Inspect the lease, unfinished runs, their processes and paths. Reads only.
+pub fn doctor(db: &Path) -> Result<Value> {
+    let queue = SqliteQueue::open(db)?;
+    let now = unix_time();
+    let supervisor = queue
+        .supervisor_lease()?
+        .map(|lease| lease_health(&lease, now));
+    let runs = queue
+        .active_runs()?
+        .into_iter()
+        .map(|run| {
+            let processes = queue.processes(&run.id)?;
+            Ok(run_health(&run, &processes, supervisor.as_ref(), now))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(serde_json::to_value(DoctorReport {
+        checked_at: now,
+        supervisor,
+        runs,
+    })?)
+}
+
+/// Mark an orphaned run `interrupted` and drop the stale lease, after checking
+/// that nothing registered for it is still alive. Never reruns, never deletes
+/// the worktree or workspace, and leaves the task `in_progress`.
+pub fn recover(db: &Path, id: &str) -> Result<Value> {
+    let mut queue = SqliteQueue::open(db)?;
+    let run = queue.run(id)?;
+    ensure!(
+        matches!(
+            run.status,
+            RunStatus::Claimed | RunStatus::Starting | RunStatus::Running | RunStatus::Validating
+        ),
+        "run {id} is {}; only unfinished runs can be recovered",
+        run.status.as_str()
+    );
+    let now = unix_time();
+    let supervisor = queue
+        .supervisor_lease()?
+        .map(|lease| lease_health(&lease, now));
+    let processes = queue.processes(&run.id)?;
+    let health = run_health(&run, &processes, supervisor.as_ref(), now);
+    ensure!(
+        health.recoverable,
+        "refusing to recover run {id}: {}",
+        health.blockers.join("; ")
+    );
+    let report = json!({"supervisor": supervisor, "run": health});
+    let run = queue.recover_run(&run.id, processes.len(), report)?;
+    Ok(json!({"outcome": "recovered", "run": run}))
+}
+
+fn lease_health(lease: &SupervisorLease, now: i64) -> LeaseHealth {
+    let age = now - lease.heartbeat_at;
+    LeaseHealth {
+        pid: lease.pid,
+        alive: process_alive(lease.pid),
+        heartbeat_at: lease.heartbeat_at,
+        heartbeat_age_secs: age,
+        stale: age > HEARTBEAT_TIMEOUT_SECS,
+    }
+}
+
+fn run_health(
+    run: &TaskRun,
+    processes: &[RunProcess],
+    supervisor: Option<&LeaseHealth>,
+    now: i64,
+) -> RunHealth {
+    let mut blockers = Vec::new();
+    let processes: Vec<ProcessHealth> = processes
+        .iter()
+        .map(|process| {
+            let age = now - process.heartbeat_at;
+            let alive = process
+                .exited_at
+                .is_none()
+                .then(|| process_alive(process.pid));
+            if alive == Some(true) {
+                blockers.push(format!("{} pid {} is alive", process.role, process.pid));
+            }
+            ProcessHealth {
+                role: process.role.clone(),
+                pid: process.pid,
+                alive,
+                heartbeat_at: process.heartbeat_at,
+                heartbeat_age_secs: age,
+                heartbeat_stale: process.exited_at.is_none() && age > HEARTBEAT_TIMEOUT_SECS,
+                exited_at: process.exited_at,
+                exit_code: process.exit_code,
+            }
+        })
+        .collect();
+    if let Some(lease) = supervisor {
+        if !lease.stale {
+            blockers.push(format!(
+                "supervisor heartbeat is {}s old (limit {HEARTBEAT_TIMEOUT_SECS}s)",
+                lease.heartbeat_age_secs
+            ));
+        }
+        if lease.alive {
+            blockers.push(format!("supervisor pid {} is alive", lease.pid));
+        }
+    }
+    let exists = |path: &Option<String>| path.as_deref().map(|p| Path::new(p).exists());
+    RunHealth {
+        run_id: run.id.clone(),
+        task_id: run.task_id,
+        status: run.status,
+        workspace_id: run.workspace_id.clone(),
+        worktree_path: run.worktree_path.clone(),
+        worktree_exists: exists(&run.worktree_path),
+        run_dir: run.run_dir.clone(),
+        run_dir_exists: exists(&run.run_dir),
+        receipt_exists: exists(&run.receipt_path),
+        last_error: run.last_error.clone(),
+        processes,
+        recoverable: blockers.is_empty(),
+        blockers,
+    }
 }
 
 /// Run from cmux, not from a pipe; stdout must remain a terminal for Claude.

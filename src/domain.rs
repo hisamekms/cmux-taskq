@@ -67,11 +67,20 @@ pub enum TaskAction {
 }
 
 impl TaskStatus {
-    pub fn transition(self, action: TaskAction) -> Result<Self> {
+    /// `unfinished_run` is whether the task still owns a run that is executing or
+    /// awaiting integration. An in-progress task whose runs have all failed or
+    /// been interrupted may be retried or canceled by hand; a retry is a new run.
+    pub fn transition(self, action: TaskAction, unfinished_run: bool) -> Result<Self> {
         match (self, action) {
             (Self::Draft, TaskAction::Ready) => Ok(Self::Ready),
             (Self::Ready, TaskAction::Draft) => Ok(Self::Draft),
             (Self::Draft | Self::Ready, TaskAction::Cancel) => Ok(Self::Canceled),
+            (Self::InProgress, _) if unfinished_run => bail!(
+                "task has an unfinished run; recover or integrate it before applying {action:?}"
+            ),
+            (Self::InProgress, TaskAction::Ready) => Ok(Self::Ready),
+            (Self::InProgress, TaskAction::Draft) => Ok(Self::Draft),
+            (Self::InProgress, TaskAction::Cancel) => Ok(Self::Canceled),
             _ => bail!("cannot apply {action:?} to task in {} state", self.as_str()),
         }
     }

@@ -74,6 +74,13 @@ enum Command {
     },
     /// Inspect supervisor ownership and heartbeat without changing it.
     Status,
+    /// Report the lease, unfinished runs, their processes, heartbeats and paths without changing state.
+    Doctor,
+    /// Mark an unfinished run interrupted once its processes and supervisor are gone; keeps its worktree and workspace.
+    Recover {
+        /// Run ID from `show` or `doctor`.
+        run: String,
+    },
     #[command(hide = true)]
     Session {
         #[arg(long)]
@@ -151,6 +158,8 @@ fn execute(cli: Cli) -> Result<Value> {
                 &std::env::current_exe()?,
             )?
         }
+        Command::Doctor => cmux_taskq::runtime::doctor(&cli.db)?,
+        Command::Recover { run } => cmux_taskq::runtime::recover(&cli.db, &run)?,
         Command::Session { run, lease, claude } => {
             cmux_taskq::runtime::session(&cli.db, &run, &lease, &claude)?
         }

@@ -477,6 +477,10 @@ fn failed_agent_retains_worktree_and_does_not_complete_task() {
     assert!(Path::new(detail.runs[0].worktree_path.as_ref().unwrap()).exists());
     assert!(queue.supervisor_lease().unwrap().is_none());
     assert!(queue.candidates().unwrap().is_empty());
+    // A failed run does not free the task automatically, but the operator may give up on it.
+    assert_eq!(runtime::doctor(&db).unwrap()["runs"], json!([]));
+    queue.transition(1, TaskAction::Cancel).unwrap();
+    assert_eq!(queue.show(1).unwrap().task.status, TaskStatus::Canceled);
 }
 
 #[test]
@@ -720,4 +724,198 @@ fn no_ready_task_releases_lease_without_creating_a_run() {
     );
     assert!(queue.supervisor_lease().unwrap().is_none());
     assert!(queue.show(1).unwrap().runs.is_empty());
+}
+
+/// A PID that certainly belonged to a process that has already exited.
+fn dead_pid() -> u32 {
+    let mut child = Command::new("true").spawn().unwrap();
+    let pid = child.id();
+    child.wait().unwrap();
+    pid
+}
+
+/// Register a run the way `supervise` does, with the given PIDs as wrapper and
+/// agent, but with no supervisor loop watching it. Returns the running run.
+fn orphan_run(repo: &Path, db: &Path, wrapper: u32, agent: u32) -> TaskRun {
+    use cmux_taskq::{
+        domain::ClaimOutcome,
+        infrastructure::{
+            adapters::{GitRepository, path_text},
+            runtime_store::RunPlan,
+        },
+    };
+    let repository = GitRepository::inspect(repo).unwrap();
+    let mut queue = SqliteQueue::open(db).unwrap();
+    queue
+        .acquire_supervisor("owner", &path_text(&repository.common_dir).unwrap())
+        .unwrap();
+    let ClaimOutcome::Claimed { run } = queue.claim(&repository.base_commit).unwrap() else {
+        panic!()
+    };
+    let run_dir = db.parent().unwrap().join("orphan");
+    fs::create_dir(&run_dir).unwrap();
+    queue
+        .plan_run(
+            &run.id,
+            "owner",
+            &RunPlan {
+                repo_path: path_text(&repository.root).unwrap(),
+                run_dir: path_text(&run_dir).unwrap(),
+                branch: format!("taskq/{}", run.id),
+                worktree_path: path_text(&run_dir.join("worktree")).unwrap(),
+                receipt_path: path_text(&run_dir.join("receipt.json")).unwrap(),
+                log_path: path_text(&run_dir.join("log")).unwrap(),
+            },
+        )
+        .unwrap();
+    let run = queue.run(&run.id).unwrap();
+    repository.create_worktree(&run).unwrap();
+    queue.workspace_created(&run.id, "owner", "ws-1").unwrap();
+    queue.register_wrapper(&run.id, "owner", wrapper).unwrap();
+    queue.register_agent(&run.id, wrapper, agent).unwrap();
+    let run = queue.run(&run.id).unwrap();
+    assert_eq!(run.status, RunStatus::Running);
+    run
+}
+
+#[test]
+fn recover_requires_dead_processes_and_stale_lease_then_allows_a_new_run() {
+    let (_dir, repo, db) = fixture();
+    let mut wrapper = Command::new("sleep").arg("60").spawn().unwrap();
+    let mut agent = Command::new("sleep").arg("60").spawn().unwrap();
+    let run = orphan_run(&repo, &db, wrapper.id(), agent.id());
+    let mut queue = SqliteQueue::open(&db).unwrap();
+
+    // Everything is alive: doctor says so and recover refuses.
+    let report = runtime::doctor(&db).unwrap();
+    assert_eq!(report["supervisor"]["stale"], false);
+    assert_eq!(report["supervisor"]["alive"], true);
+    let health = &report["runs"][0];
+    assert_eq!(health["run_id"], json!(run.id));
+    assert_eq!(health["status"], "running");
+    assert_eq!(health["workspace_id"], "ws-1");
+    assert_eq!(health["worktree_exists"], true);
+    assert_eq!(health["run_dir_exists"], true);
+    assert_eq!(health["receipt_exists"], false);
+    assert_eq!(health["recoverable"], false);
+    let processes = health["processes"].as_array().unwrap();
+    assert_eq!(processes.len(), 2);
+    assert!(processes.iter().all(|p| p["alive"] == true));
+    let error = format!("{:#}", runtime::recover(&db, &run.id).unwrap_err());
+    assert!(
+        error.contains("wrapper pid") && error.contains("supervisor heartbeat"),
+        "{error}"
+    );
+    assert!(queue.transition(1, TaskAction::Ready).is_err());
+
+    // The supervisor is gone (stale heartbeat, dead PID) but the session is not.
+    let raw = Connection::open(&db).unwrap();
+    raw.execute(
+        "UPDATE supervisor_leases SET heartbeat_at=0, pid=?1",
+        [dead_pid()],
+    )
+    .unwrap();
+    raw.execute("UPDATE run_processes SET heartbeat_at=0", [])
+        .unwrap();
+    let report = runtime::doctor(&db).unwrap();
+    assert_eq!(report["supervisor"]["stale"], true);
+    assert_eq!(report["supervisor"]["alive"], false);
+    assert_eq!(report["runs"][0]["processes"][0]["heartbeat_stale"], true);
+    let error = format!("{:#}", runtime::recover(&db, &run.id).unwrap_err());
+    assert!(
+        error.contains("agent pid") && !error.contains("supervisor"),
+        "{error}"
+    );
+    assert_eq!(queue.run(&run.id).unwrap().status, RunStatus::Running);
+    assert!(queue.supervisor_lease().unwrap().is_some());
+
+    // The session processes are gone too: recovery is allowed and explicit.
+    agent.kill().unwrap();
+    agent.wait().unwrap();
+    wrapper.kill().unwrap();
+    wrapper.wait().unwrap();
+    let report = runtime::doctor(&db).unwrap();
+    assert_eq!(report["runs"][0]["recoverable"], true);
+    assert_eq!(report["runs"][0]["blockers"], json!([]));
+    let outcome = runtime::recover(&db, &run.id).unwrap();
+    assert_eq!(outcome["outcome"], "recovered");
+    assert_eq!(outcome["run"]["status"], "interrupted");
+    let detail = queue.show(1).unwrap();
+    assert_eq!(detail.task.status, TaskStatus::InProgress);
+    assert_eq!(detail.runs[0].status, RunStatus::Interrupted);
+    assert!(queue.supervisor_lease().unwrap().is_none());
+    let recovered = detail
+        .events
+        .iter()
+        .find(|e| e.kind == "run_recovered")
+        .unwrap();
+    assert_eq!(recovered.payload["previous_status"], "running");
+    assert_eq!(recovered.payload["lease_deleted"], true);
+    assert_eq!(recovered.payload["run"]["processes"][0]["alive"], false);
+    assert_eq!(recovered.payload["supervisor"]["stale"], true);
+    // Registrations and resources are left as observed.
+    assert!(detail.processes.iter().all(|p| p.exited_at.is_none()));
+    assert!(Path::new(run.worktree_path.as_ref().unwrap()).exists());
+    assert!(runtime::recover(&db, &run.id).is_err()); // No longer unfinished.
+    assert_eq!(runtime::doctor(&db).unwrap()["runs"], json!([]));
+    assert!(queue.candidates().unwrap().is_empty());
+
+    // Retry is a separate decision: ready again, then a second run with new paths.
+    queue.transition(1, TaskAction::Ready).unwrap();
+    assert_eq!(queue.candidates().unwrap().len(), 1);
+    let backend = TestWorkspace::new(&db, false, VALID_AGENT);
+    let outcome = supervise(&db, &repo, &backend).unwrap();
+    backend.join();
+    assert_eq!(outcome["run"]["status"], "awaiting_integration");
+    let detail = queue.show(1).unwrap();
+    assert_eq!(detail.runs.len(), 2);
+    assert_eq!(detail.runs[0].status, RunStatus::Interrupted);
+    assert_eq!(detail.runs[0].worktree_path, run.worktree_path);
+    assert!(Path::new(run.worktree_path.as_ref().unwrap()).exists());
+    assert_ne!(detail.runs[1].worktree_path, run.worktree_path);
+    assert!(queue.transition(1, TaskAction::Ready).is_err()); // Awaiting integration still owns the task.
+}
+
+#[test]
+fn recover_ignores_exited_processes_and_tolerates_a_missing_lease() {
+    let (_dir, repo, db) = fixture();
+    // The wrapper reported its exit before the supervisor died; its live PID
+    // (this test process) must not block recovery.
+    let pid = std::process::id();
+    let run = orphan_run(&repo, &db, pid, pid);
+    let mut queue = SqliteQueue::open(&db).unwrap();
+    queue.wrapper_exited(&run.id, pid, 0).unwrap();
+    let error = format!("{:#}", runtime::recover(&db, &run.id).unwrap_err());
+    assert!(
+        error.contains("supervisor pid") && !error.contains("wrapper pid"),
+        "{error}"
+    );
+    let report = runtime::doctor(&db).unwrap();
+    assert!(
+        report["runs"][0]["processes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|p| p["alive"].is_null() && p["heartbeat_stale"] == false)
+    );
+    Connection::open(&db)
+        .unwrap()
+        .execute("DELETE FROM supervisor_leases", [])
+        .unwrap();
+    assert_eq!(runtime::doctor(&db).unwrap()["supervisor"], Value::Null);
+    let outcome = runtime::recover(&db, &run.id).unwrap();
+    assert_eq!(outcome["run"]["status"], "interrupted");
+    let detail = queue.show(1).unwrap();
+    let recovered = detail
+        .events
+        .iter()
+        .find(|e| e.kind == "run_recovered")
+        .unwrap();
+    assert_eq!(recovered.payload["lease_deleted"], false);
+    assert_eq!(recovered.payload["supervisor"], Value::Null);
+    // The task can be edited again before a retry.
+    assert!(queue.add_dependency(1, 1).is_err());
+    queue.transition(1, TaskAction::Draft).unwrap();
+    assert_eq!(queue.show(1).unwrap().task.status, TaskStatus::Draft);
+    assert!(runtime::recover(&db, "no-such-run").is_err());
 }

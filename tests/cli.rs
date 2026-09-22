@@ -72,6 +72,11 @@ fn reads_do_not_create_a_queue_and_unknown_tasks_fail() {
     assert!(!invoke(&db, &["list"]).status.success());
     assert!(!db.exists());
     ok(&db, &["init"]);
+    assert_eq!(
+        ok(&db, &["doctor"]),
+        serde_json::json!({"checked_at": ok(&db, &["doctor"])["checked_at"], "supervisor": null, "runs": []})
+    );
+    assert!(!invoke(&db, &["recover", "missing-run"]).status.success());
     assert!(!invoke(&db, &["show", "1"]).status.success());
     assert!(!invoke(&db, &["add", "  "]).status.success());
     assert_eq!(ok(&db, &["list"]), serde_json::json!([]));

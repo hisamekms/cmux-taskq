@@ -42,6 +42,18 @@ pub fn executable(path: &Path) -> Result<PathBuf> {
         .with_context(|| format!("resolve executable {}", candidate.display()))
 }
 
+/// `kill -0` semantics: a process we may not signal (EPERM) still exists.
+pub fn process_alive(pid: u32) -> bool {
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        return false;
+    };
+    // SAFETY: signal 0 performs no action beyond the existence and permission check.
+    if unsafe { libc::kill(pid, 0) } == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+}
+
 pub fn output(command: &mut Command) -> Result<String> {
     let (status, stdout, stderr) = capture(command, Duration::from_secs(30))?;
     ensure!(

@@ -166,7 +166,9 @@ impl TaskQueue for SqliteQueue {
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let task = read_task(&tx, task_id)?;
-        let next = task.status.transition(action)?;
+        let next = task
+            .status
+            .transition(action, has_unfinished_run(&tx, task_id)?)?;
         tx.execute("UPDATE tasks SET status=?1, updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?2",
             params![next.as_str(), task_id])?;
         event(
@@ -263,6 +265,16 @@ impl TaskQueue for SqliteQueue {
         tx.commit()?;
         Ok(ClaimOutcome::Claimed { run: Box::new(run) })
     }
+}
+
+/// Executing or awaiting integration; the same set as `one_unfinished_run_per_task`.
+fn has_unfinished_run(conn: &Connection, task_id: i64) -> Result<bool> {
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM task_runs WHERE task_id=?1
+         AND status IN ('claimed','starting','running','validating','awaiting_integration'))",
+        [task_id],
+        |r| r.get(0),
+    )?)
 }
 
 fn read_task(conn: &Connection, task_id: i64) -> Result<Task> {

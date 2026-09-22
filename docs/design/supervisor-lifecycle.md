@@ -32,7 +32,7 @@ ready task
 
 ## Implementation status
 
-ステップ3で`claim`から`running`、セッション終了検知までを、ステップ4の[005](../journal/005-receipt-validation.md)でreceiptの検証と`awaiting_integration`への遷移を、[006](../journal/006-workspace-close.md)で受理後のworkspace終了を`src/runtime.rs`に実装した。統合確認、`doctor`/`recover`はステップ4の残りで追加する。
+ステップ3で`claim`から`running`、セッション終了検知までを、ステップ4の[005](../journal/005-receipt-validation.md)でreceiptの検証と`awaiting_integration`への遷移を、[006](../journal/006-workspace-close.md)で受理後のworkspace終了を、[009](../journal/009-doctor-recover.md)で`doctor`/`recover`を`src/runtime.rs`に実装した。統合確認はステップ4の残りで追加する。
 
 ## `supervise`
 
@@ -93,3 +93,21 @@ workspaceの終了はsupervisorが行う。receipt検証を通った`awaiting_in
 closeの成否は`task_runs.workspace_closed_at`で表す。nullは「閉じたことを確認していない」で、closeの失敗だけでなく、cmuxが閉じた後にDBへ書けなかった場合も含む。closeの失敗は`cleanup_failed`イベントと`last_error`に残るが、run状態は変えない。閉じていないworkspaceをcleaned扱いにせず、再試行は`doctor`/`recover`（[009](../journal/009-doctor-recover.md)）で扱う。
 
 supervisorの再起動ではleaseとheartbeatを確認し、孤児プロセスを勝手に再実行しない。ユーザーが`recover`で明示的に復旧した後に新しいTaskRunを作る。
+
+### `doctor`
+
+`cmux-taskq --db PATH doctor`は状態を変えずにJSONで報告する。
+
+- `supervisor`: leaseのPID、`kill -0`による生存、heartbeatの経過秒数、30秒を超えた`stale`。leaseがなければnull。
+- `runs`: `claimed`/`starting`/`running`/`validating`のrunごとに、`workspace_id`、worktreeとrun directoryとreceiptの存在、`last_error`、登録済みwrapper/agentプロセスのPID・生存・heartbeat経過秒数・終了コード。`exited_at`が記録済みのプロセスはPIDが再利用されうるため生存確認せず`alive: null`にする。
+- `blockers`: そのrunの`recover`を拒む理由の一覧。空なら`recoverable: true`。
+
+cmux workspaceの存在は確認しない（cmuxなしで動く）。IDを見てユーザーが`cmux workspace list`で確認する。
+
+### `recover RUN_ID`
+
+1. runが`claimed`/`starting`/`running`/`validating`でなければ拒否する。
+2. `doctor`と同じ確認を行い、未終了として登録されたプロセスのPIDが生きている、leaseのheartbeatが30秒以内、leaseのPIDが生きている、のいずれかなら拒否する。heartbeatが止まったまま生きているsupervisorはleaseを奪わず、ユーザーが止める。
+3. `BEGIN IMMEDIATE`の中でleaseが新鮮でないことと`run_processes`の行数が確認時と同じことを再検査し、runを`interrupted`にし、確認した内容を`run_recovered`イベント（`previous_status`、`lease_deleted`、`supervisor`、`run`）に記録し、leaseを削除する。
+
+`run_processes`、worktree、branch、workspace、run directoryは触らない。Taskは`in_progress`のまま残る。再試行は`ready ID`（編集するなら`draft ID`）で行い、次の`supervise`が新しいTaskRunと新しいworktreeを作る。`recover`はTaskを`ready`に戻さない: 復旧と再実行は別の判断であり、`failed`で止まったTaskの再試行と同じ経路にまとめるため。
