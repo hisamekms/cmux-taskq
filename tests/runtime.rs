@@ -14,8 +14,12 @@ use std::{
     fs,
     path::{Path, PathBuf},
     process::Command,
-    sync::Mutex,
+    sync::{
+        Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
     thread,
+    time::Duration,
 };
 use tempfile::TempDir;
 
@@ -59,7 +63,9 @@ fn fixture() -> (TempDir, PathBuf, PathBuf) {
 }
 
 /// Shell prelude for the fake agent: `receipt COMMIT [RUN_ID]` writes an
-/// atomically renamed receipt claiming success with evidence on every check.
+/// atomically renamed receipt claiming success with evidence on every check,
+/// `idle` mimics Claude's Stop hook, and `await_exit` blocks until the test
+/// workspace delivers the supervisor's exit request.
 const AGENT_PRELUDE: &str = r#"
 test -f seed.txt || exit 99
 printf 'fixture log\n' > "$LOG"
@@ -67,10 +73,16 @@ receipt() {
   printf '{"run_id":"%s","result":"succeeded","commit":"%s","tests":{"status":"passed","evidence_or_reason":"ran"},"e2e":{"status":"not_applicable","evidence_or_reason":"no e2e surface"},"subagent_review":{"status":"passed","evidence_or_reason":"reviewed"},"summary":"done"}' "${2:-$RUN_ID}" "$1" > "$RECEIPT.tmp"
   mv "$RECEIPT.tmp" "$RECEIPT"
 }
+idle() {
+  printf '{"session_id":"%s","hook_event_name":"Stop","stop_hook_active":false}' "$RUN_ID" > "$IDLE.tmp"
+  mv "$IDLE.tmp" "$IDLE"
+}
+await_exit() { while [ ! -f "$EXIT" ]; do sleep 0.2; done; }
 commit() { printf 'change\n' > change.txt && git add change.txt && git commit -q -m "$1"; }
 sleep 2
 "#;
 const VALID_AGENT: &str = "commit work; receipt \"$(git rev-parse HEAD)\"";
+const WORKSPACE_ID: &str = "01234567-89ab-4def-8123-456789abcdef";
 
 struct TestProvider {
     script: String,
@@ -89,19 +101,27 @@ impl AgentProvider for TestProvider {
             .env("RECEIPT", run.receipt_path.as_ref().unwrap())
             .env("LOG", run.log_path.as_ref().unwrap())
             .env("BASE", &run.base_commit)
+            .env("IDLE", run.idle_marker_path().unwrap())
+            .env("EXIT", exit_request_path(run.run_dir.as_ref().unwrap()))
             .arg("-c")
             .arg(format!("{AGENT_PRELUDE}\n{}", self.script));
         Ok(command)
     }
 }
 
-const WORKSPACE_ID: &str = "01234567-89ab-4def-8123-456789abcdef";
+/// The test backend delivers an exit request as a file the fake agent polls for.
+fn exit_request_path(run_dir: &str) -> PathBuf {
+    Path::new(run_dir).join("exit-requested")
+}
 
 struct TestWorkspace {
     db: PathBuf,
     fail: bool,
     close_fail: bool,
     script: String,
+    exit_timeout: Duration,
+    run_dir: Mutex<Option<String>>,
+    exits_sent: AtomicUsize,
     worker: Mutex<Option<thread::JoinHandle<Result<Value>>>>,
     closed: Mutex<Vec<String>>,
 }
@@ -112,6 +132,9 @@ impl TestWorkspace {
             fail,
             close_fail: false,
             script: script.into(),
+            exit_timeout: Duration::from_secs(120),
+            run_dir: Mutex::new(None),
+            exits_sent: AtomicUsize::new(0),
             worker: Mutex::new(None),
             closed: Mutex::new(Vec::new()),
         }
@@ -149,6 +172,7 @@ impl WorkspaceBackend for TestWorkspace {
             [],
             |r| r.get(0),
         )?;
+        *self.run_dir.lock().unwrap() = run.run_dir.clone();
         let db = self.db.clone();
         let id = run.id.clone();
         let script = self.script.clone();
@@ -173,6 +197,17 @@ impl WorkspaceBackend for TestWorkspace {
         }
         self.closed.lock().unwrap().push(workspace_id.into());
         Ok(())
+    }
+
+    fn send_exit(&self, workspace_id: &str) -> Result<()> {
+        assert_eq!(workspace_id, WORKSPACE_ID);
+        self.exits_sent.fetch_add(1, Ordering::SeqCst);
+        let run_dir = self.run_dir.lock().unwrap().clone().unwrap();
+        fs::write(exit_request_path(&run_dir), "")?;
+        Ok(())
+    }
+    fn exit_timeout(&self) -> Duration {
+        self.exit_timeout
     }
 }
 
@@ -204,6 +239,8 @@ fn run_agent_with(
     let mut backend = TestWorkspace::new(&db, false, script);
     backend.close_fail = close_fail;
     let outcome = supervise(&db, &repo, &backend).unwrap();
+    // These scripts exit on their own, like an operator's /exit; nothing was requested.
+    assert_eq!(backend.exits_sent.load(Ordering::SeqCst), 0);
     backend.join();
     assert_eq!(outcome["outcome"], "finished");
     let mut queue = SqliteQueue::open(&db).unwrap();
@@ -453,6 +490,188 @@ fn receipt_structure_is_checked_before_git() {
     }
     assert!(Receipt::parse("{\"run_id\":\"r\"}").is_err());
     assert!(Receipt::parse(&valid.replace("passed", "maybe")).is_err());
+}
+
+fn event_kinds(detail: &cmux_taskq::domain::TaskDetail) -> Vec<&str> {
+    detail.events.iter().map(|e| e.kind.as_str()).collect()
+}
+
+#[test]
+fn idle_marker_after_receipt_triggers_exit_request_and_run_finishes() {
+    let (_dir, repo, db) = fixture();
+    let backend = TestWorkspace::new(
+        &db,
+        false,
+        "commit work; receipt \"$(git rev-parse HEAD)\"; idle; await_exit",
+    );
+    let outcome = supervise(&db, &repo, &backend).unwrap();
+    backend.join();
+    assert_eq!(outcome["outcome"], "finished");
+    assert_eq!(outcome["run"]["status"], "awaiting_integration");
+    assert_eq!(backend.exits_sent.load(Ordering::SeqCst), 1);
+    let mut queue = SqliteQueue::open(&db).unwrap();
+    let detail = queue.show(1).unwrap();
+    let run = &detail.runs[0];
+    assert_eq!(run.status, RunStatus::AwaitingIntegration);
+    assert!(queue.supervisor_lease().unwrap().is_none());
+    let kinds = event_kinds(&detail);
+    let position = |kind: &str| kinds.iter().position(|k| *k == kind).unwrap();
+    assert!(position("receipt_observed") < position("session_idle_observed"));
+    assert!(position("session_idle_observed") < position("exit_requested"));
+    assert!(position("exit_requested") < position("session_exited"));
+    assert!(!kinds.contains(&"exit_request_timed_out"));
+    // The idle evidence names the hook and session that produced it.
+    let idle = detail
+        .events
+        .iter()
+        .find(|e| e.kind == "session_idle_observed")
+        .unwrap();
+    assert_eq!(idle.payload["hook_event_name"], "Stop");
+    assert_eq!(idle.payload["session_id"], json!(run.id));
+    assert_eq!(
+        idle.payload["marker_path"],
+        json!(run.idle_marker_path().unwrap())
+    );
+    assert!(
+        idle.payload["marker_modified"].as_i64().unwrap()
+            >= idle.payload["receipt_modified"].as_i64().unwrap()
+    );
+    let requested = detail
+        .events
+        .iter()
+        .find(|e| e.kind == "exit_requested")
+        .unwrap();
+    assert_eq!(requested.payload["workspace_id"], WORKSPACE_ID);
+    assert_eq!(requested.payload["timeout_secs"], 120);
+}
+
+#[test]
+fn missing_or_stale_idle_marker_does_not_request_exit() {
+    // No marker at all, then a marker older than the receipt (an earlier turn).
+    // Both sessions end by themselves, as with an operator's /exit.
+    for script in [
+        "commit work; receipt \"$(git rev-parse HEAD)\"; sleep 3",
+        "idle; sleep 1.1; commit work; receipt \"$(git rev-parse HEAD)\"; sleep 3",
+    ] {
+        let (_dir, repo, db) = fixture();
+        let backend = TestWorkspace::new(&db, false, script);
+        let outcome = supervise(&db, &repo, &backend).unwrap();
+        backend.join();
+        assert_eq!(outcome["run"]["status"], "awaiting_integration");
+        assert_eq!(backend.exits_sent.load(Ordering::SeqCst), 0);
+        let mut queue = SqliteQueue::open(&db).unwrap();
+        let detail = queue.show(1).unwrap();
+        let kinds = event_kinds(&detail);
+        assert!(kinds.contains(&"receipt_observed"));
+        assert!(!kinds.contains(&"session_idle_observed"));
+        assert!(!kinds.contains(&"exit_requested"));
+    }
+}
+
+#[test]
+fn unanswered_exit_request_times_out_and_retains_run() {
+    let (_dir, repo, db) = fixture();
+    let mut backend = TestWorkspace::new(
+        &db,
+        false,
+        "commit work; receipt \"$(git rev-parse HEAD)\"; idle; sleep 6",
+    );
+    backend.exit_timeout = Duration::from_secs(2);
+    let error = format!("{:#}", supervise(&db, &repo, &backend).unwrap_err());
+    assert!(error.contains("did not exit within 2s"), "{error}");
+    assert_eq!(backend.exits_sent.load(Ordering::SeqCst), 1);
+    // The session was never killed; it is still alive when supervise gives up.
+    let mut queue = SqliteQueue::open(&db).unwrap();
+    let detail = queue.show(1).unwrap();
+    let run = &detail.runs[0];
+    assert_eq!(run.status, RunStatus::Running);
+    assert!(run.last_error.as_ref().unwrap().contains("did not exit"));
+    assert!(Path::new(run.worktree_path.as_ref().unwrap()).exists());
+    assert!(queue.supervisor_lease().unwrap().is_some());
+    let kinds = event_kinds(&detail);
+    assert!(kinds.contains(&"exit_requested"));
+    assert!(kinds.contains(&"exit_request_timed_out"));
+    assert!(!kinds.contains(&"session_exited"));
+    let timed_out = detail
+        .events
+        .iter()
+        .find(|e| e.kind == "exit_request_timed_out")
+        .unwrap();
+    assert_eq!(timed_out.payload["timeout_secs"], 2);
+    // A later manual exit is still recorded by the wrapper; nothing restarts the run.
+    backend.join();
+    let detail = queue.show(1).unwrap();
+    assert_eq!(detail.runs[0].status, RunStatus::Running);
+    assert!(event_kinds(&detail).contains(&"session_exited"));
+    assert!(supervise(&db, &repo, &backend).is_err());
+    assert_eq!(queue.show(1).unwrap().runs.len(), 1);
+}
+
+#[test]
+fn claude_stop_hook_settings_publish_the_idle_marker() {
+    use cmux_taskq::infrastructure::adapters::{ClaudeCode, stop_hook_settings};
+    let dir = tempfile::tempdir().unwrap();
+    let run_dir = dir.path().join("run's dir");
+    fs::create_dir(&run_dir).unwrap();
+    let run = TaskRun {
+        id: "11111111-2222-4333-8444-555555555555".into(),
+        task_id: 1,
+        status: RunStatus::Starting,
+        requested_provider: cmux_taskq::domain::Provider::Claude,
+        actual_provider: cmux_taskq::domain::Provider::Claude,
+        base_commit: "0123456789abcdef0123456789abcdef01234567".into(),
+        branch: Some("taskq/x".into()),
+        worktree_path: Some(dir.path().to_str().unwrap().into()),
+        workspace_id: None,
+        receipt_path: Some(run_dir.join("receipt.json").to_str().unwrap().into()),
+        log_path: Some(run_dir.join("claude.debug.log").to_str().unwrap().into()),
+        result_commit: None,
+        repo_path: None,
+        run_dir: Some(run_dir.to_str().unwrap().into()),
+        last_error: None,
+        workspace_closed_at: None,
+        created_at: String::new(),
+    };
+    let command = ClaudeCode {
+        executable: "claude".into(),
+    }
+    .command(&run, "prompt")
+    .unwrap();
+    let args: Vec<String> = command
+        .get_args()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
+    let settings = run_dir.join("claude-settings.json");
+    assert!(args.contains(&"--settings".to_string()));
+    assert!(args.contains(&settings.to_str().unwrap().to_string()));
+    let text = fs::read_to_string(&settings).unwrap();
+    assert_eq!(
+        text,
+        stop_hook_settings(&run.idle_marker_path().unwrap()).unwrap()
+    );
+    let parsed: Value = serde_json::from_str(&text).unwrap();
+    let hook = &parsed["hooks"]["Stop"][0]["hooks"][0];
+    assert_eq!(hook["type"], "command");
+    // Run the hook exactly as Claude would: shell command, event JSON on stdin.
+    let payload =
+        r#"{"session_id":"11111111-2222-4333-8444-555555555555","hook_event_name":"Stop"}"#;
+    let status = Command::new("/bin/sh")
+        .arg("-c")
+        .arg(hook["command"].as_str().unwrap())
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .and_then(|mut child| {
+            use std::io::Write;
+            child.stdin.take().unwrap().write_all(payload.as_bytes())?;
+            child.wait()
+        })
+        .unwrap();
+    assert!(status.success());
+    assert_eq!(
+        fs::read_to_string(run.idle_marker_path().unwrap()).unwrap(),
+        payload
+    );
+    assert!(!run_dir.join("idle.json.tmp").exists());
 }
 
 #[test]

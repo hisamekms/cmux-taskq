@@ -13,13 +13,17 @@ use std::{
     time::{Duration, Instant},
 };
 
-/// The only shell boundary is cmux's terminal startup command.
+/// Shell boundaries are cmux's terminal startup command and Claude's hook command.
 /// Quote every argument independently, including paths containing apostrophes.
 pub fn shell_join(args: &[String]) -> String {
     args.iter()
-        .map(|s| format!("'{}'", s.replace('\'', "'\"'\"'")))
+        .map(|s| shell_quote(s))
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+pub fn shell_quote(arg: &str) -> String {
+    format!("'{}'", arg.replace('\'', "'\"'\"'"))
 }
 
 pub fn path_text(path: &Path) -> Result<String> {
@@ -314,6 +318,25 @@ impl WorkspaceBackend for Cmux {
         workspace_handle(&raw).context("cmux did not confirm the workspace close")?;
         Ok(())
     }
+
+    /// Type `/exit` at Claude's prompt exactly as an operator would.
+    fn send_exit(&self, workspace_id: &str) -> Result<()> {
+        output(Command::new(&self.executable).args([
+            "send",
+            "--workspace",
+            workspace_id,
+            "--",
+            "/exit",
+        ]))?;
+        output(Command::new(&self.executable).args([
+            "send-key",
+            "--workspace",
+            workspace_id,
+            "--",
+            "enter",
+        ]))?;
+        Ok(())
+    }
 }
 
 pub fn workspace_handle(raw: &str) -> Result<&str> {
@@ -343,6 +366,10 @@ impl AgentProvider for ClaudeCode {
     }
 
     fn command(&self, run: &TaskRun, prompt: &str) -> Result<Command> {
+        let run_dir = Path::new(run.run_dir.as_ref().context("missing run directory")?);
+        let settings = run_dir.join("claude-settings.json");
+        fs::write(&settings, stop_hook_settings(&run.idle_marker_path()?)?)
+            .with_context(|| format!("write {}", settings.display()))?;
         let mut command = Command::new(&self.executable);
         command
             .current_dir(run.worktree_path.as_ref().context("missing worktree")?)
@@ -351,7 +378,9 @@ impl AgentProvider for ClaudeCode {
             .arg("--debug-file")
             .arg(run.log_path.as_ref().context("missing log path")?)
             .arg("--add-dir")
-            .arg(run.run_dir.as_ref().context("missing run directory")?)
+            .arg(run_dir)
+            .arg("--settings")
+            .arg(&settings)
             .arg("--")
             .arg(prompt)
             .stdin(Stdio::inherit())
@@ -359,4 +388,25 @@ impl AgentProvider for ClaudeCode {
             .stderr(Stdio::inherit());
         Ok(command)
     }
+}
+
+/// Per-run Claude settings whose `Stop` hook publishes the hook's stdin JSON as
+/// the idle marker. Each finished response replaces the marker atomically, so
+/// its modification time tells the supervisor whether the agent went idle after
+/// writing the receipt. `SessionEnd` is not used: session exit is confirmed by
+/// the wrapper's exit code instead.
+pub fn stop_hook_settings(idle_marker: &Path) -> Result<String> {
+    let marker = path_text(idle_marker)?;
+    let command = format!(
+        "cat > {tmp} && mv -f {tmp} {marker}",
+        tmp = shell_quote(&format!("{marker}.tmp")),
+        marker = shell_quote(&marker),
+    );
+    Ok(serde_json::to_string_pretty(&serde_json::json!({
+        "hooks": {
+            "Stop": [{
+                "hooks": [{"type": "command", "command": command, "timeout": 10}]
+            }]
+        }
+    }))?)
 }

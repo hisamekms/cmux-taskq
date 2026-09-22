@@ -31,7 +31,7 @@ related:
 - `RunEvent`: 実行中に発生した永続イベント。
 - `Receipt`: agentが提出する完了レシート。run ID、結果、commit、tests/e2e/subagent_reviewの状態と証跡または理由、要約を持つ。構造の整合性は`Receipt::check`、Gitと検証コマンドの確認はsupervisorが行う。
 
-`Task.id`はSQLiteの整数ID、`TaskRun.id`はUUID。Taskはtitle、description、acceptance、verification_commandsを保持する。TaskRunはprovider、base commitと、branch/worktree/workspace/receipt/log/result commitの任意参照を持つ。claim時のproviderは`claude`のみで、リソース参照は作成前のためnullになる。
+`Task.id`はSQLiteの整数ID、`TaskRun.id`はUUID。Taskはtitle、description、acceptance、verification_commandsを保持する。TaskRunはprovider、base commitと、branch/worktree/workspace/receipt/log/result commitの任意参照を持ち、idle marker `idle.json`のpathは`run_dir`から導出する。claim時のproviderは`claude`のみで、リソース参照は作成前のためnullになる。
 
 ## Current operations
 

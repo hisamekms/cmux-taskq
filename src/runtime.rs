@@ -229,11 +229,14 @@ fn provision_and_monitor(
         run.task_id, workspace, run.id
     );
     let startup = Instant::now();
+    let receipt_path = Path::new(&plan.receipt_path);
+    let idle_marker = run.idle_marker_path()?;
     let mut receipt_seen = false;
+    let mut exit_requested: Option<Instant> = None;
     loop {
         heartbeat.check()?;
         let processes = queue.processes(&run.id)?;
-        if !receipt_seen && Path::new(&plan.receipt_path).is_file() {
+        if !receipt_seen && receipt_path.is_file() {
             receipt_seen = true;
             queue.record_runtime_event(
                 &run.id,
@@ -241,9 +244,25 @@ fn provision_and_monitor(
                 json!({"path": plan.receipt_path, "validated": false}),
             )?;
             eprintln!(
-                "receipt received for {}; waiting for session exit (operator /exit)",
+                "receipt received for {}; waiting for the session to go idle (or an operator /exit)",
                 run.id
             );
+        }
+        if receipt_seen
+            && exit_requested.is_none()
+            && let Some(evidence) = idle_after_receipt(receipt_path, &idle_marker)?
+        {
+            queue.record_runtime_event(&run.id, "session_idle_observed", evidence)?;
+            // Ask once, the way an operator would; never kill the session.
+            cmux.send_exit(&workspace)?;
+            let timeout = cmux.exit_timeout();
+            queue.record_runtime_event(
+                &run.id,
+                "exit_requested",
+                json!({"workspace_id": workspace, "timeout_secs": timeout.as_secs()}),
+            )?;
+            eprintln!("exit requested for {}; waiting for session exit", run.id);
+            exit_requested = Some(Instant::now());
         }
         if let Some(wrapper) = processes.iter().find(|p| p.role == "wrapper") {
             if wrapper.exited_at.is_some() {
@@ -267,8 +286,55 @@ fn provision_and_monitor(
                 "wrapper did not register within 45 seconds"
             );
         }
+        if let Some(requested) = exit_requested {
+            let timeout = cmux.exit_timeout();
+            if requested.elapsed() >= timeout {
+                // The session is still alive; leave it to a human instead of forcing it.
+                queue.record_runtime_event(
+                    &run.id,
+                    "exit_request_timed_out",
+                    json!({"workspace_id": workspace, "timeout_secs": timeout.as_secs()}),
+                )?;
+                anyhow::bail!(
+                    "session did not exit within {}s of the exit request; send /exit in workspace {workspace} or recover the run",
+                    timeout.as_secs()
+                );
+            }
+        }
         thread::sleep(Duration::from_secs(1));
     }
+}
+
+/// Evidence that the agent finished a response after publishing the receipt: an
+/// idle marker written by the provider's stop hook no older than the receipt.
+/// Markers from earlier turns (for example a question to the operator) do not count.
+fn idle_after_receipt(receipt: &Path, marker: &Path) -> Result<Option<Value>> {
+    let marker_meta = match fs::metadata(marker) {
+        Ok(meta) => meta,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).context("inspect idle marker"),
+    };
+    let receipt_modified = fs::metadata(receipt)?.modified()?;
+    let marker_modified = marker_meta.modified()?;
+    if marker_modified < receipt_modified {
+        return Ok(None);
+    }
+    let hook: Value = serde_json::from_str(&fs::read_to_string(marker)?).unwrap_or(Value::Null);
+    let field = |name: &str| hook.get(name).cloned().unwrap_or(Value::Null);
+    Ok(Some(json!({
+        "marker_path": path_text(marker)?,
+        "marker_modified": unix_seconds(marker_modified),
+        "receipt_modified": unix_seconds(receipt_modified),
+        "hook_event_name": field("hook_event_name"),
+        "session_id": field("session_id"),
+        "stop_hook_active": field("stop_hook_active"),
+    })))
+}
+
+fn unix_seconds(time: SystemTime) -> i64 {
+    time.duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
 }
 
 /// Cross-check the agent's receipt against Git and rerun the task's verification
@@ -482,7 +548,7 @@ pub fn prompt(task: &Task, run: &TaskRun) -> Result<String> {
          Each of tests, e2e and subagent_review needs evidence when passed and a reason when not_applicable.\n\
          You may write this receipt outside the worktree. Keep the worktree clean after committing.\n\
          The supervisor rejects the run unless the commit is the clean head of your branch on top of the base commit, and it reruns the verification commands itself.\n\
-         After submitting, report the outcome and wait for the operator to exit with /exit. A receipt does not itself end the session.\n",
+         After submitting, report the outcome briefly and stop; do not run /exit yourself. Once you are idle the supervisor ends the session, and an operator can still send /exit. A receipt does not itself end the session.\n",
         task_id = task.id,
         run_id = run.id,
         title = task.title,

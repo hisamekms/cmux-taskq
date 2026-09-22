@@ -29,4 +29,11 @@ pub trait WorkspaceBackend {
     fn capture(&self, workspace_id: &str) -> Result<String>;
     /// Close the workspace; the worktree and branch are not touched.
     fn close(&self, workspace_id: &str) -> Result<()>;
+    /// Ask the agent session to end the way an operator would, without killing it.
+    fn send_exit(&self, workspace_id: &str) -> Result<()>;
+    /// How long the session may take to exit after the request before the
+    /// supervisor stops waiting and leaves the run to a human.
+    fn exit_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(120)
+    }
 }

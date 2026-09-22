@@ -153,6 +153,17 @@ pub struct TaskRun {
     pub created_at: String,
 }
 
+impl TaskRun {
+    /// Written by the provider's stop hook each time the agent finishes a
+    /// response; newer than the receipt means the session is idle after submitting.
+    pub fn idle_marker_path(&self) -> Result<std::path::PathBuf> {
+        Ok(
+            std::path::Path::new(self.run_dir.as_ref().context("missing run directory")?)
+                .join("idle.json"),
+        )
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunEvent {
     pub id: i64,
