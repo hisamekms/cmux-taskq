@@ -2,7 +2,7 @@
 id: journal-014
 type: journal
 title: Dogfooding: failure, recovery, and procedures
-status: draft
+status: open
 created: 2026-09-22
 updated: 2026-09-22
 plan_step: 9
@@ -26,6 +26,16 @@ related:
 
 - T6（`--depends-on` B, C）: tests/cli.rs に `cmux-taskq --version` がクレートのバージョンを出し、queueなしで動くテストを追加する。verify: fmt / test / clippy
 - 失敗のさせ方: runが `running` になったらagentプロセスを `kill -KILL` して `failed` にし、`doctor` → `recover RUN` → `ready ID` で再試行する。再試行のrunはそのまま完走させて着地する
+
+### 2026-09-22 16:16 claude (SV)
+
+- T6 は T4 の着地直後にclaim（run `4d58d1e8`、base `dfaac7b`、workspace:137 / 38B0F66D-…）。`running` を確認して agent（pid 92277、claude）に `kill -KILL`
+- 6秒後: wrapperが終了コード128を報告 → run `failed`（`supervision_finished`）。worktree・run dir・workspaceは保持。他のrunなし、supervisorは継続
+- `last_error` は null。固定バイナリ（`18800cd`）がT3の修正（`session exited with code N`）より前のため。バイナリ更新はユーザーに報告してから行う（AGENTS.md）
+- `doctor` は failed run を出さない（未完了runのみ）。`recover 4d58d1e8` は「failed; only unfinished runs can be recovered」で拒否 — wrapperが終了を報告した失敗はorphanではないので `recover` 不要、READMEどおり `ready ID` で再試行
+- AGENTS.md「失敗と中断」の手順どおり `cmux workspace close 38B0F66D-…`（OK workspace:137）で失敗runのworkspaceを閉じた
+- `ready 6` → 次のpollで新run `9a897435`（base `82b8a6c` = 最新main）。失敗runは `failed` のまま履歴に残る
+- 中断（supervisor kill → doctor → recover）の経路は010で実機確認済みなので、ここでは「失敗 → 再試行」のみ
 
 ## Result
 
