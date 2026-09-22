@@ -1,0 +1,67 @@
+#!/bin/sh
+# Launcher used by the claude-taskq plugin skills.
+#
+# Resolves the cmux-taskq binary (CMUX_TASKQ_BIN, then PATH) and the queue
+# database (CMUX_TASKQ_DB, then <git common dir>/taskq/queue.db), then runs
+# `cmux-taskq --db <db> "$@"`. It never opens the database itself.
+#
+#   taskq --resolve        print the resolved binary, version, database and repository as JSON
+#   taskq --version|--help pass through to the binary without a database
+#   taskq init             also creates the database's parent directory
+#   taskq <command> ...    any other cmux-taskq command
+set -eu
+
+json_string() {
+  printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'
+}
+
+fail() {
+  printf '{"error": "%s"}\n' "$(json_string "$1")" >&2
+  exit 1
+}
+
+resolve_binary() {
+  if [ -n "${CMUX_TASKQ_BIN:-}" ]; then
+    [ -x "$CMUX_TASKQ_BIN" ] || fail "CMUX_TASKQ_BIN is not an executable file: $CMUX_TASKQ_BIN"
+    printf '%s\n' "$CMUX_TASKQ_BIN"
+  elif command -v cmux-taskq >/dev/null 2>&1; then
+    command -v cmux-taskq
+  else
+    fail "cmux-taskq was not found on PATH and CMUX_TASKQ_BIN is unset. Build it in the cmux-taskq repository with 'cargo build --locked', then put target/debug/cmux-taskq on PATH or export CMUX_TASKQ_BIN=/absolute/path/to/cmux-taskq"
+  fi
+}
+
+resolve_db() {
+  if [ -n "${CMUX_TASKQ_DB:-}" ]; then
+    printf '%s\n' "$CMUX_TASKQ_DB"
+    return
+  fi
+  common=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null) \
+    || fail "not inside a Git repository: run from the repository the queue belongs to, or export CMUX_TASKQ_DB=/absolute/path/to/queue.db"
+  printf '%s/taskq/queue.db\n' "$common"
+}
+
+case "${1:-}" in
+  --version | -V | --help | -h)
+    binary=$(resolve_binary)
+    exec "$binary" "$@"
+    ;;
+  --resolve)
+    binary=$(resolve_binary)
+    db=$(resolve_db)
+    version=$("$binary" --version)
+    repo=$(git rev-parse --show-toplevel 2>/dev/null || true)
+    if [ -f "$db" ]; then exists=true; else exists=false; fi
+    printf '{"binary": "%s", "version": "%s", "db": "%s", "db_exists": %s, "repo": "%s"}\n' \
+      "$(json_string "$binary")" "$(json_string "$version")" "$(json_string "$db")" \
+      "$exists" "$(json_string "$repo")"
+    exit 0
+    ;;
+esac
+
+binary=$(resolve_binary)
+db=$(resolve_db)
+if [ "${1:-}" = init ]; then
+  mkdir -p "$(dirname "$db")"
+fi
+exec "$binary" --db "$db" "$@"

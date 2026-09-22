@@ -1,0 +1,11 @@
+{
+  "name": "claude-taskq",
+  "displayName": "cmux-taskq",
+  "version": "0.1.0",
+  "description": "Register, run, inspect, integrate, and recover cmux-taskq tasks through the locally built cmux-taskq binary. Skills only; the queue database is never touched directly.",
+  "author": {
+    "name": "hisamekms"
+  },
+  "repository": "https://github.com/hisamekms/cmux-taskq",
+  "keywords": ["cmux", "taskq", "worktree", "task-queue"]
+}

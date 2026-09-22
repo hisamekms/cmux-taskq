@@ -102,6 +102,26 @@ target/debug/cmux-taskq --db "$taskq_demo_dir/queue.db" integrate 1
 
 The repository defaults to the checkout recorded when the run was supervised; pass `--repo PATH` if it moved. Either way it must be the repository the queue is bound to. The worktree and branch are left for you to remove.
 
+## Use from Claude Code
+
+`plugins/claude-taskq` is a Claude Code plugin whose skills drive the binary; it has no hooks and never opens the queue database itself. Build the binary, then load the plugin for a session:
+
+```sh
+cargo build --locked
+export CMUX_TASKQ_BIN="$PWD/target/debug/cmux-taskq"   # or put it on PATH
+claude --plugin-dir "$PWD/plugins/claude-taskq"
+```
+
+By convention the queue lives at `$(git rev-parse --path-format=absolute --git-common-dir)/taskq/queue.db` of the repository you run Claude Code in, shared by all of its worktrees; set `CMUX_TASKQ_DB` to use another file. The plugin's launcher `bin/taskq` resolves both and forwards any command (`bin/taskq --resolve` shows what it found).
+
+| Skill | Covers |
+| --- | --- |
+| `/claude-taskq:taskq` | Locate the binary and queue, `init`, register with `add` (description, acceptance, `--verify`, `--depends-on`), `ready`, `list` / `show` / `candidates` / `status` / `doctor`, how to read run states |
+| `/claude-taskq:taskq-run` | Launch `supervise` in a dedicated cmux workspace, watch the run with `show`, judge completion from the run state and receipt rather than a Stop hook, review and `integrate` after the manual merge |
+| `/claude-taskq:taskq-recover` | `doctor`, `recover RUN_ID`, retry with `ready` |
+
+Claude picks the skill from the request ("queue a task to …", "did task 3 finish?", "the supervisor died"). `claude plugin validate plugins/claude-taskq` checks the manifest and skills; `tests/plugin.rs` checks them and the launcher in `cargo test`.
+
 ## Development checks
 
 ```sh
