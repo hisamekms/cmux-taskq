@@ -7,10 +7,12 @@
 # set, is passed as `--db` to use another queue file. The launcher never opens
 # the database itself.
 #
-#   taskq --resolve        print the binary, its version and `locate`'s queue fields as one JSON object
+#   taskq --resolve        print the binary, both versions and `locate`'s queue fields as one JSON object
 #   taskq --version|--help pass through to the binary
 #   taskq <command> ...    any cmux-taskq command, including init and locate
 set -eu
+
+RELEASES=https://github.com/hisamekms/cmux-taskq/releases
 
 json_string() {
   printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'
@@ -21,6 +23,23 @@ fail() {
   exit 1
 }
 
+# The plugin's own version, read out of the manifest next to this script. Empty
+# when the manifest is missing, which only happens outside a plugin checkout.
+plugin_dir=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
+plugin_version=$(
+  sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+    "$plugin_dir/.claude-plugin/plugin.json" 2>/dev/null | head -n 1
+)
+
+# `cmux-taskq --version` prints `cmux-taskq X.Y.Z`; keep the number alone.
+version_number() {
+  printf '%s' "$1" | sed -e 's/^cmux-taskq[[:space:]]*//' -e 's/[[:space:]].*//'
+}
+
+major_minor() {
+  printf '%s' "$1" | cut -d. -f1,2
+}
+
 resolve_binary() {
   if [ -n "${CMUX_TASKQ_BIN:-}" ]; then
     [ -x "$CMUX_TASKQ_BIN" ] || fail "CMUX_TASKQ_BIN is not an executable file: $CMUX_TASKQ_BIN"
@@ -28,7 +47,7 @@ resolve_binary() {
   elif command -v cmux-taskq >/dev/null 2>&1; then
     command -v cmux-taskq
   else
-    fail "cmux-taskq was not found on PATH and CMUX_TASKQ_BIN is unset. Build it in the cmux-taskq repository with 'cargo build --locked', then put target/debug/cmux-taskq on PATH or export CMUX_TASKQ_BIN=/absolute/path/to/cmux-taskq"
+    fail "cmux-taskq was not found on PATH and CMUX_TASKQ_BIN is unset. Download cmux-taskq-v${plugin_version:-<version>}-aarch64-apple-darwin.tar.gz from the GitHub Release at $RELEASES, verify it with the SHA256SUMS published beside it ('shasum -a 256 -c SHA256SUMS'), and move the extracted cmux-taskq into ~/.local/bin (which must be on PATH). When developing in the cmux-taskq repository, build it instead with 'cargo build --locked' and export CMUX_TASKQ_BIN=/absolute/path/to/target/debug/cmux-taskq"
   fi
 }
 
@@ -39,7 +58,7 @@ case "${1:-}" in
     exec "$binary" "$@"
     ;;
   --resolve)
-    version=$("$binary" --version)
+    binary_version=$(version_number "$("$binary" --version)")
     if [ -n "${CMUX_TASKQ_DB:-}" ]; then
       queue=$("$binary" --db "$CMUX_TASKQ_DB" locate)
     else
@@ -47,9 +66,16 @@ case "${1:-}" in
     fi
     repo=$(git rev-parse --show-toplevel 2>/dev/null || true)
     # `locate` prints a pretty JSON object; splice our fields in after its `{`.
-    printf '{"binary": "%s", "version": "%s", "repo": "%s",%s\n' \
-      "$(json_string "$binary")" "$(json_string "$version")" "$(json_string "$repo")" \
+    printf '{"binary": "%s", "binary_version": "%s", "plugin_version": "%s", "repo": "%s",%s\n' \
+      "$(json_string "$binary")" "$(json_string "$binary_version")" \
+      "$(json_string "$plugin_version")" "$(json_string "$repo")" \
       "${queue#\{}"
+    # A plugin and a binary that disagree in major.minor may not speak the same
+    # CLI. Report it and let the caller decide; the resolution itself is valid.
+    if [ -n "$plugin_version" ] && [ -n "$binary_version" ] &&
+      [ "$(major_minor "$plugin_version")" != "$(major_minor "$binary_version")" ]; then
+      printf '{"warning": "%s"}\n' "$(json_string "claude-taskq plugin $plugin_version and cmux-taskq binary $binary_version differ in major.minor; update the older one: the plugin with 'claude plugin update claude-taskq@cmux-taskq', the binary from $RELEASES")" >&2
+    fi
     exit 0
     ;;
 esac

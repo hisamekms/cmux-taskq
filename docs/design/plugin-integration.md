@@ -20,6 +20,7 @@ runtimeとpluginを分離する。pluginはskill、hook、provider設定を配�
 ```text
 cmux-taskq repository
   ├── runtime binary
+  ├── .claude-plugin/marketplace.json  (Claude Code の marketplace としての自己申告)
   ├── plugins/claude-taskq
   └── plugins/codex-taskq (未着手)
 ```
@@ -47,9 +48,10 @@ plugins/claude-taskq/
 
 skillはすべて`${CLAUDE_PLUGIN_ROOT}/bin/taskq`を呼ぶ。launcherはバイナリを解決してcwdのまま`cmux-taskq <args>`を`exec`するだけで、DBのpathを計算せず、DBも開かない（[016](../journal/016-queue-per-repository.md)、[ADR-0006](../adr/0006-queue-per-repository.md)）。
 
-- バイナリ: `CMUX_TASKQ_BIN`、なければPATHの`cmux-taskq`。どちらもなければ`{"error": ...}`をstderrに出し、`cargo build --locked`と`CMUX_TASKQ_BIN`の設定を案内する（CLI本体のエラー形式と同じ）。
+- バイナリ: `CMUX_TASKQ_BIN`、なければPATHの`cmux-taskq`。どちらもなければ`{"error": ...}`をstderrに出し、GitHub Release（<https://github.com/hisamekms/cmux-taskq/releases>）の`cmux-taskq-v<plugin_version>-aarch64-apple-darwin.tar.gz`を`SHA256SUMS`で検証して`~/.local/bin`に置く手順と、開発時の`cargo build --locked`＋`CMUX_TASKQ_BIN`を案内する（CLI本体のエラー形式と同じ）。
 - queue: バイナリがcwdのrepositoryから`$XDG_DATA_HOME/cmux-taskq/<hash>/queue.db`に解決する。`CMUX_TASKQ_DB`が設定されているときだけ`--db "$CMUX_TASKQ_DB"`を前置する。dirの作成と束縛は`init`が行う。
-- `--resolve`: `cmux-taskq locate`のJSON（`db`、`db_exists`、`queue_dir`、`runs_dir`、`source`、`git_common_dir`）に`binary`、`version`、`repo`（`git rev-parse --show-toplevel`、repository外は空文字）を加えた1つのobjectを返す。skillはこれをユーザーへの報告と、cmux workspaceへ渡す絶対pathの取得に使う。`--version` / `--help`はそのままバイナリに渡す。
+- `--resolve`: `cmux-taskq locate`のJSON（`db`、`db_exists`、`queue_dir`、`runs_dir`、`source`、`git_common_dir`）に`binary`、`binary_version`（`cmux-taskq --version`の数字部分）、`plugin_version`（launcherの隣の`.claude-plugin/plugin.json`をsedで読む）、`repo`（`git rev-parse --show-toplevel`、repository外は空文字）を加えた1つのobjectを返す。skillはこれをユーザーへの報告と、cmux workspaceへ渡す絶対pathの取得に使う。`--version` / `--help`はそのままバイナリに渡す。
+- version不一致: `plugin_version`と`binary_version`のmajor.minorが違うとき、stdoutの解決結果はそのまま出したうえでstderrに`{"warning": ...}`を1行出し、exitは0のまま（解決自体は正しく、CLIの差だけが不明）。skillは止まらずユーザーに報告し、古い方の更新（pluginは`claude plugin update claude-taskq@cmux-taskq`、バイナリはRelease）を案内する。
 
 ### skillの契約
 
@@ -60,8 +62,20 @@ skillはすべて`${CLAUDE_PLUGIN_ROOT}/bin/taskq`を呼ぶ。launcherはバイ�
 - mainへの着地はruntimeの`integrate ID` / `integrate --next`が行う（rebase → 再検証 → squash、[ADR-0008](../adr/0008-merge-queue-squash-landing.md)）。skillはmaintainerのレビュー後にこれを呼び、`outcome`（`integrated` / `needs_session` / `failed` / `no_run_awaiting`）を読んで結果を伝える。`needs_session`のrunはmaintainerが`claude --resume <run-id>`でworktreeに開き直すセッションが解消し、解消後は着地がworktreeを消すので`/exit`で終えてから`integrate`し直す。runのworkspace名は`taskq <repo> <task-id> <run-id>`で、`failed` / `interrupted`のworkspaceはruntimeが閉じないのでmaintainerが`cmux workspace close`する。
 - `recover`はバイナリが拒否条件を判定する。skillはプロセスをkillせず、`doctor`の`blockers`をユーザーに示す。
 
+### marketplaceとinstall
+
+repository rootの`.claude-plugin/marketplace.json`がこのrepository自身をmarketplaceにする（marketplace名`cmux-taskq`、`owner.name` `hisamekms`、`plugins`は`claude-taskq`の1件で`source`はrepository相対の`./plugins/claude-taskq`）。ユーザーの導線は2行。
+
+```sh
+claude plugin marketplace add hisamekms/cmux-taskq
+claude plugin install claude-taskq@cmux-taskq
+```
+
+`add`はGitHubのrepositoryをcloneし、`install`はそのcloneの`./plugins/claude-taskq`からuser scopeに入れる。更新は`claude plugin marketplace update cmux-taskq`と`claude plugin update claude-taskq@cmux-taskq`。pluginはskillだけなのでinstallに`-y`を要する宣言commandはなく、runtimeバイナリは同梱しない（Releaseから別に入れる。launcherのエラー文がその手順を持つ）。
+
 ### 読み込みと検証
 
-- 検証: `claude plugin validate plugins/claude-taskq`、inventory: `claude --plugin-dir plugins/claude-taskq plugin details claude-taskq`。
-- 利用: `claude --plugin-dir /path/to/cmux-taskq/plugins/claude-taskq`（そのsessionのみ）。恒久化するにはsettingsのmarketplaceにローカルpathを登録して`claude plugin install claude-taskq@<marketplace>`する（未検証）。
-- `tests/plugin.rs`がmanifest（name、versionの一致）、skill一覧（`taskq` / `taskq-maintain` / `taskq-recover`）、frontmatter（先頭行`---`、`name`がdirectory名、`description`）、launcherの解決（`XDG_DATA_HOME`配下、worktreeからの共有、`CMUX_TASKQ_DB`の優先）・エラー・`init`・登録・`show`を実バイナリで確認する。テストは`XDG_DATA_HOME`を一時dirに向け、開発者の実queueに触れない。skillに書いたコマンド列のうち自動テストにしないもの（goal系の`goal add` → `add --goal` → `ready` → `goal show` → `goal close`、runtime系の`up` → `status` → `down`）は、skillを変えたtaskのrun sessionが`cargo build --locked`したバイナリと使い捨てrepository・使い捨てqueue（`--db`）で実行し、その実行ログをreceiptのevidenceに残す（task 13、task 16）。
+- 検証: `claude plugin validate plugins/claude-taskq`と`claude plugin validate .claude-plugin/marketplace.json`（`--strict`も通る）、inventory: `claude --plugin-dir plugins/claude-taskq plugin details claude-taskq`。
+- 開発中の読み込み: `claude --plugin-dir /path/to/cmux-taskq/plugins/claude-taskq`（そのsessionのみ）。supervisorがworkerに渡すのもこの形（`up --plugin-dir`）。
+- marketplace経由のinstallは、使い捨ての`HOME` / `CLAUDE_CONFIG_DIR`でローカルpathを`marketplace add`して`install`し、`plugin list`と`plugin details`でskill 3件が載ることを確認する（task 29、Claude Code 2.1.278で確認）。
+- `tests/plugin.rs`がmanifest（name、versionの一致）、marketplace manifest（marketplace名、pluginのnameとrepository相対の`source`がpluginのdirectoryを指すこと）、launcherのversion比較（`--version`と`locate`だけ答えるfake binaryを`CMUX_TASKQ_BIN`にして、major.minorが同じならstderrが空、1 minor違えばstderrに`{"warning": ...}`が出てexit 0）、skill一覧（`taskq` / `taskq-maintain` / `taskq-recover`）、frontmatter（先頭行`---`、`name`がdirectory名、`description`）、launcherの解決（`XDG_DATA_HOME`配下、worktreeからの共有、`CMUX_TASKQ_DB`の優先、`binary_version`と`plugin_version`）・エラー（Release URL、tarball名、`SHA256SUMS`、`~/.local/bin`、`cargo build --locked`を含むこと）・`init`・登録・`show`を実バイナリで確認する。テストは`XDG_DATA_HOME`を一時dirに向け、開発者の実queueに触れない。skillに書いたコマンド列のうち自動テストにしないもの（goal系の`goal add` → `add --goal` → `ready` → `goal show` → `goal close`、runtime系の`up` → `status` → `down`）は、skillを変えたtaskのrun sessionが`cargo build --locked`したバイナリと使い捨てrepository・使い捨てqueue（`--db`）で実行し、その実行ログをreceiptのevidenceに残す（task 13、task 16）。

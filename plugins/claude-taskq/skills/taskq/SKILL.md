@@ -17,13 +17,14 @@ Run the plugin launcher, which resolves the binary and forwards every command to
 "${CLAUDE_PLUGIN_ROOT}/bin/taskq" --resolve
 ```
 
-It prints `{"binary", "version", "repo", "db", "db_exists", "queue_dir", "runs_dir", "source", "git_common_dir"}`.
+It prints `{"binary", "binary_version", "plugin_version", "repo", "db", "db_exists", "queue_dir", "runs_dir", "source", "git_common_dir"}` on stdout, and may print a `{"warning": ...}` line on stderr.
 
-- Binary: `CMUX_TASKQ_BIN` if set, otherwise `cmux-taskq` on PATH. If the launcher prints an error instead, tell the user to build it in the cmux-taskq repository with `cargo build --locked` and either put `target/debug/cmux-taskq` on PATH or `export CMUX_TASKQ_BIN=/absolute/path/to/cmux-taskq`, then retry.
+- Binary: `CMUX_TASKQ_BIN` if set, otherwise `cmux-taskq` on PATH. If the launcher prints an `{"error": ...}` instead, pass its message on: the user installs the binary from the GitHub Release at <https://github.com/hisamekms/cmux-taskq/releases> (download `cmux-taskq-v<version>-aarch64-apple-darwin.tar.gz`, verify it against the published `SHA256SUMS`, move `cmux-taskq` into `~/.local/bin`, which must be on PATH), or, when they are developing in the cmux-taskq repository itself, builds it with `cargo build --locked` and exports `CMUX_TASKQ_BIN=/absolute/path/to/target/debug/cmux-taskq`. Then retry.
+- Versions: `plugin_version` is this plugin's, `binary_version` the resolved binary's. When they differ in major.minor the launcher writes a `{"warning": ...}` to stderr and still exits 0 with a valid resolution. Do not stop; report the warning to the user and tell them to update whichever is older — the plugin with `claude plugin update claude-taskq@cmux-taskq`, the binary from the Release above — because a command the skill describes may be missing or may behave differently until they match. If a later command fails in a way the skill does not explain, name the mismatch as the likely cause.
 - Queue: one per repository. The binary resolves it from the current directory's Git common directory to `$XDG_DATA_HOME/cmux-taskq/<hash>/queue.db` (default `~/.local/share/cmux-taskq/<hash>/queue.db`); `source` is `repository`. Every worktree of the repository, including task worktrees, resolves to the same queue, and runs live in `runs_dir` next to it. Run the launcher from inside the repository the tasks belong to; outside a repository it fails. `CMUX_TASKQ_DB=/path/to/queue.db` uses another queue file instead (`source` becomes `db_flag`; the launcher passes it as `--db`).
 - If `db_exists` is false, create the queue once: `"${CLAUDE_PLUGIN_ROOT}/bin/taskq" init` (it creates the directory, binds the queue to this repository, and also migrates an existing queue while keeping its tasks). A queue bound to a different repository is refused by every command; that only happens with `CMUX_TASKQ_DB`, so unset it or point it at the right file.
 
-Report the version and the database path to the user the first time in a session. Use `TASKQ="${CLAUDE_PLUGIN_ROOT}/bin/taskq"` below.
+Report `binary_version` and the database path to the user the first time in a session, together with any version warning. Use `TASKQ="${CLAUDE_PLUGIN_ROOT}/bin/taskq"` below.
 
 ## 2. Register a goal and decompose it into tasks
 

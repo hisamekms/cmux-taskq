@@ -4,14 +4,26 @@
 
 use std::{
     fs,
+    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     process::{Command, Output},
 };
 
 use serde_json::Value;
 
+fn repository_root() -> &'static Path {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+}
+
 fn plugin_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("plugins/claude-taskq")
+    repository_root().join("plugins/claude-taskq")
+}
+
+fn plugin_manifest() -> Value {
+    serde_json::from_str(
+        &fs::read_to_string(plugin_root().join(".claude-plugin/plugin.json")).unwrap(),
+    )
+    .unwrap()
 }
 
 fn skill_dirs() -> Vec<PathBuf> {
@@ -43,10 +55,7 @@ fn frontmatter(skill: &str) -> Vec<(String, String)> {
 
 #[test]
 fn manifest_names_the_plugin_and_tracks_the_crate_version() {
-    let manifest: Value = serde_json::from_str(
-        &fs::read_to_string(plugin_root().join(".claude-plugin/plugin.json")).unwrap(),
-    )
-    .unwrap();
+    let manifest = plugin_manifest();
     assert_eq!(manifest["name"], "claude-taskq");
     assert_eq!(manifest["version"], env!("CARGO_PKG_VERSION"));
     assert!(
@@ -154,10 +163,8 @@ fn launcher_resolves_the_binary_and_the_repository_queue_under_the_data_home() {
 
     let resolved = stdout_json(&launcher(&env, &data_home, &repo, &["--resolve"]));
     assert_eq!(resolved["binary"], binary);
-    assert_eq!(
-        resolved["version"],
-        format!("cmux-taskq {}", env!("CARGO_PKG_VERSION"))
-    );
+    assert_eq!(resolved["binary_version"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(resolved["plugin_version"], plugin_manifest()["version"]);
     assert_eq!(resolved["db"], expected_db.to_str().unwrap());
     assert_eq!(resolved["db_exists"], false);
     assert_eq!(resolved["source"], "repository");
@@ -250,6 +257,19 @@ fn launcher_reports_missing_binary_and_repository_as_json_errors() {
     assert!(!missing.status.success());
     let error: Value = serde_json::from_slice(&missing.stderr).unwrap();
     let message = error["error"].as_str().unwrap();
+    assert!(
+        message.contains("https://github.com/hisamekms/cmux-taskq/releases"),
+        "{message}"
+    );
+    assert!(
+        message.contains(&format!(
+            "cmux-taskq-v{}-aarch64-apple-darwin.tar.gz",
+            plugin_manifest()["version"].as_str().unwrap()
+        )),
+        "{message}"
+    );
+    assert!(message.contains("SHA256SUMS"), "{message}");
+    assert!(message.contains("~/.local/bin"), "{message}");
     assert!(message.contains("cargo build --locked"), "{message}");
     assert!(message.contains("CMUX_TASKQ_BIN"), "{message}");
 
@@ -283,4 +303,97 @@ fn launcher_reports_missing_binary_and_repository_as_json_errors() {
     assert!(message.contains("--db"), "{message}");
     assert!(message.contains("not inside a Git repository"), "{message}");
     assert!(!data_home.exists());
+}
+
+#[test]
+fn the_marketplace_offers_this_repository_s_plugin_from_its_own_path() {
+    let marketplace: Value = serde_json::from_str(
+        &fs::read_to_string(repository_root().join(".claude-plugin/marketplace.json")).unwrap(),
+    )
+    .unwrap();
+    // `claude plugin marketplace add hisamekms/cmux-taskq` reads this file, and
+    // `claude plugin install claude-taskq@cmux-taskq` the entry below.
+    assert_eq!(marketplace["name"], "cmux-taskq");
+    assert_eq!(marketplace["owner"]["name"], "hisamekms");
+    let plugins = marketplace["plugins"].as_array().expect("plugins");
+    assert_eq!(plugins.len(), 1);
+    let entry = &plugins[0];
+    assert_eq!(entry["name"], plugin_manifest()["name"]);
+    let source = entry["source"].as_str().expect("a path source");
+    assert_eq!(source, "./plugins/claude-taskq");
+    assert_eq!(
+        repository_root().join(source.trim_start_matches("./")),
+        plugin_root()
+    );
+    assert!(plugin_root().join(".claude-plugin/plugin.json").is_file());
+}
+
+/// A stub that answers only `--version` and `locate`, which is all `--resolve`
+/// asks of the binary. It lets the version comparison be tested without
+/// building a second cmux-taskq.
+fn fake_binary(dir: &Path, name: &str, version: &str) -> PathBuf {
+    let path = dir.join(name);
+    fs::write(
+        &path,
+        format!(
+            "#!/bin/sh\ncase \"$1\" in\n\
+             --version) echo 'cmux-taskq {version}' ;;\n\
+             locate) printf '{{\\n  \"db\": \"/fake/queue.db\"\\n}}\\n' ;;\n\
+             esac\n"
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+    path
+}
+
+#[test]
+fn launcher_warns_only_when_plugin_and_binary_differ_in_major_minor() {
+    let dir = tempfile::tempdir().unwrap();
+    let data_home = dir.path().join("xdg");
+    let plugin_version = plugin_manifest()["version"].as_str().unwrap().to_string();
+    let mut parts = plugin_version.split('.');
+    let major: u64 = parts.next().unwrap().parse().unwrap();
+    let minor: u64 = parts.next().unwrap().parse().unwrap();
+
+    // Same major.minor, different patch: a resolution with nothing on stderr.
+    let same = format!("{major}.{minor}.99");
+    let binary = fake_binary(dir.path(), "same", &same);
+    let output = launcher(
+        &[("CMUX_TASKQ_BIN", binary.to_str().unwrap())],
+        &data_home,
+        dir.path(),
+        &["--resolve"],
+    );
+    let resolved = stdout_json(&output);
+    assert_eq!(resolved["plugin_version"], plugin_version);
+    assert_eq!(resolved["binary_version"], same);
+    assert_eq!(resolved["db"], "/fake/queue.db");
+    assert_eq!(
+        output.stderr,
+        b"",
+        "matching versions must not warn: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // One minor apart: the same resolution on stdout plus a warning, exit 0.
+    let other = format!("{major}.{}.0", minor + 1);
+    let binary = fake_binary(dir.path(), "other", &other);
+    let output = launcher(
+        &[("CMUX_TASKQ_BIN", binary.to_str().unwrap())],
+        &data_home,
+        dir.path(),
+        &["--resolve"],
+    );
+    let resolved = stdout_json(&output);
+    assert_eq!(resolved["binary_version"], other);
+    let warning: Value = serde_json::from_slice(&output.stderr).unwrap();
+    let message = warning["warning"].as_str().expect("warning");
+    assert!(message.contains(&plugin_version), "{message}");
+    assert!(message.contains(&other), "{message}");
+    assert!(message.contains("claude plugin update"), "{message}");
+    assert!(
+        message.contains("https://github.com/hisamekms/cmux-taskq/releases"),
+        "{message}"
+    );
 }

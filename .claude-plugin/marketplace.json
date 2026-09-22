@@ -1,0 +1,20 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "cmux-taskq",
+  "description": "The Claude Code plugin for cmux-taskq: register, run, inspect, integrate, and recover tasks that execute in cmux workspaces and isolated Git worktrees.",
+  "owner": {
+    "name": "hisamekms"
+  },
+  "plugins": [
+    {
+      "name": "claude-taskq",
+      "source": "./plugins/claude-taskq",
+      "description": "Register, run, inspect, integrate, and recover cmux-taskq tasks through the cmux-taskq binary. Skills only; the queue database is never touched directly.",
+      "author": {
+        "name": "hisamekms"
+      },
+      "category": "workflow",
+      "homepage": "https://github.com/hisamekms/cmux-taskq"
+    }
+  ]
+}

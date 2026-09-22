@@ -154,7 +154,14 @@ The landing happens in the working directory's repository; pass `--repo PATH` to
 
 ## Use from Claude Code
 
-`plugins/claude-taskq` is a Claude Code plugin whose skills drive the binary; it has no hooks and never opens the queue database itself. Build the binary, then load the plugin for a session:
+`plugins/claude-taskq` is a Claude Code plugin whose skills drive the binary; it has no hooks and never opens the queue database itself. This repository is also its marketplace (`.claude-plugin/marketplace.json`), so installing it takes two commands:
+
+```sh
+claude plugin marketplace add hisamekms/cmux-taskq
+claude plugin install claude-taskq@cmux-taskq
+```
+
+The plugin does not carry the binary: install that separately from a [release](https://github.com/hisamekms/cmux-taskq/releases) into `~/.local/bin`, or build it here. To work on the plugin itself, load it from the checkout for a session instead of installing it:
 
 ```sh
 cargo build --locked
@@ -162,7 +169,7 @@ export CMUX_TASKQ_BIN="$PWD/target/debug/cmux-taskq"   # or put it on PATH
 claude --plugin-dir "$PWD/plugins/claude-taskq"
 ```
 
-The queue is the one of the repository you run Claude Code in, resolved by the binary as described above and shared by all of its worktrees; set `CMUX_TASKQ_DB=/path/to/queue.db` to use another file, which the launcher passes as `--db`. The plugin's launcher `bin/taskq` resolves the binary and forwards any command from the current directory (`bin/taskq --resolve` shows the binary, its version, and `locate`'s output).
+The queue is the one of the repository you run Claude Code in, resolved by the binary as described above and shared by all of its worktrees; set `CMUX_TASKQ_DB=/path/to/queue.db` to use another file, which the launcher passes as `--db`. The plugin's launcher `bin/taskq` resolves the binary and forwards any command from the current directory (`bin/taskq --resolve` shows the binary, its `binary_version`, the plugin's `plugin_version`, and `locate`'s output; when the two versions differ in major.minor it also writes a `{"warning": ...}` to stderr and still exits 0).
 
 | Skill | Covers |
 | --- | --- |

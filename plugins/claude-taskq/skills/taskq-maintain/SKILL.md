@@ -5,7 +5,7 @@ description: Maintain a cmux-taskq queue: start its runtime with up (a launchd-r
 
 # cmux-taskq: run tasks and land them on main
 
-Prerequisite: resolve the launcher as in the `taskq` skill (`TASKQ="${CLAUDE_PLUGIN_ROOT}/bin/taskq"`, `"$TASKQ" --resolve`). If it is not in context, read `${CLAUDE_PLUGIN_ROOT}/skills/taskq/SKILL.md` first. Never touch the queue database directly.
+Prerequisite: resolve the launcher as in the `taskq` skill (`TASKQ="${CLAUDE_PLUGIN_ROOT}/bin/taskq"`, `"$TASKQ" --resolve`), including how it reports a missing binary and a `plugin_version` / `binary_version` mismatch. If it is not in context, read `${CLAUDE_PLUGIN_ROOT}/skills/taskq/SKILL.md` first. Never touch the queue database directly.
 
 ## 0. Roles
 
