@@ -66,7 +66,7 @@ One run's failure never changes another run: each is judged, closed and released
 
 ## 4. Review and land
 
-When the run is `awaiting_integration`, tell the user the branch and `result_commit`, and how to review: `git log main..taskq/<run-id>`, `git diff main...taskq/<run-id>`, the `receipt.json` and `verify-N.log` files in `run_dir`. Never merge, rebase, or fast-forward the branch yourself: landing is the runtime's job and it keeps `main` linear with one squash commit per task. Only land when the user has approved the run.
+When the run is `awaiting_integration`, tell the user the branch and `result_commit`, and how to review: `git log main..taskq/<run-id>`, `git diff main...taskq/<run-id>`, the `receipt.json` and `verify-N.log` files in `run_dir`. If the receipt has `follow_ups` (work the worker found outside its task, as `{title, description}`; also in the `receipt` of the `validation_finished` event), report them to the user before `integrate` and again with the outcome after it, so they are registered with the `taskq` skill (`add --goal ID` on the task's goal, or a plain `add` when the task has none) rather than lost with the run. Never merge, rebase, or fast-forward the branch yourself: landing is the runtime's job and it keeps `main` linear with one squash commit per task. Only land when the user has approved the run.
 
 ```sh
 "$TASKQ" integrate ID        # this task's run (also resumes a needs_session run)

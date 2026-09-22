@@ -61,11 +61,15 @@ cargo llvm-cov --locked --fail-under-lines 80
 | キューを作る（初回だけ） | `cmux-taskq init` |
 | キューと runs ディレクトリの場所を見る | `cmux-taskq locate` |
 
-登録。タスクの title、description、受け入れ条件、検証コマンド、依存を CLI に渡す。ジャーナルがあれば Goal を `--description`、完了条件を `--acceptance`、frontmatter の `verify` を `--verify` に写し、返った ID を `queue_task` に書く。
+登録。課題を goal として登録し、task に分解して `--goal` 付きで登録し、`ready` にする（[ADR-0009](docs/adr/0009-goal-groups-tasks.md)、手順は plugin の `taskq` skill）。goal なしは一発 task（typo 修正、clippy 警告の解消など、1 task で終わり判断を揃える相手がいないもの）だけ。タスクの title、description、受け入れ条件、検証コマンド、依存を CLI に渡す。ジャーナルがあれば Goal を `--description`、完了条件を `--acceptance`、frontmatter の `verify` を `--verify` に写し、返った ID を `queue_task` に書く。
 
 | 操作 | コマンド |
 | --- | --- |
-| 登録する | `cmux-taskq add "<title>" --description "<text>" --acceptance "<text>" --verify "<command>" --depends-on <ID>` |
+| goal を登録する | `cmux-taskq goal add "<title>" --description "<text>" --acceptance "<text>" --constraints "<text>" --doc <path>` |
+| goal の task を登録する | `cmux-taskq add "<title>" --goal <GOAL> --description "<text>" --acceptance "<text>" --context "<text>" --verify "<command>" --depends-on <ID>` |
+| 一発 task を登録する | `cmux-taskq add "<title>" --description "<text>" --acceptance "<text>" --verify "<command>" --depends-on <ID>` |
+| task の goal を変える | `cmux-taskq set-goal <ID> <GOAL>` / `cmux-taskq set-goal <ID> --none`（draft / ready のみ） |
+| goal を閉じる | `cmux-taskq goal close <GOAL> --verdict achieved`（全 task が completed か canceled になった後、receipt の follow_ups と acceptance を見て未達がなければ。未達なら先に `add --goal`） / `--verdict abandoned` |
 | 実行可能にする | `cmux-taskq ready <ID>` |
 | 依存を直す | `cmux-taskq dependency add <ID> <PREDECESSOR>` / `cmux-taskq dependency remove <ID> <PREDECESSOR>` |
 | 取り下げる | `cmux-taskq cancel <ID>` |
@@ -81,7 +85,7 @@ cargo llvm-cov --locked --fail-under-lines 80
 
 | 操作 | コマンド |
 | --- | --- |
-| 一覧と状態を見る | `cmux-taskq list` |
+| 一覧と状態を見る | `cmux-taskq list` / `cmux-taskq goal list` / `cmux-taskq goal show <GOAL>` |
 | run の状態・workspace ID・receipt と検証ログのパス・イベントを見る | `cmux-taskq show <ID>` |
 | run の画面を読む | `cmux read-screen --workspace <workspace_id> --lines <N>` |
 | run に返答する | `cmux send --workspace <workspace_id> "<text>"` のあと `cmux send-key --workspace <workspace_id> enter` |
