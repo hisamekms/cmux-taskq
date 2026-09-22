@@ -47,7 +47,7 @@ cargo clippy --locked --all-targets -- -D warnings
 
 - ジャーナルの Open 一覧から依存が満たされたタスクを選び、同時に最大4件まで起動する
 - タスクごとに main から `git worktree add .worktrees/<NNN>-<slug> -b journal/<NNN>-<slug>` で worktree を作る。`.worktrees/` は gitignore 済み
-- `cmux workspace create --name "<NNN> <slug>" --cwd <worktree> --command claude` で workspace を作り、`cmux send` / `cmux send-key` で指示を送る。指示にはジャーナルのパス、完了マーカー、SV への質問方法を含める
+- `cmux workspace create --name "<NNN> <slug>" --cwd <worktree> --command "claude --model opus"` で workspace を作り、worker は常に Opus で起動する。`cmux send` / `cmux send-key` で指示を送る。指示にはジャーナルのパス、完了マーカー、SV への質問方法を含める
 - 数分おきに `cmux read-screen --workspace <ws> --lines N` で画面を読む。権限確認は worktree 内の編集・cargo・git など安全なものは SV が応答し、それ以外とユーザーの判断が要るものはユーザーに確認する
 - worker の完了マーカーを確認したら、worktree で fmt / test / clippy を通し、差分をレビューして main へ merge（fast-forward 優先）し、push する。ジャーナルの README Open 一覧は SV が main で更新する
 - merge 後に workspace を閉じ、worktree と branch を削除する。失敗・中断時は両方を残す
