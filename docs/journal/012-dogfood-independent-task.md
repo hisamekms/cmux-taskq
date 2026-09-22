@@ -2,7 +2,7 @@
 id: journal-012
 type: journal
 title: Dogfooding: one independent task
-status: open
+status: done
 created: 2026-09-22
 updated: 2026-09-22
 plan_step: 9
@@ -48,11 +48,21 @@ SVがユーザーの指示を待たずに実行する。開始条件は、[READM
 
 ### 2026-09-22 13:49 claude (SV)
 
-- Openのplanned/openが無くなったので手順1〜4を開始。`status: open`
+- Openのplanned/openが無くなったので手順1〜4を開始。`status: done`
 - 手順2: main `18800cd` で `cargo build --release --locked`、`~/.local/bin/cmux-taskq` にコピー。`cmux-taskq --version` → `cmux-taskq 0.1.0`
 - 手順3: `cmux-taskq init` → `/Users/shinnosukeooyama/.local/share/cmux-taskq/e0f87c3b33a10073/queue.db`、schema 6、`git_common_dir` = このrepositoryの `.git`
 - 手順4 T1（このジャーナルの実task、010のFound 4・5から選定）: READMEの "Recover an interrupted run" と "Land a run on main" に、(a) 失敗・中断したrunのcmux workspaceはruntimeが閉じないのでoperatorが `cmux workspace close <workspace_id>` で閉じること、(b) `needs_session` を `claude --resume <run-id>` で解消した後は `integrate ID` の前にそのセッションを `/exit` すること（着地でworktreeが削除されるため）を追記する。受け入れ条件: 両節にその記述があり `git diff --check` が通る。verify: `grep -q 'cmux workspace close' README.md`、`grep -q -- '--resume' README.md`。依存なし
 
+### 2026-09-22 13:55 claude (SV)
+
+- 手順5: `TASKQ-SUPERVISOR` = workspace:119 で `cmux-taskq supervise --parallel 4`。T1は即claim、run `af279b92`、workspace:120（UUID 9573BB22-…）。信頼確認は出なかった（worktreeがrepository配下ではなく `~/.local/share` 配下のため？ 010では出た）
+- 手順6: 権限確認なし。receipt → `session_idle_observed` → `exit_requested` → `session_exited`(0) → 検証3件通過 → `awaiting_integration` → `workspace_closed` まで人の介入なし（約4分）
+- 手順7: receiptにsubagent review済み。差分はREADME.mdのみで要求どおり。**Procedureの `integrate RUN` は誤りで、正しくは `integrate <task ID>`（READMEが正）**。`integrate 1` → `88012c4` として着地、`refs/taskq/runs/af279b92-…` 保持、worktree削除。`git push` 済み
+- 着地後、supervisorは次のpollでT2（019）をclaimした（run `89ee1a3c`、workspace:121）
+- 手順8: このジャーナルを `done` にする。journal READMEのOpen節はT2（019）が削除するので、衝突を避けるためここでは触らない
+
 ## Result
+
+登録（`add`/`ready`）→ 常駐supervisorのclaim → 実Claudeの実行 → receipt → 自動`/exit` → 検証 → workspace close → SVのレビュー → `integrate 1` のrebase・再検証・squash着地 → `completed` → push まで、DBの手修正なしで通った。所要は登録から着地まで約5分。詰まりは `integrate` の引数（task ID）だけで、Procedureの記述を訂正した。
 
 ## Promoted
