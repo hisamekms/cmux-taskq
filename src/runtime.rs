@@ -891,9 +891,9 @@ pub fn integrate(db: &Path, target: IntegrateTarget, repo: &Path) -> Result<Valu
                 reason,
             }
         }
-        Verdict::ReceiptFailed(reason) => {
+        Verdict::ReceiptFailed { reason, receipt } => {
             eprintln!("run {} failed: {reason}", run.id);
-            let run = queue.fail_integration(&run.id, &token, &reason)?;
+            let run = queue.fail_integration(&run.id, &token, &reason, receipt)?;
             IntegrationOutcome::Failed {
                 run: Box::new(run),
                 reason,
@@ -911,8 +911,12 @@ enum Verdict {
         reason: String,
         detail: Value,
     },
-    /// The session's rewritten receipt reports `failed`.
-    ReceiptFailed(String),
+    /// The session's rewritten receipt reports `failed`; `receipt` is its
+    /// JSON, kept with the `integration_failed` event.
+    ReceiptFailed {
+        reason: String,
+        receipt: Value,
+    },
 }
 
 /// Rebase, re-validate and land one run. `Ok(Deferred)` and
@@ -975,14 +979,26 @@ fn land(
         Err(error) => return Err(error).context("read receipt"),
     };
     if receipt.result == ReceiptResult::Failed {
-        return Ok(Verdict::ReceiptFailed(format!(
-            "session reported the run as failed: {}",
-            receipt.summary
-        )));
+        return Ok(Verdict::ReceiptFailed {
+            reason: format!("session reported the run as failed: {}", receipt.summary),
+            receipt: serde_json::to_value(&receipt)?,
+        });
     }
     if let Err(error) = receipt.check(&run.id) {
         return defer(format!("{error:#}"), json!({}));
     }
+    // The receipt read here is the one that lands (or the one a session
+    // rewrote after resolving), so it is recorded whatever happens next: the
+    // DB otherwise keeps only the receipt seen at validation time.
+    queue.record_runtime_event(
+        &run.id,
+        "integration_receipt",
+        json!({
+            "main": main,
+            "commit": receipt.commit,
+            "receipt": serde_json::to_value(&receipt)?,
+        }),
+    )?;
     if head != receipt.commit.to_ascii_lowercase() {
         return defer(
             format!(

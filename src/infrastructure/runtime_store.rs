@@ -649,9 +649,24 @@ impl SqliteQueue {
         )
     }
 
-    /// End an integrating run whose rewritten receipt reports `failed`.
-    pub fn fail_integration(&mut self, id: &str, token: &str, reason: &str) -> Result<TaskRun> {
-        self.leave_integration(id, token, "failed", reason, "integration_failed", json!({}))
+    /// End an integrating run whose rewritten receipt reports `failed`. The
+    /// receipt's JSON goes into the `integration_failed` event, since the DB
+    /// otherwise holds only the receipt seen at validation time.
+    pub fn fail_integration(
+        &mut self,
+        id: &str,
+        token: &str,
+        reason: &str,
+        receipt: serde_json::Value,
+    ) -> Result<TaskRun> {
+        self.leave_integration(
+            id,
+            token,
+            "failed",
+            reason,
+            "integration_failed",
+            json!({"receipt": receipt}),
+        )
     }
 
     /// Give the slot back after an error before `main` moved: the run returns

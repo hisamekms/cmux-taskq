@@ -1604,16 +1604,34 @@ fn add_file_task(
 
 /// Rewrite the run's receipt the way a resumed session would after its work.
 fn write_receipt(run: &TaskRun, commit: &str, result: &str, summary: &str) {
-    let path = Path::new(run.receipt_path.as_ref().unwrap());
-    let text = json!({
+    write_receipt_json(run, session_receipt(run, commit, result, summary));
+}
+
+/// A session's receipt for `commit`, with the evidence it would give.
+fn session_receipt(run: &TaskRun, commit: &str, result: &str, summary: &str) -> Value {
+    json!({
         "run_id": run.id, "result": result, "commit": commit,
         "tests": {"status": "passed", "evidence_or_reason": "reran"},
         "e2e": {"status": "not_applicable", "evidence_or_reason": "none"},
         "subagent_review": {"status": "not_applicable", "evidence_or_reason": "session"},
         "summary": summary,
-    });
-    fs::write(path.with_extension("tmp"), text.to_string()).unwrap();
+    })
+}
+
+fn write_receipt_json(run: &TaskRun, receipt: Value) {
+    let path = Path::new(run.receipt_path.as_ref().unwrap());
+    fs::write(path.with_extension("tmp"), receipt.to_string()).unwrap();
     fs::rename(path.with_extension("tmp"), path).unwrap();
+}
+
+/// The `integration_receipt` events of the task's run, oldest first.
+fn integration_receipts(detail: &cmux_taskq::domain::TaskDetail) -> Vec<&Value> {
+    detail
+        .events
+        .iter()
+        .filter(|e| e.kind == "integration_receipt")
+        .map(|e| &e.payload)
+        .collect()
 }
 
 /// Assert that `main` is linear, `commits` long on top of `seed`, and that
@@ -2137,11 +2155,49 @@ fn conflicting_run_needs_a_session_and_lands_after_the_session_resolves_it() {
     assert_eq!(git_out(&worktree, &["rev-parse", "HEAD"]), resolved); // Left as the session made it.
     assert_eq!(git_out(&repo, &["rev-parse", "main"]), first_landed);
 
-    write_receipt(&parked, &resolved, "succeeded", "resolved");
+    // Every receipt that passed its checks was recorded, even when the
+    // landing then stopped: the stale one names the validated head.
+    let detail = queue.show(2).unwrap();
+    let recorded = integration_receipts(&detail);
+    assert_eq!(recorded.len(), 3, "{recorded:?}");
+    assert!(recorded.iter().all(|p| p["commit"] == json!(source)));
+    assert!(recorded.iter().all(|p| p["main"] == json!(first_landed)));
+
+    let mut rewritten = session_receipt(&parked, &resolved, "succeeded", "resolved");
+    rewritten["tests"]["evidence_or_reason"] = json!("cargo test after the rebase: 12 passed");
+    rewritten["follow_ups"] = json!([
+        {"title": "dedupe change.txt", "description": "both tasks wrote it"}
+    ]);
+    write_receipt_json(&parked, rewritten.clone());
     let outcome = integrate(&db, 2, &repo).unwrap();
     assert_eq!(outcome["outcome"], "integrated", "{outcome}");
     let landed = queue.show(2).unwrap().runs[0].clone();
     assert_landed(&repo, &landed, "second", &first_landed);
+    // The receipt the session rewrote is what the DB keeps for the landing,
+    // while validation_finished still holds the one from before the conflict.
+    let detail = queue.show(2).unwrap();
+    let recorded = integration_receipts(&detail);
+    assert_eq!(recorded.len(), 4, "{recorded:?}");
+    let last = recorded[3];
+    assert_eq!(last["commit"], json!(resolved));
+    assert_eq!(last["main"], json!(first_landed));
+    assert_eq!(last["receipt"], rewritten);
+    assert_eq!(last["receipt"]["commit"], json!(resolved));
+    assert_eq!(
+        last["receipt"]["tests"]["evidence_or_reason"],
+        json!("cargo test after the rebase: 12 passed")
+    );
+    assert_eq!(
+        last["receipt"]["follow_ups"],
+        json!([{"title": "dedupe change.txt", "description": "both tasks wrote it"}])
+    );
+    let validated = detail
+        .events
+        .iter()
+        .find(|e| e.kind == "validation_finished")
+        .unwrap();
+    assert_eq!(validated.payload["receipt"]["commit"], json!(source));
+    assert!(validated.payload["receipt"].get("follow_ups").is_none());
     assert_eq!(
         git_out(
             &repo,
@@ -2226,7 +2282,26 @@ fn failed_receipt_from_a_session_ends_the_run_without_landing() {
     );
     assert_eq!(queue.show(2).unwrap().task.status, TaskStatus::InProgress);
     assert!(queue.run_leases().unwrap().is_empty());
-    assert!(event_kinds(&queue.show(2).unwrap()).contains(&"integration_failed"));
+    let detail = queue.show(2).unwrap();
+    let failed_event = detail
+        .events
+        .iter()
+        .find(|e| e.kind == "integration_failed")
+        .unwrap();
+    assert_eq!(failed_event.payload["status"], "failed");
+    assert_eq!(failed_event.payload["reason"], json!(reason));
+    assert_eq!(
+        failed_event.payload["receipt"],
+        session_receipt(
+            &run,
+            run.result_commit.as_deref().unwrap(),
+            "failed",
+            "already covered by task 1"
+        )
+    );
+    // A failed receipt is not a receipt for a landing: only the first
+    // (conflicting) attempt recorded one.
+    assert_eq!(integration_receipts(&detail).len(), 1);
     // Retry or give up is the operator's call, as after any failed run.
     queue.transition(2, TaskAction::Cancel).unwrap();
 }
@@ -2295,6 +2370,31 @@ fn verification_failure_after_rebase_needs_a_session_and_keeps_the_rebased_tree(
     let parked = queue.show(victim).unwrap().runs[0].clone();
     assert_eq!(parked.status, RunStatus::NeedsSession);
     assert_eq!(git_out(&repo, &["rev-parse", "main"]), main);
+    // The receipt was read and recorded before the verification failed.
+    let detail = queue.show(victim).unwrap();
+    let recorded = integration_receipts(&detail);
+    assert_eq!(recorded.len(), 1, "{recorded:?}");
+    assert_eq!(
+        recorded[0]["commit"],
+        json!(run.result_commit.clone().unwrap())
+    );
+    assert_eq!(recorded[0]["main"], json!(main));
+    assert_eq!(recorded[0]["receipt"]["run_id"], json!(run.id));
+    assert_eq!(recorded[0]["receipt"]["result"], "succeeded");
+    assert_eq!(
+        recorded[0]["receipt"]["commit"],
+        json!(run.result_commit.clone().unwrap())
+    );
+    let kinds = event_kinds(&detail);
+    let receipt_at = kinds
+        .iter()
+        .position(|k| *k == "integration_receipt")
+        .unwrap();
+    let deferred_at = kinds
+        .iter()
+        .rposition(|k| *k == "integration_deferred")
+        .unwrap();
+    assert!(receipt_at < deferred_at, "{kinds:?}");
     // The session restores what the verification needs and reports the new head.
     fs::write(worktree.join("seed.txt"), "restored\n").unwrap();
     git(&worktree, &["add", "seed.txt"]);
@@ -2312,6 +2412,16 @@ fn verification_failure_after_rebase_needs_a_session_and_keeps_the_rebased_tree(
     let landed = queue.show(victim).unwrap().runs[0].clone();
     assert_landed(&repo, &landed, "needs seed", &main);
     assert!(repo.join("seed.txt").exists() && repo.join("v.txt").exists());
+    let detail = queue.show(victim).unwrap();
+    let recorded = integration_receipts(&detail);
+    assert_eq!(recorded.len(), 2, "{recorded:?}");
+    assert_eq!(
+        recorded[1]["commit"],
+        json!(git_out(
+            &repo,
+            &["rev-parse", &format!("refs/taskq/runs/{}", run.id)]
+        ))
+    );
 }
 
 /// One run lands at a time. An `integrate` process that dies leaves the run

@@ -143,7 +143,7 @@ receiptの形式は`src/domain.rs`の`Receipt`で、promptとREADMEに同じ契�
 
 1. **スロット**: runを`integrating`にし、このプロセスのtokenで`run_leases`の行を作る（`begin_integration`、`integration_started`）。同時に`integrating`のrunは1件（`one_integrating_run_per_queue`）で、別のrunが着地中ならerror。leaseは`supervise`と同じthreadで2秒ごとにheartbeatし、`status`/`doctor`に`integrating`のrunとして並ぶ。`--next`の順序は`validation_finished`イベントのid順で、`needs_session`のrunは取らない。
 2. **worktreeの前処理**: worktreeが存在し、run branch `taskq/<run-id>`をcheckoutしていること。途中のrebase（`rebase-merge` / `rebase-apply`）が残っていれば`git rebase --abort`する（`integration_rebase_aborted`）。
-3. **receiptの検査**: `<run-dir>/receipt.json`がparseでき、`result`が`succeeded`で（`failed`ならrunを`failed`にして終わる。下記）、`Receipt::check`を通り、`commit`がworktreeの現在のHEADに一致する。衝突なしのrunではHEAD = `result_commit`なので検証済みのreceiptがそのまま通る。`needs_session`から戻るrunでは、セッションが新しいheadでreceiptを書き直したことの検出になる。worktreeはcleanであること。
+3. **receiptの検査**: `<run-dir>/receipt.json`がparseでき、`result`が`succeeded`で（`failed`ならrunを`failed`にして終わる。下記）、`Receipt::check`を通り、`commit`がworktreeの現在のHEADに一致する。衝突なしのrunではHEAD = `result_commit`なので検証済みのreceiptがそのまま通る。`needs_session`から戻るrunでは、セッションが新しいheadでreceiptを書き直したことの検出になる。worktreeはcleanであること。`Receipt::check`を通った時点で、読んだreceiptを`integration_receipt`イベント（`main`、receiptの`commit`、`receipt`にJSON全体。`follow_ups`を含む）に記録する。HEAD不一致・衝突・再検証の失敗で着地しなかった場合も記録は残り、`integrate`を繰り返せばその回数だけ並ぶ。`validation_finished`は検証時のreceiptしか持たないので、セッションが書き直したreceiptの`commit`、evidence、`summary`、`follow_ups`をDBが持つのはこのイベントだけ。
 4. **rebase**: `git rebase --no-autostash --no-verify <main head>`（main headは着地開始時に読んだ`refs/heads/main`）。すでにmainの上にあればno-op。衝突したら`git diff --name-only --diff-filter=U`とGitの出力を取り、`rebase --abort`でworktreeを検証済みheadに戻して`needs_session`にする。成功したら`integration_rebased`（`head_before`、`head_after`）を記録する。
 5. **再検証**: rebase後のHEADがmain headと異なり（同じなら「commitが残らない」として`needs_session`。変更が不要ならセッションが`failed` receiptを書く）、main headの子孫であること。`git status --porcelain --untracked-files=all`が空であること。taskの`verification_commands`を順に`/bin/sh -c`でworktree内で再実行し、出力を`<run-dir>/integrate-verify-N.log`、結果を`verification_command`イベント（`phase: integration`）に残す。1件でも非0なら`needs_session`。
 6. **着地**: `git commit-tree <HEAD>^{tree} -p <main head>`で1 commitを作る。messageはtaskのtitle、receiptの`summary`（空なら省略）、trailer `Taskq-Task: <task id>` / `Taskq-Run: <run id>`。`refs/taskq/runs/<run-id>`をrebase後のHEADに向けてから、mainをcheckoutしているworktree（`git worktree list --porcelain`）があればそこで`git merge --ff-only <commit>`、なければ`git update-ref refs/heads/main <commit> <main head>`でmainを進める。
@@ -158,7 +158,7 @@ receiptの形式は`src/domain.rs`の`Receipt`で、promptとREADMEに同じ契�
 
 maintainerは`cmux workspace create --cwd <worktree> --command "claude --resume <run-id>"`でセッションを開き直し、`last_error`の理由と「mainへrebaseして解消し、検証コマンドを再実行し、新しいheadでreceiptを書き直す」指示を送る。完了を確認したら`integrate ID`で再開する。手順は1から同じで、rebaseはmainが動いていなければno-op、動いていれば再びrebaseする（再衝突すれば再び`needs_session`）。receiptの`commit`が現在のHEADと一致しなければ、セッションが終わっていないものとして理由付きで`needs_session`のまま。
 
-セッションが変更不要と判断した場合はreceiptを`result: failed`と理由（`summary`）で書き直す。`integrate ID`は`fail_integration`でrunを`failed`にし（`integration_failed`）、mainには触れない。worktreeは残る。再試行は`ready ID`、取り消しは`cancel ID`。
+セッションが変更不要と判断した場合はreceiptを`result: failed`と理由（`summary`）で書き直す。`integrate ID`は`fail_integration`でrunを`failed`にし（`integration_failed`。payloadの`receipt`にそのreceiptのJSON全体を持つ。`integration_receipt`は記録しない）、mainには触れない。worktreeは残る。再試行は`ready ID`、取り消しは`cancel ID`。
 
 ### errorと復旧
 
