@@ -2,12 +2,12 @@
 id: journal-013
 type: journal
 title: Dogfooding: dependent tasks A then B
-status: planned
+status: draft
 created: 2026-09-22
 updated: 2026-09-22
 plan_step: 9
 queue_task: null
-depends_on_journal: [11]
+depends_on_journal: [19]
 related:
   - plan-rust-runtime-mvp
 ---

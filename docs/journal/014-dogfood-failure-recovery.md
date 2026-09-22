@@ -2,7 +2,7 @@
 id: journal-014
 type: journal
 title: Dogfooding: failure, recovery, and procedures
-status: planned
+status: draft
 created: 2026-09-22
 updated: 2026-09-22
 plan_step: 9

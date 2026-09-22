@@ -21,20 +21,23 @@ depends_on:
 
 ## Goal
 
-最初の到達点を、Claude Codeから登録したタスクをcmux workspaceとGit worktreeで実行し、成果をレビューして手動でmainへ取り込むドッグフーディングとする。まずcmux-taskq自身の小さな改善に使い、その後にCodex対応と配布を進める。
+最初の到達点を、Claude Codeから登録したタスクをcmux workspaceとGit worktreeで実行し、成果をレビューしてmainへ取り込むドッグフーディングとする。まずcmux-taskq自身の小さな改善に使い、その後にCodex対応と配布を進める。
 
-2026-09-22時点でステップ1の[実機検証](../journal/001-claude-lifecycle-spike.md)、ステップ2のRust/SQLiteキュー、ステップ3の1件を実行するsupervisorを実装した。利用可能なCLIは[README](../../README.md)に記載する。receiptの検証、workspaceの終了、`completed`への遷移、復旧コマンド、pluginは未実装。
+2026-09-22時点でステップ1の[実機検証](../journal/001-claude-lifecycle-spike.md)、ステップ2のRust/SQLiteキュー、ステップ3の1件を実行するsupervisor、ステップ4のreceipt検証・workspace終了・`integrate`・`doctor`/`recover`、ステップ8のClaude Code pluginを実装した（実機の異常系確認は[010](../journal/010-failure-path-smoke.md)に残る）。利用可能なCLIは[README](../../README.md)に記載する。
+
+同日、運用方針を次のように改めた。1 repositoryに1 queueをユーザーDIRに置く（ステップ5）。依存が解けたtaskは上限まで並列に実行する（ステップ6）。統合はruntimeのmerge queueが行い、最新mainへrebase・再検証のうえ1 task = 1 commitにsquashしてmainに直線の履歴を積む（ステップ7）。SVは常駐のClaude Code sessionとし、完了確認・レビュー・`integrate`の呼び出し・衝突時のセッションへの指示を行う。SVの操作は最初は`read-screen`起点でよく、CLIコマンド単位で切っておき、順次runtimeへ移す。ADRは各ステップの実装taskで追加する。
 
 ## First dogfooding scope
 
 - ローカルのmacOS、cmux、認証済みClaude Code、単一repositoryを対象にする。
-- 同時実行数は1。タスク登録と実行開始は明示操作とし、常駐サービス化は後回しにする。
-- supervisorは起動元のClaude Codeと独立した専用ターミナルで動かす。
-- Claude Codeは通常の対話セッションで実行する。権限確認や入力待ちはworkspaceで人が対応できるようにする。
+- queueはrepositoryごとに1つ、ユーザーDIR配下に置き、cwdから解決する。
+- 同時実行は`supervise --parallel N`の上限付き並列（既定4）。supervisorは常駐ループで、SV sessionとは別の専用ターミナルで動かす。
+- Claude Codeは通常の対話セッションで実行する。権限確認や入力待ちはworkspaceで人（SV）が対応できるようにする。
 - Claude Codeのローカルpluginからバイナリを呼ぶ。SQLite操作とライフサイクル管理はruntimeに集約する。
-- 初期運用は既存設計の`integrated`方式に絞る。実行成功は`awaiting_integration`とし、mainへの取り込み確認後にTaskを`completed`にする。
-- mainへの統合は手動。後続taskのworktreeは、先行taskの統合を確認したmainから作る。
-- workspaceの終了はsupervisorが行い、成功したworktreeとbranchも統合までは保持する。
+- 実行成功は`awaiting_integration`。統合はruntimeの`integrate`が1件ずつ、最新mainへのrebase → 再検証 → squash着地で行い、Taskを`completed`にする。fast-forwardやmerge commitは使わない。
+- 初期の`integrate`はSVがレビュー後に呼ぶ承認制。承認なしの自動着地は後回し。pushはSVが行う。
+- 衝突したrunは`needs_session`で止め、SVが`claude --resume <run-id>`でworkspaceを開き直してセッションに解消させる。SVは原則コードを変更しない。
+- workspaceの終了はsupervisorが行い、成功したworktreeとbranchは着地までは保持する。
 
 ## Steps and exit criteria
 
@@ -64,7 +67,7 @@ Rustプロジェクト、migration、Task/TaskRun、依存関係、イベント�
 
 状態: 完了（2026-09-22）。`supervise`がlease取得 → claim → run管理領域とworktree作成 → cmux workspace作成 → 隠しコマンド`session`のwrapper経由でClaude起動 → heartbeat監視 → セッション終了検知までを1件分行う。実装は`src/runtime.rs`、adapterは`src/infrastructure/adapters.rs`、永続化は`src/infrastructure/runtime_store.rs`とmigration `0002_supervisor.sql`。テスト用providerとworkspaceを差し替えたruntimeテスト8件を追加し、正常終了・異常終了・作成失敗時の保持・stale leaseの不奪取・v1からのmigrationを確認した。
 
-使い捨てrepositoryでの[実機スモーク](../journal/003-supervisor.md)（cmux 0.64.25、Claude Code 2.1.278）では、専用workspaceのsupervisorからClaudeを起動し、新規worktreeの信頼確認で待機している間もsupervisorとwrapperのheartbeatが継続することを確認した。確認を進めるとClaudeが修正・unit test・commit・receipt提出を行い、receipt受領後もセッションは維持され、operatorの`/exit`で`session_exited`、`supervision_finished`が記録されrunは`validating`になった。ログはworktree外の`<db>.runs/<run-id>/`に保存され、workspace・worktree・branchは保持された。receiptの検証と`awaiting_integration`への遷移はステップ4で行う。
+使い捨てrepositoryでの[実機スモーク](../journal/003-supervisor.md)（cmux 0.64.25、Claude Code 2.1.278）では、専用workspaceのsupervisorからClaudeを起動し、新規worktreeの信頼確認で待機している間もsupervisorとwrapperのheartbeatが継続することを確認した。確認を進めるとClaudeが修正・unit test・commit・receipt提出を行い、receipt受領後もセッションは維持され、operatorの`/exit`で`session_exited`、`supervision_finished`が記録されrunは`validating`になった。ログはworktree外の`<db>.runs/<run-id>/`に保存され、workspace・worktree・branchは保持された。
 
 ステップ1の経路をruntimeへ組み込む。claim → worktree作成 → cmux workspace作成 → wrapper/Claude起動 → 監視を実装する。手動で起動し、1件を処理するところから始める。
 
@@ -75,18 +78,45 @@ Rustプロジェクト、migration、Task/TaskRun、依存関係、イベント�
 
 ### 4. 成功判定・統合待ち・障害時の扱いを完成させる
 
+状態: 実装済み（[005](../journal/005-receipt-validation.md)、[006](../journal/006-workspace-close.md)、[007](../journal/007-session-exit-request.md)、[008](../journal/008-integration-confirm.md)、[009](../journal/009-doctor-recover.md)、[015](../journal/015-e2e-happy-path.md)）。実機での異常系確認は[010](../journal/010-failure-path-smoke.md)で、ステップ6・7の実装後に並列とmerge queueを含めて行う。008の「手動mergeを確認する`integrate`」はステップ7で置き換える。
+
 receiptにはrun ID、結果、commit SHA、実施したunit test/E2E/subagent reviewの結果と証跡を記録する。適用対象外の検証には理由を要求し、taskの受け入れ条件に照らして扱う。
 
 - supervisorはreceiptの整合性、対象branchのcommit、clean worktree、必要な検証結果を確認する。receipt上の自己申告だけで成功にせず、指定された検証コマンドはsupervisor側でも実行する。
 - 検証成功とセッション終了を確認してworkspaceを閉じ、`awaiting_integration`にする。cleanup失敗は記録し、閉じられていないworkspaceをcleaned扱いしない。
-- 手動merge後、成果commitがmainに含まれることを確認する操作でTaskを`completed`にする。初期版はmerge/fast-forwardを対象とし、squash/cherry-pickの同等性判定は後回しにする。
 - 失敗、中断、不正または未提出receipt、heartbeat切れではworkspace/worktreeを保持し、後続taskを解放しない。
 - 最小の`doctor`と`recover`を用意する。旧実行が停止したことを確認して明示的に復旧し、再試行は新しいTaskRunにする。孤児runは自動再実行しない。
 - **完了条件:** 正常終了、Claude異常終了、supervisor再起動、検証失敗、cleanup失敗を確認でき、二重起動や成果の喪失が起きない。
 
-### 5. Claude Codeから使う薄いローカルpluginを作る
+### 5. queueをrepositoryごとにユーザーDIRへ置く
 
-状態: 実装済み（2026-09-22、[011](../journal/011-claude-code-plugin.md)）。`plugins/claude-taskq/` にlauncherと3つのskill（登録・確認 / 実行・統合 / 復旧）を置き、`claude --plugin-dir` で読み込んだセッションから登録と確認を実機確認した。実行・統合・復旧をClaude Codeから通す確認はステップ6で行い、その時点で完了にする。
+[016](../journal/016-queue-per-repository.md)。1 repositoryに1 queue。
+
+- DBは`~/.local/share/cmux-taskq/<Git common directoryの正規化パスのhash>/queue.db`。run dir・worktree・ログも同じ配下。
+- CLIはcwdから`git rev-parse --git-common-dir`で解決する。`--db`は使い捨てrepositoryとテスト用のoverrideとして残す。`supervise --repo`と`integrate --repo`は不要になる。
+- **完了条件:** repository内の任意のworktreeから`--db`なしで同じqueueが使え、別repositoryからは別queueになることをテストで確認できる。
+
+### 6. 依存が解けたtaskを並列に実行する
+
+[017](../journal/017-parallel-runs.md)。
+
+- queue全体の実行枠をやめ、Taskごとの未完了run 1件の制約だけ残す。leaseはrun単位にし、`doctor`/`recover`はrunごとに動く。
+- `supervise --parallel N`（既定4）は常駐ループで、候補を上限までclaim → 起動 → 各runの監視 → 検証を繰り返す。
+- 1 runの異常が他のrunに波及しない。
+- **完了条件:** 依存のないtaskが同時に走り、依存のあるtaskは先行taskの`completed`まで待ち、1 runの失敗とrecoverが他に影響しないことをテストで確認できる。
+
+### 7. merge queueでmainに直線の履歴を積む
+
+[018](../journal/018-merge-queue.md)。着地はruntimeの`integrate`が行う。
+
+- 統合スロットは1つ、検証完了の古い順。`integrating` → 最新mainへrebase → 再検証（親がmain head、clean、検証コマンド）→ treeを1 commitにsquash（trailer `Taskq-Task` / `Taskq-Run`）してmainを進める → `integrated`。
+- 衝突は`rebase --abort`して`needs_session`で止め、SVがresumeしたセッションが解消・再検証・receiptを書き直す。
+- run branchは`refs/taskq/runs/<run-id>`に残す。初期はSVが`integrate`を呼ぶ承認制。
+- **完了条件:** 衝突なしのrunがClaudeなしで着地し、衝突したrunがセッションでの解消後に着地し、mainが直線で1 task = 1 commitになることをテスト（e2e含む）で確認できる。
+
+### 8. Claude Codeから使う薄いローカルpluginを作る
+
+状態: 実装済み（2026-09-22、[011](../journal/011-claude-code-plugin.md)）。`plugins/claude-taskq/` にlauncherと3つのskill（登録・確認 / 実行・統合 / 復旧）を置き、`claude --plugin-dir` で読み込んだセッションから登録と確認を実機確認した。実行・統合・復旧をClaude Codeから通す確認はステップ9で行い、その時点で完了にする。ステップ5〜7でCLIの引数（`--db`、`--repo`、`--parallel`、`integrate`の意味）が変わるので、skillの追従は016・017・018の各taskに含める。
 
 ローカルビルドしたバイナリとClaude Code pluginを接続する。skillはタスク登録、状態確認、実行開始の手順を提供し、エージェント向けに結果を読める形で返す。
 
@@ -95,23 +125,25 @@ receiptにはrun ID、結果、commit SHA、実施したunit test/E2E/subagent r
 - 完了通知はステップ1で検証した明示的な経路を使い、停止hookだけで成功を決めない。
 - **完了条件:** Claude Code内の依頼から登録・実行・結果確認まで操作できる。pluginがDBを直接変更しない。
 
-### 6. cmux-taskq自身でドッグフーディングする
+### 9. cmux-taskq自身でドッグフーディングする
 
-ローカルに固定したビルド済みバイナリを使い、実行中のruntimeを作業成果で置き換えない。最初はドキュメント改善、その次に小さな不具合修正またはテスト追加を流す。
+ローカルに固定したビルド済みバイナリを使い、実行中のruntimeを作業成果で置き換えない。SVは常駐のClaude Code sessionで、`read-screen`で完了を確認し、差分をレビューして`integrate`を呼び、`needs_session`のrunにはresumeで指示する。
 
-1. 独立taskを1件完走し、差分と証跡をレビューしてmainに取り込む。
-2. A → Bの依存taskを登録し、Aの実行成功だけではBが始まらず、Aの統合確認後にBが変更を含むmainから始まることを確認する。
-3. 失敗または中断を1件起こし、リソース保持、状態確認、明示復旧、再試行を確認する。
+1. [012](../journal/012-dogfood-independent-task.md): 独立taskを1件完走し、差分と証跡をレビューして着地させる。ここでopenなジャーナルをqueueへ移行する。
+2. [019](../journal/019-replace-interim-workflow.md): AGENTS.mdのSV/worker運用をcmux-taskq前提に置き換える。以降のtaskは新しい手順で流す。
+3. [013](../journal/013-dogfood-dependent-tasks.md): A → Bの依存taskと独立したCを登録し、AとCが並列に走り、Aの着地後にBがAの変更を含むmainから始まることを確認する。
+4. [014](../journal/014-dogfood-failure-recovery.md): 失敗または中断を1件起こし、リソース保持、状態確認、明示復旧、再試行を確認する。
 
-**完了条件:** 上記3シナリオがDBの手修正なしで通る。セットアップ、実行、成果の取り込み、復旧の手順を文書化し、次の小さな開発taskを同じ手順で流せる。
+**完了条件:** 上記シナリオがDBの手修正なしで通る。セットアップ、実行、成果の取り込み、復旧の手順を文書化し、次の小さな開発taskを同じ手順で流せる。
 
 ## Ordering
 
-`1 → 2 → 3 → 4 → 5 → 6`。ステップ1の正常系検証、ステップ2の最小キュー、ステップ3の1件を実行するsupervisorは完了。次の着手単位はステップ4の成功判定・統合待ち・障害時の扱いとする。ステップ3で未検証のClaude異常終了、supervisor再起動、heartbeat切れ後の復旧、cleanup失敗はステップ4で扱う。
+`1 → 2 → 3 → 4 → 5 → 6 → 7 → 8 → 9`。ステップ1〜4は実装済みで、4の実機確認（010）は7の後に並列とmerge queueを含めて行う。ステップ8のpluginは実装済みで、Claude Codeからの実行・統合・復旧の確認をステップ9に含める。次の着手単位はステップ5（016）。ドッグフーディングへの移行は010の直後、012から。012・013・014・019のジャーナルは`draft`で置き、暫定運用のSVは起動しない。016・017・018・010がdoneになった時点で`cmux-taskq add`へ登録し、013・014・019はcmux-taskqで流す。
 
 ## After first dogfooding
 
 - 利用で見つかった詰まりを修正し、継続的な実行と復旧を安定させる。
+- SVの操作をruntimeへ移す。`ask` / `answer`によるセッションからSVへの相談経路、承認なしの自動着地、`needs_session`のrunをruntimeがresumeして定型の解消依頼を送る仕組み。
 - Codex provider、明示選択、Claude起動不能時のfallbackを追加する。
 - バイナリリリース、checksum、pluginとのバージョン互換性、Codex pluginを整備する。
 - 既存Pythonキューからtask ID、依存、run履歴、ログ参照を移行する。
@@ -119,7 +151,7 @@ receiptにはrun ID、結果、commit SHA、実施したunit test/E2E/subagent r
 ## Out of scope for first dogfooding
 
 - Codex対応と自動fallback
-- 複数taskの同時実行、複数repository運用
-- 自動merge、統合前の先行branchから後続taskを実行する方式
+- 複数repositoryをまたぐ依存
+- 承認なしの自動着地、統合前の先行branchから後続taskを実行する方式
 - 公開配布、自動更新、旧Pythonキューの移行
 - cmux以外のworkspaceバックエンド、Web UI、本番への自動デプロイ、外部スケジューラー

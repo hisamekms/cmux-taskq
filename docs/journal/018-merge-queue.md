@@ -30,6 +30,7 @@ related:
 - 衝突したら`rebase --abort`して`needs_session`で止める。SVが`claude --resume <run-id>`でworktreeにworkspaceを開き直し、セッションが解消・検証コマンド再実行・receiptの書き直しを行う。runtimeは新しいheadで再検証から続ける。変更が不要になった場合はセッションが`failed`のreceiptで理由を書く。
 - run branchの詳細履歴は`refs/taskq/runs/<run-id>`に残し、worktreeは着地後に削除する。
 - 初期はSVが`integrate`を呼ぶ承認制。承認なしの自動着地は後回し。pushはSVが行う。
+- `plugins/claude-taskq/`のskill（統合）を新しい`integrate`と`needs_session`の扱いに追従させる。
 - ADRを追加し、`domain-model.md`・`persistence.md`・`supervisor-lifecycle.md`・READMEを更新する。
 
 完了条件: 衝突なしのrunがClaudeなしで着地し、衝突したrunがセッションでの解消後に着地し、いずれもmainが直線で1 task = 1 commitになることがテスト（e2e含む）で確認できる。着地前の`result_commit`と着地後のmain headのtreeが一致する。

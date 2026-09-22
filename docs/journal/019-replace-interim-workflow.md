@@ -2,7 +2,7 @@
 id: journal-019
 type: journal
 title: Replace the interim SV/worker workflow with cmux-taskq operation
-status: planned
+status: draft
 created: 2026-09-22
 updated: 2026-09-22
 plan_step: 9
