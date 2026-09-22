@@ -34,7 +34,7 @@ tags:
 2. [007 session exit request](007-session-exit-request.md) — after 005
 3. [008 integration confirm](008-integration-confirm.md) — after 005
 4. [009 doctor / recover](009-doctor-recover.md) — after 005
-5. [015 e2e happy path](015-e2e-happy-path.md) — after 006, 008。実cmux + stub agentの自動e2e
+5. [015 e2e happy path](015-e2e-happy-path.md) — 実cmux + stub agentの自動e2e。close/integrateの確認は006, 008の後に追記
 6. [010 failure path smoke](010-failure-path-smoke.md) — after 006, 009, 015。ステップ4の完了
 7. [011 Claude Code plugin](011-claude-code-plugin.md) — after 008。ステップ5
 8. [012 dogfood: independent task](012-dogfood-independent-task.md) — after 011。ここでopenなジャーナルをキューへ移行する
