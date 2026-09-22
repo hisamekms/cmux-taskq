@@ -247,6 +247,17 @@ fn run_agent_with(
     let detail = queue.show(1).unwrap();
     assert_eq!(detail.task.status, TaskStatus::InProgress);
     let run = &detail.runs[0];
+    // Runs live in `runs/` next to the (canonicalized) database, worktree inside.
+    let run_dir = db
+        .canonicalize()
+        .unwrap()
+        .with_file_name("runs")
+        .join(&run.id);
+    assert_eq!(Path::new(run.run_dir.as_ref().unwrap()), run_dir);
+    assert_eq!(
+        Path::new(run.worktree_path.as_ref().unwrap()),
+        run_dir.join("worktree")
+    );
     // Every outcome keeps the worktree; only an accepted run closes its workspace.
     assert!(Path::new(run.worktree_path.as_ref().unwrap()).exists());
     assert_eq!(run.workspace_id.as_deref(), Some(WORKSPACE_ID));
@@ -1187,12 +1198,12 @@ fn fast_forward_into_main_completes_task_and_releases_dependents() {
         .unwrap()
         .events
         .len();
-    let outcome = runtime::integrate(&db, 1, None).unwrap();
+    let outcome = runtime::integrate(&db, 1, &repo).unwrap();
     assert_not_integrated(&db, &outcome, &run, events_before);
     assert_eq!(outcome["main"], json!(run.base_commit));
 
     git(&repo, &["merge", "--ff-only", branch]);
-    let outcome = runtime::integrate(&db, 1, None).unwrap();
+    let outcome = runtime::integrate(&db, 1, &repo).unwrap();
     assert_eq!(outcome["outcome"], "integrated");
     assert_eq!(outcome["task"]["status"], "completed");
     assert_eq!(outcome["run"]["status"], "integrated");
@@ -1227,16 +1238,16 @@ fn fast_forward_into_main_completes_task_and_releases_dependents() {
     assert!(Path::new(run.worktree_path.as_ref().unwrap()).exists());
 
     // Integration is one-shot, at every layer.
-    let error = format!("{:#}", runtime::integrate(&db, 1, None).unwrap_err());
+    let error = format!("{:#}", runtime::integrate(&db, 1, &repo).unwrap_err());
     assert!(error.contains("no run awaiting integration"), "{error}");
     assert!(
         queue
             .finish_integration(&run.id, &run.base_commit, "/x")
             .is_err()
     );
-    let error = format!("{:#}", runtime::integrate(&db, 2, None).unwrap_err());
+    let error = format!("{:#}", runtime::integrate(&db, 2, &repo).unwrap_err());
     assert!(error.contains("task 2 (ready) has no run"), "{error}");
-    assert!(runtime::integrate(&db, 99, None).is_err());
+    assert!(runtime::integrate(&db, 99, &repo).is_err());
     let raw = Connection::open(&db).unwrap();
     assert!(
         raw.execute(
@@ -1261,18 +1272,15 @@ fn merge_commit_integrates_and_repository_must_match_binding() {
     git(&other, &["config", "user.name", "test"]);
     git(&other, &["config", "user.email", "test@example.invalid"]);
     git(&other, &["commit", "--allow-empty", "-m", "unrelated"]);
-    let error = format!(
-        "{:#}",
-        runtime::integrate(&db, 1, Some(&other)).unwrap_err()
-    );
+    let error = format!("{:#}", runtime::integrate(&db, 1, &other).unwrap_err());
     assert!(error.contains("the queue is bound to"), "{error}");
-    assert!(runtime::integrate(&db, 1, Some(&dir.path().join("missing"))).is_err());
+    assert!(runtime::integrate(&db, 1, &dir.path().join("missing")).is_err());
     let mut queue = SqliteQueue::open(&db).unwrap();
     assert_eq!(queue.show(1).unwrap().task.status, TaskStatus::InProgress);
 
     // The run's worktree resolves to the same repository as its root checkout.
     let worktree = PathBuf::from(run.worktree_path.as_ref().unwrap());
-    let outcome = runtime::integrate(&db, 1, Some(&worktree)).unwrap();
+    let outcome = runtime::integrate(&db, 1, &worktree).unwrap();
     assert_eq!(outcome["outcome"], "integrated");
     assert_ne!(outcome["run"]["result_commit"], json!(run.base_commit));
     let detail = queue.show(1).unwrap();
@@ -1293,7 +1301,7 @@ fn squash_merge_is_not_recognized_as_integration() {
         .unwrap()
         .events
         .len();
-    let outcome = runtime::integrate(&db, 1, Some(&repo)).unwrap();
+    let outcome = runtime::integrate(&db, 1, &repo).unwrap();
     assert_not_integrated(&db, &outcome, &run, events_before);
     assert_ne!(outcome["main"], json!(run.base_commit));
     assert_ne!(outcome["main"], json!(run.result_commit));

@@ -9,6 +9,7 @@ last_verified: 2026-09-22
 scope: distribution
 related:
   - adr-0005
+  - adr-0006
 ---
 
 # Claude Code and Codex plugin integration
@@ -41,16 +42,16 @@ plugins/claude-taskq/
 
 ### launcher
 
-skillはすべて`${CLAUDE_PLUGIN_ROOT}/bin/taskq`を呼ぶ。launcherはバイナリとDBのpathを解決して`cmux-taskq --db <db> <args>`を`exec`するだけで、DBを開かない。
+skillはすべて`${CLAUDE_PLUGIN_ROOT}/bin/taskq`を呼ぶ。launcherはバイナリを解決してcwdのまま`cmux-taskq <args>`を`exec`するだけで、DBのpathを計算せず、DBも開かない（[016](../journal/016-queue-per-repository.md)、[ADR-0006](../adr/0006-queue-per-repository.md)）。
 
 - バイナリ: `CMUX_TASKQ_BIN`、なければPATHの`cmux-taskq`。どちらもなければ`{"error": ...}`をstderrに出し、`cargo build --locked`と`CMUX_TASKQ_BIN`の設定を案内する（CLI本体のエラー形式と同じ）。
-- DB: `CMUX_TASKQ_DB`、なければ`$(git rev-parse --path-format=absolute --git-common-dir)/taskq/queue.db`。repositoryの全worktreeで共有され、worktreeの外にあるので`supervise`の配置制約を満たす。`init`のときだけ親ディレクトリを作る。
-- `--resolve`: `{"binary","version","db","db_exists","repo"}`を返す。skillはこれをユーザーへの報告と、cmux workspaceへ渡す絶対pathの取得に使う。`--version` / `--help`はDBなしでバイナリに渡す。
+- queue: バイナリがcwdのrepositoryから`$XDG_DATA_HOME/cmux-taskq/<hash>/queue.db`に解決する。`CMUX_TASKQ_DB`が設定されているときだけ`--db "$CMUX_TASKQ_DB"`を前置する。dirの作成と束縛は`init`が行う。
+- `--resolve`: `cmux-taskq locate`のJSON（`db`、`db_exists`、`queue_dir`、`runs_dir`、`source`、`git_common_dir`）に`binary`、`version`、`repo`（`git rev-parse --show-toplevel`、repository外は空文字）を加えた1つのobjectを返す。skillはこれをユーザーへの報告と、cmux workspaceへ渡す絶対pathの取得に使う。`--version` / `--help`はそのままバイナリに渡す。
 
 ### skillの契約
 
 - 完了はStop hookやreceiptファイルの存在ではなく、`show`のrun `status`（`awaiting_integration` / `integrated`）、`result_commit`、`last_error`、`validation_finished`イベントで判定する。
-- `supervise`はブロックするのでClaude Codeのshellでは実行せず、`cmux workspace create --cwd <repo> --command "<bin> --db <db> supervise --repo <repo>"`で専用workspaceに起動する。workspaceのshellはsessionの環境変数を継承しないため絶対pathを渡す。
+- `supervise`はブロックするのでClaude Codeのshellでは実行せず、`cmux workspace create --cwd <repo> --command "<bin> supervise"`で専用workspaceに起動する。`--cwd`がrepositoryなのでqueueは同じものに解決される。workspaceのshellはsessionの環境変数を継承しないため絶対pathを渡し、`CMUX_TASKQ_DB`を使っているときだけ`--db <db>`を付ける。
 - mainへのmergeは手動。skillは`integrate ID`の`outcome`を読んで結果を伝える。
 - `recover`はバイナリが拒否条件を判定する。skillはプロセスをkillせず、`doctor`の`blockers`をユーザーに示す。
 
@@ -58,4 +59,4 @@ skillはすべて`${CLAUDE_PLUGIN_ROOT}/bin/taskq`を呼ぶ。launcherはバイ�
 
 - 検証: `claude plugin validate plugins/claude-taskq`、inventory: `claude --plugin-dir plugins/claude-taskq plugin details claude-taskq`。
 - 利用: `claude --plugin-dir /path/to/cmux-taskq/plugins/claude-taskq`（そのsessionのみ）。恒久化するにはsettingsのmarketplaceにローカルpathを登録して`claude plugin install claude-taskq@<marketplace>`する（未検証）。
-- `tests/plugin.rs`がmanifest（name、versionの一致）、frontmatter（先頭行`---`、`name`がdirectory名、`description`）、launcherの解決・エラー・`init`・登録・`show`を実バイナリで確認する。
+- `tests/plugin.rs`がmanifest（name、versionの一致）、frontmatter（先頭行`---`、`name`がdirectory名、`description`）、launcherの解決（`XDG_DATA_HOME`配下、worktreeからの共有、`CMUX_TASKQ_DB`の優先）・エラー・`init`・登録・`show`を実バイナリで確認する。テストは`XDG_DATA_HOME`を一時dirに向け、開発者の実queueに触れない。

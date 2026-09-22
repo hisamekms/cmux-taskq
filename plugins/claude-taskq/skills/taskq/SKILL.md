@@ -11,17 +11,17 @@ Starting a run and confirming integration are in the `taskq-run` skill; recoveri
 
 ## 1. Locate the binary and the queue
 
-Run the plugin launcher, which resolves the binary and the queue database and forwards every command:
+Run the plugin launcher, which resolves the binary and forwards every command to it from the current directory:
 
 ```sh
 "${CLAUDE_PLUGIN_ROOT}/bin/taskq" --resolve
 ```
 
-It prints `{"binary", "version", "db", "db_exists", "repo"}`.
+It prints `{"binary", "version", "repo", "db", "db_exists", "queue_dir", "runs_dir", "source", "git_common_dir"}`.
 
 - Binary: `CMUX_TASKQ_BIN` if set, otherwise `cmux-taskq` on PATH. If the launcher prints an error instead, tell the user to build it in the cmux-taskq repository with `cargo build --locked` and either put `target/debug/cmux-taskq` on PATH or `export CMUX_TASKQ_BIN=/absolute/path/to/cmux-taskq`, then retry.
-- Queue database: `CMUX_TASKQ_DB` if set, otherwise `$(git rev-parse --path-format=absolute --git-common-dir)/taskq/queue.db`, i.e. `.git/taskq/queue.db` of the repository you are in. It is shared by every worktree of the repository and is never inside a worktree. Run the launcher from inside the repository the tasks belong to.
-- If `db_exists` is false, create the queue once: `"${CLAUDE_PLUGIN_ROOT}/bin/taskq" init` (the launcher creates the parent directory; `init` also migrates an existing queue and keeps its tasks).
+- Queue: one per repository. The binary resolves it from the current directory's Git common directory to `$XDG_DATA_HOME/cmux-taskq/<hash>/queue.db` (default `~/.local/share/cmux-taskq/<hash>/queue.db`); `source` is `repository`. Every worktree of the repository, including task worktrees, resolves to the same queue, and runs live in `runs_dir` next to it. Run the launcher from inside the repository the tasks belong to; outside a repository it fails. `CMUX_TASKQ_DB=/path/to/queue.db` uses another queue file instead (`source` becomes `db_flag`; the launcher passes it as `--db`).
+- If `db_exists` is false, create the queue once: `"${CLAUDE_PLUGIN_ROOT}/bin/taskq" init` (it creates the directory, binds the queue to this repository, and also migrates an existing queue while keeping its tasks). A queue bound to a different repository is refused by every command; that only happens with `CMUX_TASKQ_DB`, so unset it or point it at the right file.
 
 Report the version and the database path to the user the first time in a session. Use `TASKQ="${CLAUDE_PLUGIN_ROOT}/bin/taskq"` below.
 
@@ -59,6 +59,7 @@ The task is registered as `draft` and the JSON includes its `id`. Then make it r
 | `"$TASKQ" list` | All tasks with `id`, `title`, `status` |
 | `"$TASKQ" show ID` | `task`, `dependencies`, `runs`, `events`, `processes` |
 | `"$TASKQ" candidates` | What the next `supervise` would pick |
+| `"$TASKQ" locate` | The queue this directory resolves to (`db`, `runs_dir`, `git_common_dir`, `db_exists`) without opening it |
 | `"$TASKQ" status` | Supervisor lease (`supervisor` null when idle) and `heartbeat_stale` |
 | `"$TASKQ" doctor` | Lease liveness, unfinished runs, processes, worktree/receipt existence, `blockers`, `recoverable` |
 

@@ -1,17 +1,18 @@
 use std::{
+    env,
     io::{self, Write},
     path::PathBuf,
     process::ExitCode,
 };
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use serde_json::{Value, json};
 
 use cmux_taskq::{
     application::TaskQueue,
     domain::{NewTask, TaskAction},
-    infrastructure::sqlite::SqliteQueue,
+    infrastructure::{adapters::path_text, location::QueueLocation, sqlite::SqliteQueue},
 };
 
 #[derive(Parser)]
@@ -20,17 +21,20 @@ use cmux_taskq::{
     about = "Manage a local dependency-aware task queue (JSON output)"
 )]
 struct Cli {
-    /// Queue database path. Only `init` creates a database.
+    /// Queue database path. Without it, the queue of the repository containing
+    /// the working directory is used: $XDG_DATA_HOME/cmux-taskq/<hash>/queue.db.
     #[arg(long)]
-    db: PathBuf,
+    db: Option<PathBuf>,
     #[command(subcommand)]
     command: Command,
 }
 
 #[derive(Subcommand)]
 enum Command {
-    /// Initialize or migrate a queue. The parent directory must exist.
+    /// Initialize or migrate the queue, creating its directory if needed.
     Init,
+    /// Show which queue this directory resolves to, without opening it.
+    Locate,
     /// Register a draft task; verification commands are stored, not executed.
     Add {
         title: String,
@@ -62,9 +66,10 @@ enum Command {
     Candidates,
     /// Run and monitor one task. Run this in a dedicated terminal.
     Supervise {
-        /// Repository whose `main` becomes the base commit and worktree source.
+        /// Checkout of the repository whose `main` becomes the base commit;
+        /// defaults to the working directory.
         #[arg(long)]
-        repo: PathBuf,
+        repo: Option<PathBuf>,
         /// cmux executable; a bare name is resolved on PATH.
         #[arg(long, default_value = "cmux")]
         cmux: PathBuf,
@@ -75,8 +80,8 @@ enum Command {
     /// Confirm that a task's awaiting run was merged into main and complete the task.
     Integrate {
         id: i64,
-        /// Repository to check; defaults to the run's recorded checkout. Must be the
-        /// repository the queue is bound to.
+        /// Checkout of the repository to check; defaults to the working directory.
+        /// Must be the repository the queue is bound to.
         #[arg(long)]
         repo: Option<PathBuf>,
     },
@@ -107,13 +112,43 @@ enum DependencyCommand {
 }
 
 fn execute(cli: Cli) -> Result<Value> {
-    if matches!(cli.command, Command::Init) {
-        let queue = SqliteQueue::init(&cli.db)?;
-        return Ok(json!({"db": cli.db, "schema_version": queue.schema_version()?}));
+    let cwd = env::current_dir().context("working directory is unavailable")?;
+    let location = QueueLocation::resolve(cli.db.as_deref(), &cwd)?;
+    let db = location.db.clone();
+    // The binding is checked on every command of a repository queue; a `--db`
+    // queue is bound by its first `supervise` and checked there and by `integrate`.
+    let common_dir = location
+        .git_common_dir
+        .as_deref()
+        .map(path_text)
+        .transpose()?;
+    if matches!(cli.command, Command::Locate) {
+        let mut value = serde_json::to_value(&location)?;
+        value["db_exists"] = json!(db.is_file());
+        return Ok(value);
     }
-    let mut queue = SqliteQueue::open(&cli.db)?;
+    if matches!(cli.command, Command::Init) {
+        location.prepare()?;
+        let mut queue = SqliteQueue::init(&db)?;
+        if let Some(common_dir) = &common_dir {
+            queue.bind_repository(common_dir)?;
+        }
+        return Ok(json!({
+            "db": db,
+            "schema_version": queue.schema_version()?,
+            "source": location.source,
+            "git_common_dir": common_dir,
+        }));
+    }
+    let mut queue = SqliteQueue::open(&db)?;
+    if let Some(common_dir) = &common_dir {
+        queue.assert_repository(common_dir)?;
+    }
+    // A repository queue already resolved the working directory; `--repo`
+    // overrides it for a `--db` queue used from elsewhere or a moved checkout.
+    let checkout = |repo: Option<PathBuf>| repo.unwrap_or_else(|| cwd.clone());
     Ok(match cli.command {
-        Command::Init => unreachable!(),
+        Command::Init | Command::Locate => unreachable!(),
         Command::Add {
             title,
             description,
@@ -157,22 +192,22 @@ fn execute(cli: Cli) -> Result<Value> {
         Command::Supervise { repo, cmux, claude } => {
             use cmux_taskq::infrastructure::adapters::{Cmux, executable};
             cmux_taskq::runtime::supervise(
-                &cli.db,
-                &repo,
+                &db,
+                &checkout(repo),
                 &Cmux {
                     executable: executable(&cmux)?,
                 },
                 &executable(&claude)?,
-                &std::env::current_exe()?,
+                &env::current_exe()?,
             )?
         }
         Command::Integrate { id, repo } => {
-            cmux_taskq::runtime::integrate(&cli.db, id, repo.as_deref())?
+            cmux_taskq::runtime::integrate(&db, id, &checkout(repo))?
         }
-        Command::Doctor => cmux_taskq::runtime::doctor(&cli.db)?,
-        Command::Recover { run } => cmux_taskq::runtime::recover(&cli.db, &run)?,
+        Command::Doctor => cmux_taskq::runtime::doctor(&db)?,
+        Command::Recover { run } => cmux_taskq::runtime::recover(&db, &run)?,
         Command::Session { run, lease, claude } => {
-            cmux_taskq::runtime::session(&cli.db, &run, &lease, &claude)?
+            cmux_taskq::runtime::session(&db, &run, &lease, &claude)?
         }
     })
 }

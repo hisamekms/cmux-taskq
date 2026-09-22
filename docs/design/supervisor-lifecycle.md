@@ -10,6 +10,7 @@ scope: runtime
 related:
   - adr-0002
   - adr-0003
+  - adr-0006
   - design-persistence
   - design-provider-lifecycle
 ---
@@ -38,15 +39,15 @@ ready task
 
 ## `supervise`
 
-`cmux-taskq --db PATH supervise --repo REPO`は専用ターミナルで実行し、1件だけ処理して終了する。
+`cmux-taskq supervise`はrepository内の専用ターミナルで実行し、1件だけ処理して終了する。queueはcwdから解決し（[persistence](persistence.md)のQueue location）、repositoryのcheckoutもcwdを使う。`--db PATH`と`--repo REPO`はそれぞれの明示override（[016](../journal/016-queue-per-repository.md)）。
 
-1. DBのpathを正規化し、repositoryのroot、Git common directory、`refs/heads/main`のcommitを取得する。DBはworktree外か、common directory配下に置く。
+1. DBのpathを正規化し、checkoutのroot、Git common directory、`refs/heads/main`のcommitを取得する。DBはworktree外か、common directory配下に置く（ユーザーDIRのqueueは常に満たす）。どのworktreeから起動してもbase commitは`refs/heads/main`で、worktreeの作成元は`repo_path`に記録したcheckout。
 2. cmux（`ping`）とClaude（`--version`）のpreflightを行う。
 3. supervisor leaseを取得する。既存leaseがある、未完了runがある、DBが別repositoryに束縛されている場合は開始しない。staleなleaseも自動では奪わない。
 4. 別スレッドで2秒ごとにleaseのheartbeatを更新する。heartbeatの失敗は監視ループで検知し、runを保持したまま終了する。
 5. `main`をbase commitとしてclaimする。候補がなければleaseを解放して`no_ready_task`を返す。
-6. run管理領域`<db>.runs/<run-id>/`のpath、branch `taskq/<run-id>`、worktree、receipt、logのpathを`run_planned`として先にDBへ保存し、その後にディレクトリ、`prompt.txt`、runtimeバイナリのスナップショット`runner`、worktreeを作る。
-7. cmux workspaceを`--cwd worktree --command '<runner> --db ... session --run ... --lease ... --claude ...'`で作成し、`identify`で解決したUUIDを`workspace_created`として保存する。
+6. run管理領域（DBと同じdirの`runs/<run-id>/`）のpath、branch `taskq/<run-id>`、worktree（`runs/<run-id>/worktree`）、receipt、logのpathを`run_planned`として先にDBへ保存し、その後にディレクトリ、`prompt.txt`、runtimeバイナリのスナップショット`runner`、worktreeを作る。
+7. cmux workspaceを`--cwd worktree --command '<runner> --db ... session --run ... --lease ... --claude ...'`で作成し、`identify`で解決したUUIDを`workspace_created`として保存する。wrapperにはDBのpathを`--db`で明示的に渡す（run worktreeからのcwd解決でも同じqueueになるが、supervisorが開いたファイルと同一であることを引数で保証する）。
 8. 監視ループで、wrapperの登録（45秒以内）、wrapper heartbeat（30秒以内）、receiptファイルの出現、idle marker、wrapperの終了を確認する。receiptの出現は`receipt_observed`（`validated: false`）として記録するだけで、セッション終了とは別に扱う。receipt観測後にidle markerがreceiptより新しければ`session_idle_observed`を記録し、`WorkspaceBackend::send_exit`で一度だけ終了を要求して`exit_requested`を記録する（下記）。
 9. wrapper終了後に画面を`terminal-final.txt`へ保存し、`supervision_finished`でrunを終了コード0なら`validating`、それ以外なら`failed`にする。Taskは`in_progress`のまま残す。
 10. `validating`なら同じleaseのままreceiptを検証し（下記）、`validation_finished`でrunを`awaiting_integration`または`failed`にする。
@@ -98,10 +99,10 @@ receiptの形式は`src/domain.rs`の`Receipt`で、promptとREADMEに同じ契�
 
 ## `integrate`
 
-`cmux-taskq --db PATH integrate ID [--repo REPO]`は、人がrun branch `taskq/<run-id>`をmainへmergeした後に実行する。supervisorとは独立した操作で、leaseを取らない。
+`cmux-taskq integrate ID`は、人がrun branch `taskq/<run-id>`をmainへmergeした後にrepository内で実行する。supervisorとは独立した操作で、leaseを取らない。`--db PATH`と`--repo REPO`は明示override。
 
 1. taskの`awaiting_integration`のrunを取る。なければerror（`integrated`済みのtaskも同じ）。同じtaskにこの状態のrunは制約で高々1件。
-2. repositoryは既定で`task_runs.repo_path`、`--repo`があればそのpathを`GitRepository::inspect`で開き、common directoryが`queue_repository.git_common_dir`と一致することを要求する。
+2. repositoryは既定でcwd、`--repo`があればそのpathを`GitRepository::inspect`で開き、common directoryが`queue_repository.git_common_dir`と一致することを要求する。`task_runs.repo_path`は記録として残るが既定には使わない（[016](../journal/016-queue-per-repository.md)）。
 3. `git merge-base --is-ancestor <result_commit> refs/heads/main`で確認する。merge commitでもfast-forwardでもresult commit自体がmainの祖先になる。squash / cherry-pickは別のSHAになるため祖先にならず、`{"outcome":"not_integrated","run":…,"main":…,"reason":…}`を返してDBは変えない（同等性判定は後回し）。
 4. 祖先なら1トランザクションでrunを`integrated`、Taskを`completed`にし、`run_integrated`（`result_commit`、`main`、`git_common_dir`）と`task_status_changed`を記録する。statusを条件にしたUPDATEで、二重実行や同時実行は0行更新のerrorになる。
 
@@ -119,7 +120,7 @@ supervisorの再起動ではleaseとheartbeatを確認し、孤児プロセス�
 
 ### `doctor`
 
-`cmux-taskq --db PATH doctor`は状態を変えずにJSONで報告する。
+`cmux-taskq doctor`は状態を変えずにJSONで報告する。
 
 - `supervisor`: leaseのPID、`kill -0`による生存、heartbeatの経過秒数、30秒を超えた`stale`。leaseがなければnull。
 - `runs`: `claimed`/`starting`/`running`/`validating`のrunごとに、`workspace_id`、worktreeとrun directoryとreceiptの存在、`last_error`、登録済みwrapper/agentプロセスのPID・生存・heartbeat経過秒数・終了コード。`exited_at`が記録済みのプロセスはPIDが再利用されうるため生存確認せず`alive: null`にする。

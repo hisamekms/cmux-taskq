@@ -1,14 +1,15 @@
 #!/bin/sh
 # Launcher used by the claude-taskq plugin skills.
 #
-# Resolves the cmux-taskq binary (CMUX_TASKQ_BIN, then PATH) and the queue
-# database (CMUX_TASKQ_DB, then <git common dir>/taskq/queue.db), then runs
-# `cmux-taskq --db <db> "$@"`. It never opens the database itself.
+# Resolves the cmux-taskq binary (CMUX_TASKQ_BIN, then PATH) and runs it from
+# the current directory, so the binary picks the queue of the repository that
+# contains it ($XDG_DATA_HOME/cmux-taskq/<hash>/queue.db). CMUX_TASKQ_DB, when
+# set, is passed as `--db` to use another queue file. The launcher never opens
+# the database itself.
 #
-#   taskq --resolve        print the resolved binary, version, database and repository as JSON
-#   taskq --version|--help pass through to the binary without a database
-#   taskq init             also creates the database's parent directory
-#   taskq <command> ...    any other cmux-taskq command
+#   taskq --resolve        print the binary, its version and `locate`'s queue fields as one JSON object
+#   taskq --version|--help pass through to the binary
+#   taskq <command> ...    any cmux-taskq command, including init and locate
 set -eu
 
 json_string() {
@@ -31,37 +32,29 @@ resolve_binary() {
   fi
 }
 
-resolve_db() {
-  if [ -n "${CMUX_TASKQ_DB:-}" ]; then
-    printf '%s\n' "$CMUX_TASKQ_DB"
-    return
-  fi
-  common=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null) \
-    || fail "not inside a Git repository: run from the repository the queue belongs to, or export CMUX_TASKQ_DB=/absolute/path/to/queue.db"
-  printf '%s/taskq/queue.db\n' "$common"
-}
+binary=$(resolve_binary)
 
 case "${1:-}" in
   --version | -V | --help | -h)
-    binary=$(resolve_binary)
     exec "$binary" "$@"
     ;;
   --resolve)
-    binary=$(resolve_binary)
-    db=$(resolve_db)
     version=$("$binary" --version)
+    if [ -n "${CMUX_TASKQ_DB:-}" ]; then
+      queue=$("$binary" --db "$CMUX_TASKQ_DB" locate)
+    else
+      queue=$("$binary" locate)
+    fi
     repo=$(git rev-parse --show-toplevel 2>/dev/null || true)
-    if [ -f "$db" ]; then exists=true; else exists=false; fi
-    printf '{"binary": "%s", "version": "%s", "db": "%s", "db_exists": %s, "repo": "%s"}\n' \
-      "$(json_string "$binary")" "$(json_string "$version")" "$(json_string "$db")" \
-      "$exists" "$(json_string "$repo")"
+    # `locate` prints a pretty JSON object; splice our fields in after its `{`.
+    printf '{"binary": "%s", "version": "%s", "repo": "%s",%s\n' \
+      "$(json_string "$binary")" "$(json_string "$version")" "$(json_string "$repo")" \
+      "${queue#\{}"
     exit 0
     ;;
 esac
 
-binary=$(resolve_binary)
-db=$(resolve_db)
-if [ "${1:-}" = init ]; then
-  mkdir -p "$(dirname "$db")"
+if [ -n "${CMUX_TASKQ_DB:-}" ]; then
+  exec "$binary" --db "$CMUX_TASKQ_DB" "$@"
 fi
-exec "$binary" --db "$db" "$@"
+exec "$binary" "$@"

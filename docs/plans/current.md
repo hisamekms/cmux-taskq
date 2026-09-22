@@ -15,6 +15,7 @@ depends_on:
   - adr-0003
   - adr-0004
   - adr-0005
+  - adr-0006
 ---
 
 # Rust runtime MVP
@@ -90,7 +91,7 @@ receiptにはrun ID、結果、commit SHA、実施したunit test/E2E/subagent r
 
 ### 5. queueをrepositoryごとにユーザーDIRへ置く
 
-[016](../journal/016-queue-per-repository.md)。1 repositoryに1 queue。
+状態: 実装済み（2026-09-22、[016](../journal/016-queue-per-repository.md)、[ADR-0006](../adr/0006-queue-per-repository.md)）。`--db`なしでcwdのrepositoryから`$XDG_DATA_HOME/cmux-taskq/<hash>/queue.db`に解決し、run dirは`runs/<run-id>/`。`supervise --repo`と`integrate --repo`は任意のoverrideに変わり、pluginは`--db`/`--repo`を渡さない。1 repositoryに1 queue。
 
 - DBは`~/.local/share/cmux-taskq/<Git common directoryの正規化パスのhash>/queue.db`。run dir・worktree・ログも同じ配下。
 - CLIはcwdから`git rev-parse --git-common-dir`で解決する。`--db`は使い捨てrepositoryとテスト用のoverrideとして残す。`supervise --repo`と`integrate --repo`は不要になる。
@@ -138,7 +139,7 @@ receiptにはrun ID、結果、commit SHA、実施したunit test/E2E/subagent r
 
 ## Ordering
 
-`1 → 2 → 3 → 4 → 5 → 6 → 7 → 8 → 9`。ステップ1〜4は実装済みで、4の実機確認（010）は7の後に並列とmerge queueを含めて行う。ステップ8のpluginは実装済みで、Claude Codeからの実行・統合・復旧の確認をステップ9に含める。次の着手単位はステップ5（016）。ドッグフーディングへの移行は010の直後、012から。012・013・014・019のジャーナルは`draft`で置き、暫定運用のSVは起動しない。016・017・018・010がdoneになった時点で`cmux-taskq add`へ登録し、013・014・019はcmux-taskqで流す。
+`1 → 2 → 3 → 4 → 5 → 6 → 7 → 8 → 9`。ステップ1〜5は実装済みで、4の実機確認（010）は7の後に並列とmerge queueを含めて行う。ステップ8のpluginは実装済みで、Claude Codeからの実行・統合・復旧の確認をステップ9に含める。次の着手単位はステップ6（017）。ドッグフーディングへの移行は010の直後、012から。012・013・014・019のジャーナルは`draft`で置き、暫定運用のSVは起動しない。016・017・018・010がdoneになった時点で`cmux-taskq add`へ登録し、013・014・019はcmux-taskqで流す。
 
 ## After first dogfooding
 

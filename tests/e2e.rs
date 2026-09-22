@@ -110,10 +110,18 @@ fn git(repo: &Path, args: &[&str]) -> String {
     String::from_utf8(result.stdout).unwrap().trim().to_owned()
 }
 
-fn taskq(db: &Path, args: &[&str]) -> Value {
+/// The queue is resolved the way a user's shell would: from the repository as
+/// the working directory, with `XDG_DATA_HOME` pointed at the disposable
+/// directory instead of the developer's real data home.
+struct Env {
+    repo: PathBuf,
+    data_home: PathBuf,
+}
+
+fn taskq(env: &Env, args: &[&str]) -> Value {
     let output = Command::new(BIN)
-        .arg("--db")
-        .arg(db)
+        .current_dir(&env.repo)
+        .env("XDG_DATA_HOME", &env.data_home)
         .args(args)
         .output()
         .unwrap();
@@ -210,15 +218,22 @@ fn happy_path_runs_a_stub_agent_through_cmux_and_awaits_integration() {
     git(&repo, &["add", "."]);
     git(&repo, &["commit", "-q", "-m", "seed"]);
     let base = git(&repo, &["rev-parse", "HEAD"]);
-    let db = dir.path().join("queue.db");
     let stub = dir.path().join("claude-stub");
     fs::write(&stub, STUB).unwrap();
     use std::os::unix::fs::PermissionsExt;
     fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).unwrap();
+    let env = Env {
+        repo: repo.clone(),
+        data_home: dir.path().join("data"),
+    };
 
-    assert_eq!(taskq(&db, &["init"])["schema_version"], 4);
+    let init = taskq(&env, &["init"]);
+    assert_eq!(init["schema_version"], 4);
+    let db = PathBuf::from(init["db"].as_str().unwrap());
+    assert!(db.starts_with(env.data_home.join("cmux-taskq")));
+    assert_eq!(taskq(&env, &["locate"])["db_exists"], true);
     let task = taskq(
-        &db,
+        &env,
         &[
             "add",
             "e2e stub task",
@@ -233,17 +248,15 @@ fn happy_path_runs_a_stub_agent_through_cmux_and_awaits_integration() {
         ],
     );
     let task_id = task["id"].to_string();
-    assert_eq!(taskq(&db, &["ready", &task_id])["status"], "ready");
-    assert_eq!(taskq(&db, &["candidates"]).as_array().unwrap().len(), 1);
+    assert_eq!(taskq(&env, &["ready", &task_id])["status"], "ready");
+    assert_eq!(taskq(&env, &["candidates"]).as_array().unwrap().len(), 1);
 
     let started = Instant::now();
     let mut child = ChildGuard(
         Command::new(BIN)
-            .arg("--db")
-            .arg(&db)
+            .current_dir(&repo)
+            .env("XDG_DATA_HOME", &env.data_home)
             .arg("supervise")
-            .arg("--repo")
-            .arg(&repo)
             .arg("--cmux")
             .arg(&cmux)
             .arg("--claude")
@@ -274,7 +287,7 @@ fn happy_path_runs_a_stub_agent_through_cmux_and_awaits_integration() {
             "supervise did not finish within {SUPERVISE_TIMEOUT:?}"
         );
         if guard.id.is_none() {
-            let detail = taskq(&db, &["show", &task_id]);
+            let detail = taskq(&env, &["show", &task_id]);
             if let Some(id) = detail["runs"][0]["workspace_id"].as_str() {
                 uuid::Uuid::parse_str(id).expect("workspace id is a UUID");
                 guard.id = Some(id.to_owned());
@@ -306,7 +319,7 @@ fn happy_path_runs_a_stub_agent_through_cmux_and_awaits_integration() {
         "{outcome}"
     );
 
-    let detail = taskq(&db, &["show", &task_id]);
+    let detail = taskq(&env, &["show", &task_id]);
     assert_eq!(detail["task"]["status"], "in_progress");
     let runs = detail["runs"].as_array().unwrap();
     assert_eq!(runs.len(), 1);
@@ -323,7 +336,25 @@ fn happy_path_runs_a_stub_agent_through_cmux_and_awaits_integration() {
         "workspace {workspace} is still open after the run was accepted"
     );
 
+    // The run lives next to the queue, and its worktree resolves the same queue.
+    let run_dir = Path::new(run["run_dir"].as_str().unwrap());
+    assert_eq!(
+        run_dir,
+        db.canonicalize()
+            .unwrap()
+            .with_file_name("runs")
+            .join(run_id)
+    );
     let worktree = Path::new(run["worktree_path"].as_str().unwrap());
+    assert_eq!(worktree, run_dir.join("worktree"));
+    let from_worktree = Env {
+        repo: worktree.to_path_buf(),
+        data_home: env.data_home.clone(),
+    };
+    assert_eq!(
+        taskq(&from_worktree, &["locate"])["db"],
+        db.to_str().unwrap()
+    );
     let head = git(worktree, &["rev-parse", "HEAD"]);
     assert_eq!(git(&repo, &["rev-parse", "main"]), base); // Not merged by the supervisor.
     assert_ne!(head, base);
@@ -413,24 +444,24 @@ fn happy_path_runs_a_stub_agent_through_cmux_and_awaits_integration() {
     assert!(processes.iter().all(|p| p["exit_code"] == 0));
 
     // The slot stays taken until integration; the lease is gone.
-    assert_eq!(taskq(&db, &["candidates"]).as_array().unwrap().len(), 0);
-    assert!(taskq(&db, &["status"])["supervisor"].is_null());
+    assert_eq!(taskq(&env, &["candidates"]).as_array().unwrap().len(), 0);
+    assert!(taskq(&env, &["status"])["supervisor"].is_null());
 
     // Integration is manual: nothing happens until main contains the commit.
-    let not_yet = taskq(&db, &["integrate", &task_id]);
+    let not_yet = taskq(&env, &["integrate", &task_id]);
     assert_eq!(not_yet["outcome"], "not_integrated", "{not_yet}");
     assert_eq!(not_yet["main"], base.as_str());
     assert_eq!(
-        taskq(&db, &["show", &task_id])["task"]["status"],
+        taskq(&env, &["show", &task_id])["task"]["status"],
         "in_progress"
     );
     git(&repo, &["merge", "--ff-only", &format!("taskq/{run_id}")]);
     assert_eq!(git(&repo, &["rev-parse", "main"]), head);
-    let integrated = taskq(&db, &["integrate", &task_id]);
+    let integrated = taskq(&env, &["integrate", &task_id]);
     assert_eq!(integrated["outcome"], "integrated", "{integrated}");
     assert_eq!(integrated["task"]["status"], "completed");
     assert_eq!(integrated["run"]["status"], "integrated");
-    let detail = taskq(&db, &["show", &task_id]);
+    let detail = taskq(&env, &["show", &task_id]);
     assert_eq!(detail["task"]["status"], "completed");
     assert_eq!(detail["runs"][0]["status"], "integrated");
     assert!(

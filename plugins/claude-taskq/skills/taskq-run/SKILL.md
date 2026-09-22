@@ -18,17 +18,16 @@ Prerequisite: resolve the launcher as in the `taskq` skill (`TASKQ="${CLAUDE_PLU
 
 ## 2. Start the supervisor in its own cmux workspace
 
-`supervise` blocks until the run is finished, so it must not run inside this Claude Code session's shell. Launch it in a dedicated cmux workspace with absolute paths taken from `--resolve` (the workspace shell does not inherit this session's environment):
+`supervise` blocks until the run is finished, so it must not run inside this Claude Code session's shell. Launch it in a dedicated cmux workspace whose working directory is the repository, so the binary resolves the same queue there. Take `binary` and `repo` from `"$TASKQ" --resolve` and substitute them as absolute paths (the workspace shell does not inherit this session's environment):
 
 ```sh
-eval "$("$TASKQ" --resolve | sed -n 's/.*"binary": "\([^"]*\)".*"db": "\([^"]*\)".*"repo": "\([^"]*\)".*/BIN=\1; DB=\2; REPO=\3/p')"
-cmux workspace create --name "taskq supervise" --cwd "$REPO" \
-  --command "'$BIN' --db '$DB' supervise --repo '$REPO'"
+cmux workspace create --name "taskq supervise" --cwd "<repo>" \
+  --command "'<binary>' supervise"
 ```
 
-`--repo` is the repository checkout whose `refs/heads/main` becomes the base commit; use the main checkout, not a task worktree. Pass `--cmux EXE` / `--claude EXE` after `supervise` if those executables are not on the workspace's PATH. If cmux is missing, tell the user the supervisor needs cmux and Claude Code installed and cannot be started from here; the same command can be run by hand in any dedicated terminal.
+The base commit is the repository's `refs/heads/main` whichever checkout `--cwd` names. Only if `CMUX_TASKQ_DB` is set in this session, add `--db '<db>'` before `supervise` with the `db` value from `--resolve`, because the workspace does not see the variable. Pass `--cmux EXE` / `--claude EXE` after `supervise` if those executables are not on the workspace's PATH. If cmux is missing, tell the user the supervisor needs cmux and Claude Code installed and cannot be started from here; the same command can be run by hand in any dedicated terminal inside the repository.
 
-The supervisor claims one candidate, creates `<db>.runs/<run-id>/`, a worktree on branch `taskq/<run-id>`, and a second cmux workspace where Claude Code works on the task interactively. Trust and permission prompts are answered in that workspace by a person. It processes exactly one task and exits.
+The supervisor claims one candidate, creates `<runs_dir>/<run-id>/` (next to the queue database, see `--resolve`), a worktree on branch `taskq/<run-id>` inside it, and a second cmux workspace where Claude Code works on the task interactively. Trust and permission prompts are answered in that workspace by a person. It processes exactly one task and exits.
 
 ## 3. Watch the run
 
@@ -52,4 +51,4 @@ After the merge, confirm it:
 "$TASKQ" integrate ID
 ```
 
-`{"outcome": "integrated", ...}` marks the run `integrated` and the task `completed`, which unblocks dependents (`candidates`). `{"outcome": "not_integrated", "main": ..., "reason": ...}` means `result_commit` is not an ancestor of `main`; nothing changed, so check the merge (a squash produces a different SHA and is not recognized). Pass `--repo PATH` only if the repository moved since the run. The worktree and branch are left for the user to remove (`git worktree remove`, `git branch -d`).
+`{"outcome": "integrated", ...}` marks the run `integrated` and the task `completed`, which unblocks dependents (`candidates`). `{"outcome": "not_integrated", "main": ..., "reason": ...}` means `result_commit` is not an ancestor of `main`; nothing changed, so check the merge (a squash produces a different SHA and is not recognized). The check runs against the current directory's repository; pass `--repo PATH` only when using `CMUX_TASKQ_DB` from outside it. The worktree and branch are left for the user to remove (`git worktree remove`, `git branch -d`).

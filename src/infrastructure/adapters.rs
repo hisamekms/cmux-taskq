@@ -138,6 +138,21 @@ pub fn run_shell_to_log(script: &str, cwd: &Path, log: &Path) -> Result<ExitStat
     )
 }
 
+/// Canonical Git common directory of the repository containing `path`. Every
+/// worktree of a repository, including run worktrees, resolves to the same one.
+pub fn git_common_dir(path: &Path) -> Result<PathBuf> {
+    let git = executable(Path::new("git"))?;
+    let raw = output(Command::new(&git).arg("-C").arg(path).args([
+        "rev-parse",
+        "--path-format=absolute",
+        "--git-common-dir",
+    ]))
+    .with_context(|| format!("{} is not inside a Git repository", path.display()))?;
+    PathBuf::from(raw.trim())
+        .canonicalize()
+        .context("resolve Git common directory")
+}
+
 pub struct GitRepository {
     pub root: PathBuf,
     pub common_dir: PathBuf,
@@ -158,15 +173,7 @@ impl GitRepository {
             .trim(),
         )
         .canonicalize()?;
-        let common_dir = PathBuf::from(
-            output(Command::new(&git).arg("-C").arg(&root).args([
-                "rev-parse",
-                "--path-format=absolute",
-                "--git-common-dir",
-            ]))?
-            .trim(),
-        )
-        .canonicalize()?;
+        let common_dir = git_common_dir(&root)?;
         let base_commit = output(Command::new(&git).arg("-C").arg(&root).args([
             "rev-parse",
             "--verify",

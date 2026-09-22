@@ -10,6 +10,7 @@ use crate::{
         adapters::{
             ClaudeCode, GitRepository, path_text, process_alive, run_shell_to_log, shell_join,
         },
+        location::runs_dir,
         runtime_store::{HEARTBEAT_TIMEOUT_SECS, RunPlan, Validation},
         sqlite::SqliteQueue,
     },
@@ -180,13 +181,7 @@ fn provision_and_monitor(
     claimed: &TaskRun,
     heartbeat: &Heartbeat,
 ) -> Result<TaskRun> {
-    let parent = db.parent().context("database has no parent")?;
-    let state_dir = parent.join(format!(
-        "{}.runs",
-        db.file_name()
-            .context("database has no filename")?
-            .to_string_lossy()
-    ));
+    let state_dir = runs_dir(db);
     let run_dir = state_dir.join(&claimed.id);
     let plan = RunPlan {
         repo_path: path_text(&repository.root)?,
@@ -528,8 +523,9 @@ fn check_receipt(
 /// Confirm that the task's awaiting run was merged into `main` by hand and
 /// complete the task. Only merge and fast-forward count: the result commit
 /// itself must be an ancestor of `refs/heads/main`. A squash or cherry-pick
-/// is reported as not integrated and nothing changes.
-pub fn integrate(db: &Path, task_id: i64, repo: Option<&Path>) -> Result<Value> {
+/// is reported as not integrated and nothing changes. `repo` is any checkout
+/// of the repository the queue is bound to.
+pub fn integrate(db: &Path, task_id: i64, repo: &Path) -> Result<Value> {
     let mut queue = SqliteQueue::open(db)?;
     let detail = queue.show(task_id)?;
     let run = detail
@@ -546,17 +542,7 @@ pub fn integrate(db: &Path, task_id: i64, repo: Option<&Path>) -> Result<Value> 
         .result_commit
         .as_deref()
         .context("run has no verified result commit")?;
-    // The run's recorded checkout is enough by default; --repo covers a moved
-    // repository. Either way it must be the repository the queue is bound to.
-    let repo = match repo {
-        Some(repo) => repo.to_owned(),
-        None => PathBuf::from(
-            run.repo_path
-                .as_deref()
-                .context("run has no repository path; pass --repo")?,
-        ),
-    };
-    let repository = GitRepository::inspect(&repo)?;
+    let repository = GitRepository::inspect(repo)?;
     let common_dir = path_text(&repository.common_dir)?;
     let bound = queue
         .repository_binding()?

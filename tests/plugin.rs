@@ -107,11 +107,13 @@ fn every_skill_has_valid_frontmatter_and_uses_the_launcher() {
     }
 }
 
-fn launcher(env: &[(&str, &str)], cwd: &Path, args: &[&str]) -> Output {
+/// `XDG_DATA_HOME` is always pointed away from the developer's real queues.
+fn launcher(env: &[(&str, &str)], data_home: &Path, cwd: &Path, args: &[&str]) -> Output {
     let mut command = Command::new(plugin_root().join("bin/taskq"));
     command
         .env_remove("CMUX_TASKQ_BIN")
         .env_remove("CMUX_TASKQ_DB")
+        .env("XDG_DATA_HOME", data_home)
         .env("PATH", "/usr/bin:/bin")
         .current_dir(cwd)
         .args(args);
@@ -131,8 +133,9 @@ fn stdout_json(output: &Output) -> Value {
 }
 
 #[test]
-fn launcher_resolves_the_binary_and_the_queue_under_the_git_common_dir() {
+fn launcher_resolves_the_binary_and_the_repository_queue_under_the_data_home() {
     let dir = tempfile::tempdir().unwrap();
+    let data_home = dir.path().join("xdg");
     let repo = dir.path().join("repo");
     fs::create_dir(&repo).unwrap();
     assert!(
@@ -146,9 +149,10 @@ fn launcher_resolves_the_binary_and_the_queue_under_the_git_common_dir() {
     let binary = env!("CARGO_BIN_EXE_cmux-taskq");
     let env = [("CMUX_TASKQ_BIN", binary)];
     let git_dir = repo.join(".git").canonicalize().unwrap();
-    let expected_db = git_dir.join("taskq/queue.db");
+    let hash = cmux_taskq::infrastructure::location::repository_hash(&git_dir);
+    let expected_db = data_home.join("cmux-taskq").join(&hash).join("queue.db");
 
-    let resolved = stdout_json(&launcher(&env, &repo, &["--resolve"]));
+    let resolved = stdout_json(&launcher(&env, &data_home, &repo, &["--resolve"]));
     assert_eq!(resolved["binary"], binary);
     assert_eq!(
         resolved["version"],
@@ -156,19 +160,26 @@ fn launcher_resolves_the_binary_and_the_queue_under_the_git_common_dir() {
     );
     assert_eq!(resolved["db"], expected_db.to_str().unwrap());
     assert_eq!(resolved["db_exists"], false);
+    assert_eq!(resolved["source"], "repository");
+    assert_eq!(resolved["git_common_dir"], git_dir.to_str().unwrap());
+    assert_eq!(
+        resolved["runs_dir"],
+        expected_db.with_file_name("runs").to_str().unwrap()
+    );
     assert_eq!(
         resolved["repo"],
         repo.canonicalize().unwrap().to_str().unwrap()
     );
 
-    // `init` creates the missing parent directory; other commands do not.
-    let listing = launcher(&env, &repo, &["list"]);
+    // `init` creates the missing directory; other commands do not.
+    let listing = launcher(&env, &data_home, &repo, &["list"]);
     assert!(!listing.status.success());
-    assert!(!expected_db.parent().unwrap().exists());
-    let init = stdout_json(&launcher(&env, &repo, &["init"]));
+    assert!(!data_home.exists());
+    let init = stdout_json(&launcher(&env, &data_home, &repo, &["init"]));
     assert_eq!(init["db"], expected_db.to_str().unwrap());
     let added = stdout_json(&launcher(
         &env,
+        &data_home,
         &repo,
         &[
             "add",
@@ -181,12 +192,12 @@ fn launcher_resolves_the_binary_and_the_queue_under_the_git_common_dir() {
     ));
     assert_eq!(added["status"], "draft");
     let id = added["id"].to_string();
-    stdout_json(&launcher(&env, &repo, &["ready", &id]));
-    let shown = stdout_json(&launcher(&env, &repo, &["show", &id]));
+    stdout_json(&launcher(&env, &data_home, &repo, &["ready", &id]));
+    let shown = stdout_json(&launcher(&env, &data_home, &repo, &["show", &id]));
     assert_eq!(shown["task"]["status"], "ready");
     assert_eq!(shown["task"]["verification_commands"][0], "true");
     assert_eq!(
-        stdout_json(&launcher(&env, &repo, &["--resolve"]))["db_exists"],
+        stdout_json(&launcher(&env, &data_home, &repo, &["--resolve"]))["db_exists"],
         true
     );
     // A worktree of the same repository shares the queue.
@@ -210,22 +221,23 @@ fn launcher_resolves_the_binary_and_the_queue_under_the_git_common_dir() {
             .success()
     );
     assert_eq!(
-        stdout_json(&launcher(&env, &worktree, &["candidates"]))[0]["id"],
+        stdout_json(&launcher(&env, &data_home, &worktree, &["candidates"]))[0]["id"],
         added["id"]
     );
-    // An explicit database path wins over the convention.
+    // An explicit database path wins over the convention, for --resolve too.
     let other = dir.path().join("other.db");
-    let init = stdout_json(&launcher(
-        &[
-            ("CMUX_TASKQ_BIN", binary),
-            ("CMUX_TASKQ_DB", other.to_str().unwrap()),
-        ],
-        &repo,
-        &["init"],
-    ));
+    let env_db = [
+        ("CMUX_TASKQ_BIN", binary),
+        ("CMUX_TASKQ_DB", other.to_str().unwrap()),
+    ];
+    let init = stdout_json(&launcher(&env_db, &data_home, &repo, &["init"]));
     assert_eq!(init["db"], other.to_str().unwrap());
+    let resolved = stdout_json(&launcher(&env_db, &data_home, dir.path(), &["--resolve"]));
+    assert_eq!(resolved["db"], other.to_str().unwrap());
+    assert_eq!(resolved["source"], "db_flag");
+    assert_eq!(resolved["repo"], "");
     // Pass-through flags need no database.
-    let version = launcher(&env, dir.path(), &["--version"]);
+    let version = launcher(&env, &data_home, dir.path(), &["--version"]);
     assert!(version.status.success());
     assert!(String::from_utf8_lossy(&version.stdout).starts_with("cmux-taskq "));
 }
@@ -233,7 +245,8 @@ fn launcher_resolves_the_binary_and_the_queue_under_the_git_common_dir() {
 #[test]
 fn launcher_reports_missing_binary_and_repository_as_json_errors() {
     let dir = tempfile::tempdir().unwrap();
-    let missing = launcher(&[], dir.path(), &["--resolve"]);
+    let data_home = dir.path().join("xdg");
+    let missing = launcher(&[], &data_home, dir.path(), &["--resolve"]);
     assert!(!missing.status.success());
     let error: Value = serde_json::from_slice(&missing.stderr).unwrap();
     let message = error["error"].as_str().unwrap();
@@ -244,6 +257,7 @@ fn launcher_reports_missing_binary_and_repository_as_json_errors() {
     fs::write(&bogus, "").unwrap();
     let bad = launcher(
         &[("CMUX_TASKQ_BIN", bogus.to_str().unwrap())],
+        &data_home,
         dir.path(),
         &["list"],
     );
@@ -256,12 +270,17 @@ fn launcher_reports_missing_binary_and_repository_as_json_errors() {
             .contains("not an executable")
     );
 
+    // Outside a repository the binary itself explains how to point at a queue.
     let outside = launcher(
         &[("CMUX_TASKQ_BIN", env!("CARGO_BIN_EXE_cmux-taskq"))],
+        &data_home,
         dir.path(),
         &["list"],
     );
     assert!(!outside.status.success());
     let error: Value = serde_json::from_slice(&outside.stderr).unwrap();
-    assert!(error["error"].as_str().unwrap().contains("CMUX_TASKQ_DB"));
+    let message = error["error"].as_str().unwrap();
+    assert!(message.contains("--db"), "{message}");
+    assert!(message.contains("not inside a Git repository"), "{message}");
+    assert!(!data_home.exists());
 }

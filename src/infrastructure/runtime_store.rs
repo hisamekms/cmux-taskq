@@ -95,7 +95,44 @@ impl SqliteQueue {
         Ok(())
     }
 
-    /// Git common directory recorded by the first `supervise`, if any.
+    /// Bind the queue to a repository before any run exists, as `init` does for a
+    /// queue resolved from the working directory. A queue already bound to
+    /// another repository is refused; rebinding is never implicit.
+    pub fn bind_repository(&mut self, common_dir: &str) -> Result<()> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute(
+            "INSERT OR IGNORE INTO queue_repository VALUES (1,?1)",
+            [common_dir],
+        )?;
+        let bound: String = tx.query_row(
+            "SELECT git_common_dir FROM queue_repository WHERE singleton=1",
+            [],
+            |r| r.get(0),
+        )?;
+        ensure!(
+            bound == common_dir,
+            "queue is bound to another Git repository: {bound}"
+        );
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Refuse a queue that belongs to another repository. An unbound queue
+    /// (created with `--db` and never supervised) passes.
+    pub fn assert_repository(&self, common_dir: &str) -> Result<()> {
+        if let Some(bound) = self.repository_binding()? {
+            ensure!(
+                bound == common_dir,
+                "queue is bound to another Git repository: {bound} (this repository is {common_dir})"
+            );
+        }
+        Ok(())
+    }
+
+    /// Git common directory the queue is bound to, recorded by `init` for a
+    /// repository queue or by the first `supervise` otherwise.
     pub fn repository_binding(&self) -> Result<Option<String>> {
         Ok(self
             .conn
