@@ -31,11 +31,10 @@ tags:
 
 ## Open
 
-1. [018 merge queue](018-merge-queue.md) — after 017。ステップ7
-2. [010 failure path smoke](010-failure-path-smoke.md) — after 006, 009, 015, 018。ステップ4の完了（並列とmerge queueを含む）
-3. [012 dogfood: independent task](012-dogfood-independent-task.md) — draft。after 010。ここからドッグフーディング。draftのジャーナルをキューへ移行する
-4. [019 replace interim workflow](019-replace-interim-workflow.md) — draft。after 012。AGENTS.mdのSV/worker運用をcmux-taskq前提にし、このOpen節を消す
-5. [013 dogfood: dependent tasks](013-dogfood-dependent-tasks.md) — draft。after 019
-6. [014 dogfood: failure and recovery](014-dogfood-failure-recovery.md) — draft。after 013。ステップ9とM1の完了
+1. [010 failure path smoke](010-failure-path-smoke.md) — after 006, 009, 015, 018。ステップ4の完了（並列とmerge queueを含む）
+2. [012 dogfood: independent task](012-dogfood-independent-task.md) — draft。after 010。ここからドッグフーディング。draftのジャーナルをキューへ移行する
+3. [019 replace interim workflow](019-replace-interim-workflow.md) — draft。after 012。AGENTS.mdのSV/worker運用をcmux-taskq前提にし、このOpen節を消す
+4. [013 dogfood: dependent tasks](013-dogfood-dependent-tasks.md) — draft。after 019
+5. [014 dogfood: failure and recovery](014-dogfood-failure-recovery.md) — draft。after 013。ステップ9とM1の完了
 
 M2以降（Codex provider、配布、Python版からの移行）は[plans/current.md](../plans/current.md)のAfter first dogfoodingに留め、まだタスクに割らない。
