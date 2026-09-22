@@ -4,8 +4,17 @@
 //! workspace, and reports what the maintainer should look at first. `down`
 //! unloads the agent so the supervisor drains and is not restarted. Both
 //! are idempotent: a second `up` reuses what the first one started.
+//!
+//! A launchd-started supervisor is not a child of a cmux terminal, and cmux
+//! admits such a process only by socket password. `up` therefore proves the
+//! connection from outside cmux (a `ping` with the agent's environment, run
+//! outside cmux's process tree) before it writes the agent, or launchd would
+//! keep restarting a supervisor that fails its own preflight forever.
 use crate::{
-    application::{AgentProvider, LaunchAgent, ProcessControl, WorkspaceBackend},
+    application::{
+        AgentProvider, DetachedRefusal, LaunchAgent, ProcessControl, SupervisorEnvironment,
+        WorkspaceBackend,
+    },
     domain::{RunStatus, SupervisorRegistration},
     infrastructure::{
         adapters::{ClaudeCode, GitRepository, maintainer_workspace_name, path_text, shell_join},
@@ -43,9 +52,22 @@ pub struct UpEnvironment {
     pub queue: Option<PathBuf>,
     /// `PATH`, copied into the agent so the supervisor finds what this shell finds.
     pub path: String,
+    /// `CMUX_SOCKET_PASSWORD`, if this shell exported it (non-empty); it is
+    /// then copied into the agent too.
+    pub socket_password: Option<String>,
     /// The binary launchd runs: this one, by absolute path.
     pub current_exe: PathBuf,
 }
+
+/// What `up` says when cmux does not admit a process from outside its
+/// terminals. The remedies are the operator's: cmux's CLI takes the password
+/// saved in its Settings on its own, or `CMUX_SOCKET_PASSWORD` from the
+/// shell that runs `up` (stored in the agent then).
+pub const DETACHED_CMUX_HINT: &str = "cmux refused a connection from outside its own terminals, \
+so the supervisor launchd starts could not reach it. Either save a socket password in cmux \
+Settings (its CLI uses it on its own), or export CMUX_SOCKET_PASSWORD before `up` (it is then \
+written into the LaunchAgent); until the in-cmux supervisor mode exists, the alternative is \
+to start `supervise` by hand in a cmux terminal and run `up` again, which reuses it";
 
 #[derive(Debug, Clone)]
 pub struct UpOptions {
@@ -64,7 +86,8 @@ pub struct UpOptions {
 /// Ensure the supervisor and the maintainer workspace exist and report the
 /// queue's open work. Preflight first (cmux, claude, an initialized queue,
 /// the repository), then prune registrations whose process is gone, start
-/// the agent only when no live registration remains, and open the
+/// the agent only when no live registration remains (after proving that
+/// cmux admits a process with the agent's environment), and open the
 /// maintainer workspace only outside a maintainer session.
 pub fn up(
     location: &QueueLocation,
@@ -118,6 +141,17 @@ pub fn up(
         }),
         None => {
             let spec = launch_agent_spec(location, &db, &repository, environment, options)?;
+            if let Err(error) = cmux.preflight_detached(&spec.environment) {
+                // Only a refusal has the password as its remedy; a ping
+                // that could not be run or did not answer is its own error.
+                return Err(if error.is::<DetachedRefusal>() {
+                    error.context(DETACHED_CMUX_HINT)
+                } else {
+                    error.context(
+                        "cmux could not be asked whether it admits a connection from outside its own terminals",
+                    )
+                });
+            }
             launchd.install(&spec.label, &spec.plist, &spec.xml())?;
             let registration =
                 wait_for_registration(&queue, processes, options).with_context(|| {
@@ -192,7 +226,8 @@ fn wait_for_registration(
 }
 
 /// The agent definition: this binary running `supervise` on this queue from
-/// the repository root, with the caller's PATH and the queue's log directory.
+/// the repository root, with the caller's PATH (and exported socket
+/// password) and the queue's log directory.
 pub fn launch_agent_spec(
     location: &QueueLocation,
     db: &Path,
@@ -218,7 +253,10 @@ pub fn launch_agent_spec(
             path_text(&options.claude)?,
         ],
         working_directory: path_text(&repository.root)?,
-        path: environment.path.clone(),
+        environment: SupervisorEnvironment {
+            path: environment.path.clone(),
+            socket_password: environment.socket_password.clone(),
+        },
         log: path_text(&location.log_dir.join(LAUNCHD_LOG_NAME))?,
     })
 }

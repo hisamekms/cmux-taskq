@@ -1,6 +1,6 @@
 use anyhow::{Result, bail};
 use cmux_taskq::{
-    application::{AgentProvider, TaskQueue, WorkspaceBackend},
+    application::{AgentProvider, SupervisorEnvironment, TaskQueue, WorkspaceBackend},
     domain::{GoalEdit, NewGoal, NewTask, RunStatus, TaskAction, TaskRun, TaskStatus},
     infrastructure::{
         adapters::{shell_join, workspace_handle},
@@ -199,6 +199,9 @@ impl TestWorkspace {
 impl WorkspaceBackend for TestWorkspace {
     fn preflight(&self) -> Result<()> {
         Ok(())
+    }
+    fn preflight_detached(&self, _: &SupervisorEnvironment) -> Result<()> {
+        unreachable!("only up preflights the detached connection")
     }
     fn create(&self, run: &TaskRun, command: &str) -> Result<String> {
         assert!(

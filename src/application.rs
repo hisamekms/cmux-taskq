@@ -41,8 +41,42 @@ pub trait AgentProvider {
     fn command(&self, run: &crate::domain::TaskRun, prompt: &str) -> Result<std::process::Command>;
 }
 
+/// The environment variables the LaunchAgent gives the supervisor, which
+/// is all a launchd-started process keeps of the shell that ran `up`: its
+/// PATH and, only when that shell exported it, the cmux socket password.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct SupervisorEnvironment {
+    pub path: String,
+    /// `CMUX_SOCKET_PASSWORD` as exported by the invoking shell; a password
+    /// saved in cmux's Settings is never read or stored here.
+    pub socket_password: Option<String>,
+}
+
+/// cmux answered the detached ping and did not admit it (its message is
+/// `reason`), as opposed to not answering at all: only this failure has
+/// the socket password as its remedy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DetachedRefusal {
+    pub reason: String,
+}
+
+impl std::fmt::Display for DetachedRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.reason)
+    }
+}
+
+impl std::error::Error for DetachedRefusal {}
+
 pub trait WorkspaceBackend {
     fn preflight(&self) -> Result<()>;
+    /// Check that cmux accepts a connection from a process that is not a
+    /// child of one of its terminals, the way the launchd-run supervisor
+    /// connects: `ping` run outside cmux's process tree with `environment`
+    /// and none of the `CMUX_*` variables a cmux session inherits (cmux
+    /// admits such a process only by socket password). A refusal is a
+    /// [`DetachedRefusal`]; any other error means cmux could not be asked.
+    fn preflight_detached(&self, environment: &SupervisorEnvironment) -> Result<()>;
     fn create(&self, run: &crate::domain::TaskRun, command: &str) -> Result<String>;
     fn capture(&self, workspace_id: &str) -> Result<String>;
     /// Close the workspace; the worktree and branch are not touched.

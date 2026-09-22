@@ -376,6 +376,7 @@ fn execute(cli: Cli) -> Result<Value> {
             cmux,
             claude,
         } => {
+            use cmux_taskq::infrastructure::adapters::SOCKET_PASSWORD_ENV;
             use cmux_taskq::infrastructure::{
                 adapters::{Cmux, SystemProcesses, executable},
                 launchd::Launchctl,
@@ -385,6 +386,9 @@ fn execute(cli: Cli) -> Result<Value> {
                 role: env::var(ROLE_ENV).ok(),
                 queue: env::var_os(QUEUE_ENV).map(PathBuf::from),
                 path: env::var("PATH").context("PATH is unset")?,
+                socket_password: env::var(SOCKET_PASSWORD_ENV)
+                    .ok()
+                    .filter(|password| !password.is_empty()),
                 current_exe: env::current_exe()?,
             };
             let options = UpOptions {

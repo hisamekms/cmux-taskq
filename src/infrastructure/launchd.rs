@@ -7,14 +7,15 @@ use anyhow::{Context, Result, ensure};
 use serde::Serialize;
 use std::{
     fs,
+    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     process::Command,
     thread,
     time::{Duration, Instant},
 };
 
-use super::adapters::capture;
-use crate::application::{AgentState, LaunchAgent};
+use super::adapters::{SOCKET_PASSWORD_ENV, capture};
+use crate::application::{AgentState, LaunchAgent, SupervisorEnvironment};
 
 /// How long launchd waits after SIGTERM before it kills the supervisor. A
 /// drain waits for the active runs, which can take as long as their
@@ -29,9 +30,10 @@ pub struct LaunchAgentSpec {
     pub plist: PathBuf,
     pub program_arguments: Vec<String>,
     pub working_directory: String,
-    /// PATH of the shell that ran `up`; launchd's own is too small for
-    /// `cmux` and `claude`.
-    pub path: String,
+    /// PATH of the shell that ran `up` (launchd's own is too small for
+    /// `cmux` and `claude`) and the socket password when that shell
+    /// exported it.
+    pub environment: SupervisorEnvironment,
     pub log: String,
 }
 
@@ -59,9 +61,16 @@ impl LaunchAgentSpec {
             escape(&self.working_directory)
         ));
         xml.push_str(&format!(
-            "\t<key>EnvironmentVariables</key>\n\t<dict>\n\t\t<key>PATH</key>\n\t\t<string>{}</string>\n\t</dict>\n",
-            escape(&self.path)
+            "\t<key>EnvironmentVariables</key>\n\t<dict>\n\t\t<key>PATH</key>\n\t\t<string>{}</string>\n",
+            escape(&self.environment.path)
         ));
+        if let Some(password) = &self.environment.socket_password {
+            xml.push_str(&format!(
+                "\t\t<key>{SOCKET_PASSWORD_ENV}</key>\n\t\t<string>{}</string>\n",
+                escape(password)
+            ));
+        }
+        xml.push_str("\t</dict>\n");
         xml.push_str("\t<key>KeepAlive</key>\n\t<true/>\n");
         xml.push_str("\t<key>RunAtLoad</key>\n\t<true/>\n");
         xml.push_str(&format!(
@@ -186,7 +195,10 @@ impl LaunchAgent for Launchctl {
         );
         let dir = path.parent().context("LaunchAgent path has no parent")?;
         fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+        // The definition may carry the socket password: readable by its owner only.
         fs::write(path, contents).with_context(|| format!("write {}", path.display()))?;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("chmod {}", path.display()))?;
         // A definition already loaded keeps its old arguments until reloaded,
         // and launchd refuses a bootstrap while the old service is exiting.
         if self.bootout(label)? {
@@ -241,7 +253,10 @@ mod tests {
                 "/data/q/logs".into(),
             ],
             working_directory: "/repo & co".into(),
-            path: "/usr/bin:/home/u/.local/bin".into(),
+            environment: SupervisorEnvironment {
+                path: "/usr/bin:/home/u/.local/bin".into(),
+                socket_password: None,
+            },
             log: "/data/q/logs/launchd.log".into(),
         };
         let xml = spec.xml();
@@ -267,6 +282,23 @@ mod tests {
             )
         );
         assert!(xml.ends_with("</dict>\n</plist>\n"));
+        assert!(!xml.contains("CMUX_SOCKET_PASSWORD"));
+
+        // An exported password goes into the same dict, escaped like the rest.
+        let with_password = LaunchAgentSpec {
+            environment: SupervisorEnvironment {
+                path: "/usr/bin".into(),
+                socket_password: Some("s3cret&<>".into()),
+            },
+            ..spec
+        }
+        .xml();
+        assert!(
+            with_password.contains(
+                "<key>EnvironmentVariables</key>\n\t<dict>\n\t\t<key>PATH</key>\n\t\t<string>/usr/bin</string>\n\t\t<key>CMUX_SOCKET_PASSWORD</key>\n\t\t<string>s3cret&amp;&lt;&gt;</string>\n\t</dict>"
+            ),
+            "{with_password}"
+        );
     }
 
     #[test]

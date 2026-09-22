@@ -1,12 +1,19 @@
 //! `up` and `down` against fakes for launchd, cmux and process signals: the
-//! idempotent start, the pruning of dead registrations, the maintainer
-//! workspace decision, and every `down` outcome. The real launchd and cmux
-//! path is `tests/e2e.rs`.
+//! idempotent start, the out-of-cmux connection preflight, the pruning of
+//! dead registrations, the maintainer workspace decision, and every `down`
+//! outcome. The real launchd and cmux path is `tests/e2e.rs`.
 use anyhow::{Result, bail};
 use cmux_taskq::{
-    application::{AgentState, LaunchAgent, ProcessControl, TaskQueue, WorkspaceBackend},
+    application::{
+        AgentState, DetachedRefusal, LaunchAgent, ProcessControl, SupervisorEnvironment, TaskQueue,
+        WorkspaceBackend,
+    },
     domain::{NewTask, TaskAction, TaskRun},
-    infrastructure::{adapters::GitRepository, location::QueueLocation, sqlite::SqliteQueue},
+    infrastructure::{
+        adapters::{Cmux, GitRepository, SOCKET_PASSWORD_ENV, detach, process_alive},
+        location::QueueLocation,
+        sqlite::SqliteQueue,
+    },
     lifecycle::{
         self, DownOptions, MAINTAINER_ROLE, QUEUE_ENV, ROLE_ENV, UpEnvironment, UpOptions,
         maintainer_command,
@@ -17,6 +24,7 @@ use rusqlite::Connection;
 use serde_json::{Value, json};
 use std::{
     collections::HashSet,
+    ffi::OsString,
     fs,
     path::{Path, PathBuf},
     process::Command,
@@ -81,6 +89,7 @@ fn fixture() -> Fixture {
             role: None,
             queue: None,
             path: "/usr/bin:/bin:/home/u/.local/bin".into(),
+            socket_password: None,
             current_exe: "/opt/bin/cmux-taskq".into(),
         },
         options: UpOptions {
@@ -178,15 +187,36 @@ impl ProcessControl for FakeProcesses {
 }
 
 /// Named workspaces only; the run-bound methods are the supervisor's and
-/// must not be reached by `up`.
+/// must not be reached by `up`. Admits or refuses the detached connection
+/// as configured and records the environment `up` proved it with.
 #[derive(Default)]
 struct FakeCmux {
     calls: AtomicUsize,
     workspaces: Mutex<Vec<(String, PathBuf, String, String)>>,
+    refuses_detached: bool,
+    /// The ping could not be run at all (not a refusal).
+    detached_unreachable: bool,
+    detached_preflights: Mutex<Vec<SupervisorEnvironment>>,
 }
 
 impl WorkspaceBackend for FakeCmux {
     fn preflight(&self) -> Result<()> {
+        Ok(())
+    }
+    fn preflight_detached(&self, environment: &SupervisorEnvironment) -> Result<()> {
+        self.detached_preflights
+            .lock()
+            .unwrap()
+            .push(environment.clone());
+        if self.refuses_detached {
+            return Err(DetachedRefusal {
+                reason: "\"cmux\" ping from outside cmux failed: only processes started inside cmux can connect".into(),
+            }
+            .into());
+        }
+        if self.detached_unreachable {
+            bail!("\"/bin/sh\" did not finish within 60s")
+        }
         Ok(())
     }
     fn create(&self, _: &TaskRun, _: &str) -> Result<String> {
@@ -319,6 +349,16 @@ fn up_starts_the_agent_and_the_maintainer_once_and_reuses_them_after() {
     assert!(contents.contains(
         "<key>EnvironmentVariables</key>\n\t<dict>\n\t\t<key>PATH</key>\n\t\t<string>/usr/bin:/bin:/home/u/.local/bin</string>\n\t</dict>"
     ));
+    // No password was exported, so none is stored, and the connection was
+    // proved with exactly the environment the plist carries.
+    assert!(!contents.contains(SOCKET_PASSWORD_ENV));
+    assert_eq!(
+        *cmux.detached_preflights.lock().unwrap(),
+        vec![SupervisorEnvironment {
+            path: "/usr/bin:/bin:/home/u/.local/bin".into(),
+            socket_password: None,
+        }]
+    );
     assert!(contents.contains("<key>KeepAlive</key>\n\t<true/>"));
     assert!(contents.contains("<key>RunAtLoad</key>\n\t<true/>"));
     let launchd_log = fixture.location.log_dir.join("launchd.log");
@@ -354,6 +394,8 @@ fn up_starts_the_agent_and_the_maintainer_once_and_reuses_them_after() {
     assert_eq!(launchd.installs.lock().unwrap().len(), 1);
     assert!(launchd.uninstalls.lock().unwrap().is_empty());
     assert_eq!(cmux.workspaces.lock().unwrap().len(), 1);
+    // A reused supervisor already reaches cmux; nothing is proved again.
+    assert_eq!(cmux.detached_preflights.lock().unwrap().len(), 1);
     assert_eq!(
         SqliteQueue::open(&fixture.location.db)
             .unwrap()
@@ -388,6 +430,300 @@ fn up_fails_when_the_started_supervisor_never_registers() {
     // The agent stays loaded for inspection; no maintainer workspace was opened.
     assert!(*launchd.loaded.lock().unwrap());
     assert!(cmux.workspaces.lock().unwrap().is_empty());
+}
+
+/// cmux admits only its own terminals' children unless a socket password is
+/// configured; a supervisor launchd starts is neither, so `up` proves the
+/// connection first and stops before launchd sees anything.
+#[test]
+fn up_fails_before_writing_the_plist_when_cmux_refuses_the_detached_ping() {
+    let fixture = fixture();
+    let cmux = FakeCmux {
+        refuses_detached: true,
+        ..FakeCmux::default()
+    };
+    let launchd = FakeLaunchd::new(&fixture.location.db);
+    let processes = FakeProcesses::default();
+    let error = lifecycle::up(
+        &fixture.location,
+        &fixture.repo,
+        &cmux,
+        &launchd,
+        &processes,
+        &fixture.environment,
+        &fixture.options,
+    )
+    .unwrap_err();
+    let message = format!("{error:#}");
+    assert!(
+        message.starts_with("cmux refused a connection from outside its own terminals"),
+        "{message}"
+    );
+    assert!(
+        message.contains("socket password in cmux Settings"),
+        "{message}"
+    );
+    assert!(message.contains("export CMUX_SOCKET_PASSWORD"), "{message}");
+    assert!(message.contains("in-cmux"), "{message}");
+    assert!(
+        message.ends_with("only processes started inside cmux can connect"),
+        "{message}"
+    );
+    assert_eq!(cmux.detached_preflights.lock().unwrap().len(), 1);
+    // No plist, no launchd call, no maintainer workspace, and no plist file.
+    assert!(launchd.installs.lock().unwrap().is_empty());
+    assert!(launchd.uninstalls.lock().unwrap().is_empty());
+    assert!(!*launchd.loaded.lock().unwrap());
+    assert!(!fixture.location.launch_agent.exists());
+    assert!(cmux.workspaces.lock().unwrap().is_empty());
+    assert_eq!(cmux.calls.load(Ordering::SeqCst), 0);
+    assert!(
+        SqliteQueue::open(&fixture.location.db)
+            .unwrap()
+            .supervisors()
+            .unwrap()
+            .is_empty()
+    );
+
+    // A ping that could not be run or did not answer is not a refusal and
+    // does not send the maintainer to the password; it still stops `up`.
+    let cmux = FakeCmux {
+        detached_unreachable: true,
+        ..FakeCmux::default()
+    };
+    let error = lifecycle::up(
+        &fixture.location,
+        &fixture.repo,
+        &cmux,
+        &launchd,
+        &processes,
+        &fixture.environment,
+        &fixture.options,
+    )
+    .unwrap_err();
+    let message = format!("{error:#}");
+    assert_eq!(
+        message,
+        "cmux could not be asked whether it admits a connection from outside its own terminals: \"/bin/sh\" did not finish within 60s"
+    );
+    assert!(launchd.installs.lock().unwrap().is_empty());
+    assert!(cmux.workspaces.lock().unwrap().is_empty());
+}
+
+/// A password exported by the invoking shell is what the connection is
+/// proved with and what the agent stores, and nothing else changes.
+#[test]
+fn up_proves_the_connection_with_the_exported_password_and_stores_it_in_the_plist() {
+    let mut fixture = fixture();
+    fixture.environment.socket_password = Some("hunter2 & <co>".into());
+    let cmux = FakeCmux::default();
+    let launchd = FakeLaunchd::new(&fixture.location.db);
+    let processes = FakeProcesses::default();
+    let report = up(&fixture, &cmux, &launchd, &processes);
+    assert_eq!(report["supervisor"]["outcome"], "started", "{report}");
+    assert_eq!(report["maintainer"]["outcome"], "created");
+    assert_eq!(
+        *cmux.detached_preflights.lock().unwrap(),
+        vec![SupervisorEnvironment {
+            path: "/usr/bin:/bin:/home/u/.local/bin".into(),
+            socket_password: Some("hunter2 & <co>".into()),
+        }]
+    );
+    let installs = launchd.installs.lock().unwrap();
+    assert_eq!(installs.len(), 1);
+    let contents = &installs[0].2;
+    assert!(
+        contents.contains(
+            "<key>EnvironmentVariables</key>\n\t<dict>\n\t\t<key>PATH</key>\n\t\t<string>/usr/bin:/bin:/home/u/.local/bin</string>\n\t\t<key>CMUX_SOCKET_PASSWORD</key>\n\t\t<string>hunter2 &amp; &lt;co&gt;</string>\n\t</dict>"
+        ),
+        "{contents}"
+    );
+    // The password is not in the maintainer's command: the maintainer
+    // session is a cmux terminal's child and needs none.
+    let workspaces = cmux.workspaces.lock().unwrap();
+    assert!(!workspaces[0].3.contains("hunter2"));
+}
+
+/// The detached environment keeps nothing of the cmux session `up` runs
+/// in: every inherited `CMUX_*` variable is removed (the socket capability
+/// and the workspace, surface and socket paths among them), PATH is the
+/// agent's, and the password is the exported one or absent.
+#[test]
+fn detached_command_drops_every_inherited_cmux_variable_but_the_password() {
+    let inherited = [
+        "CMUX_SOCKET_CAPABILITY",
+        "CMUX_SOCKET_PATH",
+        "CMUX_WORKSPACE_ID",
+        "CMUX_SURFACE_ID",
+        "CMUX_SOCKET_PASSWORD",
+        "HOME",
+        "PATH",
+        "NOT_CMUX_",
+    ]
+    .map(OsString::from);
+    let environment = SupervisorEnvironment {
+        path: "/agent/bin".into(),
+        socket_password: None,
+    };
+    let mut command = Command::new("cmux");
+    detach(&mut command, inherited.clone(), &environment);
+    let envs: Vec<(String, Option<String>)> = command
+        .get_envs()
+        .map(|(name, value)| {
+            (
+                name.to_string_lossy().into_owned(),
+                value.map(|value| value.to_string_lossy().into_owned()),
+            )
+        })
+        .collect();
+    assert_eq!(
+        envs,
+        vec![
+            ("CMUX_SOCKET_CAPABILITY".to_owned(), None),
+            ("CMUX_SOCKET_PASSWORD".to_owned(), None),
+            ("CMUX_SOCKET_PATH".to_owned(), None),
+            ("CMUX_SURFACE_ID".to_owned(), None),
+            ("CMUX_WORKSPACE_ID".to_owned(), None),
+            ("PATH".to_owned(), Some("/agent/bin".to_owned())),
+        ]
+    );
+
+    let mut command = Command::new("cmux");
+    detach(
+        &mut command,
+        inherited,
+        &SupervisorEnvironment {
+            path: "/agent/bin".into(),
+            socket_password: Some("pw".into()),
+        },
+    );
+    let password = command
+        .get_envs()
+        .find(|(name, _)| *name == SOCKET_PASSWORD_ENV)
+        .map(|(_, value)| value.map(|v| v.to_string_lossy().into_owned()));
+    assert_eq!(password, Some(Some("pw".to_owned())));
+    assert_eq!(
+        command
+            .get_envs()
+            .filter(|(name, value)| name.to_string_lossy().starts_with("CMUX_") && value.is_some())
+            .count(),
+        1
+    );
+}
+
+/// The real adapter runs `cmux ping` in that environment and outside
+/// cmux's process tree: a stub cmux dumps what it was given and who its
+/// parent is, and this test process (which may itself run inside cmux)
+/// leaks none of its `CMUX_*` variables into it, while launchd (pid 1) is
+/// the stub's parent, as it is the LaunchAgent supervisor's.
+#[test]
+fn the_cmux_adapter_pings_orphaned_with_the_detached_environment() {
+    let dir = tempfile::tempdir().unwrap();
+    let dump = dir.path().join("env.txt");
+    let stub = dir.path().join("cmux-stub");
+    fs::write(
+        &stub,
+        format!(
+            "#!/bin/sh\n[ \"$1\" = ping ] || exit 2\n/usr/bin/env > '{0}'\necho \"PARENT=$PPID\" >> '{0}'\nprintf 'PONG\\n'\n",
+            dump.display()
+        ),
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).unwrap();
+    let cmux = Cmux {
+        executable: stub.clone(),
+    };
+    cmux.preflight_detached(&SupervisorEnvironment {
+        path: "/usr/bin:/bin".into(),
+        socket_password: Some("pw".into()),
+    })
+    .unwrap();
+    let seen: Vec<(String, String)> = fs::read_to_string(&dump)
+        .unwrap()
+        .lines()
+        .filter_map(|line| line.split_once('='))
+        .map(|(name, value)| (name.to_owned(), value.to_owned()))
+        .collect();
+    let cmux_variables: Vec<&(String, String)> = seen
+        .iter()
+        .filter(|(name, _)| name.starts_with("CMUX_"))
+        .collect();
+    assert_eq!(
+        cmux_variables,
+        vec![&("CMUX_SOCKET_PASSWORD".to_owned(), "pw".to_owned())],
+        "{seen:?}"
+    );
+    assert!(seen.contains(&("PATH".to_owned(), "/usr/bin:/bin".to_owned())));
+    assert!(
+        seen.contains(&("PARENT".to_owned(), "1".to_owned())),
+        "{seen:?}"
+    );
+
+    // Without an exported password none reaches the stub either.
+    cmux.preflight_detached(&SupervisorEnvironment {
+        path: "/usr/bin:/bin".into(),
+        socket_password: None,
+    })
+    .unwrap();
+    assert!(
+        !fs::read_to_string(&dump)
+            .unwrap()
+            .lines()
+            .any(|line| line.starts_with("CMUX_"))
+    );
+
+    // A refusal is cmux's stderr; a wrong reply is reported as such.
+    let environment = SupervisorEnvironment {
+        path: "/usr/bin:/bin".into(),
+        socket_password: None,
+    };
+    fs::write(
+        &stub,
+        "#!/bin/sh\necho 'only processes started inside cmux can connect' >&2\nexit 1\n",
+    )
+    .unwrap();
+    let error = cmux.preflight_detached(&environment).unwrap_err();
+    assert!(error.is::<DetachedRefusal>(), "{error:#}");
+    let error = format!("{error:#}");
+    assert!(error.contains("ping from outside cmux failed"), "{error}");
+    assert!(
+        error.ends_with("only processes started inside cmux can connect"),
+        "{error}"
+    );
+    fs::write(&stub, "#!/bin/sh\necho PING\n").unwrap();
+    let error = cmux.preflight_detached(&environment).unwrap_err();
+    assert!(error.is::<DetachedRefusal>(), "{error:#}");
+    assert!(
+        format!("{error:#}").ends_with("unexpected response: PING"),
+        "{error:#}"
+    );
+
+    // A ping that hangs is killed at the deadline and reported.
+    let pid_file = dir.path().join("pid.txt");
+    fs::write(
+        &stub,
+        format!(
+            "#!/bin/sh\necho $$ > '{}'\nexec /bin/sleep 60\n",
+            pid_file.display()
+        ),
+    )
+    .unwrap();
+    let error = cmux
+        .preflight_detached_within(&environment, Duration::from_millis(300))
+        .unwrap_err();
+    assert!(!error.is::<DetachedRefusal>(), "{error:#}");
+    assert!(
+        format!("{error:#}").ends_with("did not finish within 300ms"),
+        "{error:#}"
+    );
+    let pid: u32 = fs::read_to_string(&pid_file)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    thread::sleep(Duration::from_millis(200));
+    assert!(!process_alive(pid), "sleep {pid} outlived the deadline");
 }
 
 /// Two registrations whose processes are gone, one whose process lives and
@@ -576,6 +912,9 @@ fn up_requires_cmux_claude_and_an_initialized_queue() {
     impl WorkspaceBackend for NoCmux {
         fn preflight(&self) -> Result<()> {
             bail!("cmux ping failed")
+        }
+        fn preflight_detached(&self, _: &SupervisorEnvironment) -> Result<()> {
+            unreachable!()
         }
         fn create(&self, _: &TaskRun, _: &str) -> Result<String> {
             unreachable!()
