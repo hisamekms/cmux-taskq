@@ -13,7 +13,8 @@ CLI の使い方（登録・起動・監視・レビューと着地・復旧）�
 ## 作業中
 
 - タスクは `cmux-taskq add` で登録し、`ready` にしてから supervisor に流す。経過と次の一手はキュー（`show ID` の run 履歴と receipt）が持つ
-- Git worktree と cmux workspace のスモークは使い捨て repository で行い、この repository の queue DB や実行中の runtime バイナリ（`~/.local/bin/cmux-taskq`）を作業成果で置き換えない。バイナリの更新は maintainer がユーザーに報告してから行う
+- 本番 queue（この repository の queue DB）の登録・参照・操作は、supervisor・maintainer・計画中の session のどれでも必ず固定バイナリ `~/.local/bin/cmux-taskq` で行う。`target/debug` や `target/release` のバイナリは queue を開いただけで schema を黙って migrate し、古い schema のまま走っている固定バイナリの supervisor と実行中の run を `unsupported queue schema version` で壊すので、本番 queue には使わない。session 開始時に `which cmux-taskq` が `~/.local/bin/cmux-taskq` に解決することを確認する
+- 新しいビルドの動作確認と、Git worktree・cmux workspace のスモークは使い捨て repository の queue で行う。この repository の queue DB や実行中の runtime バイナリ（`~/.local/bin/cmux-taskq`）を作業成果で置き換えない。固定バイナリの更新は maintainer がユーザーに報告してから行う
 
 ## 変更後に必ず通す
 
@@ -60,7 +61,7 @@ cmux-taskq up --plugin-dir <この repository>/plugins/claude-taskq
 ```
 
 - 操作は plugin の `taskq` / `taskq-maintain` / `taskq-recover` skill に従う。CLI の外で状態を持たず、DB は手で直さない。`cmux read-screen` は当面の一次情報として認める
-- バイナリは `~/.local/bin/cmux-taskq` に固定したものを使う（`~/.local/bin` が PATH にあるので supervisor の起動でも同じものが動く）。キューは cwd から解決されるので、コマンドは repository の中（どの worktree でもよい）で実行する
+- バイナリは「作業中」のとおり固定した `~/.local/bin/cmux-taskq` だけを使う（`~/.local/bin` が PATH にあるので supervisor の起動でも同じものが動く）。キューは cwd から解決されるので、コマンドは repository の中（どの worktree でもよい）で実行する
 - runtime（`src/`）を変えた run は、`integrate` の前に run の worktree で `cargo test --locked --test e2e -- --ignored` を通す
 - push は maintainer だけが行う。着手と着地はユーザーに報告するが承認は待たない。ユーザーの判断が要るとき（受け入れ条件の変更、固定バイナリの更新、DB に触らずに解消できない詰まり）だけ報告して待つ
 - 権限確認は worktree 内の編集・cargo・git など安全なものは maintainer が応答し、それ以外とユーザーの判断が要るものはユーザーに確認する
