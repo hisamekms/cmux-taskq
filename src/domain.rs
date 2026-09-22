@@ -209,10 +209,26 @@ pub struct RunProcess {
 /// A supervisor's ownership of one executing run. The row exists while the
 /// supervisor watches the run and heartbeats it; it is deleted when the run
 /// comes to rest, when the supervisor gives the run up, or by `recover`.
+/// `token` is the owning process's token, shared with its
+/// [`SupervisorRegistration`] when the owner is a resident `supervise`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunLease {
     pub run_id: String,
+    pub token: String,
     pub pid: u32,
+    pub heartbeat_at: i64,
+}
+
+/// A resident `supervise` process as it registered itself, whether or not it
+/// holds any lease. The row is heartbeated with the leases and deleted on a
+/// graceful exit; a row left by a killed supervisor stays until an operator
+/// deals with it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SupervisorRegistration {
+    pub token: String,
+    pub pid: u32,
+    pub parallel: u32,
+    pub started_at: i64,
     pub heartbeat_at: i64,
 }
 

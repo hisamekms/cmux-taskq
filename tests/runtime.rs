@@ -872,12 +872,13 @@ fn provisioning_failure_retains_the_run_and_stops_claiming_other_tasks() {
     // The environment is suspect: the second candidate was left alone.
     assert!(queue.show(2).unwrap().runs.is_empty());
     assert_eq!(queue.candidates().unwrap()[0].id, 2);
-    // The run is disowned, so nothing has to be stopped before recovering it.
+    // The run is disowned, so nothing has to be stopped before recovering it;
+    // the drained loop took its registration with it.
     assert!(queue.run_leases().unwrap().is_empty());
-    assert_eq!(
-        runtime::doctor(&db).unwrap()["runs"][0]["recoverable"],
-        true
-    );
+    assert!(queue.supervisors().unwrap().is_empty());
+    let report = runtime::doctor(&db).unwrap();
+    assert_eq!(report["supervisors"], json!([]));
+    assert_eq!(report["runs"][0]["recoverable"], true);
     assert_eq!(
         runtime::recover(&db, &run.id).unwrap()["run"]["status"],
         "interrupted"
@@ -964,7 +965,7 @@ fn migration_from_v1_preserves_task_and_initializes_runtime_tables() {
     raw.pragma_update(None, "user_version", 1).unwrap();
     raw.execute("INSERT INTO tasks(title,description,acceptance,verification_commands) VALUES ('preserved','','','[]')", []).unwrap();
     let mut queue = SqliteQueue::open(&db).unwrap();
-    assert_eq!(queue.schema_version().unwrap(), 6);
+    assert_eq!(queue.schema_version().unwrap(), 7);
     assert_eq!(queue.show(1).unwrap().task.title, "preserved");
     assert!(queue.run_leases().unwrap().is_empty());
 }
@@ -1132,8 +1133,181 @@ fn no_ready_task_ends_a_once_pass_without_creating_a_run_or_lease() {
     assert_eq!(outcome["runs"], json!([]));
     assert_eq!(outcome["errors"], json!([]));
     assert!(queue.run_leases().unwrap().is_empty());
+    assert!(queue.supervisors().unwrap().is_empty());
     assert!(queue.show(1).unwrap().runs.is_empty());
     assert!(supervise_with(&db, &repo, &backend, &SuperviseOptions::new(0, true)).is_err());
+    assert!(queue.supervisors().unwrap().is_empty());
+}
+
+/// A resident supervisor that holds no run is still listed by `status` and
+/// `doctor` through its registration, which its heartbeat refreshes and a
+/// graceful stop removes.
+#[test]
+fn resident_supervisor_without_runs_is_listed_until_it_stops() {
+    let (_dir, repo, db) = fixture();
+    let mut queue = SqliteQueue::open(&db).unwrap();
+    queue.transition(1, TaskAction::Draft).unwrap();
+    assert_eq!(runtime::status(&db).unwrap()["supervisors"], json!([]));
+    let backend = Arc::new(TestWorkspace::new(&db, true, VALID_AGENT));
+    let options = SuperviseOptions::new(3, false);
+    let supervisor = {
+        let (db, repo, backend, options) =
+            (db.clone(), repo.clone(), backend.clone(), options.clone());
+        thread::spawn(move || supervise_with(&db, &repo, &backend, &options))
+    };
+    wait_until(&db, Duration::from_secs(10), |queue| {
+        queue.supervisors().unwrap().len() == 1
+    });
+    let registered = queue.supervisors().unwrap().remove(0);
+    assert_eq!(registered.pid, std::process::id());
+    assert_eq!(registered.parallel, 3);
+    for report in [runtime::status(&db).unwrap(), runtime::doctor(&db).unwrap()] {
+        assert_eq!(report["runs"], json!([]));
+        assert_eq!(report["supervisors"].as_array().unwrap().len(), 1);
+        let entry = &report["supervisors"][0];
+        assert_eq!(entry["pid"], json!(std::process::id()));
+        assert_eq!(entry["alive"], true);
+        assert_eq!(entry["registered"], true);
+        assert_eq!(entry["parallel"], 3);
+        assert_eq!(entry["started_at"], json!(registered.started_at));
+        assert_eq!(entry["stale"], false);
+        assert!(entry["heartbeat_age_secs"].as_i64().unwrap() <= 5);
+        assert_eq!(entry["run_ids"], json!([]));
+    }
+    // The heartbeat keeps the registration fresh while nothing runs.
+    Connection::open(&db)
+        .unwrap()
+        .execute("UPDATE supervisors SET heartbeat_at=0", [])
+        .unwrap();
+    wait_until(&db, Duration::from_secs(10), |queue| {
+        queue.supervisors().unwrap()[0].heartbeat_at > 0
+    });
+    assert!(queue.run_leases().unwrap().is_empty());
+
+    options.stop.store(true, Ordering::SeqCst);
+    let outcome = supervisor.join().unwrap().unwrap();
+    assert_eq!(outcome["outcome"], "stopped");
+    assert_eq!(outcome["runs"], json!([]));
+    assert!(queue.supervisors().unwrap().is_empty());
+    assert_eq!(runtime::status(&db).unwrap()["supervisors"], json!([]));
+    assert_eq!(runtime::doctor(&db).unwrap()["supervisors"], json!([]));
+
+    // An error out of the loop itself (here: main vanished before a claim)
+    // ends the process with nothing active, so it deregisters too.
+    let options = SuperviseOptions::new(1, false);
+    let supervisor = {
+        let (db, repo, backend, options) =
+            (db.clone(), repo.clone(), backend.clone(), options.clone());
+        thread::spawn(move || supervise_with(&db, &repo, &backend, &options))
+    };
+    wait_until(&db, Duration::from_secs(10), |queue| {
+        queue.supervisors().unwrap().len() == 1
+    });
+    git(&repo, &["update-ref", "-d", "refs/heads/main"]);
+    queue.transition(1, TaskAction::Ready).unwrap();
+    let error = format!("{:#}", supervisor.join().unwrap().unwrap_err());
+    assert!(error.contains("Needed a single revision"), "{error}");
+    assert!(queue.supervisors().unwrap().is_empty());
+    assert!(queue.show(1).unwrap().runs.is_empty());
+}
+
+/// A registration whose process died, or whose heartbeat stopped, is
+/// reported as stale by `status` and `doctor` and left for an operator;
+/// neither a later supervisor nor `recover` removes it, and an `integrate`
+/// or orphaned lease holder is listed next to it without a registration.
+#[test]
+fn killed_supervisor_registration_is_reported_stale_and_never_deleted() {
+    let (_dir, repo, db) = fixture();
+    let mut queue = SqliteQueue::open(&db).unwrap();
+    let dead = dead_pid();
+    let killed = queue.register_supervisor("killed", dead, 4).unwrap();
+    // Killed a moment ago: the heartbeat is fresh, the pid is gone.
+    let status = runtime::status(&db).unwrap();
+    assert_eq!(status["runs"], json!([]));
+    let entry = &status["supervisors"][0];
+    assert_eq!(entry["pid"], json!(dead));
+    assert_eq!(entry["alive"], false);
+    assert_eq!(entry["stale"], true);
+    assert_eq!(entry["registered"], true);
+    assert_eq!(entry["parallel"], 4);
+    assert_eq!(entry["heartbeat_at"], json!(killed.heartbeat_at));
+    assert!(entry["heartbeat_age_secs"].as_i64().unwrap() <= 5);
+    // Alive but silent: stale by heartbeat age alone.
+    queue
+        .register_supervisor("hung", std::process::id(), 1)
+        .unwrap();
+    let raw = Connection::open(&db).unwrap();
+    raw.execute(
+        "UPDATE supervisors SET heartbeat_at=1700000000 WHERE token='hung'",
+        [],
+    )
+    .unwrap();
+    drop(raw);
+    let doctor = runtime::doctor(&db).unwrap();
+    assert_eq!(doctor["supervisors"].as_array().unwrap().len(), 2);
+    let hung = &doctor["supervisors"][1];
+    assert_eq!(hung["alive"], true);
+    assert_eq!(hung["stale"], true);
+    assert!(hung["heartbeat_age_secs"].as_i64().unwrap() > 30);
+    assert_eq!(hung["run_ids"], json!([]));
+
+    // A run owned without a registration (an `integrate` process, or a
+    // supervisor from before the registry) is still attributed to its lease.
+    let orphan = orphan_run(&repo, &db, "owner", std::process::id(), std::process::id());
+    let status = runtime::status(&db).unwrap();
+    let supervisors = status["supervisors"].as_array().unwrap();
+    assert_eq!(supervisors.len(), 3);
+    assert_eq!(supervisors[2]["registered"], false);
+    assert_eq!(supervisors[2]["parallel"], Value::Null);
+    assert_eq!(supervisors[2]["started_at"], Value::Null);
+    assert_eq!(supervisors[2]["pid"], json!(std::process::id()));
+    assert_eq!(supervisors[2]["alive"], true);
+    assert_eq!(supervisors[2]["stale"], false);
+    assert_eq!(supervisors[2]["run_ids"], json!([orphan.id]));
+    assert_eq!(status["runs"][0]["lease"]["pid"], json!(std::process::id()));
+    // A registered supervisor's leases join it by token rather than by pid.
+    queue
+        .register_supervisor("owner", std::process::id(), 2)
+        .unwrap();
+    let status = runtime::status(&db).unwrap();
+    let supervisors = status["supervisors"].as_array().unwrap();
+    assert_eq!(supervisors.len(), 3);
+    assert_eq!(supervisors[2]["registered"], true);
+    assert_eq!(supervisors[2]["parallel"], 2);
+    assert_eq!(supervisors[2]["run_ids"], json!([orphan.id]));
+
+    // Recovery of the run and a later supervisor's own registration and
+    // deregistration leave the stale rows alone.
+    queue
+        .wrapper_exited(&orphan.id, std::process::id(), 0)
+        .unwrap();
+    Connection::open(&db)
+        .unwrap()
+        .execute("DELETE FROM run_leases", [])
+        .unwrap();
+    assert_eq!(
+        runtime::recover(&db, &orphan.id).unwrap()["run"]["status"],
+        "interrupted"
+    );
+    let backend = TestWorkspace::new(&db, true, VALID_AGENT);
+    assert_eq!(
+        supervise(&db, &repo, &backend).unwrap()["outcome"],
+        "finished"
+    );
+    let tokens: Vec<String> = queue
+        .supervisors()
+        .unwrap()
+        .into_iter()
+        .map(|s| s.token)
+        .collect();
+    assert_eq!(tokens, ["killed", "hung", "owner"]);
+    assert_eq!(
+        runtime::doctor(&db).unwrap()["supervisors"]
+            .as_array()
+            .unwrap()
+            .len(),
+        3
+    );
 }
 
 /// A PID that certainly belonged to a process that has already exited.

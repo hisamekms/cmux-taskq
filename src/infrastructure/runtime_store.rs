@@ -5,7 +5,9 @@ use serde::Serialize;
 use serde_json::json;
 
 use super::sqlite::{SqliteQueue, claim_task, event, read_task, run_row};
-use crate::domain::{ClaimOutcome, RunLease, RunProcess, Task, TaskRun, validate_base_commit};
+use crate::domain::{
+    ClaimOutcome, RunLease, RunProcess, SupervisorRegistration, Task, TaskRun, validate_base_commit,
+};
 
 pub const HEARTBEAT_TIMEOUT_SECS: i64 = 30;
 
@@ -79,6 +81,72 @@ impl SqliteQueue {
             "UPDATE run_leases SET heartbeat_at=unixepoch() WHERE token=?1",
             [token],
         )?)
+    }
+
+    /// One heartbeat of a process identified by `token`: its registration
+    /// (if it is a resident supervisor) and every lease it holds, in one
+    /// transaction so `status` never sees them disagree. Returns the number
+    /// of leases refreshed.
+    pub fn heartbeat(&mut self, token: &str) -> Result<usize> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute(
+            "UPDATE supervisors SET heartbeat_at=unixepoch() WHERE token=?1",
+            [token],
+        )?;
+        let leases = tx.execute(
+            "UPDATE run_leases SET heartbeat_at=unixepoch() WHERE token=?1",
+            [token],
+        )?;
+        tx.commit()?;
+        Ok(leases)
+    }
+
+    /// Register a resident `supervise` process before it claims anything,
+    /// so `status` and `doctor` can list it while it holds no run.
+    pub fn register_supervisor(
+        &mut self,
+        token: &str,
+        pid: u32,
+        parallel: u32,
+    ) -> Result<SupervisorRegistration> {
+        ensure!(parallel >= 1, "parallel must be at least 1");
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute(
+            "INSERT INTO supervisors(token,pid,parallel) VALUES (?1,?2,?3)",
+            params![token, pid, parallel],
+        )
+        .context("supervisor token is already registered")?;
+        let result = tx.query_row(
+            "SELECT * FROM supervisors WHERE token=?1",
+            [token],
+            supervisor_row,
+        )?;
+        tx.commit()?;
+        Ok(result)
+    }
+
+    /// Remove the registration on a graceful exit. Leases are untouched; a
+    /// missing row (already removed, or never written) is not an error, so a
+    /// crashed supervisor's row is only ever removed by an operator.
+    pub fn deregister_supervisor(&self, token: &str) -> Result<bool> {
+        Ok(self
+            .conn
+            .execute("DELETE FROM supervisors WHERE token=?1", [token])?
+            == 1)
+    }
+
+    /// Every registered supervisor, oldest registration first, whether its
+    /// process is alive or not.
+    pub fn supervisors(&self) -> Result<Vec<SupervisorRegistration>> {
+        Ok(self
+            .conn
+            .prepare("SELECT * FROM supervisors ORDER BY started_at, rowid")?
+            .query_map([], supervisor_row)?
+            .collect::<rusqlite::Result<_>>()?)
     }
 
     /// Give up ownership of a run that came to rest (`awaiting_integration`
@@ -183,7 +251,7 @@ impl SqliteQueue {
     pub fn run_leases(&self) -> Result<Vec<RunLease>> {
         Ok(self
             .conn
-            .prepare("SELECT l.run_id,l.pid,l.heartbeat_at FROM run_leases l JOIN task_runs r ON r.id=l.run_id ORDER BY r.rowid")?
+            .prepare("SELECT l.run_id,l.token,l.pid,l.heartbeat_at FROM run_leases l JOIN task_runs r ON r.id=l.run_id ORDER BY r.rowid")?
             .query_map([], lease_row)?
             .collect::<rusqlite::Result<_>>()?)
     }
@@ -192,7 +260,7 @@ impl SqliteQueue {
         Ok(self
             .conn
             .query_row(
-                "SELECT run_id,pid,heartbeat_at FROM run_leases WHERE run_id=?1",
+                "SELECT run_id,token,pid,heartbeat_at FROM run_leases WHERE run_id=?1",
                 [id],
                 lease_row,
             )
@@ -775,8 +843,19 @@ fn assert_lease(conn: &Connection, id: &str, token: &str) -> Result<()> {
 fn lease_row(r: &Row<'_>) -> rusqlite::Result<RunLease> {
     Ok(RunLease {
         run_id: r.get(0)?,
-        pid: r.get(1)?,
-        heartbeat_at: r.get(2)?,
+        token: r.get(1)?,
+        pid: r.get(2)?,
+        heartbeat_at: r.get(3)?,
+    })
+}
+
+fn supervisor_row(r: &Row<'_>) -> rusqlite::Result<SupervisorRegistration> {
+    Ok(SupervisorRegistration {
+        token: r.get("token")?,
+        pid: r.get("pid")?,
+        parallel: r.get("parallel")?,
+        started_at: r.get("started_at")?,
+        heartbeat_at: r.get("heartbeat_at")?,
     })
 }
 

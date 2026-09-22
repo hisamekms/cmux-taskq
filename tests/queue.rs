@@ -387,7 +387,7 @@ fn initialization_is_repeatable_and_preserves_existing_tasks() {
     queue.add(new_task("preserved")).unwrap();
     drop(queue);
     let queue = SqliteQueue::init(dir.path().join("queue.db")).unwrap();
-    assert_eq!(queue.schema_version().unwrap(), 6);
+    assert_eq!(queue.schema_version().unwrap(), 7);
     assert_eq!(queue.list().unwrap().len(), 1);
     assert!(SqliteQueue::open(dir.path().join("typo.db")).is_err());
     assert!(!dir.path().join("typo.db").exists());
@@ -530,7 +530,7 @@ fn migration_to_v5_rebuilds_runs_moves_the_lease_and_keeps_foreign_keys() {
     .unwrap();
     drop(raw);
     let mut queue = SqliteQueue::open(&path).unwrap();
-    assert_eq!(queue.schema_version().unwrap(), 6);
+    assert_eq!(queue.schema_version().unwrap(), 7);
     // The queue-wide lease became the orphaned run's lease; the slot index is gone.
     let leases = queue.run_leases().unwrap();
     assert_eq!(leases.len(), 1);
@@ -622,7 +622,7 @@ fn migration_to_v6_adds_the_integration_statuses_and_the_single_slot() {
     .unwrap();
     drop(raw);
     let mut queue = SqliteQueue::open(&path).unwrap();
-    assert_eq!(queue.schema_version().unwrap(), 6);
+    assert_eq!(queue.schema_version().unwrap(), 7);
     assert_eq!(
         queue.show(1).unwrap().runs[0].status,
         RunStatus::AwaitingIntegration
@@ -690,4 +690,78 @@ fn migration_to_v6_adds_the_integration_statuses_and_the_single_slot() {
     );
     assert!(queue.candidates().unwrap().is_empty());
     assert!(queue.transition(3, TaskAction::Cancel).is_err());
+}
+
+#[test]
+fn migration_to_v7_adds_the_supervisor_registry_and_keeps_leases() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("v6.db");
+    let raw = Connection::open(&path).unwrap();
+    for migration in [
+        include_str!("../migrations/0001_queue.sql"),
+        include_str!("../migrations/0002_supervisor.sql"),
+        include_str!("../migrations/0003_workspace_close.sql"),
+        include_str!("../migrations/0004_integration.sql"),
+        include_str!("../migrations/0005_run_leases.sql"),
+        include_str!("../migrations/0006_merge_queue.sql"),
+    ] {
+        raw.execute_batch(migration).unwrap();
+    }
+    raw.pragma_update(None, "application_id", 0x43545131)
+        .unwrap();
+    raw.pragma_update(None, "user_version", 6).unwrap();
+    raw.execute_batch(&format!(
+        "INSERT INTO tasks(title,description,acceptance,verification_commands,status)
+         VALUES ('running','','','[]','in_progress');
+         INSERT INTO task_runs(id,task_id,status,requested_provider,actual_provider,base_commit,supervisor_token)
+         VALUES ('run-running',1,'running','claude','claude','{BASE}','tok');
+         INSERT INTO run_leases(run_id,token,pid,heartbeat_at) VALUES ('run-running','tok',4242,1700000000);"
+    ))
+    .unwrap();
+    assert!(raw.execute("SELECT count(*) FROM supervisors", []).is_err());
+    drop(raw);
+    let mut queue = SqliteQueue::open(&path).unwrap();
+    assert_eq!(queue.schema_version().unwrap(), 7);
+    // A v6 supervisor that was running has no registration; its lease is intact.
+    assert!(queue.supervisors().unwrap().is_empty());
+    let leases = queue.run_leases().unwrap();
+    assert_eq!(leases.len(), 1);
+    assert_eq!(leases[0].run_id, "run-running");
+    assert_eq!(leases[0].token, "tok");
+    assert_eq!(leases[0].pid, 4242);
+    assert_eq!(leases[0].heartbeat_at, 1700000000);
+    assert_eq!(queue.show(1).unwrap().runs[0].status, RunStatus::Running);
+
+    // Registration: one row per token, a parallel limit of at least one,
+    // heartbeat refreshed with the leases, removed only by deregistration.
+    let before = queue.heartbeat("tok").unwrap();
+    assert_eq!(before, 1);
+    let registered = queue.register_supervisor("sv", 4243, 2).unwrap();
+    assert_eq!(registered.token, "sv");
+    assert_eq!(registered.pid, 4243);
+    assert_eq!(registered.parallel, 2);
+    assert!(registered.started_at > 1700000000);
+    assert_eq!(registered.heartbeat_at, registered.started_at);
+    assert!(queue.register_supervisor("sv", 4243, 2).is_err());
+    assert!(queue.register_supervisor("zero", 4244, 0).is_err());
+    let raw = Connection::open(&path).unwrap();
+    raw.execute("UPDATE supervisors SET heartbeat_at=0 WHERE token='sv'", [])
+        .unwrap();
+    assert!(
+        raw.execute(
+            "INSERT INTO supervisors(token,pid,parallel) VALUES ('bad',1,0)",
+            []
+        )
+        .is_err()
+    );
+    drop(raw);
+    assert_eq!(queue.heartbeat("sv").unwrap(), 0); // No lease, still refreshed.
+    let listed = queue.supervisors().unwrap();
+    assert_eq!(listed.len(), 1);
+    assert!(listed[0].heartbeat_at >= registered.started_at);
+    assert_eq!(queue.heartbeat("nobody").unwrap(), 0);
+    assert!(queue.deregister_supervisor("sv").unwrap());
+    assert!(!queue.deregister_supervisor("sv").unwrap());
+    assert!(queue.supervisors().unwrap().is_empty());
+    assert_eq!(queue.run_leases().unwrap().len(), 1);
 }

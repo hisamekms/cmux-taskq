@@ -24,6 +24,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../../migrations/0004_integration.sql"),
     include_str!("../../migrations/0005_run_leases.sql"),
     include_str!("../../migrations/0006_merge_queue.sql"),
+    include_str!("../../migrations/0007_supervisors.sql"),
 ];
 const READY_QUERY: &str = "
     SELECT t.* FROM tasks t

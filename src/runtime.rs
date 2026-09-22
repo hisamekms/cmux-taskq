@@ -6,7 +6,7 @@ use crate::{
     application::{AgentProvider, TaskQueue, WorkspaceBackend},
     domain::{
         ClaimOutcome, IntegrationOutcome, Predecessor, Receipt, ReceiptResult, RunLease,
-        RunProcess, RunStatus, Task, TaskRun,
+        RunProcess, RunStatus, SupervisorRegistration, Task, TaskRun,
     },
     infrastructure::{
         adapters::{
@@ -21,7 +21,6 @@ use anyhow::{Context, Result, anyhow, bail, ensure};
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::{
-    collections::BTreeMap,
     fs,
     io::IsTerminal,
     path::{Path, PathBuf},
@@ -64,7 +63,8 @@ impl SuperviseOptions {
     }
 }
 
-/// One supervisor process heartbeats every lease it holds with a single token.
+/// One process heartbeats its registration (a resident supervisor) and every
+/// lease it holds with a single token.
 struct Heartbeat {
     stop: mpsc::Sender<()>,
     worker: Option<thread::JoinHandle<()>>,
@@ -78,9 +78,9 @@ impl Heartbeat {
         let flag = failed.clone();
         let worker = thread::spawn(move || {
             let result = (|| -> Result<()> {
-                let queue = SqliteQueue::open(db)?;
+                let mut queue = SqliteQueue::open(db)?;
                 loop {
-                    queue.heartbeat_leases(&token)?;
+                    queue.heartbeat(&token)?;
                     match recv.recv_timeout(Duration::from_secs(2)) {
                         Err(mpsc::RecvTimeoutError::Timeout) => (),
                         _ => break,
@@ -156,6 +156,11 @@ pub fn supervise(
     let mut queue = SqliteQueue::open(&db)?;
     queue.bind_repository(&path_text(&repository.common_dir)?)?;
     let token = Uuid::new_v4().to_string();
+    // Registered before the first heartbeat so the loop is visible to
+    // `status` from its first second, runs or not.
+    let parallel =
+        u32::try_from(options.parallel).context("parallel does not fit a registration")?;
+    queue.register_supervisor(&token, std::process::id(), parallel)?;
     let heartbeat = Heartbeat::start(db.clone(), token.clone());
     let mut supervisor = Supervisor {
         queue,
@@ -215,11 +220,26 @@ enum Step {
 }
 
 impl Supervisor<'_> {
+    /// Drive the loop, then remove this process's registration: it is about
+    /// to exit, whether it drained its runs, ran out of work, or failed on
+    /// a claim or provisioning. Only a heartbeat failure keeps the row (the
+    /// database may be unreachable), and it goes stale with the leases.
     fn run_loop(&mut self, options: &SuperviseOptions) -> Result<Value> {
+        let result = self.drive(options);
+        if self.heartbeat.check().is_ok()
+            && let Err(error) = self.queue.deregister_supervisor(&self.token)
+        {
+            eprintln!("supervisor registration could not be removed: {error:#}");
+        }
+        result
+    }
+
+    fn drive(&mut self, options: &SuperviseOptions) -> Result<Value> {
         loop {
             if let Err(error) = self.heartbeat.check() {
                 // Supervisor-level failure: note it on every run and keep the
-                // leases; they go stale once this process is gone.
+                // leases and the registration; they go stale once this
+                // process is gone.
                 for slot in &self.slots {
                     let _ = self
                         .queue
@@ -1249,15 +1269,24 @@ pub struct LeaseHealth {
     pub stale: bool,
 }
 
-/// A supervisor process as seen through the leases it holds; every lease of
-/// one process carries the same heartbeat.
+/// A process that owns runs, as `status` and `doctor` report it: a resident
+/// `supervise` through its registration (`registered`, with `parallel` and
+/// `started_at`), or an `integrate` process through the lease it holds
+/// (`registered: false`). `run_ids` are the leases carrying its token, and
+/// they share its heartbeat. `stale` is a registration or lease that no
+/// working process stands behind: a dead pid or a heartbeat older than
+/// `HEARTBEAT_TIMEOUT_SECS`. Nothing here is deleted automatically.
 #[derive(Debug, Clone, Serialize)]
 pub struct SupervisorHealth {
     pub pid: u32,
     pub alive: bool,
-    pub run_ids: Vec<String>,
+    pub registered: bool,
+    pub parallel: Option<u32>,
+    pub started_at: Option<i64>,
+    pub heartbeat_at: i64,
     pub heartbeat_age_secs: i64,
     pub stale: bool,
+    pub run_ids: Vec<String>,
 }
 
 /// Health of one registered wrapper/agent process. `alive` is only checked
@@ -1302,11 +1331,12 @@ pub struct DoctorReport {
     pub runs: Vec<RunHealth>,
 }
 
-/// Live supervisors and the unfinished runs with their leases, without
-/// inspecting the runs' processes.
+/// Registered supervisors, lease holders and the unfinished runs with their
+/// leases, without inspecting the runs' processes.
 pub fn status(db: &Path) -> Result<Value> {
     let queue = SqliteQueue::open(db)?;
     let now = unix_time();
+    let registrations = queue.supervisors()?;
     let leases = queue.run_leases()?;
     let runs = queue
         .active_runs()?
@@ -1327,15 +1357,17 @@ pub fn status(db: &Path) -> Result<Value> {
         .collect::<Vec<_>>();
     Ok(json!({
         "checked_at": now,
-        "supervisors": supervisors(&leases, now),
+        "supervisors": supervisors(&registrations, &leases, now),
         "runs": runs,
     }))
 }
 
-/// Inspect every unfinished run, its lease, processes and paths. Reads only.
+/// Inspect every registered supervisor and every unfinished run with its
+/// lease, processes and paths. Reads only.
 pub fn doctor(db: &Path) -> Result<Value> {
     let queue = SqliteQueue::open(db)?;
     let now = unix_time();
+    let registrations = queue.supervisors()?;
     let leases = queue.run_leases()?;
     let runs = queue
         .active_runs()?
@@ -1351,7 +1383,7 @@ pub fn doctor(db: &Path) -> Result<Value> {
         .collect::<Result<Vec<_>>>()?;
     Ok(serde_json::to_value(DoctorReport {
         checked_at: now,
-        supervisors: supervisors(&leases, now),
+        supervisors: supervisors(&registrations, &leases, now),
         runs,
     })?)
 }
@@ -1401,22 +1433,57 @@ fn lease_health(lease: &RunLease, now: i64) -> LeaseHealth {
     }
 }
 
-fn supervisors(leases: &[RunLease], now: i64) -> Vec<SupervisorHealth> {
-    let mut by_pid: BTreeMap<u32, SupervisorHealth> = BTreeMap::new();
-    for lease in leases {
-        let age = now - lease.heartbeat_at;
-        let entry = by_pid.entry(lease.pid).or_insert_with(|| SupervisorHealth {
-            pid: lease.pid,
-            alive: process_alive(lease.pid),
-            run_ids: Vec::new(),
+/// Registered supervisors in registration order, then any other lease
+/// holder (an `integrate` process) in lease order; leases join by token.
+fn supervisors(
+    registrations: &[SupervisorRegistration],
+    leases: &[RunLease],
+    now: i64,
+) -> Vec<SupervisorHealth> {
+    let health = |pid: u32, heartbeat_at: i64, registration: Option<&SupervisorRegistration>| {
+        let alive = process_alive(pid);
+        let age = now - heartbeat_at;
+        SupervisorHealth {
+            pid,
+            alive,
+            registered: registration.is_some(),
+            parallel: registration.map(|r| r.parallel),
+            started_at: registration.map(|r| r.started_at),
+            heartbeat_at,
             heartbeat_age_secs: age,
-            stale: age > HEARTBEAT_TIMEOUT_SECS,
-        });
+            stale: !alive || age > HEARTBEAT_TIMEOUT_SECS,
+            run_ids: Vec::new(),
+        }
+    };
+    let mut entries: Vec<(&str, SupervisorHealth)> = registrations
+        .iter()
+        .map(|r| (r.token.as_str(), health(r.pid, r.heartbeat_at, Some(r))))
+        .collect();
+    for lease in leases {
+        let index = match entries.iter().position(|(token, _)| *token == lease.token) {
+            Some(index) => index,
+            None => {
+                entries.push((
+                    lease.token.as_str(),
+                    health(lease.pid, lease.heartbeat_at, None),
+                ));
+                entries.len() - 1
+            }
+        };
+        let entry = &mut entries[index].1;
         entry.run_ids.push(lease.run_id.clone());
-        entry.heartbeat_age_secs = entry.heartbeat_age_secs.min(age);
-        entry.stale = entry.heartbeat_age_secs > HEARTBEAT_TIMEOUT_SECS;
+        if !entry.registered {
+            // Every lease of one process carries the same heartbeat; the
+            // freshest one stands for the process.
+            let age = now - lease.heartbeat_at;
+            if age < entry.heartbeat_age_secs {
+                entry.heartbeat_at = lease.heartbeat_at;
+                entry.heartbeat_age_secs = age;
+                entry.stale = !entry.alive || age > HEARTBEAT_TIMEOUT_SECS;
+            }
+        }
     }
-    by_pid.into_values().collect()
+    entries.into_iter().map(|(_, health)| health).collect()
 }
 
 fn run_health(

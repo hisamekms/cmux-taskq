@@ -60,8 +60,8 @@ The task is registered as `draft` and the JSON includes its `id`. Then make it r
 | `"$TASKQ" show ID` | `task`, `dependencies`, `runs`, `events`, `processes` |
 | `"$TASKQ" candidates` | What the next `supervise` would pick |
 | `"$TASKQ" locate` | The queue this directory resolves to (`db`, `runs_dir`, `git_common_dir`, `db_exists`) without opening it |
-| `"$TASKQ" status` | Live supervisors and `integrate` processes (`supervisors`, empty when none owns a run) and unfinished runs with their leases |
-| `"$TASKQ" doctor` | Per run: lease liveness, processes, worktree/receipt existence, `blockers`, `recoverable` |
+| `"$TASKQ" status` | `supervisors`: every registered `supervise` process (`pid`, `alive`, `parallel`, `heartbeat_age_secs`, `stale`, `run_ids`; listed even while it holds no run) plus any `integrate` process holding a lease (`registered: false`); `runs`: unfinished runs with their leases |
+| `"$TASKQ" doctor` | The same `supervisors`; per run: lease liveness, processes, worktree/receipt existence, `blockers`, `recoverable` |
 
 Task `status`: `draft` → `ready` → `in_progress` → `completed`, or `canceled`. A task stays `in_progress` while any run is unfinished or awaiting integration.
 

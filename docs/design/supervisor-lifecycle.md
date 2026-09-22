@@ -56,7 +56,7 @@ ready task (dependencies completed)
 1. DBのpathを正規化し、checkoutのroot、Git common directoryを取得する。DBはworktree外か、common directory配下に置く（ユーザーDIRのqueueは常に満たす）。worktreeの作成元は`repo_path`に記録したcheckout。
 2. cmux（`ping`）とClaude（`--version`）のpreflightを行う。
 3. queueをrepositoryに束縛する（`bind_repository`）。別repositoryに束縛済みなら開始しない。queue全体の排他はなく、同じqueueに別のsupervisorがいても構わない。
-4. supervisorプロセスのtoken（UUID）を作り、別スレッドで2秒ごとにそのtokenの全leaseのheartbeatを更新する（`UPDATE run_leases ... WHERE token=?`）。heartbeatの失敗はループで検知し、全runに`runtime_error`を記録してleaseを残したまま終了する（プロセス終了後にstaleになる）。
+4. supervisorプロセスのtoken（UUID）を作り、`supervisors`表に自分を登録する（`register_supervisor`: token、PID、`--parallel`、`started_at`）。runを1つも持たない常駐supervisorも、この登録で`status`/`doctor`に並ぶ。続けて別スレッドで2秒ごとにそのtokenの登録と全leaseのheartbeatを1トランザクションで更新する（`heartbeat(token)`）。heartbeatの失敗はループで検知し、全runに`runtime_error`を記録してleaseと登録を残したまま終了する（プロセス終了後にstaleになる）。
 
 ループ（1秒ごと）:
 
@@ -67,9 +67,9 @@ ready task (dependencies completed)
 9. `validating`のrunはreceipt検証（下記）をrunごとのthread（専用SQLite接続）で行い、ループは完了を待ちながら他のrunを監視し続ける。完了したら`validation_finished`でrunを`awaiting_integration`または`failed`にする。
 10. `awaiting_integration`になったrunだけ`cmux workspace close <workspace_id>`でworkspaceを閉じ、`OK workspace:N`の応答を確認して`workspace_closed`（`task_runs.workspace_closed_at`）を記録する。worktreeとbranchは統合まで残す。closeが失敗したら`cleanup_failed`イベントと`last_error`に記録し、runは`awaiting_integration`、`workspace_closed_at`はnullのままにする。
 11. `awaiting_integration`または`failed`になったrunのleaseを解放する（`lease_released`）。
-12. active runがなく、`--once`か停止要求（下記）か、provisioning失敗でclaimを止めていればループを抜ける。それ以外はactive runがない間2秒ごとに`candidates`を見る。
+12. active runがなく、`--once`か停止要求（下記）か、provisioning失敗でclaimを止めていればループを抜ける。それ以外はactive runがない間2秒ごとに`candidates`を見る。ループを抜けたら（claimやGitのエラーで抜ける場合も含む）自分の登録を消す（`deregister_supervisor`）。heartbeat失敗で終わるときだけは消さない。
 
-結果は`{"outcome": "finished" | "stopped", "runs": [休止したrun], "errors": [{run_id, task_id, message}]}`。SIGINT/SIGTERMは1回目でclaimを止めてactive runの終了を待ち（graceful drain）、2回目で既定の動作（即終了）になる。即終了したsupervisorのleaseは30秒でstaleになる。
+結果は`{"outcome": "finished" | "stopped", "runs": [休止したrun], "errors": [{run_id, task_id, message}]}`。SIGINT/SIGTERMは1回目でclaimを止めてactive runの終了を待ち（graceful drain）、2回目で既定の動作（即終了）になる。即終了した（killされた）supervisorのleaseは30秒でstaleになり、登録はPIDが死んだ時点から`stale`として`status`/`doctor`に残る。登録はruntimeが自動で消さず、operatorが確認して扱う。
 
 ### Prompt
 
@@ -167,13 +167,13 @@ supervisorの再起動ではrunごとのleaseとheartbeatを確認し、孤児�
 
 ### `status`
 
-`cmux-taskq status`はprocessを調べずにleaseだけを返す。`supervisors`はleaseのPIDごとに`pid`、`alive`、`run_ids`、`heartbeat_age_secs`、`stale`（着地中の`integrate`プロセスも1つとして並ぶ）。`runs`は未完了run（`claimed`/`starting`/`running`/`validating`/`integrating`）ごとに`run_id`、`task_id`、`status`、`workspace_id`、`lease`（なければnull）。`awaiting_integration`と`needs_session`はプロセスを持たないので並ばない。
+`cmux-taskq status`はrunのprocessを調べずに登録とleaseだけを返す。`supervisors`は`supervisors`表の登録を`started_at`順に、続けて登録のないtokenのlease保持者（着地中の`integrate`プロセス、または登録表以前のsupervisor）をlease順に並べ、leaseはtokenで登録に結び付ける。各項目は`pid`、`alive`（`kill -0`）、`registered`、`parallel`と`started_at`（登録がなければnull）、`heartbeat_at`、`heartbeat_age_secs`、`stale`（PIDが死んでいるかheartbeatが30秒より古い）、`run_ids`（そのtokenのlease）。runを持たない常駐supervisorは`run_ids: []`で並ぶ。`runs`は未完了run（`claimed`/`starting`/`running`/`validating`/`integrating`）ごとに`run_id`、`task_id`、`status`、`workspace_id`、`lease`（なければnull。`pid`でどのsupervisorが持つかが分かる）。`awaiting_integration`と`needs_session`はプロセスを持たないので並ばない。
 
 ### `doctor`
 
 `cmux-taskq doctor`は状態を変えずにJSONで報告する。
 
-- `supervisors`: `status`と同じ。
+- `supervisors`: `status`と同じ。staleな登録は報告するだけで、`doctor`も`recover`も`integrate`も消さない。
 - `runs`: `claimed`/`starting`/`running`/`validating`/`integrating`のrunごとに、`workspace_id`、worktreeとrun directoryとreceiptの存在、`last_error`、そのrunの`lease`（PID、`kill -0`による生存、heartbeatの経過秒数、30秒を超えた`stale`。なければnull）、登録済みwrapper/agentプロセスのPID・生存・heartbeat経過秒数・終了コード。`exited_at`が記録済みのプロセスはPIDが再利用されうるため生存確認せず`alive: null`にする。
 - `blockers`: そのrunの`recover`を拒む理由の一覧。そのrunのprocessとleaseだけを見る。空なら`recoverable: true`。
 

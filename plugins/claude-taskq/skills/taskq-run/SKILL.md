@@ -14,7 +14,7 @@ Prerequisite: resolve the launcher as in the `taskq` skill (`TASKQ="${CLAUDE_PLU
 "$TASKQ" status
 ```
 
-`candidates` must list the task; otherwise make it `ready` or complete its dependencies first. `status` shows the live supervisors (`supervisors`, one entry per process with its `pid`, `alive`, `run_ids`, `stale`) and the unfinished runs with their leases. If a supervisor is already running and alive, do not start another one: it picks the task up on its next poll (within a few seconds). A supervisor listed with `stale: true` and `alive: false` died; its runs are handled with the `taskq-recover` skill, and a new supervisor may be started meanwhile because leases are per run.
+`candidates` must list the task; otherwise make it `ready` or complete its dependencies first. `status` shows the supervisors (`supervisors`, one entry per registered `supervise` process with its `pid`, `alive`, `parallel`, `heartbeat_age_secs`, `stale`, `run_ids`; a resident supervisor is listed even when `run_ids` is empty, and an `integrate` process appears with `registered: false` while it lands a run) and the unfinished runs with their leases. If a supervisor is listed with `registered: true`, `alive: true` and `stale: false`, do not start another one: it picks the task up on its next poll (within a few seconds). A supervisor listed with `stale: true` died or hangs (`alive: false`, or `heartbeat_age_secs` over 30); its row stays until the user deals with it, its runs are handled with the `taskq-recover` skill, and a new supervisor may be started meanwhile because leases are per run.
 
 ## 2. Start the supervisor in its own cmux workspace
 
