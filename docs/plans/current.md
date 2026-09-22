@@ -146,6 +146,7 @@ receiptにはrun ID、結果、commit SHA、実施したunit test/E2E/subagent r
 ## After first dogfooding
 
 - 利用で見つかった詰まりを修正し、継続的な実行と復旧を安定させる。
+- 複数のtaskが解く上位の課題を`Goal`として表現し、依存元のreceipt summary・result commit、同時実行中の兄弟、goalの記述と制約をworkerのpromptに流す（[ADR-0009](../adr/0009-goal-groups-tasks.md)、proposed）。段階1（依存元の情報をpromptへ）、goalエンティティ、prompt拡張、plugin skillの4 taskとして014の後に登録し、この4件を最初のgoalの実例にする。
 - SVの操作をruntimeへ移す。`ask` / `answer`によるセッションからSVへの相談経路、承認なしの自動着地、`needs_session`のrunをruntimeがresumeして定型の解消依頼を送る仕組み。
 - Codex provider、明示選択、Claude起動不能時のfallbackを追加する。
 - バイナリリリース、checksum、pluginとのバージョン互換性、Codex pluginを整備する。
