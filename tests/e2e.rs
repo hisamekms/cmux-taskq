@@ -157,6 +157,19 @@ fn workspace_listed(cmux: &Path, id: &str) -> bool {
         .any(|w| w["id"].as_str().is_some_and(|w| w.eq_ignore_ascii_case(id)))
 }
 
+/// cmux confirms a `workspace close` before the workspace leaves its
+/// listing, so "gone" is waited for rather than asserted on the first look.
+fn wait_until_not_listed(cmux: &Path, id: &str) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while workspace_listed(cmux, id) {
+        assert!(
+            Instant::now() < deadline,
+            "workspace {id} is still listed 30s after it was closed"
+        );
+        thread::sleep(Duration::from_millis(200));
+    }
+}
+
 /// Closes the workspaces the supervisor created if they are still open when
 /// the test ends, on success and on panic alike. On the happy path the
 /// supervisor has already closed them; cmux 0.64 also closes a workspace by
@@ -1128,4 +1141,141 @@ fn up_starts_a_launchd_supervisor_that_status_lists_and_down_wait_stops_it() {
     assert!(workspace_listed(cmux, &maintainer));
     let again = taskq_with(env, &[("HOME", home.as_path())], &["down"]);
     assert_eq!(again["outcome"], "not_running", "{again}");
+}
+
+/// `up --in-cmux` needs no socket password: the supervisor runs inside a
+/// cmux workspace of its own, so it is a child of a cmux terminal like any
+/// other client. Nothing about launchd is touched, `status` reports the
+/// mode, and `down --wait` interrupts the supervisor and closes the
+/// workspace once it has drained.
+#[test]
+#[ignore = "needs a running cmux; run with --ignored"]
+fn up_in_cmux_starts_a_supervisor_in_a_workspace_that_down_wait_stops_and_closes() {
+    let fixture = fixture();
+    let Fixture {
+        cmux,
+        repo,
+        stub,
+        env,
+        ..
+    } = &fixture;
+    // A disposable HOME, so a stray plist could only land there; none should.
+    let home = fixture._dir.path().join("home");
+    fs::create_dir(&home).unwrap();
+    let located = taskq_with(env, &[("HOME", home.as_path())], &["locate"]);
+    let plist = PathBuf::from(located["launch_agent"].as_str().unwrap());
+    let label = located["label"].as_str().unwrap().to_owned();
+    let log_dir = PathBuf::from(located["log_dir"].as_str().unwrap());
+    let mut workspaces = WorkspaceGuard {
+        cmux: cmux.clone(),
+        ids: Vec::new(),
+    };
+
+    let up_args = [
+        "up",
+        "--in-cmux",
+        "--parallel",
+        "2",
+        "--cmux",
+        cmux.to_str().unwrap(),
+        "--claude",
+        stub.to_str().unwrap(),
+    ];
+    let started = Instant::now();
+    let first = taskq_with(env, &[("HOME", home.as_path())], &up_args);
+    eprintln!("up --in-cmux took {:?}: {first}", started.elapsed());
+    assert_eq!(first["supervisor"]["outcome"], "started", "{first}");
+    assert_eq!(first["supervisor"]["mode"], "in_cmux");
+    assert_eq!(first["supervisor"]["plist"], Value::Null);
+    let repo_name = repo.file_name().unwrap().to_str().unwrap();
+    assert_eq!(
+        first["supervisor"]["name"],
+        format!("taskq {repo_name} supervisor")
+    );
+    let supervisor_workspace = first["supervisor"]["workspace_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    uuid::Uuid::parse_str(&supervisor_workspace).expect("workspace id is a UUID");
+    workspaces.ids.push(supervisor_workspace.clone());
+    assert!(workspace_listed(cmux, &supervisor_workspace));
+    let pid = u32::try_from(first["supervisor"]["pid"].as_u64().unwrap()).unwrap();
+    assert!(pid_alive(pid));
+    let maintainer = first["maintainer"]["workspace_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    workspaces.ids.push(maintainer.clone());
+    assert_eq!(first["maintainer"]["outcome"], "created", "{first}");
+
+    // launchd knows nothing about this queue, and no plist was written.
+    assert!(!plist.exists(), "{} exists", plist.display());
+    assert!(
+        !Command::new("launchctl")
+            .args(["print", &format!("gui/{}/{label}", uid())])
+            .output()
+            .unwrap()
+            .status
+            .success(),
+        "launchd has an agent for {label}"
+    );
+    // The supervisor in the workspace writes to the queue's log directory,
+    // exactly as the launchd-run one does: `--log-dir` is on its command.
+    let logs: Vec<PathBuf> = fs::read_dir(&log_dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| {
+            path.file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .ends_with(&format!("-{pid}.log"))
+        })
+        .collect();
+    assert_eq!(logs.len(), 1, "{logs:?} in {}", log_dir.display());
+    assert!(
+        fs::read_to_string(&logs[0])
+            .unwrap()
+            .contains(&format!("started: pid {pid}, parallel 2"))
+    );
+
+    let status = taskq(env, &["status"]);
+    let supervisors = status["supervisors"].as_array().unwrap();
+    assert_eq!(supervisors.len(), 1, "{status}");
+    assert_eq!(supervisors[0]["pid"], pid);
+    assert_eq!(supervisors[0]["mode"], "in_cmux");
+    assert_eq!(
+        supervisors[0]["workspace_id"],
+        supervisor_workspace.as_str()
+    );
+    assert_eq!(supervisors[0]["stale"], false);
+    let doctor = taskq(env, &["doctor"]);
+    assert_eq!(doctor["supervisors"][0]["mode"], "in_cmux", "{doctor}");
+
+    // Idempotent: the live supervisor is reused with its mode and workspace.
+    let second = taskq_with(env, &[("HOME", home.as_path())], &up_args);
+    assert_eq!(second["supervisor"]["outcome"], "reused", "{second}");
+    assert_eq!(second["supervisor"]["mode"], "in_cmux");
+    assert_eq!(
+        second["supervisor"]["workspace_id"],
+        supervisor_workspace.as_str()
+    );
+    assert_eq!(second["maintainer"]["workspace_id"], maintainer.as_str());
+
+    let started = Instant::now();
+    let down = taskq_with(env, &[("HOME", home.as_path())], &["down", "--wait"]);
+    eprintln!("down --wait took {:?}: {down}", started.elapsed());
+    assert_eq!(down["outcome"], "stopped", "{down}");
+    assert_eq!(down["pid"], pid);
+    assert_eq!(down["launch_agent_unloaded"], false);
+    assert_eq!(
+        down["supervisor_workspaces"],
+        serde_json::json!([{"workspace_id": supervisor_workspace, "outcome": "closed"}]),
+        "{down}"
+    );
+    assert!(!pid_alive(pid), "supervisor {pid} is still alive");
+    wait_until_not_listed(cmux, &supervisor_workspace);
+    assert_eq!(taskq(env, &["status"])["supervisors"], Value::Array(vec![]));
+    // The maintainer workspace is left open by `down`; the guard closes it.
+    assert!(workspace_listed(cmux, &maintainer));
 }

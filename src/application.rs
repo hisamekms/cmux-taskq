@@ -121,6 +121,10 @@ pub trait ProcessControl {
     fn alive(&self, pid: u32) -> bool;
     /// Ask the process to drain (SIGTERM); used when no agent is loaded for it.
     fn terminate(&self, pid: u32) -> Result<()>;
+    /// Ask the process to drain the way Ctrl-C in its terminal would
+    /// (SIGINT); used for the supervisor of an in-cmux workspace, which no
+    /// service manager can signal for us.
+    fn interrupt(&self, pid: u32) -> Result<()>;
     /// End the process immediately (SIGKILL).
     fn kill(&self, pid: u32) -> Result<()>;
 }

@@ -3,8 +3,8 @@ use std::sync::{Arc, Barrier};
 use cmux_taskq::{
     application::TaskQueue,
     domain::{
-        ClaimOutcome, GoalEdit, GoalVerdict, NewGoal, NewTask, Provider, RunStatus, TaskAction,
-        TaskStatus,
+        ClaimOutcome, GoalEdit, GoalVerdict, NewGoal, NewTask, Provider, RunStatus, SupervisorMode,
+        TaskAction, TaskStatus,
     },
     infrastructure::sqlite::SqliteQueue,
 };
@@ -775,6 +775,35 @@ fn migration_to_v7_adds_the_supervisor_registry_and_keeps_leases() {
     assert_eq!(listed.len(), 1);
     assert!(listed[0].heartbeat_at >= registered.started_at);
     assert_eq!(queue.heartbeat("nobody").unwrap(), 0);
+
+    // The mode is `up`'s to record once the process has registered; a
+    // supervisor started by hand keeps none, and only the two modes fit.
+    assert_eq!(listed[0].mode, None);
+    assert_eq!(listed[0].workspace_id, None);
+    queue
+        .set_supervisor_mode("sv", SupervisorMode::InCmux, Some("ws-1"))
+        .unwrap();
+    let listed = queue.supervisors().unwrap();
+    assert_eq!(listed[0].mode, Some(SupervisorMode::InCmux));
+    assert_eq!(listed[0].workspace_id.as_deref(), Some("ws-1"));
+    queue
+        .set_supervisor_mode("sv", SupervisorMode::Launchd, None)
+        .unwrap();
+    let listed = queue.supervisors().unwrap();
+    assert_eq!(listed[0].mode, Some(SupervisorMode::Launchd));
+    assert_eq!(listed[0].workspace_id, None);
+    assert!(
+        queue
+            .set_supervisor_mode("nobody", SupervisorMode::Launchd, None)
+            .is_err()
+    );
+    let raw = Connection::open(&path).unwrap();
+    assert!(
+        raw.execute("UPDATE supervisors SET mode='by-hand' WHERE token='sv'", [])
+            .is_err()
+    );
+    drop(raw);
+
     assert!(queue.deregister_supervisor("sv").unwrap());
     assert!(!queue.deregister_supervisor("sv").unwrap());
     assert!(queue.supervisors().unwrap().is_empty());
@@ -814,9 +843,10 @@ fn migration_from_v6_adds_goals_and_keeps_tasks_runs_and_events() {
     .unwrap();
     drop(raw);
     let mut queue = SqliteQueue::open(&path).unwrap();
-    // 0007 (supervisors) and 0008 (goals) are applied together.
-    assert_eq!(SqliteQueue::SCHEMA_VERSION, 8);
-    assert_eq!(queue.schema_version().unwrap(), 8);
+    // 0007 (supervisors), 0008 (goals) and 0009 (supervisor mode) are
+    // applied together.
+    assert_eq!(SqliteQueue::SCHEMA_VERSION, 9);
+    assert_eq!(queue.schema_version().unwrap(), 9);
     let landed = queue.show(1).unwrap();
     assert_eq!(landed.task.title, "landed");
     assert_eq!(landed.task.description, "why");

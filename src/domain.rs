@@ -50,6 +50,15 @@ string_enum!(RunStatus {
 
 string_enum!(Provider { Claude => "claude" });
 
+// How `up` started a supervisor (ADR-0011). `Launchd` is the resident
+// LaunchAgent; `InCmux` is the fallback that runs `supervise` inside the cmux
+// workspace `taskq <repo> supervisor`, which nothing restarts. A registration
+// without a mode was started by hand.
+string_enum!(SupervisorMode {
+    Launchd => "launchd",
+    InCmux => "in_cmux",
+});
+
 // How a goal was closed. A goal has no state machine: it is open until one
 // close records the verdict, and its progress derives from its tasks.
 string_enum!(GoalVerdict {
@@ -393,7 +402,8 @@ pub struct RunLease {
 /// A resident `supervise` process as it registered itself, whether or not it
 /// holds any lease. The row is heartbeated with the leases and deleted on a
 /// graceful exit; a row left by a killed supervisor stays until `up` prunes
-/// it or the maintainer deals with it.
+/// it or the maintainer deals with it. `mode` and `workspace_id` describe
+/// how the process was started, so they share the row's lifetime.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SupervisorRegistration {
     pub token: String,
@@ -401,6 +411,12 @@ pub struct SupervisorRegistration {
     pub parallel: u32,
     pub started_at: i64,
     pub heartbeat_at: i64,
+    /// Written by the `up` that started this process, once it registered;
+    /// `None` for a supervisor started by hand.
+    pub mode: Option<SupervisorMode>,
+    /// The cmux workspace `supervise` runs in, in [`SupervisorMode::InCmux`]
+    /// only; `down` closes it when the supervisor is gone.
+    pub workspace_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

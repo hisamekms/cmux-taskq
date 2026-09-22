@@ -138,6 +138,10 @@ impl ProcessControl for SystemProcesses {
         signal(pid, libc::SIGTERM)
     }
 
+    fn interrupt(&self, pid: u32) -> Result<()> {
+        signal(pid, libc::SIGINT)
+    }
+
     fn kill(&self, pid: u32) -> Result<()> {
         signal(pid, libc::SIGKILL)
     }
@@ -794,6 +798,13 @@ pub fn maintainer_workspace_name(repo_root: &Path) -> String {
     format!("taskq {} maintainer", repository_name(repo_root))
 }
 
+/// `taskq <repo> supervisor`: the workspace `up --in-cmux` runs `supervise`
+/// in when launchd cannot reach cmux (ADR-0011). The launchd mode has no
+/// workspace at all.
+pub fn supervisor_workspace_name(repo_root: &Path) -> String {
+    format!("taskq {} supervisor", repository_name(repo_root))
+}
+
 fn repository_name(root: &Path) -> String {
     root.file_name()
         .map(|name| name.to_string_lossy().into_owned())
@@ -926,6 +937,10 @@ mod tests {
         assert_eq!(
             maintainer_workspace_name(Path::new("/")),
             "taskq / maintainer"
+        );
+        assert_eq!(
+            supervisor_workspace_name(Path::new("/home/u/ghq/cmux-taskq")),
+            "taskq cmux-taskq supervisor"
         );
     }
 

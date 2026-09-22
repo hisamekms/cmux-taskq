@@ -6,10 +6,11 @@ use serde_json::json;
 
 use super::{
     adapters::process_alive,
-    sqlite::{SqliteQueue, claim_task, event, read_task, run_row},
+    sqlite::{SqliteQueue, claim_task, enum_col, event, read_task, run_row},
 };
 use crate::domain::{
-    ClaimOutcome, RunLease, RunProcess, SupervisorRegistration, Task, TaskRun, validate_base_commit,
+    ClaimOutcome, RunLease, RunProcess, SupervisorMode, SupervisorRegistration, Task, TaskRun,
+    validate_base_commit,
 };
 
 pub const HEARTBEAT_TIMEOUT_SECS: i64 = 30;
@@ -146,6 +147,26 @@ impl SqliteQueue {
         )?;
         tx.commit()?;
         Ok(result)
+    }
+
+    /// Record how `up` started this supervisor, once its process has
+    /// registered itself. Only `up` writes it, and only for a supervisor it
+    /// started; the row's own process never does, so a supervisor started
+    /// by hand keeps `mode` unset. The workspace belongs to `in_cmux` mode.
+    pub fn set_supervisor_mode(
+        &self,
+        token: &str,
+        mode: SupervisorMode,
+        workspace_id: Option<&str>,
+    ) -> Result<()> {
+        ensure!(
+            self.conn.execute(
+                "UPDATE supervisors SET mode=?2, workspace_id=?3 WHERE token=?1",
+                params![token, mode.as_str(), workspace_id],
+            )? == 1,
+            "supervisor {token} is no longer registered"
+        );
+        Ok(())
     }
 
     /// Remove the registration on a graceful exit. Leases are untouched; a
@@ -1034,6 +1055,11 @@ fn supervisor_row(r: &Row<'_>) -> rusqlite::Result<SupervisorRegistration> {
         parallel: r.get("parallel")?,
         started_at: r.get("started_at")?,
         heartbeat_at: r.get("heartbeat_at")?,
+        mode: r
+            .get::<_, Option<String>>("mode")?
+            .map(|_| enum_col(r, "mode"))
+            .transpose()?,
+        workspace_id: r.get("workspace_id")?,
     })
 }
 

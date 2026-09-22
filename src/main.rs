@@ -120,6 +120,11 @@ enum Command {
         /// Maximum number of runs the supervisor executes at once.
         #[arg(long, default_value_t = 4, value_parser = clap::value_parser!(u16).range(1..))]
         parallel: u16,
+        /// Run the supervisor in the cmux workspace `taskq <repo> supervisor`
+        /// instead of under launchd: no socket password needed, and nothing
+        /// restarts it if it stops.
+        #[arg(long)]
+        in_cmux: bool,
         /// Claude Code plugin directory the maintainer session loads (`claude --plugin-dir`).
         #[arg(long)]
         plugin_dir: Option<PathBuf>,
@@ -133,7 +138,7 @@ enum Command {
         #[arg(long, default_value = "claude")]
         claude: PathBuf,
     },
-    /// Stop the queue's supervisor: unload its launchd agent so it drains and is not restarted. Leaves the maintainer workspace open.
+    /// Stop the queue's supervisor: unload its launchd agent so it drains and is not restarted, or signal and close the workspace of an in-cmux one. Leaves the maintainer workspace open.
     Down {
         /// Wait until the supervisor's registration is gone or its process exited.
         #[arg(long)]
@@ -141,6 +146,9 @@ enum Command {
         /// Kill the supervisor after the unload and drop its registration.
         #[arg(long, conflicts_with = "wait")]
         force: bool,
+        /// cmux executable, used to close an in-cmux supervisor's workspace.
+        #[arg(long, default_value = "cmux")]
+        cmux: PathBuf,
     },
     /// Land a validated run on main: rebase, re-validate, squash into one commit, complete the task.
     Integrate {
@@ -371,6 +379,7 @@ fn execute(cli: Cli) -> Result<Value> {
         }
         Command::Up {
             parallel,
+            in_cmux,
             plugin_dir,
             repo,
             cmux,
@@ -393,6 +402,7 @@ fn execute(cli: Cli) -> Result<Value> {
             };
             let options = UpOptions {
                 parallel,
+                in_cmux,
                 plugin_dir,
                 cmux: executable(&cmux)?,
                 claude: executable(&claude)?,
@@ -411,11 +421,20 @@ fn execute(cli: Cli) -> Result<Value> {
                 &options,
             )?
         }
-        Command::Down { wait, force } => {
-            use cmux_taskq::infrastructure::{adapters::SystemProcesses, launchd::Launchctl};
+        Command::Down { wait, force, cmux } => {
+            use cmux_taskq::infrastructure::{
+                adapters::{Cmux, SystemProcesses, executable},
+                launchd::Launchctl,
+            };
             use cmux_taskq::lifecycle::DownOptions;
+            // cmux is only needed to close an in-cmux supervisor's
+            // workspace, so a queue without one still goes down when cmux
+            // is not installed; the unresolved name then fails only there.
             cmux_taskq::lifecycle::down(
                 &location,
+                &Cmux {
+                    executable: executable(&cmux).unwrap_or(cmux),
+                },
                 &Launchctl { uid: current_uid() },
                 &SystemProcesses,
                 &DownOptions {

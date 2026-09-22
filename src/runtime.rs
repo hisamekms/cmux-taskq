@@ -8,7 +8,7 @@ use crate::{
     application::{AgentProvider, TaskQueue, WorkspaceBackend},
     domain::{
         ClaimOutcome, Goal, IntegrationOutcome, Predecessor, Receipt, ReceiptResult, RunLease,
-        RunProcess, RunStatus, SupervisorRegistration, Task, TaskRun,
+        RunProcess, RunStatus, SupervisorMode, SupervisorRegistration, Task, TaskRun,
     },
     infrastructure::{
         adapters::{
@@ -1607,12 +1607,17 @@ pub struct LeaseHealth {
 /// (`registered: false`). `run_ids` are the leases carrying its token, and
 /// they share its heartbeat. `stale` is a registration or lease that no
 /// working process stands behind: a dead pid or a heartbeat older than
-/// `HEARTBEAT_TIMEOUT_SECS`. Nothing here is deleted automatically.
+/// `HEARTBEAT_TIMEOUT_SECS`. `mode` is how `up` started it (`launchd`, or
+/// `in_cmux` with the `workspace_id` it runs in); a supervisor started by
+/// hand and an `integrate` process have none. Nothing here is deleted
+/// automatically.
 #[derive(Debug, Clone, Serialize)]
 pub struct SupervisorHealth {
     pub pid: u32,
     pub alive: bool,
     pub registered: bool,
+    pub mode: Option<SupervisorMode>,
+    pub workspace_id: Option<String>,
     pub parallel: Option<u32>,
     pub started_at: Option<i64>,
     pub heartbeat_at: i64,
@@ -1779,6 +1784,8 @@ fn supervisors(
             pid,
             alive,
             registered: registration.is_some(),
+            mode: registration.and_then(|r| r.mode),
+            workspace_id: registration.and_then(|r| r.workspace_id.clone()),
             parallel: registration.map(|r| r.parallel),
             started_at: registration.map(|r| r.started_at),
             heartbeat_at,

@@ -20,18 +20,19 @@ Three roles share one queue:
 ```sh
 "$TASKQ" up --plugin-dir "$CLAUDE_PLUGIN_ROOT"
 "$TASKQ" up --parallel 4 --plugin-dir "$CLAUDE_PLUGIN_ROOT"    # --parallel defaults to 4
+"$TASKQ" up --in-cmux --plugin-dir "$CLAUDE_PLUGIN_ROOT"       # no launchd; see the preflight failure below
 ```
 
-Always start the runtime through `up`; do not create a workspace for `supervise` yourself. `up` preflights cmux, Claude Code, the repository and an initialized queue (run `init` from the `taskq` skill first if the queue does not exist), deletes supervisor registrations whose process is dead (`pruned_supervisors`), keeps one supervisor resident as a launchd LaunchAgent, opens the maintainer's cmux workspace, and ends with a `doctor` summary. Pass `--plugin-dir "$CLAUDE_PLUGIN_ROOT"` so the maintainer session it opens loads this plugin; add `--repo PATH` only for a checkout other than the working directory, and `--cmux EXE` / `--claude EXE` when those are not on PATH.
+Always start the runtime through `up`; do not create a workspace for `supervise` yourself. `up` preflights cmux, Claude Code, the repository and an initialized queue (run `init` from the `taskq` skill first if the queue does not exist), deletes supervisor registrations whose process is dead (`pruned_supervisors`), keeps one supervisor resident as a launchd LaunchAgent, opens the maintainer's cmux workspace, and ends with a `doctor` summary. `--in-cmux` runs the supervisor in a cmux workspace named `taskq <repo> supervisor` instead of under launchd; use it only when the preflight below sends you there, because nothing restarts a supervisor started that way. Pass `--plugin-dir "$CLAUDE_PLUGIN_ROOT"` so the maintainer session it opens loads this plugin; add `--repo PATH` only for a checkout other than the working directory, and `--cmux EXE` / `--claude EXE` when those are not on PATH.
 
 Read the result:
 
-- `supervisor`: `{"outcome": "started" | "reused", "pid", "token", "plist", "log_dir"}`. `reused` means a live, heartbeating supervisor already served this queue and nothing was touched.
+- `supervisor`: `{"outcome": "started" | "reused", "mode", "pid", "token", "workspace_id", "plist", "log_dir"}`. `reused` means a live, heartbeating supervisor already served this queue and nothing was touched. `mode` is `launchd`, or `in_cmux` with the `workspace_id` it runs in; it is null for a supervisor someone started by hand.
 - `maintainer`: `{"outcome": "created" | "reused" | "skipped", "workspace_id", "name"}`. **`skipped` is the normal answer when you call `up` from inside the maintainer session**: that session is marked with `CMUX_TASKQ_ROLE=maintainer` and `CMUX_TASKQ_QUEUE`, so `up` does not open a second one. It is not an error, and the supervisor was still started or reused.
 - `pruned_supervisors`: dead registrations `up` removed.
 - `doctor`: `unfinished_runs` (with `lease_stale`), `awaiting_integration`, `needs_session`. Report these to the user; they are the open work.
 
-`up` is idempotent, so run it again whenever you are unsure. If it fails because cmux refuses a connection from outside its own terminals, no LaunchAgent was installed (the preflight runs before anything is written; only the dead registrations it had already pruned are gone): the supervisor launchd would start cannot reach cmux. Report the message to the user with the remedies it names — a socket password saved in cmux's Settings, or `CMUX_SOCKET_PASSWORD` exported in the shell that runs `up`, and the fallback of starting `supervise` by hand in one of their cmux terminals, after which `up` reuses it. All three are theirs to do, not this session's.
+`up` is idempotent, so run it again whenever you are unsure. If it fails because cmux refuses a connection from outside its own terminals, no LaunchAgent was installed (the preflight runs before anything is written; only the dead registrations it had already pruned are gone): the supervisor launchd would start cannot reach cmux. Report the message to the user with the remedies it names — a socket password saved in cmux's Settings, or `CMUX_SOCKET_PASSWORD` exported in the shell that runs `up`; both are theirs to do, not this session's. The third remedy is `up --in-cmux`, which you can run yourself once they have chosen it: it needs no password, but launchd no longer restarts the supervisor, so tell them that and run `up --in-cmux` again whenever `status` shows nothing serving the queue.
 
 ## 2. Check that something can run
 
@@ -134,6 +135,8 @@ Send it the reason from `last_error` and this instruction: rebase the branch ont
 `--wait` and `--force` exclude each other: `--force` does not drain first.
 
 Use plain `down` to end the day's work: the supervisor stops claiming, finishes its active runs and exits, and launchd does not restart it. Use `--wait` when the next step depends on it being gone (rebuilding or replacing the binary, a machine the user is about to shut down); it blocks while the runs drain, which can take as long as a run. Use `--force` only when the user accepts losing the active runs: their leases go stale after 30 seconds and the runs are then handled with the `taskq-recover` skill. The `outcome` is `draining` (plain `down`, which returns at once), `stopped` (`--wait`, the registration is gone), `killed` (`--force`), or `not_running` when no live supervisor was registered — a lingering agent is unloaded in that case too, and `--force` also drops the dead registrations. `down` never closes the maintainer workspace, and it does not stop the workers' own sessions.
+
+An `in_cmux` supervisor (`mode` in `status`) has no launchd agent to unload, so `down` sends it SIGINT instead and closes the `taskq <repo> supervisor` workspace it ran in once it has seen the stop through — after the drain with `--wait`, after the kill with `--force`. Plain `down` returns while that supervisor is still draining, so it leaves the workspace open and reports it under `supervisor_workspaces` as `left_open`; run `down --wait` (or have the user close it) before the next `up --in-cmux`, which refuses to open a second supervisor workspace over a leftover one.
 
 ## 8. Logs
 

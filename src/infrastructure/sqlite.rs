@@ -27,6 +27,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../../migrations/0006_merge_queue.sql"),
     include_str!("../../migrations/0007_supervisors.sql"),
     include_str!("../../migrations/0008_goals.sql"),
+    include_str!("../../migrations/0009_supervisor_mode.sql"),
 ];
 const READY_QUERY: &str = "
     SELECT t.* FROM tasks t
@@ -640,7 +641,10 @@ pub(super) fn event(
     Ok(())
 }
 
-fn enum_col<T: FromStr<Err = anyhow::Error>>(row: &Row<'_>, name: &str) -> rusqlite::Result<T> {
+pub(super) fn enum_col<T: FromStr<Err = anyhow::Error>>(
+    row: &Row<'_>,
+    name: &str,
+) -> rusqlite::Result<T> {
     let value: String = row.get(name)?;
     value.parse().map_err(|error: anyhow::Error| {
         rusqlite::Error::FromSqlConversionFailure(
