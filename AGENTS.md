@@ -55,12 +55,15 @@ runtime の `supervise` プロセスが **supervisor**、登録・監視・レ�
 
 ### maintainer
 
-cold start は repository の中で1行。
+cold start は repository の中で1行。当面は in-cmux mode で運用する（cmux の socket password を設定していないので launchd mode は preflight で止まる。[ADR-0011](docs/adr/0011-cmux-socket-password-and-in-cmux-fallback.md)）。
 
 ```sh
-cmux-taskq up --plugin-dir <この repository>/plugins/claude-taskq
+cmux-taskq up --in-cmux --claude ~/.local/bin/claude --plugin-dir <この repository>/plugins/claude-taskq
 ```
 
+- `--claude` を明示するのは、cmux の terminal の PATH では session ごとの shim（`$TMPDIR/cmux-cli-shims/<surface id>/claude`）が先に解決され、`up` がそれを supervisor の `--claude` に固定してしまうため。`up` は path を実体（`~/.local/share/claude/versions/<version>`）に解決して固定するので、Claude Code を更新したら `down --wait` → 同じ `up` で解決し直す
+- in-cmux mode に自動再起動はない。supervisor が止まったら `taskq cmux-taskq supervisor` workspace の画面を読んで閉じ、同じ `up` を打ち直す（`down --wait` は drain の後に workspace を閉じるところまで行う）
+- maintainer workspace は `taskq cmux-taskq maintainer`。maintainer session の中から `up` を打つと maintainer は `skipped`、生きている supervisor は `reused` になる
 - 操作は plugin の `taskq` / `taskq-maintain` / `taskq-recover` skill に従う。CLI の外で状態を持たず、DB は手で直さない。`cmux read-screen` は当面の一次情報として認める
 - バイナリは「作業中」のとおり固定した `~/.local/bin/cmux-taskq` だけを使う（`~/.local/bin` が PATH にあるので supervisor の起動でも同じものが動く）。キューは cwd から解決されるので、コマンドは repository の中（どの worktree でもよい）で実行する
 - runtime（`src/`）を変えた run は、`integrate` の前に run の worktree で `cargo test --locked --test e2e -- --ignored` を通す
