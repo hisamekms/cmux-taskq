@@ -5,7 +5,7 @@
 //! A run whose supervisor died while its session lives on is adopted by a
 //! supervisor with a free slot instead of being rerun (ADR-0012).
 use crate::{
-    application::{AgentProvider, TaskQueue, WorkspaceBackend},
+    application::{AgentProvider, TaskStore, WorkspaceBackend},
     domain::{
         ClaimOutcome, Goal, IntegrationOutcome, Predecessor, Receipt, ReceiptResult, RunLease,
         RunProcess, RunStatus, SupervisorMode, SupervisorRegistration, Task, TaskRun,
@@ -641,7 +641,7 @@ impl Supervisor<'_> {
         let plan = RunPlan {
             repo_path: path_text(&self.repository.root)?,
             run_dir: path_text(&run_dir)?,
-            branch: format!("taskq/{}", claimed.id),
+            branch: format!("dagq/{}", claimed.id),
             worktree_path: path_text(&run_dir.join("worktree"))?,
             receipt_path: path_text(&run_dir.join("receipt.json"))?,
             log_path: path_text(&run_dir.join("claude.debug.log"))?,
@@ -1037,7 +1037,7 @@ pub enum IntegrateTarget {
 /// Land one validated run on `main`: take the single integration slot,
 /// rebase the run worktree onto the current `refs/heads/main`, re-validate
 /// (receipt, descent from main, clean tree, verification commands), squash
-/// the tree into one commit with `Taskq-Task` / `Taskq-Run` trailers and
+/// the tree into one commit with `Dagq-Task` / `Dagq-Run` trailers and
 /// fast-forward `main` to it. Never a merge commit, never a fast-forward of
 /// the run branch itself. A conflict or a failed re-validation parks the run
 /// as `needs_session` for a resumed session to fix; a rewritten receipt that
@@ -1350,11 +1350,11 @@ fn land(
         }
     }
     // One commit on main with the rebased tree; the run's own history stays
-    // reachable under refs/taskq/runs/<run-id>.
+    // reachable under refs/dagq/runs/<run-id>.
     let paragraphs = commit_message(task, run, &receipt);
     let tree = repository.tree_of(&rebased)?;
     let commit = repository.commit_tree(&tree, main, &paragraphs)?;
-    let history_ref = format!("refs/taskq/runs/{}", run.id);
+    let history_ref = format!("refs/dagq/runs/{}", run.id);
     repository.update_ref(&history_ref, &rebased)?;
     repository.advance_main(main, &commit)?;
     Ok(Verdict::Landed(Landing {
@@ -1374,7 +1374,7 @@ fn commit_message(task: &Task, run: &TaskRun, receipt: &Receipt) -> Vec<String> 
     if !summary.is_empty() {
         paragraphs.push(summary.to_owned());
     }
-    paragraphs.push(format!("Taskq-Task: {}\nTaskq-Run: {}", task.id, run.id));
+    paragraphs.push(format!("Dagq-Task: {}\nDagq-Run: {}", task.id, run.id));
     paragraphs
 }
 
@@ -1549,7 +1549,7 @@ pub fn prompt(
         text
     };
     Ok(format!(
-        "You are executing cmux-taskq task {task_id}, run {run_id}.\n\
+        "You are executing dagq task {task_id}, run {run_id}.\n\
          Work only in the assigned Git worktree. Read its repository instructions.\n\
          Implement the task, run the required verification commands, and commit the result.\n\
          Do not merge, push, close the workspace, or modify the queue/runtime files.\n\
@@ -1575,18 +1575,18 @@ pub fn prompt(
 }
 
 /// The initial prompt of the maintainer session that `up` opens in the
-/// `taskq <repo> maintainer` workspace. It names the queue and the roles,
+/// `dagq <repo> maintainer` workspace. It names the queue and the roles,
 /// points at the supervisor's logs, and asks for a first report through the
-/// plugin's `taskq-maintain` skill; the CLI itself is documented there, not
+/// plugin's `dagq-maintain` skill; the CLI itself is documented there, not
 /// here, so the prompt stays stable across skill revisions.
 pub fn maintainer_prompt(db: &Path, log_dir: &Path) -> Result<String> {
     Ok(format!(
-        "You are the maintainer session of the cmux-taskq queue at {db}.\n\
-         Roles: supervisor is the resident `cmux-taskq supervise` process that runs tasks; maintainer is this session, which registers, watches, reviews and lands them; worker is the Claude session of one run.\n\
+        "You are the maintainer session of the dagq queue at {db}.\n\
+         Roles: supervisor is the resident `dagq supervise` process that runs tasks; maintainer is this session, which registers, watches, reviews and lands them; worker is the Claude session of one run.\n\
          The supervisor writes its logs to {log_dir} (one supervisor-<started_at>-<pid>.log per start, launchd output in launchd.log).\n\
-         Start by using the taskq-maintain skill of the taskq plugin to run status and doctor. Report stale supervisors, unfinished runs, runs awaiting_integration and runs in needs_session, then wait for the user's instructions.\n\
-         If the taskq-maintain skill is not available in this session, say so and wait.\n\
-         Never open or edit the queue database directly; go through the cmux-taskq CLI only.\n",
+         Start by using the dagq-maintain skill of the dagq plugin to run status and doctor. Report stale supervisors, unfinished runs, runs awaiting_integration and runs in needs_session, then wait for the user's instructions.\n\
+         If the dagq-maintain skill is not available in this session, say so and wait.\n\
+         Never open or edit the queue database directly; go through the dagq CLI only.\n",
         db = path_text(db)?,
         log_dir = path_text(log_dir)?,
     ))
@@ -1619,7 +1619,7 @@ pub struct SupervisorHealth {
     pub registered: bool,
     pub mode: Option<SupervisorMode>,
     pub workspace_id: Option<String>,
-    /// The `cmux-taskq` version the registered process runs; `None` for a
+    /// The `dagq` version the registered process runs; `None` for a
     /// lease holder without a registration, or a registration older than
     /// the column (ADR-0014).
     pub binary_version: Option<String>,

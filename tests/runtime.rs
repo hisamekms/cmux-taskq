@@ -1,7 +1,7 @@
 use anyhow::{Result, bail};
-use cmux_taskq::{
+use dagq::{
     VERSION,
-    application::{AgentProvider, SupervisorEnvironment, TaskQueue, WorkspaceBackend},
+    application::{AgentProvider, SupervisorEnvironment, TaskStore, WorkspaceBackend},
     domain::{GoalEdit, NewGoal, NewTask, RunStatus, TaskAction, TaskRun, TaskStatus},
     infrastructure::{
         adapters::{shell_join, workspace_handle},
@@ -312,7 +312,7 @@ fn supervise_with(
         repo,
         backend,
         &claude_stub(db),
-        Path::new(env!("CARGO_BIN_EXE_cmux-taskq")),
+        Path::new(env!("CARGO_BIN_EXE_dagq")),
         options,
     )
 }
@@ -331,14 +331,11 @@ fn wait_until(db: &Path, timeout: Duration, mut condition: impl FnMut(&mut Sqlit
 }
 
 /// Run one fake agent script through supervise and return the task detail.
-fn run_agent(script: &str) -> (TempDir, PathBuf, cmux_taskq::domain::TaskDetail) {
+fn run_agent(script: &str) -> (TempDir, PathBuf, dagq::domain::TaskDetail) {
     run_agent_with(script, false)
 }
 
-fn run_agent_with(
-    script: &str,
-    close_fail: bool,
-) -> (TempDir, PathBuf, cmux_taskq::domain::TaskDetail) {
+fn run_agent_with(script: &str, close_fail: bool) -> (TempDir, PathBuf, dagq::domain::TaskDetail) {
     let (dir, repo, db) = fixture();
     let mut backend = TestWorkspace::new(&db, false, script);
     backend.close_fail = close_fail;
@@ -391,7 +388,7 @@ fn read_prompt(run: &TaskRun) -> String {
     fs::read_to_string(Path::new(run.run_dir.as_ref().unwrap()).join("prompt.txt")).unwrap()
 }
 
-fn rejection_reason(detail: &cmux_taskq::domain::TaskDetail) -> String {
+fn rejection_reason(detail: &dagq::domain::TaskDetail) -> String {
     let run = &detail.runs[0];
     assert_eq!(run.status, RunStatus::Failed);
     let event = detail
@@ -557,7 +554,7 @@ fn receipt_without_new_commit_fails_validation() {
 #[test]
 fn receipt_commit_that_is_not_branch_head_fails_validation() {
     let (_dir, _db, detail) = run_agent("commit work; receipt \"$BASE\"");
-    assert!(rejection_reason(&detail).contains("is not the head of taskq/"));
+    assert!(rejection_reason(&detail).contains("is not the head of dagq/"));
 }
 
 #[test]
@@ -590,7 +587,7 @@ fn failing_verification_command_fails_validation_despite_receipt_claims() {
 
 #[test]
 fn receipt_structure_is_checked_before_git() {
-    use cmux_taskq::domain::Receipt;
+    use dagq::domain::Receipt;
     let valid = r#"{"run_id":"r","result":"succeeded","commit":"0123456789abcdef0123456789abcdef01234567",
         "tests":{"status":"passed","evidence_or_reason":"cargo test"},
         "e2e":{"status":"not_applicable","evidence_or_reason":"library only"},
@@ -663,7 +660,7 @@ fn receipt_structure_is_checked_before_git() {
     assert!(error.contains("follow_ups must be an array"), "{error}");
 }
 
-fn event_kinds(detail: &cmux_taskq::domain::TaskDetail) -> Vec<&str> {
+fn event_kinds(detail: &dagq::domain::TaskDetail) -> Vec<&str> {
     detail.events.iter().map(|e| e.kind.as_str()).collect()
 }
 
@@ -806,7 +803,7 @@ fn unanswered_exit_request_times_out_and_retains_run() {
 
 #[test]
 fn claude_stop_hook_settings_publish_the_idle_marker() {
-    use cmux_taskq::infrastructure::adapters::{ClaudeCode, stop_hook_settings};
+    use dagq::infrastructure::adapters::{ClaudeCode, stop_hook_settings};
     let dir = tempfile::tempdir().unwrap();
     let run_dir = dir.path().join("run's dir");
     fs::create_dir(&run_dir).unwrap();
@@ -814,10 +811,10 @@ fn claude_stop_hook_settings_publish_the_idle_marker() {
         id: "11111111-2222-4333-8444-555555555555".into(),
         task_id: 1,
         status: RunStatus::Starting,
-        requested_provider: cmux_taskq::domain::Provider::Claude,
-        actual_provider: cmux_taskq::domain::Provider::Claude,
+        requested_provider: dagq::domain::Provider::Claude,
+        actual_provider: dagq::domain::Provider::Claude,
         base_commit: "0123456789abcdef0123456789abcdef01234567".into(),
-        branch: Some("taskq/x".into()),
+        branch: Some("dagq/x".into()),
         worktree_path: Some(dir.path().to_str().unwrap().into()),
         workspace_id: None,
         receipt_path: Some(run_dir.join("receipt.json").to_str().unwrap().into()),
@@ -945,7 +942,7 @@ fn provisioning_failure_retains_the_run_and_stops_claiming_other_tasks() {
 
 #[test]
 fn claim_creates_a_lease_that_only_its_owner_can_use_or_release() {
-    use cmux_taskq::{domain::ClaimOutcome, infrastructure::runtime_store::RunPlan};
+    use dagq::{domain::ClaimOutcome, infrastructure::runtime_store::RunPlan};
     let (_dir, _repo, db) = fixture();
     let mut queue = SqliteQueue::open(&db).unwrap();
     queue.bind_repository("/repo/one/.git").unwrap();
@@ -967,7 +964,7 @@ fn claim_creates_a_lease_that_only_its_owner_can_use_or_release() {
     let plan = RunPlan {
         repo_path: "/test".into(),
         run_dir: "/run".into(),
-        branch: "taskq/test".into(),
+        branch: "dagq/test".into(),
         worktree_path: "/run/worktree".into(),
         receipt_path: "/run/receipt.json".into(),
         log_path: "/run/log".into(),
@@ -1029,7 +1026,7 @@ fn migration_from_v1_preserves_task_and_initializes_runtime_tables() {
 
 #[test]
 fn wrapper_registration_is_one_shot_and_rejects_stale_owners() {
-    use cmux_taskq::{
+    use dagq::{
         domain::ClaimOutcome,
         infrastructure::runtime_store::{RunPlan, Validation},
     };
@@ -1048,7 +1045,7 @@ fn wrapper_registration_is_one_shot_and_rejects_stale_owners() {
             &RunPlan {
                 repo_path: "/test".into(),
                 run_dir: "/run".into(),
-                branch: "taskq/test".into(),
+                branch: "dagq/test".into(),
                 worktree_path: "/run/worktree".into(),
                 receipt_path: "/run/receipt.json".into(),
                 log_path: "/run/log".into(),
@@ -1107,7 +1104,7 @@ fn wrapper_registration_is_one_shot_and_rejects_stale_owners() {
 
 #[test]
 fn workspace_close_is_recorded_once_and_only_for_accepted_runs() {
-    use cmux_taskq::{
+    use dagq::{
         domain::ClaimOutcome,
         infrastructure::runtime_store::{RunPlan, Validation},
     };
@@ -1126,7 +1123,7 @@ fn workspace_close_is_recorded_once_and_only_for_accepted_runs() {
             &RunPlan {
                 repo_path: "/test".into(),
                 run_dir: "/run".into(),
-                branch: "taskq/test".into(),
+                branch: "dagq/test".into(),
                 worktree_path: "/run/worktree".into(),
                 receipt_path: "/run/receipt.json".into(),
                 log_path: "/run/log".into(),
@@ -1472,7 +1469,7 @@ fn dead_pid() -> u32 {
 /// as wrapper and agent, but with no supervisor loop watching it. Returns the
 /// running run.
 fn orphan_run(repo: &Path, db: &Path, token: &str, wrapper: u32, agent: u32) -> TaskRun {
-    use cmux_taskq::{
+    use dagq::{
         domain::ClaimOutcome,
         infrastructure::{
             adapters::{GitRepository, path_text},
@@ -1499,7 +1496,7 @@ fn orphan_run(repo: &Path, db: &Path, token: &str, wrapper: u32, agent: u32) -> 
             &RunPlan {
                 repo_path: path_text(&repository.root).unwrap(),
                 run_dir: path_text(&run_dir).unwrap(),
-                branch: format!("taskq/{}", run.id),
+                branch: format!("dagq/{}", run.id),
                 worktree_path: path_text(&run_dir.join("worktree")).unwrap(),
                 receipt_path: path_text(&run_dir.join("receipt.json")).unwrap(),
                 log_path: path_text(&run_dir.join("log")).unwrap(),
@@ -1739,7 +1736,7 @@ fn write_receipt_json(run: &TaskRun, receipt: Value) {
 }
 
 /// The `integration_receipt` events of the task's run, oldest first.
-fn integration_receipts(detail: &cmux_taskq::domain::TaskDetail) -> Vec<&Value> {
+fn integration_receipts(detail: &dagq::domain::TaskDetail) -> Vec<&Value> {
     detail
         .events
         .iter()
@@ -1761,7 +1758,7 @@ fn assert_landed(repo: &Path, run: &TaskRun, task_title: &str, expected_parent: 
             .count(),
         2
     );
-    let history = format!("refs/taskq/runs/{}", run.id);
+    let history = format!("refs/dagq/runs/{}", run.id);
     let source = git_out(repo, &["rev-parse", &history]);
     assert_eq!(
         git_out(repo, &["rev-parse", "main^{tree}"]),
@@ -1769,15 +1766,15 @@ fn assert_landed(repo: &Path, run: &TaskRun, task_title: &str, expected_parent: 
     );
     let message = git_out(repo, &["log", "-1", "--format=%B", "main"]);
     assert!(message.starts_with(task_title), "{message}");
-    assert!(message.contains("\n\nTaskq-Task: "), "{message}");
+    assert!(message.contains("\n\nDagq-Task: "), "{message}");
     assert!(
-        message.ends_with(&format!("Taskq-Run: {}", run.id)),
+        message.ends_with(&format!("Dagq-Run: {}", run.id)),
         "{message}"
     );
     // Worktree and branch are gone; the run's history stays under the ref.
     assert!(!Path::new(run.worktree_path.as_ref().unwrap()).exists());
     assert!(
-        !git_out(repo, &["branch", "--list", run.branch.as_deref().unwrap()]).contains("taskq/")
+        !git_out(repo, &["branch", "--list", run.branch.as_deref().unwrap()]).contains("dagq/")
     );
 }
 
@@ -1836,10 +1833,7 @@ fn conflict_free_run_lands_as_one_squash_commit_and_releases_dependents() {
     // No rebase was needed: the landed tree is the validated tree, and the
     // history ref points at the validated commit.
     assert_eq!(
-        git_out(
-            &repo,
-            &["rev-parse", &format!("refs/taskq/runs/{}", run.id)]
-        ),
+        git_out(&repo, &["rev-parse", &format!("refs/dagq/runs/{}", run.id)]),
         source
     );
     assert_eq!(
@@ -1849,7 +1843,7 @@ fn conflict_free_run_lands_as_one_squash_commit_and_releases_dependents() {
     let message = git_out(&repo, &["log", "-1", "--format=%B", "main"]);
     assert_eq!(
         message,
-        format!("test task\n\ndone\n\nTaskq-Task: 1\nTaskq-Run: {}", run.id)
+        format!("test task\n\ndone\n\nDagq-Task: 1\nDagq-Run: {}", run.id)
     );
     // The main checkout moved with the ref.
     assert_eq!(
@@ -1883,7 +1877,7 @@ fn conflict_free_run_lands_as_one_squash_commit_and_releases_dependents() {
     assert_eq!(integrated.payload["main_before"], json!(seed));
     assert_eq!(
         integrated.payload["history_ref"],
-        json!(format!("refs/taskq/runs/{}", run.id))
+        json!(format!("refs/dagq/runs/{}", run.id))
     );
     let verification = detail
         .events
@@ -2315,7 +2309,7 @@ fn successor_starts_when_the_predecessor_receipt_is_unavailable() {
     assert_eq!(summary.result_commit, landed_commit);
     assert_eq!((summary.task_id, summary.title.as_str()), (1, "test task"));
     // A predecessor completed without an integrated run has neither.
-    let by_hand = cmux_taskq::domain::Predecessor {
+    let by_hand = dagq::domain::Predecessor {
         task: corrupt[0].task.clone(),
         integrated_run: None,
     };
@@ -2413,7 +2407,7 @@ fn runs_land_fifo_by_validation_time_and_later_ones_are_rebased() {
     // The second run was rebased: its history ref sits on the first landing.
     let history = git_out(
         &repo,
-        &["rev-parse", &format!("refs/taskq/runs/{}", second.id)],
+        &["rev-parse", &format!("refs/dagq/runs/{}", second.id)],
     );
     assert_ne!(history, second.result_commit.clone().unwrap());
     assert_eq!(
@@ -2575,10 +2569,7 @@ fn conflicting_run_needs_a_session_and_lands_after_the_session_resolves_it() {
     assert_eq!(validated.payload["receipt"]["commit"], json!(source));
     assert!(validated.payload["receipt"].get("follow_ups").is_none());
     assert_eq!(
-        git_out(
-            &repo,
-            &["rev-parse", &format!("refs/taskq/runs/{}", run.id)]
-        ),
+        git_out(&repo, &["rev-parse", &format!("refs/dagq/runs/{}", run.id)]),
         resolved
     );
     assert_eq!(
@@ -2651,7 +2642,7 @@ fn failed_receipt_from_a_session_ends_the_run_without_landing() {
     assert!(Path::new(failed.worktree_path.as_ref().unwrap()).exists());
     assert_eq!(git_out(&repo, &["rev-parse", "main"]), main);
     assert!(
-        git_out(&repo, &["for-each-ref", "refs/taskq/runs/"])
+        git_out(&repo, &["for-each-ref", "refs/dagq/runs/"])
             .lines()
             .count()
             == 1
@@ -2795,7 +2786,7 @@ fn verification_failure_after_rebase_needs_a_session_and_keeps_the_rebased_tree(
         recorded[1]["commit"],
         json!(git_out(
             &repo,
-            &["rev-parse", &format!("refs/taskq/runs/{}", run.id)]
+            &["rev-parse", &format!("refs/dagq/runs/{}", run.id)]
         ))
     );
 }
@@ -3185,7 +3176,7 @@ fn start_run_under_dead_supervisor(
     backend: &TestWorkspace,
     token: &str,
 ) -> TaskRun {
-    use cmux_taskq::{
+    use dagq::{
         domain::ClaimOutcome,
         infrastructure::{
             adapters::{GitRepository, path_text},
@@ -3212,7 +3203,7 @@ fn start_run_under_dead_supervisor(
             &RunPlan {
                 repo_path: path_text(&repository.root).unwrap(),
                 run_dir: path_text(&run_dir).unwrap(),
-                branch: format!("taskq/{}", run.id),
+                branch: format!("dagq/{}", run.id),
                 worktree_path: path_text(&run_dir.join("worktree")).unwrap(),
                 receipt_path: path_text(&run_dir.join("receipt.json")).unwrap(),
                 log_path: path_text(&run_dir.join("claude.debug.log")).unwrap(),
@@ -3254,7 +3245,7 @@ fn age_lease(db: &Path, run: &TaskRun, seconds: i64) {
         .unwrap();
 }
 
-fn adoption_events(detail: &cmux_taskq::domain::TaskDetail) -> Vec<&Value> {
+fn adoption_events(detail: &dagq::domain::TaskDetail) -> Vec<&Value> {
     detail
         .events
         .iter()
@@ -3426,7 +3417,7 @@ fn fresh_leases_dead_wrappers_early_runs_leaseless_and_integrating_runs_are_not_
     )
     .unwrap();
     // `starting` with a stale lease: register_wrapper needs the claimer's token.
-    use cmux_taskq::{domain::ClaimOutcome, infrastructure::runtime_store::RunPlan};
+    use dagq::{domain::ClaimOutcome, infrastructure::runtime_store::RunPlan};
     let base = queue.run(&fresh.id).unwrap().base_commit;
     let ClaimOutcome::Claimed { run: starting } =
         queue.claim_for_supervisor(&base, "gone-early").unwrap()
@@ -3440,7 +3431,7 @@ fn fresh_leases_dead_wrappers_early_runs_leaseless_and_integrating_runs_are_not_
             &RunPlan {
                 repo_path: "/test".into(),
                 run_dir: "/run".into(),
-                branch: "taskq/starting".into(),
+                branch: "dagq/starting".into(),
                 worktree_path: "/run/worktree".into(),
                 receipt_path: "/run/receipt.json".into(),
                 log_path: "/run/log".into(),
@@ -3827,7 +3818,7 @@ fn two_supervisors_racing_for_one_stale_lease_adopt_it_once() {
     assert_eq!(payload["previous_token"], "fresh");
     assert_eq!(payload["previous_pid"], json!(std::process::id()));
     // A `starting` run is refused by the method too, stale or not.
-    use cmux_taskq::domain::ClaimOutcome;
+    use dagq::domain::ClaimOutcome;
     let ClaimOutcome::Claimed { run: early } = queue
         .claim_for_supervisor(&second.base_commit, "early")
         .unwrap()

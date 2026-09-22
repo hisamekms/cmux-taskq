@@ -23,11 +23,11 @@ def save(path, value):
 
 
 def prepare():
-    root = Path(tempfile.mkdtemp(prefix='cmux-taskq-spike-')).resolve()
+    root = Path(tempfile.mkdtemp(prefix='dagq-spike-')).resolve()
     repo, worktree = root / 'repo', root / 'worktree'
     repo.mkdir()
     run('git', 'init', '-b', 'main', str(repo))
-    run('git', 'config', 'user.name', 'cmux-taskq spike', cwd=repo)
+    run('git', 'config', 'user.name', 'dagq spike', cwd=repo)
     run('git', 'config', 'user.email', 'spike@example.invalid', cwd=repo)
     (repo / 'greeting.py').write_text('def greeting(name):\n    return "Hello!"\n')
     (repo / 'test_greeting.py').write_text(
@@ -49,7 +49,7 @@ def prepare():
     save(root / 'run.json', state)
     submit = shlex.join([sys.executable, str(script), 'submit', str(root)])
     (root / 'prompt.txt').write_text(
-        'This is a disposable cmux-taskq lifecycle smoke test. '
+        'This is a disposable dagq lifecycle smoke test. '
         'Work only in this worktree. Fix greeting.py so greeting("cmux") returns '
         '"Hello, cmux!". Do not change the test. Run python3 -m unittest -v, '
         'then commit the fix. Do not push, create agents, or close the workspace. '
@@ -60,7 +60,7 @@ def prepare():
     command = shlex.join([sys.executable, str(script), 'session', str(root)])
     print(json.dumps({'root': str(root), 'launch_argv': [
         'cmux', '--json', '--id-format', 'uuids', 'new-workspace',
-        '--name', 'taskq Claude lifecycle spike', '--cwd', str(worktree),
+        '--name', 'dagq Claude lifecycle spike', '--cwd', str(worktree),
         '--command', command, '--focus', 'false']}, indent=2))
 
 

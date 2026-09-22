@@ -3,8 +3,8 @@ members = ["."]
 resolver = "3"
 
 [package]
-name = "cmux-taskq"
-version = "0.1.0"
+name = "dagq"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.93"
 description = "A dependency-aware task queue for cmux and isolated Git worktrees"

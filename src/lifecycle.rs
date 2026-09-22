@@ -11,13 +11,13 @@
 //! outside cmux's process tree) before it writes the agent, or launchd would
 //! keep restarting a supervisor that fails its own preflight forever. Where
 //! that password is not configured, `up --in-cmux` starts the supervisor
-//! inside the cmux workspace `taskq <repo> supervisor` instead, with no
+//! inside the cmux workspace `dagq <repo> supervisor` instead, with no
 //! launchd involved and so nothing to restart it (ADR-0011).
 //!
 //! A supervisor is only reused while it runs this binary's own version.
 //! Every registration carries the `binary_version` its process recorded,
 //! and `up` drains a live supervisor of any other build before starting one
-//! of its own in its place, so replacing `~/.local/bin/cmux-taskq` and
+//! of its own in its place, so replacing `~/.local/bin/dagq` and
 //! running `up` is the whole binary update (ADR-0014).
 use crate::{
     VERSION,
@@ -49,9 +49,9 @@ use std::{
 
 /// Set in the maintainer workspace's command so that `up`, run from inside
 /// that session (the plugin skill calls it), does not open a second one.
-pub const ROLE_ENV: &str = "CMUX_TASKQ_ROLE";
+pub const ROLE_ENV: &str = "DAGQ_ROLE";
 /// The queue database the maintainer session belongs to.
-pub const QUEUE_ENV: &str = "CMUX_TASKQ_QUEUE";
+pub const QUEUE_ENV: &str = "DAGQ_QUEUE";
 pub const MAINTAINER_ROLE: &str = "maintainer";
 /// File under the queue's log directory that launchd appends the
 /// supervisor's stdout and stderr to.
@@ -60,9 +60,9 @@ pub const LAUNCHD_LOG_NAME: &str = "launchd.log";
 /// What `up` reads from the process that runs it.
 #[derive(Debug, Clone)]
 pub struct UpEnvironment {
-    /// `CMUX_TASKQ_ROLE`, if set.
+    /// `DAGQ_ROLE`, if set.
     pub role: Option<String>,
-    /// `CMUX_TASKQ_QUEUE`, if set.
+    /// `DAGQ_QUEUE`, if set.
     pub queue: Option<PathBuf>,
     /// `PATH`, copied into the agent so the supervisor finds what this shell finds.
     pub path: String,
@@ -86,7 +86,7 @@ workspace without launchd and without any automatic restart";
 #[derive(Debug, Clone)]
 pub struct UpOptions {
     pub parallel: u16,
-    /// Start the supervisor inside the cmux workspace `taskq <repo>
+    /// Start the supervisor inside the cmux workspace `dagq <repo>
     /// supervisor` instead of as a LaunchAgent: no launchd, no automatic
     /// restart, and no out-of-cmux preflight to pass.
     pub in_cmux: bool,
@@ -463,7 +463,7 @@ once `status` shows it gone",
 /// Refuse, before anything is stopped, when the name an in-cmux supervisor
 /// needs is held by a workspace this replacement will not close. `up`
 /// prunes a dead registration without closing its workspace and cmux keeps
-/// a workspace open after its command exits, so `taskq <repo> supervisor`
+/// a workspace open after its command exits, so `dagq <repo> supervisor`
 /// can be held by a crashed supervisor that is no longer registered at all.
 /// Finding that only after the drain would cost a working supervisor and
 /// leave the queue with nothing serving it.
@@ -555,7 +555,7 @@ fn start_under_launchd(
 /// no socket password is needed. Nothing restarts it either.
 ///
 /// cmux keeps a workspace open after its command exits, so a leftover
-/// `taskq <repo> supervisor` may belong to a supervisor that crashed, or to
+/// `dagq <repo> supervisor` may belong to a supervisor that crashed, or to
 /// one that is alive but no longer heartbeating (which `up` never reuses
 /// and never kills). Either way it is the maintainer's to close, and `up`
 /// stops rather than open a second one or interfere with the first.

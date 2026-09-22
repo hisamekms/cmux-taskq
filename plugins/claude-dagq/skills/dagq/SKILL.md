@@ -1,30 +1,30 @@
 ---
-name: taskq
-description: Register and inspect cmux-taskq goals and tasks through the locally built cmux-taskq binary. Use when the user brings a development problem to queue for cmux-taskq (register it as a goal, decompose it into tasks with title, description, acceptance criteria, verification commands, dependencies and context), make tasks ready, list goals or tasks, check a goal's progress or a task's status or run result, close a goal after reviewing its tasks' receipts and follow_ups, or find the cmux-taskq binary and queue database.
+name: dagq
+description: Register and inspect dagq goals and tasks through the locally built dagq binary. Use when the user brings a development problem to queue for dagq (register it as a goal, decompose it into tasks with title, description, acceptance criteria, verification commands, dependencies and context), make tasks ready, list goals or tasks, check a goal's progress or a task's status or run result, close a goal after reviewing its tasks' receipts and follow_ups, or find the dagq binary and queue database.
 ---
 
-# cmux-taskq: register and inspect tasks
+# dagq: register and inspect tasks
 
-cmux-taskq runs development tasks in cmux workspaces and isolated Git worktrees. This skill drives the `cmux-taskq` binary; every command prints JSON on stdout, and a runtime error prints `{"error": ...}` on stderr with exit status 1. Never read or modify the SQLite queue file directly (no `sqlite3`, no editing); the binary is the only interface.
+dagq runs development tasks in cmux workspaces and isolated Git worktrees. This skill drives the `dagq` binary; every command prints JSON on stdout, and a runtime error prints `{"error": ...}` on stderr with exit status 1. Never read or modify the SQLite queue file directly (no `sqlite3`, no editing); the binary is the only interface.
 
-A goal is the problem several tasks solve together; a task is one unit of work a session executes in its own worktree. Register the goal first, then its tasks. Starting the runtime with `up`, watching the runs, landing one on `main` with `integrate`, and resuming a `needs_session` run are in the `taskq-maintain` skill; recovering an interrupted run is in `taskq-recover`.
+A goal is the problem several tasks solve together; a task is one unit of work a session executes in its own worktree. Register the goal first, then its tasks. Starting the runtime with `up`, watching the runs, landing one on `main` with `integrate`, and resuming a `needs_session` run are in the `dagq-maintain` skill; recovering an interrupted run is in `dagq-recover`.
 
 ## 1. Locate the binary and the queue
 
 Run the plugin launcher, which resolves the binary and forwards every command to it from the current directory:
 
 ```sh
-"${CLAUDE_PLUGIN_ROOT}/bin/taskq" --resolve
+"${CLAUDE_PLUGIN_ROOT}/bin/dagq" --resolve
 ```
 
 It prints `{"binary", "binary_version", "plugin_version", "repo", "db", "db_exists", "queue_dir", "runs_dir", "source", "git_common_dir"}` on stdout, and may print a `{"warning": ...}` line on stderr.
 
-- Binary: `CMUX_TASKQ_BIN` if set, otherwise `cmux-taskq` on PATH. If the launcher prints an `{"error": ...}` instead, pass its message on: the user installs the binary from the GitHub Release at <https://github.com/hisamekms/cmux-taskq/releases> (download `cmux-taskq-v<version>-aarch64-apple-darwin.tar.gz`, verify it against the published `SHA256SUMS`, move `cmux-taskq` into `~/.local/bin`, which must be on PATH), or, when they are developing in the cmux-taskq repository itself, builds it with `cargo build --locked` and exports `CMUX_TASKQ_BIN=/absolute/path/to/target/debug/cmux-taskq`. Then retry.
-- Versions: `plugin_version` is this plugin's, `binary_version` the resolved binary's. When they differ in major.minor the launcher writes a `{"warning": ...}` to stderr and still exits 0 with a valid resolution. Do not stop; report the warning to the user and tell them to update whichever is older — the plugin with `claude plugin update claude-taskq@cmux-taskq`, the binary from the Release above — because a command the skill describes may be missing or may behave differently until they match. If a later command fails in a way the skill does not explain, name the mismatch as the likely cause.
-- Queue: one per repository. The binary resolves it from the current directory's Git common directory to `$XDG_DATA_HOME/cmux-taskq/<hash>/queue.db` (default `~/.local/share/cmux-taskq/<hash>/queue.db`); `source` is `repository`. Every worktree of the repository, including task worktrees, resolves to the same queue, and runs live in `runs_dir` next to it. Run the launcher from inside the repository the tasks belong to; outside a repository it fails. `CMUX_TASKQ_DB=/path/to/queue.db` uses another queue file instead (`source` becomes `db_flag`; the launcher passes it as `--db`).
-- If `db_exists` is false, create the queue once: `"${CLAUDE_PLUGIN_ROOT}/bin/taskq" init` (it creates the directory, binds the queue to this repository, and also migrates an existing queue while keeping its tasks). A queue bound to a different repository is refused by every command; that only happens with `CMUX_TASKQ_DB`, so unset it or point it at the right file.
+- Binary: `DAGQ_BIN` if set, otherwise `dagq` on PATH. If the launcher prints an `{"error": ...}` instead, pass its message on: the user installs the binary from the GitHub Release at <https://github.com/hisamekms/dagq/releases> (download `dagq-v<version>-aarch64-apple-darwin.tar.gz`, verify it against the published `SHA256SUMS`, move `dagq` into `~/.local/bin`, which must be on PATH), or, when they are developing in the dagq repository itself, builds it with `cargo build --locked` and exports `DAGQ_BIN=/absolute/path/to/target/debug/dagq`. Then retry.
+- Versions: `plugin_version` is this plugin's, `binary_version` the resolved binary's. When they differ in major.minor the launcher writes a `{"warning": ...}` to stderr and still exits 0 with a valid resolution. Do not stop; report the warning to the user and tell them to update whichever is older — the plugin with `claude plugin update claude-dagq@dagq`, the binary from the Release above — because a command the skill describes may be missing or may behave differently until they match. If a later command fails in a way the skill does not explain, name the mismatch as the likely cause.
+- Queue: one per repository. The binary resolves it from the current directory's Git common directory to `$XDG_DATA_HOME/dagq/<hash>/queue.db` (default `~/.local/share/dagq/<hash>/queue.db`); `source` is `repository`. Every worktree of the repository, including task worktrees, resolves to the same queue, and runs live in `runs_dir` next to it. Run the launcher from inside the repository the tasks belong to; outside a repository it fails. `DAGQ_DB=/path/to/queue.db` uses another queue file instead (`source` becomes `db_flag`; the launcher passes it as `--db`).
+- If `db_exists` is false, create the queue once: `"${CLAUDE_PLUGIN_ROOT}/bin/dagq" init` (it creates the directory, binds the queue to this repository, and also migrates an existing queue while keeping its tasks). A queue bound to a different repository is refused by every command; that only happens with `DAGQ_DB`, so unset it or point it at the right file.
 
-Report `binary_version` and the database path to the user the first time in a session, together with any version warning. Use `TASKQ="${CLAUDE_PLUGIN_ROOT}/bin/taskq"` below.
+Report `binary_version` and the database path to the user the first time in a session, together with any version warning. Use `DAGQ="${CLAUDE_PLUGIN_ROOT}/bin/dagq"` below.
 
 ## 2. Register a goal and decompose it into tasks
 
@@ -45,7 +45,7 @@ Collect from the user, asking only for what is missing:
 - doc: the path of a reference document inside the repository (an ADR, a design document, a plan), relative to the repository root; the worker is told the path and reads it in its worktree, so it must be committed
 
 ```sh
-"$TASKQ" goal add "TITLE" \
+"$DAGQ" goal add "TITLE" \
   --description "DESCRIPTION" \
   --acceptance "ACCEPTANCE" \
   --constraints "CONSTRAINTS" \
@@ -67,7 +67,7 @@ Split the goal into tasks a single session can finish in one worktree, each with
 - `--context`: why this task exists and what to read first, when the goal's description does not already say it (a journal, an issue, a failing command); it is shown to the worker whether or not the task has a goal
 
 ```sh
-"$TASKQ" add "TITLE" \
+"$DAGQ" add "TITLE" \
   --goal 1 \
   --description "DESCRIPTION" \
   --acceptance "ACCEPTANCE" \
@@ -79,8 +79,8 @@ Split the goal into tasks a single session can finish in one worktree, each with
 A one-shot task omits `--goal`. The task is registered as `draft` and the JSON includes its `id` and `goal_id`. Then make it runnable and confirm it is a candidate:
 
 ```sh
-"$TASKQ" ready ID
-"$TASKQ" candidates
+"$DAGQ" ready ID
+"$DAGQ" candidates
 ```
 
 `candidates` lists ready tasks whose dependencies are all `completed`, in registration order, without reserving them; it does not prefer one goal over another. A ready task missing from `candidates` is blocked by a dependency; show the blocking IDs from `show ID`'s `dependencies`. Use `draft ID` to take a task back for editing, `cancel ID` to drop it (its dependents are not satisfied), and `dependency add TASK PREDECESSOR` / `dependency remove TASK PREDECESSOR` to change prerequisites of a draft or ready task. Self-dependencies and cycles are rejected.
@@ -88,12 +88,12 @@ A one-shot task omits `--goal`. The task is registered as `draft` and the JSON i
 ### Change a goal or a task's goal
 
 ```sh
-"$TASKQ" goal list                         # every goal with its task counts by status
-"$TASKQ" goal show ID                      # the goal, its tasks (id, title, status), its events
-"$TASKQ" set-goal TASK GOAL                # move a draft or ready task into an open goal
-"$TASKQ" set-goal TASK --none              # take a draft or ready task out of its goal
-"$TASKQ" goal edit ID --constraints "..."  # replace one or more fields (--title, --description, --acceptance, --constraints, --doc; --doc "" clears it)
-"$TASKQ" goal close ID --verdict achieved  # or abandoned; see section 4
+"$DAGQ" goal list                         # every goal with its task counts by status
+"$DAGQ" goal show ID                      # the goal, its tasks (id, title, status), its events
+"$DAGQ" set-goal TASK GOAL                # move a draft or ready task into an open goal
+"$DAGQ" set-goal TASK --none              # take a draft or ready task out of its goal
+"$DAGQ" goal edit ID --constraints "..."  # replace one or more fields (--title, --description, --acceptance, --constraints, --doc; --doc "" clears it)
+"$DAGQ" goal close ID --verdict achieved  # or abandoned; see section 4
 ```
 
 `set-goal` follows the dependency rules: only a `draft` or `ready` task can be moved, and a closed goal accepts no task. Take an `in_progress` task back with `draft ID` only if its run is finished; a `completed` task keeps the goal it landed with. `goal edit` records the old and new fields in a `goal_updated` event; a run already claimed keeps the prompt it started with, and runs claimed afterwards see the new text.
@@ -102,24 +102,24 @@ A one-shot task omits `--goal`. The task is registered as `draft` and the JSON i
 
 | Command | Use |
 | --- | --- |
-| `"$TASKQ" goal list` | All goals with `id`, `title`, `closed`, `verdict`, and `tasks` counts (`total`, `draft`, `ready`, `in_progress`, `completed`, `canceled`) |
-| `"$TASKQ" goal show ID` | `goal` (all fields), `tasks` (`id`, `title`, `status`), `closed`, `events` (`goal_created`, `goal_updated`, `goal_closed`) |
-| `"$TASKQ" list` | All tasks with `id`, `title`, `status`, `goal_id` |
-| `"$TASKQ" show ID` | `task` (with `goal_id` and `context`), `dependencies`, `runs`, `events`, `processes` |
-| `"$TASKQ" candidates` | What the next `supervise` would pick |
-| `"$TASKQ" locate` | The queue this directory resolves to (`db`, `runs_dir`, `git_common_dir`, `db_exists`) without opening it |
-| `"$TASKQ" status` | `supervisors`: every registered `supervise` process (`pid`, `alive`, `parallel`, `heartbeat_age_secs`, `stale`, `run_ids`; listed even while it holds no run) plus any `integrate` process holding a lease (`registered: false`); `runs`: unfinished runs with their leases |
-| `"$TASKQ" doctor` | The same `supervisors`; per run: lease liveness, processes, worktree/receipt existence, `blockers`, `recoverable` |
+| `"$DAGQ" goal list` | All goals with `id`, `title`, `closed`, `verdict`, and `tasks` counts (`total`, `draft`, `ready`, `in_progress`, `completed`, `canceled`) |
+| `"$DAGQ" goal show ID` | `goal` (all fields), `tasks` (`id`, `title`, `status`), `closed`, `events` (`goal_created`, `goal_updated`, `goal_closed`) |
+| `"$DAGQ" list` | All tasks with `id`, `title`, `status`, `goal_id` |
+| `"$DAGQ" show ID` | `task` (with `goal_id` and `context`), `dependencies`, `runs`, `events`, `processes` |
+| `"$DAGQ" candidates` | What the next `supervise` would pick |
+| `"$DAGQ" locate` | The queue this directory resolves to (`db`, `runs_dir`, `git_common_dir`, `db_exists`) without opening it |
+| `"$DAGQ" status` | `supervisors`: every registered `supervise` process (`pid`, `alive`, `parallel`, `heartbeat_age_secs`, `stale`, `run_ids`; listed even while it holds no run) plus any `integrate` process holding a lease (`registered: false`); `runs`: unfinished runs with their leases |
+| `"$DAGQ" doctor` | The same `supervisors`; per run: lease liveness, processes, worktree/receipt existence, `blockers`, `recoverable` |
 
 Task `status`: `draft` → `ready` → `in_progress` → `completed`, or `canceled`. A task stays `in_progress` while any run is unfinished or awaiting integration.
 
 Run `status` in `runs` (latest last): `claimed`, `starting`, `running`, `validating` are unfinished; `awaiting_integration` means the receipt and verification passed and the run waits for `integrate` to land it on `main`; `integrating` means an `integrate` process is landing it right now; `needs_session` means the landing hit a rebase conflict or a failed verification and a resumed session must fix it (`last_error` says what); `integrated` means the run was squashed onto `main` (`result_commit` is the landed commit) and the task is `completed`; `failed` and `interrupted` keep their worktree and workspace for inspection, with the reason in `last_error`. Dependency-free tasks run in parallel (up to the supervisor's `--parallel`), each in its own workspace and worktree; a dependent task waits until every predecessor is `completed`.
 
-Useful run fields: `branch` (`taskq/<run-id>`), `worktree_path`, `workspace_id` (cmux), `run_dir` (prompt, logs, `receipt.json`, `verify-N.log`), `receipt_path`, `result_commit`, `last_error`, `workspace_closed_at`.
+Useful run fields: `branch` (`dagq/<run-id>`), `worktree_path`, `workspace_id` (cmux), `run_dir` (prompt, logs, `receipt.json`, `verify-N.log`), `receipt_path`, `result_commit`, `last_error`, `workspace_closed_at`.
 
 ## 4. Report results
 
-Judge completion only from `show`: the run's `status`, `result_commit`, `last_error`, and the `validation_finished` event. Neither a Stop hook firing, an idle session, nor the receipt file's existence means success; the supervisor validates the receipt against Git and the verification commands before a run becomes `awaiting_integration`. Summarize for the user: task status, latest run status, branch and commit to review, and the next step (`taskq-maintain` to start the runtime or integrate, `taskq-recover` if the run is stuck).
+Judge completion only from `show`: the run's `status`, `result_commit`, `last_error`, and the `validation_finished` event. Neither a Stop hook firing, an idle session, nor the receipt file's existence means success; the supervisor validates the receipt against Git and the verification commands before a run becomes `awaiting_integration`. Summarize for the user: task status, latest run status, branch and commit to review, and the next step (`dagq-maintain` to start the runtime or integrate, `dagq-recover` if the run is stuck).
 
 ### Close a goal
 
@@ -131,7 +131,7 @@ A goal is closed once, by the maintainer, after reviewing it; the runtime never 
 4. When nothing is missing, record the verdict:
 
 ```sh
-"$TASKQ" goal close ID --verdict achieved
+"$DAGQ" goal close ID --verdict achieved
 ```
 
 `achieved` is refused while any task is `draft`, `ready` or `in_progress` (the error names the count and status); cancel or finish them first. `abandoned` records that the goal is given up: it is refused while a task is `in_progress`, and it does not cancel the goal's `draft` or `ready` tasks, so cancel them yourself first or the supervisor still runs them. Both verdicts are final; further work on the same problem is a new goal. `goal show ID` afterwards has `closed: true` at the top level, `verdict` and `closed_at` inside `goal`, and a `goal_closed` event with the task counts at close time.

@@ -52,7 +52,7 @@ string_enum!(Provider { Claude => "claude" });
 
 // How `up` started a supervisor (ADR-0011). `Launchd` is the resident
 // LaunchAgent; `InCmux` is the fallback that runs `supervise` inside the cmux
-// workspace `taskq <repo> supervisor`, which nothing restarts. A registration
+// workspace `dagq <repo> supervisor`, which nothing restarts. A registration
 // without a mode was started by hand.
 string_enum!(SupervisorMode {
     Launchd => "launchd",
@@ -418,7 +418,7 @@ pub struct SupervisorRegistration {
     /// The cmux workspace `supervise` runs in, in [`SupervisorMode::InCmux`]
     /// only; `down` closes it when the supervisor is gone.
     pub workspace_id: Option<String>,
-    /// The `cmux-taskq` version of the process, written by that process
+    /// The `dagq` version of the process, written by that process
     /// itself when it registers. `None` is a supervisor that registered
     /// before the column existed; `up` treats it as a version that is not
     /// its own (ADR-0014).

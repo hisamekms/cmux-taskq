@@ -1,0 +1,85 @@
+#!/bin/sh
+# Launcher used by the claude-dagq plugin skills.
+#
+# Resolves the dagq binary (DAGQ_BIN, then PATH) and runs it from the current
+# directory, so the binary picks the queue of the repository that contains it
+# ($XDG_DATA_HOME/dagq/<hash>/queue.db). DAGQ_DB, when set, is passed as `--db`
+# to use another queue file. The launcher never opens the database itself.
+#
+#   dagq --resolve        print the binary, both versions and `locate`'s queue fields as one JSON object
+#   dagq --version|--help pass through to the binary
+#   dagq <command> ...    any dagq command, including init and locate
+set -eu
+
+RELEASES=https://github.com/hisamekms/dagq/releases
+
+json_string() {
+  printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'
+}
+
+fail() {
+  printf '{"error": "%s"}\n' "$(json_string "$1")" >&2
+  exit 1
+}
+
+# The plugin's own version, read out of the manifest next to this script. Empty
+# when the manifest is missing, which only happens outside a plugin checkout.
+plugin_dir=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
+plugin_version=$(
+  sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+    "$plugin_dir/.claude-plugin/plugin.json" 2>/dev/null | head -n 1
+)
+
+# `dagq --version` prints `dagq X.Y.Z`; keep the number alone.
+version_number() {
+  printf '%s' "$1" | sed -e 's/^dagq[[:space:]]*//' -e 's/[[:space:]].*//'
+}
+
+major_minor() {
+  printf '%s' "$1" | cut -d. -f1,2
+}
+
+resolve_binary() {
+  if [ -n "${DAGQ_BIN:-}" ]; then
+    [ -x "$DAGQ_BIN" ] || fail "DAGQ_BIN is not an executable file: $DAGQ_BIN"
+    printf '%s\n' "$DAGQ_BIN"
+  elif command -v dagq >/dev/null 2>&1; then
+    command -v dagq
+  else
+    fail "dagq was not found on PATH and DAGQ_BIN is unset. Download dagq-v${plugin_version:-<version>}-aarch64-apple-darwin.tar.gz from the GitHub Release at $RELEASES, verify it with the SHA256SUMS published beside it ('shasum -a 256 -c SHA256SUMS'), and move the extracted dagq into ~/.local/bin (which must be on PATH). When developing in the dagq repository, build it instead with 'cargo build --locked' and export DAGQ_BIN=/absolute/path/to/target/debug/dagq"
+  fi
+}
+
+binary=$(resolve_binary)
+
+case "${1:-}" in
+  --version | -V | --help | -h)
+    exec "$binary" "$@"
+    ;;
+  --resolve)
+    binary_version=$(version_number "$("$binary" --version)")
+    if [ -n "${DAGQ_DB:-}" ]; then
+      queue=$("$binary" --db "$DAGQ_DB" locate)
+    else
+      queue=$("$binary" locate)
+    fi
+    repo=$(git rev-parse --show-toplevel 2>/dev/null || true)
+    # `locate` prints a pretty JSON object; splice our fields in after its `{`.
+    printf '{"binary": "%s", "binary_version": "%s", "plugin_version": "%s", "repo": "%s",%s\n' \
+      "$(json_string "$binary")" "$(json_string "$binary_version")" \
+      "$(json_string "$plugin_version")" "$(json_string "$repo")" \
+      "${queue#\{}"
+    # A plugin and a binary that disagree in major.minor may not speak the same
+    # CLI. Report it and let the caller decide; the resolution itself is valid.
+    if [ -n "$plugin_version" ] && [ -n "$binary_version" ] &&
+      [ "$(major_minor "$plugin_version")" != "$(major_minor "$binary_version")" ]; then
+      printf '{"warning": "%s"}\n' "$(json_string "claude-dagq plugin $plugin_version and dagq binary $binary_version differ in major.minor; update the older one: the plugin with 'claude plugin update claude-dagq@dagq', the binary from $RELEASES")" >&2
+    fi
+    exit 0
+    ;;
+esac
+
+if [ -n "${DAGQ_DB:-}" ]; then
+  exec "$binary" --db "$DAGQ_DB" "$@"
+fi
+exec "$binary" "$@"

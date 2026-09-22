@@ -4,10 +4,10 @@
 //! maintainer workspace decision, and every `down` outcome. The real
 //! launchd and cmux path is `tests/e2e.rs`.
 use anyhow::{Result, bail};
-use cmux_taskq::{
+use dagq::{
     VERSION,
     application::{
-        AgentState, DetachedRefusal, LaunchAgent, ProcessControl, SupervisorEnvironment, TaskQueue,
+        AgentState, DetachedRefusal, LaunchAgent, ProcessControl, SupervisorEnvironment, TaskStore,
         WorkspaceBackend,
     },
     domain::{NewTask, SupervisorMode, TaskAction, TaskRun},
@@ -92,7 +92,7 @@ fn fixture() -> Fixture {
             queue: None,
             path: "/usr/bin:/bin:/home/u/.local/bin".into(),
             socket_password: None,
-            current_exe: "/opt/bin/cmux-taskq".into(),
+            current_exe: "/opt/bin/dagq".into(),
         },
         options: UpOptions {
             parallel: 2,
@@ -211,7 +211,7 @@ struct FakeCmux {
     detached_unreachable: bool,
     detached_preflights: Mutex<Vec<SupervisorEnvironment>>,
     closed: Mutex<Vec<String>>,
-    /// Queue a `taskq … supervisor` workspace registers a supervisor in,
+    /// Queue a `dagq … supervisor` workspace registers a supervisor in,
     /// the way the `supervise` cmux runs in its terminal would.
     registers_supervisor_in: Option<PathBuf>,
 }
@@ -374,7 +374,7 @@ fn claim_a_run(fixture: &Fixture, queue: &mut SqliteQueue, token: &str) -> Strin
         .claim_for_supervisor(&repository.base_commit, token)
         .unwrap()
     {
-        cmux_taskq::domain::ClaimOutcome::Claimed { run } => run.id,
+        dagq::domain::ClaimOutcome::Claimed { run } => run.id,
         outcome => panic!("expected a claim, got {outcome:?}"),
     }
 }
@@ -418,7 +418,7 @@ fn up_starts_the_agent_and_the_maintainer_once_and_reuses_them_after() {
         json!(fixture.location.log_dir)
     );
     assert_eq!(first["maintainer"]["outcome"], "created");
-    assert_eq!(first["maintainer"]["name"], "taskq my repo maintainer");
+    assert_eq!(first["maintainer"]["name"], "dagq my repo maintainer");
     assert_eq!(first["pruned_supervisors"], json!([]));
     assert_eq!(first["doctor"]["unfinished_runs"], json!([]));
     assert_eq!(first["doctor"]["awaiting_integration"], json!([]));
@@ -429,7 +429,7 @@ fn up_starts_the_agent_and_the_maintainer_once_and_reuses_them_after() {
     assert_eq!(installs.len(), 1);
     let (label, path, contents) = &installs[0];
     assert_eq!(label, &fixture.location.label);
-    assert!(label.starts_with("com.cmux-taskq."));
+    assert!(label.starts_with("com.dagq."));
     assert_eq!(path, &fixture.location.launch_agent);
     assert_eq!(
         path,
@@ -443,7 +443,7 @@ fn up_starts_the_agent_and_the_maintainer_once_and_reuses_them_after() {
     let string = |text: &str| format!("<string>{text}</string>");
     assert!(contents.contains(&format!("<key>Label</key>\n\t{}", string(label))));
     let arguments = [
-        "/opt/bin/cmux-taskq",
+        "/opt/bin/dagq",
         "--db",
         db.to_str().unwrap(),
         "supervise",
@@ -496,10 +496,10 @@ fn up_starts_the_agent_and_the_maintainer_once_and_reuses_them_after() {
     let workspaces = cmux.workspaces.lock().unwrap();
     assert_eq!(workspaces.len(), 1);
     let (name, cwd, id, command) = &workspaces[0];
-    assert_eq!(name, "taskq my repo maintainer");
+    assert_eq!(name, "dagq my repo maintainer");
     assert_eq!(cwd, &root);
     assert_eq!(first["maintainer"]["workspace_id"], json!(id));
-    assert!(command.starts_with("'env' 'CMUX_TASKQ_ROLE=maintainer' 'CMUX_TASKQ_QUEUE="));
+    assert!(command.starts_with("'env' 'DAGQ_ROLE=maintainer' 'DAGQ_QUEUE="));
     assert!(command.contains(&format!("'{}'", fixture.options.claude.display())));
     assert!(command.contains("'--plugin-dir'"));
     assert!(command.contains("You are the maintainer session"));
@@ -947,7 +947,7 @@ fn up_reports_runs_that_wait_for_the_maintainer() {
             })
             .unwrap();
         queue.transition(task.id, TaskAction::Ready).unwrap();
-        let cmux_taskq::domain::ClaimOutcome::Claimed { run } = queue
+        let dagq::domain::ClaimOutcome::Claimed { run } = queue
             .claim_for_supervisor(&repository.base_commit, "gone")
             .unwrap()
         else {
@@ -1019,7 +1019,7 @@ fn up_skips_the_maintainer_workspace_inside_a_maintainer_session_of_the_same_que
     assert_eq!(report["supervisor"]["outcome"], "started");
     assert_eq!(
         report["maintainer"],
-        json!({"outcome": "skipped", "workspace_id": null, "name": "taskq my repo maintainer"})
+        json!({"outcome": "skipped", "workspace_id": null, "name": "dagq my repo maintainer"})
     );
     assert_eq!(cmux.calls.load(Ordering::SeqCst), 0);
     assert!(cmux.workspaces.lock().unwrap().is_empty());
@@ -1128,7 +1128,7 @@ fn up_in_cmux_starts_the_supervisor_in_a_workspace_and_leaves_launchd_alone() {
     assert_eq!(first["supervisor"]["outcome"], "started", "{first}");
     assert_eq!(first["supervisor"]["mode"], "in_cmux");
     assert_eq!(first["supervisor"]["pid"], json!(std::process::id()));
-    assert_eq!(first["supervisor"]["name"], "taskq my repo supervisor");
+    assert_eq!(first["supervisor"]["name"], "dagq my repo supervisor");
     assert_eq!(first["supervisor"]["plist"], Value::Null);
     assert_eq!(
         first["supervisor"]["log_dir"],
@@ -1149,7 +1149,7 @@ fn up_in_cmux_starts_the_supervisor_in_a_workspace_and_leaves_launchd_alone() {
     let workspaces = cmux.workspaces.lock().unwrap();
     assert_eq!(workspaces.len(), 2, "{workspaces:?}");
     let (name, cwd, id, command) = &workspaces[0];
-    assert_eq!(name, "taskq my repo supervisor");
+    assert_eq!(name, "dagq my repo supervisor");
     assert_eq!(cwd, &root);
     assert_eq!(first["supervisor"]["workspace_id"], json!(id));
     let db = fixture.location.db.canonicalize().unwrap();
@@ -1157,7 +1157,7 @@ fn up_in_cmux_starts_the_supervisor_in_a_workspace_and_leaves_launchd_alone() {
     assert_eq!(
         command,
         &format!(
-            "'/opt/bin/cmux-taskq' '--db' {} 'supervise' '--parallel' '2' '--log-dir' {} '--cmux' {} '--claude' {}",
+            "'/opt/bin/dagq' '--db' {} 'supervise' '--parallel' '2' '--log-dir' {} '--cmux' {} '--claude' {}",
             quoted(&db),
             quoted(&fixture.location.log_dir),
             quoted(&fixture.options.cmux),
@@ -1167,7 +1167,7 @@ fn up_in_cmux_starts_the_supervisor_in_a_workspace_and_leaves_launchd_alone() {
     // The fixture's queue directory has an apostrophe: cmux types this
     // into a login shell, so every argument is quoted on its own.
     assert!(command.contains(r#"queue'"'"'s dir"#), "{command}");
-    assert_eq!(workspaces[1].0, "taskq my repo maintainer");
+    assert_eq!(workspaces[1].0, "dagq my repo maintainer");
     drop(workspaces);
 
     // The registration carries the mode and the workspace, and `status`
@@ -1182,13 +1182,13 @@ fn up_in_cmux_starts_the_supervisor_in_a_workspace_and_leaves_launchd_alone() {
         registrations[0].workspace_id.as_deref(),
         first["supervisor"]["workspace_id"].as_str()
     );
-    let status = cmux_taskq::runtime::status(&fixture.location.db).unwrap();
+    let status = dagq::runtime::status(&fixture.location.db).unwrap();
     assert_eq!(status["supervisors"][0]["mode"], "in_cmux", "{status}");
     assert_eq!(
         status["supervisors"][0]["workspace_id"],
         first["supervisor"]["workspace_id"]
     );
-    let doctor = cmux_taskq::runtime::doctor(&fixture.location.db).unwrap();
+    let doctor = dagq::runtime::doctor(&fixture.location.db).unwrap();
     assert_eq!(doctor["supervisors"][0]["mode"], "in_cmux", "{doctor}");
 
     // Idempotent: the live registration is reused with the mode it was
@@ -1255,7 +1255,7 @@ fn up_in_cmux_does_not_mistake_a_silent_supervisor_for_the_one_it_started() {
 
 /// cmux keeps a workspace open after its command exits, so a supervisor
 /// that crashed (or one that is alive but silent, which `up` never reuses)
-/// leaves `taskq <repo> supervisor` behind. `up --in-cmux` stops rather
+/// leaves `dagq <repo> supervisor` behind. `up --in-cmux` stops rather
 /// than open a second one; closing it is the maintainer's call.
 #[test]
 fn up_in_cmux_refuses_to_open_a_second_supervisor_workspace() {
@@ -1265,11 +1265,7 @@ fn up_in_cmux_refuses_to_open_a_second_supervisor_workspace() {
     let launchd = FakeLaunchd::new(&fixture.location.db);
     let processes = FakeProcesses::default();
     let leftover = cmux
-        .create_named(
-            "taskq my repo supervisor",
-            &fixture.repo,
-            "cmux-taskq supervise",
-        )
+        .create_named("dagq my repo supervisor", &fixture.repo, "dagq supervise")
         .unwrap();
     let error = lifecycle::up(
         &fixture.location,
@@ -1283,7 +1279,7 @@ fn up_in_cmux_refuses_to_open_a_second_supervisor_workspace() {
     .unwrap_err();
     let message = format!("{error:#}");
     assert!(message.contains(&leftover), "{message}");
-    assert!(message.contains("taskq my repo supervisor"), "{message}");
+    assert!(message.contains("dagq my repo supervisor"), "{message}");
     assert!(
         message.contains(&format!("cmux workspace close {leftover}")),
         "{message}"
@@ -1311,7 +1307,7 @@ fn down_interrupts_an_in_cmux_supervisor_and_closes_its_workspace_once_it_is_gon
     let pid = std::process::id();
     let cmux = FakeCmux::default();
     let workspace = cmux
-        .create_named("taskq my repo supervisor", &fixture.repo, "supervise")
+        .create_named("dagq my repo supervisor", &fixture.repo, "supervise")
         .unwrap();
     queue
         .register_supervisor("in-cmux", pid, 2, VERSION)
@@ -1385,7 +1381,7 @@ fn down_force_kills_an_in_cmux_supervisor_and_closes_or_reports_its_workspace() 
     let pid = std::process::id();
     let cmux = FakeCmux::default();
     let workspace = cmux
-        .create_named("taskq my repo supervisor", &fixture.repo, "supervise")
+        .create_named("dagq my repo supervisor", &fixture.repo, "supervise")
         .unwrap();
     queue
         .register_supervisor("in-cmux", pid, 2, VERSION)
@@ -1511,7 +1507,7 @@ fn down_stops_a_launchd_and_an_in_cmux_supervisor_in_one_call() {
     let in_cmux_pid = dead_pid(); // any pid the fake treats as alive
     let cmux = FakeCmux::default();
     let workspace = cmux
-        .create_named("taskq my repo supervisor", &fixture.repo, "supervise")
+        .create_named("dagq my repo supervisor", &fixture.repo, "supervise")
         .unwrap();
     queue
         .register_supervisor("agent", agent_pid, 4, VERSION)
@@ -1707,22 +1703,21 @@ fn down_force_kills_after_the_unload_and_drops_the_registration() {
 fn maintainer_prompt_names_the_queue_the_logs_the_skill_and_the_rules() {
     let prompt =
         maintainer_prompt(Path::new("/data/q/queue.db"), Path::new("/data/q/logs")).unwrap();
-    assert!(prompt.starts_with(
-        "You are the maintainer session of the cmux-taskq queue at /data/q/queue.db.\n"
-    ));
-    assert!(prompt.contains("supervisor is the resident `cmux-taskq supervise` process"));
+    assert!(
+        prompt
+            .starts_with("You are the maintainer session of the dagq queue at /data/q/queue.db.\n")
+    );
+    assert!(prompt.contains("supervisor is the resident `dagq supervise` process"));
     assert!(prompt.contains("maintainer is this session"));
     assert!(prompt.contains("worker is the Claude session of one run"));
     assert!(prompt.contains("logs to /data/q/logs"));
-    assert!(prompt.contains("taskq-maintain skill"));
+    assert!(prompt.contains("dagq-maintain skill"));
     assert!(prompt.contains("run status and doctor"));
     assert!(prompt.contains(
         "stale supervisors, unfinished runs, runs awaiting_integration and runs in needs_session"
     ));
     assert!(prompt.contains("wait for the user's instructions"));
-    assert!(
-        prompt.contains("If the taskq-maintain skill is not available in this session, say so")
-    );
+    assert!(prompt.contains("If the dagq-maintain skill is not available in this session, say so"));
     assert!(prompt.contains("Never open or edit the queue database directly"));
 
     // The workspace command carries the role, the queue, the plugin and the
@@ -1731,14 +1726,14 @@ fn maintainer_prompt_names_the_queue_the_logs_the_skill_and_the_rules() {
         Path::new("/data/q's/queue.db"),
         Path::new("/data/q's/logs"),
         Path::new("/opt/claude"),
-        Some(Path::new("/plugins/claude-taskq")),
+        Some(Path::new("/plugins/claude-dagq")),
     )
     .unwrap();
     assert!(command.starts_with(
-        "'env' 'CMUX_TASKQ_ROLE=maintainer' 'CMUX_TASKQ_QUEUE=/data/q'\"'\"'s/queue.db' '/opt/claude' '--plugin-dir' '/plugins/claude-taskq' '--' 'You are the maintainer session"
+        "'env' 'DAGQ_ROLE=maintainer' 'DAGQ_QUEUE=/data/q'\"'\"'s/queue.db' '/opt/claude' '--plugin-dir' '/plugins/claude-dagq' '--' 'You are the maintainer session"
     ), "{command}");
-    assert_eq!(ROLE_ENV, "CMUX_TASKQ_ROLE");
-    assert_eq!(QUEUE_ENV, "CMUX_TASKQ_QUEUE");
+    assert_eq!(ROLE_ENV, "DAGQ_ROLE");
+    assert_eq!(QUEUE_ENV, "DAGQ_QUEUE");
     let bare = maintainer_command(
         Path::new("/data/q/queue.db"),
         Path::new("/data/q/logs"),
@@ -1879,7 +1874,7 @@ fn up_in_cmux_replaces_an_in_cmux_supervisor_of_another_version() {
     // going through `create_named` would register a supervisor for it.
     let workspace = "01234567-89ab-4def-8123-0000000000ff".to_owned();
     cmux.workspaces.lock().unwrap().push((
-        "taskq my repo supervisor".into(),
+        "dagq my repo supervisor".into(),
         fixture.repo.clone(),
         workspace.clone(),
         "supervise".into(),
@@ -2076,7 +2071,7 @@ fn up_proves_the_detached_connection_before_draining_the_old_supervisor() {
     assert_eq!(registrations[0].token, "old");
 }
 
-/// `--in-cmux` needs the name `taskq <repo> supervisor`, and a workspace
+/// `--in-cmux` needs the name `dagq <repo> supervisor`, and a workspace
 /// the replacement will not close holds it: a crashed in-cmux supervisor
 /// whose registration an earlier `up` pruned leaves one behind. That has
 /// to be found before the drain, or a working supervisor is spent and the
@@ -2091,7 +2086,7 @@ fn up_in_cmux_refuses_a_leftover_supervisor_workspace_before_draining() {
     // Left by a supervisor that is no longer registered at all.
     let orphan = "01234567-89ab-4def-8123-0000000000aa".to_owned();
     cmux.workspaces.lock().unwrap().push((
-        "taskq my repo supervisor".into(),
+        "dagq my repo supervisor".into(),
         fixture.repo.clone(),
         orphan.clone(),
         "supervise".into(),
@@ -2181,7 +2176,7 @@ fn up_drops_the_row_of_a_replaced_supervisor_that_died_without_deregistering() {
     };
     let workspace = "01234567-89ab-4def-8123-0000000000bb".to_owned();
     cmux.workspaces.lock().unwrap().push((
-        "taskq my repo supervisor".into(),
+        "dagq my repo supervisor".into(),
         fixture.repo.clone(),
         workspace.clone(),
         "supervise".into(),

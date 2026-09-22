@@ -6,7 +6,7 @@ use std::{
     process::{Command, Output},
 };
 
-use cmux_taskq::infrastructure::{location::repository_hash, sqlite::SqliteQueue};
+use dagq::infrastructure::{location::repository_hash, sqlite::SqliteQueue};
 use serde_json::Value;
 use tempfile::TempDir;
 
@@ -37,7 +37,7 @@ fn repository(dir: &Path, name: &str) -> PathBuf {
 /// Run the binary from `cwd` with a controlled environment; `env` overrides
 /// `XDG_DATA_HOME`/`HOME` (both removed first) so no real queue is touched.
 fn invoke(cwd: &Path, env: &[(&str, &Path)], args: &[&str]) -> Output {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_cmux-taskq"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_dagq"));
     command
         .env_remove("XDG_DATA_HOME")
         .env_remove("HOME")
@@ -69,7 +69,7 @@ fn error(cwd: &Path, env: &[(&str, &Path)], args: &[&str]) -> String {
 fn expected_db(data_home: &Path, repo: &Path) -> PathBuf {
     let common_dir = repo.join(".git").canonicalize().unwrap();
     data_home
-        .join("cmux-taskq")
+        .join("dagq")
         .join(repository_hash(&common_dir))
         .join("queue.db")
 }
@@ -102,7 +102,7 @@ fn every_worktree_of_a_repository_shares_one_queue_under_the_data_home() {
     // The LaunchAgent is named after the queue, lives under HOME, and is
     // reported before `up` writes it.
     let hash = db.parent().unwrap().file_name().unwrap().to_str().unwrap();
-    assert_eq!(located["label"], format!("com.cmux-taskq.{hash}"));
+    assert_eq!(located["label"], format!("com.dagq.{hash}"));
     let home = dir.path().join("home");
     let with_home = ok(
         &repo,
@@ -115,7 +115,7 @@ fn every_worktree_of_a_repository_shares_one_queue_under_the_data_home() {
     assert_eq!(
         with_home["launch_agent"],
         home.join("Library/LaunchAgents")
-            .join(format!("com.cmux-taskq.{hash}.plist"))
+            .join(format!("com.dagq.{hash}.plist"))
             .to_str()
             .unwrap()
     );
@@ -174,7 +174,7 @@ fn every_worktree_of_a_repository_shares_one_queue_under_the_data_home() {
             "add",
             "-q",
             "-b",
-            "taskq/fake-run",
+            "dagq/fake-run",
             run_worktree.to_str().unwrap(),
         ],
     );

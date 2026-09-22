@@ -1,8 +1,8 @@
 use std::sync::{Arc, Barrier};
 
-use cmux_taskq::{
+use dagq::{
     VERSION,
-    application::TaskQueue,
+    application::TaskStore,
     domain::{
         ClaimOutcome, GoalEdit, GoalVerdict, NewGoal, NewTask, Provider, RunStatus, SupervisorMode,
         TaskAction, TaskStatus,
@@ -366,7 +366,7 @@ fn awaiting_integration_keeps_dependents_blocked_but_frees_execution_slot() {
     };
     let raw = Connection::open(dir.path().join("queue.db")).unwrap();
     raw.execute(
-        "UPDATE task_runs SET status='awaiting_integration', branch='taskq/a',
+        "UPDATE task_runs SET status='awaiting_integration', branch='dagq/a',
         worktree_path='/tmp/a', workspace_id='ws-a', receipt_path='/tmp/receipt.json',
         log_path='/tmp/run.log', result_commit=?1 WHERE id=?2",
         rusqlite::params![BASE, run.id],

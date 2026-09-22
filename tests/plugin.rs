@@ -1,4 +1,4 @@
-//! The Claude Code plugin in `plugins/claude-taskq` is data plus one launcher
+//! The Claude Code plugin in `plugins/claude-dagq` is data plus one launcher
 //! script. These tests catch a broken manifest, skill frontmatter, or launcher
 //! before `claude plugin validate` or a real session would.
 
@@ -16,7 +16,7 @@ fn repository_root() -> &'static Path {
 }
 
 fn plugin_root() -> PathBuf {
-    repository_root().join("plugins/claude-taskq")
+    repository_root().join("plugins/claude-dagq")
 }
 
 fn plugin_manifest() -> Value {
@@ -56,14 +56,9 @@ fn frontmatter(skill: &str) -> Vec<(String, String)> {
 #[test]
 fn manifest_names_the_plugin_and_tracks_the_crate_version() {
     let manifest = plugin_manifest();
-    assert_eq!(manifest["name"], "claude-taskq");
+    assert_eq!(manifest["name"], "claude-dagq");
     assert_eq!(manifest["version"], env!("CARGO_PKG_VERSION"));
-    assert!(
-        manifest["description"]
-            .as_str()
-            .unwrap()
-            .contains("cmux-taskq")
-    );
+    assert!(manifest["description"].as_str().unwrap().contains("dagq"));
     // Component paths are optional; if given they must stay inside the plugin.
     for key in ["skills", "commands", "agents", "hooks"] {
         if let Some(path) = manifest[key].as_str() {
@@ -82,7 +77,7 @@ fn every_skill_has_valid_frontmatter_and_uses_the_launcher() {
         .iter()
         .map(|d| d.file_name().unwrap().to_string_lossy().into_owned())
         .collect();
-    assert_eq!(names, ["taskq", "taskq-maintain", "taskq-recover"]);
+    assert_eq!(names, ["dagq", "dagq-maintain", "dagq-recover"]);
     for dir in &dirs {
         let skill = fs::read_to_string(dir.join("SKILL.md")).unwrap();
         let fields = frontmatter(&skill);
@@ -106,7 +101,7 @@ fn every_skill_has_valid_frontmatter_and_uses_the_launcher() {
             description.len()
         );
         assert!(
-            skill.contains("${CLAUDE_PLUGIN_ROOT}/bin/taskq"),
+            skill.contains("${CLAUDE_PLUGIN_ROOT}/bin/dagq"),
             "{name} must call the launcher"
         );
         assert!(
@@ -118,10 +113,10 @@ fn every_skill_has_valid_frontmatter_and_uses_the_launcher() {
 
 /// `XDG_DATA_HOME` is always pointed away from the developer's real queues.
 fn launcher(env: &[(&str, &str)], data_home: &Path, cwd: &Path, args: &[&str]) -> Output {
-    let mut command = Command::new(plugin_root().join("bin/taskq"));
+    let mut command = Command::new(plugin_root().join("bin/dagq"));
     command
-        .env_remove("CMUX_TASKQ_BIN")
-        .env_remove("CMUX_TASKQ_DB")
+        .env_remove("DAGQ_BIN")
+        .env_remove("DAGQ_DB")
         .env("XDG_DATA_HOME", data_home)
         .env("PATH", "/usr/bin:/bin")
         .current_dir(cwd)
@@ -155,11 +150,11 @@ fn launcher_resolves_the_binary_and_the_repository_queue_under_the_data_home() {
             .unwrap()
             .success()
     );
-    let binary = env!("CARGO_BIN_EXE_cmux-taskq");
-    let env = [("CMUX_TASKQ_BIN", binary)];
+    let binary = env!("CARGO_BIN_EXE_dagq");
+    let env = [("DAGQ_BIN", binary)];
     let git_dir = repo.join(".git").canonicalize().unwrap();
-    let hash = cmux_taskq::infrastructure::location::repository_hash(&git_dir);
-    let expected_db = data_home.join("cmux-taskq").join(&hash).join("queue.db");
+    let hash = dagq::infrastructure::location::repository_hash(&git_dir);
+    let expected_db = data_home.join("dagq").join(&hash).join("queue.db");
 
     let resolved = stdout_json(&launcher(&env, &data_home, &repo, &["--resolve"]));
     assert_eq!(resolved["binary"], binary);
@@ -233,10 +228,7 @@ fn launcher_resolves_the_binary_and_the_repository_queue_under_the_data_home() {
     );
     // An explicit database path wins over the convention, for --resolve too.
     let other = dir.path().join("other.db");
-    let env_db = [
-        ("CMUX_TASKQ_BIN", binary),
-        ("CMUX_TASKQ_DB", other.to_str().unwrap()),
-    ];
+    let env_db = [("DAGQ_BIN", binary), ("DAGQ_DB", other.to_str().unwrap())];
     let init = stdout_json(&launcher(&env_db, &data_home, &repo, &["init"]));
     assert_eq!(init["db"], other.to_str().unwrap());
     let resolved = stdout_json(&launcher(&env_db, &data_home, dir.path(), &["--resolve"]));
@@ -246,7 +238,7 @@ fn launcher_resolves_the_binary_and_the_repository_queue_under_the_data_home() {
     // Pass-through flags need no database.
     let version = launcher(&env, &data_home, dir.path(), &["--version"]);
     assert!(version.status.success());
-    assert!(String::from_utf8_lossy(&version.stdout).starts_with("cmux-taskq "));
+    assert!(String::from_utf8_lossy(&version.stdout).starts_with("dagq "));
 }
 
 #[test]
@@ -258,12 +250,12 @@ fn launcher_reports_missing_binary_and_repository_as_json_errors() {
     let error: Value = serde_json::from_slice(&missing.stderr).unwrap();
     let message = error["error"].as_str().unwrap();
     assert!(
-        message.contains("https://github.com/hisamekms/cmux-taskq/releases"),
+        message.contains("https://github.com/hisamekms/dagq/releases"),
         "{message}"
     );
     assert!(
         message.contains(&format!(
-            "cmux-taskq-v{}-aarch64-apple-darwin.tar.gz",
+            "dagq-v{}-aarch64-apple-darwin.tar.gz",
             plugin_manifest()["version"].as_str().unwrap()
         )),
         "{message}"
@@ -271,12 +263,12 @@ fn launcher_reports_missing_binary_and_repository_as_json_errors() {
     assert!(message.contains("SHA256SUMS"), "{message}");
     assert!(message.contains("~/.local/bin"), "{message}");
     assert!(message.contains("cargo build --locked"), "{message}");
-    assert!(message.contains("CMUX_TASKQ_BIN"), "{message}");
+    assert!(message.contains("DAGQ_BIN"), "{message}");
 
     let bogus = dir.path().join("not-executable");
     fs::write(&bogus, "").unwrap();
     let bad = launcher(
-        &[("CMUX_TASKQ_BIN", bogus.to_str().unwrap())],
+        &[("DAGQ_BIN", bogus.to_str().unwrap())],
         &data_home,
         dir.path(),
         &["list"],
@@ -292,7 +284,7 @@ fn launcher_reports_missing_binary_and_repository_as_json_errors() {
 
     // Outside a repository the binary itself explains how to point at a queue.
     let outside = launcher(
-        &[("CMUX_TASKQ_BIN", env!("CARGO_BIN_EXE_cmux-taskq"))],
+        &[("DAGQ_BIN", env!("CARGO_BIN_EXE_dagq"))],
         &data_home,
         dir.path(),
         &["list"],
@@ -311,16 +303,16 @@ fn the_marketplace_offers_this_repository_s_plugin_from_its_own_path() {
         &fs::read_to_string(repository_root().join(".claude-plugin/marketplace.json")).unwrap(),
     )
     .unwrap();
-    // `claude plugin marketplace add hisamekms/cmux-taskq` reads this file, and
-    // `claude plugin install claude-taskq@cmux-taskq` the entry below.
-    assert_eq!(marketplace["name"], "cmux-taskq");
+    // `claude plugin marketplace add hisamekms/dagq` reads this file, and
+    // `claude plugin install claude-dagq@dagq` the entry below.
+    assert_eq!(marketplace["name"], "dagq");
     assert_eq!(marketplace["owner"]["name"], "hisamekms");
     let plugins = marketplace["plugins"].as_array().expect("plugins");
     assert_eq!(plugins.len(), 1);
     let entry = &plugins[0];
     assert_eq!(entry["name"], plugin_manifest()["name"]);
     let source = entry["source"].as_str().expect("a path source");
-    assert_eq!(source, "./plugins/claude-taskq");
+    assert_eq!(source, "./plugins/claude-dagq");
     assert_eq!(
         repository_root().join(source.trim_start_matches("./")),
         plugin_root()
@@ -330,14 +322,14 @@ fn the_marketplace_offers_this_repository_s_plugin_from_its_own_path() {
 
 /// A stub that answers only `--version` and `locate`, which is all `--resolve`
 /// asks of the binary. It lets the version comparison be tested without
-/// building a second cmux-taskq.
+/// building a second dagq.
 fn fake_binary(dir: &Path, name: &str, version: &str) -> PathBuf {
     let path = dir.join(name);
     fs::write(
         &path,
         format!(
             "#!/bin/sh\ncase \"$1\" in\n\
-             --version) echo 'cmux-taskq {version}' ;;\n\
+             --version) echo 'dagq {version}' ;;\n\
              locate) printf '{{\\n  \"db\": \"/fake/queue.db\"\\n}}\\n' ;;\n\
              esac\n"
         ),
@@ -360,7 +352,7 @@ fn launcher_warns_only_when_plugin_and_binary_differ_in_major_minor() {
     let same = format!("{major}.{minor}.99");
     let binary = fake_binary(dir.path(), "same", &same);
     let output = launcher(
-        &[("CMUX_TASKQ_BIN", binary.to_str().unwrap())],
+        &[("DAGQ_BIN", binary.to_str().unwrap())],
         &data_home,
         dir.path(),
         &["--resolve"],
@@ -380,7 +372,7 @@ fn launcher_warns_only_when_plugin_and_binary_differ_in_major_minor() {
     let other = format!("{major}.{}.0", minor + 1);
     let binary = fake_binary(dir.path(), "other", &other);
     let output = launcher(
-        &[("CMUX_TASKQ_BIN", binary.to_str().unwrap())],
+        &[("DAGQ_BIN", binary.to_str().unwrap())],
         &data_home,
         dir.path(),
         &["--resolve"],
@@ -393,7 +385,7 @@ fn launcher_warns_only_when_plugin_and_binary_differ_in_major_minor() {
     assert!(message.contains(&other), "{message}");
     assert!(message.contains("claude plugin update"), "{message}");
     assert!(
-        message.contains("https://github.com/hisamekms/cmux-taskq/releases"),
+        message.contains("https://github.com/hisamekms/dagq/releases"),
         "{message}"
     );
 }

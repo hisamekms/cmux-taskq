@@ -14,8 +14,8 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use serde_json::{Value, json};
 
-use cmux_taskq::{
-    application::TaskQueue,
+use dagq::{
+    application::TaskStore,
     domain::{GoalEdit, GoalVerdict, NewGoal, NewTask, TaskAction},
     infrastructure::{adapters::path_text, location::QueueLocation, sqlite::SqliteQueue},
 };
@@ -27,7 +27,7 @@ use cmux_taskq::{
 )]
 struct Cli {
     /// Queue database path. Without it, the queue of the repository containing
-    /// the working directory is used: $XDG_DATA_HOME/cmux-taskq/<hash>/queue.db.
+    /// the working directory is used: $XDG_DATA_HOME/dagq/<hash>/queue.db.
     #[arg(long)]
     db: Option<PathBuf>,
     #[command(subcommand)]
@@ -120,7 +120,7 @@ enum Command {
         /// Maximum number of runs the supervisor executes at once.
         #[arg(long, default_value_t = 4, value_parser = clap::value_parser!(u16).range(1..))]
         parallel: u16,
-        /// Run the supervisor in the cmux workspace `taskq <repo> supervisor`
+        /// Run the supervisor in the cmux workspace `dagq <repo> supervisor`
         /// instead of under launchd: no socket password needed, and nothing
         /// restarts it if it stops.
         #[arg(long)]
@@ -353,7 +353,7 @@ fn execute(cli: Cli) -> Result<Value> {
             none: _,
         } => serde_json::to_value(queue.set_goal(task, goal)?)?,
         Command::Candidates => serde_json::to_value(queue.candidates()?)?,
-        Command::Status => cmux_taskq::runtime::status(&db)?,
+        Command::Status => dagq::runtime::status(&db)?,
         Command::Supervise {
             repo,
             parallel,
@@ -362,15 +362,15 @@ fn execute(cli: Cli) -> Result<Value> {
             claude,
             log_dir,
         } => {
-            use cmux_taskq::infrastructure::adapters::{Cmux, executable};
-            use cmux_taskq::runtime::SuperviseOptions;
+            use dagq::infrastructure::adapters::{Cmux, executable};
+            use dagq::runtime::SuperviseOptions;
             let options = SuperviseOptions {
                 parallel: usize::from(parallel),
                 once,
                 stop: install_stop_signal()?,
                 log_dir,
             };
-            cmux_taskq::runtime::supervise(
+            dagq::runtime::supervise(
                 &db,
                 &checkout(repo),
                 &Cmux {
@@ -390,12 +390,12 @@ fn execute(cli: Cli) -> Result<Value> {
             cmux,
             claude,
         } => {
-            use cmux_taskq::infrastructure::adapters::SOCKET_PASSWORD_ENV;
-            use cmux_taskq::infrastructure::{
+            use dagq::infrastructure::adapters::SOCKET_PASSWORD_ENV;
+            use dagq::infrastructure::{
                 adapters::{Cmux, SystemProcesses, executable},
                 launchd::Launchctl,
             };
-            use cmux_taskq::lifecycle::{QUEUE_ENV, ROLE_ENV, UpEnvironment, UpOptions};
+            use dagq::lifecycle::{QUEUE_ENV, ROLE_ENV, UpEnvironment, UpOptions};
             let environment = UpEnvironment {
                 role: env::var(ROLE_ENV).ok(),
                 queue: env::var_os(QUEUE_ENV).map(PathBuf::from),
@@ -415,7 +415,7 @@ fn execute(cli: Cli) -> Result<Value> {
                 startup_timeout: Duration::from_secs(30),
                 poll: Duration::from_millis(500),
             };
-            cmux_taskq::lifecycle::up(
+            dagq::lifecycle::up(
                 &location,
                 &checkout(repo),
                 &Cmux {
@@ -428,15 +428,15 @@ fn execute(cli: Cli) -> Result<Value> {
             )?
         }
         Command::Down { wait, force, cmux } => {
-            use cmux_taskq::infrastructure::{
+            use dagq::infrastructure::{
                 adapters::{Cmux, SystemProcesses, executable},
                 launchd::Launchctl,
             };
-            use cmux_taskq::lifecycle::DownOptions;
+            use dagq::lifecycle::DownOptions;
             // cmux is only needed to close an in-cmux supervisor's
             // workspace, so a queue without one still goes down when cmux
             // is not installed; the unresolved name then fails only there.
-            cmux_taskq::lifecycle::down(
+            dagq::lifecycle::down(
                 &location,
                 &Cmux {
                     executable: executable(&cmux).unwrap_or(cmux),
@@ -451,17 +451,17 @@ fn execute(cli: Cli) -> Result<Value> {
             )?
         }
         Command::Integrate { id, next, repo } => {
-            use cmux_taskq::runtime::IntegrateTarget;
+            use dagq::runtime::IntegrateTarget;
             let target = match (id, next) {
                 (Some(id), false) => IntegrateTarget::Task(id),
                 _ => IntegrateTarget::Next,
             };
-            cmux_taskq::runtime::integrate(&db, target, &checkout(repo))?
+            dagq::runtime::integrate(&db, target, &checkout(repo))?
         }
-        Command::Doctor => cmux_taskq::runtime::doctor(&db)?,
-        Command::Recover { run } => cmux_taskq::runtime::recover(&db, &run)?,
+        Command::Doctor => dagq::runtime::doctor(&db)?,
+        Command::Recover { run } => dagq::runtime::recover(&db, &run)?,
         Command::Session { run, lease, claude } => {
-            cmux_taskq::runtime::session(&db, &run, &lease, &claude)?
+            dagq::runtime::session(&db, &run, &lease, &claude)?
         }
     })
 }

@@ -1,0 +1,11 @@
+{
+  "name": "claude-dagq",
+  "displayName": "dagq",
+  "version": "0.2.0",
+  "description": "Register, run, inspect, integrate, and recover dagq tasks through the locally built dagq binary. Skills only; the queue database is never touched directly.",
+  "author": {
+    "name": "hisamekms"
+  },
+  "repository": "https://github.com/hisamekms/dagq",
+  "keywords": ["cmux", "dagq", "worktree", "task-queue"]
+}

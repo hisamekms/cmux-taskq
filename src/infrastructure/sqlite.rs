@@ -9,7 +9,7 @@ use serde_json::json;
 use uuid::Uuid;
 
 use crate::{
-    application::TaskQueue,
+    application::TaskStore,
     domain::{
         ClaimOutcome, Goal, GoalDetail, GoalEdit, GoalSummary, GoalTask, GoalVerdict, NewGoal,
         NewTask, Predecessor, RunEvent, Task, TaskAction, TaskDetail, TaskRun, TaskStatus,
@@ -112,9 +112,9 @@ impl SqliteQueue {
                 [],
                 |r| r.get(0),
             )?;
-            ensure!(objects == 0, "database is not an empty cmux-taskq queue");
+            ensure!(objects == 0, "database is not an empty dagq queue");
         } else {
-            ensure!(app == APPLICATION_ID, "database is not a cmux-taskq queue");
+            ensure!(app == APPLICATION_ID, "database is not a dagq queue");
         }
         for (index, migration) in MIGRATIONS.iter().enumerate().skip(version as usize) {
             tx.execute_batch(migration)
@@ -137,7 +137,7 @@ impl SqliteQueue {
     }
 }
 
-impl TaskQueue for SqliteQueue {
+impl TaskStore for SqliteQueue {
     fn add(&mut self, task: NewTask) -> Result<Task> {
         task.validate()?;
         let tx = self

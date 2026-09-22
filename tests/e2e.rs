@@ -15,9 +15,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-const BIN: &str = env!("CARGO_BIN_EXE_cmux-taskq");
+const BIN: &str = env!("CARGO_BIN_EXE_dagq");
 /// The version the binary under test records on its registration.
-const VERSION: &str = cmux_taskq::VERSION;
+const VERSION: &str = dagq::VERSION;
 /// Longer than the supervisor's own 120 s exit-request timeout so its error
 /// surfaces first.
 const SUPERVISE_TIMEOUT: Duration = Duration::from_secs(180);
@@ -52,7 +52,7 @@ grep -q '"Stop"' "$settings" || { printf 'stub: settings lack a Stop hook\n' >&2
   printf 'argv: --session-id %s --debug-file %s --add-dir %s --settings %s\n' "$session_id" "$debug_file" "$add_dir" "$settings"
   printf 'cwd: %s\n' "$(pwd)"
 } > "$debug_file"
-run_id=$(printf '%s\n' "$prompt" | sed -n 's/^You are executing cmux-taskq task [0-9]*, run \(.*\)\.$/\1/p')
+run_id=$(printf '%s\n' "$prompt" | sed -n 's/^You are executing dagq task [0-9]*, run \(.*\)\.$/\1/p')
 [ "$run_id" = "$session_id" ] || { printf 'stub: prompt run %s != session %s\n' "$run_id" "$session_id" >&2; exit 65; }
 receipt=$(printf '%s\n' "$prompt" | sed -n 's/^Write a completion receipt to \(.*\) using a temporary file in the same directory.*/\1/p')
 [ -n "$receipt" ] || { printf 'stub: prompt does not name the receipt path\n' >&2; exit 65; }
@@ -77,14 +77,14 @@ printf 'bye\n'
 "#;
 
 fn cmux_executable() -> PathBuf {
-    env::var_os("CMUX_TASKQ_E2E_CMUX")
+    env::var_os("DAGQ_E2E_CMUX")
         .map(PathBuf::from)
         .unwrap_or_else(|| "cmux".into())
 }
 
 /// Fail loudly, never skip, when cmux is missing: the test would prove nothing.
 fn preflight(cmux: &Path) -> String {
-    let hint = "the e2e test needs a running cmux; put cmux on PATH or set CMUX_TASKQ_E2E_CMUX";
+    let hint = "the e2e test needs a running cmux; put cmux on PATH or set DAGQ_E2E_CMUX";
     let ping = Command::new(cmux)
         .arg("ping")
         .output()
@@ -123,11 +123,11 @@ struct Env {
     data_home: PathBuf,
 }
 
-fn taskq(env: &Env, args: &[&str]) -> Value {
-    taskq_with(env, &[], args)
+fn dagq(env: &Env, args: &[&str]) -> Value {
+    dagq_with(env, &[], args)
 }
 
-fn taskq_with(env: &Env, extra: &[(&str, &Path)], args: &[&str]) -> Value {
+fn dagq_with(env: &Env, extra: &[(&str, &Path)], args: &[&str]) -> Value {
     let mut command = Command::new(BIN);
     command
         .current_dir(&env.repo)
@@ -139,7 +139,7 @@ fn taskq_with(env: &Env, extra: &[(&str, &Path)], args: &[&str]) -> Value {
     let output = command.output().unwrap();
     assert!(
         output.status.success(),
-        "cmux-taskq {args:?}: {}",
+        "dagq {args:?}: {}",
         String::from_utf8_lossy(&output.stderr)
     );
     serde_json::from_slice(&output.stdout).unwrap()
@@ -258,14 +258,14 @@ fn fixture() -> Fixture {
         repo: repo.clone(),
         data_home: dir.path().join("data"),
     };
-    let init = taskq(&env, &["init"]);
+    let init = dagq(&env, &["init"]);
     assert_eq!(
         init["schema_version"],
-        cmux_taskq::infrastructure::sqlite::SqliteQueue::SCHEMA_VERSION
+        dagq::infrastructure::sqlite::SqliteQueue::SCHEMA_VERSION
     );
     let db = PathBuf::from(init["db"].as_str().unwrap());
-    assert!(db.starts_with(env.data_home.join("cmux-taskq")));
-    assert_eq!(taskq(&env, &["locate"])["db_exists"], true);
+    assert!(db.starts_with(env.data_home.join("dagq")));
+    assert_eq!(dagq(&env, &["locate"])["db_exists"], true);
     Fixture {
         _dir: dir,
         cmux,
@@ -294,8 +294,8 @@ fn add_ready_task(env: &Env, title: &str, dependencies: &[&str]) -> String {
     for dependency in dependencies {
         args.extend(["--depends-on", dependency]);
     }
-    let id = taskq(env, &args)["id"].to_string();
-    assert_eq!(taskq(env, &["ready", &id])["status"], "ready");
+    let id = dagq(env, &args)["id"].to_string();
+    assert_eq!(dagq(env, &["ready", &id])["status"], "ready");
     id
 }
 
@@ -353,7 +353,7 @@ fn supervise_once(
             if workspaces.iter().any(|(t, _)| t == task) {
                 continue;
             }
-            let detail = taskq(&fixture.env, &["show", task]);
+            let detail = dagq(&fixture.env, &["show", task]);
             if let Some(id) = detail["runs"]
                 .as_array()
                 .unwrap()
@@ -404,7 +404,7 @@ fn happy_path_runs_a_stub_agent_through_cmux_and_lands_on_main() {
         ..
     } = &fixture;
     let task_id = add_ready_task(env, "e2e stub task", &[]);
-    assert_eq!(taskq(env, &["candidates"]).as_array().unwrap().len(), 1);
+    assert_eq!(dagq(env, &["candidates"]).as_array().unwrap().len(), 1);
 
     let mut guard = WorkspaceGuard {
         cmux: cmux.clone(),
@@ -428,7 +428,7 @@ fn happy_path_runs_a_stub_agent_through_cmux_and_lands_on_main() {
     let repo = repo.as_path();
     let db = db.as_path();
 
-    let detail = taskq(env, &["show", &task_id]);
+    let detail = dagq(env, &["show", &task_id]);
     assert_eq!(detail["task"]["status"], "in_progress");
     let runs = detail["runs"].as_array().unwrap();
     assert_eq!(runs.len(), 1);
@@ -438,7 +438,7 @@ fn happy_path_runs_a_stub_agent_through_cmux_and_lands_on_main() {
     assert_eq!(run["workspace_id"], workspace.as_str());
     assert_eq!(run["base_commit"], base);
     assert!(run["last_error"].is_null());
-    assert_eq!(run["branch"], format!("taskq/{run_id}"));
+    assert_eq!(run["branch"], format!("dagq/{run_id}"));
     assert!(run["workspace_closed_at"].is_number(), "{run}");
     assert!(
         !workspace_listed(cmux, &workspace),
@@ -462,7 +462,7 @@ fn happy_path_runs_a_stub_agent_through_cmux_and_lands_on_main() {
         data_home: env.data_home.clone(),
     };
     assert_eq!(
-        taskq(&from_worktree, &["locate"])["db"],
+        dagq(&from_worktree, &["locate"])["db"],
         db.to_str().unwrap()
     );
     let head = git(worktree, &["rev-parse", "HEAD"]);
@@ -471,7 +471,7 @@ fn happy_path_runs_a_stub_agent_through_cmux_and_lands_on_main() {
     assert_eq!(run["result_commit"], head.as_str());
     assert_eq!(
         git(worktree, &["symbolic-ref", "HEAD"]),
-        format!("refs/heads/taskq/{run_id}")
+        format!("refs/heads/dagq/{run_id}")
     );
     assert_eq!(git(worktree, &["status", "--porcelain"]), "");
     assert_eq!(
@@ -556,13 +556,13 @@ fn happy_path_runs_a_stub_agent_through_cmux_and_lands_on_main() {
     assert!(processes.iter().all(|p| p["exit_code"] == 0));
 
     // The task stays taken until integration; the lease is gone.
-    assert_eq!(taskq(env, &["candidates"]).as_array().unwrap().len(), 0);
-    let status = taskq(env, &["status"]);
+    assert_eq!(dagq(env, &["candidates"]).as_array().unwrap().len(), 0);
+    let status = dagq(env, &["status"]);
     assert_eq!(status["supervisors"], Value::Array(vec![]), "{status}");
     assert_eq!(status["runs"], Value::Array(vec![]), "{status}");
 
     // Landing is the runtime's job: one squash commit on main with the run's tree.
-    let integrated = taskq(env, &["integrate", &task_id]);
+    let integrated = dagq(env, &["integrate", &task_id]);
     assert_eq!(integrated["outcome"], "integrated", "{integrated}");
     assert_eq!(integrated["task"]["status"], "completed");
     assert_eq!(integrated["run"]["status"], "integrated");
@@ -576,20 +576,20 @@ fn happy_path_runs_a_stub_agent_through_cmux_and_lands_on_main() {
     );
     assert_eq!(
         git(repo, &["log", "-1", "--format=%B", "main"]),
-        format!("e2e stub task\n\nadded e2e.txt\n\nTaskq-Task: {task_id}\nTaskq-Run: {run_id}")
+        format!("e2e stub task\n\nadded e2e.txt\n\nDagq-Task: {task_id}\nDagq-Run: {run_id}")
     );
     assert_eq!(git(repo, &["status", "--porcelain"]), ""); // The checkout moved with main.
     assert!(repo.join("e2e.txt").exists());
     assert_eq!(
-        git(repo, &["rev-parse", &format!("refs/taskq/runs/{run_id}")]),
+        git(repo, &["rev-parse", &format!("refs/dagq/runs/{run_id}")]),
         head
     );
     assert!(!worktree.exists(), "landed worktree was not removed");
     assert_eq!(
-        git(repo, &["branch", "--list", &format!("taskq/{run_id}")]),
+        git(repo, &["branch", "--list", &format!("dagq/{run_id}")]),
         ""
     );
-    let detail = taskq(env, &["show", &task_id]);
+    let detail = dagq(env, &["show", &task_id]);
     assert_eq!(detail["task"]["status"], "completed");
     assert_eq!(detail["runs"][0]["status"], "integrated");
     let kinds: Vec<&str> = detail["events"]
@@ -608,10 +608,10 @@ fn happy_path_runs_a_stub_agent_through_cmux_and_lands_on_main() {
     }
     assert!(!kinds.contains(&"cleanup_failed"), "{kinds:?}");
     assert_eq!(
-        taskq(env, &["integrate", "--next"])["outcome"],
+        dagq(env, &["integrate", "--next"])["outcome"],
         "no_run_awaiting"
     );
-    assert_eq!(taskq(env, &["status"])["runs"], Value::Array(vec![]));
+    assert_eq!(dagq(env, &["status"])["runs"], Value::Array(vec![]));
 }
 
 /// Two independent tasks run in two cmux workspaces at once; the task that
@@ -631,7 +631,7 @@ fn two_independent_tasks_run_concurrently_and_a_dependent_follows_integration() 
     let first = add_ready_task(env, "e2e first", &[]);
     let second = add_ready_task(env, "e2e second", &[]);
     let third = add_ready_task(env, "e2e dependent", &[&first]);
-    assert_eq!(taskq(env, &["candidates"]).as_array().unwrap().len(), 2);
+    assert_eq!(dagq(env, &["candidates"]).as_array().unwrap().len(), 2);
 
     let mut guard = WorkspaceGuard {
         cmux: cmux.clone(),
@@ -658,7 +658,7 @@ fn two_independent_tasks_run_concurrently_and_a_dependent_follows_integration() 
         "{outcome}"
     );
     for task in [&first, &second] {
-        let detail = taskq(env, &["show", task]);
+        let detail = dagq(env, &["show", task]);
         assert_eq!(detail["task"]["status"], "in_progress");
         let run = &detail["runs"][0];
         assert_eq!(run["status"], "awaiting_integration");
@@ -669,33 +669,33 @@ fn two_independent_tasks_run_concurrently_and_a_dependent_follows_integration() 
         assert_eq!(git(worktree, &["status", "--porcelain"]), "");
     }
     // The dependent never started: awaiting integration is not completion.
-    let detail = taskq(env, &["show", &third]);
+    let detail = dagq(env, &["show", &third]);
     assert_eq!(detail["task"]["status"], "ready");
     assert_eq!(detail["runs"], Value::Array(vec![]));
-    assert_eq!(taskq(env, &["candidates"]).as_array().unwrap().len(), 0);
-    assert_eq!(taskq(env, &["doctor"])["runs"], Value::Array(vec![]));
+    assert_eq!(dagq(env, &["candidates"]).as_array().unwrap().len(), 0);
+    assert_eq!(dagq(env, &["doctor"])["runs"], Value::Array(vec![]));
 
     // Land the first task; the dependent becomes claimable from the landed main.
-    let first_run = taskq(env, &["show", &first])["runs"][0].clone();
+    let first_run = dagq(env, &["show", &first])["runs"][0].clone();
     let first_commit = first_run["result_commit"].as_str().unwrap().to_owned();
-    assert_eq!(taskq(env, &["integrate", &first])["outcome"], "integrated");
+    assert_eq!(dagq(env, &["integrate", &first])["outcome"], "integrated");
     let first_landed = git(repo, &["rev-parse", "main"]);
     assert_ne!(first_landed, first_commit);
     assert_eq!(git(repo, &["rev-parse", "main^"]), base.as_str());
-    assert_eq!(taskq(env, &["candidates"])[0]["id"].to_string(), third);
+    assert_eq!(dagq(env, &["candidates"])[0]["id"].to_string(), third);
     let pass = supervise_once(&fixture, &["--parallel", "2"], &[&third], &mut guard);
     assert_eq!(pass.outcome["runs"].as_array().unwrap().len(), 1);
-    let run = taskq(env, &["show", &third])["runs"][0].clone();
+    let run = dagq(env, &["show", &third])["runs"][0].clone();
     assert_eq!(run["status"], "awaiting_integration", "{run}");
     assert_eq!(run["base_commit"], first_landed.as_str());
     assert_eq!(git(repo, &["rev-parse", "main"]), first_landed);
-    assert_eq!(taskq(env, &["status"])["supervisors"], Value::Array(vec![]));
+    assert_eq!(dagq(env, &["status"])["supervisors"], Value::Array(vec![]));
 
     // The merge queue is FIFO by validation time: --next takes the second
     // task first. It rewrote the same file as the first, so the runtime
     // cannot rebase it and parks it for a session; the next --next lands the
     // dependent, which sits on the first landing.
-    let parked = taskq(env, &["integrate", "--next"]);
+    let parked = dagq(env, &["integrate", "--next"]);
     assert_eq!(parked["outcome"], "needs_session", "{parked}");
     assert_eq!(parked["run"]["task_id"].to_string(), second);
     assert!(
@@ -705,14 +705,14 @@ fn two_independent_tasks_run_concurrently_and_a_dependent_follows_integration() 
             .contains("conflicted in e2e.txt"),
         "{parked}"
     );
-    let next = taskq(env, &["integrate", "--next"]);
+    let next = dagq(env, &["integrate", "--next"]);
     assert_eq!(next["outcome"], "integrated", "{next}");
     assert_eq!(next["task"]["id"].to_string(), third);
     let third_landed = git(repo, &["rev-parse", "main"]);
     assert_eq!(git(repo, &["rev-parse", "main^"]), first_landed);
 
     // The session resolves the parked run on top of main and rewrites its receipt.
-    let run = taskq(env, &["show", &second])["runs"][0].clone();
+    let run = dagq(env, &["show", &second])["runs"][0].clone();
     assert_eq!(run["status"], "needs_session");
     let worktree = Path::new(run["worktree_path"].as_str().unwrap());
     assert_eq!(
@@ -720,7 +720,7 @@ fn two_independent_tasks_run_concurrently_and_a_dependent_follows_integration() 
         run["result_commit"].as_str().unwrap()
     );
     assert_eq!(
-        taskq(env, &["integrate", "--next"])["outcome"],
+        dagq(env, &["integrate", "--next"])["outcome"],
         "no_run_awaiting"
     );
     let rebase = Command::new("git")
@@ -750,7 +750,7 @@ fn two_independent_tasks_run_concurrently_and_a_dependent_follows_integration() 
     receipt["summary"] = Value::String("resolved e2e.txt".into());
     fs::write(receipt_path.with_extension("tmp"), receipt.to_string()).unwrap();
     fs::rename(receipt_path.with_extension("tmp"), receipt_path).unwrap();
-    let landed = taskq(env, &["integrate", &second]);
+    let landed = dagq(env, &["integrate", &second]);
     assert_eq!(landed["outcome"], "integrated", "{landed}");
     assert_eq!(git(repo, &["rev-parse", "main^"]), third_landed);
     assert_eq!(
@@ -762,7 +762,7 @@ fn two_independent_tasks_run_concurrently_and_a_dependent_follows_integration() 
         "resolved by the session\n"
     );
     for task in [&first, &second, &third] {
-        let detail = taskq(env, &["show", task]);
+        let detail = dagq(env, &["show", task]);
         assert_eq!(detail["task"]["status"], "completed", "{task}");
         assert!(
             !Path::new(detail["runs"][0]["worktree_path"].as_str().unwrap()).exists(),
@@ -770,7 +770,7 @@ fn two_independent_tasks_run_concurrently_and_a_dependent_follows_integration() 
         );
     }
     assert_eq!(
-        git(repo, &["for-each-ref", "refs/taskq/runs/"])
+        git(repo, &["for-each-ref", "refs/dagq/runs/"])
             .lines()
             .count(),
         3
@@ -824,7 +824,7 @@ fn killed_supervisor_run_is_adopted_by_the_next_supervisor_and_lands() {
             started.elapsed() < SUPERVISE_TIMEOUT,
             "the worker did not start within {SUPERVISE_TIMEOUT:?}"
         );
-        let detail = taskq(env, &["show", &task_id]);
+        let detail = dagq(env, &["show", &task_id]);
         if let Some(run) = detail["runs"].as_array().unwrap().last()
             && run["status"] == "running"
         {
@@ -849,7 +849,7 @@ fn killed_supervisor_run_is_adopted_by_the_next_supervisor_and_lands() {
 
     // What the maintainer sees before anyone adopts: the registration and
     // the lease are stale by pid, the wrapper is alive, and the run keeps going.
-    let status = taskq(env, &["status"]);
+    let status = dagq(env, &["status"]);
     let supervisors = status["supervisors"].as_array().unwrap();
     assert_eq!(supervisors.len(), 1, "{status}");
     assert_eq!(supervisors[0]["pid"], victim_pid);
@@ -862,7 +862,7 @@ fn killed_supervisor_run_is_adopted_by_the_next_supervisor_and_lands() {
     assert_eq!(status["runs"][0]["run_id"], run_id.as_str());
     assert_eq!(status["runs"][0]["lease"]["pid"], victim_pid);
     assert_eq!(status["runs"][0]["lease"]["alive"], false);
-    let doctor = taskq(env, &["doctor"]);
+    let doctor = dagq(env, &["doctor"]);
     assert_eq!(doctor["runs"][0]["recoverable"], false, "{doctor}");
     let wrapper = doctor["runs"][0]["processes"]
         .as_array()
@@ -889,7 +889,7 @@ fn killed_supervisor_run_is_adopted_by_the_next_supervisor_and_lands() {
     );
     assert_eq!(pass.workspaces, vec![(task_id.clone(), workspace.clone())]);
 
-    let detail = taskq(env, &["show", &task_id]);
+    let detail = dagq(env, &["show", &task_id]);
     assert_eq!(detail["runs"].as_array().unwrap().len(), 1); // Not rerun.
     let run = &detail["runs"][0];
     assert_eq!(run["status"], "awaiting_integration");
@@ -915,14 +915,14 @@ fn killed_supervisor_run_is_adopted_by_the_next_supervisor_and_lands() {
     assert!(position("run_adopted") < position("exit_requested"));
     assert!(position("exit_requested") < position("session_exited"));
     // The adopter deregistered on exit; the killed one's row stays for `up` to prune.
-    let status = taskq(env, &["status"]);
+    let status = dagq(env, &["status"]);
     let supervisors = status["supervisors"].as_array().unwrap();
     assert_eq!(supervisors.len(), 1, "{status}");
     assert_eq!(supervisors[0]["pid"], victim_pid);
     assert_eq!(supervisors[0]["run_ids"], Value::Array(vec![]));
     assert_eq!(status["runs"], Value::Array(vec![]));
 
-    let integrated = taskq(env, &["integrate", &task_id]);
+    let integrated = dagq(env, &["integrate", &task_id]);
     assert_eq!(integrated["outcome"], "integrated", "{integrated}");
     assert_eq!(integrated["task"]["status"], "completed");
     assert_eq!(
@@ -1011,7 +1011,7 @@ fn up_starts_a_launchd_supervisor_that_status_lists_and_down_wait_stops_it() {
     // The agent's plist goes under a disposable HOME, not the developer's.
     let home = fixture._dir.path().join("home");
     fs::create_dir(&home).unwrap();
-    let located = taskq_with(env, &[("HOME", home.as_path())], &["locate"]);
+    let located = dagq_with(env, &[("HOME", home.as_path())], &["locate"]);
     let label = located["label"].as_str().unwrap().to_owned();
     let plist = PathBuf::from(located["launch_agent"].as_str().unwrap());
     assert!(plist.starts_with(&home));
@@ -1052,7 +1052,7 @@ fn up_starts_a_launchd_supervisor_that_status_lists_and_down_wait_stops_it() {
             "launchd.log:\n{}",
             fs::read_to_string(&launchd_log).unwrap_or_else(|_| "(not written)".into())
         );
-        panic!("cmux-taskq up: {}", String::from_utf8_lossy(&output.stderr));
+        panic!("dagq up: {}", String::from_utf8_lossy(&output.stderr));
     }
     let first: Value = serde_json::from_slice(&output.stdout).unwrap();
     eprintln!("up took {:?}: {first}", started.elapsed());
@@ -1073,7 +1073,7 @@ fn up_starts_a_launchd_supervisor_that_status_lists_and_down_wait_stops_it() {
     let repo_name = repo.file_name().unwrap().to_str().unwrap();
     assert_eq!(
         first["maintainer"]["name"],
-        format!("taskq {repo_name} maintainer")
+        format!("dagq {repo_name} maintainer")
     );
     // launchd knows the agent, and the plist is what `up` described.
     assert!(
@@ -1107,7 +1107,7 @@ fn up_starts_a_launchd_supervisor_that_status_lists_and_down_wait_stops_it() {
         "{log}"
     );
 
-    let status = taskq(env, &["status"]);
+    let status = dagq(env, &["status"]);
     let supervisors = status["supervisors"].as_array().unwrap();
     assert_eq!(supervisors.len(), 1, "{status}");
     assert_eq!(supervisors[0]["pid"], pid);
@@ -1121,7 +1121,7 @@ fn up_starts_a_launchd_supervisor_that_status_lists_and_down_wait_stops_it() {
     assert_eq!(status["runs"], Value::Array(vec![]));
 
     // Idempotent: nothing is started or opened twice.
-    let second = taskq_with(env, &[("HOME", home.as_path())], &up_args);
+    let second = dagq_with(env, &[("HOME", home.as_path())], &up_args);
     assert_eq!(second["supervisor"]["outcome"], "reused", "{second}");
     assert_eq!(second["supervisor"]["version"], VERSION, "{second}");
     assert_eq!(second["supervisor"]["pid"], pid);
@@ -1130,7 +1130,7 @@ fn up_starts_a_launchd_supervisor_that_status_lists_and_down_wait_stops_it() {
     assert_eq!(second["pruned_supervisors"], Value::Array(vec![]));
 
     let started = Instant::now();
-    let down = taskq_with(env, &[("HOME", home.as_path())], &["down", "--wait"]);
+    let down = dagq_with(env, &[("HOME", home.as_path())], &["down", "--wait"]);
     eprintln!("down --wait took {:?}: {down}", started.elapsed());
     assert_eq!(down["outcome"], "stopped", "{down}");
     assert_eq!(down["pid"], pid);
@@ -1138,7 +1138,7 @@ fn up_starts_a_launchd_supervisor_that_status_lists_and_down_wait_stops_it() {
     assert!(!pid_alive(pid), "supervisor {pid} is still alive");
     assert!(!agent.loaded(), "the agent is still loaded");
     assert!(!plist.exists(), "the plist was not removed");
-    let status = taskq(env, &["status"]);
+    let status = dagq(env, &["status"]);
     assert_eq!(status["supervisors"], Value::Array(vec![]), "{status}");
     let log = fs::read_to_string(&logs[0]).unwrap();
     assert!(
@@ -1147,7 +1147,7 @@ fn up_starts_a_launchd_supervisor_that_status_lists_and_down_wait_stops_it() {
     );
     // The maintainer workspace is left open by `down`; the guard closes it.
     assert!(workspace_listed(cmux, &maintainer));
-    let again = taskq_with(env, &[("HOME", home.as_path())], &["down"]);
+    let again = dagq_with(env, &[("HOME", home.as_path())], &["down"]);
     assert_eq!(again["outcome"], "not_running", "{again}");
 }
 
@@ -1170,7 +1170,7 @@ fn up_in_cmux_starts_a_supervisor_in_a_workspace_that_down_wait_stops_and_closes
     // A disposable HOME, so a stray plist could only land there; none should.
     let home = fixture._dir.path().join("home");
     fs::create_dir(&home).unwrap();
-    let located = taskq_with(env, &[("HOME", home.as_path())], &["locate"]);
+    let located = dagq_with(env, &[("HOME", home.as_path())], &["locate"]);
     let plist = PathBuf::from(located["launch_agent"].as_str().unwrap());
     let label = located["label"].as_str().unwrap().to_owned();
     let log_dir = PathBuf::from(located["log_dir"].as_str().unwrap());
@@ -1190,7 +1190,7 @@ fn up_in_cmux_starts_a_supervisor_in_a_workspace_that_down_wait_stops_and_closes
         stub.to_str().unwrap(),
     ];
     let started = Instant::now();
-    let first = taskq_with(env, &[("HOME", home.as_path())], &up_args);
+    let first = dagq_with(env, &[("HOME", home.as_path())], &up_args);
     eprintln!("up --in-cmux took {:?}: {first}", started.elapsed());
     assert_eq!(first["supervisor"]["outcome"], "started", "{first}");
     assert_eq!(first["supervisor"]["mode"], "in_cmux");
@@ -1198,7 +1198,7 @@ fn up_in_cmux_starts_a_supervisor_in_a_workspace_that_down_wait_stops_and_closes
     let repo_name = repo.file_name().unwrap().to_str().unwrap();
     assert_eq!(
         first["supervisor"]["name"],
-        format!("taskq {repo_name} supervisor")
+        format!("dagq {repo_name} supervisor")
     );
     let supervisor_workspace = first["supervisor"]["workspace_id"]
         .as_str()
@@ -1245,7 +1245,7 @@ fn up_in_cmux_starts_a_supervisor_in_a_workspace_that_down_wait_stops_and_closes
         "started: version {VERSION}, pid {pid}, parallel 2"
     )));
 
-    let status = taskq(env, &["status"]);
+    let status = dagq(env, &["status"]);
     let supervisors = status["supervisors"].as_array().unwrap();
     assert_eq!(supervisors.len(), 1, "{status}");
     assert_eq!(supervisors[0]["pid"], pid);
@@ -1255,7 +1255,7 @@ fn up_in_cmux_starts_a_supervisor_in_a_workspace_that_down_wait_stops_and_closes
         supervisor_workspace.as_str()
     );
     assert_eq!(supervisors[0]["stale"], false);
-    let doctor = taskq(env, &["doctor"]);
+    let doctor = dagq(env, &["doctor"]);
     assert_eq!(doctor["supervisors"][0]["mode"], "in_cmux", "{doctor}");
     assert_eq!(
         doctor["supervisors"][0]["binary_version"], VERSION,
@@ -1264,7 +1264,7 @@ fn up_in_cmux_starts_a_supervisor_in_a_workspace_that_down_wait_stops_and_closes
 
     // Idempotent: the live supervisor is of this binary's own version, so
     // it is reused with its mode and workspace and nothing is replaced.
-    let second = taskq_with(env, &[("HOME", home.as_path())], &up_args);
+    let second = dagq_with(env, &[("HOME", home.as_path())], &up_args);
     assert_eq!(second["supervisor"]["outcome"], "reused", "{second}");
     assert_eq!(second["supervisor"]["version"], VERSION, "{second}");
     assert_eq!(second["supervisor"]["mode"], "in_cmux");
@@ -1275,7 +1275,7 @@ fn up_in_cmux_starts_a_supervisor_in_a_workspace_that_down_wait_stops_and_closes
     assert_eq!(second["maintainer"]["workspace_id"], maintainer.as_str());
 
     let started = Instant::now();
-    let down = taskq_with(env, &[("HOME", home.as_path())], &["down", "--wait"]);
+    let down = dagq_with(env, &[("HOME", home.as_path())], &["down", "--wait"]);
     eprintln!("down --wait took {:?}: {down}", started.elapsed());
     assert_eq!(down["outcome"], "stopped", "{down}");
     assert_eq!(down["pid"], pid);
@@ -1287,7 +1287,7 @@ fn up_in_cmux_starts_a_supervisor_in_a_workspace_that_down_wait_stops_and_closes
     );
     assert!(!pid_alive(pid), "supervisor {pid} is still alive");
     wait_until_not_listed(cmux, &supervisor_workspace);
-    assert_eq!(taskq(env, &["status"])["supervisors"], Value::Array(vec![]));
+    assert_eq!(dagq(env, &["status"])["supervisors"], Value::Array(vec![]));
     // The maintainer workspace is left open by `down`; the guard closes it.
     assert!(workspace_listed(cmux, &maintainer));
 }

@@ -781,28 +781,28 @@ pub fn workspace_named<'a>(listing: &'a Value, name: &str) -> Option<&'a str> {
 }
 
 /// Workspaces are named per repository because one cmux serves several
-/// queues: `taskq <repo> <task-id> <run-id>` for a worker, where `<repo>`
+/// queues: `dagq <repo> <task-id> <run-id>` for a worker, where `<repo>`
 /// is the basename of the repository root the run was planned from.
 pub fn run_workspace_name(run: &TaskRun) -> Result<String> {
     let repo = Path::new(run.repo_path.as_ref().context("missing repository path")?);
     Ok(format!(
-        "taskq {} {} {}",
+        "dagq {} {} {}",
         repository_name(repo),
         run.task_id,
         run.id
     ))
 }
 
-/// `taskq <repo> maintainer`: the one resident Claude session of a repository's queue.
+/// `dagq <repo> maintainer`: the one resident Claude session of a repository's queue.
 pub fn maintainer_workspace_name(repo_root: &Path) -> String {
-    format!("taskq {} maintainer", repository_name(repo_root))
+    format!("dagq {} maintainer", repository_name(repo_root))
 }
 
-/// `taskq <repo> supervisor`: the workspace `up --in-cmux` runs `supervise`
+/// `dagq <repo> supervisor`: the workspace `up --in-cmux` runs `supervise`
 /// in when launchd cannot reach cmux (ADR-0011). The launchd mode has no
 /// workspace at all.
 pub fn supervisor_workspace_name(repo_root: &Path) -> String {
-    format!("taskq {} supervisor", repository_name(repo_root))
+    format!("dagq {} supervisor", repository_name(repo_root))
 }
 
 fn repository_name(root: &Path) -> String {
@@ -916,12 +916,12 @@ mod tests {
     #[test]
     fn workspace_names_carry_the_repository_the_task_and_the_run() {
         assert_eq!(
-            run_workspace_name(&run(Some("/home/u/ghq/cmux-taskq"))).unwrap(),
-            "taskq cmux-taskq 15 0d8e3f1a-7c1b-4e35-9a11-3f6d2c9b8e47"
+            run_workspace_name(&run(Some("/home/u/ghq/dagq"))).unwrap(),
+            "dagq dagq 15 0d8e3f1a-7c1b-4e35-9a11-3f6d2c9b8e47"
         );
         assert_eq!(
             run_workspace_name(&run(Some("/tmp/my repo/"))).unwrap(),
-            "taskq my repo 15 0d8e3f1a-7c1b-4e35-9a11-3f6d2c9b8e47"
+            "dagq my repo 15 0d8e3f1a-7c1b-4e35-9a11-3f6d2c9b8e47"
         );
         assert!(
             run_workspace_name(&run(None))
@@ -930,17 +930,17 @@ mod tests {
                 .contains("missing repository path")
         );
         assert_eq!(
-            maintainer_workspace_name(Path::new("/home/u/ghq/cmux-taskq")),
-            "taskq cmux-taskq maintainer"
+            maintainer_workspace_name(Path::new("/home/u/ghq/dagq")),
+            "dagq dagq maintainer"
         );
         // A root with no basename falls back to the path itself.
         assert_eq!(
             maintainer_workspace_name(Path::new("/")),
-            "taskq / maintainer"
+            "dagq / maintainer"
         );
         assert_eq!(
-            supervisor_workspace_name(Path::new("/home/u/ghq/cmux-taskq")),
-            "taskq cmux-taskq supervisor"
+            supervisor_workspace_name(Path::new("/home/u/ghq/dagq")),
+            "dagq dagq supervisor"
         );
     }
 
@@ -949,17 +949,17 @@ mod tests {
         let listing = serde_json::json!({
             "window_id": "W",
             "workspaces": [
-                {"id": "AAAA", "title": "taskq repo maintainer extra"},
-                {"id": "BBBB", "title": "taskq repo maintainer"},
-                {"id": "CCCC", "title": "taskq repo maintainer"},
+                {"id": "AAAA", "title": "dagq repo maintainer extra"},
+                {"id": "BBBB", "title": "dagq repo maintainer"},
+                {"id": "CCCC", "title": "dagq repo maintainer"},
                 {"id": "DDDD"}
             ]
         });
         assert_eq!(
-            workspace_named(&listing, "taskq repo maintainer"),
+            workspace_named(&listing, "dagq repo maintainer"),
             Some("BBBB")
         );
-        assert_eq!(workspace_named(&listing, "taskq other maintainer"), None);
+        assert_eq!(workspace_named(&listing, "dagq other maintainer"), None);
         assert_eq!(workspace_named(&serde_json::json!({}), "x"), None);
     }
 }

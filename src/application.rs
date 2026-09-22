@@ -7,7 +7,7 @@ use crate::domain::{
     Predecessor, Task, TaskAction, TaskDetail,
 };
 
-pub trait TaskQueue {
+pub trait TaskStore {
     fn add(&mut self, task: NewTask) -> Result<Task>;
     fn list(&self) -> Result<Vec<Task>>;
     fn show(&mut self, task_id: i64) -> Result<TaskDetail>;

@@ -240,10 +240,10 @@ mod tests {
     #[test]
     fn plist_lists_every_key_launchd_needs() {
         let spec = LaunchAgentSpec {
-            label: "com.cmux-taskq.abc".into(),
-            plist: "/home/u/Library/LaunchAgents/com.cmux-taskq.abc.plist".into(),
+            label: "com.dagq.abc".into(),
+            plist: "/home/u/Library/LaunchAgents/com.dagq.abc.plist".into(),
             program_arguments: vec![
-                "/bin/cmux-taskq".into(),
+                "/bin/dagq".into(),
                 "--db".into(),
                 "/data/q/queue.db".into(),
                 "supervise".into(),
@@ -261,9 +261,9 @@ mod tests {
         };
         let xml = spec.xml();
         assert!(xml.starts_with("<?xml version=\"1.0\""));
-        assert!(xml.contains("<key>Label</key>\n\t<string>com.cmux-taskq.abc</string>"));
+        assert!(xml.contains("<key>Label</key>\n\t<string>com.dagq.abc</string>"));
         assert!(xml.contains(
-            "<key>ProgramArguments</key>\n\t<array>\n\t\t<string>/bin/cmux-taskq</string>\n\t\t<string>--db</string>"
+            "<key>ProgramArguments</key>\n\t<array>\n\t\t<string>/bin/dagq</string>\n\t\t<string>--db</string>"
         ));
         assert!(xml.contains("<string>--parallel</string>\n\t\t<string>3</string>\n\t\t<string>--log-dir</string>\n\t\t<string>/data/q/logs</string>\n\t</array>"));
         assert!(xml.contains("<key>WorkingDirectory</key>\n\t<string>/repo &amp; co</string>"));
@@ -314,22 +314,20 @@ mod tests {
         assert!(format!("{error:#}").contains("must be absolute"));
         // Nothing is loaded under a label that was never bootstrapped, and a
         // plist that is not there is not an error either.
-        let missing = dir.path().join("com.cmux-taskq.missing.plist");
+        let missing = dir.path().join("com.dagq.missing.plist");
         assert_eq!(
-            launchctl
-                .uninstall("com.cmux-taskq.missing", &missing)
-                .unwrap(),
+            launchctl.uninstall("com.dagq.missing", &missing).unwrap(),
             AgentState {
                 loaded: false,
                 pid: None
             }
         );
-        assert!(!launchctl.bootout("com.cmux-taskq.missing").unwrap());
+        assert!(!launchctl.bootout("com.dagq.missing").unwrap());
     }
 
     #[test]
     fn print_pid_reads_the_pid_line() {
-        let listing = "gui/501/com.cmux-taskq.x = {\n\tactive count = 1\n\tpath = /p\n\tstate = running\n\n\tpid = 4213\n\tprogram = /bin\n}";
+        let listing = "gui/501/com.dagq.x = {\n\tactive count = 1\n\tpath = /p\n\tstate = running\n\n\tpid = 4213\n\tprogram = /bin\n}";
         assert_eq!(print_pid(listing), Some(4213));
         assert_eq!(
             print_pid("gui/501/x = {\n\tstate = spawn scheduled\n}"),

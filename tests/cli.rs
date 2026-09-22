@@ -3,11 +3,11 @@ use std::{
     process::{Command, Output},
 };
 
-use cmux_taskq::infrastructure::sqlite::SqliteQueue;
+use dagq::infrastructure::sqlite::SqliteQueue;
 use serde_json::Value;
 
 fn invoke(db: &Path, args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_cmux-taskq"))
+    Command::new(env!("CARGO_BIN_EXE_dagq"))
         .arg("--db")
         .arg(db)
         .args(args)
@@ -114,7 +114,7 @@ fn reads_do_not_create_a_queue_and_unknown_tasks_fail() {
 #[test]
 fn version_works_outside_a_repository_and_without_a_queue() {
     let dir = tempfile::tempdir().unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_cmux-taskq"))
+    let output = Command::new(env!("CARGO_BIN_EXE_dagq"))
         .arg("--version")
         .current_dir(dir.path())
         .output()

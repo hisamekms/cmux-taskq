@@ -1,5 +1,5 @@
 //! Where a queue lives. Without `--db`, the queue of the repository containing
-//! the working directory is `<data home>/cmux-taskq/<hash>/queue.db`, where the
+//! the working directory is `<data home>/dagq/<hash>/queue.db`, where the
 //! hash identifies the repository's Git common directory. Runs, worktrees and
 //! their logs live next to the database in `runs/`, the supervisor's logs in
 //! `logs/`, and the LaunchAgent that keeps the supervisor resident is named
@@ -16,13 +16,13 @@ use std::{
 
 use super::adapters::git_common_dir;
 
-pub const DATA_DIR_NAME: &str = "cmux-taskq";
+pub const DATA_DIR_NAME: &str = "dagq";
 pub const DB_FILE_NAME: &str = "queue.db";
 pub const RUNS_DIR_NAME: &str = "runs";
 /// Supervisor logs (`supervisor-<started_at>-<pid>.log`, `launchd.log`).
 pub const LOGS_DIR_NAME: &str = "logs";
-/// LaunchAgent labels are `com.cmux-taskq.<queue hash>`.
-pub const LAUNCH_AGENT_PREFIX: &str = "com.cmux-taskq";
+/// LaunchAgent labels are `com.dagq.<queue hash>`.
+pub const LAUNCH_AGENT_PREFIX: &str = "com.dagq";
 /// Human-readable pointer back from a hashed queue directory to its repository.
 pub const REPOSITORY_FILE_NAME: &str = "repository";
 const HASH_HEX_LEN: usize = 16;
@@ -228,11 +228,11 @@ mod tests {
         let hash = repository_hash(Path::new("/repo/.git"));
         assert_eq!(
             location.db,
-            Path::new("/data/cmux-taskq").join(&hash).join("queue.db")
+            Path::new("/data/dagq").join(&hash).join("queue.db")
         );
         assert_eq!(
             location.runs_dir,
-            Path::new("/data/cmux-taskq").join(&hash).join("runs")
+            Path::new("/data/dagq").join(&hash).join("runs")
         );
         assert_eq!(location.source, QueueSource::Repository);
         assert_eq!(
@@ -246,12 +246,12 @@ mod tests {
         );
         assert_eq!(
             location.log_dir,
-            Path::new("/data/cmux-taskq").join(&hash).join("logs")
+            Path::new("/data/dagq").join(&hash).join("logs")
         );
-        assert_eq!(location.label, format!("com.cmux-taskq.{hash}"));
+        assert_eq!(location.label, format!("com.dagq.{hash}"));
         assert_eq!(
             location.launch_agent,
-            Path::new("/home/u/Library/LaunchAgents").join(format!("com.cmux-taskq.{hash}.plist"))
+            Path::new("/home/u/Library/LaunchAgents").join(format!("com.dagq.{hash}.plist"))
         );
     }
 
@@ -271,10 +271,10 @@ mod tests {
         // The agent of an explicit queue is named after the file, not a repository.
         let explicit = QueueLocation::explicit_in(Path::new("/x/y/other.db"), Path::new("/home/u"));
         let hash = repository_hash(Path::new("/x/y/other.db"));
-        assert_eq!(explicit.label, format!("com.cmux-taskq.{hash}"));
+        assert_eq!(explicit.label, format!("com.dagq.{hash}"));
         assert_eq!(
             explicit.launch_agent,
-            Path::new("/home/u/Library/LaunchAgents").join(format!("com.cmux-taskq.{hash}.plist"))
+            Path::new("/home/u/Library/LaunchAgents").join(format!("com.dagq.{hash}.plist"))
         );
         assert_ne!(
             explicit.label,

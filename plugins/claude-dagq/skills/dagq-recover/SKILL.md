@@ -1,16 +1,16 @@
 ---
-name: taskq-recover
-description: Diagnose and recover one cmux-taskq run that is stuck, that its supervisor gave up on, whose supervisor or integrate process died, or that stays claimed/starting/running/validating/integrating after its process ended, without disturbing the runs executing next to it. Use when the user reports an orphaned run, a run with last_error and no lease, a stale supervisor in status or doctor, a run stuck in integrating, or asks to recover or retry a run.
+name: dagq-recover
+description: Diagnose and recover one dagq run that is stuck, that its supervisor gave up on, whose supervisor or integrate process died, or that stays claimed/starting/running/validating/integrating after its process ended, without disturbing the runs executing next to it. Use when the user reports an orphaned run, a run with last_error and no lease, a stale supervisor in status or doctor, a run stuck in integrating, or asks to recover or retry a run.
 ---
 
-# cmux-taskq: diagnose and recover a run
+# dagq: diagnose and recover a run
 
-Prerequisite: resolve the launcher as in the `taskq` skill (`TASKQ="${CLAUDE_PLUGIN_ROOT}/bin/taskq"`). Never touch the queue database directly; the binary refuses unsafe recoveries itself, so do not work around it.
+Prerequisite: resolve the launcher as in the `dagq` skill (`DAGQ="${CLAUDE_PLUGIN_ROOT}/bin/dagq"`). Never touch the queue database directly; the binary refuses unsafe recoveries itself, so do not work around it.
 
 ## 1. Diagnose without changing state
 
 ```sh
-"$TASKQ" doctor
+"$DAGQ" doctor
 ```
 
 - `supervisors`: one entry per registered `supervise` process (`registered: true`, with `pid`, `alive` (`kill -0`), `parallel`, `started_at`, `heartbeat_at`, `heartbeat_age_secs`, `run_ids`, and `stale` when the PID is dead or the heartbeat is older than 30 seconds), plus one per process that holds leases without a registration, such as a running `integrate` (`registered: false`). A resident supervisor is listed even with an empty `run_ids`; empty `supervisors` means no supervisor is registered and no run is owned by anyone. A stale registration is left by a killed or hung supervisor; the runtime never deletes it, so report it to the user rather than trying to remove it, and `recover` works on runs regardless of it.
@@ -28,11 +28,11 @@ Recovery is refused while any process registered for that run is alive, its leas
 ## 3. Recover
 
 ```sh
-"$TASKQ" recover RUN_ID
+"$DAGQ" recover RUN_ID
 ```
 
-`RUN_ID` comes from `doctor` or `show ID`. On success it prints `{"outcome": "recovered", "run": ...}`: the run is `interrupted` (an `integrating` run goes back to `awaiting_integration` instead, because its validated result is intact; land it again with the `taskq-maintain` skill), a `run_recovered` event records what was checked, and that run's lease (if any) is deleted. Other runs, their leases and processes are untouched, so a supervisor running other tasks keeps going. The worktree, branch, cmux workspace, and run directory are kept for inspection, and the task stays `in_progress`. Nothing is rerun automatically.
+`RUN_ID` comes from `doctor` or `show ID`. On success it prints `{"outcome": "recovered", "run": ...}`: the run is `interrupted` (an `integrating` run goes back to `awaiting_integration` instead, because its validated result is intact; land it again with the `dagq-maintain` skill), a `run_recovered` event records what was checked, and that run's lease (if any) is deleted. Other runs, their leases and processes are untouched, so a supervisor running other tasks keeps going. The worktree, branch, cmux workspace, and run directory are kept for inspection, and the task stays `in_progress`. Nothing is rerun automatically.
 
 ## 4. Retry or give up
 
-A retry is a separate decision. To run the task again, `"$TASKQ" ready ID` (or `draft ID` to edit it first, then `ready`); a running supervisor (or the next one) creates a new run with its own worktree. The same applies to a task whose latest run `failed`. To drop the task, `cancel ID`. Removing the old worktree, branch, and workspace is the user's manual cleanup; list them from the run's `worktree_path`, `branch`, and `workspace_id` in `show ID`.
+A retry is a separate decision. To run the task again, `"$DAGQ" ready ID` (or `draft ID` to edit it first, then `ready`); a running supervisor (or the next one) creates a new run with its own worktree. The same applies to a task whose latest run `failed`. To drop the task, `cancel ID`. Removing the old worktree, branch, and workspace is the user's manual cleanup; list them from the run's `worktree_path`, `branch`, and `workspace_id` in `show ID`.
