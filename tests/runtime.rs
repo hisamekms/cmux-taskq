@@ -1735,6 +1735,18 @@ fn write_receipt_json(run: &TaskRun, receipt: Value) {
     fs::rename(path.with_extension("tmp"), path).unwrap();
 }
 
+/// The payloads of the `verification_command` events the landing recorded
+/// (`phase: integration`), oldest first. Validation's own runs of the same
+/// commands carry no `phase`.
+fn integration_verifications(detail: &dagq::domain::TaskDetail) -> Vec<&Value> {
+    detail
+        .events
+        .iter()
+        .filter(|e| e.kind == "verification_command" && e.payload["phase"] == "integration")
+        .map(|e| &e.payload)
+        .collect()
+}
+
 /// The `integration_receipt` events of the task's run, oldest first.
 fn integration_receipts(detail: &dagq::domain::TaskDetail) -> Vec<&Value> {
     detail
@@ -1822,6 +1834,9 @@ fn conflict_free_run_lands_as_one_squash_commit_and_releases_dependents() {
     let worktree = PathBuf::from(run.worktree_path.as_ref().unwrap());
     let outcome = integrate(&db, 1, &worktree).unwrap();
     assert_eq!(outcome["outcome"], "integrated", "{outcome}");
+    // Main has not moved, so the rebase was a no-op and the verification
+    // commands were not run a second time on the validated tree.
+    assert_eq!(outcome["verification_skipped"], json!(true), "{outcome}");
     assert_eq!(outcome["task"]["status"], "completed");
     assert_eq!(outcome["run"]["status"], "integrated");
     let mut queue = SqliteQueue::open(&db).unwrap();
@@ -1859,8 +1874,10 @@ fn conflict_free_run_lands_as_one_squash_commit_and_releases_dependents() {
     let position = |kind: &str| kinds.iter().rposition(|k| *k == kind).unwrap();
     assert!(position("validation_finished") < position("integration_started"));
     assert!(position("integration_started") < position("integration_rebased"));
-    assert!(position("integration_rebased") < position("verification_command"));
-    assert!(position("verification_command") < position("run_integrated"));
+    assert!(position("integration_rebased") < position("integration_verification_skipped"));
+    assert!(position("integration_verification_skipped") < position("run_integrated"));
+    // The only verification commands are validation's, before the landing.
+    assert!(position("verification_command") < position("integration_started"));
     assert!(position("run_integrated") < position("worktree_removed"));
     assert!(!kinds.contains(&"cleanup_failed"));
     let integrated = detail
@@ -1879,18 +1896,31 @@ fn conflict_free_run_lands_as_one_squash_commit_and_releases_dependents() {
         integrated.payload["history_ref"],
         json!(format!("refs/dagq/runs/{}", run.id))
     );
-    let verification = detail
+    assert_eq!(integrated.payload["verification_skipped"], json!(true));
+    assert!(
+        detail
+            .events
+            .iter()
+            .all(|e| e.kind != "verification_command" || e.payload["phase"] != "integration"),
+        "{:?}",
+        event_kinds(&detail)
+    );
+    let skipped = detail
         .events
         .iter()
-        .rev()
-        .find(|e| e.kind == "verification_command")
+        .find(|e| e.kind == "integration_verification_skipped")
         .unwrap();
-    assert_eq!(verification.payload["phase"], "integration");
+    assert_eq!(skipped.run_id.as_deref(), Some(run.id.as_str()));
+    assert_eq!(skipped.payload["main"], json!(seed));
+    assert_eq!(skipped.payload["head"], json!(source));
+    assert_eq!(
+        skipped.payload["reason"],
+        "rebase was a no-op; validation already verified this head"
+    );
     assert!(
-        verification.payload["log_path"]
-            .as_str()
-            .unwrap()
-            .ends_with("integrate-verify-1.log")
+        !Path::new(run.run_dir.as_ref().unwrap())
+            .join("integrate-verify-1.log")
+            .exists()
     );
     let changed = detail
         .events
@@ -2430,6 +2460,106 @@ fn runs_land_fifo_by_validation_time_and_later_ones_are_rebased() {
     assert!(queue.run_leases().unwrap().is_empty());
 }
 
+/// The landing reruns the verification commands only when the rebase moved
+/// the head. The first run lands on an unmoved main, so its rebase is a
+/// no-op and validation's run of the same commands on the same commit
+/// stands; the second is rebased onto that landing, so its tree is new and
+/// the commands run again.
+#[test]
+fn reverification_is_skipped_for_a_no_op_rebase_and_runs_when_the_head_moves() {
+    let (_dir, repo, db) = fixture();
+    let mut queue = SqliteQueue::open(&db).unwrap();
+    queue.transition(1, TaskAction::Draft).unwrap();
+    let backend = TestWorkspace::new(&db, false, VALID_AGENT);
+    // `ls` always passes, and its output names the tree it ran on.
+    let first = add_file_task(&mut queue, &backend, "first", "first.txt", "1", &["ls"]);
+    let second = add_file_task(&mut queue, &backend, "second", "second.txt", "2", &["ls"]);
+    supervise(&db, &repo, &backend).unwrap();
+    backend.join();
+    let seed = git_out(&repo, &["rev-parse", "main"]);
+    // Landing order is FIFO by validation time; take whichever validated first.
+    let validated_first = queue.next_awaiting_integration().unwrap().unwrap();
+    // `landed_file` is the file the first landing puts on main, so it exists
+    // in the second run's tree only after the rebase.
+    let (first, second, landed_file) = if validated_first.task_id == first {
+        (first, second, "first.txt")
+    } else {
+        (second, first, "second.txt")
+    };
+    let head_before = queue.show(first).unwrap().runs[0]
+        .result_commit
+        .clone()
+        .unwrap();
+
+    // (a) Main has not moved: the rebase is a no-op and nothing is rerun.
+    let outcome = integrate(&db, first, &repo).unwrap();
+    assert_eq!(outcome["outcome"], "integrated", "{outcome}");
+    assert_eq!(outcome["verification_skipped"], json!(true), "{outcome}");
+    let detail = queue.show(first).unwrap();
+    let run = detail.runs[0].clone();
+    assert!(
+        integration_verifications(&detail).is_empty(),
+        "{:?}",
+        event_kinds(&detail)
+    );
+    assert!(
+        !Path::new(run.run_dir.as_ref().unwrap())
+            .join("integrate-verify-1.log")
+            .exists()
+    );
+    let skipped: Vec<_> = detail
+        .events
+        .iter()
+        .filter(|e| e.kind == "integration_verification_skipped")
+        .collect();
+    assert_eq!(skipped.len(), 1, "{:?}", event_kinds(&detail));
+    assert_eq!(skipped[0].payload["main"], json!(seed));
+    assert_eq!(skipped[0].payload["head"], json!(head_before));
+    assert_eq!(
+        skipped[0].payload["reason"],
+        "rebase was a no-op; validation already verified this head"
+    );
+
+    // (b) The second run is rebased onto that landing: a new tree, so the
+    // verification commands run again and leave their log and event.
+    let landed = git_out(&repo, &["rev-parse", "main"]);
+    let outcome = integrate(&db, second, &repo).unwrap();
+    assert_eq!(outcome["outcome"], "integrated", "{outcome}");
+    assert_eq!(outcome["verification_skipped"], json!(false), "{outcome}");
+    let detail = queue.show(second).unwrap();
+    let run = detail.runs[0].clone();
+    let rebased = detail
+        .events
+        .iter()
+        .find(|e| e.kind == "integration_rebased")
+        .unwrap();
+    assert_eq!(rebased.payload["main"], json!(landed));
+    assert_ne!(
+        rebased.payload["head_before"],
+        rebased.payload["head_after"]
+    );
+    let verifications = integration_verifications(&detail);
+    assert_eq!(verifications.len(), 1, "{:?}", event_kinds(&detail));
+    assert_eq!(verifications[0]["command"], "ls");
+    assert_eq!(verifications[0]["exit_code"], 0);
+    assert!(
+        verifications[0]["log_path"]
+            .as_str()
+            .unwrap()
+            .ends_with("integrate-verify-1.log")
+    );
+    // The rerun ran on the rebased tree: it sees the file the first landing
+    // added, which validation's own run of `ls` could not have seen.
+    let integration_log =
+        fs::read_to_string(Path::new(run.run_dir.as_ref().unwrap()).join("integrate-verify-1.log"))
+            .unwrap();
+    assert!(integration_log.contains(landed_file), "{integration_log}");
+    let validation_log =
+        fs::read_to_string(Path::new(run.run_dir.as_ref().unwrap()).join("verify-1.log")).unwrap();
+    assert!(!validation_log.contains(landed_file), "{validation_log}");
+    assert!(!event_kinds(&detail).contains(&"integration_verification_skipped"));
+}
+
 /// Both runs change the same file: the second cannot be rebased by the
 /// runtime and waits for a session, which resolves, reruns verification and
 /// rewrites the receipt; then it lands like any other run.
@@ -2541,11 +2671,27 @@ fn conflicting_run_needs_a_session_and_lands_after_the_session_resolves_it() {
     write_receipt_json(&parked, rewritten.clone());
     let outcome = integrate(&db, 2, &repo).unwrap();
     assert_eq!(outcome["outcome"], "integrated", "{outcome}");
+    // The session rebased the branch itself, so this rebase is a no-op -- but
+    // the head is the session's, not the one validation verified, so the
+    // verification commands still run here.
+    assert_eq!(outcome["verification_skipped"], json!(false), "{outcome}");
     let landed = queue.show(2).unwrap().runs[0].clone();
     assert_landed(&repo, &landed, "second", &first_landed);
     // The receipt the session rewrote is what the DB keeps for the landing,
     // while validation_finished still holds the one from before the conflict.
     let detail = queue.show(2).unwrap();
+    assert!(!event_kinds(&detail).contains(&"integration_verification_skipped"));
+    let rebased = detail
+        .events
+        .iter()
+        .rev()
+        .find(|e| e.kind == "integration_rebased")
+        .unwrap();
+    assert_eq!(rebased.payload["head_before"], json!(resolved));
+    assert_eq!(rebased.payload["head_after"], json!(resolved));
+    let verifications = integration_verifications(&detail);
+    assert_eq!(verifications.len(), 1, "{:?}", event_kinds(&detail));
+    assert_eq!(verifications[0]["exit_code"], 0);
     let recorded = integration_receipts(&detail);
     assert_eq!(recorded.len(), 4, "{recorded:?}");
     let last = recorded[3];

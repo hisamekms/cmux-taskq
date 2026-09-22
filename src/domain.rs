@@ -433,15 +433,21 @@ pub enum ClaimOutcome {
 }
 
 /// Result of one `integrate` invocation. `Integrated` landed the run on
-/// `main` (`run.result_commit` is the landed commit). `NeedsSession` parked
-/// the run for a session to resolve; `Failed` ended it because its rewritten
-/// receipt reported `failed`. `NoRunAwaiting` is `--next` on an empty queue.
+/// `main` (`run.result_commit` is the landed commit); its
+/// `verification_skipped` is true when the rebase was a no-op on the
+/// validated head and the landing reused the validation's run of the
+/// verification commands.
+/// `NeedsSession` parked the run for a session to resolve; `Failed` ended it
+/// because its rewritten receipt reported `failed`. `NoRunAwaiting` is
+/// `--next` on an empty queue.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "outcome", rename_all = "snake_case")]
 pub enum IntegrationOutcome {
     Integrated {
         task: Task,
         run: Box<TaskRun>,
+        #[serde(default)]
+        verification_skipped: bool,
     },
     NeedsSession {
         run: Box<TaskRun>,

@@ -1118,6 +1118,7 @@ pub fn integrate(db: &Path, target: IntegrateTarget, repo: &Path) -> Result<Valu
     };
     let outcome = match verdict {
         Verdict::Landed(landing) => {
+            let verification_skipped = landing.verification_skipped;
             let (task, run) = queue
                 .finish_integration(&run.id, &token, &landing, &common_dir)
                 .with_context(|| {
@@ -1134,6 +1135,7 @@ pub fn integrate(db: &Path, target: IntegrateTarget, repo: &Path) -> Result<Valu
             IntegrationOutcome::Integrated {
                 task,
                 run: Box::new(run),
+                verification_skipped,
             }
         }
         Verdict::Deferred { reason, detail } => {
@@ -1321,8 +1323,30 @@ fn land(
             json!({"main": main, "head": rebased}),
         );
     }
-    // The task's verification commands run again on the rebased tree.
-    for (index, command) in task.verification_commands.iter().enumerate() {
+    // The task's verification commands run again on the rebased tree, unless
+    // the rebase was a no-op on the head validation itself verified: the
+    // supervisor ran these very commands on this commit and tree, so a second
+    // run can only repeat its result. A head a session wrote after
+    // `needs_session` is not that head, even when the session rebased it onto
+    // main itself, so it is verified here.
+    let verification_skipped = rebased == head && run.result_commit.as_deref() == Some(&*head);
+    if verification_skipped {
+        queue.record_runtime_event(
+            &run.id,
+            "integration_verification_skipped",
+            json!({
+                "main": main,
+                "head": rebased,
+                "reason": "rebase was a no-op; validation already verified this head",
+            }),
+        )?;
+    }
+    let commands: &[String] = if verification_skipped {
+        &[]
+    } else {
+        &task.verification_commands
+    };
+    for (index, command) in commands.iter().enumerate() {
         let log = run_dir.join(format!("integrate-verify-{}.log", index + 1));
         let status = run_shell_to_log(command, worktree, &log)?;
         let exit_code = status.code().unwrap_or(128);
@@ -1363,6 +1387,7 @@ fn land(
         main_before: main.to_owned(),
         history_ref,
         message: paragraphs.join("\n\n"),
+        verification_skipped,
     }))
 }
 
