@@ -99,3 +99,22 @@ fn reads_do_not_create_a_queue_and_unknown_tasks_fail() {
     assert!(!invoke(&db, &["integrate"]).status.success());
     assert!(!invoke(&db, &["integrate", "1", "--next"]).status.success());
 }
+
+#[test]
+fn version_works_outside_a_repository_and_without_a_queue() {
+    let dir = tempfile::tempdir().unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_cmux-taskq"))
+        .arg("--version")
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap().trim(),
+        format!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"))
+    );
+}
