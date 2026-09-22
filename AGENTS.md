@@ -20,7 +20,14 @@ cmux-taskq は cmux と Git worktree で依存関係付きの開発タスクを�
 cargo fmt --all --check
 cargo test --locked
 cargo clippy --locked --all-targets -- -D warnings
+cargo llvm-cov --locked --fail-under-lines 80
 ```
+
+## テストの制約
+
+- unit test: 行カバレッジの合計を 80% 以上に保つ（`cargo-llvm-cov`、行基準、全体）。下回る変更は merge しない
+- e2e test: ハッピーパスを `tests/e2e.rs` に置く。実バイナリ・実 Git・実 cmux を使い、Claude の代わりに受け入れ条件どおり commit と receipt を書く stub スクリプトを provider にする。cmux が必要なので `#[ignore]` とし、SV が merge 前に `cargo test --locked --test e2e -- --ignored` で実行する
+- 実 Claude を含む経路は自動化せず、手動スモーク（journal 010, 012）で確認する
 
 ## 文書のルール
 
@@ -49,7 +56,7 @@ cargo clippy --locked --all-targets -- -D warnings
 - タスクごとに main から `git worktree add .worktrees/<NNN>-<slug> -b journal/<NNN>-<slug>` で worktree を作る。`.worktrees/` は gitignore 済み
 - `cmux workspace create --name "TASKQ-<NNN> <slug>" --cwd <worktree> --command "claude --model opus"` で workspace を作り、worker は常に Opus で起動する。`cmux send` / `cmux send-key` で指示を送る。指示にはジャーナルのパス、完了マーカー、SV への質問方法を含める
 - 数分おきに `cmux read-screen --workspace <ws> --lines N` で画面を読む。権限確認は worktree 内の編集・cargo・git など安全なものは SV が応答し、それ以外とユーザーの判断が要るものはユーザーに確認する
-- worker の完了マーカーを確認したら、worktree で fmt / test / clippy を通し、差分をレビューして main へ merge（fast-forward 優先）し、push する。ジャーナルの README Open 一覧は SV が main で更新する
+- worker の完了マーカーを確認したら、worktree で fmt / test / clippy / llvm-cov と e2e（`--ignored`）を通し、差分をレビューして main へ merge（fast-forward 優先）し、push する。ジャーナルの README Open 一覧は SV が main で更新する
 - merge 後に workspace を閉じ、worktree と branch を削除する。失敗・中断時は両方を残す
 - Claude 利用制限などで worker が止まったら、ジャーナルの Log を確認して別 session で引き継ぐ
 

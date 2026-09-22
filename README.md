@@ -77,9 +77,10 @@ The receipt is JSON at `<run-dir>/receipt.json`, written by atomic rename:
 cargo fmt --all --check
 cargo test --locked
 cargo clippy --locked --all-targets -- -D warnings
+cargo llvm-cov --locked --fail-under-lines 80
 ```
 
-The tests use temporary databases and do not require cmux, Claude Code, or network access after dependencies have been fetched.
+The tests use temporary databases and do not require cmux, Claude Code, or network access after dependencies have been fetched. Line coverage must stay at or above 80% (`cargo install cargo-llvm-cov`). The end-to-end happy path in `tests/e2e.rs` drives the real binary through cmux with a stub agent and is ignored by default; run it with `cargo test --locked --test e2e -- --ignored` where cmux is available.
 
 ## Documentation
 

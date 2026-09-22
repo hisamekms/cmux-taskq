@@ -7,7 +7,7 @@ created: 2026-09-22
 updated: 2026-09-22
 plan_step: 4
 queue_task: null
-depends_on_journal: [6, 9]
+depends_on_journal: [6, 9, 15]
 related:
   - journal-003
 ---
