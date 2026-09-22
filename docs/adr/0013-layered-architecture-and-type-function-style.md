@@ -186,3 +186,61 @@ statusの遷移ではないが、業務上の拒否をinfrastructureが`anyhow`�
 - `Uuid::new_v4()`は3か所: `src/runtime.rs:203`（supervisorのtoken）、`src/runtime.rs:1096`（`integrate`のtoken）、`src/infrastructure/sqlite.rs:547`（`claim_task`のrun ID）。→ ID生成をapplicationのportにし、domainには生成済みの`RunId`を渡す。テストで固定IDを注入できるようにする。
 - `Instant::now()`（`src/runtime.rs:627`、`:702`、`:767`、`:1900`、`src/lifecycle.rs:214`、`:223`、`src/infrastructure/adapters.rs:85`、`:89`、`:201`、`:206`、`src/infrastructure/launchd.rs:158`）はタイムアウトの計測であって業務上の時刻ではない。clock portの対象にはせず、そのまま残す。
 - SQLiteが生成するタイムスタンプ（`sqlite.rs`と`runtime_store.rs`の`strftime('%Y-%m-%dT%H:%M:%fZ','now')`、`unixepoch()`、およびmigrationsの`DEFAULT`）はschemaの一部なので変えない。注入した時刻はこれらを置き換えず、application側で必要な判断にだけ使う。
+
+## 追補（2026-09-22）
+
+この節は2026-09-22の追補である。この文書を書いた時点では、ユーザーの設計方針のうち**8（DDDのトリレンマ）が途中で切れた状態**でしか読めず、9（同時更新・トランザクション）と10（実施方針と検証）は存在しなかった。その後goal 3のconstraintsに8の全文と9・10が追加されたので、ここに書き写す。ADRは追記のみなので上の`## Decision`の8は書き換えず、**この節が8の最新版**とする。あわせて`## Consequences`の記述を1点訂正する。
+
+### 8. DDDのトリレンマ（全文）
+
+ドメインの純粋性を基本とし、次の順で対応する。
+
+第一選択は「applicationで取得 → domainで判断・状態遷移 → applicationで保存」とする。情報量や取得コストが小さい場合は、多少の不要な取得を許容して構造を単純に保つ。
+
+条件付きの取得が必要で、先読みのコストが問題になる箇所では、**domainの処理を段階に分ける**。
+
+1. domainがenumなどで「完了」または「追加情報が必要」を返す。
+2. applicationが要求された情報を取得する。
+3. domainに取得結果を渡し、処理を続ける。
+
+「追加情報が必要か」という業務判断はdomainに置き、applicationはその結果に従ってI/Oを実行する。必要に応じて**非公開フィールドを持つ中間型**で途中の状態を表す。
+
+この方式は複雑さを増やすため、全ユースケースへ一律に導入しない。段階分けが過度に複雑になる場合に**限り**、applicationへの限定的な業務分岐配置や、I/Oを伴うドメインサービスを検討し、理由を明示する（この repository ではreceiptのsummaryに書く）。
+
+**trait経由でも、domainが外部I/Oを実行する場合は純粋ではない**ことに留意する。domainにport traitの引数を渡して「抽象化したから純粋」とはみなさない。
+
+この repository で既に例外として認めている依存グラフの循環検出（SQLの再帰CTE）は、上の「限定的な例外」に当たる。理由（全依存グラフの取得コスト）を担当タスクのreceiptに書く。
+
+### 9. 同時更新・トランザクション
+
+Rustの所有権と、DB上の同時更新制御は別に扱う。
+
+- 更新競合が発生する箇所では、バージョン照合などの**楽観ロック**を検討する。
+- 複数の保存を不可分に扱う必要がある場合は、**applicationがトランザクション境界を制御**し、具体的なDB操作はinfrastructureに置く。
+- 照会結果だけで整合性を保証せず、条件付き更新・予約・トランザクションなどを要件に応じて使う。
+- **コマンドが集約を消費することは、永続化済みの変更のロールバックを意味しない**。所有権が移ったことと、DBの状態が戻ることは別である。
+
+この repository では、`claim`とleaseの`BEGIN IMMEDIATE`と`UPDATE ... WHERE status IN (...)`が既にこの役割（トランザクション境界と条件付き更新による楽観的な競合検出）を持っている。ユースケースをapplicationへ移すときも、この境界と述語は維持する。
+
+### 10. 実施方針と検証
+
+- まず**既存実装と方針の差分を整理**し、**変更範囲を示した**うえで実装する。この文書の`## 棚卸し`がその差分整理にあたる。
+- **既存の仕組みが方針を満たす場合は活用する**。置き換えを目的にしない。
+- **ドメインイベント、状態ごとの型分け、汎用的な処理実行フレームワークなどは、具体的な必要性がない限り導入しない**。
+- **既存テストを活用**し、変更に伴うリスクに応じて、不変条件、正常・異常な状態遷移、復元時の検証、更新競合などの重要な振る舞いを検証する。
+- 完了時には、主な変更、検証結果、方針からの例外とその理由、残る課題を報告する。この repository では**receiptの`summary`**に書く。
+
+### 訂正: SQLが生成するタイムスタンプと注入した時刻
+
+`## Consequences`の「`created_at` / `updated_at`のようなSQLiteが`strftime` / `unixepoch`で生成するタイムスタンプはDB側に残り、注入した時刻で置き換えはしない」と、`## 棚卸し`末尾の同趣旨の記述を、次のとおり訂正する。
+
+- **schemaの`DEFAULT`式はそのまま残す**。`migrations/`の`DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))`と`DEFAULT (unixepoch())`は変えない。schemaを変えないという制約はそのままである。
+- **runtimeがSQLの中で`strftime('now')` / `unixepoch()`を呼んで更新している箇所は、方針7に従いapplicationに注入した`Clock`の値をbindする形に変える**。対象は`src/infrastructure/sqlite.rs`の`updated_at`（`transition`、`set_goal`、goalの更新、`claim_task`、依存の更新）と`close_goal`の`closed_at`、`src/infrastructure/runtime_store.rs`の`heartbeat_at`（lease・supervisor・run process）、`exited_at`、`workspace_closed_at`、`finish_integration`がtaskを`completed`にするときの`updated_at`、および`SELECT unixepoch()`とstale判定の`heartbeat_at >= unixepoch()-?`の基準時刻である。担当は時刻/IDタスク（キュー上のID 37）。
+
+理由は3つ。
+
+1. テストで固定時刻を使えるようになり、stale判定や`workspace_closed_at`の検証がDBの現在時刻に依存しなくなる。
+2. 1つの業務操作の中で基準時刻を揃えられる。いまは同じ操作の中の複数のSQLがそれぞれ別の`unixepoch()`を読む。
+3. bindしても**schemaと保存形式は変わらない**。列の型も値の書式（`%Y-%m-%dT%H:%M:%fZ`のTEXT、UNIX秒のINTEGER）も同じなので、外部公開APIの固定と両立する。
+
+`DEFAULT`式が効くのは`INSERT`でその列を指定しなかったときだけなので、既定値をschemaに残したまま、runtimeの更新側だけをbindへ寄せられる。
