@@ -14,7 +14,7 @@ related:
 
 # SQLite persistence
 
-SQLiteはキューの正本であり、プロセス間共有と再起動後の復旧に使う。stdoutは正本にしない。ステップ2で4テーブル、ステップ3で3テーブルを実装した（schema version 2）。
+SQLiteはキューの正本であり、プロセス間共有と再起動後の復旧に使う。stdoutは正本にしない。ステップ2で4テーブル、ステップ3で3テーブル、ステップ4で`task_runs.workspace_closed_at`列を実装した（schema version 3）。
 
 ```text
 tasks
@@ -26,7 +26,7 @@ supervisor_leases    -- 0002: supervisor token、PID、heartbeat（1行）
 run_processes        -- 0002: runごとのwrapper/agentのPID、heartbeat、終了コード
 ```
 
-`task_dependencies(task_id, predecessor_id)`は依存関係を保存する。TaskRunは試行ごとに新しい行を作り、Taskに履歴を持たせる。workspace、worktree、receipt、log、repo、run directory、supervisor token、last errorの参照列をtask_runsに置き、claim時点ではnullにする。`result_commit`は検証で確認したcommit、`last_error`は検証の拒否理由またはruntime errorを持つ。成果物hashは未実装。
+`task_dependencies(task_id, predecessor_id)`は依存関係を保存する。TaskRunは試行ごとに新しい行を作り、Taskに履歴を持たせる。workspace、worktree、receipt、log、repo、run directory、supervisor token、last errorの参照列をtask_runsに置き、claim時点ではnullにする。`result_commit`は検証で確認したcommit、`last_error`は検証の拒否理由、cleanup失敗、またはruntime errorを持つ。`workspace_closed_at`（0003）はcmuxがcloseを確認した時刻で、nullの間はworkspaceを開いているものとして扱う。成果物hashは未実装。
 
 ## Runtime ownership
 
@@ -35,6 +35,7 @@ run_processes        -- 0002: runごとのwrapper/agentのPID、heartbeat、終�
 - `run_processes`は`(run_id, role)`を主キーとし、wrapperとagentの登録は1回限りにする。wrapperの操作は登録したPIDかつ未終了であることを要求する。
 - ログ本体とreceiptは`<db>.runs/<run-id>/`のファイルに置き、pathをtask_runsへ記録する。
 - receipt検証は`validating`かつ同じsupervisor tokenのrunだけを`awaiting_integration`または`failed`へ進める。検証コマンドの結果は`verification_command`イベント、判定とreceiptの内容は`validation_finished`イベントに置き、専用テーブルは持たない。
+- workspaceのcloseは`awaiting_integration`かつ同じtokenで`workspace_closed_at`がnullのrunだけに記録でき、`workspace_closed`イベントと一緒に一度だけ書く。失敗は`cleanup_failed`イベントと`last_error`に残し、列はnullのままにする。イベントから導出せず列に持つのは、`doctor`/`recover`や統合確認が閉じていないworkspaceを1クエリで拾えるようにし、失敗後の再試行で`cleanup_failed`と`workspace_closed`の順序を追わずに済ませるため。
 
 ## Transactions and constraints
 

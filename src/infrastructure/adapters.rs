@@ -292,6 +292,16 @@ impl WorkspaceBackend for Cmux {
             "2000",
         ]))
     }
+
+    fn close(&self, workspace_id: &str) -> Result<()> {
+        let raw = output(
+            Command::new(&self.executable)
+                .args(["workspace", "close"])
+                .arg(workspace_id),
+        )?;
+        workspace_handle(&raw).context("cmux did not confirm the workspace close")?;
+        Ok(())
+    }
 }
 
 pub fn workspace_handle(raw: &str) -> Result<&str> {

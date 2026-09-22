@@ -139,6 +139,8 @@ pub struct TaskRun {
     pub repo_path: Option<String>,
     pub run_dir: Option<String>,
     pub last_error: Option<String>,
+    /// Set once cmux confirmed the close; null keeps the run out of any cleaned state.
+    pub workspace_closed_at: Option<i64>,
     pub created_at: String,
 }
 

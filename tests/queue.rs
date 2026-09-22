@@ -325,7 +325,7 @@ fn initialization_is_repeatable_and_preserves_existing_tasks() {
     queue.add(new_task("preserved")).unwrap();
     drop(queue);
     let queue = SqliteQueue::init(dir.path().join("queue.db")).unwrap();
-    assert_eq!(queue.schema_version().unwrap(), 2);
+    assert_eq!(queue.schema_version().unwrap(), 3);
     assert_eq!(queue.list().unwrap().len(), 1);
     assert!(SqliteQueue::open(dir.path().join("typo.db")).is_err());
     assert!(!dir.path().join("typo.db").exists());

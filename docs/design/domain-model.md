@@ -25,7 +25,7 @@ related:
 - `TaskDependency`: taskからpredecessorへの有向辺。循環は禁止する。
 - `TaskRun`: 1回の実行試行。provider、worktree、branch、結果、実行statusを持つ。
 - `AgentSession`: providerが起動したセッション。プロセスとprovider固有識別子を持つ。
-- `Workspace`: cmux workspace。TaskRunと1対1で関連し、実行後に閉じる。
+- `Workspace`: cmux workspace。TaskRunと1対1で関連し、receipt検証を通った後にsupervisorが閉じる。閉じたことの確認は`TaskRun.workspace_closed_at`で持つ。
 - `SupervisorLease`: キューを所有するsupervisorのPIDとheartbeat。
 - `RunProcess`: runごとのsession wrapperとagentのPID、heartbeat、終了コード。
 - `RunEvent`: 実行中に発生した永続イベント。
@@ -37,7 +37,7 @@ related:
 
 - `add`でdraftを作り、`draft → ready`、`ready → draft`、`draft/ready → canceled`を手動操作できる。
 - `claim`だけが`ready → in_progress`へ遷移させる。同じトランザクションでclaimed状態のTaskRunとイベントを作る。
-- supervisorはrunを`claimed → starting`（path計画）→ `running`（agent起動）→ `validating`または`failed`（wrapper終了）→ `awaiting_integration`または`failed`（receipt検証）へ進める。各遷移はleaseまたはwrapperの所有を要求する。
+- supervisorはrunを`claimed → starting`（path計画）→ `running`（agent起動）→ `validating`または`failed`（wrapper終了）→ `awaiting_integration`または`failed`（receipt検証）へ進め、`awaiting_integration`のworkspaceを閉じて`workspace_closed_at`を記録する。各遷移はleaseまたはwrapperの所有を要求する。
 - `in_progress`または終端状態のTaskは手動変更できない。依存の追加・削除もdraft/readyだけに許可する。
 - Taskの`completed`への遷移と`awaiting_integration`以降のrunの遷移、失敗runの回復はまだ公開していない。mainへの統合検証を実装してから接続する。
 - `candidates`は全依存がcompletedのready taskをID順で返す。同時実行枠の空きはclaimで再確認する。
@@ -50,6 +50,6 @@ related:
 - 依存グラフは循環しない。
 - `in_progress`はschedulerがclaimしたTaskだけが持つ。
 - TaskRunが成功するには完了レシート、base commitの上に積まれたbranch headのコミット、clean worktree、supervisorが再実行した検証コマンドの成功が必要。receiptの自己申告だけでは成功しない。
-- workspaceを閉じる前にTaskRunをcleanedにしない。
+- workspaceを閉じる前にTaskRunをcleanedにしない。閉じたことをcmuxの応答で確認して`workspace_closed_at`に記録するまでは開いている扱いで、close失敗はrun状態を変えない。
 - agentの異常終了だけでTaskを自動再実行しない。
 - 実装途中のprovider fallbackは行わず、起動不能など安全に判定できる場合だけfallbackする。

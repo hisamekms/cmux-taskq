@@ -27,4 +27,6 @@ pub trait WorkspaceBackend {
     fn preflight(&self) -> Result<()>;
     fn create(&self, run: &crate::domain::TaskRun, command: &str) -> Result<String>;
     fn capture(&self, workspace_id: &str) -> Result<String>;
+    /// Close the workspace; the worktree and branch are not touched.
+    fn close(&self, workspace_id: &str) -> Result<()>;
 }

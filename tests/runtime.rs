@@ -95,20 +95,29 @@ impl AgentProvider for TestProvider {
     }
 }
 
+const WORKSPACE_ID: &str = "01234567-89ab-4def-8123-456789abcdef";
+
 struct TestWorkspace {
     db: PathBuf,
     fail: bool,
+    close_fail: bool,
     script: String,
     worker: Mutex<Option<thread::JoinHandle<Result<Value>>>>,
+    closed: Mutex<Vec<String>>,
 }
 impl TestWorkspace {
     fn new(db: &Path, fail: bool, script: &str) -> Self {
         Self {
             db: db.into(),
             fail,
+            close_fail: false,
             script: script.into(),
             worker: Mutex::new(None),
+            closed: Mutex::new(Vec::new()),
         }
+    }
+    fn closed(&self) -> Vec<String> {
+        self.closed.lock().unwrap().clone()
     }
     fn join(&self) {
         self.worker
@@ -146,10 +155,24 @@ impl WorkspaceBackend for TestWorkspace {
         *self.worker.lock().unwrap() = Some(thread::spawn(move || {
             runtime::session_with_provider(&db, &id, &token, &TestProvider { script })
         }));
-        Ok("01234567-89ab-4def-8123-456789abcdef".into())
+        Ok(WORKSPACE_ID.into())
     }
     fn capture(&self, _: &str) -> Result<String> {
         Ok("fixture terminal screen".into())
+    }
+    fn close(&self, workspace_id: &str) -> Result<()> {
+        // The session must have exited before the supervisor gives up the workspace.
+        let exited: bool = Connection::open(&self.db)?.query_row(
+            "SELECT EXISTS(SELECT 1 FROM run_processes WHERE role='wrapper' AND exited_at IS NOT NULL)",
+            [],
+            |r| r.get(0),
+        )?;
+        assert!(exited);
+        if self.close_fail {
+            bail!("injected workspace close failure");
+        }
+        self.closed.lock().unwrap().push(workspace_id.into());
+        Ok(())
     }
 }
 
@@ -170,15 +193,37 @@ fn supervise(db: &Path, repo: &Path, backend: &TestWorkspace) -> Result<Value> {
 
 /// Run one fake agent script through supervise and return the task detail.
 fn run_agent(script: &str) -> (TempDir, PathBuf, cmux_taskq::domain::TaskDetail) {
+    run_agent_with(script, false)
+}
+
+fn run_agent_with(
+    script: &str,
+    close_fail: bool,
+) -> (TempDir, PathBuf, cmux_taskq::domain::TaskDetail) {
     let (dir, repo, db) = fixture();
-    let backend = TestWorkspace::new(&db, false, script);
+    let mut backend = TestWorkspace::new(&db, false, script);
+    backend.close_fail = close_fail;
     let outcome = supervise(&db, &repo, &backend).unwrap();
     backend.join();
     assert_eq!(outcome["outcome"], "finished");
     let mut queue = SqliteQueue::open(&db).unwrap();
     let detail = queue.show(1).unwrap();
     assert_eq!(detail.task.status, TaskStatus::InProgress);
-    assert!(Path::new(detail.runs[0].worktree_path.as_ref().unwrap()).exists());
+    let run = &detail.runs[0];
+    // Every outcome keeps the worktree; only an accepted run closes its workspace.
+    assert!(Path::new(run.worktree_path.as_ref().unwrap()).exists());
+    assert_eq!(run.workspace_id.as_deref(), Some(WORKSPACE_ID));
+    let kinds: Vec<&str> = detail.events.iter().map(|e| e.kind.as_str()).collect();
+    if run.status == RunStatus::AwaitingIntegration && !close_fail {
+        assert_eq!(backend.closed(), vec![WORKSPACE_ID.to_owned()]);
+        assert!(run.workspace_closed_at.is_some());
+        assert!(kinds.contains(&"workspace_closed"));
+    } else {
+        assert!(backend.closed().is_empty());
+        assert!(run.workspace_closed_at.is_none());
+        assert!(!kinds.contains(&"workspace_closed"));
+    }
+    assert_eq!(kinds.contains(&"cleanup_failed"), close_fail);
     assert!(queue.supervisor_lease().unwrap().is_none());
     assert!(queue.candidates().unwrap().is_empty());
     (dir, db, detail)
@@ -252,10 +297,61 @@ fn valid_receipt_is_verified_and_awaits_integration() {
         finished.payload["receipt"]["e2e"]["status"],
         "not_applicable"
     );
+    // The workspace is closed only after validation succeeded; the branch stays.
+    let closed = detail
+        .events
+        .iter()
+        .find(|e| e.kind == "workspace_closed")
+        .unwrap();
+    assert!(closed.id > finished.id);
+    assert_eq!(closed.payload["workspace_id"], WORKSPACE_ID);
+    assert_eq!(
+        closed.payload["closed_at"],
+        json!(run.workspace_closed_at.unwrap())
+    );
+    let branch = Command::new("git")
+        .arg("-C")
+        .arg(run.worktree_path.as_ref().unwrap())
+        .args(["symbolic-ref", "HEAD"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        String::from_utf8(branch.stdout).unwrap().trim(),
+        format!("refs/heads/{}", run.branch.as_ref().unwrap())
+    );
     // The task still owns its slot until integration; no second run starts.
     let mut queue = SqliteQueue::open(&db).unwrap();
     assert_eq!(queue.show(1).unwrap().runs.len(), 1);
     assert!(queue.candidates().unwrap().is_empty());
+}
+
+#[test]
+fn failed_workspace_close_is_recorded_without_changing_run_status() {
+    let (_dir, _db, detail) = run_agent_with(VALID_AGENT, true);
+    let run = &detail.runs[0];
+    assert_eq!(run.status, RunStatus::AwaitingIntegration);
+    assert!(run.result_commit.is_some());
+    let error = run.last_error.as_ref().unwrap();
+    assert!(
+        error.contains("injected workspace close failure"),
+        "{error}"
+    );
+    assert!(error.contains(WORKSPACE_ID));
+    let failed = detail
+        .events
+        .iter()
+        .find(|e| e.kind == "cleanup_failed")
+        .unwrap();
+    assert_eq!(failed.payload["workspace_id"], WORKSPACE_ID);
+    assert_eq!(failed.payload["message"], json!(error));
+    // Validation itself was accepted; the failure is confined to cleanup.
+    let finished = detail
+        .events
+        .iter()
+        .find(|e| e.kind == "validation_finished")
+        .unwrap();
+    assert_eq!(finished.payload["accepted"], true);
+    assert!(failed.id > finished.id);
 }
 
 #[test]
@@ -370,8 +466,11 @@ fn failed_agent_retains_worktree_and_does_not_complete_task() {
     let outcome = supervise(&db, &repo, &backend).unwrap();
     backend.join();
     assert_eq!(outcome["run"]["status"], "failed");
-    // A nonzero session exit is final; the receipt is not validated.
+    // A nonzero session exit is final; the receipt is not validated and the
+    // workspace stays open for inspection.
     assert_eq!(outcome["run"]["result_commit"], Value::Null);
+    assert_eq!(outcome["run"]["workspace_closed_at"], Value::Null);
+    assert!(backend.closed().is_empty());
     let mut queue = SqliteQueue::open(&db).unwrap();
     let detail = queue.show(1).unwrap();
     assert_eq!(detail.task.status, TaskStatus::InProgress);
@@ -450,7 +549,7 @@ fn migration_from_v1_preserves_task_and_initializes_runtime_tables() {
     raw.pragma_update(None, "user_version", 1).unwrap();
     raw.execute("INSERT INTO tasks(title,description,acceptance,verification_commands) VALUES ('preserved','','','[]')", []).unwrap();
     let mut queue = SqliteQueue::open(&db).unwrap();
-    assert_eq!(queue.schema_version().unwrap(), 2);
+    assert_eq!(queue.schema_version().unwrap(), 3);
     assert_eq!(queue.show(1).unwrap().task.title, "preserved");
     assert!(queue.supervisor_lease().unwrap().is_none());
 }
@@ -529,6 +628,84 @@ fn wrapper_registration_is_one_shot_and_rejects_stale_owners() {
             .finish_validation(&run.id, "owner", &validation)
             .is_err()
     ); // Terminal.
+    // A failed run never records a workspace close or cleanup failure.
+    assert!(queue.workspace_closed(&run.id, "owner").is_err());
+    assert!(queue.cleanup_failed(&run.id, "owner", "late").is_err());
+}
+
+#[test]
+fn workspace_close_is_recorded_once_and_only_for_accepted_runs() {
+    use cmux_taskq::{
+        domain::ClaimOutcome,
+        infrastructure::runtime_store::{RunPlan, Validation},
+    };
+    let (_dir, _repo, db) = fixture();
+    let mut queue = SqliteQueue::open(&db).unwrap();
+    queue.acquire_supervisor("owner", "/test/.git").unwrap();
+    let ClaimOutcome::Claimed { run } = queue
+        .claim("0123456789abcdef0123456789abcdef01234567")
+        .unwrap()
+    else {
+        panic!()
+    };
+    queue
+        .plan_run(
+            &run.id,
+            "owner",
+            &RunPlan {
+                repo_path: "/test".into(),
+                run_dir: "/run".into(),
+                branch: "taskq/test".into(),
+                worktree_path: "/run/worktree".into(),
+                receipt_path: "/run/receipt.json".into(),
+                log_path: "/run/log".into(),
+            },
+        )
+        .unwrap();
+    queue
+        .workspace_created(&run.id, "owner", WORKSPACE_ID)
+        .unwrap();
+    queue.register_wrapper(&run.id, "owner", 10).unwrap();
+    queue.register_agent(&run.id, 10, 12).unwrap();
+    // Still running: neither close nor cleanup failure may be recorded.
+    assert!(queue.workspace_closed(&run.id, "owner").is_err());
+    assert!(queue.cleanup_failed(&run.id, "owner", "early").is_err());
+    queue.wrapper_exited(&run.id, 10, 0).unwrap();
+    queue.finish_supervision(&run.id, "owner").unwrap();
+    let accepted = queue
+        .finish_validation(
+            &run.id,
+            "owner",
+            &Validation {
+                accepted: true,
+                result_commit: Some("89abcdef0123456789abcdef0123456789abcdef".into()),
+                reason: None,
+                receipt: Value::Null,
+            },
+        )
+        .unwrap();
+    assert_eq!(accepted.status, RunStatus::AwaitingIntegration);
+    assert!(accepted.workspace_closed_at.is_none());
+    assert!(queue.workspace_closed(&run.id, "other-owner").is_err());
+    let failed = queue.cleanup_failed(&run.id, "owner", "cmux down").unwrap();
+    assert_eq!(failed.status, RunStatus::AwaitingIntegration);
+    assert_eq!(failed.last_error.as_deref(), Some("cmux down"));
+    assert!(failed.workspace_closed_at.is_none());
+    // A later successful close clears nothing but records the close once.
+    let closed = queue.workspace_closed(&run.id, "owner").unwrap();
+    assert!(closed.workspace_closed_at.is_some());
+    assert_eq!(closed.status, RunStatus::AwaitingIntegration);
+    assert!(queue.workspace_closed(&run.id, "owner").is_err());
+    assert!(queue.cleanup_failed(&run.id, "owner", "late").is_err());
+    let kinds: Vec<String> = queue
+        .show(1)
+        .unwrap()
+        .events
+        .iter()
+        .map(|e| e.kind.clone())
+        .collect();
+    assert_eq!(kinds.iter().filter(|k| *k == "workspace_closed").count(), 1);
+    assert_eq!(kinds.iter().filter(|k| *k == "cleanup_failed").count(), 1);
 }
 
 #[test]

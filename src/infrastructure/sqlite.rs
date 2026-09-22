@@ -20,6 +20,7 @@ const APPLICATION_ID: i64 = 0x43545131;
 const MIGRATIONS: &[&str] = &[
     include_str!("../../migrations/0001_queue.sql"),
     include_str!("../../migrations/0002_supervisor.sql"),
+    include_str!("../../migrations/0003_workspace_close.sql"),
 ];
 const READY_QUERY: &str = "
     SELECT t.* FROM tasks t
@@ -381,6 +382,7 @@ pub(super) fn run_row(row: &Row<'_>) -> rusqlite::Result<TaskRun> {
         repo_path: row.get("repo_path")?,
         run_dir: row.get("run_dir")?,
         last_error: row.get("last_error")?,
+        workspace_closed_at: row.get("workspace_closed_at")?,
         created_at: row.get("created_at")?,
     })
 }

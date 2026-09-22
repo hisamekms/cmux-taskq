@@ -1,4 +1,4 @@
-//! Execute one reserved task and validate its receipt. Workspace cleanup is a separate stage.
+//! Execute one reserved task, validate its receipt, and close the workspace of an accepted run.
 use crate::{
     application::{AgentProvider, TaskQueue, WorkspaceBackend},
     domain::{ClaimOutcome, Receipt, RunStatus, Task, TaskRun},
@@ -131,6 +131,14 @@ pub fn supervise(
     let result = result.and_then(|run| {
         if run.status == RunStatus::Validating {
             validate(&mut queue, &repository, &token, &run, &heartbeat)
+        } else {
+            Ok(run)
+        }
+    });
+    // Only an accepted run gives up its workspace; failures keep it for inspection.
+    let result = result.and_then(|run| {
+        if run.status == RunStatus::AwaitingIntegration {
+            close_workspace(&mut queue, cmux, &token, &run, &heartbeat)
         } else {
             Ok(run)
         }
@@ -293,6 +301,28 @@ fn validate(
         }
     };
     queue.finish_validation(&run.id, token, &validation)
+}
+
+/// Close the cmux workspace of an accepted run. The worktree and branch stay
+/// until integration. A close failure is recorded but does not change the run
+/// status; `workspace_closed_at` stays null so nothing treats it as cleaned.
+fn close_workspace(
+    queue: &mut SqliteQueue,
+    cmux: &dyn WorkspaceBackend,
+    token: &str,
+    run: &TaskRun,
+    heartbeat: &Heartbeat,
+) -> Result<TaskRun> {
+    heartbeat.check()?;
+    let workspace = run.workspace_id.as_ref().context("missing workspace")?;
+    match cmux.close(workspace) {
+        Ok(()) => queue.workspace_closed(&run.id, token),
+        Err(error) => {
+            let message = format!("workspace {workspace} could not be closed: {error:#}");
+            eprintln!("run {}: {message}", run.id);
+            queue.cleanup_failed(&run.id, token, &message)
+        }
+    }
 }
 
 struct Rejection {

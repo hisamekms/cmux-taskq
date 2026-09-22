@@ -32,7 +32,7 @@ ready task
 
 ## Implementation status
 
-ステップ3で`claim`から`running`、セッション終了検知までを、ステップ4の[005](../journal/005-receipt-validation.md)でreceiptの検証と`awaiting_integration`への遷移を`src/runtime.rs`に実装した。workspaceの終了、統合確認、`doctor`/`recover`はステップ4の残りで追加する。
+ステップ3で`claim`から`running`、セッション終了検知までを、ステップ4の[005](../journal/005-receipt-validation.md)でreceiptの検証と`awaiting_integration`への遷移を、[006](../journal/006-workspace-close.md)で受理後のworkspace終了を`src/runtime.rs`に実装した。統合確認、`doctor`/`recover`はステップ4の残りで追加する。
 
 ## `supervise`
 
@@ -47,7 +47,8 @@ ready task
 7. cmux workspaceを`--cwd worktree --command '<runner> --db ... session --run ... --lease ... --claude ...'`で作成し、`identify`で解決したUUIDを`workspace_created`として保存する。
 8. 監視ループで、wrapperの登録（45秒以内）、wrapper heartbeat（30秒以内）、receiptファイルの出現、wrapperの終了を確認する。receiptの出現は`receipt_observed`（`validated: false`）として記録するだけで、セッション終了とは別に扱う。
 9. wrapper終了後に画面を`terminal-final.txt`へ保存し、`supervision_finished`でrunを終了コード0なら`validating`、それ以外なら`failed`にする。Taskは`in_progress`のまま残す。
-10. `validating`なら同じleaseのままreceiptを検証し（下記）、`validation_finished`でrunを`awaiting_integration`または`failed`にしてからleaseを解放する。
+10. `validating`なら同じleaseのままreceiptを検証し（下記）、`validation_finished`でrunを`awaiting_integration`または`failed`にする。
+11. `awaiting_integration`になったrunだけ、同じleaseのまま`cmux workspace close <workspace_id>`でworkspaceを閉じ、`OK workspace:N`の応答を確認して`workspace_closed`（`task_runs.workspace_closed_at`）を記録する。worktreeとbranchは統合まで残す。closeが失敗したら`cleanup_failed`イベントと`last_error`に記録し、runは`awaiting_integration`、`workspace_closed_at`はnullのままにする。最後にleaseを解放する。
 
 作成や通信に失敗した場合は、セッションが生きている可能性があるためleaseを解放せず、リソースも削除しない。`last_error`と`runtime_error`イベントに原因を記録し、`show`と`status`で確認する。検証の判定ではなく検証処理そのもの（Git呼び出しやDB）が失敗した場合も同じ扱いで、runは`validating`のまま残る。
 
@@ -87,6 +88,8 @@ receiptの形式は`src/domain.rs`の`Receipt`で、promptとREADMEに同じ契�
 
 ## Cleanup and recovery
 
-workspace削除はsupervisorが行う（[006](../journal/006-workspace-close.md)で実装）。成功時はworkspaceだけを削除し、`integrated`ではworktreeとbranchをmainへの反映まで残す。失敗・中断・heartbeat切れ・検証失敗の場合は調査のためworkspaceとworktreeを残す。
+workspaceの終了はsupervisorが行う。receipt検証を通った`awaiting_integration`のrunだけが対象で、workspaceだけを閉じ、worktreeとbranchはmainへの反映まで残す。`failed`（非0終了、検証拒否）、provisioningや検証処理のエラー、wrapper heartbeat切れの場合はworkspaceもworktreeも調査のため残し、closeを呼ばない。
+
+closeの成否は`task_runs.workspace_closed_at`で表す。nullは「閉じたことを確認していない」で、closeの失敗だけでなく、cmuxが閉じた後にDBへ書けなかった場合も含む。closeの失敗は`cleanup_failed`イベントと`last_error`に残るが、run状態は変えない。閉じていないworkspaceをcleaned扱いにせず、再試行は`doctor`/`recover`（[009](../journal/009-doctor-recover.md)）で扱う。
 
 supervisorの再起動ではleaseとheartbeatを確認し、孤児プロセスを勝手に再実行しない。ユーザーが`recover`で明示的に復旧した後に新しいTaskRunを作る。

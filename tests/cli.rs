@@ -28,7 +28,7 @@ fn ok(db: &Path, args: &[&str]) -> Value {
 fn cli_persists_across_processes_and_reports_dependency_errors_as_json() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("queue with spaces.db");
-    assert_eq!(ok(&db, &["init"])["schema_version"], 2);
+    assert_eq!(ok(&db, &["init"])["schema_version"], 3);
     let first = ok(
         &db,
         &[

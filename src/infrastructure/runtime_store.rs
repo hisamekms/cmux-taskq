@@ -316,6 +316,60 @@ impl SqliteQueue {
     }
 }
 
+impl SqliteQueue {
+    /// Record a confirmed cmux close. Only an accepted run whose workspace is
+    /// still recorded as open qualifies; the worktree and branch stay for integration.
+    pub fn workspace_closed(&mut self, id: &str, token: &str) -> Result<TaskRun> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        assert_lease(&tx, token)?;
+        ensure!(
+            tx.execute(
+                "UPDATE task_runs SET workspace_closed_at=unixepoch() WHERE id=?1 AND supervisor_token=?2
+                 AND status='awaiting_integration' AND workspace_id IS NOT NULL AND workspace_closed_at IS NULL",
+                params![id, token]
+            )? == 1,
+            "run is not awaiting integration with an open workspace under this supervisor"
+        );
+        let result = tx.query_row("SELECT * FROM task_runs WHERE id=?1", [id], run_row)?;
+        run_event(
+            &tx,
+            id,
+            "workspace_closed",
+            json!({"workspace_id": result.workspace_id, "closed_at": result.workspace_closed_at}),
+        )?;
+        tx.commit()?;
+        Ok(result)
+    }
+
+    /// A failed close leaves `workspace_closed_at` null so the workspace is never
+    /// treated as cleaned; the run status does not change.
+    pub fn cleanup_failed(&mut self, id: &str, token: &str, message: &str) -> Result<TaskRun> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        assert_lease(&tx, token)?;
+        ensure!(
+            tx.execute(
+                "UPDATE task_runs SET last_error=?3 WHERE id=?1 AND supervisor_token=?2
+                 AND status='awaiting_integration' AND workspace_closed_at IS NULL",
+                params![id, token, message]
+            )? == 1,
+            "run is not awaiting integration with an open workspace under this supervisor"
+        );
+        let result = tx.query_row("SELECT * FROM task_runs WHERE id=?1", [id], run_row)?;
+        run_event(
+            &tx,
+            id,
+            "cleanup_failed",
+            json!({"workspace_id": result.workspace_id, "message": message}),
+        )?;
+        tx.commit()?;
+        Ok(result)
+    }
+}
+
 fn assert_lease(conn: &Connection, token: &str) -> Result<()> {
     let valid: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM supervisor_leases WHERE token=?1 AND heartbeat_at >= unixepoch()-?2)",
         params![token,HEARTBEAT_TIMEOUT_SECS], |r| r.get(0))?;
