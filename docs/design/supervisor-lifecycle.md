@@ -149,7 +149,7 @@ mainを進める前のGit・ファイル・DBのerror（worktreeがない、main
 
 workspaceの終了はsupervisorが行う。leaseはrun単位で（[ADR-0007](../adr/0007-run-level-leases-parallel-execution.md)）、1 runの復旧が他のrunに影響しない。receipt検証を通った`awaiting_integration`のrunだけが対象で、workspaceだけを閉じ、worktreeとbranchは`integrate`が着地するまで残す（着地後に`integrate`が削除する）。`failed`（非0終了、検証拒否）、provisioningや検証処理のエラー、wrapper heartbeat切れの場合はworkspaceもworktreeも調査のため残し、closeを呼ばない。
 
-cmux 0.64.25は`--command`のプロセスが終了すると1〜2秒後にworkspaceを自ら閉じる。supervisorのcloseはこれと競合し、先にcmuxが閉じていると`cmux workspace close`は`not_found`で失敗して`cleanup_failed`になる（[015](../journal/015-e2e-happy-path.md)のe2eでは、wrapper終了から検証・closeまでが1秒以内に収まるため通常はsupervisorのcloseが先に成功する）。wrapper終了直後の`read-screen`も同じ競合で`screen_capture_failed`になりうる。
+cmux 0.64.25の`workspace create --command`はコマンドをログインシェルに打ち込む形で起動し、wrapperが終了してもシェルとworkspaceは残る（[010](../journal/010-failure-path-smoke.md)の実機確認。[015](../journal/015-e2e-happy-path.md)が観測した「終了後1〜2秒で自動的に閉じる」挙動は010の環境では再現せず、cmuxの設定に依存するとみられる）。どちらの場合もsupervisorの手順は同じで、先にworkspaceが消えていれば`cmux workspace close`は`not_found`で失敗して`cleanup_failed`になり、wrapper終了直後の`read-screen`も`screen_capture_failed`になりうる。`failed`・`interrupted`のrunのworkspaceは誰も閉じないので、調査が済んだらoperatorが`show`/`doctor`の`workspace_id`を`cmux workspace close`に渡して閉じる。
 
 closeの成否は`task_runs.workspace_closed_at`で表す。nullは「閉じたことを確認していない」で、closeの失敗だけでなく、cmuxが閉じた後にDBへ書けなかった場合も含む。closeの失敗は`cleanup_failed`イベントと`last_error`に残るが、run状態は変えない。閉じていないworkspaceをcleaned扱いにせず、再試行は`doctor`/`recover`（[009](../journal/009-doctor-recover.md)）で扱う。
 
