@@ -11,9 +11,9 @@ pub trait TaskQueue {
     fn transition(&mut self, task_id: i64, action: TaskAction) -> Result<Task>;
     fn add_dependency(&mut self, task_id: i64, predecessor_id: i64) -> Result<()>;
     fn remove_dependency(&mut self, task_id: i64, predecessor_id: i64) -> Result<()>;
-    /// Dependency-ready tasks; an occupied execution slot is reported by claim.
+    /// Dependency-ready tasks; each task is limited to one unfinished run.
     fn candidates(&self) -> Result<Vec<Task>>;
-    /// Reserve one run atomically. Does not start a process or validate Git objects.
+    /// Reserve one run atomically, without a lease. Does not start a process or validate Git objects.
     fn claim(&mut self, base_commit: &str) -> Result<ClaimOutcome>;
 }
 

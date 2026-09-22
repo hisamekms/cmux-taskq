@@ -28,7 +28,7 @@ fn ok(db: &Path, args: &[&str]) -> Value {
 fn cli_persists_across_processes_and_reports_dependency_errors_as_json() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("queue with spaces.db");
-    assert_eq!(ok(&db, &["init"])["schema_version"], 4);
+    assert_eq!(ok(&db, &["init"])["schema_version"], 5);
     let first = ok(
         &db,
         &[
@@ -74,7 +74,11 @@ fn reads_do_not_create_a_queue_and_unknown_tasks_fail() {
     ok(&db, &["init"]);
     assert_eq!(
         ok(&db, &["doctor"]),
-        serde_json::json!({"checked_at": ok(&db, &["doctor"])["checked_at"], "supervisor": null, "runs": []})
+        serde_json::json!({"checked_at": ok(&db, &["doctor"])["checked_at"], "supervisors": [], "runs": []})
+    );
+    assert_eq!(
+        ok(&db, &["status"]),
+        serde_json::json!({"checked_at": ok(&db, &["status"])["checked_at"], "supervisors": [], "runs": []})
     );
     assert!(!invoke(&db, &["recover", "missing-run"]).status.success());
     assert!(!invoke(&db, &["show", "1"]).status.success());

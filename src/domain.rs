@@ -194,8 +194,12 @@ pub struct RunProcess {
     pub exit_code: Option<i32>,
 }
 
+/// A supervisor's ownership of one executing run. The row exists while the
+/// supervisor watches the run and heartbeats it; it is deleted when the run
+/// comes to rest, when the supervisor gives the run up, or by `recover`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SupervisorLease {
+pub struct RunLease {
+    pub run_id: String,
     pub pid: u32,
     pub heartbeat_at: i64,
 }
@@ -204,7 +208,6 @@ pub struct SupervisorLease {
 #[serde(tag = "outcome", rename_all = "snake_case")]
 pub enum ClaimOutcome {
     Claimed { run: Box<TaskRun> },
-    Busy { run_id: String },
     NoReadyTask,
 }
 

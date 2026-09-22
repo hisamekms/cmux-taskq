@@ -1,10 +1,11 @@
-//! Execute one reserved task, validate its receipt, close the workspace of an
-//! accepted run, confirm its integration into main, and recover orphaned runs.
+//! Execute claimed tasks in parallel, validate their receipts, close the
+//! workspaces of accepted runs, confirm integration into main, and recover
+//! orphaned runs. One run's state machine is unchanged from the single-run
+//! supervisor; the loop multiplexes independent slots and isolates failures.
 use crate::{
     application::{AgentProvider, TaskQueue, WorkspaceBackend},
     domain::{
-        ClaimOutcome, IntegrationOutcome, Receipt, RunProcess, RunStatus, SupervisorLease, Task,
-        TaskRun,
+        ClaimOutcome, IntegrationOutcome, Receipt, RunLease, RunProcess, RunStatus, Task, TaskRun,
     },
     infrastructure::{
         adapters::{
@@ -15,10 +16,11 @@ use crate::{
         sqlite::SqliteQueue,
     },
 };
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::{
+    collections::BTreeMap,
     fs,
     io::IsTerminal,
     path::{Path, PathBuf},
@@ -39,6 +41,29 @@ pub fn unix_time() -> i64 {
         .as_secs() as i64
 }
 
+/// How the supervisor loop is driven. `stop` is the graceful drain switch
+/// (SIGINT in the CLI): no more claims, exit once every active run rests.
+#[derive(Debug, Clone)]
+pub struct SuperviseOptions {
+    /// Upper bound on runs executing at once.
+    pub parallel: usize,
+    /// Exit when no run is active and no task can be claimed, instead of
+    /// polling for new work.
+    pub once: bool,
+    pub stop: Arc<AtomicBool>,
+}
+
+impl SuperviseOptions {
+    pub fn new(parallel: usize, once: bool) -> Self {
+        Self {
+            parallel,
+            once,
+            stop: Arc::new(AtomicBool::new(false)),
+        }
+    }
+}
+
+/// One supervisor process heartbeats every lease it holds with a single token.
 struct Heartbeat {
     stop: mpsc::Sender<()>,
     worker: Option<thread::JoinHandle<()>>,
@@ -54,7 +79,7 @@ impl Heartbeat {
             let result = (|| -> Result<()> {
                 let queue = SqliteQueue::open(db)?;
                 loop {
-                    queue.heartbeat_supervisor(&token)?;
+                    queue.heartbeat_leases(&token)?;
                     match recv.recv_timeout(Duration::from_secs(2)) {
                         Err(mpsc::RecvTimeoutError::Timeout) => (),
                         _ => break,
@@ -77,7 +102,7 @@ impl Heartbeat {
     fn check(&self) -> Result<()> {
         ensure!(
             !self.failed.load(Ordering::SeqCst),
-            "supervisor heartbeat failed; preserving run for inspection"
+            "supervisor heartbeat failed; preserving runs for inspection"
         );
         Ok(())
     }
@@ -92,13 +117,28 @@ impl Drop for Heartbeat {
     }
 }
 
+/// A run this supervisor gave up on; it keeps its status, lease-less, with
+/// the message in `last_error`.
+#[derive(Debug, Clone, Serialize)]
+pub struct RunError {
+    pub run_id: String,
+    pub task_id: i64,
+    pub message: String,
+}
+
+/// Run and monitor tasks until the loop ends: with `once`, when nothing is
+/// active or claimable; otherwise on `stop`, or after a provisioning failure
+/// has drained the active runs (an error). Every task unblocked by `integrate`
+/// is picked up on a later pass with the then-current `main` as its base.
 pub fn supervise(
     db: &Path,
     repo: &Path,
     cmux: &dyn WorkspaceBackend,
     claude: &Path,
     runner: &Path,
+    options: &SuperviseOptions,
 ) -> Result<Value> {
+    ensure!(options.parallel >= 1, "parallel must be at least 1");
     let db = db
         .canonicalize()
         .context("queue must already be initialized")?;
@@ -113,166 +153,343 @@ pub fn supervise(
     }
     .preflight()?;
     let mut queue = SqliteQueue::open(&db)?;
+    queue.bind_repository(&path_text(&repository.common_dir)?)?;
     let token = Uuid::new_v4().to_string();
-    queue.acquire_supervisor(&token, &path_text(&repository.common_dir)?)?;
     let heartbeat = Heartbeat::start(db.clone(), token.clone());
-    let claim = queue.claim(&repository.base_commit);
-    let run = match claim {
-        Ok(ClaimOutcome::Claimed { run }) => run,
-        other => {
-            drop(heartbeat);
-            queue.release_supervisor(&token)?;
-            return Ok(serde_json::to_value(other?)?);
-        }
-    };
-    let result = provision_and_monitor(
-        &mut queue,
-        &db,
-        &repository,
+    let mut supervisor = Supervisor {
+        queue,
+        db,
+        repository,
         cmux,
         claude,
         runner,
-        &token,
-        &run,
-        &heartbeat,
-    );
-    let result = result.and_then(|run| {
-        if run.status == RunStatus::Validating {
-            validate(&mut queue, &repository, &token, &run, &heartbeat)
+        token,
+        heartbeat,
+        slots: Vec::new(),
+        finished: Vec::new(),
+        errors: Vec::new(),
+        claiming: true,
+        provisioning_error: None,
+    };
+    supervisor.run_loop(options)
+}
+
+const IDLE_POLL: Duration = Duration::from_secs(2);
+const TICK: Duration = Duration::from_secs(1);
+
+struct Supervisor<'a> {
+    queue: SqliteQueue,
+    db: PathBuf,
+    repository: GitRepository,
+    cmux: &'a dyn WorkspaceBackend,
+    claude: &'a Path,
+    runner: &'a Path,
+    token: String,
+    heartbeat: Heartbeat,
+    slots: Vec<Slot>,
+    finished: Vec<TaskRun>,
+    errors: Vec<RunError>,
+    /// Cleared after a provisioning failure so an unavailable cmux or Git
+    /// does not burn through every candidate.
+    claiming: bool,
+    provisioning_error: Option<String>,
+}
+
+/// One executing run between provisioning and rest.
+struct Slot {
+    run: TaskRun,
+    phase: Phase,
+}
+
+enum Phase {
+    Session(SessionWatch),
+    /// Receipt validation runs off the loop because verification commands may
+    /// take minutes; the loop only joins the result.
+    Validating(Option<thread::JoinHandle<Result<Validation>>>),
+}
+
+enum Step {
+    Continue,
+    Done(Box<TaskRun>),
+}
+
+impl Supervisor<'_> {
+    fn run_loop(&mut self, options: &SuperviseOptions) -> Result<Value> {
+        loop {
+            if let Err(error) = self.heartbeat.check() {
+                // Supervisor-level failure: note it on every run and keep the
+                // leases; they go stale once this process is gone.
+                for slot in &self.slots {
+                    let _ = self
+                        .queue
+                        .record_runtime_error(&slot.run.id, &format!("{error:#}"));
+                }
+                return Err(error);
+            }
+            let stopping = options.stop.load(Ordering::SeqCst);
+            if self.claiming && !stopping {
+                self.fill_slots(options.parallel)?;
+            }
+            if self.slots.is_empty() {
+                if options.once || stopping || !self.claiming {
+                    break;
+                }
+                thread::sleep(IDLE_POLL);
+                continue;
+            }
+            self.tick();
+            thread::sleep(TICK);
+        }
+        if let Some(message) = &self.provisioning_error {
+            bail!(
+                "{message}; claiming stopped and {} active run(s) were drained; inspect doctor before recovery",
+                self.finished.len()
+            );
+        }
+        let outcome = if options.stop.load(Ordering::SeqCst) {
+            "stopped"
         } else {
-            Ok(run)
+            "finished"
+        };
+        Ok(json!({"outcome": outcome, "runs": self.finished, "errors": self.errors}))
+    }
+
+    /// Claim and provision candidates until every slot is taken or nothing is
+    /// claimable. `main` is reread per claim so a task released by `integrate`
+    /// starts from the main that contains its predecessor.
+    fn fill_slots(&mut self, parallel: usize) -> Result<()> {
+        while self.slots.len() < parallel {
+            if self.queue.candidates()?.is_empty() {
+                break;
+            }
+            let base = self.repository.main_head()?;
+            let run = match self.queue.claim_for_supervisor(&base, &self.token)? {
+                ClaimOutcome::Claimed { run } => *run,
+                ClaimOutcome::NoReadyTask => break,
+            };
+            match self.provision(&run) {
+                Ok(watch) => {
+                    let run = self.queue.run(&run.id)?;
+                    self.slots.push(Slot {
+                        run,
+                        phase: Phase::Session(watch),
+                    });
+                }
+                Err(error) => {
+                    let message = format!("run {} provisioning failed: {error:#}", run.id);
+                    eprintln!("{message}; no further tasks will be claimed");
+                    self.abandon(&run, message.clone());
+                    self.claiming = false;
+                    self.provisioning_error = Some(message);
+                    break;
+                }
+            }
         }
-    });
-    // Only an accepted run gives up its workspace; failures keep it for inspection.
-    let result = result.and_then(|run| {
-        if run.status == RunStatus::AwaitingIntegration {
-            close_workspace(&mut queue, cmux, &token, &run, &heartbeat)
-        } else {
-            Ok(run)
+        Ok(())
+    }
+
+    fn tick(&mut self) {
+        let mut index = 0;
+        while index < self.slots.len() {
+            let mut slot = self.slots.remove(index);
+            match self.step(&mut slot) {
+                Ok(Step::Continue) => {
+                    self.slots.insert(index, slot);
+                    index += 1;
+                }
+                Ok(Step::Done(run)) => {
+                    eprintln!("run {} is {}", run.id, run.status.as_str());
+                    self.finished.push(*run);
+                }
+                Err(error) => {
+                    // Creation/communication failures can be ambiguous: the
+                    // session may be alive. Disown the run, delete nothing,
+                    // and keep serving the other slots.
+                    let message = format!("{error:#}");
+                    eprintln!(
+                        "run {} retained for inspection: {message}; see show {} and doctor",
+                        slot.run.id, slot.run.task_id
+                    );
+                    self.abandon(&slot.run, message);
+                }
+            }
         }
-    });
-    drop(heartbeat);
-    match result {
-        Ok(run) => {
-            queue.release_supervisor(&token)?;
-            Ok(json!({"outcome": "finished", "run": run}))
+    }
+
+    fn abandon(&mut self, run: &TaskRun, message: String) {
+        if let Err(error) = self.queue.abandon_run(&run.id, &self.token, &message) {
+            eprintln!("run {}: could not record the error: {error:#}", run.id);
         }
-        Err(error) => {
-            // Creation/communication failures can be ambiguous. Never free the
-            // execution slot or delete resources when a session might be alive.
-            let _ = queue.record_runtime_error(&run.id, &format!("{error:#}"));
-            Err(error.context(format!(
-                "run {} retained; inspect show {} and status before recovery",
-                run.id, run.task_id
-            )))
+        self.errors.push(RunError {
+            run_id: run.id.clone(),
+            task_id: run.task_id,
+            message,
+        });
+    }
+
+    fn step(&mut self, slot: &mut Slot) -> Result<Step> {
+        match &mut slot.phase {
+            Phase::Session(watch) => {
+                let Some(run) = watch.poll(&mut self.queue, self.cmux, &self.token, &slot.run)?
+                else {
+                    return Ok(Step::Continue);
+                };
+                if run.status != RunStatus::Validating {
+                    self.queue.release_lease(&run.id, &self.token)?;
+                    return Ok(Step::Done(Box::new(run)));
+                }
+                let handle =
+                    spawn_validation(self.db.clone(), self.repository.clone(), run.clone());
+                slot.run = run;
+                slot.phase = Phase::Validating(Some(handle));
+                Ok(Step::Continue)
+            }
+            Phase::Validating(handle) => {
+                if !handle.as_ref().is_some_and(|h| h.is_finished()) {
+                    return Ok(Step::Continue);
+                }
+                let validation = handle
+                    .take()
+                    .context("validation already joined")?
+                    .join()
+                    .map_err(|_| anyhow!("validation thread panicked"))??;
+                let run = self
+                    .queue
+                    .finish_validation(&slot.run.id, &self.token, &validation)?;
+                // Only an accepted run gives up its workspace; failures keep it for inspection.
+                let run = if run.status == RunStatus::AwaitingIntegration {
+                    close_workspace(&mut self.queue, self.cmux, &self.token, &run)?
+                } else {
+                    run
+                };
+                self.queue.release_lease(&run.id, &self.token)?;
+                Ok(Step::Done(Box::new(run)))
+            }
         }
+    }
+
+    /// Plan paths, create the run directory, worktree and workspace. Any
+    /// error leaves what was created for inspection.
+    fn provision(&mut self, claimed: &TaskRun) -> Result<SessionWatch> {
+        let state_dir = runs_dir(&self.db);
+        let run_dir = state_dir.join(&claimed.id);
+        let plan = RunPlan {
+            repo_path: path_text(&self.repository.root)?,
+            run_dir: path_text(&run_dir)?,
+            branch: format!("taskq/{}", claimed.id),
+            worktree_path: path_text(&run_dir.join("worktree"))?,
+            receipt_path: path_text(&run_dir.join("receipt.json"))?,
+            log_path: path_text(&run_dir.join("claude.debug.log"))?,
+        };
+        // Save intended paths before any external resource is created.
+        self.queue.plan_run(&claimed.id, &self.token, &plan)?;
+        fs::create_dir_all(&state_dir)?;
+        fs::create_dir(&run_dir).context("run directory must be new")?;
+        let run = self.queue.run(&claimed.id)?;
+        let task = self.queue.show(run.task_id)?.task;
+        fs::write(run_dir.join("prompt.txt"), prompt(&task, &run)?)?;
+        // A running wrapper must not change when the development binary is rebuilt.
+        fs::copy(self.runner, run_dir.join("runner")).context("snapshot runtime binary")?;
+        let git_output = self.repository.create_worktree(&run)?;
+        fs::write(run_dir.join("worktree-create.txt"), git_output)?;
+        self.queue.record_runtime_event(
+            &run.id,
+            "worktree_created",
+            json!({"path": plan.worktree_path, "branch": plan.branch}),
+        )?;
+        let command = shell_join(&[
+            path_text(&run_dir.join("runner"))?,
+            "--db".into(),
+            path_text(&self.db)?,
+            "session".into(),
+            "--run".into(),
+            run.id.clone(),
+            "--lease".into(),
+            self.token.clone(),
+            "--claude".into(),
+            path_text(self.claude)?,
+        ]);
+        let workspace = self.cmux.create(&run, &command)?;
+        self.queue
+            .workspace_created(&run.id, &self.token, &workspace)?;
+        eprintln!(
+            "task {} running in workspace {}; run {}",
+            run.task_id, workspace, run.id
+        );
+        Ok(SessionWatch {
+            workspace,
+            run_dir,
+            receipt_path: PathBuf::from(plan.receipt_path),
+            idle_marker: run.idle_marker_path()?,
+            startup: Instant::now(),
+            receipt_seen: false,
+            exit_requested: None,
+        })
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn provision_and_monitor(
-    queue: &mut SqliteQueue,
-    db: &Path,
-    repository: &GitRepository,
-    cmux: &dyn WorkspaceBackend,
-    claude: &Path,
-    runner: &Path,
-    token: &str,
-    claimed: &TaskRun,
-    heartbeat: &Heartbeat,
-) -> Result<TaskRun> {
-    let state_dir = runs_dir(db);
-    let run_dir = state_dir.join(&claimed.id);
-    let plan = RunPlan {
-        repo_path: path_text(&repository.root)?,
-        run_dir: path_text(&run_dir)?,
-        branch: format!("taskq/{}", claimed.id),
-        worktree_path: path_text(&run_dir.join("worktree"))?,
-        receipt_path: path_text(&run_dir.join("receipt.json"))?,
-        log_path: path_text(&run_dir.join("claude.debug.log"))?,
-    };
-    // Save intended paths before any external resource is created.
-    queue.plan_run(&claimed.id, token, &plan)?;
-    fs::create_dir_all(&state_dir)?;
-    fs::create_dir(&run_dir).context("run directory must be new")?;
-    let run = queue.run(&claimed.id)?;
-    let task = queue.show(run.task_id)?.task;
-    fs::write(run_dir.join("prompt.txt"), prompt(&task, &run)?)?;
-    // A running wrapper must not change when the development binary is rebuilt.
-    fs::copy(runner, run_dir.join("runner")).context("snapshot runtime binary")?;
-    let git_output = repository.create_worktree(&run)?;
-    fs::write(run_dir.join("worktree-create.txt"), git_output)?;
-    queue.record_runtime_event(
-        &run.id,
-        "worktree_created",
-        json!({"path": plan.worktree_path, "branch": plan.branch}),
-    )?;
-    heartbeat.check()?;
-    let command = shell_join(&[
-        path_text(&run_dir.join("runner"))?,
-        "--db".into(),
-        path_text(db)?,
-        "session".into(),
-        "--run".into(),
-        run.id.clone(),
-        "--lease".into(),
-        token.into(),
-        "--claude".into(),
-        path_text(claude)?,
-    ]);
-    let workspace = cmux.create(&run, &command)?;
-    queue.workspace_created(&run.id, token, &workspace)?;
-    eprintln!(
-        "task {} running in workspace {}; run {}",
-        run.task_id, workspace, run.id
-    );
-    let startup = Instant::now();
-    let receipt_path = Path::new(&plan.receipt_path);
-    let idle_marker = run.idle_marker_path()?;
-    let mut receipt_seen = false;
-    let mut exit_requested: Option<Instant> = None;
-    loop {
-        heartbeat.check()?;
+/// Watches one session: wrapper registration and heartbeat, receipt and idle
+/// marker, the single exit request, and the wrapper's exit.
+struct SessionWatch {
+    workspace: String,
+    run_dir: PathBuf,
+    receipt_path: PathBuf,
+    idle_marker: PathBuf,
+    startup: Instant,
+    receipt_seen: bool,
+    exit_requested: Option<Instant>,
+}
+
+impl SessionWatch {
+    /// One observation. `Some` once the wrapper exited and supervision finished
+    /// (`validating` or `failed`); an error means the run must be retained.
+    fn poll(
+        &mut self,
+        queue: &mut SqliteQueue,
+        cmux: &dyn WorkspaceBackend,
+        token: &str,
+        run: &TaskRun,
+    ) -> Result<Option<TaskRun>> {
         let processes = queue.processes(&run.id)?;
-        if !receipt_seen && receipt_path.is_file() {
-            receipt_seen = true;
+        if !self.receipt_seen && self.receipt_path.is_file() {
+            self.receipt_seen = true;
             queue.record_runtime_event(
                 &run.id,
                 "receipt_observed",
-                json!({"path": plan.receipt_path, "validated": false}),
+                json!({"path": path_text(&self.receipt_path)?, "validated": false}),
             )?;
             eprintln!(
                 "receipt received for {}; waiting for the session to go idle (or an operator /exit)",
                 run.id
             );
         }
-        if receipt_seen
-            && exit_requested.is_none()
-            && let Some(evidence) = idle_after_receipt(receipt_path, &idle_marker)?
+        if self.receipt_seen
+            && self.exit_requested.is_none()
+            && let Some(evidence) = idle_after_receipt(&self.receipt_path, &self.idle_marker)?
         {
             queue.record_runtime_event(&run.id, "session_idle_observed", evidence)?;
             // Ask once, the way an operator would; never kill the session.
-            cmux.send_exit(&workspace)?;
+            cmux.send_exit(&self.workspace)?;
             let timeout = cmux.exit_timeout();
             queue.record_runtime_event(
                 &run.id,
                 "exit_requested",
-                json!({"workspace_id": workspace, "timeout_secs": timeout.as_secs()}),
+                json!({"workspace_id": self.workspace, "timeout_secs": timeout.as_secs()}),
             )?;
             eprintln!("exit requested for {}; waiting for session exit", run.id);
-            exit_requested = Some(Instant::now());
+            self.exit_requested = Some(Instant::now());
         }
         if let Some(wrapper) = processes.iter().find(|p| p.role == "wrapper") {
             if wrapper.exited_at.is_some() {
-                match cmux.capture(&workspace) {
-                    Ok(screen) => fs::write(run_dir.join("terminal-final.txt"), screen)?,
+                match cmux.capture(&self.workspace) {
+                    Ok(screen) => fs::write(self.run_dir.join("terminal-final.txt"), screen)?,
                     Err(error) => queue.record_runtime_event(
                         &run.id,
                         "screen_capture_failed",
                         json!({"error": format!("{error:#}")}),
                     )?,
                 }
-                return queue.finish_supervision(&run.id, token);
+                return queue.finish_supervision(&run.id, token).map(Some);
             }
             ensure!(
                 unix_time() - wrapper.heartbeat_at <= HEARTBEAT_TIMEOUT_SECS,
@@ -280,26 +497,27 @@ fn provision_and_monitor(
             );
         } else {
             ensure!(
-                startup.elapsed() < Duration::from_secs(45),
+                self.startup.elapsed() < Duration::from_secs(45),
                 "wrapper did not register within 45 seconds"
             );
         }
-        if let Some(requested) = exit_requested {
+        if let Some(requested) = self.exit_requested {
             let timeout = cmux.exit_timeout();
             if requested.elapsed() >= timeout {
                 // The session is still alive; leave it to a human instead of forcing it.
                 queue.record_runtime_event(
                     &run.id,
                     "exit_request_timed_out",
-                    json!({"workspace_id": workspace, "timeout_secs": timeout.as_secs()}),
+                    json!({"workspace_id": self.workspace, "timeout_secs": timeout.as_secs()}),
                 )?;
-                anyhow::bail!(
-                    "session did not exit within {}s of the exit request; send /exit in workspace {workspace} or recover the run",
-                    timeout.as_secs()
+                bail!(
+                    "session did not exit within {}s of the exit request; send /exit in workspace {} or recover the run",
+                    timeout.as_secs(),
+                    self.workspace
                 );
             }
         }
-        thread::sleep(Duration::from_secs(1));
+        Ok(None)
     }
 }
 
@@ -336,39 +554,40 @@ fn unix_seconds(time: SystemTime) -> i64 {
 }
 
 /// Cross-check the agent's receipt against Git and rerun the task's verification
-/// commands. Rejections become `failed`; only errors in the checks themselves
+/// commands on a thread with its own connection. Rejections become a
+/// `Validation` that is not accepted; only errors in the checks themselves
 /// propagate, leaving the run in `validating`.
-fn validate(
-    queue: &mut SqliteQueue,
-    repository: &GitRepository,
-    token: &str,
-    run: &TaskRun,
-    heartbeat: &Heartbeat,
-) -> Result<TaskRun> {
-    let task = queue.show(run.task_id)?.task;
-    let checked = check_receipt(queue, repository, &task, run, heartbeat)?;
-    let validation = match checked {
-        Ok((receipt, commit)) => Validation {
-            accepted: true,
-            result_commit: Some(commit),
-            reason: None,
-            receipt: serde_json::to_value(receipt)?,
-        },
-        Err(rejection) => {
-            eprintln!("run {} rejected: {}", run.id, rejection.reason);
-            Validation {
-                accepted: false,
-                result_commit: rejection.commit,
-                reason: Some(rejection.reason),
-                receipt: rejection
-                    .receipt
-                    .map(serde_json::to_value)
-                    .transpose()?
-                    .unwrap_or(Value::Null),
+fn spawn_validation(
+    db: PathBuf,
+    repository: GitRepository,
+    run: TaskRun,
+) -> thread::JoinHandle<Result<Validation>> {
+    thread::spawn(move || {
+        let mut queue = SqliteQueue::open(&db)?;
+        let task = queue.show(run.task_id)?.task;
+        let checked = check_receipt(&queue, &repository, &task, &run)?;
+        Ok(match checked {
+            Ok((receipt, commit)) => Validation {
+                accepted: true,
+                result_commit: Some(commit),
+                reason: None,
+                receipt: serde_json::to_value(receipt)?,
+            },
+            Err(rejection) => {
+                eprintln!("run {} rejected: {}", run.id, rejection.reason);
+                Validation {
+                    accepted: false,
+                    result_commit: rejection.commit,
+                    reason: Some(rejection.reason),
+                    receipt: rejection
+                        .receipt
+                        .map(serde_json::to_value)
+                        .transpose()?
+                        .unwrap_or(Value::Null),
+                }
             }
-        }
-    };
-    queue.finish_validation(&run.id, token, &validation)
+        })
+    })
 }
 
 /// Close the cmux workspace of an accepted run. The worktree and branch stay
@@ -379,9 +598,7 @@ fn close_workspace(
     cmux: &dyn WorkspaceBackend,
     token: &str,
     run: &TaskRun,
-    heartbeat: &Heartbeat,
 ) -> Result<TaskRun> {
-    heartbeat.check()?;
     let workspace = run.workspace_id.as_ref().context("missing workspace")?;
     match cmux.close(workspace) {
         Ok(()) => queue.workspace_closed(&run.id, token),
@@ -404,7 +621,6 @@ fn check_receipt(
     repository: &GitRepository,
     task: &Task,
     run: &TaskRun,
-    heartbeat: &Heartbeat,
 ) -> Result<std::result::Result<(Receipt, String), Rejection>> {
     let reject = |reason: String, commit: Option<String>, receipt: Option<Receipt>| {
         Ok(Err(Rejection {
@@ -490,7 +706,6 @@ fn check_receipt(
     // Rerun the task's own verification commands; the receipt's claims are not enough.
     let run_dir = Path::new(run.run_dir.as_ref().context("missing run directory")?);
     for (index, command) in task.verification_commands.iter().enumerate() {
-        heartbeat.check()?;
         let log = run_dir.join(format!("verify-{}.log", index + 1));
         let status = run_shell_to_log(command, worktree, &log)?;
         let exit_code = status.code().unwrap_or(128);
@@ -606,12 +821,23 @@ pub fn prompt(task: &Task, run: &TaskRun) -> Result<String> {
     ))
 }
 
-/// Health of the supervisor lease as `doctor` reports it.
+/// Health of one run's lease as `status` and `doctor` report it.
 #[derive(Debug, Clone, Serialize)]
 pub struct LeaseHealth {
     pub pid: u32,
     pub alive: bool,
     pub heartbeat_at: i64,
+    pub heartbeat_age_secs: i64,
+    pub stale: bool,
+}
+
+/// A supervisor process as seen through the leases it holds; every lease of
+/// one process carries the same heartbeat.
+#[derive(Debug, Clone, Serialize)]
+pub struct SupervisorHealth {
+    pub pid: u32,
+    pub alive: bool,
+    pub run_ids: Vec<String>,
     pub heartbeat_age_secs: i64,
     pub stale: bool,
 }
@@ -630,8 +856,9 @@ pub struct ProcessHealth {
     pub exit_code: Option<i32>,
 }
 
-/// One run holding the execution slot. `blockers` lists why `recover` would
-/// refuse it; an empty list means it is recoverable now.
+/// One unfinished run. `blockers` lists why `recover` would refuse it; an
+/// empty list means it is recoverable now. Only this run's own lease and
+/// processes count; other runs never block it.
 #[derive(Debug, Clone, Serialize)]
 pub struct RunHealth {
     pub run_id: String,
@@ -644,6 +871,7 @@ pub struct RunHealth {
     pub run_dir_exists: Option<bool>,
     pub receipt_exists: Option<bool>,
     pub last_error: Option<String>,
+    pub lease: Option<LeaseHealth>,
     pub processes: Vec<ProcessHealth>,
     pub blockers: Vec<String>,
     pub recoverable: bool,
@@ -652,35 +880,68 @@ pub struct RunHealth {
 #[derive(Debug, Clone, Serialize)]
 pub struct DoctorReport {
     pub checked_at: i64,
-    pub supervisor: Option<LeaseHealth>,
+    pub supervisors: Vec<SupervisorHealth>,
     pub runs: Vec<RunHealth>,
 }
 
-/// Inspect the lease, unfinished runs, their processes and paths. Reads only.
+/// Live supervisors and the unfinished runs with their leases, without
+/// inspecting the runs' processes.
+pub fn status(db: &Path) -> Result<Value> {
+    let queue = SqliteQueue::open(db)?;
+    let now = unix_time();
+    let leases = queue.run_leases()?;
+    let runs = queue
+        .active_runs()?
+        .into_iter()
+        .map(|run| {
+            let lease = leases
+                .iter()
+                .find(|l| l.run_id == run.id)
+                .map(|l| lease_health(l, now));
+            json!({
+                "run_id": run.id,
+                "task_id": run.task_id,
+                "status": run.status,
+                "workspace_id": run.workspace_id,
+                "lease": lease,
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(json!({
+        "checked_at": now,
+        "supervisors": supervisors(&leases, now),
+        "runs": runs,
+    }))
+}
+
+/// Inspect every unfinished run, its lease, processes and paths. Reads only.
 pub fn doctor(db: &Path) -> Result<Value> {
     let queue = SqliteQueue::open(db)?;
     let now = unix_time();
-    let supervisor = queue
-        .supervisor_lease()?
-        .map(|lease| lease_health(&lease, now));
+    let leases = queue.run_leases()?;
     let runs = queue
         .active_runs()?
         .into_iter()
         .map(|run| {
             let processes = queue.processes(&run.id)?;
-            Ok(run_health(&run, &processes, supervisor.as_ref(), now))
+            let lease = leases
+                .iter()
+                .find(|l| l.run_id == run.id)
+                .map(|l| lease_health(l, now));
+            Ok(run_health(&run, &processes, lease, now))
         })
         .collect::<Result<Vec<_>>>()?;
     Ok(serde_json::to_value(DoctorReport {
         checked_at: now,
-        supervisor,
+        supervisors: supervisors(&leases, now),
         runs,
     })?)
 }
 
-/// Mark an orphaned run `interrupted` and drop the stale lease, after checking
-/// that nothing registered for it is still alive. Never reruns, never deletes
-/// the worktree or workspace, and leaves the task `in_progress`.
+/// Mark an orphaned run `interrupted` and drop its lease, after checking that
+/// nothing registered for it is still alive. Never reruns, never deletes the
+/// worktree or workspace, leaves the task `in_progress`, and does not touch
+/// any other run.
 pub fn recover(db: &Path, id: &str) -> Result<Value> {
     let mut queue = SqliteQueue::open(db)?;
     let run = queue.run(id)?;
@@ -693,22 +954,20 @@ pub fn recover(db: &Path, id: &str) -> Result<Value> {
         run.status.as_str()
     );
     let now = unix_time();
-    let supervisor = queue
-        .supervisor_lease()?
-        .map(|lease| lease_health(&lease, now));
+    let lease = queue.run_lease(id)?.map(|l| lease_health(&l, now));
     let processes = queue.processes(&run.id)?;
-    let health = run_health(&run, &processes, supervisor.as_ref(), now);
+    let health = run_health(&run, &processes, lease, now);
     ensure!(
         health.recoverable,
         "refusing to recover run {id}: {}",
         health.blockers.join("; ")
     );
-    let report = json!({"supervisor": supervisor, "run": health});
+    let report = json!({"run": health});
     let run = queue.recover_run(&run.id, processes.len(), report)?;
     Ok(json!({"outcome": "recovered", "run": run}))
 }
 
-fn lease_health(lease: &SupervisorLease, now: i64) -> LeaseHealth {
+fn lease_health(lease: &RunLease, now: i64) -> LeaseHealth {
     let age = now - lease.heartbeat_at;
     LeaseHealth {
         pid: lease.pid,
@@ -719,10 +978,28 @@ fn lease_health(lease: &SupervisorLease, now: i64) -> LeaseHealth {
     }
 }
 
+fn supervisors(leases: &[RunLease], now: i64) -> Vec<SupervisorHealth> {
+    let mut by_pid: BTreeMap<u32, SupervisorHealth> = BTreeMap::new();
+    for lease in leases {
+        let age = now - lease.heartbeat_at;
+        let entry = by_pid.entry(lease.pid).or_insert_with(|| SupervisorHealth {
+            pid: lease.pid,
+            alive: process_alive(lease.pid),
+            run_ids: Vec::new(),
+            heartbeat_age_secs: age,
+            stale: age > HEARTBEAT_TIMEOUT_SECS,
+        });
+        entry.run_ids.push(lease.run_id.clone());
+        entry.heartbeat_age_secs = entry.heartbeat_age_secs.min(age);
+        entry.stale = entry.heartbeat_age_secs > HEARTBEAT_TIMEOUT_SECS;
+    }
+    by_pid.into_values().collect()
+}
+
 fn run_health(
     run: &TaskRun,
     processes: &[RunProcess],
-    supervisor: Option<&LeaseHealth>,
+    lease: Option<LeaseHealth>,
     now: i64,
 ) -> RunHealth {
     let mut blockers = Vec::new();
@@ -749,10 +1026,10 @@ fn run_health(
             }
         })
         .collect();
-    if let Some(lease) = supervisor {
+    if let Some(lease) = &lease {
         if !lease.stale {
             blockers.push(format!(
-                "supervisor heartbeat is {}s old (limit {HEARTBEAT_TIMEOUT_SECS}s)",
+                "lease heartbeat is {}s old (limit {HEARTBEAT_TIMEOUT_SECS}s)",
                 lease.heartbeat_age_secs
             ));
         }
@@ -772,6 +1049,7 @@ fn run_health(
         run_dir_exists: exists(&run.run_dir),
         receipt_exists: exists(&run.receipt_path),
         last_error: run.last_error.clone(),
+        lease,
         processes,
         recoverable: blockers.is_empty(),
         blockers,

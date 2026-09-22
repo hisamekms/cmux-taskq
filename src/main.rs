@@ -3,6 +3,10 @@ use std::{
     io::{self, Write},
     path::PathBuf,
     process::ExitCode,
+    sync::{
+        Arc, OnceLock,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use anyhow::{Context, Result};
@@ -64,12 +68,19 @@ enum Command {
     },
     /// List ready tasks whose prerequisites are all completed; does not claim.
     Candidates,
-    /// Run and monitor one task. Run this in a dedicated terminal.
+    /// Run and monitor tasks in parallel until interrupted. Run this in a dedicated terminal.
     Supervise {
         /// Checkout of the repository whose `main` becomes the base commit;
         /// defaults to the working directory.
         #[arg(long)]
         repo: Option<PathBuf>,
+        /// Maximum number of runs executing at once.
+        #[arg(long, default_value_t = 4, value_parser = clap::value_parser!(u16).range(1..))]
+        parallel: u16,
+        /// Exit once no run is active and no task can be claimed, instead of
+        /// waiting for new work.
+        #[arg(long)]
+        once: bool,
         /// cmux executable; a bare name is resolved on PATH.
         #[arg(long, default_value = "cmux")]
         cmux: PathBuf,
@@ -85,11 +96,11 @@ enum Command {
         #[arg(long)]
         repo: Option<PathBuf>,
     },
-    /// Inspect supervisor ownership and heartbeat without changing it.
+    /// List live supervisors and unfinished runs with their leases without changing anything.
     Status,
-    /// Report the lease, unfinished runs, their processes, heartbeats and paths without changing state.
+    /// Report every unfinished run with its lease, processes, heartbeats and paths without changing state.
     Doctor,
-    /// Mark an unfinished run interrupted once its processes and supervisor are gone; keeps its worktree and workspace.
+    /// Mark one unfinished run interrupted once its processes and supervisor are gone; keeps its worktree and workspace and leaves other runs alone.
     Recover {
         /// Run ID from `show` or `doctor`.
         run: String,
@@ -181,16 +192,21 @@ fn execute(cli: Cli) -> Result<Value> {
             serde_json::to_value(queue.show(id)?)?
         }
         Command::Candidates => serde_json::to_value(queue.candidates()?)?,
-        Command::Status => {
-            let lease = queue.supervisor_lease()?;
-            let stale = lease.as_ref().map(|l| {
-                cmux_taskq::runtime::unix_time() - l.heartbeat_at
-                    > cmux_taskq::infrastructure::runtime_store::HEARTBEAT_TIMEOUT_SECS
-            });
-            json!({"supervisor": lease, "heartbeat_stale": stale})
-        }
-        Command::Supervise { repo, cmux, claude } => {
+        Command::Status => cmux_taskq::runtime::status(&db)?,
+        Command::Supervise {
+            repo,
+            parallel,
+            once,
+            cmux,
+            claude,
+        } => {
             use cmux_taskq::infrastructure::adapters::{Cmux, executable};
+            use cmux_taskq::runtime::SuperviseOptions;
+            let options = SuperviseOptions {
+                parallel: usize::from(parallel),
+                once,
+                stop: install_stop_signal()?,
+            };
             cmux_taskq::runtime::supervise(
                 &db,
                 &checkout(repo),
@@ -199,6 +215,7 @@ fn execute(cli: Cli) -> Result<Value> {
                 },
                 &executable(&claude)?,
                 &env::current_exe()?,
+                &options,
             )?
         }
         Command::Integrate { id, repo } => {
@@ -210,6 +227,34 @@ fn execute(cli: Cli) -> Result<Value> {
             cmux_taskq::runtime::session(&db, &run, &lease, &claude)?
         }
     })
+}
+
+static STOP: OnceLock<Arc<AtomicBool>> = OnceLock::new();
+
+extern "C" fn request_stop(signal: libc::c_int) {
+    if let Some(stop) = STOP.get() {
+        stop.store(true, Ordering::SeqCst);
+    }
+    // SAFETY: restoring the default disposition is async-signal-safe, so a
+    // second signal terminates the process the usual way.
+    unsafe {
+        libc::signal(signal, libc::SIG_DFL);
+    }
+}
+
+/// The first SIGINT/SIGTERM asks the supervisor to stop claiming and drain its
+/// active runs; the second one terminates it (leases then go stale).
+fn install_stop_signal() -> Result<Arc<AtomicBool>> {
+    let stop = STOP
+        .get_or_init(|| Arc::new(AtomicBool::new(false)))
+        .clone();
+    for signal in [libc::SIGINT, libc::SIGTERM] {
+        // SAFETY: the handler only stores an atomic and resets the disposition.
+        let previous =
+            unsafe { libc::signal(signal, request_stop as extern "C" fn(libc::c_int) as usize) };
+        anyhow::ensure!(previous != libc::SIG_ERR, "install signal handler");
+    }
+    Ok(stop)
 }
 
 fn main() -> ExitCode {

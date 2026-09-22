@@ -60,12 +60,12 @@ The task is registered as `draft` and the JSON includes its `id`. Then make it r
 | `"$TASKQ" show ID` | `task`, `dependencies`, `runs`, `events`, `processes` |
 | `"$TASKQ" candidates` | What the next `supervise` would pick |
 | `"$TASKQ" locate` | The queue this directory resolves to (`db`, `runs_dir`, `git_common_dir`, `db_exists`) without opening it |
-| `"$TASKQ" status` | Supervisor lease (`supervisor` null when idle) and `heartbeat_stale` |
-| `"$TASKQ" doctor` | Lease liveness, unfinished runs, processes, worktree/receipt existence, `blockers`, `recoverable` |
+| `"$TASKQ" status` | Live supervisors (`supervisors`, empty when none owns a run) and unfinished runs with their leases |
+| `"$TASKQ" doctor` | Per run: lease liveness, processes, worktree/receipt existence, `blockers`, `recoverable` |
 
 Task `status`: `draft` → `ready` → `in_progress` → `completed`, or `canceled`. A task stays `in_progress` while any run is unfinished or awaiting integration.
 
-Run `status` in `runs` (latest last): `claimed`, `starting`, `running`, `validating` are unfinished; `awaiting_integration` means the receipt and verification passed and the branch waits for a manual merge into `main`; `integrated` means the merge was confirmed and the task is `completed`; `failed` and `interrupted` keep their worktree and workspace for inspection, with the reason in `last_error`.
+Run `status` in `runs` (latest last): `claimed`, `starting`, `running`, `validating` are unfinished; `awaiting_integration` means the receipt and verification passed and the branch waits for a manual merge into `main`; `integrated` means the merge was confirmed and the task is `completed`; `failed` and `interrupted` keep their worktree and workspace for inspection, with the reason in `last_error`. Dependency-free tasks run in parallel (up to the supervisor's `--parallel`), each in its own workspace and worktree; a dependent task waits until every predecessor is `completed`.
 
 Useful run fields: `branch` (`taskq/<run-id>`), `worktree_path`, `workspace_id` (cmux), `run_dir` (prompt, logs, `receipt.json`, `verify-N.log`), `receipt_path`, `result_commit`, `last_error`, `workspace_closed_at`.
 

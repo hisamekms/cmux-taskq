@@ -22,6 +22,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../../migrations/0002_supervisor.sql"),
     include_str!("../../migrations/0003_workspace_close.sql"),
     include_str!("../../migrations/0004_integration.sql"),
+    include_str!("../../migrations/0005_run_leases.sql"),
 ];
 const READY_QUERY: &str = "
     SELECT t.* FROM tasks t
@@ -252,38 +253,39 @@ impl TaskQueue for SqliteQueue {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let busy: Option<String> = tx.query_row(
-            "SELECT id FROM task_runs WHERE status IN ('claimed','starting','running','validating') LIMIT 1",
-            [], |r| r.get(0),
-        ).optional()?;
-        if let Some(run_id) = busy {
-            return Ok(ClaimOutcome::Busy { run_id });
-        }
-        let candidate = tx
-            .query_row(&format!("{READY_QUERY} LIMIT 1"), [], task_row)
-            .optional()?;
-        let Some(task) = candidate else {
-            return Ok(ClaimOutcome::NoReadyTask);
-        };
-        let run_id = Uuid::new_v4().to_string();
-        tx.execute("UPDATE tasks SET status='in_progress', updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?1",
-            [task.id])?;
-        tx.execute(
-            "INSERT INTO task_runs(id,task_id,status,requested_provider,actual_provider,base_commit)
-             VALUES (?1,?2,'claimed','claude','claude',?3)",
-            params![run_id, task.id, base_commit.to_ascii_lowercase()],
-        )?;
-        event(
-            &tx,
-            task.id,
-            Some(&run_id),
-            "run_claimed",
-            json!({"from": "ready", "to": "in_progress", "provider": "claude"}),
-        )?;
-        let run = tx.query_row("SELECT * FROM task_runs WHERE id=?1", [&run_id], run_row)?;
+        let outcome = claim_task(&tx, base_commit)?;
         tx.commit()?;
-        Ok(ClaimOutcome::Claimed { run: Box::new(run) })
+        Ok(outcome)
     }
+}
+
+/// Reserve the first dependency-ready task inside the caller's write
+/// transaction. There is no queue-wide execution slot; `one_unfinished_run_per_task`
+/// is the only limit, so concurrent claims take different tasks.
+pub(super) fn claim_task(tx: &Connection, base_commit: &str) -> Result<ClaimOutcome> {
+    let candidate = tx
+        .query_row(&format!("{READY_QUERY} LIMIT 1"), [], task_row)
+        .optional()?;
+    let Some(task) = candidate else {
+        return Ok(ClaimOutcome::NoReadyTask);
+    };
+    let run_id = Uuid::new_v4().to_string();
+    tx.execute("UPDATE tasks SET status='in_progress', updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?1",
+        [task.id])?;
+    tx.execute(
+        "INSERT INTO task_runs(id,task_id,status,requested_provider,actual_provider,base_commit)
+         VALUES (?1,?2,'claimed','claude','claude',?3)",
+        params![run_id, task.id, base_commit.to_ascii_lowercase()],
+    )?;
+    event(
+        tx,
+        task.id,
+        Some(&run_id),
+        "run_claimed",
+        json!({"from": "ready", "to": "in_progress", "provider": "claude"}),
+    )?;
+    let run = tx.query_row("SELECT * FROM task_runs WHERE id=?1", [&run_id], run_row)?;
+    Ok(ClaimOutcome::Claimed { run: Box::new(run) })
 }
 
 /// Executing or awaiting integration; the same set as `one_unfinished_run_per_task`.

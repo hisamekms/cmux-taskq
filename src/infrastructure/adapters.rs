@@ -153,9 +153,21 @@ pub fn git_common_dir(path: &Path) -> Result<PathBuf> {
         .context("resolve Git common directory")
 }
 
+fn main_head(git: &Path, root: &Path) -> Result<String> {
+    Ok(output(Command::new(git).arg("-C").arg(root).args([
+        "rev-parse",
+        "--verify",
+        "refs/heads/main^{commit}",
+    ]))?
+    .trim()
+    .to_owned())
+}
+
+#[derive(Clone)]
 pub struct GitRepository {
     pub root: PathBuf,
     pub common_dir: PathBuf,
+    /// `refs/heads/main` at inspection time; `main_head` rereads it.
     pub base_commit: String,
     git: PathBuf,
 }
@@ -174,19 +186,19 @@ impl GitRepository {
         )
         .canonicalize()?;
         let common_dir = git_common_dir(&root)?;
-        let base_commit = output(Command::new(&git).arg("-C").arg(&root).args([
-            "rev-parse",
-            "--verify",
-            "refs/heads/main^{commit}",
-        ]))?
-        .trim()
-        .to_owned();
+        let base_commit = main_head(&git, &root)?;
         Ok(Self {
             root,
             common_dir,
             base_commit,
             git,
         })
+    }
+
+    /// Current `refs/heads/main`, read again so that a task unblocked by an
+    /// integration starts from the main that contains its predecessor.
+    pub fn main_head(&self) -> Result<String> {
+        main_head(&self.git, &self.root)
     }
 
     /// Symbolic HEAD of a worktree, or None when detached.

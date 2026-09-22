@@ -1,11 +1,11 @@
-//! Durable supervisor ownership and one-shot wrapper registration.
+//! Durable per-run supervisor ownership and one-shot wrapper registration.
 use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
 use serde::Serialize;
 use serde_json::json;
 
-use super::sqlite::{SqliteQueue, event, read_task, run_row};
-use crate::domain::{RunProcess, SupervisorLease, Task, TaskRun};
+use super::sqlite::{SqliteQueue, claim_task, event, read_task, run_row};
+use crate::domain::{ClaimOutcome, RunLease, RunProcess, Task, TaskRun, validate_base_commit};
 
 pub const HEARTBEAT_TIMEOUT_SECS: i64 = 30;
 
@@ -30,69 +30,92 @@ pub struct RunPlan {
 }
 
 impl SqliteQueue {
-    pub fn acquire_supervisor(&mut self, token: &str, common_dir: &str) -> Result<()> {
+    /// Reserve the next dependency-ready task for this supervisor: the run,
+    /// its `supervisor_token` and its lease row are created in one transaction,
+    /// so a claimed run never exists without an owner. Concurrent supervisors
+    /// on the same queue take different tasks.
+    pub fn claim_for_supervisor(&mut self, base_commit: &str, token: &str) -> Result<ClaimOutcome> {
+        validate_base_commit(base_commit)?;
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let existing: Option<String> = tx
-            .query_row(
-                "SELECT git_common_dir FROM queue_repository WHERE singleton=1",
-                [],
-                |r| r.get(0),
-            )
-            .optional()?;
-        if let Some(existing) = existing {
-            ensure!(
-                existing == common_dir,
-                "queue is bound to another Git repository: {existing}"
-            );
+        let outcome = claim_task(&tx, base_commit)?;
+        if let ClaimOutcome::Claimed { run } = &outcome {
+            tx.execute(
+                "UPDATE task_runs SET supervisor_token=?2 WHERE id=?1",
+                params![run.id, token],
+            )?;
+            tx.execute(
+                "INSERT INTO run_leases(run_id,token,pid) VALUES (?1,?2,?3)",
+                params![run.id, token, std::process::id()],
+            )?;
+            run_event(
+                &tx,
+                &run.id,
+                "lease_acquired",
+                json!({"pid": std::process::id()}),
+            )?;
         }
-        let leased: bool =
-            tx.query_row("SELECT EXISTS(SELECT 1 FROM supervisor_leases)", [], |r| {
-                r.get(0)
-            })?;
+        tx.commit()?;
+        Ok(outcome)
+    }
+
+    /// Refresh every lease this supervisor holds. Zero rows is not an error:
+    /// an idle supervisor owns nothing.
+    pub fn heartbeat_leases(&self, token: &str) -> Result<usize> {
+        Ok(self.conn.execute(
+            "UPDATE run_leases SET heartbeat_at=unixepoch() WHERE token=?1",
+            [token],
+        )?)
+    }
+
+    /// Give up ownership of a run that came to rest (`awaiting_integration`
+    /// or `failed`). The run's `supervisor_token` stays as a record.
+    pub fn release_lease(&mut self, id: &str, token: &str) -> Result<()> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         ensure!(
-            !leased,
-            "supervisor lease already exists; inspect status (stale leases are never taken over automatically)"
+            tx.execute(
+                "DELETE FROM run_leases WHERE run_id=?1 AND token=?2",
+                params![id, token]
+            )? == 1,
+            "run lease was lost"
         );
-        let active: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM task_runs WHERE status IN ('claimed','starting','running','validating'))", [], |r| r.get(0)
-        )?;
-        ensure!(
-            !active,
-            "an unfinished run exists; inspect its state before starting another run"
-        );
-        tx.execute(
-            "INSERT OR IGNORE INTO queue_repository VALUES (1,?1)",
-            [common_dir],
-        )?;
-        tx.execute(
-            "INSERT INTO supervisor_leases(singleton,token,pid) VALUES (1,?1,?2)",
-            params![token, std::process::id()],
-        )?;
+        run_event(&tx, id, "lease_released", json!({"reason": "finished"}))?;
         tx.commit()?;
         Ok(())
     }
 
-    pub fn heartbeat_supervisor(&self, token: &str) -> Result<()> {
+    /// Record a runtime error and disown the run without changing its status
+    /// or touching its processes and resources. Dropping the lease lets
+    /// `recover` judge the run by its registered processes alone while this
+    /// supervisor keeps serving other runs; a wrapper that has not registered
+    /// yet can no longer do so.
+    pub fn abandon_run(&mut self, id: &str, token: &str, message: &str) -> Result<TaskRun> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         ensure!(
-            self.conn.execute(
-                "UPDATE supervisor_leases SET heartbeat_at=unixepoch() WHERE token=?1",
-                [token]
+            tx.execute(
+                "UPDATE task_runs SET last_error=?2 WHERE id=?1",
+                params![id, message]
             )? == 1,
-            "supervisor lease was lost"
+            "run does not exist"
         );
-        Ok(())
-    }
-
-    pub fn release_supervisor(&self, token: &str) -> Result<()> {
-        ensure!(
-            self.conn
-                .execute("DELETE FROM supervisor_leases WHERE token=?1", [token])?
-                == 1,
-            "supervisor lease was lost"
-        );
-        Ok(())
+        let released = tx.execute(
+            "DELETE FROM run_leases WHERE run_id=?1 AND token=?2",
+            params![id, token],
+        )?;
+        run_event(
+            &tx,
+            id,
+            "runtime_error",
+            json!({"message": message, "lease_released": released == 1}),
+        )?;
+        let result = tx.query_row("SELECT * FROM task_runs WHERE id=?1", [id], run_row)?;
+        tx.commit()?;
+        Ok(result)
     }
 
     /// Bind the queue to a repository before any run exists, as `init` does for a
@@ -144,15 +167,23 @@ impl SqliteQueue {
             .optional()?)
     }
 
-    pub fn supervisor_lease(&self) -> Result<Option<SupervisorLease>> {
+    /// Every lease in the queue, oldest run first.
+    pub fn run_leases(&self) -> Result<Vec<RunLease>> {
         Ok(self
             .conn
-            .query_row("SELECT pid,heartbeat_at FROM supervisor_leases", [], |r| {
-                Ok(SupervisorLease {
-                    pid: r.get(0)?,
-                    heartbeat_at: r.get(1)?,
-                })
-            })
+            .prepare("SELECT l.run_id,l.pid,l.heartbeat_at FROM run_leases l JOIN task_runs r ON r.id=l.run_id ORDER BY r.rowid")?
+            .query_map([], lease_row)?
+            .collect::<rusqlite::Result<_>>()?)
+    }
+
+    pub fn run_lease(&self, id: &str) -> Result<Option<RunLease>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT run_id,pid,heartbeat_at FROM run_leases WHERE run_id=?1",
+                [id],
+                lease_row,
+            )
             .optional()?)
     }
 
@@ -167,13 +198,25 @@ impl SqliteQueue {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        assert_lease(&tx, token)?;
-        ensure!(tx.execute(
-            "UPDATE task_runs SET status='starting',supervisor_token=?2,repo_path=?3,run_dir=?4,
+        assert_lease(&tx, id, token)?;
+        ensure!(
+            tx.execute(
+                "UPDATE task_runs SET status='starting',repo_path=?3,run_dir=?4,
              branch=?5,worktree_path=?6,receipt_path=?7,log_path=?8
-             WHERE id=?1 AND status='claimed' AND supervisor_token IS NULL",
-            params![id,token,plan.repo_path,plan.run_dir,plan.branch,plan.worktree_path,plan.receipt_path,plan.log_path]
-        )? == 1, "run cannot be provisioned twice");
+             WHERE id=?1 AND status='claimed' AND supervisor_token=?2",
+                params![
+                    id,
+                    token,
+                    plan.repo_path,
+                    plan.run_dir,
+                    plan.branch,
+                    plan.worktree_path,
+                    plan.receipt_path,
+                    plan.log_path
+                ]
+            )? == 1,
+            "run cannot be provisioned twice"
+        );
         run_event(&tx, id, "run_planned", serde_json::to_value(plan)?)?;
         tx.commit()?;
         Ok(())
@@ -183,7 +226,7 @@ impl SqliteQueue {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        assert_lease(&tx, token)?;
+        assert_lease(&tx, id, token)?;
         ensure!(
             tx.execute(
                 "UPDATE task_runs SET workspace_id=?3 WHERE id=?1 AND supervisor_token=?2
@@ -231,7 +274,7 @@ impl SqliteQueue {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        assert_lease(&tx, token)?;
+        assert_lease(&tx, id, token)?;
         let allowed: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM task_runs WHERE id=?1 AND supervisor_token=?2
              AND status='starting' AND workspace_id IS NOT NULL)",
@@ -306,7 +349,8 @@ impl SqliteQueue {
     /// Operator recovery of an orphaned run. The caller has checked that the
     /// registered processes are dead; `checked_processes` guards against a
     /// registration that happened in between, and a fresh lease is refused here
-    /// again. Resources and the task's `in_progress` status are left untouched.
+    /// again. Only this run's lease is deleted; other runs, their leases,
+    /// resources and the task's `in_progress` status are left untouched.
     pub fn recover_run(
         &mut self,
         id: &str,
@@ -317,11 +361,11 @@ impl SqliteQueue {
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let fresh: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM supervisor_leases WHERE heartbeat_at >= unixepoch()-?1)",
-            [HEARTBEAT_TIMEOUT_SECS],
+            "SELECT EXISTS(SELECT 1 FROM run_leases WHERE run_id=?1 AND heartbeat_at >= unixepoch()-?2)",
+            params![id, HEARTBEAT_TIMEOUT_SECS],
             |r| r.get(0),
         )?;
-        ensure!(!fresh, "supervisor lease heartbeat is fresh");
+        ensure!(!fresh, "run lease heartbeat is fresh");
         let registered: i64 = tx.query_row(
             "SELECT count(*) FROM run_processes WHERE run_id=?1",
             [id],
@@ -345,7 +389,7 @@ impl SqliteQueue {
             )? == 1,
             "run {id} is {previous}; only unfinished runs can be recovered"
         );
-        let leases_deleted = tx.execute("DELETE FROM supervisor_leases", [])?;
+        let leases_deleted = tx.execute("DELETE FROM run_leases WHERE run_id=?1", [id])?;
         report["previous_status"] = json!(previous);
         report["lease_deleted"] = json!(leases_deleted == 1);
         run_event(&tx, id, "run_recovered", report)?;
@@ -367,7 +411,7 @@ impl SqliteQueue {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        assert_lease(&tx, token)?;
+        assert_lease(&tx, id, token)?;
         let code: i32 = tx.query_row(
             "SELECT exit_code FROM run_processes WHERE run_id=?1 AND role='wrapper' AND exited_at IS NOT NULL",
             [id], |r| r.get(0)
@@ -396,7 +440,7 @@ impl SqliteQueue {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        assert_lease(&tx, token)?;
+        assert_lease(&tx, id, token)?;
         let status = if validation.accepted {
             "awaiting_integration"
         } else {
@@ -480,7 +524,7 @@ impl SqliteQueue {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        assert_lease(&tx, token)?;
+        assert_lease(&tx, id, token)?;
         ensure!(
             tx.execute(
                 "UPDATE task_runs SET workspace_closed_at=unixepoch() WHERE id=?1 AND supervisor_token=?2
@@ -506,7 +550,7 @@ impl SqliteQueue {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        assert_lease(&tx, token)?;
+        assert_lease(&tx, id, token)?;
         ensure!(
             tx.execute(
                 "UPDATE task_runs SET last_error=?3 WHERE id=?1 AND supervisor_token=?2
@@ -527,11 +571,19 @@ impl SqliteQueue {
     }
 }
 
-fn assert_lease(conn: &Connection, token: &str) -> Result<()> {
-    let valid: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM supervisor_leases WHERE token=?1 AND heartbeat_at >= unixepoch()-?2)",
-        params![token,HEARTBEAT_TIMEOUT_SECS], |r| r.get(0))?;
-    ensure!(valid, "supervisor lease is missing or stale");
+fn assert_lease(conn: &Connection, id: &str, token: &str) -> Result<()> {
+    let valid: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM run_leases WHERE run_id=?1 AND token=?2 AND heartbeat_at >= unixepoch()-?3)",
+        params![id,token,HEARTBEAT_TIMEOUT_SECS], |r| r.get(0))?;
+    ensure!(valid, "run lease is missing or stale");
     Ok(())
+}
+
+fn lease_row(r: &Row<'_>) -> rusqlite::Result<RunLease> {
+    Ok(RunLease {
+        run_id: r.get(0)?,
+        pid: r.get(1)?,
+        heartbeat_at: r.get(2)?,
+    })
 }
 
 fn assert_wrapper(conn: &Connection, id: &str, pid: u32) -> Result<()> {

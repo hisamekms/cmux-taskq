@@ -62,9 +62,10 @@ fn tasks_dependencies_runs_and_events_survive_reopen() {
     let second = reopened.show(b.id).unwrap();
     assert_eq!(second.dependencies, vec![a.id]);
     assert_eq!(second.events.len(), 2); // Duplicate dependency is idempotent.
+    // The dependent stays blocked; the claimed task owns its run.
     assert!(matches!(
         reopened.claim(BASE).unwrap(),
-        ClaimOutcome::Busy { .. }
+        ClaimOutcome::NoReadyTask
     ));
 }
 
@@ -179,7 +180,7 @@ fn manual_transitions_cannot_change_claimed_or_terminal_tasks() {
 }
 
 #[test]
-fn concurrent_connections_claim_only_one_execution_slot() {
+fn concurrent_connections_claim_each_ready_task_once() {
     let (dir, mut queue) = fixture();
     for title in ["first", "second"] {
         let task = queue.add(new_task(title)).unwrap();
@@ -205,17 +206,19 @@ fn concurrent_connections_claim_only_one_execution_slot() {
             _ => None,
         })
         .collect();
-    assert_eq!(runs.len(), 1);
-    assert_eq!(runs[0].task_id, 1);
+    // No queue-wide slot: both tasks are claimed, each exactly once.
+    let mut claimed: Vec<i64> = runs.iter().map(|r| r.task_id).collect();
+    claimed.sort();
+    assert_eq!(claimed, [1, 2]);
     assert_eq!(
         outcomes
             .iter()
-            .filter(|o| matches!(o, ClaimOutcome::Busy { run_id } if run_id == &runs[0].id))
+            .filter(|o| matches!(o, ClaimOutcome::NoReadyTask))
             .count(),
-        7
+        6
     );
     assert_eq!(queue.show(1).unwrap().runs.len(), 1);
-    assert!(queue.show(2).unwrap().runs.is_empty());
+    assert_eq!(queue.show(2).unwrap().runs.len(), 1);
 }
 
 #[test]
@@ -325,7 +328,7 @@ fn initialization_is_repeatable_and_preserves_existing_tasks() {
     queue.add(new_task("preserved")).unwrap();
     drop(queue);
     let queue = SqliteQueue::init(dir.path().join("queue.db")).unwrap();
-    assert_eq!(queue.schema_version().unwrap(), 4);
+    assert_eq!(queue.schema_version().unwrap(), 5);
     assert_eq!(queue.list().unwrap().len(), 1);
     assert!(SqliteQueue::open(dir.path().join("typo.db")).is_err());
     assert!(!dir.path().join("typo.db").exists());
@@ -394,12 +397,11 @@ fn dependency_change_and_claim_are_serialized() {
             assert_eq!(detail.task.status, TaskStatus::Ready);
             assert!(detail.runs.is_empty());
         }
-        ClaimOutcome::Busy { .. } => panic!("no run existed before this claim"),
     }
 }
 
 #[test]
-fn database_constraints_guard_execution_slot_and_integration_ownership() {
+fn database_constraints_guard_per_task_runs_and_integration_ownership() {
     let (dir, mut queue) = fixture();
     let a = queue.add(new_task("a")).unwrap().id;
     let b = queue.add(new_task("b")).unwrap().id;
@@ -413,7 +415,11 @@ fn database_constraints_guard_execution_slot_and_integration_ownership() {
         rusqlite::params![id, BASE],
     )
     };
-    assert!(insert(b).is_err());
+    // Another task may execute at the same time; the same task may not.
+    assert!(insert(a).is_err());
+    assert!(insert(b).is_ok());
+    raw.execute("DELETE FROM task_runs WHERE id='extra'", [])
+        .unwrap();
     raw.execute("UPDATE task_runs SET status='awaiting_integration'", [])
         .unwrap();
     assert!(insert(a).is_err());
@@ -434,7 +440,7 @@ fn database_constraints_guard_execution_slot_and_integration_ownership() {
 }
 
 #[test]
-fn migration_to_v4_rebuilds_runs_with_history_and_keeps_foreign_keys() {
+fn migration_to_v5_rebuilds_runs_moves_the_lease_and_keeps_foreign_keys() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("v3.db");
     let raw = Connection::open(&path).unwrap();
@@ -455,12 +461,34 @@ fn migration_to_v4_rebuilds_runs_with_history_and_keeps_foreign_keys() {
          INSERT INTO task_runs(id,task_id,status,requested_provider,actual_provider,base_commit,result_commit,workspace_closed_at)
          VALUES ('run-awaiting',1,'awaiting_integration','claude','claude','{BASE}','{BASE}',1700000000);
          INSERT INTO run_events(task_id,run_id,kind,payload) VALUES (1,'run-failed','validation_finished','{{}}');
-         INSERT INTO run_processes(run_id,role,pid,exited_at,exit_code) VALUES ('run-awaiting','wrapper',1,1,0);"
+         INSERT INTO run_processes(run_id,role,pid,exited_at,exit_code) VALUES ('run-awaiting','wrapper',1,1,0);
+         INSERT INTO tasks(title,description,acceptance,verification_commands,status)
+         VALUES ('orphaned','','','[]','in_progress');
+         INSERT INTO task_runs(id,task_id,status,requested_provider,actual_provider,base_commit,supervisor_token)
+         VALUES ('run-orphan',2,'running','claude','claude','{BASE}','old-token');
+         INSERT INTO supervisor_leases(singleton,token,pid,heartbeat_at) VALUES (1,'old-token',4242,1700000000);"
     ))
     .unwrap();
     drop(raw);
     let mut queue = SqliteQueue::open(&path).unwrap();
-    assert_eq!(queue.schema_version().unwrap(), 4);
+    assert_eq!(queue.schema_version().unwrap(), 5);
+    // The queue-wide lease became the orphaned run's lease; the slot index is gone.
+    let leases = queue.run_leases().unwrap();
+    assert_eq!(leases.len(), 1);
+    assert_eq!(leases[0].run_id, "run-orphan");
+    assert_eq!(leases[0].pid, 4242);
+    assert_eq!(leases[0].heartbeat_at, 1700000000);
+    assert!(queue.run_lease("run-awaiting").unwrap().is_none());
+    let raw = Connection::open(&path).unwrap();
+    let objects: Vec<String> = raw
+        .prepare("SELECT name FROM sqlite_master WHERE name IN ('supervisor_leases','one_executing_run_per_queue','run_leases','one_unfinished_run_per_task') ORDER BY name")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert_eq!(objects, ["one_unfinished_run_per_task", "run_leases"]);
+    drop(raw);
     let detail = queue.show(1).unwrap();
     assert_eq!(
         detail

@@ -16,6 +16,7 @@ depends_on:
   - adr-0004
   - adr-0005
   - adr-0006
+  - adr-0007
 ---
 
 # Rust runtime MVP
@@ -99,7 +100,7 @@ receiptにはrun ID、結果、commit SHA、実施したunit test/E2E/subagent r
 
 ### 6. 依存が解けたtaskを並列に実行する
 
-[017](../journal/017-parallel-runs.md)。
+状態: 実装済み（2026-09-22、[017](../journal/017-parallel-runs.md)、[ADR-0007](../adr/0007-run-level-leases-parallel-execution.md)）。leaseは`run_leases`でrun単位（schema v5）、queue全体の実行枠は廃止。`supervise --parallel N`（既定4）は常駐ループで、`--once`で1 batch。1 runのruntime errorはそのrunだけをabandonし、`doctor`/`recover`はrunごと。2件同時と依存taskの後追い、1 run失敗の非波及、1 runだけのrecoverをunit testとe2eで確認した。
 
 - queue全体の実行枠をやめ、Taskごとの未完了run 1件の制約だけ残す。leaseはrun単位にし、`doctor`/`recover`はrunごとに動く。
 - `supervise --parallel N`（既定4）は常駐ループで、候補を上限までclaim → 起動 → 各runの監視 → 検証を繰り返す。
@@ -139,7 +140,7 @@ receiptにはrun ID、結果、commit SHA、実施したunit test/E2E/subagent r
 
 ## Ordering
 
-`1 → 2 → 3 → 4 → 5 → 6 → 7 → 8 → 9`。ステップ1〜5は実装済みで、4の実機確認（010）は7の後に並列とmerge queueを含めて行う。ステップ8のpluginは実装済みで、Claude Codeからの実行・統合・復旧の確認をステップ9に含める。次の着手単位はステップ6（017）。ドッグフーディングへの移行は010の直後、012から。012・013・014・019のジャーナルは`draft`で置き、暫定運用のSVは起動しない。016・017・018・010がdoneになった時点で`cmux-taskq add`へ登録し、013・014・019はcmux-taskqで流す。
+`1 → 2 → 3 → 4 → 5 → 6 → 7 → 8 → 9`。ステップ1〜6は実装済みで、4の実機確認（010）は7の後に並列とmerge queueを含めて行う。ステップ8のpluginは実装済みで、Claude Codeからの実行・統合・復旧の確認をステップ9に含める。次の着手単位はステップ7（018）。ドッグフーディングへの移行は010の直後、012から。012・013・014・019のジャーナルは`draft`で置き、暫定運用のSVは起動しない。016・017・018・010がdoneになった時点で`cmux-taskq add`へ登録し、013・014・019はcmux-taskqで流す。
 
 ## After first dogfooding
 

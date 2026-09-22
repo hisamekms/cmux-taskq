@@ -51,7 +51,7 @@ run_id=$(printf '%s\n' "$prompt" | sed -n 's/^You are executing cmux-taskq task 
 [ "$run_id" = "$session_id" ] || { printf 'stub: prompt run %s != session %s\n' "$run_id" "$session_id" >&2; exit 65; }
 receipt=$(printf '%s\n' "$prompt" | sed -n 's/^Write a completion receipt to \(.*\) using a temporary file in the same directory.*/\1/p')
 [ -n "$receipt" ] || { printf 'stub: prompt does not name the receipt path\n' >&2; exit 65; }
-printf 'written by the stub agent\n' > e2e.txt
+printf 'written by the stub agent for %s\n' "$session_id" > e2e.txt
 git add e2e.txt
 git commit -q -m 'feat: e2e stub change'
 sh -c 'test -f seed.txt'
@@ -147,35 +147,35 @@ fn workspace_listed(cmux: &Path, id: &str) -> bool {
         .any(|w| w["id"].as_str().is_some_and(|w| w.eq_ignore_ascii_case(id)))
 }
 
-/// Closes the workspace the supervisor created if it is still open when the
-/// test ends, on success and on panic alike. On the happy path the supervisor
-/// has already closed it; cmux 0.64 also closes a workspace by itself once its
-/// command exits. Either way "not listed" is the expected state, not a failure.
+/// Closes the workspaces the supervisor created if they are still open when
+/// the test ends, on success and on panic alike. On the happy path the
+/// supervisor has already closed them; cmux 0.64 also closes a workspace by
+/// itself once its command exits. Either way "not listed" is the expected
+/// state, not a failure.
 struct WorkspaceGuard {
     cmux: PathBuf,
-    id: Option<String>,
+    ids: Vec<String>,
 }
 
 impl Drop for WorkspaceGuard {
     fn drop(&mut self) {
-        let Some(id) = &self.id else {
-            return;
-        };
-        if !workspace_listed(&self.cmux, id) {
-            eprintln!("workspace {id} already closed");
-            return;
-        }
-        match Command::new(&self.cmux)
-            .args(["workspace", "close"])
-            .arg(id)
-            .output()
-        {
-            Ok(output) if output.status.success() => eprintln!("closed workspace {id}"),
-            Ok(output) => eprintln!(
-                "closing workspace {id} failed: {}",
-                String::from_utf8_lossy(&output.stderr)
-            ),
-            Err(error) => eprintln!("closing workspace {id} failed: {error}"),
+        for id in &self.ids {
+            if !workspace_listed(&self.cmux, id) {
+                eprintln!("workspace {id} already closed");
+                continue;
+            }
+            match Command::new(&self.cmux)
+                .args(["workspace", "close"])
+                .arg(id)
+                .output()
+            {
+                Ok(output) if output.status.success() => eprintln!("closed workspace {id}"),
+                Ok(output) => eprintln!(
+                    "closing workspace {id} failed: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                ),
+                Err(error) => eprintln!("closing workspace {id} failed: {error}"),
+            }
         }
     }
 }
@@ -200,14 +200,21 @@ fn reader(mut source: impl Read + Send + 'static) -> thread::JoinHandle<String> 
     })
 }
 
-#[test]
-#[ignore = "needs a running cmux; run with --ignored"]
-fn happy_path_runs_a_stub_agent_through_cmux_and_awaits_integration() {
+/// Disposable repository, queue and stub agent, all outside this repository.
+struct Fixture {
+    _dir: tempfile::TempDir,
+    cmux: PathBuf,
+    repo: PathBuf,
+    stub: PathBuf,
+    base: String,
+    db: PathBuf,
+    env: Env,
+}
+
+fn fixture() -> Fixture {
     let cmux = cmux_executable();
     let cmux_version = preflight(&cmux);
     eprintln!("cmux: {cmux_version}");
-
-    // Disposable repository, queue and stub, all outside this repository.
     let dir = tempfile::tempdir().unwrap();
     let repo = dir.path().join("repo");
     fs::create_dir(&repo).unwrap();
@@ -226,41 +233,76 @@ fn happy_path_runs_a_stub_agent_through_cmux_and_awaits_integration() {
         repo: repo.clone(),
         data_home: dir.path().join("data"),
     };
-
     let init = taskq(&env, &["init"]);
-    assert_eq!(init["schema_version"], 4);
+    assert_eq!(init["schema_version"], 5);
     let db = PathBuf::from(init["db"].as_str().unwrap());
     assert!(db.starts_with(env.data_home.join("cmux-taskq")));
     assert_eq!(taskq(&env, &["locate"])["db_exists"], true);
-    let task = taskq(
-        &env,
-        &[
-            "add",
-            "e2e stub task",
-            "--description",
-            "Add e2e.txt to the worktree",
-            "--acceptance",
-            "e2e.txt is committed and seed.txt still exists",
-            "--verify",
-            "test -f seed.txt",
-            "--verify",
-            "test -f e2e.txt",
-        ],
-    );
-    let task_id = task["id"].to_string();
-    assert_eq!(taskq(&env, &["ready", &task_id])["status"], "ready");
-    assert_eq!(taskq(&env, &["candidates"]).as_array().unwrap().len(), 1);
+    Fixture {
+        _dir: dir,
+        cmux,
+        repo,
+        stub,
+        base,
+        db,
+        env,
+    }
+}
 
+/// Register a ready task whose acceptance the stub agent satisfies.
+fn add_ready_task(env: &Env, title: &str, dependencies: &[&str]) -> String {
+    let mut args = vec![
+        "add",
+        title,
+        "--description",
+        "Add e2e.txt to the worktree",
+        "--acceptance",
+        "e2e.txt is committed and seed.txt still exists",
+        "--verify",
+        "test -f seed.txt",
+        "--verify",
+        "test -f e2e.txt",
+    ];
+    for dependency in dependencies {
+        args.extend(["--depends-on", dependency]);
+    }
+    let id = taskq(env, &args)["id"].to_string();
+    assert_eq!(taskq(env, &["ready", &id])["status"], "ready");
+    id
+}
+
+/// What one `supervise` pass produced, plus what the test observed while it ran.
+struct Pass {
+    outcome: Value,
+    stderr: String,
+    /// Workspace id per task, in the order they were first seen.
+    workspaces: Vec<(String, String)>,
+    /// Whether every workspace was listed by cmux at one moment; for one task
+    /// this is simply "it was listed".
+    listed_together: bool,
+}
+
+/// Run `supervise --once` with the given extra arguments and watch the runs of
+/// `tasks` until it exits: their workspace ids must appear in the queue and in
+/// cmux's own list before the sessions end.
+fn supervise_once(
+    fixture: &Fixture,
+    extra: &[&str],
+    tasks: &[&str],
+    guard: &mut WorkspaceGuard,
+) -> Pass {
     let started = Instant::now();
     let mut child = ChildGuard(
         Command::new(BIN)
-            .current_dir(&repo)
-            .env("XDG_DATA_HOME", &env.data_home)
+            .current_dir(&fixture.repo)
+            .env("XDG_DATA_HOME", &fixture.env.data_home)
             .arg("supervise")
+            .arg("--once")
+            .args(extra)
             .arg("--cmux")
-            .arg(&cmux)
+            .arg(&fixture.cmux)
             .arg("--claude")
-            .arg(&stub)
+            .arg(&fixture.stub)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -269,15 +311,8 @@ fn happy_path_runs_a_stub_agent_through_cmux_and_awaits_integration() {
     );
     let stdout = reader(child.0.stdout.take().unwrap());
     let stderr = reader(child.0.stderr.take().unwrap());
-
-    // Watch the run while the supervisor is busy: the workspace id must appear
-    // in the queue and in cmux's own list before the session ends.
-    let mut guard = WorkspaceGuard {
-        cmux: cmux.clone(),
-        id: None,
-    };
-    let mut workspace_seen_at = None;
-    let mut listed = false;
+    let mut workspaces: Vec<(String, String)> = Vec::new();
+    let mut listed_together = false;
     let status = loop {
         if let Some(status) = child.0.try_wait().unwrap() {
             break status;
@@ -286,40 +321,86 @@ fn happy_path_runs_a_stub_agent_through_cmux_and_awaits_integration() {
             started.elapsed() < SUPERVISE_TIMEOUT,
             "supervise did not finish within {SUPERVISE_TIMEOUT:?}"
         );
-        if guard.id.is_none() {
-            let detail = taskq(&env, &["show", &task_id]);
-            if let Some(id) = detail["runs"][0]["workspace_id"].as_str() {
+        for task in tasks {
+            if workspaces.iter().any(|(t, _)| t == task) {
+                continue;
+            }
+            let detail = taskq(&fixture.env, &["show", task]);
+            if let Some(id) = detail["runs"]
+                .as_array()
+                .unwrap()
+                .last()
+                .and_then(|r| r["workspace_id"].as_str())
+            {
                 uuid::Uuid::parse_str(id).expect("workspace id is a UUID");
-                guard.id = Some(id.to_owned());
-                workspace_seen_at = Some(started.elapsed());
+                eprintln!(
+                    "task {task} workspace {id} registered after {:?}",
+                    started.elapsed()
+                );
+                workspaces.push((task.to_string(), id.to_owned()));
+                guard.ids.push(id.to_owned());
             }
         }
-        if let Some(id) = &guard.id {
-            listed |= workspace_listed(&cmux, id);
+        if workspaces.len() == tasks.len() && !listed_together {
+            listed_together = workspaces
+                .iter()
+                .all(|(_, id)| workspace_listed(&fixture.cmux, id));
         }
         thread::sleep(Duration::from_millis(200));
     };
     let supervise_took = started.elapsed();
     let stdout = stdout.join().unwrap();
     let stderr = stderr.join().unwrap();
-    eprintln!(
-        "workspace registered after {workspace_seen_at:?}; supervise finished in {supervise_took:?}\n{stderr}"
-    );
+    eprintln!("supervise finished in {supervise_took:?}\n{stderr}");
     assert!(status.success(), "supervise failed ({status}): {stderr}");
-    let workspace = guard.id.clone().expect("workspace id was recorded");
-    assert!(
-        listed,
-        "workspace {workspace} never appeared in cmux workspace list"
-    );
-
     let outcome: Value = serde_json::from_str(&stdout).unwrap();
     assert_eq!(outcome["outcome"], "finished", "{outcome}");
+    Pass {
+        outcome,
+        stderr,
+        workspaces,
+        listed_together,
+    }
+}
+
+#[test]
+#[ignore = "needs a running cmux; run with --ignored"]
+fn happy_path_runs_a_stub_agent_through_cmux_and_awaits_integration() {
+    let fixture = fixture();
+    let Fixture {
+        cmux,
+        repo,
+        base,
+        db,
+        env,
+        ..
+    } = &fixture;
+    let task_id = add_ready_task(env, "e2e stub task", &[]);
+    assert_eq!(taskq(env, &["candidates"]).as_array().unwrap().len(), 1);
+
+    let mut guard = WorkspaceGuard {
+        cmux: cmux.clone(),
+        ids: Vec::new(),
+    };
+    let pass = supervise_once(&fixture, &[], &[&task_id], &mut guard);
+    let workspace = pass.workspaces[0].1.clone();
+    assert!(
+        pass.listed_together,
+        "workspace {workspace} never appeared in cmux workspace list"
+    );
+    let outcome = &pass.outcome;
+    assert_eq!(outcome["runs"].as_array().unwrap().len(), 1, "{outcome}");
+    assert_eq!(outcome["errors"], Value::Array(vec![]), "{outcome}");
     assert_eq!(
-        outcome["run"]["status"], "awaiting_integration",
+        outcome["runs"][0]["status"], "awaiting_integration",
         "{outcome}"
     );
+    let stderr = &pass.stderr;
+    let base = base.as_str();
+    let repo = repo.as_path();
+    let db = db.as_path();
 
-    let detail = taskq(&env, &["show", &task_id]);
+    let detail = taskq(env, &["show", &task_id]);
     assert_eq!(detail["task"]["status"], "in_progress");
     let runs = detail["runs"].as_array().unwrap();
     assert_eq!(runs.len(), 1);
@@ -327,14 +408,15 @@ fn happy_path_runs_a_stub_agent_through_cmux_and_awaits_integration() {
     let run_id = run["id"].as_str().unwrap();
     assert_eq!(run["status"], "awaiting_integration");
     assert_eq!(run["workspace_id"], workspace.as_str());
-    assert_eq!(run["base_commit"], base.as_str());
+    assert_eq!(run["base_commit"], base);
     assert!(run["last_error"].is_null());
     assert_eq!(run["branch"], format!("taskq/{run_id}"));
     assert!(run["workspace_closed_at"].is_number(), "{run}");
     assert!(
-        !workspace_listed(&cmux, &workspace),
+        !workspace_listed(cmux, &workspace),
         "workspace {workspace} is still open after the run was accepted"
     );
+    assert!(stderr.contains("awaiting_integration"), "{stderr}");
 
     // The run lives next to the queue, and its worktree resolves the same queue.
     let run_dir = Path::new(run["run_dir"].as_str().unwrap());
@@ -356,7 +438,7 @@ fn happy_path_runs_a_stub_agent_through_cmux_and_awaits_integration() {
         db.to_str().unwrap()
     );
     let head = git(worktree, &["rev-parse", "HEAD"]);
-    assert_eq!(git(&repo, &["rev-parse", "main"]), base); // Not merged by the supervisor.
+    assert_eq!(git(repo, &["rev-parse", "main"]), base); // Not merged by the supervisor.
     assert_ne!(head, base);
     assert_eq!(run["result_commit"], head.as_str());
     assert_eq!(
@@ -366,7 +448,7 @@ fn happy_path_runs_a_stub_agent_through_cmux_and_awaits_integration() {
     assert_eq!(git(worktree, &["status", "--porcelain"]), "");
     assert_eq!(
         fs::read_to_string(worktree.join("e2e.txt")).unwrap(),
-        "written by the stub agent\n"
+        format!("written by the stub agent for {run_id}\n")
     );
     assert!(!repo.join("e2e.txt").exists()); // main is untouched.
 
@@ -392,6 +474,7 @@ fn happy_path_runs_a_stub_agent_through_cmux_and_awaits_integration() {
         .map(|e| e["kind"].as_str().unwrap())
         .collect();
     for expected in [
+        "lease_acquired",
         "worktree_created",
         "workspace_created",
         "wrapper_started",
@@ -404,6 +487,7 @@ fn happy_path_runs_a_stub_agent_through_cmux_and_awaits_integration() {
         "verification_command",
         "validation_finished",
         "workspace_closed",
+        "lease_released",
     ] {
         assert!(kinds.contains(&expected), "missing {expected} in {kinds:?}");
     }
@@ -443,25 +527,27 @@ fn happy_path_runs_a_stub_agent_through_cmux_and_awaits_integration() {
     assert_eq!(processes.len(), 2);
     assert!(processes.iter().all(|p| p["exit_code"] == 0));
 
-    // The slot stays taken until integration; the lease is gone.
-    assert_eq!(taskq(&env, &["candidates"]).as_array().unwrap().len(), 0);
-    assert!(taskq(&env, &["status"])["supervisor"].is_null());
+    // The task stays taken until integration; the lease is gone.
+    assert_eq!(taskq(env, &["candidates"]).as_array().unwrap().len(), 0);
+    let status = taskq(env, &["status"]);
+    assert_eq!(status["supervisors"], Value::Array(vec![]), "{status}");
+    assert_eq!(status["runs"], Value::Array(vec![]), "{status}");
 
     // Integration is manual: nothing happens until main contains the commit.
-    let not_yet = taskq(&env, &["integrate", &task_id]);
+    let not_yet = taskq(env, &["integrate", &task_id]);
     assert_eq!(not_yet["outcome"], "not_integrated", "{not_yet}");
-    assert_eq!(not_yet["main"], base.as_str());
+    assert_eq!(not_yet["main"], base);
     assert_eq!(
-        taskq(&env, &["show", &task_id])["task"]["status"],
+        taskq(env, &["show", &task_id])["task"]["status"],
         "in_progress"
     );
-    git(&repo, &["merge", "--ff-only", &format!("taskq/{run_id}")]);
-    assert_eq!(git(&repo, &["rev-parse", "main"]), head);
-    let integrated = taskq(&env, &["integrate", &task_id]);
+    git(repo, &["merge", "--ff-only", &format!("taskq/{run_id}")]);
+    assert_eq!(git(repo, &["rev-parse", "main"]), head);
+    let integrated = taskq(env, &["integrate", &task_id]);
     assert_eq!(integrated["outcome"], "integrated", "{integrated}");
     assert_eq!(integrated["task"]["status"], "completed");
     assert_eq!(integrated["run"]["status"], "integrated");
-    let detail = taskq(&env, &["show", &task_id]);
+    let detail = taskq(env, &["show", &task_id]);
     assert_eq!(detail["task"]["status"], "completed");
     assert_eq!(detail["runs"][0]["status"], "integrated");
     assert!(
@@ -472,4 +558,83 @@ fn happy_path_runs_a_stub_agent_through_cmux_and_awaits_integration() {
             .any(|e| e["kind"] == "run_integrated")
     );
     assert!(worktree.exists()); // Kept until the operator removes it.
+}
+
+/// Two independent tasks run in two cmux workspaces at once; the task that
+/// depends on one of them waits for its integration and then starts from
+/// the main that contains it.
+#[test]
+#[ignore = "needs a running cmux; run with --ignored"]
+fn two_independent_tasks_run_concurrently_and_a_dependent_follows_integration() {
+    let fixture = fixture();
+    let Fixture {
+        cmux,
+        repo,
+        base,
+        env,
+        ..
+    } = &fixture;
+    let first = add_ready_task(env, "e2e first", &[]);
+    let second = add_ready_task(env, "e2e second", &[]);
+    let third = add_ready_task(env, "e2e dependent", &[&first]);
+    assert_eq!(taskq(env, &["candidates"]).as_array().unwrap().len(), 2);
+
+    let mut guard = WorkspaceGuard {
+        cmux: cmux.clone(),
+        ids: Vec::new(),
+    };
+    let pass = supervise_once(
+        &fixture,
+        &["--parallel", "2"],
+        &[&first, &second],
+        &mut guard,
+    );
+    assert!(
+        pass.listed_together,
+        "both workspaces were never open at the same time: {:?}",
+        pass.workspaces
+    );
+    assert_ne!(pass.workspaces[0].1, pass.workspaces[1].1);
+    let outcome = &pass.outcome;
+    assert_eq!(outcome["errors"], Value::Array(vec![]), "{outcome}");
+    let runs = outcome["runs"].as_array().unwrap();
+    assert_eq!(runs.len(), 2, "{outcome}");
+    assert!(
+        runs.iter().all(|r| r["status"] == "awaiting_integration"),
+        "{outcome}"
+    );
+    for task in [&first, &second] {
+        let detail = taskq(env, &["show", task]);
+        assert_eq!(detail["task"]["status"], "in_progress");
+        let run = &detail["runs"][0];
+        assert_eq!(run["status"], "awaiting_integration");
+        assert_eq!(run["base_commit"], base.as_str());
+        assert!(run["workspace_closed_at"].is_number(), "{run}");
+        assert!(run["last_error"].is_null(), "{run}");
+        let worktree = Path::new(run["worktree_path"].as_str().unwrap());
+        assert_eq!(git(worktree, &["status", "--porcelain"]), "");
+    }
+    // The dependent never started: awaiting integration is not completion.
+    let detail = taskq(env, &["show", &third]);
+    assert_eq!(detail["task"]["status"], "ready");
+    assert_eq!(detail["runs"], Value::Array(vec![]));
+    assert_eq!(taskq(env, &["candidates"]).as_array().unwrap().len(), 0);
+    assert_eq!(taskq(env, &["doctor"])["runs"], Value::Array(vec![]));
+
+    // Integrate the first task; the dependent becomes claimable from the new main.
+    let first_run = taskq(env, &["show", &first])["runs"][0].clone();
+    let first_commit = first_run["result_commit"].as_str().unwrap().to_owned();
+    git(
+        repo,
+        &["merge", "--ff-only", first_run["branch"].as_str().unwrap()],
+    );
+    assert_eq!(taskq(env, &["integrate", &first])["outcome"], "integrated");
+    assert_eq!(taskq(env, &["candidates"])[0]["id"].to_string(), third);
+    let pass = supervise_once(&fixture, &["--parallel", "2"], &[&third], &mut guard);
+    assert_eq!(pass.outcome["runs"].as_array().unwrap().len(), 1);
+    let run = taskq(env, &["show", &third])["runs"][0].clone();
+    assert_eq!(run["status"], "awaiting_integration", "{run}");
+    assert_eq!(run["base_commit"], first_commit.as_str());
+    assert_eq!(git(repo, &["rev-parse", "main"]), first_commit);
+    assert_eq!(taskq(env, &["status"])["supervisors"], Value::Array(vec![]));
 }

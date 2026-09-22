@@ -6,9 +6,9 @@ The runtime is distributed as a binary. Claude Code and Codex integrations are d
 
 ## Current status
 
-The Rust/SQLite queue and a single-run supervisor are implemented. Tasks, dependencies, state transitions, candidate selection, run reservation, supervisor leases, process heartbeats, and events are persisted locally. `supervise` claims one ready task, creates a Git worktree and a cmux workspace, starts an interactive Claude Code session through a wrapper, records the session exit, validates the completion receipt against Git and the task's verification commands, and closes the workspace of an accepted run. `integrate` confirms that the validated commit was merged into `main` and completes the task. Claude Code's interactive lifecycle was [verified first](docs/journal/001-claude-lifecycle-spike.md).
+The Rust/SQLite queue and a parallel supervisor are implemented. Tasks, dependencies, state transitions, candidate selection, run reservation, per-run supervisor leases, process heartbeats, and events are persisted locally. `supervise` is a resident loop: it claims dependency-ready tasks up to `--parallel N` (default 4), creates a Git worktree and a cmux workspace for each, starts an interactive Claude Code session through a wrapper, records each session's exit, validates each completion receipt against Git and the task's verification commands, and closes the workspace of an accepted run. `integrate` confirms that a validated commit was merged into `main` and completes the task, and the supervisor picks up the tasks that unblocks. Claude Code's interactive lifecycle was [verified first](docs/journal/001-claude-lifecycle-spike.md).
 
-A validated run stays in `awaiting_integration`; its workspace is closed, while its worktree and branch are kept until the result is merged into `main` by hand and confirmed with `integrate`. Stale supervisor leases are never taken over automatically: `doctor` reports an interrupted supervisor and `recover` releases its run once nothing is left running.
+A validated run stays in `awaiting_integration`; its workspace is closed, while its worktree and branch are kept until the result is merged into `main` by hand and confirmed with `integrate`. One run's failure never touches another: each run has its own lease, and `doctor` / `recover` judge and release one run at a time. Stale leases are never taken over automatically.
 
 ## Build and try the queue
 
@@ -48,41 +48,45 @@ Commands return JSON on stdout. Runtime errors return JSON on stderr with a nonz
 | `cancel ID` | Cancel a draft, ready, or retryable in-progress task; does not satisfy its dependents |
 | `dependency add TASK PREDECESSOR` / `dependency remove TASK PREDECESSOR` | Change prerequisites of a draft or ready task |
 | `candidates` | List dependency-ready tasks in registration order without reserving them |
-| `supervise [--repo PATH] [--cmux EXE] [--claude EXE]` | Claim one task, run it in a cmux workspace, request exit once the receipt is in and Claude is idle, validate the receipt, and close the workspace on success. The checkout is the working directory unless `--repo` says otherwise |
+| `supervise [--parallel N] [--once] [--repo PATH] [--cmux EXE] [--claude EXE]` | Resident loop: claim dependency-ready tasks up to `N` (default 4), run each in its own cmux workspace, request exit once its receipt is in and Claude is idle, validate the receipt, close the workspace on success, and keep polling for new candidates (including tasks unblocked by `integrate`). `--once` exits when nothing is active or claimable. The checkout is the working directory unless `--repo` says otherwise |
 | `integrate ID [--repo PATH]` | Confirm that the task's awaiting run was merged into `main` (merge or fast-forward) and mark the task `completed`; checks the working directory's repository unless `--repo` says otherwise |
-| `status` | Show the supervisor lease and whether its heartbeat is stale |
-| `doctor` | Report the lease, unfinished runs, their wrapper/agent processes, heartbeats, and paths without changing state |
-| `recover RUN_ID` | Mark an unfinished run `interrupted` and drop the stale lease once its processes and supervisor are gone; keeps its worktree and workspace |
+| `status` | List live supervisors (by lease PID) and unfinished runs with their leases and heartbeat staleness |
+| `doctor` | Report every unfinished run with its lease, wrapper/agent processes, heartbeats, paths, and recovery blockers without changing state |
+| `recover RUN_ID` | Mark one unfinished run `interrupted` and drop its lease once its processes and supervisor are gone; keeps its worktree and workspace, and leaves other runs alone |
 
 Verification commands are shell lines that the supervisor runs in the worktree (`/bin/sh -c`) after the session exits; the agent is asked to run them too. Task descriptions and acceptance criteria are optional during registration.
 
-## Run one task with the supervisor
+## Run tasks with the supervisor
 
-Requires cmux and an authenticated Claude Code on PATH (or pass `--cmux` / `--claude`). Run the supervisor in a dedicated terminal inside the repository; it processes one task and exits.
+Requires cmux and an authenticated Claude Code on PATH (or pass `--cmux` / `--claude`). Run the supervisor in a dedicated terminal inside the repository; it stays resident and runs dependency-ready tasks as they appear, up to `--parallel` at once.
 
 ```sh
-cmux-taskq supervise
+cmux-taskq supervise --parallel 4
 ```
 
-The base commit is the repository's `refs/heads/main`, whichever worktree you start from; pass `--repo PATH` to use a checkout other than the working directory. Runtime files live next to the database in `runs/<run-id>/` (see `locate`'s `runs_dir`): the prompt, a snapshot of the runtime binary, the worktree on branch `taskq/<run-id>`, Claude's per-run settings and debug log, the idle marker, the receipt, and the final terminal screen. The workspace command starts a hidden `session` wrapper that launches Claude with the run ID as its session ID and reports heartbeats and the exit code.
+Every few seconds the supervisor looks for candidates and claims them until `--parallel` runs (default 4) are active. Each claim reads `refs/heads/main` again and uses it as the run's base commit, whichever worktree you start from, so a task released by `integrate` starts from the `main` that contains its predecessor; pass `--repo PATH` to use a checkout other than the working directory. Each run gets its own lease (`lease_acquired` / `lease_released` events), workspace, and worktree, and goes through the same state machine independently of the others. Runtime files live next to the database in `runs/<run-id>/` (see `locate`'s `runs_dir`): the prompt, a snapshot of the runtime binary, the worktree on branch `taskq/<run-id>`, Claude's per-run settings and debug log, the idle marker, the receipt, and the final terminal screen. The workspace command starts a hidden `session` wrapper that launches Claude with the run ID as its session ID and reports heartbeats and the exit code.
 
-Claude may wait for trust or permission prompts in the workspace; answer them there. A receipt does not end the session. Claude is started with a per-run `--settings` file whose `Stop` hook writes `<run-dir>/idle.json` each time a response finishes; once that marker is newer than the receipt, the supervisor records `session_idle_observed` and sends `/exit` to the workspace once (`exit_requested`). You can still send `/exit` yourself at any time, and you must if the hook is disabled or Claude is waiting on a prompt. If the session has not exited 120 seconds after the request, the supervisor records `exit_request_timed_out` and stops with an error, leaving the run `running` with its lease, workspace, and worktree intact for you to finish by hand. A nonzero exit code marks the run `failed`. With exit code 0 the supervisor validates the receipt: it must name this run, report `succeeded`, give evidence for passed checks and a reason for `not_applicable` ones, and its commit must be the clean head of the run branch on top of the base commit. The supervisor then reruns the task's verification commands in the worktree, logging each to `<run-dir>/verify-N.log`. A run that passes becomes `awaiting_integration` with its `result_commit` recorded; anything else becomes `failed` with the reason in `last_error`. Only an accepted run has its cmux workspace closed (`workspace_closed_at` is set once cmux confirms); its worktree and branch stay until integration. If the close fails, the run stays `awaiting_integration` with a `cleanup_failed` event and the error in `last_error`, and `workspace_closed_at` stays null so the workspace is not treated as cleaned. A failed run keeps its workspace, worktree, and branch. Then the lease is released. If provisioning or validation itself errors, the run, its lease, and any created resources are kept for inspection; check `show ID` and `status`.
+The loop ends in three ways. Ctrl-C (or SIGTERM) once stops claiming and waits for the active runs to finish; a second Ctrl-C terminates the process immediately and its leases go stale after 30 seconds. `--once` exits as soon as no run is active and no task is claimable, which suits a single batch or a test. A provisioning failure (worktree or workspace creation) is treated as an environment problem: the supervisor gives that run up, stops claiming, waits for its other runs, and exits with an error. The final JSON lists the runs that came to rest under `runs` and the runs it gave up under `errors`.
+
+Claude may wait for trust or permission prompts in each workspace; answer them there. A receipt does not end the session. Claude is started with a per-run `--settings` file whose `Stop` hook writes `<run-dir>/idle.json` each time a response finishes; once that marker is newer than the receipt, the supervisor records `session_idle_observed` and sends `/exit` to the workspace once (`exit_requested`). You can still send `/exit` yourself at any time, and you must if the hook is disabled or Claude is waiting on a prompt. If the session has not exited 120 seconds after the request, the supervisor records `exit_request_timed_out` and gives that run up (see below), leaving it `running` with its workspace and worktree intact for you to finish by hand while the other runs continue. A nonzero exit code marks the run `failed`. With exit code 0 the supervisor validates the receipt: it must name this run, report `succeeded`, give evidence for passed checks and a reason for `not_applicable` ones, and its commit must be the clean head of the run branch on top of the base commit. The supervisor then reruns the task's verification commands in the worktree, logging each to `<run-dir>/verify-N.log`. A run that passes becomes `awaiting_integration` with its `result_commit` recorded; anything else becomes `failed` with the reason in `last_error`. Only an accepted run has its cmux workspace closed (`workspace_closed_at` is set once cmux confirms); its worktree and branch stay until integration. If the close fails, the run stays `awaiting_integration` with a `cleanup_failed` event and the error in `last_error`, and `workspace_closed_at` stays null so the workspace is not treated as cleaned. A failed run keeps its workspace, worktree, and branch. A run that reached `awaiting_integration` or `failed` releases its lease.
+
+If something goes wrong around a run rather than in it (its wrapper stops heartbeating, the exit request times out, validation itself errors, or the close cannot be recorded), the supervisor gives that one run up: it records the cause in `last_error` and a `runtime_error` event, deletes the run's lease, and leaves its status, processes, workspace, and worktree untouched, then keeps serving the other runs. Such a run shows up in `doctor` without a lease. Nothing is rerun automatically.
 
 ## Recover an interrupted run
 
-If the supervisor is killed or loses its heartbeat, the run keeps the execution slot and its lease, and `supervise` refuses to start. Nothing is rerun automatically. Inspect first:
+A run is orphaned when its supervisor gave it up, was killed, or lost its heartbeat. The task stays `in_progress` and the run keeps its resources; other runs, and a supervisor still running them, are unaffected. Inspect first:
 
 ```sh
 cmux-taskq doctor
 ```
 
-`doctor` lists the lease (PID, whether it is alive, heartbeat age, stale after 30 seconds) and every run in `claimed`, `starting`, `running`, or `validating` with its workspace ID, whether its worktree and run directory exist, and each registered wrapper/agent process with its PID, liveness (`kill -0`), and heartbeat age. `blockers` names what would stop a recovery; `recoverable` is true when the list is empty. Stop the listed processes yourself, for example by exiting the session in its workspace.
+`doctor` lists the live supervisors (one per lease PID, with liveness, the runs it holds, and heartbeat staleness after 30 seconds) and every run in `claimed`, `starting`, `running`, or `validating` with its workspace ID, whether its worktree and run directory exist, its own lease (or `null`), and each registered wrapper/agent process with its PID, liveness (`kill -0`), and heartbeat age. `blockers` names what would stop a recovery of that run, considering only its own lease and processes; `recoverable` is true when the list is empty. Stop the listed processes yourself, for example by exiting the session in its workspace.
 
 ```sh
 cmux-taskq recover <run id>
 ```
 
-`recover` refuses while any process registered for the run is still alive, the lease heartbeat is fresh, or the supervisor PID is alive. Otherwise it marks the run `interrupted`, records a `run_recovered` event with the state it checked, and deletes the lease. The worktree, branch, and workspace are kept for inspection, and the task stays `in_progress`. To retry, make the task ready again with `ready ID` (or `draft ID` to edit it first); the next `supervise` creates a new run with its own worktree. The same applies to a task whose last run `failed`.
+`recover` refuses while any process registered for that run is still alive, its lease heartbeat is fresh, or its lease's supervisor PID is alive. Otherwise it marks the run `interrupted`, records a `run_recovered` event with the state it checked, and deletes that run's lease only. The worktree, branch, and workspace are kept for inspection, and the task stays `in_progress`. To retry, make the task ready again with `ready ID` (or `draft ID` to edit it first); a running supervisor (or the next one) creates a new run with its own worktree. The same applies to a task whose last run `failed`.
 
 The receipt is JSON at `<run-dir>/receipt.json`, written by atomic rename:
 
@@ -104,7 +108,7 @@ Review the run branch `taskq/<run-id>` and merge it into `main` yourself (merge 
 cmux-taskq integrate 1
 ```
 
-`integrate` checks with Git that the run's `result_commit` is an ancestor of `refs/heads/main`. If it is, the run becomes `integrated`, the task becomes `completed`, `run_integrated` and `task_status_changed` events are recorded, and tasks depending on it can appear in `candidates`. If it is not, the command prints `{"outcome": "not_integrated", ...}` with the current `main` commit and changes nothing; a squash merge or cherry-pick produces a different commit and is therefore not recognized. A task with no run awaiting integration is an error, so a task cannot be integrated twice.
+`integrate` checks with Git that the run's `result_commit` is an ancestor of `refs/heads/main`. If it is, the run becomes `integrated`, the task becomes `completed`, `run_integrated` and `task_status_changed` events are recorded, and tasks depending on it can appear in `candidates`; a running supervisor claims them on its next poll with the new `main` as their base. If it is not, the command prints `{"outcome": "not_integrated", ...}` with the current `main` commit and changes nothing; a squash merge or cherry-pick produces a different commit and is therefore not recognized. A task with no run awaiting integration is an error, so a task cannot be integrated twice.
 
 The check runs against the working directory's repository; pass `--repo PATH` to name another checkout, for example when using `--db` from elsewhere. Either way it must be the repository the queue is bound to: a queue resolved from the working directory is bound by `init`, a `--db` queue by its first `supervise`, and a mismatch is an error. The worktree and branch are left for you to remove.
 
@@ -123,8 +127,8 @@ The queue is the one of the repository you run Claude Code in, resolved by the b
 | Skill | Covers |
 | --- | --- |
 | `/claude-taskq:taskq` | Locate the binary and queue, `init`, register with `add` (description, acceptance, `--verify`, `--depends-on`), `ready`, `list` / `show` / `candidates` / `locate` / `status` / `doctor`, how to read run states |
-| `/claude-taskq:taskq-run` | Launch `supervise` in a dedicated cmux workspace whose `--cwd` is the repository, watch the run with `show`, judge completion from the run state and receipt rather than a Stop hook, review and `integrate` after the manual merge |
-| `/claude-taskq:taskq-recover` | `doctor`, `recover RUN_ID`, retry with `ready` |
+| `/claude-taskq:taskq-run` | Launch `supervise --parallel N` in a dedicated cmux workspace whose `--cwd` is the repository, watch runs with `show` and `status`, judge completion from the run state and receipt rather than a Stop hook, review and `integrate` after the manual merge |
+| `/claude-taskq:taskq-recover` | `doctor`, `recover RUN_ID` for one run without disturbing the others, retry with `ready` |
 
 Claude picks the skill from the request ("queue a task to …", "did task 3 finish?", "the supervisor died"). `claude plugin validate plugins/claude-taskq` checks the manifest and skills; `tests/plugin.rs` checks them and the launcher in `cargo test`.
 
@@ -137,7 +141,7 @@ cargo clippy --locked --all-targets -- -D warnings
 cargo llvm-cov --locked --fail-under-lines 80
 ```
 
-The tests use temporary databases and repositories, point `XDG_DATA_HOME` at temporary directories, and do not require cmux, Claude Code, or network access after dependencies have been fetched. Line coverage must stay at or above 80% (`cargo install cargo-llvm-cov`). The end-to-end happy path in `tests/e2e.rs` drives the real binary through cmux with a stub agent, resolving the queue from the disposable repository's working directory, and is ignored by default; run it with `cargo test --locked --test e2e -- --ignored` where cmux is available.
+The tests use temporary databases and repositories, point `XDG_DATA_HOME` at temporary directories, and do not require cmux, Claude Code, or network access after dependencies have been fetched. Line coverage must stay at or above 80% (`cargo install cargo-llvm-cov`). The end-to-end happy paths in `tests/e2e.rs` (one task, and two tasks in parallel followed by a dependent one) drive the real binary through cmux with a stub agent, resolving the queue from the disposable repository's working directory, and are ignored by default; run them with `cargo test --locked --test e2e -- --ignored` where cmux is available.
 
 ## Documentation
 
