@@ -5,9 +5,9 @@ title: Dogfooding: dependent tasks A then B
 status: planned
 created: 2026-09-22
 updated: 2026-09-22
-plan_step: 6
+plan_step: 9
 queue_task: null
-depends_on_journal: [12]
+depends_on_journal: [11]
 related:
   - plan-rust-runtime-mvp
 ---
@@ -16,9 +16,9 @@ related:
 
 ## Goal
 
-[plans/current.md](../plans/current.md) ステップ6。A → Bの依存taskを登録し、依存解放が統合確認に紐づくことを確認する。
+[plans/current.md](../plans/current.md) ステップ9。A → Bの依存taskと、依存のないCを登録し、依存解放が着地に紐づくこと、依存のないtask同士は並列に走ることを確認する。
 
-完了条件: Aの実行成功（`awaiting_integration`）だけではBが始まらず、Aの統合確認後にBがAの変更を含むmainから作られたworktreeで始まる。
+完了条件: AとCが同時に走り、Aの実行成功（`awaiting_integration`）だけではBが始まらず、Aの着地後にBがAの変更を含むmainから作られたworktreeで始まる。
 
 ## Log
 

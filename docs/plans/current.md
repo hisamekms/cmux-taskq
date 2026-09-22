@@ -86,6 +86,8 @@ receiptにはrun ID、結果、commit SHA、実施したunit test/E2E/subagent r
 
 ### 5. Claude Codeから使う薄いローカルpluginを作る
 
+状態: 実装済み（2026-09-22、[011](../journal/011-claude-code-plugin.md)）。`plugins/claude-taskq/` にlauncherと3つのskill（登録・確認 / 実行・統合 / 復旧）を置き、`claude --plugin-dir` で読み込んだセッションから登録と確認を実機確認した。実行・統合・復旧をClaude Codeから通す確認はステップ6で行い、その時点で完了にする。
+
 ローカルビルドしたバイナリとClaude Code pluginを接続する。skillはタスク登録、状態確認、実行開始の手順を提供し、エージェント向けに結果を読める形で返す。
 
 - バイナリの場所とバージョンを確認する。

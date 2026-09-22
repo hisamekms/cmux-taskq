@@ -30,10 +30,13 @@ tags:
 
 ## Open
 
-1. [010 failure path smoke](010-failure-path-smoke.md) — after 006, 009, 015。ステップ4の完了
-2. [011 Claude Code plugin](011-claude-code-plugin.md) — after 008。ステップ5
-3. [012 dogfood: independent task](012-dogfood-independent-task.md) — after 011。ここでopenなジャーナルをキューへ移行する
-4. [013 dogfood: dependent tasks](013-dogfood-dependent-tasks.md) — after 012
-5. [014 dogfood: failure and recovery](014-dogfood-failure-recovery.md) — after 013。ステップ6とM1の完了
+1. [016 queue per repository](016-queue-per-repository.md) — ステップ5
+2. [017 parallel runs](017-parallel-runs.md) — after 016。ステップ6
+3. [018 merge queue](018-merge-queue.md) — after 017。ステップ7
+4. [010 failure path smoke](010-failure-path-smoke.md) — after 006, 009, 015, 018。ステップ4の完了（並列とmerge queueを含む）
+5. [012 dogfood: independent task](012-dogfood-independent-task.md) — after 010。ここからドッグフーディング。openなジャーナルをキューへ移行する
+6. [019 replace interim workflow](019-replace-interim-workflow.md) — after 012。AGENTS.mdのSV/worker運用をcmux-taskq前提にし、このOpen節を消す
+7. [013 dogfood: dependent tasks](013-dogfood-dependent-tasks.md) — after 011
+8. [014 dogfood: failure and recovery](014-dogfood-failure-recovery.md) — after 013。ステップ9とM1の完了
 
 M2以降（Codex provider、配布、Python版からの移行）は[plans/current.md](../plans/current.md)のAfter first dogfoodingに留め、まだタスクに割らない。
