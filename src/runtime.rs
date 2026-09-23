@@ -1814,7 +1814,7 @@ pub fn prompt(
 }
 
 /// The initial prompt of the maintainer session that `up` opens in the
-/// `dagq <repo> maintainer` workspace. It names the queue and the roles,
+/// `[<repo>]dagq maintainer` workspace. It names the queue and the roles,
 /// points at the supervisor's logs, and asks for a first report through the
 /// plugin's `dagq-maintain` skill; the CLI itself is documented there, not
 /// here, so the prompt stays stable across skill revisions.

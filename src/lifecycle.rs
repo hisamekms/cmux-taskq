@@ -11,7 +11,7 @@
 //! outside cmux's process tree) before it writes the agent, or launchd would
 //! keep restarting a supervisor that fails its own preflight forever. Where
 //! that password is not configured, `up --in-cmux` starts the supervisor
-//! inside the cmux workspace `dagq <repo> supervisor` instead, with no
+//! inside the cmux workspace `[<repo>]dagq supervisor` instead, with no
 //! launchd involved and so nothing to restart it (ADR-0011).
 //!
 //! A supervisor is only reused while it runs this binary's own version.
@@ -86,7 +86,7 @@ workspace without launchd and without any automatic restart";
 #[derive(Debug, Clone)]
 pub struct UpOptions {
     pub parallel: u16,
-    /// Start the supervisor inside the cmux workspace `dagq <repo>
+    /// Start the supervisor inside the cmux workspace `[<repo>]dagq
     /// supervisor` instead of as a LaunchAgent: no launchd, no automatic
     /// restart, and no out-of-cmux preflight to pass.
     pub in_cmux: bool,
@@ -463,7 +463,7 @@ once `status` shows it gone",
 /// Refuse, before anything is stopped, when the name an in-cmux supervisor
 /// needs is held by a workspace this replacement will not close. `up`
 /// prunes a dead registration without closing its workspace and cmux keeps
-/// a workspace open after its command exits, so `dagq <repo> supervisor`
+/// a workspace open after its command exits, so `[<repo>]dagq supervisor`
 /// can be held by a crashed supervisor that is no longer registered at all.
 /// Finding that only after the drain would cost a working supervisor and
 /// leave the queue with nothing serving it.
@@ -555,7 +555,7 @@ fn start_under_launchd(
 /// no socket password is needed. Nothing restarts it either.
 ///
 /// cmux keeps a workspace open after its command exits, so a leftover
-/// `dagq <repo> supervisor` may belong to a supervisor that crashed, or to
+/// `[<repo>]dagq supervisor` may belong to a supervisor that crashed, or to
 /// one that is alive but no longer heartbeating (which `up` never reuses
 /// and never kills). Either way it is the maintainer's to close, and `up`
 /// stops rather than open a second one or interfere with the first.

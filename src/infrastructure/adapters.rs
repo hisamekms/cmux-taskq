@@ -890,16 +890,16 @@ pub fn run_workspace_description(run: &TaskRun) -> String {
     format!("run {}", run.id)
 }
 
-/// `dagq <repo> maintainer`: the one resident Claude session of a repository's queue.
+/// `[<repo>]dagq maintainer`: the one resident Claude session of a repository's queue.
 pub fn maintainer_workspace_name(repo_root: &Path) -> String {
-    format!("dagq {} maintainer", repository_name(repo_root))
+    format!("[{}]dagq maintainer", repository_name(repo_root))
 }
 
-/// `dagq <repo> supervisor`: the workspace `up --in-cmux` runs `supervise`
+/// `[<repo>]dagq supervisor`: the workspace `up --in-cmux` runs `supervise`
 /// in when launchd cannot reach cmux (ADR-0011). The launchd mode has no
 /// workspace at all.
 pub fn supervisor_workspace_name(repo_root: &Path) -> String {
-    format!("dagq {} supervisor", repository_name(repo_root))
+    format!("[{}]dagq supervisor", repository_name(repo_root))
 }
 
 fn repository_name(root: &Path) -> String {
@@ -1057,16 +1057,16 @@ mod tests {
         );
         assert_eq!(
             maintainer_workspace_name(Path::new("/home/u/ghq/dagq")),
-            "dagq dagq maintainer"
+            "[dagq]dagq maintainer"
         );
         // A root with no basename falls back to the path itself.
         assert_eq!(
             maintainer_workspace_name(Path::new("/")),
-            "dagq / maintainer"
+            "[/]dagq maintainer"
         );
         assert_eq!(
             supervisor_workspace_name(Path::new("/home/u/ghq/dagq")),
-            "dagq dagq supervisor"
+            "[dagq]dagq supervisor"
         );
     }
 

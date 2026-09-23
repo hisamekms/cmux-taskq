@@ -63,8 +63,9 @@ dagq up --in-cmux --claude ~/.local/bin/claude --plugin-dir <この repository>/
 ```
 
 - `--claude` を明示するのは、cmux の terminal の PATH では session ごとの shim（`$TMPDIR/cmux-cli-shims/<surface id>/claude`）が先に解決され、`up` がそれを supervisor の `--claude` に固定してしまうため。`up` は path を実体（`~/.local/share/claude/versions/<version>`）に解決して固定するので、Claude Code を更新したら `down --wait` → 同じ `up` で解決し直す
-- in-cmux mode に自動再起動はない。supervisor が止まったら `dagq dagq supervisor` workspace の画面を読んで閉じ、同じ `up` を打ち直す（`down --wait` は drain の後に workspace を閉じるところまで行う）
-- maintainer workspace は `dagq dagq maintainer`。maintainer session の中から `up` を打つと maintainer は `skipped`、生きている supervisor は `reused` になる
+- in-cmux mode に自動再起動はない。supervisor が止まったら `[dagq]dagq supervisor` workspace の画面を読んで閉じ、同じ `up` を打ち直す（`down --wait` は drain の後に workspace を閉じるところまで行う）
+- maintainer workspace は `[dagq]dagq maintainer`。maintainer session の中から `up` を打つと maintainer は `skipped`、生きている supervisor は `reused` になる
+- workspace 名は [ADR-0021](docs/adr/0021-maintainer-and-supervisor-workspace-names-follow-the-run-style.md) で旧書式 `dagq <repo> <role>` から `[<repo>]dagq <role>` に変わった。旧名のバイナリから入れ替えるときは、入れ替え前に旧名の maintainer workspace を `cmux workspace-action --workspace <id> --action rename --title "[dagq]dagq maintainer"` で改名するか閉じる（残すと maintainer session の外から打った `up` が 2 つ目の maintainer を作る）。supervisor は `down --wait`（`workspace_id` で旧名の workspace を閉じる）→ バイナリ入れ替え → `up --in-cmux` で済む
 - 操作は plugin の `dagq` / `dagq-maintain` / `dagq-recover` skill に従う。CLI の外で状態を持たず、DB は手で直さない（例外は無い。repository を移動したときの束縛の付け替えも `rebind` で行う。[ADR-0020](docs/adr/0020-rebind-queue-to-a-moved-repository.md)）。`cmux read-screen` は当面の一次情報として認める
 - バイナリは「作業中」のとおり固定した `~/.local/bin/dagq` だけを使う（`~/.local/bin` が PATH にあるので supervisor の起動でも同じものが動く）。キューは cwd から解決されるので、コマンドは repository の中（どの worktree でもよい）で実行する
 - runtime（`src/`）を変えた run は、`integrate` の前に receipt の `e2e` の evidence と run_dir の log を確認する。e2e は自分では再実行せず、evidence が無い・不十分なときだけ worker の session に差し戻す

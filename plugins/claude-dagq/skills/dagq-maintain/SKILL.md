@@ -23,7 +23,7 @@ Three roles share one queue:
 "$DAGQ" up --in-cmux --plugin-dir "$CLAUDE_PLUGIN_ROOT"       # no launchd; see the preflight failure below
 ```
 
-Always start the runtime through `up`; do not create a workspace for `supervise` yourself. `up` preflights cmux, Claude Code, the repository and an initialized queue (run `init` from the `dagq` skill first if the queue does not exist), deletes supervisor registrations whose process is dead (`pruned_supervisors`), keeps one supervisor resident as a launchd LaunchAgent, opens the maintainer's cmux workspace, and ends with a `doctor` summary. `--in-cmux` runs the supervisor in a cmux workspace named `dagq <repo> supervisor` instead of under launchd; use it only when the preflight below sends you there, because nothing restarts a supervisor started that way. Pass `--plugin-dir "$CLAUDE_PLUGIN_ROOT"` so the maintainer session it opens loads this plugin; add `--repo PATH` only for a checkout other than the working directory, and `--cmux EXE` / `--claude EXE` when those are not on PATH.
+Always start the runtime through `up`; do not create a workspace for `supervise` yourself. `up` preflights cmux, Claude Code, the repository and an initialized queue (run `init` from the `dagq` skill first if the queue does not exist), deletes supervisor registrations whose process is dead (`pruned_supervisors`), keeps one supervisor resident as a launchd LaunchAgent, opens the maintainer's cmux workspace, and ends with a `doctor` summary. `--in-cmux` runs the supervisor in a cmux workspace named `[<repo>]dagq supervisor` instead of under launchd; use it only when the preflight below sends you there, because nothing restarts a supervisor started that way. Pass `--plugin-dir "$CLAUDE_PLUGIN_ROOT"` so the maintainer session it opens loads this plugin; add `--repo PATH` only for a checkout other than the working directory, and `--cmux EXE` / `--claude EXE` when those are not on PATH.
 
 Read the result:
 
@@ -125,7 +125,7 @@ An error (exit status 1) before `main` moved puts the run back to its previous s
 A `needs_session` run is fixed by a Claude session in its own worktree, not by this session and not by hand. Take `worktree_path`, the run `id`, and `last_error` from `"$DAGQ" show ID --full` (plain `show` cuts a long `last_error` at 300 characters), then open a workspace that resumes the run's session (its session ID is the run ID):
 
 ```sh
-cmux workspace create --name "dagq resume <run-id>" --cwd "<worktree_path>" \
+cmux workspace create --name "[<repo>]dagq resume <run ID>" --cwd "<worktree_path>" \
   --command "claude --resume <run-id>"
 ```
 
@@ -143,7 +143,7 @@ Send it the reason from `last_error` and this instruction: rebase the branch ont
 
 Use plain `down` to end the day's work: the supervisor stops claiming, finishes its active runs and exits, and launchd does not restart it. Use `--wait` when the next step depends on it being gone (rebuilding or replacing the binary, a machine the user is about to shut down); it blocks while the runs drain, which can take as long as a run. Use `--force` only when the user accepts losing the active runs: their leases go stale after 30 seconds and the runs are then handled with the `dagq-recover` skill. The `outcome` is `draining` (plain `down`, which returns at once), `stopped` (`--wait`, the registration is gone), `killed` (`--force`), or `not_running` when no live supervisor was registered — a lingering agent is unloaded in that case too, and `--force` also drops the dead registrations. `down` never closes the maintainer workspace, and it does not stop the workers' own sessions.
 
-An `in_cmux` supervisor (`mode` in `status`) has no launchd agent to unload, so `down` sends it SIGINT instead and closes the `dagq <repo> supervisor` workspace it ran in once it has seen the stop through — after the drain with `--wait`, after the kill with `--force`. Plain `down` returns while that supervisor is still draining, so it leaves the workspace open and reports it under `supervisor_workspaces` as `left_open`; run `down --wait` (or have the user close it) before the next `up --in-cmux`, which refuses to open a second supervisor workspace over a leftover one.
+An `in_cmux` supervisor (`mode` in `status`) has no launchd agent to unload, so `down` sends it SIGINT instead and closes the `[<repo>]dagq supervisor` workspace it ran in once it has seen the stop through — after the drain with `--wait`, after the kill with `--force`. Plain `down` returns while that supervisor is still draining, so it leaves the workspace open and reports it under `supervisor_workspaces` as `left_open`; run `down --wait` (or have the user close it) before the next `up --in-cmux`, which refuses to open a second supervisor workspace over a leftover one.
 
 ## 8. Logs
 

@@ -1103,7 +1103,7 @@ fn up_starts_a_launchd_supervisor_that_status_lists_and_down_wait_stops_it() {
     let repo_name = repo.file_name().unwrap().to_str().unwrap();
     assert_eq!(
         first["maintainer"]["name"],
-        format!("dagq {repo_name} maintainer")
+        format!("[{repo_name}]dagq maintainer")
     );
     // launchd knows the agent, and the plist is what `up` described.
     assert!(
@@ -1228,7 +1228,7 @@ fn up_in_cmux_starts_a_supervisor_in_a_workspace_that_down_wait_stops_and_closes
     let repo_name = repo.file_name().unwrap().to_str().unwrap();
     assert_eq!(
         first["supervisor"]["name"],
-        format!("dagq {repo_name} supervisor")
+        format!("[{repo_name}]dagq supervisor")
     );
     let supervisor_workspace = first["supervisor"]["workspace_id"]
         .as_str()
