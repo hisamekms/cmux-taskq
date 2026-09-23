@@ -1956,15 +1956,16 @@ fn resume_request(
         ));
     }
     lines.push("3. Keep the worktree clean.".to_owned());
+    lines.push(format!("4. {STOP_BACKGROUND}"));
     lines.push(format!(
-        "4. Rewrite the receipt at {receipt} with the new head commit, writing a temporary file in the same directory and renaming it."
+        "5. Rewrite the receipt at {receipt} with the new head commit, writing a temporary file in the same directory and renaming it."
     ));
     lines.push(
-        "5. If the change is no longer needed, write the receipt with result failed and the reason in summary."
+        "6. If the change is no longer needed, write the receipt with result failed and the reason in summary."
             .to_owned(),
     );
     lines.push(
-        "6. Do not merge or push. When done, report briefly and stop; do not run /exit.".to_owned(),
+        "7. Do not merge or push. When done, report briefly and stop; do not run /exit.".to_owned(),
     );
     Ok(lines.join("\n"))
 }
@@ -3407,6 +3408,12 @@ pub fn siblings_in_progress(task: &Task, in_progress: Vec<Task>) -> Vec<Task> {
         .collect()
 }
 
+/// The line in the worker prompt and the resume request that asks the
+/// session to stop its own background work before the receipt: a leftover
+/// background shell makes Claude Code answer the supervisor's `/exit` with a
+/// confirmation screen, and the exit request times out.
+pub const STOP_BACKGROUND: &str = "Before writing the receipt, stop every background process you started (run_in_background shells, wait loops, watches); if any is left, /exit stops at a confirmation screen.";
+
 /// What a worker reads before it starts, and nothing more: everything else
 /// about its run is in the prompt, and reading the queue or the whole docs
 /// tree only delays the first commit (goal 11, decision 4).
@@ -3511,10 +3518,12 @@ pub fn prompt(
          You may write this receipt outside the worktree. Keep the worktree clean after committing.\n\
          The supervisor rejects the run unless the commit is the clean head of your branch on top of the base commit, and it reruns the verification commands itself.\n\
          When you need a decision you cannot make from the task and the repository, do not write the question to the terminal and wait: run `dagq ask --run {run_id} --kind worker_question --question '...'` in the worktree (one ask at a time, with everything you need decided in its question), report briefly that you asked, and stop. The answer arrives in this terminal as `answer to ask <id>: ...`; continue from it.\n\
+         {stop_background}\n\
          After submitting, report the outcome briefly and stop; do not run /exit yourself. Once you are idle the supervisor ends the session, and the maintainer can still send /exit. A receipt does not itself end the session.\n",
         task_id = task.id,
         run_id = run.id,
         reading = WORKER_READING,
+        stop_background = STOP_BACKGROUND,
         title = task.title,
         description = task.description,
         acceptance = task.acceptance,

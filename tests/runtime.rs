@@ -168,6 +168,8 @@ impl AgentProvider for TestProvider {
             "`dagq ask --run {} --kind worker_question --question '...'`",
             run.id
         )));
+        // Background work is stopped before the receipt, or /exit stalls.
+        assert!(prompt.contains(runtime::STOP_BACKGROUND), "{prompt}");
         let mut command = Command::new("/bin/sh");
         command
             .current_dir(run.worktree_path.as_ref().unwrap())
@@ -4430,6 +4432,7 @@ fn approved_needs_session_run_is_resumed_until_the_runtime_lands_it() {
             run.receipt_path.as_ref().unwrap()
         ),
         "result failed".to_owned(),
+        format!("4. {}", runtime::STOP_BACKGROUND),
         "Do not merge or push. When done, report briefly and stop; do not run /exit.".to_owned(),
     ] {
         assert!(text.contains(&expected), "{expected:?} not in {text}");
@@ -4516,6 +4519,7 @@ fn unapproved_resumed_run_returns_to_awaiting_integration() {
         "{text}"
     );
     assert!(!text.contains("git rebase"), "{text}");
+    assert!(text.contains(runtime::STOP_BACKGROUND), "{text}");
     // The maintainer is woken to review it again.
     let events = dagq::watch::events(&db, cursor, 100, false).unwrap();
     assert_eq!(events["events"][0]["kind"], "resume_finished", "{events}");
