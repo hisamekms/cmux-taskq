@@ -7,12 +7,28 @@ use dagq::infrastructure::sqlite::SqliteQueue;
 use serde_json::Value;
 
 fn invoke(db: &Path, args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_dagq"))
-        .arg("--db")
-        .arg(db)
-        .args(args)
-        .output()
-        .unwrap()
+    invoke_as(None, db, args)
+}
+
+/// Run with `DAGQ_ROLE` set to `role`, or unset: the tests do not inherit
+/// the role of the session running them.
+fn invoke_as(role: Option<&str>, db: &Path, args: &[&str]) -> Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_dagq"));
+    command.env_remove("DAGQ_ROLE");
+    if let Some(role) = role {
+        command.env("DAGQ_ROLE", role);
+    }
+    command.arg("--db").arg(db).args(args).output().unwrap()
+}
+
+fn ok_as(role: &str, db: &Path, args: &[&str]) -> Value {
+    let output = invoke_as(Some(role), db, args);
+    assert!(
+        output.status.success(),
+        "{args:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).unwrap()
 }
 
 fn ok(db: &Path, args: &[&str]) -> Value {
@@ -520,6 +536,213 @@ fn graph_reports_unfinished_dependencies_releases_and_the_critical_chain() {
     assert_eq!(ids, [1, 6]);
     assert_eq!(in_goal["candidates"], serde_json::json!([1]));
     assert_eq!(in_goal["critical"], serde_json::json!([1, 6]));
+}
+
+#[test]
+fn draft_goal_tasks_wait_for_goal_ready() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("queue.db");
+    ok(&db, &["init"]);
+    let goal = ok(&db, &["goal", "add", "proposal", "--draft"]);
+    assert_eq!(goal["status"], "draft");
+    let id = goal["id"].to_string();
+    ok(&db, &["add", "proposed", "--goal", &id]);
+    ok(&db, &["ready", "1"]);
+    assert_eq!(ok(&db, &["candidates"]), serde_json::json!([]));
+    assert_eq!(ok(&db, &["goal", "list"])[0]["status"], "draft");
+    assert_eq!(ok(&db, &["goal", "show", &id])["goal"]["status"], "draft");
+    let graph = ok(&db, &["graph"]);
+    assert_eq!(graph["tasks"][0]["goal_status"], "draft");
+    assert_eq!(graph["candidates"], serde_json::json!([]));
+
+    let opened = ok(&db, &["goal", "ready", &id]);
+    assert_eq!(opened["status"], "open");
+    let candidates = ok(&db, &["candidates"]);
+    assert_eq!(candidates[0]["id"], 1);
+    assert_eq!(ok(&db, &["graph"])["tasks"][0]["goal_status"], "open");
+    let again = invoke(&db, &["goal", "ready", &id]);
+    assert!(!again.status.success());
+    assert!(String::from_utf8_lossy(&again.stderr).contains("is not a draft"));
+    // A goal registered without --draft is open.
+    assert_eq!(ok(&db, &["goal", "add", "plain"])["status"], "open");
+}
+
+#[test]
+fn ready_tasks_of_a_draft_goal_do_not_raise_idle_slots() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("queue.db");
+    ok(&db, &["init"]);
+    SqliteQueue::open(&db)
+        .unwrap()
+        .register_supervisor("live", std::process::id(), 2, "0.0.1")
+        .unwrap();
+    let idle = |db: &Path| {
+        ok(db, &["stats"])["alerts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|alert| alert["kind"] == "idle_slots")
+    };
+    ok(&db, &["goal", "add", "proposal", "--draft"]);
+    ok(&db, &["add", "proposed", "--goal", "1"]);
+    ok(&db, &["ready", "1"]);
+    assert!(!idle(&db));
+    // A ready task blocked by a predecessor still raises it.
+    ok(&db, &["add", "first"]);
+    ok(&db, &["add", "blocked", "--depends-on", "2"]);
+    ok(&db, &["ready", "3"]);
+    assert!(idle(&db));
+}
+
+#[test]
+fn notes_are_observations_read_by_notes_show_and_goal_show() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("queue.db");
+    ok(&db, &["init"]);
+    ok(&db, &["goal", "add", "observed"]);
+    ok(&db, &["add", "task", "--goal", "1"]);
+    let on_goal = ok(&db, &["note", "--goal", "1", "--text", "goal is slow"]);
+    assert_eq!(on_goal["kind"], "observation");
+    assert_eq!(
+        on_goal["payload"],
+        serde_json::json!({"text": "goal is slow", "kind": "note", "by": "human"})
+    );
+    let on_task = ok_as(
+        "observer",
+        &db,
+        &[
+            "note",
+            "--task",
+            "1",
+            "--text",
+            "failed twice",
+            "--kind",
+            "retry",
+        ],
+    );
+    assert_eq!(on_task["task_id"], 1);
+    assert_eq!(on_task["payload"]["by"], "observer");
+    assert_eq!(on_task["payload"]["kind"], "retry");
+    assert!(
+        !invoke(&db, &["note", "--task", "1", "--goal", "1", "--text", "x"])
+            .status
+            .success()
+    );
+    assert!(!invoke(&db, &["note", "--text", "x"]).status.success());
+    assert!(
+        !invoke(&db, &["note", "--run", "missing", "--text", "x"])
+            .status
+            .success()
+    );
+    assert!(
+        !invoke(
+            &db,
+            &["note", "--goal", "1", "--text", "x", "--kind", "Bad Kind"]
+        )
+        .status
+        .success()
+    );
+
+    let notes = ok(&db, &["notes"]);
+    let texts = |page: &Value| {
+        page["notes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|n| n["payload"]["text"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(texts(&notes), ["goal is slow", "failed twice"]);
+    assert_eq!(notes["cursor"], on_task["id"]);
+    assert_eq!(texts(&ok(&db, &["notes", "--goal", "1"])).len(), 2);
+    assert_eq!(texts(&ok(&db, &["notes", "--task", "1"])), ["failed twice"]);
+    let since = on_goal["id"].to_string();
+    assert_eq!(
+        texts(&ok(&db, &["notes", "--since", &since, "--limit", "1"])),
+        ["failed twice"]
+    );
+
+    let shown = ok(&db, &["show", "1"]);
+    assert_eq!(shown["observations"][0]["text"], "failed twice");
+    assert_eq!(shown["observations"][0]["by"], "observer");
+    let goal = ok(&db, &["goal", "show", "1"]);
+    assert_eq!(
+        goal["observations"],
+        serde_json::json!([{"id": on_goal["id"], "created_at": on_goal["created_at"],
+                            "text": "goal is slow", "kind": "note", "by": "human"}])
+    );
+}
+
+#[test]
+fn observer_may_note_and_propose_but_not_change_queue_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("queue.db");
+    ok(&db, &["init"]);
+    ok(&db, &["goal", "add", "open goal"]);
+    ok(&db, &["add", "existing", "--goal", "1"]);
+    let denied = |args: &[&str]| {
+        let output = invoke_as(Some("observer"), &db, args);
+        assert!(!output.status.success(), "{args:?} was allowed");
+        let error: Value = serde_json::from_slice(&output.stderr).unwrap();
+        assert_eq!(
+            error,
+            serde_json::json!({"error": "observer may not change queue state"}),
+            "{args:?}"
+        );
+    };
+    for args in [
+        &["ready", "1"][..],
+        &["draft", "1"],
+        &["cancel", "1"],
+        &["integrate", "1"],
+        &["integrate", "--next"],
+        &["recover", "run"],
+        &["goal", "close", "1", "--verdict", "abandoned"],
+        &["goal", "ready", "1"],
+        &["goal", "edit", "1", "--title", "x"],
+        &["goal", "add", "not a draft"],
+        &["add", "loose"],
+        &["add", "into open goal", "--goal", "1"],
+        &["set-goal", "1", "--none"],
+        &["dependency", "add", "1", "1"],
+        &["init"],
+        &["review", "1"],
+        &["down"],
+    ] {
+        denied(args);
+    }
+
+    // Reads, notes, a draft goal and draft tasks in it are allowed.
+    for args in [
+        &["list"][..],
+        &["show", "1"],
+        &["candidates"],
+        &["graph"],
+        &["status"],
+        &["events"],
+        &["stats"],
+        &["doctor"],
+        &["goal", "list"],
+        &["goal", "show", "1"],
+        &["notes"],
+    ] {
+        ok_as("observer", &db, args);
+    }
+    ok_as("observer", &db, &["note", "--goal", "1", "--text", "seen"]);
+    let draft = ok_as("observer", &db, &["goal", "add", "proposal", "--draft"]);
+    assert_eq!(draft["status"], "draft");
+    let task = ok_as(
+        "observer",
+        &db,
+        &["add", "proposed", "--goal", "2", "--depends-on", "1"],
+    );
+    assert_eq!(task["status"], "draft");
+    // The observer cannot adopt its own proposal; the planner does.
+    denied(&["goal", "ready", "2"]);
+    ok(&db, &["goal", "ready", "2"]);
+    denied(&["add", "after adoption", "--goal", "2"]);
+    // Other roles are not restricted.
+    ok_as("planner", &db, &["add", "planned"]);
 }
 
 mod stats {

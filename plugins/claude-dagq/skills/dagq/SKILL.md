@@ -1,6 +1,6 @@
 ---
 name: dagq
-description: Register and inspect dagq goals and tasks through the locally built dagq binary. Use when the user brings a development problem to queue for dagq (register it as a goal, decompose it into tasks with title, description, acceptance criteria, verification commands, dependencies and context), make tasks ready, list goals or tasks, check a goal's progress or a task's status or run result, close a goal after reviewing its tasks' receipts and follow_ups, or find the dagq binary and queue database.
+description: Register and inspect dagq goals and tasks through the locally built dagq binary. Use when the user brings a development problem to queue for dagq (register it as a goal, decompose it into tasks with title, description, acceptance criteria, verification commands, dependencies and context), make tasks ready, list goals or tasks, check a goal's progress or a task's status or run result, close a goal after reviewing its tasks' receipts and follow_ups, adopt or reject a draft goal, record or read notes (observations), or find the dagq binary and queue database.
 ---
 
 # dagq: register and inspect tasks
@@ -39,7 +39,7 @@ Collect from the user, asking only for what is missing: title (the problem, one 
 "$DAGQ" goal add "TITLE" --description "..." --acceptance "..." --constraints "..." --doc docs/adr/NNNN-name.md
 ```
 
-A goal has no state machine and no verification commands; a goal-level check belongs in a final task that depends on all the others.
+A goal has no verification commands; a goal-level check belongs in a final task that depends on all the others. Its one state is draft or open: `goal add --draft` registers a proposal whose tasks are never claimed, even when `ready`. Adopt it with `goal ready ID` (its ready tasks become candidates), or reject it with `goal close ID --verdict abandoned`. Decide with the user; observer drafts cite their notes.
 
 ### Register the tasks
 
@@ -63,6 +63,7 @@ A one-shot task omits `--goal`. `add` registers a `draft`; `ready` makes it runn
 - `"$DAGQ" list`: one page of unfinished tasks, newest first, as `{"tasks", "next", "total"}`. More pages exist only when `next` is not null; then pass `--before NEXT` with the same filters. Filters: `--status`, `--all`, `--goal ID`.
 - `"$DAGQ" show ID`: the task, its dependencies, the latest run and the latest 10 events.
 - `"$DAGQ" graph [--goal ID]`: unfinished tasks with what they wait for and how many they release; `critical` is the chain that holds back the most work, and `candidates` the order the supervisor claims in. Use it to decide what to make `ready` next.
+- `"$DAGQ" notes [--goal ID] [--task ID] [--since CURSOR]`: notes (`observation` events) oldest first; `note --task ID | --run RUN_ID | --goal ID --text "..." [--kind SLUG]` records one. `show` and `goal show` list the latest 5.
 - `"$DAGQ" stats [--since CURSOR] [--goal ID]`: where time goes per run and goal (work, validation, waiting to land) and `alerts` over thresholds; pass `next_cursor` to `--since` for only newer runs.
 
 `show`, `goal show` and `doctor` are compact: long texts are cut to 300 characters ending in `…` with `truncated: true`. Add `--full` only for the whole text, every run, every event payload (a receipt) or `run_dir`. Field lists and statuses are in `reference/inspect.md`.

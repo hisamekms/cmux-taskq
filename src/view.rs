@@ -6,12 +6,14 @@
 
 use serde_json::{Map, Value, json};
 
-use crate::domain::{GoalDetail, RunEvent, TaskDetail};
+use crate::domain::{GoalDetail, OBSERVATION_KIND, RunEvent, TaskDetail};
 
 /// Characters a long text field keeps before `…`.
 pub const TEXT_LIMIT: usize = 300;
 /// Latest events a compact view keeps unless told otherwise.
 pub const DEFAULT_EVENTS: usize = 10;
+/// Latest notes (`observation` events) a compact view lists in full.
+pub const DEFAULT_OBSERVATIONS: usize = 5;
 /// Payload keys a compact event keeps: what happened, not where.
 const EVENT_GIST: [&str; 5] = ["status", "reason", "last_error", "from", "to"];
 
@@ -98,8 +100,32 @@ pub fn task_detail(detail: &TaskDetail, events: usize) -> Value {
         "runs_total": detail.runs.len(),
         "events": events,
         "events_total": detail.events.len(),
+        "observations": observations(&detail.events),
         "processes": processes,
     })
+}
+
+/// The latest [`DEFAULT_OBSERVATIONS`] notes among `events`, oldest first,
+/// with their text cut to [`TEXT_LIMIT`].
+fn observations(events: &[RunEvent]) -> Vec<Value> {
+    let notes: Vec<&RunEvent> = events
+        .iter()
+        .filter(|event| event.kind == OBSERVATION_KIND)
+        .collect();
+    latest(&notes, DEFAULT_OBSERVATIONS)
+        .iter()
+        .map(|event| {
+            let mut note = pick(&object(event), &["id", "created_at"]);
+            if let Some(run_id) = &event.run_id {
+                note.insert("run_id".into(), json!(run_id));
+            }
+            if let Value::Object(payload) = &event.payload {
+                note.extend(pick(payload, &["text", "kind", "by"]));
+            }
+            truncate_fields(&mut note, &["text"]);
+            Value::Object(note)
+        })
+        .collect()
 }
 
 fn event_gist(event: &RunEvent) -> Value {
@@ -135,6 +161,7 @@ pub fn goal_detail(detail: &GoalDetail) -> Value {
         "tasks": detail.tasks,
         "events": events,
         "events_total": detail.events.len(),
+        "observations": observations(&detail.events),
     })
 }
 
@@ -290,6 +317,7 @@ mod tests {
                 acceptance: "a".into(),
                 constraints: "c".repeat(TEXT_LIMIT + 1),
                 doc: None,
+                status: crate::domain::GoalStatus::Draft,
                 closed_at: None,
                 verdict: None,
                 created_at: "c".into(),
@@ -315,5 +343,37 @@ mod tests {
         let events = view["events"].as_array().unwrap();
         assert_eq!(events.len(), DEFAULT_EVENTS);
         assert_eq!(events[0], json!({"kind": "kind2", "created_at": "t2"}));
+    }
+
+    #[test]
+    fn views_list_the_latest_notes_with_their_text() {
+        let note = |id: i64, text: &str| RunEvent {
+            kind: OBSERVATION_KIND.into(),
+            ..event(id, json!({"text": text, "kind": "stall", "by": "observer"}))
+        };
+        let mut events: Vec<RunEvent> = (1..=7).map(|id| note(id, "slow")).collect();
+        events.push(event(8, json!({})));
+        events.push(RunEvent {
+            run_id: None,
+            ..note(9, &"n".repeat(TEXT_LIMIT + 1))
+        });
+        let detail = TaskDetail {
+            task: task("short"),
+            dependencies: vec![],
+            runs: vec![],
+            events,
+            processes: vec![],
+        };
+        let view = task_detail(&detail, 1);
+        let notes = view["observations"].as_array().unwrap();
+        assert_eq!(notes.len(), DEFAULT_OBSERVATIONS);
+        assert_eq!(
+            notes[0],
+            json!({"id": 4, "created_at": "t4", "run_id": "b",
+                   "text": "slow", "kind": "stall", "by": "observer"})
+        );
+        assert_eq!(notes[4]["truncated"], true);
+        assert!(notes[4].get("run_id").is_none());
+        assert!(notes[4]["text"].as_str().unwrap().ends_with('…'));
     }
 }

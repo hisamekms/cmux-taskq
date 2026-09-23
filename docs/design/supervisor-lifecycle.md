@@ -357,7 +357,7 @@ attentionイベントの判定は`domain::event_attention(kind, payload)`（候�
   - `ask_unanswered`: `ask_opened`から60分答えられていないask（ADR-0022。`ask_answered`とはpayloadの`ask_id`（無ければ`id`）とrun・taskで対にする）
   - `task_failed`: 同じtaskのrunの`failed`が合わせて2回。回数はpageに関係なく全runで数え、`run_id`はその最後に失敗したrunで、そのrunが対象に入るときに出す（`--since`で2回目だけが新しくても出る）
   - `work_over_median`: `work`がそのgoal（goalの無いrunはgoalの無いrun同士）の中央値の2倍を超えたrun
-  - `idle_slots`: staleでないsupervisorの`parallel`の合計から実行中（`integrating`以外の未完了）runを引いた空きslotがあるのに、candidatesがゼロで`ready`のtaskが残っている（依存で詰まっている）。`value`は空きslot数で、`task_id` / `run_id`はnull。readyのtaskが無い空のqueueは詰まりではないので出さない。`stats`を読んだ時点のsnapshotで判定し、時間帯の履歴は持たない
+  - `idle_slots`: staleでないsupervisorの`parallel`の合計から実行中（`integrating`以外の未完了）runを引いた空きslotがあるのに、candidatesがゼロで`ready`のtaskが残っている（依存で詰まっている）。`value`は空きslot数で、`task_id` / `run_id`はnull。readyのtaskが無い空のqueueは詰まりではないので出さない。draftのgoalに属するreadyのtaskは`goal ready`を待っているだけなので数えない。`stats`を読んだ時点のsnapshotで判定し、時間帯の履歴は持たない
   - `backend_failures`: 同じwindowの`backend_call_failed`が2件以上。`value`は件数、`task_id` / `run_id`はnull
 - **`backend_failures`**: `{count, by_op, max_load_avg, max_slots}`。`backend_call_failed`の件数、`op`ごとの件数、記録された`load_avg`の最大（無ければnull）、`slots`の最大（無ければnull）。windowは`--since`があればcursorより後から`next_cursor`まで、無ければ対象のrunの最初のイベントのうち最も古いもの以降（`--full`か対象のrunが無ければ全件）。`--goal`はそのgoalのrunの失敗だけを数える（runの無い失敗は数えない）
 

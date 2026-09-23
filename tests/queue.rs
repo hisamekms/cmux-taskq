@@ -4,8 +4,8 @@ use dagq::{
     VERSION,
     application::{StatusFilter, TaskQuery, TaskStore},
     domain::{
-        ClaimOutcome, GoalEdit, GoalVerdict, NewGoal, NewTask, Provider, RunStatus, SupervisorMode,
-        TaskAction, TaskStatus,
+        ClaimOutcome, GoalEdit, GoalStatus, GoalVerdict, NewGoal, NewNote, NewTask, NotePage,
+        NoteQuery, NoteTarget, Provider, RunStatus, SupervisorMode, TaskAction, TaskStatus,
     },
     infrastructure::sqlite::SqliteQueue,
 };
@@ -33,6 +33,7 @@ fn new_goal(title: &str) -> NewGoal {
         acceptance: "Every task landed and the feature works end to end".into(),
         constraints: "Keep the module boundary".into(),
         doc: Some("docs/adr/0009-goal-groups-tasks.md".into()),
+        draft: false,
     }
 }
 
@@ -887,10 +888,11 @@ fn migration_from_v6_adds_goals_and_keeps_tasks_runs_and_events() {
     drop(raw);
     let mut queue = SqliteQueue::open(&path).unwrap();
     // 0007 (supervisors), 0008 (goals), 0009 (supervisor mode), 0010
-    // (supervisor binary version), 0011 (session workspaces) and 0012
-    // (queue-level backend failures) are applied together.
-    assert_eq!(SqliteQueue::SCHEMA_VERSION, 12);
-    assert_eq!(queue.schema_version().unwrap(), 12);
+    // (supervisor binary version), 0011 (session workspaces), 0012
+    // (queue-level backend failures) and 0013 (goal draft) are applied
+    // together.
+    assert_eq!(SqliteQueue::SCHEMA_VERSION, 13);
+    assert_eq!(queue.schema_version().unwrap(), 13);
     assert_eq!(
         queue
             .session_workspace(dagq::domain::SessionRole::Maintainer)
@@ -962,6 +964,229 @@ fn migration_from_v6_adds_goals_and_keeps_tasks_runs_and_events() {
         raw.execute("UPDATE goals SET verdict='achieved' WHERE id=1", [])
             .is_err()
     );
+}
+
+#[test]
+fn goals_of_a_version_12_queue_migrate_as_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("v12.db");
+    let raw = Connection::open(&path).unwrap();
+    for migration in [
+        include_str!("../migrations/0001_queue.sql"),
+        include_str!("../migrations/0002_supervisor.sql"),
+        include_str!("../migrations/0003_workspace_close.sql"),
+        include_str!("../migrations/0004_integration.sql"),
+        include_str!("../migrations/0005_run_leases.sql"),
+        include_str!("../migrations/0006_merge_queue.sql"),
+        include_str!("../migrations/0007_supervisors.sql"),
+        include_str!("../migrations/0008_goals.sql"),
+        include_str!("../migrations/0009_supervisor_mode.sql"),
+        include_str!("../migrations/0010_supervisor_binary_version.sql"),
+        include_str!("../migrations/0011_session_workspaces.sql"),
+        include_str!("../migrations/0012_queue_events.sql"),
+    ] {
+        raw.execute_batch(migration).unwrap();
+    }
+    raw.pragma_update(None, "application_id", 0x43545131)
+        .unwrap();
+    raw.pragma_update(None, "user_version", 12).unwrap();
+    raw.execute_batch(
+        "INSERT INTO goals(title) VALUES ('existing');
+         INSERT INTO tasks(title,description,acceptance,verification_commands,status,goal_id)
+         VALUES ('in goal','','','[]','ready',1);",
+    )
+    .unwrap();
+    drop(raw);
+    let mut queue = SqliteQueue::open(&path).unwrap();
+    assert_eq!(queue.schema_version().unwrap(), 13);
+    let goal = queue.show_goal(1).unwrap().goal;
+    assert_eq!(goal.status, GoalStatus::Open);
+    assert_eq!(queue.list_goals().unwrap()[0].status, GoalStatus::Open);
+    assert_eq!(queue.candidates().unwrap()[0].id, 1);
+    let raw = Connection::open(&path).unwrap();
+    assert!(
+        raw.execute("UPDATE goals SET status='closed' WHERE id=1", [])
+            .is_err()
+    );
+}
+
+#[test]
+fn draft_goal_tasks_are_not_candidates_until_the_goal_is_ready() {
+    let (dir, mut queue) = fixture();
+    let draft = queue
+        .add_goal(NewGoal {
+            draft: true,
+            ..new_goal("proposal")
+        })
+        .unwrap();
+    assert_eq!(draft.status, GoalStatus::Draft);
+    let task = queue
+        .add(NewTask {
+            goal_id: Some(draft.id),
+            ..new_task("proposed")
+        })
+        .unwrap();
+    let plain = queue.add(new_task("plain")).unwrap();
+    queue.transition(task.id, TaskAction::Ready).unwrap();
+    queue.transition(plain.id, TaskAction::Ready).unwrap();
+    let ids = |queue: &SqliteQueue| {
+        queue
+            .candidates()
+            .unwrap()
+            .iter()
+            .map(|t| t.id)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(ids(&queue), [plain.id]);
+    let graph = queue.graph_input().unwrap();
+    assert_eq!(graph.candidates, [plain.id]);
+    assert_eq!(graph.tasks[0].goal_status, Some(GoalStatus::Draft));
+    assert_eq!(graph.tasks[1].goal_status, None);
+    // The supervisor's claim skips the draft goal's task as well.
+    let claimed = match queue.claim(BASE).unwrap() {
+        ClaimOutcome::Claimed { run } => run.task_id,
+        ClaimOutcome::NoReadyTask => panic!("plain task is claimable"),
+    };
+    assert_eq!(claimed, plain.id);
+    assert!(matches!(
+        queue.claim(BASE).unwrap(),
+        ClaimOutcome::NoReadyTask
+    ));
+
+    let opened = queue.ready_goal(draft.id).unwrap();
+    assert_eq!(opened.status, GoalStatus::Open);
+    assert_eq!(ids(&queue), [task.id]);
+    let events = queue.show_goal(draft.id).unwrap().events;
+    assert_eq!(events.last().unwrap().kind, "goal_status_changed");
+    assert_eq!(
+        events.last().unwrap().payload,
+        serde_json::json!({"from": "draft", "to": "open"})
+    );
+    assert_eq!(
+        queue.ready_goal(draft.id).unwrap_err().to_string(),
+        format!("goal {} is not a draft", draft.id)
+    );
+    assert!(queue.ready_goal(99).is_err());
+    let abandoned = queue
+        .add_goal(NewGoal {
+            draft: true,
+            ..new_goal("rejected")
+        })
+        .unwrap();
+    queue
+        .close_goal(abandoned.id, GoalVerdict::Abandoned)
+        .unwrap();
+    assert!(queue.ready_goal(abandoned.id).is_err());
+    drop(dir);
+}
+
+#[test]
+fn notes_attach_to_tasks_runs_and_goals_and_page_by_cursor() {
+    let (_dir, mut queue) = fixture();
+    let goal = queue.add_goal(new_goal("observed")).unwrap();
+    let task = queue
+        .add(NewTask {
+            goal_id: Some(goal.id),
+            ..new_task("in goal")
+        })
+        .unwrap();
+    let other = queue.add(new_task("elsewhere")).unwrap();
+    queue.transition(task.id, TaskAction::Ready).unwrap();
+    let run = match queue.claim(BASE).unwrap() {
+        ClaimOutcome::Claimed { run } => run,
+        ClaimOutcome::NoReadyTask => panic!("task is claimable"),
+    };
+    let note = |target: NoteTarget, text: &str| NewNote {
+        target,
+        text: text.into(),
+        kind: None,
+        by: "observer".into(),
+    };
+    let on_goal = queue
+        .add_note(note(NoteTarget::Goal(goal.id), "goal note"))
+        .unwrap();
+    assert_eq!(on_goal.kind, "observation");
+    assert_eq!(on_goal.goal_id, Some(goal.id));
+    assert_eq!(on_goal.task_id, None);
+    assert_eq!(
+        on_goal.payload,
+        serde_json::json!({"text": "goal note", "kind": "note", "by": "observer"})
+    );
+    let on_run = queue
+        .add_note(NewNote {
+            kind: Some("slow".into()),
+            ..note(NoteTarget::Run(run.id.clone()), "run note")
+        })
+        .unwrap();
+    assert_eq!(on_run.task_id, Some(task.id));
+    assert_eq!(on_run.run_id.as_deref(), Some(run.id.as_str()));
+    let on_other = queue
+        .add_note(note(NoteTarget::Task(other.id), "other note"))
+        .unwrap();
+    assert!(
+        queue
+            .add_note(note(NoteTarget::Run("missing".into()), "x"))
+            .is_err()
+    );
+    assert!(queue.add_note(note(NoteTarget::Task(99), "x")).is_err());
+    assert!(queue.add_note(note(NoteTarget::Goal(99), "x")).is_err());
+    assert!(
+        queue
+            .add_note(note(NoteTarget::Goal(goal.id), " "))
+            .is_err()
+    );
+
+    let ids = |page: &NotePage| page.notes.iter().map(|n| n.id).collect::<Vec<_>>();
+    let all = queue
+        .notes(&NoteQuery {
+            limit: 10,
+            ..NoteQuery::default()
+        })
+        .unwrap();
+    assert_eq!(ids(&all), [on_goal.id, on_run.id, on_other.id]);
+    assert_eq!(all.cursor, on_other.id);
+    let latest = queue
+        .notes(&NoteQuery {
+            limit: 2,
+            ..NoteQuery::default()
+        })
+        .unwrap();
+    assert_eq!(ids(&latest), [on_run.id, on_other.id]);
+    let in_goal = queue
+        .notes(&NoteQuery {
+            goal_id: Some(goal.id),
+            limit: 10,
+            ..NoteQuery::default()
+        })
+        .unwrap();
+    assert_eq!(ids(&in_goal), [on_goal.id, on_run.id]);
+    let of_task = queue
+        .notes(&NoteQuery {
+            task_id: Some(task.id),
+            limit: 10,
+            ..NoteQuery::default()
+        })
+        .unwrap();
+    assert_eq!(ids(&of_task), [on_run.id]);
+    let after = queue
+        .notes(&NoteQuery {
+            since: Some(on_goal.id),
+            limit: 1,
+            ..NoteQuery::default()
+        })
+        .unwrap();
+    assert_eq!(ids(&after), [on_run.id]);
+    assert_eq!(after.cursor, on_run.id);
+    let none = queue
+        .notes(&NoteQuery {
+            since: Some(on_other.id),
+            limit: 1,
+            ..NoteQuery::default()
+        })
+        .unwrap();
+    assert!(none.notes.is_empty());
+    assert_eq!(none.cursor, on_other.id);
+    assert!(queue.notes(&NoteQuery::default()).is_err());
 }
 
 #[test]

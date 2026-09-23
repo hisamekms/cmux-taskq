@@ -66,17 +66,29 @@ string_enum!(SupervisorMode {
 // The part a cmux workspace plays for a queue, carried in its `DAGQ_ROLE`
 // environment variable and its description (ADR-0026). `Planner` and `Inbox`
 // are named here for the sessions `up` is to open later; no workspace of
-// theirs exists yet.
+// theirs exists yet. `Observer` is the periodic job of ADR-0024: it has no
+// workspace, and the CLI refuses queue changes from its environment.
 string_enum!(SessionRole {
     Maintainer => "maintainer",
     Supervisor => "supervisor",
     Worker => "worker",
     Planner => "planner",
     Inbox => "inbox",
+    Observer => "observer",
 });
 
-// How a goal was closed. A goal has no state machine: it is open until one
-// close records the verdict, and its progress derives from its tasks.
+// Whether a goal's tasks may run (ADR-0024 decision 5). A `draft` goal is a
+// proposal, typically the observer's: its tasks are not candidates until
+// `goal ready` opens it. Existing goals are `open`. Closing is independent
+// and recorded in the verdict.
+string_enum!(GoalStatus {
+    Draft => "draft",
+    Open => "open",
+});
+
+// How a goal was closed. Apart from draft/open, a goal has no state machine:
+// it is open until one close records the verdict, and its progress derives
+// from its tasks.
 string_enum!(GoalVerdict {
     Achieved => "achieved",
     Abandoned => "abandoned",
@@ -163,6 +175,14 @@ pub enum DomainError {
     FollowUpsNotArray,
     /// The run has no run directory yet.
     MissingRunDirectory,
+    /// `goal ready` on a goal that is not a draft.
+    GoalNotDraft {
+        goal_id: i64,
+    },
+    /// A note kind that is not a lowercase slug.
+    InvalidNoteKind {
+        kind: String,
+    },
 }
 
 impl fmt::Display for DomainError {
@@ -227,6 +247,11 @@ impl fmt::Display for DomainError {
             ),
             Self::FollowUpsNotArray => f.write_str("receipt follow_ups must be an array"),
             Self::MissingRunDirectory => f.write_str("missing run directory"),
+            Self::GoalNotDraft { goal_id } => write!(f, "goal {goal_id} is not a draft"),
+            Self::InvalidNoteKind { kind } => write!(
+                f,
+                "note kind {kind:?} must be a slug of lowercase letters, digits, '-' and '_'"
+            ),
         }
     }
 }
@@ -375,6 +400,7 @@ pub struct Goal {
     pub acceptance: String,
     pub constraints: String,
     pub doc: Option<String>,
+    pub status: GoalStatus,
     pub closed_at: Option<String>,
     pub verdict: Option<GoalVerdict>,
     pub created_at: String,
@@ -385,6 +411,22 @@ impl Goal {
     pub fn is_closed(&self) -> bool {
         self.closed_at.is_some()
     }
+
+    /// An unclosed draft: the only goal `goal ready` opens.
+    pub fn is_draft(&self) -> bool {
+        self.status == GoalStatus::Draft && !self.is_closed()
+    }
+
+    /// `goal ready` takes a draft that is not closed.
+    pub fn check_ready(&self) -> Result<(), DomainError> {
+        require(!self.is_closed(), || DomainError::GoalAlreadyClosed {
+            goal_id: self.id,
+            verdict: self.verdict,
+        })?;
+        require(self.status == GoalStatus::Draft, || {
+            DomainError::GoalNotDraft { goal_id: self.id }
+        })
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -394,6 +436,8 @@ pub struct NewGoal {
     pub acceptance: String,
     pub constraints: String,
     pub doc: Option<String>,
+    /// Register the goal as a draft whose tasks are not candidates.
+    pub draft: bool,
 }
 
 impl NewGoal {
@@ -478,6 +522,7 @@ impl TaskStatusCounts {
 pub struct GoalSummary {
     pub id: i64,
     pub title: String,
+    pub status: GoalStatus,
     pub closed: bool,
     pub verdict: Option<GoalVerdict>,
     pub tasks: TaskStatusCounts,
@@ -597,6 +642,78 @@ pub struct RunEvent {
     pub kind: String,
     pub payload: serde_json::Value,
     pub created_at: String,
+}
+
+/// Run event kind of a note (ADR-0024 decision 4): a free-form observation
+/// attached to a task, a run or a goal, with payload `{text, kind, by}`.
+pub const OBSERVATION_KIND: &str = "observation";
+/// `kind` of a note registered without one.
+pub const DEFAULT_NOTE_KIND: &str = "note";
+
+/// What a note is attached to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NoteTarget {
+    Task(i64),
+    Run(String),
+    Goal(i64),
+}
+
+/// A note to record as an `observation` run event.
+#[derive(Debug, Clone)]
+pub struct NewNote {
+    pub target: NoteTarget,
+    pub text: String,
+    /// A lowercase slug classifying the note; [`DEFAULT_NOTE_KIND`] when absent.
+    pub kind: Option<String>,
+    /// `DAGQ_ROLE` of the writer, or `human`.
+    pub by: String,
+}
+
+impl NewNote {
+    pub fn validate(&self) -> Result<(), DomainError> {
+        require(!self.text.trim().is_empty(), || DomainError::Blank {
+            field: "note text",
+        })?;
+        if let Some(kind) = &self.kind {
+            require(
+                !kind.is_empty()
+                    && kind.len() <= 64
+                    && kind.bytes().all(|b| {
+                        b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_'
+                    }),
+                || DomainError::InvalidNoteKind { kind: kind.clone() },
+            )?;
+        }
+        Ok(())
+    }
+
+    /// The payload of the `observation` event.
+    pub fn payload(&self) -> serde_json::Value {
+        serde_json::json!({
+            "text": self.text,
+            "kind": self.kind.as_deref().unwrap_or(DEFAULT_NOTE_KIND),
+            "by": self.by,
+        })
+    }
+}
+
+/// Which notes `notes` lists: past `since` (oldest first), or the latest
+/// `limit` without it, narrowed to a goal (its own notes and those of its
+/// tasks and their runs) and/or a task (its own and its runs').
+#[derive(Debug, Clone, Default)]
+pub struct NoteQuery {
+    pub goal_id: Option<i64>,
+    pub task_id: Option<i64>,
+    pub since: Option<i64>,
+    pub limit: usize,
+}
+
+/// One page of `notes`, oldest first; `cursor` is the last note's event id
+/// (or `since` when the page is empty), to pass back as `--since`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NotePage {
+    pub notes: Vec<RunEvent>,
+    pub cursor: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -835,11 +952,64 @@ mod tests {
             acceptance: String::new(),
             constraints: String::new(),
             doc: None,
+            status: GoalStatus::Open,
             closed_at: verdict.map(|_| "2026-09-23T00:00:00Z".into()),
             verdict,
             created_at: String::new(),
             updated_at: String::new(),
         }
+    }
+
+    #[test]
+    fn only_an_unclosed_draft_goal_becomes_ready() {
+        let draft = Goal {
+            status: GoalStatus::Draft,
+            ..goal(None)
+        };
+        assert!(draft.is_draft());
+        draft.check_ready().unwrap();
+        assert_eq!(
+            goal(None).check_ready().unwrap_err().to_string(),
+            "goal 7 is not a draft"
+        );
+        let closed = Goal {
+            status: GoalStatus::Draft,
+            ..goal(Some(GoalVerdict::Abandoned))
+        };
+        assert!(!closed.is_draft());
+        assert_eq!(
+            closed.check_ready().unwrap_err().to_string(),
+            "goal 7 is already closed as abandoned"
+        );
+    }
+
+    #[test]
+    fn a_note_needs_text_and_a_slug_kind() {
+        let note = |text: &str, kind: Option<&str>| NewNote {
+            target: NoteTarget::Goal(1),
+            text: text.into(),
+            kind: kind.map(Into::into),
+            by: "human".into(),
+        };
+        note("x", None).validate().unwrap();
+        note("x", Some("slow-land_2")).validate().unwrap();
+        assert_eq!(
+            note(" ", None).validate().unwrap_err().to_string(),
+            "note text must not be blank"
+        );
+        for kind in ["", "Upper", "a b", &"k".repeat(65)] {
+            assert!(
+                matches!(
+                    note("x", Some(kind)).validate(),
+                    Err(DomainError::InvalidNoteKind { .. })
+                ),
+                "{kind}"
+            );
+        }
+        assert_eq!(
+            note("x", None).payload(),
+            serde_json::json!({"text": "x", "kind": "note", "by": "human"})
+        );
     }
 
     #[test]

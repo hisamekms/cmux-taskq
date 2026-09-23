@@ -3,8 +3,9 @@
 use anyhow::Result;
 
 use crate::domain::{
-    ClaimOutcome, Goal, GoalDetail, GoalEdit, GoalSummary, GoalVerdict, NewGoal, NewTask,
-    Predecessor, RunStatus, Task, TaskAction, TaskDetail, TaskStatus,
+    ClaimOutcome, Goal, GoalDetail, GoalEdit, GoalStatus, GoalSummary, GoalVerdict, NewGoal,
+    NewNote, NewTask, NotePage, NoteQuery, Predecessor, RunEvent, RunStatus, Task, TaskAction,
+    TaskDetail, TaskStatus,
 };
 
 /// Which task statuses `list` returns.
@@ -127,6 +128,8 @@ pub struct GraphTask {
     pub status: TaskStatus,
     pub title: String,
     pub goal_id: Option<i64>,
+    /// Status of the task's goal; a draft goal's tasks are not candidates.
+    pub goal_status: Option<GoalStatus>,
     /// IDs of the direct predecessors, ascending.
     pub depends_on: Vec<i64>,
 }
@@ -146,6 +149,9 @@ pub struct GraphNode {
     pub status: TaskStatus,
     pub title: String,
     pub goal_id: Option<i64>,
+    /// Status of the task's goal, present only for a task in a goal.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub goal_status: Option<GoalStatus>,
     /// Every direct predecessor, ascending.
     pub depends_on: Vec<i64>,
     /// Unfinished tasks that depend on this one directly, ascending.
@@ -249,6 +255,7 @@ pub fn dependency_graph(input: GraphInput, goal_id: Option<i64>) -> DependencyGr
             status: task.status,
             title: task.title,
             goal_id: task.goal_id,
+            goal_status: task.goal_status,
             depends_on: task.depends_on,
         })
         .collect();
@@ -289,6 +296,12 @@ pub trait TaskStore {
     fn close_goal(&mut self, goal_id: i64, verdict: GoalVerdict) -> Result<Goal>;
     /// Move a draft or ready task to an open goal, or to none.
     fn set_goal(&mut self, task_id: i64, goal_id: Option<i64>) -> Result<Task>;
+    /// Open a draft goal so its tasks become candidates (ADR-0024 decision 5).
+    fn ready_goal(&mut self, goal_id: i64) -> Result<Goal>;
+    /// Record a note as an `observation` run event on its task, run or goal.
+    fn add_note(&mut self, note: NewNote) -> Result<RunEvent>;
+    /// One page of notes, oldest first.
+    fn notes(&self, query: &NoteQuery) -> Result<NotePage>;
 }
 
 /// Provider-specific CLI construction is kept outside supervisor orchestration.
@@ -463,6 +476,7 @@ mod tests {
             },
             title: format!("task {id}"),
             goal_id,
+            goal_status: goal_id.map(|_| GoalStatus::Open),
             depends_on: depends_on.to_vec(),
         }
     }

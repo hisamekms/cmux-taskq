@@ -2771,6 +2771,15 @@ pub fn stats(db: &Path, query: &crate::domain::stats::StatsQuery) -> Result<Valu
             ..Default::default()
         })?
         .total;
+    // A draft goal's ready tasks wait for `goal ready`, not for a
+    // predecessor, so they do not make free slots an alert.
+    let ready_in_draft_goals: usize = queue
+        .list_goals()?
+        .iter()
+        .filter(|goal| goal.status == crate::domain::GoalStatus::Draft)
+        .map(|goal| goal.tasks.ready)
+        .sum();
+    let ready = ready.saturating_sub(ready_in_draft_goals);
     let snapshot = SlotSnapshot {
         free_slots: slots - i64::try_from(executing)?,
         candidates: queue.candidates()?.len(),

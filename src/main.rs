@@ -10,13 +10,16 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use serde_json::{Value, json};
 
 use dagq::{
     application::{StatusFilter, TaskQuery, TaskStore, dependency_graph},
-    domain::{GoalEdit, GoalVerdict, NewGoal, NewTask, TaskAction, TaskStatus},
+    domain::{
+        GoalEdit, GoalVerdict, NewGoal, NewNote, NewTask, NoteQuery, NoteTarget, TaskAction,
+        TaskStatus,
+    },
     infrastructure::{adapters::path_text, location::QueueLocation, sqlite::SqliteQueue},
 };
 
@@ -118,7 +121,37 @@ enum Command {
         #[arg(long)]
         none: bool,
     },
-    /// List ready tasks whose prerequisites are all completed; does not claim.
+    /// Record a note (an `observation` run event) on a task, a run or a goal.
+    #[command(group = clap::ArgGroup::new("target").required(true))]
+    Note {
+        #[arg(long, group = "target")]
+        task: Option<i64>,
+        #[arg(long, group = "target")]
+        run: Option<String>,
+        #[arg(long, group = "target")]
+        goal: Option<i64>,
+        #[arg(long)]
+        text: String,
+        /// Lowercase slug classifying the note (default: note).
+        #[arg(long)]
+        kind: Option<String>,
+    },
+    /// List notes oldest first: the latest --limit, or the next --limit after --since.
+    /// Prints {"notes", "cursor"}; pass `cursor` to --since for the notes recorded later.
+    Notes {
+        /// Only notes on this goal and on its tasks and their runs.
+        #[arg(long = "goal")]
+        goal_id: Option<i64>,
+        /// Only notes on this task and its runs.
+        #[arg(long = "task")]
+        task_id: Option<i64>,
+        /// Event id (a previous `cursor`): only notes recorded after it.
+        #[arg(long)]
+        since: Option<i64>,
+        #[arg(long, default_value_t = 20, value_parser = clap::value_parser!(u32).range(1..))]
+        limit: u32,
+    },
+    /// List ready tasks whose prerequisites are all completed and whose goal is not a draft; does not claim.
     Candidates,
     /// Show the unfinished tasks' dependencies: per task its direct predecessors (`depends_on`),
     /// the unfinished ones (`ready_after`), the tasks it blocks directly and how many it
@@ -304,8 +337,13 @@ enum GoalCommand {
         /// Path of a reference document inside the repository.
         #[arg(long)]
         doc: Option<String>,
+        /// Register a draft: its tasks are not candidates until `goal ready`.
+        #[arg(long)]
+        draft: bool,
     },
-    /// List goals with their task counts by status.
+    /// Open a draft goal so the supervisor may claim its ready tasks.
+    Ready { id: i64 },
+    /// List goals with their status and task counts by status.
     List,
     /// Show a goal, its tasks, and the kinds of its latest 10 events; long
     /// texts are cut to 300 characters (ending in `…`, with `truncated: true`).
@@ -339,7 +377,59 @@ enum GoalCommand {
     },
 }
 
+/// The error of a command the observer may not run.
+const OBSERVER_DENIED: &str = "observer may not change queue state";
+
+/// What the observer's environment may run (ADR-0024 decision 4).
+#[derive(Debug, PartialEq, Eq)]
+enum ObserverAccess {
+    Allowed,
+    Denied,
+    /// `add` into this goal, allowed only while it is a draft.
+    DraftGoal(i64),
+}
+
+/// An allowlist: reads, notes, draft goals and tasks of a draft goal. Every
+/// other command, including ones added later, is refused until listed here.
+fn observer_access(command: &Command) -> ObserverAccess {
+    match command {
+        Command::Locate
+        | Command::List { .. }
+        | Command::Show { .. }
+        | Command::Candidates
+        | Command::Graph { .. }
+        | Command::Status
+        | Command::Events { .. }
+        | Command::Watch { .. }
+        | Command::Stats { .. }
+        | Command::Doctor { .. }
+        | Command::Note { .. }
+        | Command::Notes { .. }
+        | Command::Goal {
+            command:
+                GoalCommand::List | GoalCommand::Show { .. } | GoalCommand::Add { draft: true, .. },
+        } => ObserverAccess::Allowed,
+        Command::Add {
+            goal_id: Some(goal_id),
+            ..
+        } => ObserverAccess::DraftGoal(*goal_id),
+        _ => ObserverAccess::Denied,
+    }
+}
+
 fn execute(cli: Cli) -> Result<Value> {
+    let role = env::var(dagq::lifecycle::ROLE_ENV)
+        .ok()
+        .filter(|role| !role.is_empty());
+    let observer = role.as_deref() == Some(dagq::lifecycle::OBSERVER_ROLE);
+    let access = if observer {
+        observer_access(&cli.command)
+    } else {
+        ObserverAccess::Allowed
+    };
+    if access == ObserverAccess::Denied {
+        bail!(OBSERVER_DENIED);
+    }
     let cwd = env::current_dir().context("working directory is unavailable")?;
     let location = QueueLocation::resolve(cli.db.as_deref(), &cwd)?;
     let db = location.db.clone();
@@ -378,6 +468,11 @@ fn execute(cli: Cli) -> Result<Value> {
     let mut queue = SqliteQueue::open(&db)?;
     if let Some(common_dir) = &common_dir {
         queue.assert_repository(common_dir)?;
+    }
+    if let ObserverAccess::DraftGoal(goal_id) = access
+        && !queue.show_goal(goal_id)?.goal.is_draft()
+    {
+        bail!(OBSERVER_DENIED);
     }
     Ok(match cli.command {
         Command::Init | Command::Locate | Command::Rebind { .. } => unreachable!(),
@@ -457,13 +552,16 @@ fn execute(cli: Cli) -> Result<Value> {
                 acceptance,
                 constraints,
                 doc,
+                draft,
             } => serde_json::to_value(queue.add_goal(NewGoal {
                 title,
                 description,
                 acceptance,
                 constraints,
                 doc,
+                draft,
             })?)?,
+            GoalCommand::Ready { id } => serde_json::to_value(queue.ready_goal(id)?)?,
             GoalCommand::List => serde_json::to_value(queue.list_goals()?)?,
             GoalCommand::Show { id, full } => {
                 let detail = queue.show_goal(id)?;
@@ -499,6 +597,36 @@ fn execute(cli: Cli) -> Result<Value> {
             goal,
             none: _,
         } => serde_json::to_value(queue.set_goal(task, goal)?)?,
+        Command::Note {
+            task,
+            run,
+            goal,
+            text,
+            kind,
+        } => {
+            let target = match (task, run, goal) {
+                (Some(task), _, _) => NoteTarget::Task(task),
+                (_, Some(run), _) => NoteTarget::Run(run),
+                (_, _, goal) => NoteTarget::Goal(goal.context("note needs a target")?),
+            };
+            serde_json::to_value(queue.add_note(NewNote {
+                target,
+                text,
+                kind,
+                by: role.unwrap_or_else(|| "human".into()),
+            })?)?
+        }
+        Command::Notes {
+            goal_id,
+            task_id,
+            since,
+            limit,
+        } => serde_json::to_value(queue.notes(&NoteQuery {
+            goal_id,
+            task_id,
+            since,
+            limit: usize::try_from(limit)?,
+        })?)?,
         Command::Candidates => serde_json::to_value(queue.candidates()?)?,
         Command::Graph { goal_id } => {
             serde_json::to_value(dependency_graph(queue.graph_input()?, goal_id))?

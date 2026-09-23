@@ -66,6 +66,10 @@ pub const PLANNER_ROLE: &str = SessionRole::Planner.as_str();
 /// `DAGQ_ROLE` of the session where a person answers the maintainer's asks.
 /// `up` is to open it in a later goal; no workspace of it exists yet.
 pub const INBOX_ROLE: &str = SessionRole::Inbox.as_str();
+/// `DAGQ_ROLE` of the periodic observer job (ADR-0024 decision 4). The CLI
+/// refuses every command that changes queue state from this environment,
+/// except notes, draft goals and the draft tasks of a draft goal.
+pub const OBSERVER_ROLE: &str = SessionRole::Observer.as_str();
 /// File under the queue's log directory that launchd appends the
 /// supervisor's stdout and stderr to.
 pub const LAUNCHD_LOG_NAME: &str = "launchd.log";

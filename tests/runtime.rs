@@ -2628,6 +2628,7 @@ fn review_writes_the_run_material_to_review_md_and_returns_only_its_size() {
             acceptance: "goal acceptance".into(),
             constraints: "goal constraints".into(),
             doc: None,
+            draft: false,
         })
         .unwrap();
     queue.set_goal(1, Some(goal.id)).unwrap();
@@ -3131,6 +3132,7 @@ fn prompt_describes_the_goal_and_the_context_and_keeps_one_shape_without_them() 
             acceptance: "goal acceptance".into(),
             constraints: "goal constraints".into(),
             doc: Some("docs/plans/goal.md".into()),
+            draft: false,
         })
         .unwrap();
     fs::write(repo.join("unrelated.md"), "not read\n").unwrap();
@@ -5669,6 +5671,7 @@ fn integrate_registers_the_landed_follow_ups_as_draft_tasks_of_the_goal_once() {
             acceptance: "done".into(),
             constraints: String::new(),
             doc: None,
+            draft: false,
         })
         .unwrap();
     queue.set_goal(1, Some(goal.id)).unwrap();

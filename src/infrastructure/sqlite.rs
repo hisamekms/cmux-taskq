@@ -19,9 +19,10 @@ use crate::{
         TaskStore,
     },
     domain::{
-        ClaimOutcome, DomainError, Goal, GoalDetail, GoalEdit, GoalSummary, GoalTask, GoalVerdict,
-        NewGoal, NewTask, Predecessor, RunEvent, Task, TaskAction, TaskDetail, TaskRun, TaskStatus,
-        TaskStatusCounts, validate_base_commit,
+        ClaimOutcome, DomainError, Goal, GoalDetail, GoalEdit, GoalStatus, GoalSummary, GoalTask,
+        GoalVerdict, NewGoal, NewNote, NewTask, NotePage, NoteQuery, NoteTarget, OBSERVATION_KIND,
+        Predecessor, RunEvent, Task, TaskAction, TaskDetail, TaskRun, TaskStatus, TaskStatusCounts,
+        validate_base_commit,
     },
     infrastructure::location::runs_dir,
 };
@@ -40,10 +41,16 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../../migrations/0010_supervisor_binary_version.sql"),
     include_str!("../../migrations/0011_session_workspaces.sql"),
     include_str!("../../migrations/0012_queue_events.sql"),
+    include_str!("../../migrations/0013_goal_draft.sql"),
 ];
+/// Ready tasks whose predecessors are completed, that own no unfinished run
+/// and whose goal, if any, is not a draft (ADR-0024 decision 5).
 const READY_QUERY: &str = "
     SELECT t.* FROM tasks t
     WHERE t.status = 'ready'
+      AND NOT EXISTS (
+        SELECT 1 FROM goals g WHERE g.id = t.goal_id AND g.status = 'draft'
+      )
       AND NOT EXISTS (
         SELECT 1 FROM task_dependencies d JOIN tasks p ON p.id = d.predecessor_id
         WHERE d.task_id = t.id AND p.status <> 'completed'
@@ -394,10 +401,15 @@ impl TaskStore for SqliteQueue {
         let tasks = tasks
             .into_iter()
             .map(|task| {
+                let goal_status = task
+                    .goal_id
+                    .map(|goal_id| read_goal(&tx, goal_id).map(|goal| goal.status))
+                    .transpose()?;
                 Ok(GraphTask {
                     depends_on: dependencies
                         .query_map([task.id], |r| r.get(0))?
                         .collect::<rusqlite::Result<_>>()?,
+                    goal_status,
                     id: task.id,
                     status: task.status,
                     title: task.title,
@@ -465,13 +477,20 @@ impl TaskStore for SqliteQueue {
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         tx.execute(
-            "INSERT INTO goals(title, description, acceptance, constraints, doc) VALUES (?1,?2,?3,?4,?5)",
+            "INSERT INTO goals(title, description, acceptance, constraints, doc, status)
+             VALUES (?1,?2,?3,?4,?5,?6)",
             params![
                 goal.title,
                 goal.description,
                 goal.acceptance,
                 goal.constraints,
-                goal.doc.filter(|d| !d.trim().is_empty())
+                goal.doc.filter(|d| !d.trim().is_empty()),
+                if goal.draft {
+                    GoalStatus::Draft
+                } else {
+                    GoalStatus::Open
+                }
+                .as_str()
             ],
         )?;
         let id = tx.last_insert_rowid();
@@ -492,6 +511,7 @@ impl TaskStore for SqliteQueue {
             .map(|goal| {
                 Ok(GoalSummary {
                     id: goal.id,
+                    status: goal.status,
                     closed: goal.is_closed(),
                     verdict: goal.verdict,
                     tasks: task_counts(&self.conn, goal.id)?,
@@ -578,6 +598,102 @@ impl TaskStore for SqliteQueue {
         let result = read_goal(&tx, goal_id)?;
         tx.commit()?;
         Ok(result)
+    }
+
+    fn ready_goal(&mut self, goal_id: i64) -> Result<Goal> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        read_goal(&tx, goal_id)?.check_ready()?;
+        tx.execute(
+            "UPDATE goals SET status='open', updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+             WHERE id=?1",
+            [goal_id],
+        )?;
+        goal_event(
+            &tx,
+            goal_id,
+            "goal_status_changed",
+            json!({"from": GoalStatus::Draft, "to": GoalStatus::Open}),
+        )?;
+        let result = read_goal(&tx, goal_id)?;
+        tx.commit()?;
+        Ok(result)
+    }
+
+    fn add_note(&mut self, note: NewNote) -> Result<RunEvent> {
+        note.validate()?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let payload = note.payload();
+        match &note.target {
+            NoteTarget::Task(task_id) => {
+                read_task(&tx, *task_id)?;
+                event(&tx, *task_id, None, OBSERVATION_KIND, payload)?;
+            }
+            NoteTarget::Run(run_id) => {
+                let task_id: i64 = tx
+                    .query_row("SELECT task_id FROM task_runs WHERE id=?1", [run_id], |r| {
+                        r.get(0)
+                    })
+                    .optional()?
+                    .with_context(|| format!("run {run_id} does not exist"))?;
+                event(&tx, task_id, Some(run_id), OBSERVATION_KIND, payload)?;
+            }
+            NoteTarget::Goal(goal_id) => {
+                read_goal(&tx, *goal_id)?;
+                goal_event(&tx, *goal_id, OBSERVATION_KIND, payload)?;
+            }
+        }
+        let result = tx.query_row(
+            "SELECT * FROM run_events WHERE id=?1",
+            [tx.last_insert_rowid()],
+            event_row,
+        )?;
+        tx.commit()?;
+        Ok(result)
+    }
+
+    fn notes(&self, query: &NoteQuery) -> Result<NotePage> {
+        ensure!(query.limit > 0, "limit must be at least 1");
+        let mut filters = vec!["kind = ?".to_owned()];
+        let mut values = vec![Value::from(OBSERVATION_KIND.to_owned())];
+        if let Some(goal_id) = query.goal_id {
+            filters.push(
+                "(goal_id = ? OR task_id IN (SELECT id FROM tasks WHERE goal_id = ?))".into(),
+            );
+            values.extend([Value::from(goal_id), Value::from(goal_id)]);
+        }
+        if let Some(task_id) = query.task_id {
+            filters.push("task_id = ?".into());
+            values.push(Value::from(task_id));
+        }
+        // Past a cursor the page runs forward from it; without one it is
+        // the latest `limit` notes. Either way it is printed oldest first.
+        let order = if let Some(since) = query.since {
+            filters.push("id > ?".into());
+            values.push(Value::from(since));
+            "ASC"
+        } else {
+            "DESC"
+        };
+        values.push(Value::from(i64::try_from(query.limit)?));
+        let mut notes: Vec<RunEvent> = self
+            .conn
+            .prepare(&format!(
+                "SELECT * FROM run_events WHERE {} ORDER BY id {order} LIMIT ?",
+                filters.join(" AND ")
+            ))?
+            .query_map(params_from_iter(&values), event_row)?
+            .collect::<rusqlite::Result<_>>()?;
+        notes.sort_by_key(|note| note.id);
+        let cursor = notes
+            .last()
+            .map(|note| note.id)
+            .or(query.since)
+            .unwrap_or(0);
+        Ok(NotePage { notes, cursor })
     }
 
     fn set_goal(&mut self, task_id: i64, goal_id: Option<i64>) -> Result<Task> {
@@ -829,6 +945,7 @@ fn goal_row(row: &Row<'_>) -> rusqlite::Result<Goal> {
         acceptance: row.get("acceptance")?,
         constraints: row.get("constraints")?,
         doc: row.get("doc")?,
+        status: enum_col(row, "status")?,
         closed_at: row.get("closed_at")?,
         verdict: verdict
             .map(|_| enum_col::<GoalVerdict>(row, "verdict"))
