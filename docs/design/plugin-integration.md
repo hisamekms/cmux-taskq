@@ -11,6 +11,7 @@ related:
   - adr-0005
   - adr-0006
   - adr-0010
+  - adr-0016
 ---
 
 # Claude Code and Codex plugin integration
@@ -77,6 +78,14 @@ plugins/claude-dagq/
 ```
 
 [ADR-0010](../adr/0010-maintainer-and-resident-supervisor.md)は、maintainerが使うCLIの手順（起動・監視・レビュー・着地・停止）をskill `dagq-maintain`に集め、AGENTS.mdにはrepository固有の注意だけを残すことを決めた。task 16で`taskq-run`を廃し、その内容を現在の`dagq-maintain`にあたるskillへ移し、AGENTS.mdからCLIのコマンド表を落としてcold startを`dagq up`の1行にした。maintainerの初期promptはruntimeが生成し（[supervisor-lifecycle](supervisor-lifecycle.md#maintainer-prompt)）、`dagq-maintain` skillで`status`と`doctor`を見るよう指示する。
+
+### 起き直しhookとskill分割（ADR-0016で決定、goal 6のtaskで実装予定）
+
+[ADR-0016](../adr/0016-maintainer-notification-and-compact-output.md)で、上の「hook・agent・MCPは持たない」を改めることを決めた。未実装。
+
+- pluginは`SessionStart` hook（matcher `compact` / `clear`）を持ち、`DAGQ_ROLE=maintainer`の時だけ`dagq status`を出力してmaintainerの起き直しを自動化する。worker（runtimeが`--settings`で渡す`Stop` hookとは別）と他のsessionでは何も出力しない。
+- `dagq-maintain` skillを役割ごとに分割し、コマンドの詳細やJSONの読み方などの参照情報は`reference/`に置いて必要な時だけ読む。
+- maintainer skillは`status`から始め、`watch --after <cursor>`をbackgroundで回して終了で起き、attentionを報告して承認を待つ。レビューは`review ID`の`review.md`のpathをsubagentに渡して結論だけ受け取る。既定出力は圧縮され、全文が要る時だけ`--full`を付ける。
 
 ### launcher
 

@@ -1,5 +1,5 @@
 ---
-id: adr-0014
+id: adr-0015
 type: adr
 title: cmux-taskqをdagqに改名する
 status: accepted
@@ -16,7 +16,7 @@ related:
   - adr-0006
 ---
 
-# ADR-0014: cmux-taskqをdagqに改名する
+# ADR-0015: cmux-taskqをdagqに改名する
 
 ## Context
 
@@ -62,7 +62,7 @@ repository・crate・バイナリ・plugin・skill・環境変数・データデ
 - エラー文・ログ・コメント・ドキュメントの「cmux-taskq」は「dagq」に、「cmux-taskq queue」は「dagq queue」に置き換える。説明文の「cmuxとGit worktreeで動く」は事実なので残す。
 - SQLiteのschemaとAPPLICATION_IDは変えない。migrationを足さない。バイナリ名と環境変数が変わるbreaking changeなのでversionだけ0.2.0に上げる。
 - 互換shimは作らない。旧環境変数の読み取り、旧データディレクトリの探索、旧branch接頭辞の認識のいずれも実装しない。利用者はこのrepositoryだけで、切り替えはmaintainerが手で行う。
-- `docs/journal/`と既存ADR（0001〜0013）は凍結なので旧名のまま触らない。旧名を書くのはこのADR-0014だけ。
+- `docs/journal/`と既存ADR（0001〜0013）は凍結なので旧名のまま触らない。旧名を書くのはこのADR-0015だけ。
 
 ## Alternatives
 
@@ -87,7 +87,7 @@ goal 4の全taskがmainに着地してから行う。
      "UPDATE queue_repository SET git_common_dir='<新しいcommon directoryのpath>' WHERE singleton=1;"
    ```
 
-   rebind用のサブコマンドを足すなら別taskにする。この切り替えは一度きりなので、ADR-0014ではruntimeを変えない。
+   rebind用のサブコマンドを足すなら別taskにする。この切り替えは一度きりなので、ADR-0015ではruntimeを変えない。
 5. 旧LaunchAgent`com.cmux-taskq.<旧hash>`のplistを`~/Library/LaunchAgents`から外す（`launchctl bootout`してからplistを削除）。
 6. `~/.local/bin/cmux-taskq`を`~/.local/bin/dagq`に置き換える。固定バイナリの更新はAGENTS.mdの規則どおり、maintainerがユーザーに報告してから行う。
 7. pluginを入れ直す。`claude plugin marketplace add hisamekms/dagq`と`claude plugin install claude-dagq@dagq`。旧`claude-taskq@cmux-taskq`とその marketplace は外す。

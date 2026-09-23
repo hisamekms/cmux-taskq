@@ -18,6 +18,7 @@ related:
   - adr-0011
   - adr-0012
   - adr-0014
+  - adr-0016
   - design-persistence
   - design-provider-lifecycle
   - design-plugin-integration
@@ -101,6 +102,17 @@ cmux workspaceの名前は複数repositoryで同じcmuxを使うためrepository
 ### Maintainer prompt
 
 `src/runtime.rs`の`maintainer_prompt(db, log_dir)`がworker promptの隣で生成する。内容: この queue（db path）のmaintainer sessionであること、役割名の1行（supervisor / maintainer / worker）、supervisorのlog dir、dagq pluginの`dagq-maintain` skillで`status`と`doctor`を確認し、staleなsupervisor・未完了run・`awaiting_integration`・`needs_session`を報告してユーザーの指示を待つこと、skillが無ければそう報告すること、queue DBを直接触らずCLIだけを使うこと。CLIの手順はpromptに書かずskillに置くので、skillを変えてもpromptは変わらない。
+
+### Maintainerへの通知（ADR-0016で決定、goal 6のtaskで実装予定）
+
+[ADR-0016](../adr/0016-maintainer-notification-and-compact-output.md)で次を決めた。未実装で、現在の接点は上の初期promptだけ。
+
+- maintainerは状態を持たない使い捨てのsessionで、compaction・`/clear`・再起動からの起き直しは`status`の1コマンドで行う。`status`はsupervisorの健全性、未完了run、attention、次のcursorを上限のある大きさで返す。
+- `watch --after <cursor>`はcursorより後のattentionイベントかsupervisor健全性の変化までblockし、attentionと新しいcursorを返して終わる。maintainerはこれをbackgroundで走らせて終了で起きる。`doctor`は診断専用で、pollingには使わない。
+- attentionはrun_eventsのkind（公開契約。既存のkind名とpayloadは変えず追加だけ）からdomainが判定する: runの`awaiting_integration`・`needs_session`・`failed`、`exit_request_timed_out`、supervisorの停止/stale。supervisorの状態はrun_eventsに載せず`supervisors`表から導出し、schemaは変えない。
+- supervisorはattentionのたびにmaintainer workspaceへ`cmux notify`を送る（人向け）。runtimeはmaintainerのterminalに`cmux send`で打ち込まない（workerへの`/exit`は従来どおり）。`integrate`は`watch`からもイベントの副作用としても呼ばない。
+- maintainer経路のコマンドは既定で圧縮し（既存キー名を変えずに省く・切り詰める）、全文は`--full`。レビューは`review ID`が`<run_dir>/review.md`を書き、maintainerはsubagentにpathを渡す。
+- `maintainer_prompt`は「`status`から始め、`watch`をbackgroundで回し、attentionを報告して承認を待つ」に縮める。
 
 ## `supervise`
 
