@@ -6,6 +6,11 @@
 //! supervisor's resolution request from its terminal and resolves the
 //! conflict. Requires a running cmux, so it is ignored by
 //! default: `cargo test --locked --test e2e -- --ignored --nocapture`.
+//!
+//! The launchd `up` / `down` test is temporarily off even under `--ignored`:
+//! no project runs the launchd mode now, and without a cmux socket password
+//! its preflight always stops `up`. It returns at once, printing why, unless
+//! `DAGQ_E2E_LAUNCHD=1` is set; the in-cmux `up` / `down` test always runs.
 use serde_json::{Value, json};
 use std::{
     env, fs,
@@ -1390,13 +1395,34 @@ fn pid_alive(pid: u32) -> bool {
         .success()
 }
 
+/// Whether the launchd `up` / `down` e2e runs. It is temporarily off unless
+/// `DAGQ_E2E_LAUNCHD=1`: no project runs the launchd mode now, and without a
+/// cmux socket password `up`'s preflight always stops it, which would fail
+/// every `--ignored` run. To bring it back, drop this check.
+fn launchd_e2e_enabled() -> bool {
+    if env::var("DAGQ_E2E_LAUNCHD").as_deref() == Ok("1") {
+        return true;
+    }
+    eprintln!(
+        "skipping the launchd up/down e2e: the launchd mode is temporarily out of the \
+         default e2e because no project runs it now and, without a cmux socket password, \
+         its preflight always stops `up`; set DAGQ_E2E_LAUNCHD=1 to run it"
+    );
+    false
+}
+
 /// `up` bootstraps the supervisor as a LaunchAgent of the real launchd and
 /// opens the maintainer workspace in the real cmux; `status` lists the
 /// supervisor through its registration; `down --wait` unloads the agent
 /// and returns once the supervisor has drained and deregistered.
+///
+/// Runs only with `DAGQ_E2E_LAUNCHD=1`; see [`launchd_e2e_enabled`].
 #[test]
-#[ignore = "needs a running cmux and launchd; run with --ignored"]
+#[ignore = "needs a running cmux and launchd; run with --ignored and DAGQ_E2E_LAUNCHD=1"]
 fn up_starts_a_launchd_supervisor_that_status_lists_and_down_wait_stops_it() {
+    if !launchd_e2e_enabled() {
+        return;
+    }
     let fixture = fixture();
     let Fixture {
         cmux,
