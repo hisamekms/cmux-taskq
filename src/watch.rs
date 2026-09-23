@@ -6,8 +6,8 @@
 //! by `domain`.
 use crate::{
     domain::{
-        ATTENTION_KINDS, Attention, RunEvent, SupervisorPulse, SupervisorRegistration,
-        event_attention, run_attention, supervisor_attention,
+        ATTENTION_KINDS, Attention, AttentionNext, RunEvent, SupervisorPulse,
+        SupervisorRegistration, event_attention, run_attention, supervisor_attention,
     },
     infrastructure::{adapters::process_alive, sqlite::SqliteQueue},
     runtime::{supervisors, unix_time},
@@ -37,29 +37,41 @@ pub fn pulses(registrations: &[SupervisorRegistration], now: i64) -> Vec<Supervi
 
 /// What waits for the maintainer now: stale or missing supervisors first,
 /// then the latest run of every `in_progress` task that rests where only the
-/// maintainer or the user moves it on, then every landed run whose push of
-/// `main` failed with no successful push since. `kind` is the event that
-/// brought the run there.
+/// maintainer or the user moves it on or that is unfinished without a lease,
+/// then every landed run whose push of `main` failed with no successful push
+/// since. `kind` is the event that brought the run there (for a run without
+/// a lease, its latest `runtime_error`).
 pub fn attention(
     queue: &SqliteQueue,
     registrations: &[SupervisorRegistration],
     now: i64,
 ) -> Result<Vec<Attention>> {
     let mut attention = supervisor_attention(&pulses(registrations, now));
-    for run in queue.latest_runs_in_progress()? {
+    for mut run in queue.latest_runs_in_progress()? {
+        let leased = queue.run_lease(&run.id)?.is_some();
+        if !leased {
+            // A supervisor leaves the unfinished statuses before it releases
+            // the lease, so a run read before a release and its lease read
+            // after it would look abandoned: judge it by its status now.
+            run = queue.run(&run.id)?;
+        }
         let events = queue.run_events(&run.id)?;
         let exit_pending = events
             .iter()
             .rev()
             .find(|e| matches!(e.kind.as_str(), "exit_request_timed_out" | "session_exited"))
             .is_some_and(|e| e.kind == "exit_request_timed_out");
-        let Some(next) = run_attention(run.status, exit_pending, false) else {
+        let Some(next) = run_attention(run.status, exit_pending, false, leased) else {
             continue;
         };
         let kind = events
             .iter()
             .rev()
-            .find(|e| event_attention(&e.kind, &e.payload).is_some())
+            .find(|e| match next {
+                // The error the owner gave up with, whatever its payload.
+                AttentionNext::RecoverRun => e.kind == "runtime_error",
+                _ => event_attention(&e.kind, &e.payload).is_some(),
+            })
             .map_or_else(|| run.status.as_str().to_owned(), |e| e.kind.clone());
         attention.push(Attention {
             run_id: Some(run.id),
@@ -72,7 +84,7 @@ pub fn attention(
         });
     }
     for run in queue.runs_with_pending_push()? {
-        let Some(next) = run_attention(run.status, false, true) else {
+        let Some(next) = run_attention(run.status, false, true, false) else {
             continue;
         };
         let error = queue

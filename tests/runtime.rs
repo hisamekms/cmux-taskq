@@ -149,6 +149,10 @@ struct TestWorkspace {
     script: String,
     scripts: Mutex<HashMap<i64, String>>,
     exit_timeout: Duration,
+    registration_timeout: Duration,
+    /// `create` opens the workspace but starts no session, so its wrapper
+    /// never registers.
+    no_session: bool,
     /// `send_exit` returns only after the wrapper recorded its exit, as a
     /// slow `cmux send` does when the session exits on the first keystroke.
     exit_returns_after_session: bool,
@@ -167,6 +171,8 @@ impl TestWorkspace {
             script: script.into(),
             scripts: Mutex::new(HashMap::new()),
             exit_timeout: Duration::from_secs(120),
+            registration_timeout: Duration::from_secs(45),
+            no_session: false,
             exit_returns_after_session: false,
             exits_sent: AtomicUsize::new(0),
             sessions: Mutex::new(Vec::new()),
@@ -238,6 +244,17 @@ impl WorkspaceBackend for TestWorkspace {
             .unwrap_or_else(|| self.script.clone());
         let mut sessions = self.sessions.lock().unwrap();
         let workspace = workspace_id(sessions.len());
+        if self.no_session {
+            sessions.push((
+                workspace.clone(),
+                TestSession {
+                    run_id: run.id.clone(),
+                    run_dir: run.run_dir.clone().unwrap(),
+                    worker: None,
+                },
+            ));
+            return Ok(workspace);
+        }
         let worker = thread::spawn(move || {
             runtime::session_with_provider(&db, &id, &token, &TestProvider { script })
         });
@@ -308,6 +325,9 @@ impl WorkspaceBackend for TestWorkspace {
     }
     fn exit_timeout(&self) -> Duration {
         self.exit_timeout
+    }
+    fn registration_timeout(&self) -> Duration {
+        self.registration_timeout
     }
     // The maintainer workspace is `up`'s business; the supervisor never asks.
     fn find_named(&self, _: &str) -> Result<Option<String>> {
@@ -4913,6 +4933,80 @@ fn status_reports_failed_runs_and_unanswered_exit_requests() {
     assert_eq!(pending["next"], "send /exit");
     queue.wrapper_exited(&orphan.id, pid, 0).unwrap();
     assert!(run_attention_of(&runtime::status(&db).unwrap(), &orphan.id).is_none());
+}
+
+/// A run the supervisor gives up (here: its wrapper never registers) keeps
+/// its status without a lease, and nothing moves it on: it waits for
+/// `recover`. A `runtime_error` that releases no lease is only a note.
+#[test]
+fn an_abandoned_run_asks_for_recovery_until_it_is_recovered() {
+    let (_dir, repo, db) = fixture();
+    let mut queue = SqliteQueue::open(&db).unwrap();
+    let cursor = queue.latest_event_id().unwrap();
+    let mut backend = TestWorkspace::new(&db, false, VALID_AGENT);
+    backend.no_session = true;
+    backend.registration_timeout = Duration::from_secs(1);
+    let outcome = supervise(&db, &repo, &backend).unwrap();
+    let errors = outcome["errors"].as_array().unwrap();
+    assert_eq!(errors.len(), 1, "{outcome}");
+    assert!(
+        errors[0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("wrapper did not register within 1 seconds"),
+        "{outcome}"
+    );
+    let run = queue.show(1).unwrap().runs[0].clone();
+    assert!(queue.run_lease(&run.id).unwrap().is_none());
+    let error = queue
+        .run_events(&run.id)
+        .unwrap()
+        .into_iter()
+        .rfind(|e| e.kind == "runtime_error")
+        .unwrap();
+    assert_eq!(error.payload["lease_released"], true);
+
+    let status = runtime::status(&db).unwrap();
+    let abandoned = run_attention_of(&status, &run.id).unwrap();
+    assert_eq!(abandoned["status"], run.status.as_str());
+    assert_eq!(abandoned["kind"], "runtime_error");
+    assert_eq!(abandoned["next"], "recover run");
+    assert!(
+        abandoned["last_error"]
+            .as_str()
+            .unwrap()
+            .contains("did not register")
+    );
+    // The abandon is the only attention event of the pass, and it wakes watch.
+    let woke = watch_for(&db, Some(cursor), Duration::from_secs(20));
+    let events = woke["events"].as_array().unwrap();
+    assert_eq!(events.len(), 1, "{woke}");
+    assert_eq!(events[0]["kind"], "runtime_error");
+    assert_eq!(events[0]["next"], "recover run");
+    assert_eq!(events[0]["run_id"], json!(run.id));
+
+    // Recovered, the run is interrupted and waits for nobody.
+    assert_eq!(
+        runtime::recover(&db, &run.id).unwrap()["run"]["status"],
+        "interrupted"
+    );
+    assert!(run_attention_of(&runtime::status(&db).unwrap(), &run.id).is_none());
+
+    // A runtime error recorded on a leased run is not an attention.
+    add_ready_task(&mut queue, "noted", &[]);
+    let pid = std::process::id();
+    let noted = orphan_run(&repo, &db, "owner", pid, pid);
+    let cursor = queue.latest_event_id().unwrap();
+    queue
+        .record_runtime_error(&noted.id, "a passing error")
+        .unwrap();
+    assert!(run_attention_of(&runtime::status(&db).unwrap(), &noted.id).is_none());
+    assert_eq!(
+        dagq::watch::events(&db, cursor, 100, false).unwrap()["events"],
+        json!([])
+    );
+    let quiet = watch_for(&db, Some(cursor), Duration::from_millis(300));
+    assert_eq!(quiet["events"], json!([]));
 }
 
 #[test]

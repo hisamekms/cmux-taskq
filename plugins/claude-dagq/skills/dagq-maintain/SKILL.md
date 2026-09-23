@@ -32,6 +32,7 @@ Read, in this order:
 2. `attention`: what waits for the user or you now. Each entry has `run_id`, `task_id`, `status`, `kind`, `last_error` and a fixed `next`. Route it:
    - `review and integrate` (`awaiting_integration`): the `dagq-land` skill.
    - `resume session` (`needs_session`), `inspect and close workspace` (`failed`), `send /exit` (exit request timed out): the `dagq-session` skill.
+   - `recover run` (`kind` `runtime_error`: an unfinished run its supervisor gave up, left without a lease): the `dagq-recover` skill.
    - `restart supervisor` (`supervisor_stale`, `supervisor_stopped`): `up` as in step 1.
    - `push main` (`push_failed` on an `integrated` run): `integrate` landed it but could not push; the `dagq-land` skill, step 5.
 3. `runs`: unfinished runs with their leases. A run in progress needs nothing from you.

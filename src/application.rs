@@ -371,6 +371,11 @@ pub trait WorkspaceBackend {
     fn exit_timeout(&self) -> std::time::Duration {
         std::time::Duration::from_secs(120)
     }
+    /// How long the session's wrapper may take to register after the
+    /// workspace opens before the supervisor gives the run up.
+    fn registration_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(45)
+    }
 }
 
 /// What the service manager had under a label when `uninstall` ran.

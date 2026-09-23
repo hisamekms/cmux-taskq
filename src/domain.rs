@@ -945,6 +945,7 @@ string_enum!(AttentionNext {
     SendExit => "send /exit",
     RestartSupervisor => "restart supervisor",
     PushMain => "push main",
+    RecoverRun => "recover run",
 });
 
 /// The `run_events` kinds that can mark an attention. The kind names are a
@@ -958,6 +959,7 @@ pub const ATTENTION_KINDS: &[&str] = &[
     "integration_error",
     "exit_request_timed_out",
     "push_failed",
+    "runtime_error",
 ];
 
 /// Whether a run event is a transition that stops at the maintainer's or the
@@ -966,7 +968,10 @@ pub const ATTENTION_KINDS: &[&str] = &[
 /// session did not answer `/exit`. `integration_error` back to
 /// `awaiting_integration` is not one: the `integrate` caller got the error.
 /// `integration_rebase_aborted` is not one either: the landing goes on and
-/// its outcome is its own event.
+/// its outcome is its own event. A `runtime_error` is one only when the
+/// supervisor released the run's lease with it (`lease_released: true`, the
+/// abandon): nothing moves the run on until it is recovered. A
+/// `runtime_error` recorded without releasing the lease is a note.
 pub fn event_attention(kind: &str, payload: &serde_json::Value) -> Option<AttentionNext> {
     let status = payload
         .get("status")
@@ -985,23 +990,43 @@ pub fn event_attention(kind: &str, payload: &serde_json::Value) -> Option<Attent
         }
         ("exit_request_timed_out", _) => Some(AttentionNext::SendExit),
         ("push_failed", _) => Some(AttentionNext::PushMain),
+        ("runtime_error", _)
+            if payload.get("lease_released") == Some(&serde_json::Value::Bool(true)) =>
+        {
+            Some(AttentionNext::RecoverRun)
+        }
         _ => None,
     }
 }
 
 /// Whether a run in `status` waits for the maintainer now. `exit_pending` is
 /// a `running` run whose `/exit` request timed out with no session exit
-/// since. The caller passes only the latest run of an `in_progress` task, so
-/// a failed run stops counting once the task is retried or canceled, and
-/// the `integrated` run whose push of `main` failed with no successful push
-/// since (`push_pending`), which the task being completed does not end.
+/// since. `push_pending` is the `integrated` run whose push of `main`
+/// failed with no successful push since, which the task being completed does
+/// not end. `leased` is whether the run has a lease row, stale or not: an
+/// unfinished run without one was given up by its owner (the supervisor's
+/// abandon), and neither adoption, which takes only stale leases, nor
+/// anything else moves it on until it is recovered. A stale lease is the
+/// supervisor's attention, not the run's. The caller passes only the latest
+/// run of an `in_progress` task, so a failed run stops counting once the task
+/// is retried or canceled.
 pub fn run_attention(
     status: RunStatus,
     exit_pending: bool,
     push_pending: bool,
+    leased: bool,
 ) -> Option<AttentionNext> {
     match status {
         RunStatus::Integrated if push_pending => Some(AttentionNext::PushMain),
+        RunStatus::Claimed
+        | RunStatus::Starting
+        | RunStatus::Running
+        | RunStatus::Validating
+        | RunStatus::Integrating
+            if !leased =>
+        {
+            Some(AttentionNext::RecoverRun)
+        }
         RunStatus::AwaitingIntegration => Some(AttentionNext::ReviewAndIntegrate),
         RunStatus::NeedsSession => Some(AttentionNext::ResumeSession),
         RunStatus::Failed => Some(AttentionNext::InspectAndClose),
@@ -1148,6 +1173,17 @@ mod attention_tests {
                 json!({"remote": "origin", "reason": "x"}),
                 None,
             ),
+            (
+                "runtime_error",
+                json!({"message": "x", "lease_released": true}),
+                Some(RecoverRun),
+            ),
+            (
+                "runtime_error",
+                json!({"message": "x", "lease_released": false}),
+                None,
+            ),
+            ("runtime_error", json!({"message": "x"}), None),
             ("integration_rebase_aborted", json!({"reason": "x"}), None),
             ("run_integrated", json!({"result_commit": "x"}), None),
             (
@@ -1169,6 +1205,7 @@ mod attention_tests {
             }
         }
         assert_eq!(SendExit.as_str(), "send /exit");
+        assert_eq!(RecoverRun.as_str(), "recover run");
         assert_eq!(
             "restart supervisor".parse::<AttentionNext>().unwrap(),
             RestartSupervisor
@@ -1179,22 +1216,22 @@ mod attention_tests {
     fn run_attention_follows_the_resting_status() {
         use AttentionNext::*;
         assert_eq!(
-            run_attention(RunStatus::AwaitingIntegration, false, false),
+            run_attention(RunStatus::AwaitingIntegration, false, false, false),
             Some(ReviewAndIntegrate)
         );
         assert_eq!(
-            run_attention(RunStatus::NeedsSession, false, false),
+            run_attention(RunStatus::NeedsSession, false, false, false),
             Some(ResumeSession)
         );
         assert_eq!(
-            run_attention(RunStatus::Failed, false, false),
+            run_attention(RunStatus::Failed, false, false, false),
             Some(InspectAndClose)
         );
         assert_eq!(
-            run_attention(RunStatus::Running, true, false),
+            run_attention(RunStatus::Running, true, false, true),
             Some(SendExit)
         );
-        assert_eq!(run_attention(RunStatus::Running, false, false), None);
+        assert_eq!(run_attention(RunStatus::Running, false, false, true), None);
         for status in [
             RunStatus::Claimed,
             RunStatus::Starting,
@@ -1205,17 +1242,56 @@ mod attention_tests {
             RunStatus::Interrupted,
         ] {
             assert_eq!(
-                run_attention(status, true, false),
+                run_attention(status, true, false, true),
                 None,
                 "{}",
                 status.as_str()
             );
         }
         assert_eq!(
-            run_attention(RunStatus::Integrated, false, true),
+            run_attention(RunStatus::Integrated, false, true, false),
             Some(PushMain)
         );
-        assert_eq!(run_attention(RunStatus::Succeeded, false, true), None);
+        assert_eq!(
+            run_attention(RunStatus::Succeeded, false, true, false),
+            None
+        );
+    }
+
+    #[test]
+    fn run_attention_asks_to_recover_an_unfinished_run_without_a_lease() {
+        use AttentionNext::*;
+        for status in [
+            RunStatus::Claimed,
+            RunStatus::Starting,
+            RunStatus::Running,
+            RunStatus::Validating,
+            RunStatus::Integrating,
+        ] {
+            assert_eq!(
+                run_attention(status, false, false, false),
+                Some(RecoverRun),
+                "{}",
+                status.as_str()
+            );
+        }
+        // Nothing moves an abandoned run, so `/exit` alone would not do.
+        assert_eq!(
+            run_attention(RunStatus::Running, true, false, false),
+            Some(RecoverRun)
+        );
+        for status in [
+            RunStatus::Integrated,
+            RunStatus::Succeeded,
+            RunStatus::Interrupted,
+        ] {
+            assert_eq!(
+                run_attention(status, false, false, false),
+                None,
+                "{}",
+                status.as_str()
+            );
+        }
     }
 
     #[test]

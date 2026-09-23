@@ -1,11 +1,13 @@
 ---
 name: dagq-recover
-description: Diagnose and recover one dagq run that is stuck, that its supervisor gave up on, whose supervisor or integrate process died, or that stays claimed/starting/running/validating/integrating after its process ended, without disturbing the runs executing next to it. Use when the user reports an orphaned run, a run with last_error and no lease, a stale supervisor in status or doctor, a run stuck in integrating, or asks to recover or retry a run.
+description: Diagnose and recover one dagq run that is stuck, that its supervisor gave up on, whose supervisor or integrate process died, or that stays claimed/starting/running/validating/integrating after its process ended, without disturbing the runs executing next to it. Use when status or watch shows an attention with next "recover run", when the user reports an orphaned run, a run with last_error and no lease, a stale supervisor in status or doctor, a run stuck in integrating, or asks to recover or retry a run.
 ---
 
 # dagq: diagnose and recover a run
 
 Prerequisite: resolve the launcher as in the `dagq` skill (`DAGQ="${CLAUDE_PLUGIN_ROOT}/bin/dagq"`). Never touch the queue database directly; the binary refuses unsafe recoveries itself, so do not work around it.
+
+An attention with `next` `recover run` in `status` or `watch` (its `kind` is `runtime_error`) is this skill's case: the run is `claimed` / `starting` / `running` / `validating` / `integrating` with no lease, because its supervisor gave it up (the wrapper's heartbeat was lost, the wrapper did not register, a step or provisioning failed). Nothing adopts such a run, so it waits until you recover it; follow the steps below. The attention goes away once the run is recovered. A stale lease is not this case: a dead supervisor shows up as `restart supervisor`, and its runs are adopted or handled by these steps. `status` is authoritative: if `watch` reported `recover run` but `status` shows the run at rest (for example `awaiting_integration` after a failed workspace close), there is nothing to recover.
 
 ## 1. Diagnose without changing state
 
@@ -33,7 +35,7 @@ Recovery is refused while any process registered for that run is alive, its leas
 "$DAGQ" recover RUN_ID
 ```
 
-`RUN_ID` comes from `doctor` or `show ID`. On success it prints `{"outcome": "recovered", "run": ...}`: the run is `interrupted` (an `integrating` run goes back to `awaiting_integration` instead, because its validated result is intact; land it again with the `dagq-maintain` skill), a `run_recovered` event records what was checked, and that run's lease (if any) is deleted. Other runs, their leases and processes are untouched, so a supervisor running other tasks keeps going. The worktree, branch, cmux workspace, and run directory are kept for inspection, and the task stays `in_progress`. Nothing is rerun automatically.
+`RUN_ID` comes from `doctor` or `show ID`. On success it prints `{"outcome": "recovered", "run": ...}`: the run is `interrupted` (an `integrating` run goes back to `awaiting_integration` instead, because its validated result is intact; land it again with the `dagq-land` skill), a `run_recovered` event records what was checked, and that run's lease (if any) is deleted. Other runs, their leases and processes are untouched, so a supervisor running other tasks keeps going. The worktree, branch, cmux workspace, and run directory are kept for inspection, and the task stays `in_progress`. Nothing is rerun automatically.
 
 ## 4. Retry or give up
 

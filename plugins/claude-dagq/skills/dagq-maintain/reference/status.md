@@ -16,6 +16,7 @@ Read this when a field of `status`, `watch` or `show` is unclear.
   - `inspect and close workspace`: `failed`.
   - `send /exit`: a `running` run whose exit request timed out.
   - `push main`: an `integrated` run (its task `completed`) whose push of `main` to `origin` failed (`kind` `push_failed`, `last_error` the Git error) with no successful push since.
+  - `recover run`: a `claimed` / `starting` / `running` / `validating` / `integrating` run without a lease, given up by its supervisor (`kind` `runtime_error` with `lease_released: true`). Nothing adopts it; handle it with the `dagq-recover` skill. It disappears once recovered. If `watch` reported it but `status` shows the run at rest, `status` wins.
   - `restart supervisor`: `kind` `supervisor_stale` (with its `pid`) or `supervisor_stopped` (nothing registered).
 - `cursor`: the newest event id.
 

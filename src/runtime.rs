@@ -805,9 +805,11 @@ impl SessionWatch {
                 "wrapper heartbeat expired; session may still be alive"
             );
         } else {
+            let timeout = cmux.registration_timeout();
             ensure!(
-                self.startup.elapsed() < Duration::from_secs(45),
-                "wrapper did not register within 45 seconds"
+                self.startup.elapsed() < timeout,
+                "wrapper did not register within {} seconds",
+                timeout.as_secs()
             );
         }
         if let Some(requested) = self.exit_requested
