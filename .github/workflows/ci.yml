@@ -35,13 +35,13 @@ jobs:
       - name: cargo fmt
         run: cargo fmt --all --check
 
-      # The e2e tests in tests/e2e.rs need a running cmux, so they stay
-      # #[ignore]d here and are run by the maintainer before integrate.
-      - name: cargo test
-        run: cargo test --locked
-
       - name: cargo clippy
         run: cargo clippy --locked --all-targets -- -D warnings
 
+      # cargo llvm-cov runs the same test binaries as cargo test (unit tests in
+      # src/lib.rs and tests/*.rs; the crate has no doctests) and fails if any
+      # test fails, so there is no separate cargo test step.
+      # The e2e tests in tests/e2e.rs need a running cmux, so they stay
+      # #[ignore]d here and are run by the worker before integrate.
       - name: cargo llvm-cov
         run: cargo llvm-cov --locked --fail-under-lines 80
