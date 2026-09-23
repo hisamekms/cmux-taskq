@@ -175,6 +175,9 @@ struct TestWorkspace {
     groups: Mutex<Vec<(String, String)>>,
     /// `workspace-group create` fails.
     group_fails: bool,
+    /// `send_exit` delivers the request but reports a timeout, the way
+    /// `cmux send` does when cmux answers too late under load.
+    send_times_out: bool,
 }
 impl TestWorkspace {
     fn new(db: &Path, fail: bool, script: &str) -> Self {
@@ -198,6 +201,7 @@ impl TestWorkspace {
             tags: Mutex::new(Vec::new()),
             groups: Mutex::new(Vec::new()),
             group_fails: false,
+            send_times_out: false,
         }
     }
     /// Agent script for one task; other tasks use the default script.
@@ -326,6 +330,9 @@ impl WorkspaceBackend for TestWorkspace {
         self.exits_sent.fetch_add(1, Ordering::SeqCst);
         let run_dir = self.session_run_dir(workspace_id);
         fs::write(exit_request_path(&run_dir), "")?;
+        if self.send_times_out {
+            bail!("\"cmux\" send did not finish within 30s");
+        }
         if self.exit_returns_after_session {
             let run_id = self
                 .sessions
@@ -1282,6 +1289,160 @@ fn provisioning_failure_retains_the_run_and_stops_claiming_other_tasks() {
     assert_eq!(queue.show(1).unwrap().runs.len(), 1);
 }
 
+/// The `backend_call_failed` events of a task, oldest first.
+fn backend_failures(detail: &dagq::domain::TaskDetail) -> Vec<&dagq::domain::RunEvent> {
+    detail
+        .events
+        .iter()
+        .filter(|e| e.kind == "backend_call_failed")
+        .collect()
+}
+
+/// A failed backend call carries the call, the error and the load it
+/// failed under: the load average (or null), the supervisor's slots held
+/// and its `--parallel` (task 109).
+fn assert_backend_failure(
+    event: &dagq::domain::RunEvent,
+    op: &str,
+    workspace: Option<&str>,
+    error: &str,
+    run_id: &str,
+) {
+    assert_eq!(event.run_id.as_deref(), Some(run_id));
+    assert_eq!(event.payload["op"], op, "{:?}", event.payload);
+    assert_eq!(event.payload["workspace_id"], json!(workspace));
+    assert_eq!(event.payload["timeout_secs"], 30);
+    assert!(
+        event.payload["error"].as_str().unwrap().contains(error),
+        "{:?}",
+        event.payload
+    );
+    assert!(event.payload["load_avg"].is_f64() || event.payload["load_avg"].is_null());
+    assert_eq!(event.payload["slots"], 1);
+    assert_eq!(event.payload["parallel"], 4);
+}
+
+/// cmux failing to create, close or send is recorded as
+/// `backend_call_failed` on the run, next to (and before) what the
+/// supervisor already recorded for it: the abandon's `runtime_error`, and
+/// `cleanup_failed`; `stats` counts them and raises `backend_failures`.
+#[test]
+fn failed_backend_calls_are_recorded_with_the_load_and_counted_by_stats() {
+    // create: the provisioning failure abandons the run.
+    let (_dir, repo, db) = fixture();
+    let backend = TestWorkspace::new(&db, true, VALID_AGENT);
+    supervise(&db, &repo, &backend).unwrap_err();
+    let detail = SqliteQueue::open(&db).unwrap().show(1).unwrap();
+    let run = &detail.runs[0];
+    let failures = backend_failures(&detail);
+    assert_eq!(failures.len(), 1, "{failures:?}");
+    assert_backend_failure(
+        failures[0],
+        "create",
+        None,
+        "injected workspace creation failure",
+        &run.id,
+    );
+    let abandoned = detail
+        .events
+        .iter()
+        .find(|e| e.kind == "runtime_error")
+        .unwrap();
+    assert!(failures[0].id < abandoned.id);
+
+    // close: `cleanup_failed` stays as it was, and the failure is recorded too.
+    let (_dir, db, detail) = run_agent_with(VALID_AGENT, true);
+    let run = &detail.runs[0];
+    let failures = backend_failures(&detail);
+    assert_eq!(failures.len(), 1, "{failures:?}");
+    assert_backend_failure(
+        failures[0],
+        "close",
+        Some(WORKSPACE_ID),
+        "injected workspace close failure",
+        &run.id,
+    );
+    let cleanup = detail
+        .events
+        .iter()
+        .find(|e| e.kind == "cleanup_failed")
+        .unwrap();
+    assert_eq!(
+        cleanup
+            .payload
+            .as_object()
+            .unwrap()
+            .keys()
+            .collect::<Vec<_>>(),
+        ["message", "workspace_id"]
+    );
+    assert!(failures[0].id < cleanup.id);
+    let stats = runtime::stats(&db, &Default::default()).unwrap();
+    assert_eq!(stats["backend_failures"]["count"], 1, "{stats}");
+    assert!(
+        !stats["alerts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|a| a["kind"] == "backend_failures")
+    );
+
+    // send: the /exit that timed out abandons the run.
+    let (_dir, repo, db) = fixture();
+    let mut backend = TestWorkspace::new(
+        &db,
+        false,
+        "commit work; receipt \"$(git rev-parse HEAD)\"; idle; await_exit",
+    );
+    backend.send_times_out = true;
+    let cursor = runtime::status(&db).unwrap()["cursor"].as_i64().unwrap();
+    let outcome = supervise(&db, &repo, &backend).unwrap();
+    // The abandoned session still exits on the delivered request; its
+    // wrapper no longer holds the run.
+    for (_, session) in backend.sessions.lock().unwrap().iter_mut() {
+        let _ = session.worker.take().unwrap().join();
+    }
+    assert_eq!(outcome["errors"].as_array().unwrap().len(), 1, "{outcome}");
+    let detail = SqliteQueue::open(&db).unwrap().show(1).unwrap();
+    let run = &detail.runs[0];
+    let failures = backend_failures(&detail);
+    assert_eq!(failures.len(), 1, "{failures:?}");
+    assert_backend_failure(
+        failures[0],
+        "send_exit",
+        Some(WORKSPACE_ID),
+        "did not finish within 30s",
+        &run.id,
+    );
+    let abandoned = detail
+        .events
+        .iter()
+        .find(|e| e.kind == "runtime_error")
+        .unwrap();
+    assert!(failures[0].id < abandoned.id);
+
+    // A second failure in the same window is an alert.
+    let recording = runtime::RecordingBackend::new(&backend, db.clone(), None);
+    assert!(recording.exists(WORKSPACE_ID).is_err());
+    let stats = runtime::stats(
+        &db,
+        &dagq::domain::stats::StatsQuery {
+            since: Some(cursor),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let failures = &stats["backend_failures"];
+    assert_eq!(failures["count"], 2, "{stats}");
+    assert_eq!(failures["by_op"], json!({"exists": 1, "send_exit": 1}));
+    assert_eq!(failures["max_slots"], 1);
+    assert!(failures["max_load_avg"].is_f64() || failures["max_load_avg"].is_null());
+    assert!(stats["alerts"].as_array().unwrap().contains(&json!({
+        "kind": "backend_failures", "task_id": null, "run_id": null,
+        "value": 2, "threshold": 2
+    })));
+}
+
 /// A workspace group cmux cannot make leaves a warning in the supervisor
 /// log, and the run opens outside any group (ADR-0026).
 #[test]
@@ -1311,6 +1472,21 @@ fn a_workspace_group_cmux_cannot_make_is_a_logged_warning() {
             && log.contains("workspace-group create failed"),
         "{log}"
     );
+    // The group belongs to no run, so its failure is recorded without one.
+    let failures: Vec<_> = queue
+        .all_events()
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.kind == "backend_call_failed")
+        .collect();
+    // One per run workspace opened.
+    assert_eq!(failures.len(), backend.groups.lock().unwrap().len());
+    for failure in failures {
+        assert_eq!((failure.task_id, failure.run_id.as_deref()), (None, None));
+        assert_eq!(failure.payload["op"], "ensure_group");
+        assert_eq!(failure.payload["slots"], 1);
+        assert_eq!(failure.payload["parallel"], 1);
+    }
 }
 
 /// With one slot the supervisor claims the candidate whose completion

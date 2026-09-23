@@ -783,6 +783,116 @@ mod stats {
     }
 
     #[test]
+    fn backend_failures_are_counted_per_window_with_the_highest_load() {
+        let mut events = Events::default();
+        let failure = |op: &str, load: Value, slots: i64| {
+            json!({"op": op, "workspace_id": "w", "timeout_secs": 30, "error": "timed out",
+                   "load_avg": load, "slots": slots, "parallel": 4})
+        };
+        events.run(1, "a", "run_claimed", 0);
+        events.push(
+            1,
+            Some("a"),
+            "backend_call_failed",
+            1,
+            failure("close", json!(23.5), 3),
+        );
+        events.status(1, "a", "supervision_finished", 2, "failed");
+        let cursor = events.last_id();
+        events.run(2, "b", "run_claimed", 3);
+        events.push(
+            2,
+            Some("b"),
+            "backend_call_failed",
+            4,
+            failure("send_exit", json!(34.25), 4),
+        );
+        events.push(
+            2,
+            Some("b"),
+            "backend_call_failed",
+            5,
+            failure("send_exit", Value::Null, 2),
+        );
+        // A call for no run (up's group): no task, no run.
+        events.push(
+            1,
+            None,
+            "backend_call_failed",
+            6,
+            failure("ensure_group", json!(1.0), 0),
+        );
+        events.0.last_mut().unwrap().task_id = None;
+        events.status(2, "b", "supervision_finished", 7, "failed");
+        let goals = HashMap::from([(1, None), (2, Some(5))]);
+        let run = |query: StatsQuery| {
+            value(&stats(
+                &events.0,
+                &goals,
+                at(8),
+                SlotSnapshot::default(),
+                &query,
+            ))
+        };
+        let alert = json!({"kind": "backend_failures", "task_id": null, "run_id": null,
+                           "value": 4, "threshold": 2});
+
+        let all = run(StatsQuery::default());
+        assert_eq!(
+            all["backend_failures"],
+            json!({"count": 4, "by_op": {"close": 1, "ensure_group": 1, "send_exit": 2},
+                   "max_load_avg": 34.25, "max_slots": 4})
+        );
+        assert!(all["alerts"].as_array().unwrap().contains(&alert));
+
+        // Past the cursor: three failures, the close is before it.
+        let since = run(StatsQuery {
+            since: Some(cursor),
+            ..Default::default()
+        });
+        assert_eq!(since["backend_failures"]["count"], 3);
+        assert_eq!(since["backend_failures"]["by_op"]["close"], Value::Null);
+        assert!(
+            since["alerts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|a| a["kind"] == "backend_failures" && a["value"] == 3)
+        );
+
+        // --goal keeps only the failures of its runs; one is no alert.
+        let goal = run(StatsQuery {
+            goal_id: Some(5),
+            since: Some(cursor),
+            ..Default::default()
+        });
+        assert_eq!(goal["backend_failures"]["count"], 2);
+        let only_close = run(StatsQuery {
+            goal_id: Some(9),
+            full: true,
+            ..Default::default()
+        });
+        assert_eq!(
+            only_close["backend_failures"],
+            json!({"count": 0, "by_op": {}, "max_load_avg": null, "max_slots": null})
+        );
+
+        // Nothing past the last event: an empty window.
+        let empty = run(StatsQuery {
+            since: Some(events.last_id()),
+            ..Default::default()
+        });
+        assert_eq!(empty["backend_failures"]["count"], 0);
+        assert!(
+            !empty["alerts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|a| a["kind"] == "backend_failures")
+        );
+    }
+
+    #[test]
     fn work_over_the_goal_median_is_an_alert() {
         let mut events = Events::default();
         for (task, work) in [(1, 10), (2, 10), (3, 30)] {

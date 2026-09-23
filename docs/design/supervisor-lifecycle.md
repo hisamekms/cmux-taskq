@@ -17,6 +17,7 @@ related:
   - adr-0010
   - adr-0011
   - adr-0012
+  - adr-0013
   - adr-0014
   - adr-0016
   - adr-0018
@@ -60,7 +61,7 @@ ready task (dependencies completed)
 
 ## Implementation status
 
-ステップ3で`claim`から`running`、セッション終了検知までを、ステップ4の[005](../journal/005-receipt-validation.md)でreceiptの検証と`awaiting_integration`への遷移を、[006](../journal/006-workspace-close.md)で受理後のworkspace終了を、[007](../journal/007-session-exit-request.md)でreceipt受領後の終了要求を、[009](../journal/009-doctor-recover.md)で`doctor`/`recover`を、[008](../journal/008-integration-confirm.md)で統合確認`integrate`と`completed`への遷移を`src/runtime.rs`に実装した。ステップ6の[017](../journal/017-parallel-runs.md)（[ADR-0007](../adr/0007-run-level-leases-parallel-execution.md)）でleaseをrun単位にし、`supervise`を上限付き並列の常駐ループにした。ステップ7の[018](../journal/018-merge-queue.md)（[ADR-0008](../adr/0008-merge-queue-squash-landing.md)）で`integrate`を手動mergeの確認からruntimeによる着地（rebase → 再検証 → squash）に置き換えた。[021](../journal/021-maintainer-up-down.md)で`up` / `down`（`src/lifecycle.rs`）、launchdによる常駐、`supervise --log-dir`、maintainer promptを足した。task 24（[ADR-0012](../adr/0012-adopt-stale-lease-of-live-wrapper.md)）で、supervisorが死んだ後もwrapperが生きているrunを次のsupervisorが引き継ぐ（adopt）ようにした。[ADR-0011](../adr/0011-cmux-socket-password-and-in-cmux-fallback.md)のtask 21で`up`にcmux外接続のpreflightを、task 22で`up --in-cmux`（launchdなしのfallback）と`supervisors.mode`を足した。task 30（[ADR-0014](../adr/0014-up-replaces-a-supervisor-of-another-binary-version.md)）で`supervisors.binary_version`を足し、`up`がversionの違うliveなsupervisorをdrainして入れ替えるようにした（`--no-wait`は走行中のrunがあれば入れ替えない）。task 57（[ADR-0016](../adr/0016-maintainer-notification-and-compact-output.md)）で`status`に`attention`と`cursor`を足し、`events --after`と`watch`（`src/watch.rs`、判定は`src/domain.rs`）を足した。task 75（task 58の登録し直し）で`WorkspaceBackend::notify`とcmux adapterの`cmux notify`を足した。supervisorはまだ通知を送らない（[人への通知](#人への通知cmux-notify)）。task 70（[ADR-0019](../adr/0019-move-routine-maintainer-work-into-the-runtime.md)の決定3）で`integrate`が着地後に`main`を`origin`へpushするようにし（`--no-push`、`push_finished` / `push_skipped` / `push_failed`）、`push_failed`をattention（`push main`）にした。task 79（[ADR-0025](../adr/0025-leaseless-unfinished-run-is-a-recover-run-attention.md)）で、supervisorが手放した（leaseの無い）未完了runを`recover run`のattentionにした。task 94（[ADR-0023](../adr/0023-verify-once-review-in-supervisor-run-env-graph-and-stats.md)の決定5）でrun_eventsから時間と閾値超えを導出する`stats`（集計は`src/domain/stats.rs`）を足した。
+ステップ3で`claim`から`running`、セッション終了検知までを、ステップ4の[005](../journal/005-receipt-validation.md)でreceiptの検証と`awaiting_integration`への遷移を、[006](../journal/006-workspace-close.md)で受理後のworkspace終了を、[007](../journal/007-session-exit-request.md)でreceipt受領後の終了要求を、[009](../journal/009-doctor-recover.md)で`doctor`/`recover`を、[008](../journal/008-integration-confirm.md)で統合確認`integrate`と`completed`への遷移を`src/runtime.rs`に実装した。ステップ6の[017](../journal/017-parallel-runs.md)（[ADR-0007](../adr/0007-run-level-leases-parallel-execution.md)）でleaseをrun単位にし、`supervise`を上限付き並列の常駐ループにした。ステップ7の[018](../journal/018-merge-queue.md)（[ADR-0008](../adr/0008-merge-queue-squash-landing.md)）で`integrate`を手動mergeの確認からruntimeによる着地（rebase → 再検証 → squash）に置き換えた。[021](../journal/021-maintainer-up-down.md)で`up` / `down`（`src/lifecycle.rs`）、launchdによる常駐、`supervise --log-dir`、maintainer promptを足した。task 24（[ADR-0012](../adr/0012-adopt-stale-lease-of-live-wrapper.md)）で、supervisorが死んだ後もwrapperが生きているrunを次のsupervisorが引き継ぐ（adopt）ようにした。[ADR-0011](../adr/0011-cmux-socket-password-and-in-cmux-fallback.md)のtask 21で`up`にcmux外接続のpreflightを、task 22で`up --in-cmux`（launchdなしのfallback）と`supervisors.mode`を足した。task 30（[ADR-0014](../adr/0014-up-replaces-a-supervisor-of-another-binary-version.md)）で`supervisors.binary_version`を足し、`up`がversionの違うliveなsupervisorをdrainして入れ替えるようにした（`--no-wait`は走行中のrunがあれば入れ替えない）。task 57（[ADR-0016](../adr/0016-maintainer-notification-and-compact-output.md)）で`status`に`attention`と`cursor`を足し、`events --after`と`watch`（`src/watch.rs`、判定は`src/domain.rs`）を足した。task 75（task 58の登録し直し）で`WorkspaceBackend::notify`とcmux adapterの`cmux notify`を足した。supervisorはまだ通知を送らない（[人への通知](#人への通知cmux-notify)）。task 70（[ADR-0019](../adr/0019-move-routine-maintainer-work-into-the-runtime.md)の決定3）で`integrate`が着地後に`main`を`origin`へpushするようにし（`--no-push`、`push_finished` / `push_skipped` / `push_failed`）、`push_failed`をattention（`push main`）にした。task 79（[ADR-0025](../adr/0025-leaseless-unfinished-run-is-a-recover-run-attention.md)）で、supervisorが手放した（leaseの無い）未完了runを`recover run`のattentionにした。task 94（[ADR-0023](../adr/0023-verify-once-review-in-supervisor-run-env-graph-and-stats.md)の決定5）でrun_eventsから時間と閾値超えを導出する`stats`（集計は`src/domain/stats.rs`）を足した。task 109でcmuxの呼び出しの失敗とtimeoutを`backend_call_failed`（load averageとslot数つき）として記録し、`stats`に`backend_failures`とalert `backend_failures`を足した（[backendの呼び出しの失敗](#backendの呼び出しの失敗)）。
 
 ## Roles
 
@@ -308,6 +309,16 @@ cmux 0.64.25の`workspace create --command`はコマンドをログインシェ�
 
 closeの成否は`task_runs.workspace_closed_at`で表す。nullは「閉じたことを確認していない」で、closeの失敗だけでなく、cmuxが閉じた後にDBへ書けなかった場合も含む。closeの失敗は`cleanup_failed`イベントと`last_error`に残るが、run状態は変えない。閉じていないworkspaceをcleaned扱いにせず、再試行は`doctor`/`recover`（[009](../journal/009-doctor-recover.md)）で扱う。
 
+### backendの呼び出しの失敗
+
+`WorkspaceBackend`（cmux adapter）の呼び出しが失敗するかtimeoutすると（cmuxはどの呼び出しも30秒、`WorkspaceBackend::call_timeout`）、runtimeは`backend_call_failed`をrun_eventsに記録する（task 109）。負荷が高いとcmuxが詰まることをqueueに残し、observerが`stats`の`backend_failures`から並列度の見直しを根拠つきで提案できるようにするためで、記録するのはruntime、observerは`stats`を読むだけ。
+
+- **payload**: `op`（`create` / `create_named` / `capture` / `close` / `send_exit`（`send`と`send-key`）/ `exists` / `ensure_group` / `notify`。起動時の`preflight` / `preflight_detached`はcmuxに繋がるかの確認で、失敗すればコマンド自体が止まるので記録しない）、`workspace_id`（無い呼び出しはnull）、`timeout_secs`、`error`（先頭300文字）、`load_avg`（getloadavg(3)の1分値。取れなければnull）、`slots`、`parallel`。
+- **run**: runのための呼び出し（`create`、runの開いたworkspaceへの`capture` / `close` / `send_exit`）はそのrunのイベントとして`task_id`と`run_id`を持つ。workspaceからrunを引けない呼び出し（`up`のmaintainer / supervisor workspaceの`create_named`と`exists`、queueのworkspace groupの`ensure_group`、`down`のsupervisor workspaceの`close`）は`task_id`も`run_id`も持たない（0012で`run_events`のCHECKがこのkindだけに認める）。
+- **slots / parallel**: supervisorの呼び出しはそのsupervisorのtokenのlease数（握っているslot）と`--parallel`。`up` / `down`の呼び出しは全leaseの数と、登録済みsupervisorの`parallel`の合計（登録が無ければnull）。
+- **記録する場所**: cmux adapterではなくapplication層の`runtime::RecordingBackend`（`WorkspaceBackend`を包むdecorator）が、`supervise`・`up`・`down`で渡されたbackendを包んで記録する（[ADR-0013](../adr/0013-layered-architecture-and-type-function-style.md)）。記録は自前の接続で書き、書けなくても呼び出し元へ返すエラーは元のまま。
+- 既存の記録はそのまま残す: closeの失敗は`cleanup_failed`、wrapper終了後の`read-screen`の失敗は`screen_capture_failed`で、どちらも同じ失敗を`backend_call_failed`としても記録する（呼び出しの直後なので`backend_call_failed`が先）。`/exit`後にsessionが終わらない`exit_request_timed_out`はcmuxの呼び出しの失敗ではないので`backend_call_failed`にならない（`backend_call_failed`になるのは`/exit`の送信（`send_exit`）そのものが失敗かtimeoutしたときだけ）。`create`の失敗（provisioningの失敗）と`/exit`の送信失敗はrunをabandonするが、`backend_call_failed`はabandonの`runtime_error`より前に入る。
+
 supervisorの再起動ではrunごとのleaseとheartbeatを確認し、孤児プロセスを勝手に再実行しない。wrapperが生きている（heartbeatが30秒以内か`exited_at`記録済み）`running` / `validating`のrunだけは、staleなleaseごと次のsupervisorが引き継いで同じrunを続ける（[ADR-0012](../adr/0012-adopt-stale-lease-of-live-wrapper.md)、[`supervise`](#supervise)の5）。それ以外（wrapperが死んだ・黙った、`claimed` / `starting`、`integrating`、leaseなし）はユーザーが`recover`で明示的に復旧した後に新しいTaskRunを作る。
 
 ### `status`
@@ -347,6 +358,8 @@ attentionイベントの判定は`domain::event_attention(kind, payload)`（候�
   - `task_failed`: 同じtaskのrunの`failed`が合わせて2回。回数はpageに関係なく全runで数え、`run_id`はその最後に失敗したrunで、そのrunが対象に入るときに出す（`--since`で2回目だけが新しくても出る）
   - `work_over_median`: `work`がそのgoal（goalの無いrunはgoalの無いrun同士）の中央値の2倍を超えたrun
   - `idle_slots`: staleでないsupervisorの`parallel`の合計から実行中（`integrating`以外の未完了）runを引いた空きslotがあるのに、candidatesがゼロで`ready`のtaskが残っている（依存で詰まっている）。`value`は空きslot数で、`task_id` / `run_id`はnull。readyのtaskが無い空のqueueは詰まりではないので出さない。`stats`を読んだ時点のsnapshotで判定し、時間帯の履歴は持たない
+  - `backend_failures`: 同じwindowの`backend_call_failed`が2件以上。`value`は件数、`task_id` / `run_id`はnull
+- **`backend_failures`**: `{count, by_op, max_load_avg, max_slots}`。`backend_call_failed`の件数、`op`ごとの件数、記録された`load_avg`の最大（無ければnull）、`slots`の最大（無ければnull）。windowは`--since`があればcursorより後から`next_cursor`まで、無ければ対象のrunの最初のイベントのうち最も古いもの以降（`--full`か対象のrunが無ければ全件）。`--goal`はそのgoalのrunの失敗だけを数える（runの無い失敗は数えない）
 
 ### `doctor`
 

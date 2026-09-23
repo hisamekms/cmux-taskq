@@ -25,6 +25,13 @@ Read this when a field of `status`, `watch` or `show` is unclear.
 
 `"$DAGQ" watch --after <cursor> [--timeout 600] [--interval 2]` blocks until an attention event arrives after the cursor or the supervisors' registrations or `alive` / `stale` change, then returns `{events, supervisors_changed, supervisors, cursor}`. On timeout `events` is empty and the cursor is unchanged. `"$DAGQ" events --after <cursor>` returns the same attention events without waiting (`--all` for every kind, `--limit N`, default 100). Each event is compact: `status`, `exit_code`, `reason` cut to 300 characters, and `next`.
 
+## stats
+
+`"$DAGQ" stats [--since CURSOR] [--goal ID] [--full]` reads run events only; the field list is in the `dagq` skill's `reference/inspect.md`. For load problems look at:
+
+- `backend_failures`: `{count, by_op, max_load_avg, max_slots}` — cmux calls that failed or timed out (30 s each) in the window: after `--since` up to `next_cursor`, otherwise since the oldest returned run started. `by_op` counts per call (`create`, `create_named`, `capture`, `close`, `send_exit`, `exists`, `ensure_group`, `notify`); `max_load_avg` is the highest 1-minute load average recorded with one (null when unavailable) and `max_slots` the most runs the supervisor held then. Each failure is a `backend_call_failed` event (`op`, `workspace_id`, `timeout_secs`, `error`, `load_avg`, `slots`, `parallel`), on its run when it was for one and on no task for `up` / `down` / the workspace group. `cleanup_failed`, `screen_capture_failed` and `exit_request_timed_out` are still recorded as before; the first two also produce a `backend_call_failed`, while `exit_request_timed_out` (a session that did not exit) does not — only a failed `send_exit` does.
+- The alert `backend_failures` (`value` the count, `threshold` 2, no task or run): two or more failures in the window. A high `max_load_avg` with it is the evidence for proposing a lower `--parallel`; the observer reads it from `stats` and does not fix it.
+
 ## show
 
 `"$DAGQ" show ID` prints the task, only the latest run, the latest 10 events (`--events N` for more) with the gist of their payload, and long texts cut to 300 characters ending in `…` with `truncated: true`. `show ID --full` adds `run_dir`, earlier runs and whole event payloads such as a receipt. `"$DAGQ" list --status in_progress` finds the tasks worth a `show`: each entry's `latest_run` gives the newest run's `id` and `status`.

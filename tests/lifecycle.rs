@@ -1325,6 +1325,29 @@ fn up_warns_and_goes_on_when_the_workspace_group_cannot_be_made() {
         "{warning}"
     );
     assert!(warning.contains(&fixture.location.hash()), "{warning}");
+    // The failed call is in the queue, on no run and no task (task 109).
+    let failures = backend_failures(&fixture);
+    assert_eq!(failures.len(), 1, "{failures:?}");
+    let failure = &failures[0];
+    assert_eq!((failure.task_id, failure.run_id.as_deref()), (None, None));
+    assert_eq!(failure.payload["op"], "ensure_group");
+    assert_eq!(failure.payload["workspace_id"], Value::Null);
+    assert_eq!(failure.payload["timeout_secs"], 30);
+    assert_eq!(failure.payload["error"], "workspace-group create failed");
+    assert!(failure.payload["load_avg"].is_f64() || failure.payload["load_avg"].is_null());
+    assert!(failure.payload["slots"].is_i64());
+    assert!(failure.payload.get("parallel").is_some());
+}
+
+/// The `backend_call_failed` events of the fixture's queue, oldest first.
+fn backend_failures(fixture: &Fixture) -> Vec<dagq::domain::RunEvent> {
+    SqliteQueue::open(&fixture.location.db)
+        .unwrap()
+        .all_events()
+        .unwrap()
+        .into_iter()
+        .filter(|event| event.kind == "backend_call_failed")
+        .collect()
 }
 
 #[test]
@@ -1799,6 +1822,16 @@ fn down_force_kills_an_in_cmux_supervisor_and_closes_or_reports_its_workspace() 
         format!("no such workspace: {workspace}")
     );
     assert!(queue.supervisors().unwrap().is_empty());
+    // The refused close is recorded without a run (task 109).
+    let failures = backend_failures(&fixture);
+    assert_eq!(failures.len(), 1, "{failures:?}");
+    assert_eq!(failures[0].run_id, None);
+    assert_eq!(failures[0].payload["op"], "close");
+    assert_eq!(failures[0].payload["workspace_id"], json!(workspace));
+    assert_eq!(
+        failures[0].payload["error"],
+        format!("no such workspace: {workspace}")
+    );
 }
 
 fn down(

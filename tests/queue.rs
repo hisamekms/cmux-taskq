@@ -887,10 +887,10 @@ fn migration_from_v6_adds_goals_and_keeps_tasks_runs_and_events() {
     drop(raw);
     let mut queue = SqliteQueue::open(&path).unwrap();
     // 0007 (supervisors), 0008 (goals), 0009 (supervisor mode), 0010
-    // (supervisor binary version) and 0011 (session workspaces) are applied
-    // together.
-    assert_eq!(SqliteQueue::SCHEMA_VERSION, 11);
-    assert_eq!(queue.schema_version().unwrap(), 11);
+    // (supervisor binary version), 0011 (session workspaces) and 0012
+    // (queue-level backend failures) are applied together.
+    assert_eq!(SqliteQueue::SCHEMA_VERSION, 12);
+    assert_eq!(queue.schema_version().unwrap(), 12);
     assert_eq!(
         queue
             .session_workspace(dagq::domain::SessionRole::Maintainer)
@@ -934,6 +934,19 @@ fn migration_from_v6_adds_goals_and_keeps_tasks_runs_and_events() {
     assert!(
         raw.execute(
             "INSERT INTO run_events(kind,payload) VALUES ('orphan','{}')",
+            []
+        )
+        .is_err()
+    );
+    // Only a failed backend call may belong to neither a task nor a goal.
+    raw.execute(
+        "INSERT INTO run_events(kind,payload) VALUES ('backend_call_failed','{}')",
+        [],
+    )
+    .unwrap();
+    assert!(
+        raw.execute(
+            "INSERT INTO run_events(run_id,kind,payload) VALUES ('run-landed','backend_call_failed','{}')",
             []
         )
         .is_err()

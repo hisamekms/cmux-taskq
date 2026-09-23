@@ -393,6 +393,11 @@ pub trait WorkspaceBackend {
     /// to; `None` sends it without one. The supervisor sends none yet:
     /// ADR-0022 limits notifications to `ask_opened`, aimed at the inbox.
     fn notify(&self, title: &str, body: &str, workspace: Option<&str>) -> Result<()>;
+    /// How long one call may run before the backend gives it up as failed;
+    /// recorded with every `backend_call_failed`.
+    fn call_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(30)
+    }
     /// How long the session may take to exit after the request before the
     /// supervisor stops waiting and leaves the run to a human.
     fn exit_timeout(&self) -> std::time::Duration {

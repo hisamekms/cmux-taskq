@@ -39,6 +39,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../../migrations/0009_supervisor_mode.sql"),
     include_str!("../../migrations/0010_supervisor_binary_version.sql"),
     include_str!("../../migrations/0011_session_workspaces.sql"),
+    include_str!("../../migrations/0012_queue_events.sql"),
 ];
 const READY_QUERY: &str = "
     SELECT t.* FROM tasks t

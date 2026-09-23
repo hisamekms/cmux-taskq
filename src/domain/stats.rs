@@ -22,6 +22,8 @@ pub const ASK_UNANSWERED_SECS: i64 = 60 * 60;
 pub const TASK_FAILED_TIMES: i64 = 2;
 /// A run whose work took more than this many times its goal's median is an alert.
 pub const WORK_MEDIAN_FACTOR: i64 = 2;
+/// This many `backend_call_failed` in one window is an alert.
+pub const BACKEND_FAILURES: i64 = 2;
 
 /// What `stats` looks at.
 #[derive(Debug, Clone, Default)]
@@ -104,7 +106,21 @@ pub struct Alert {
     pub threshold: i64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+/// The `backend_call_failed` events in the window: how often cmux failed or
+/// timed out, for which calls, and under what load. A window where nothing
+/// failed has a zero count and null maxima.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct BackendFailures {
+    pub count: i64,
+    /// Failures per `op`.
+    pub by_op: BTreeMap<String, i64>,
+    /// The highest 1-minute load average recorded with a failure.
+    pub max_load_avg: Option<f64>,
+    /// The most slots held when one failed.
+    pub max_slots: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Stats {
     /// Finished runs, oldest finish first.
     pub runs: Vec<RunStats>,
@@ -112,6 +128,11 @@ pub struct Stats {
     pub goals: Vec<GoalStats>,
     pub overall: Intervals,
     pub alerts: Vec<Alert>,
+    /// Failed backend calls after `--since` (up to `next_cursor`); without
+    /// it, those since the earliest first event of the runs returned, or all of
+    /// them with `--full` or when no run is returned. With `--goal`, only
+    /// the failures of that goal's runs.
+    pub backend_failures: BackendFailures,
     /// Pass it to `--since` to read only runs that finish later.
     pub next_cursor: i64,
 }
@@ -133,6 +154,12 @@ pub fn stats(
             .is_none_or(|goal| goals.get(&task_id).copied().flatten() == Some(goal))
     };
     let tracks = runs(events, goals);
+    let mut first_event: HashMap<&str, i64> = HashMap::new();
+    for event in events {
+        if let Some(run_id) = &event.run_id {
+            first_event.entry(run_id.as_str()).or_insert(event.id);
+        }
+    }
     // Per task, over every run and not only this page: the `failed` count
     // and the latest run that failed.
     let mut failures: BTreeMap<i64, (i64, String)> = BTreeMap::new();
@@ -261,6 +288,27 @@ pub fn stats(
             });
         }
     }
+    let window_start = match query.since {
+        Some(since) => since,
+        None if query.full => 0,
+        None => finished
+            .iter()
+            .filter_map(|track| first_event.get(track.stats.run_id.as_str()))
+            .min()
+            .map_or(0, |id| id - 1),
+    };
+    let backend_failures = backend_failures(events, window_start, next_cursor, |task_id| {
+        query.goal_id.is_none() || task_id.is_some_and(in_goal)
+    });
+    if backend_failures.count >= BACKEND_FAILURES {
+        alerts.push(Alert {
+            kind: "backend_failures",
+            task_id: None,
+            run_id: None,
+            value: backend_failures.count,
+            threshold: BACKEND_FAILURES,
+        });
+    }
     if slots.free_slots > 0 && slots.candidates == 0 && slots.ready > 0 {
         alerts.push(Alert {
             kind: "idle_slots",
@@ -276,8 +324,40 @@ pub fn stats(
         goals: goal_stats,
         overall,
         alerts,
+        backend_failures,
         next_cursor,
     }
+}
+
+/// Aggregate the `backend_call_failed` events with `after < id <= upto`
+/// whose task `counts` accepts.
+fn backend_failures(
+    events: &[RunEvent],
+    after: i64,
+    upto: i64,
+    counts: impl Fn(Option<i64>) -> bool,
+) -> BackendFailures {
+    let mut failures = BackendFailures::default();
+    for event in events.iter().filter(|event| {
+        event.kind == "backend_call_failed"
+            && event.id > after
+            && event.id <= upto
+            && counts(event.task_id)
+    }) {
+        failures.count += 1;
+        let op = event.payload.get("op").and_then(Value::as_str);
+        *failures
+            .by_op
+            .entry(op.unwrap_or("unknown").to_owned())
+            .or_default() += 1;
+        if let Some(load) = event.payload.get("load_avg").and_then(Value::as_f64) {
+            failures.max_load_avg = Some(failures.max_load_avg.map_or(load, |max| max.max(load)));
+        }
+        if let Some(slots) = event.payload.get("slots").and_then(Value::as_i64) {
+            failures.max_slots = Some(failures.max_slots.map_or(slots, |max| max.max(slots)));
+        }
+    }
+    failures
 }
 
 fn alert(kind: &'static str, run: &RunStats, value: i64, threshold: i64) -> Alert {

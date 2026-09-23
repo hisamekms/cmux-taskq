@@ -605,6 +605,56 @@ impl SqliteQueue {
         run_event(&self.conn, id, kind, payload)
     }
 
+    /// Record `backend_call_failed`: on `run` (its id) when the call was for
+    /// one, otherwise with neither a task nor a run.
+    pub fn record_backend_failure(
+        &self,
+        run: Option<&str>,
+        payload: serde_json::Value,
+    ) -> Result<()> {
+        match run {
+            Some(id) => run_event(&self.conn, id, "backend_call_failed", payload),
+            None => {
+                self.conn.execute(
+                    "INSERT INTO run_events(kind,payload) VALUES ('backend_call_failed',?1)",
+                    [serde_json::to_string(&payload)?],
+                )?;
+                Ok(())
+            }
+        }
+    }
+
+    /// The latest run whose session opened in `workspace_id`, if any.
+    pub fn run_in_workspace(&self, workspace_id: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT id FROM task_runs WHERE workspace_id=?1 ORDER BY rowid DESC LIMIT 1",
+                [workspace_id],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
+    /// The slots held and the slots offered when a backend call failed:
+    /// for the supervisor `token`, its leased runs and its `--parallel`;
+    /// without one (`up`, `down`), every lease and the sum over every
+    /// registered supervisor. `parallel` is `None` when no supervisor is
+    /// registered (under `token`).
+    pub fn backend_slots(&self, token: Option<&str>) -> Result<(i64, Option<i64>)> {
+        let slots = self.conn.query_row(
+            "SELECT count(*) FROM run_leases WHERE ?1 IS NULL OR token=?1",
+            [token],
+            |r| r.get(0),
+        )?;
+        let parallel = self.conn.query_row(
+            "SELECT SUM(parallel) FROM supervisors WHERE ?1 IS NULL OR token=?1",
+            [token],
+            |r| r.get(0),
+        )?;
+        Ok((slots, parallel))
+    }
+
     pub fn record_runtime_error(&mut self, id: &str, message: &str) -> Result<()> {
         let tx = self
             .conn

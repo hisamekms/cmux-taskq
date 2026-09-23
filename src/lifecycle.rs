@@ -37,7 +37,7 @@ use crate::{
         runtime_store::HEARTBEAT_TIMEOUT_SECS,
         sqlite::SqliteQueue,
     },
-    runtime::{maintainer_prompt, unix_time},
+    runtime::{RecordingBackend, maintainer_prompt, unix_time},
 };
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Value, json};
@@ -189,6 +189,10 @@ pub fn up(
         })
         .transpose()?;
     let queue = SqliteQueue::open(&db)?;
+    // Every workspace call from here on is recorded when it fails; none of
+    // them is for a run.
+    let recording = RecordingBackend::new(cmux, db.clone(), None);
+    let cmux: &dyn WorkspaceBackend = &recording;
     let workspaces = QueueWorkspaces::new(cmux, &db, location.hash(), &repository.root);
 
     let mut pruned = Vec::new();
@@ -946,6 +950,8 @@ pub fn down(
     options: &DownOptions,
 ) -> Result<Value> {
     let queue = SqliteQueue::open(&location.db)?;
+    let recording = RecordingBackend::new(cmux, location.db.clone(), None);
+    let cmux: &dyn WorkspaceBackend = &recording;
     // Every registration is considered for the workspace close, whichever
     // path this `down` takes: the rule is the same for all of them, and a
     // queue can hold supervisors of both modes at once.

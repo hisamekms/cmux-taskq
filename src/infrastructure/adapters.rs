@@ -159,8 +159,19 @@ fn signal(pid: u32, signal: libc::c_int) -> Result<()> {
     Ok(())
 }
 
+/// How long [`output`] lets a command run, and so each cmux call.
+pub const OUTPUT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The 1-minute load average (getloadavg(3)); `None` when it is unavailable.
+pub fn load_average() -> Option<f64> {
+    let mut loads = [0f64; 1];
+    // SAFETY: getloadavg writes at most `nelem` doubles into the buffer.
+    let written = unsafe { libc::getloadavg(loads.as_mut_ptr(), 1) };
+    (written >= 1 && loads[0].is_finite()).then_some(loads[0])
+}
+
 pub fn output(command: &mut Command) -> Result<String> {
-    let (status, stdout, stderr) = capture(command, Duration::from_secs(30))?;
+    let (status, stdout, stderr) = capture(command, OUTPUT_TIMEOUT)?;
     ensure!(
         status.success(),
         "{:?} failed ({status}): {stderr}",
@@ -787,6 +798,11 @@ impl WorkspaceBackend for Cmux {
     fn preflight_detached(&self, environment: &SupervisorEnvironment) -> Result<()> {
         self.preflight_detached_within(environment, DETACHED_PING_TIMEOUT)
     }
+
+    fn call_timeout(&self) -> Duration {
+        OUTPUT_TIMEOUT
+    }
+
     fn create(
         &self,
         task: &Task,
