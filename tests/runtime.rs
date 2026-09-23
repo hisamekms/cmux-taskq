@@ -1,10 +1,10 @@
 use anyhow::{Result, bail, ensure};
 use dagq::{
     VERSION,
-    application::{AgentProvider, SupervisorEnvironment, TaskStore, WorkspaceBackend},
+    application::{AgentProvider, MainRemote, SupervisorEnvironment, TaskStore, WorkspaceBackend},
     domain::{GoalEdit, NewGoal, NewTask, RunStatus, Task, TaskAction, TaskRun, TaskStatus},
     infrastructure::{
-        adapters::{shell_join, workspace_handle},
+        adapters::{GitRepository, shell_join, workspace_handle},
         sqlite::SqliteQueue,
     },
     runtime::{self, IntegrateTarget, SuperviseOptions},
@@ -1833,12 +1833,197 @@ fn git_out(repo: &Path, args: &[&str]) -> String {
     String::from_utf8(result.stdout).unwrap().trim().to_owned()
 }
 
+/// `integrate` as the CLI runs it without `--no-push`: pushing through the
+/// real Git adapter, which finds no origin in the fixtures.
 fn integrate(db: &Path, task_id: i64, repo: &Path) -> Result<Value> {
-    runtime::integrate(db, IntegrateTarget::Task(task_id), repo)
+    let remote = GitRepository::inspect(repo).ok();
+    runtime::integrate(
+        db,
+        IntegrateTarget::Task(task_id),
+        repo,
+        remote.as_ref().map(|r| r as &dyn MainRemote),
+    )
 }
 
 fn integrate_next(db: &Path, repo: &Path) -> Value {
-    runtime::integrate(db, IntegrateTarget::Next, repo).unwrap()
+    let remote = GitRepository::inspect(repo).unwrap();
+    runtime::integrate(db, IntegrateTarget::Next, repo, Some(&remote)).unwrap()
+}
+
+/// A Git remote double: `origin` exists unless `missing`, and a push fails
+/// with `failure` when set. Every push is counted.
+#[derive(Default)]
+struct TestRemote {
+    missing: bool,
+    failure: Option<String>,
+    pushes: Mutex<Vec<String>>,
+}
+
+impl MainRemote for TestRemote {
+    fn has_remote(&self, remote: &str) -> Result<bool> {
+        Ok(!self.missing && remote == "origin")
+    }
+
+    fn push_main(&self, remote: &str) -> Result<()> {
+        self.pushes.lock().unwrap().push(remote.to_owned());
+        match &self.failure {
+            Some(failure) => bail!("{failure}"),
+            None => Ok(()),
+        }
+    }
+}
+
+fn integrate_with(db: &Path, repo: &Path, remote: Option<&dyn MainRemote>) -> Value {
+    runtime::integrate(db, IntegrateTarget::Task(1), repo, remote).unwrap()
+}
+
+fn events_of(db: &Path, run_id: &str, kind: &str) -> Vec<Value> {
+    SqliteQueue::open(db)
+        .unwrap()
+        .run_events(run_id)
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.kind == kind)
+        .map(|e| e.payload)
+        .collect()
+}
+
+#[test]
+fn integrate_pushes_the_landed_main_to_origin() {
+    let (_dir, repo, db, run) = awaiting_run();
+    let remote = TestRemote::default();
+    let outcome = integrate_with(&db, &repo, Some(&remote));
+    assert_eq!(outcome["outcome"], "integrated", "{outcome}");
+    assert_eq!(
+        outcome["push"],
+        json!({"outcome": "pushed", "remote": "origin", "error": null})
+    );
+    assert_eq!(*remote.pushes.lock().unwrap(), ["origin"]);
+    let landed = git_out(&repo, &["rev-parse", "main"]);
+    assert_eq!(
+        events_of(&db, &run.id, "push_finished"),
+        [json!({"remote": "origin", "commit": landed})]
+    );
+    let status = runtime::status(&db).unwrap();
+    assert!(run_attention_of(&status, &run.id).is_none(), "{status}");
+}
+
+#[test]
+fn a_failed_push_keeps_the_landing_and_waits_as_attention() {
+    let (_dir, repo, db, run) = awaiting_run();
+    let remote = TestRemote {
+        failure: Some("rejected: fetch first".into()),
+        ..TestRemote::default()
+    };
+    let outcome = integrate_with(&db, &repo, Some(&remote));
+    assert_eq!(outcome["outcome"], "integrated", "{outcome}");
+    assert_eq!(outcome["run"]["status"], "integrated");
+    assert_eq!(outcome["task"]["status"], "completed");
+    assert_eq!(outcome["push"]["outcome"], "failed");
+    assert_eq!(outcome["push"]["remote"], "origin");
+    assert_eq!(outcome["push"]["error"], "rejected: fetch first");
+    let landed = git_out(&repo, &["rev-parse", "main"]);
+    assert_eq!(
+        events_of(&db, &run.id, "push_failed"),
+        [json!({"remote": "origin", "commit": landed, "error": "rejected: fetch first"})]
+    );
+    let mut queue = SqliteQueue::open(&db).unwrap();
+    assert_eq!(queue.show(1).unwrap().task.status, TaskStatus::Completed);
+    drop(queue);
+
+    // `status` keeps it as an attention on the integrated run, and `events`
+    // reports the push_failed event with its next.
+    let status = runtime::status(&db).unwrap();
+    assert_eq!(
+        run_attention_of(&status, &run.id).unwrap(),
+        &json!({
+            "run_id": run.id, "task_id": 1, "status": "integrated",
+            "kind": "push_failed", "last_error": "rejected: fetch first", "next": "push main",
+        })
+    );
+    let events = dagq::watch::events(&db, 0, 100, false).unwrap();
+    let failed = events["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["kind"] == "push_failed")
+        .unwrap();
+    assert_eq!(failed["next"], "push main");
+    assert_eq!(failed["reason"], "rejected: fetch first");
+
+    // A later successful push carries this landing too and clears it.
+    SqliteQueue::open(&db)
+        .unwrap()
+        .record_runtime_event(&run.id, "push_finished", json!({"remote": "origin"}))
+        .unwrap();
+    let status = runtime::status(&db).unwrap();
+    assert!(run_attention_of(&status, &run.id).is_none(), "{status}");
+}
+
+#[test]
+fn no_push_and_a_missing_origin_skip_the_push() {
+    let (_dir, repo, db, run) = awaiting_run();
+    let remote = TestRemote::default();
+    let outcome = integrate_with(&db, &repo, None);
+    assert_eq!(outcome["outcome"], "integrated", "{outcome}");
+    assert_eq!(
+        outcome["push"],
+        json!({"outcome": "skipped", "remote": "origin", "error": null, "reason": "--no-push"})
+    );
+    assert!(remote.pushes.lock().unwrap().is_empty());
+    let skipped = events_of(&db, &run.id, "push_skipped");
+    assert_eq!(skipped.len(), 1);
+    assert_eq!(skipped[0]["reason"], "--no-push");
+
+    let (_dir, repo, db, run) = awaiting_run();
+    let remote = TestRemote {
+        missing: true,
+        ..TestRemote::default()
+    };
+    let outcome = integrate_with(&db, &repo, Some(&remote));
+    assert_eq!(outcome["push"]["outcome"], "skipped", "{outcome}");
+    assert_eq!(
+        outcome["push"]["reason"],
+        "the repository has no remote origin"
+    );
+    assert!(remote.pushes.lock().unwrap().is_empty());
+    assert_eq!(events_of(&db, &run.id, "push_skipped").len(), 1);
+}
+
+/// The real Git adapter pushes main to a bare origin, and reports Git's
+/// error when origin cannot take it.
+#[test]
+fn git_adapter_pushes_main_to_a_bare_origin() {
+    let (dir, repo, db, run) = awaiting_run();
+    let origin = dir.path().join("origin.git");
+    let made = Command::new("git")
+        .args(["init", "--bare", "-b", "main"])
+        .arg(&origin)
+        .output()
+        .unwrap();
+    assert!(made.status.success());
+    git(
+        &repo,
+        &["remote", "add", "origin", origin.to_str().unwrap()],
+    );
+    let outcome = integrate(&db, 1, &repo).unwrap();
+    assert_eq!(outcome["push"]["outcome"], "pushed", "{outcome}");
+    assert_eq!(
+        git_out(&origin, &["rev-parse", "main"]),
+        git_out(&repo, &["rev-parse", "main"])
+    );
+    assert_eq!(events_of(&db, &run.id, "push_finished").len(), 1);
+
+    // An origin that is not a repository fails the push with Git's message.
+    let adapter = GitRepository::inspect(&repo).unwrap();
+    git(
+        &repo,
+        &["remote", "set-url", "origin", "/nonexistent/origin.git"],
+    );
+    assert!(adapter.has_remote("origin").unwrap());
+    assert!(!adapter.has_remote("upstream").unwrap());
+    let error = format!("{:#}", adapter.push_main("origin").unwrap_err());
+    assert!(error.contains("git push origin main failed"), "{error}");
 }
 
 /// A task whose fake agent commits `file` with `content`; verification
@@ -2121,10 +2306,12 @@ fn conflict_free_run_lands_as_one_squash_commit_and_releases_dependents() {
     assert!(error.contains("the queue is bound to"), "{error}");
     assert!(integrate(&db, 1, &dir.path().join("missing")).is_err());
 
-    // Landing from the run's own worktree resolves the same repository.
+    // Landing from the run's own worktree resolves the same repository,
+    // and the push that follows the worktree's removal still reaches Git.
     let worktree = PathBuf::from(run.worktree_path.as_ref().unwrap());
     let outcome = integrate(&db, 1, &worktree).unwrap();
     assert_eq!(outcome["outcome"], "integrated", "{outcome}");
+    assert_eq!(outcome["push"]["outcome"], "skipped", "{outcome}");
     // Main has not moved, so the rebase was a no-op and the verification
     // commands were not run a second time on the validated tree.
     assert_eq!(outcome["verification_skipped"], json!(true), "{outcome}");

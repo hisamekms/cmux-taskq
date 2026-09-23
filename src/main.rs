@@ -191,7 +191,7 @@ enum Command {
         #[arg(long, default_value = "cmux")]
         cmux: PathBuf,
     },
-    /// Land a validated run on main: rebase, re-validate, squash into one commit, complete the task.
+    /// Land a validated run on main: rebase, re-validate, squash into one commit, complete the task, then push main to origin.
     Integrate {
         /// Task whose run awaits integration or comes back from a session.
         #[arg(required_unless_present = "next", conflicts_with = "next")]
@@ -203,6 +203,9 @@ enum Command {
         /// Must be the repository the queue is bound to.
         #[arg(long)]
         repo: Option<PathBuf>,
+        /// Do not push the landed main to origin (recorded as push_skipped).
+        #[arg(long)]
+        no_push: bool,
     },
     /// Write the review material of the task's run awaiting integration or a session to <run_dir>/review.md and report its path and diff size; the diff itself is only in the file.
     Review {
@@ -598,13 +601,31 @@ fn execute(cli: Cli) -> Result<Value> {
                 },
             )?
         }
-        Command::Integrate { id, next, repo } => {
-            use dagq::runtime::IntegrateTarget;
+        Command::Integrate {
+            id,
+            next,
+            repo,
+            no_push,
+        } => {
+            use dagq::{infrastructure::adapters::GitRepository, runtime::IntegrateTarget};
             let target = match (id, next) {
                 (Some(id), false) => IntegrateTarget::Task(id),
                 _ => IntegrateTarget::Next,
             };
-            dagq::runtime::integrate(&db, target, &checkout(repo))?
+            let repo = checkout(repo);
+            let remote = if no_push {
+                None
+            } else {
+                Some(GitRepository::inspect(&repo)?)
+            };
+            dagq::runtime::integrate(
+                &db,
+                target,
+                &repo,
+                remote
+                    .as_ref()
+                    .map(|r| r as &dyn dagq::application::MainRemote),
+            )?
         }
         Command::Review { id } => dagq::runtime::review(&db, id)?,
         Command::Doctor { full } => dagq::runtime::doctor(&db, full)?,

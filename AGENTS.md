@@ -45,7 +45,7 @@ cargo clippy --locked --all-targets -- -D warnings
 
 ## コミット
 
-- run session は自分の run branch `dagq/<run-id>` にコミットする。main への着地は `dagq integrate` だけが行い（1 タスク 1 squash commit）、push は maintainer だけが行う
+- run session は自分の run branch `dagq/<run-id>` にコミットする。main への着地は `dagq integrate` だけが行い（1 タスク 1 squash commit）、push は integrate が行う（`push_failed` の attention が出たら maintainer が原因を直して `git push origin main`）
 - メッセージは `feat:` / `fix:` / `docs:` / `test:` の接頭辞、本文は何をなぜ変えたか。着地時の commit メッセージはタスクの title と receipt の summary から runtime が作る
 
 ## 役割: supervisor と maintainer と worker
@@ -69,7 +69,7 @@ dagq up --in-cmux --claude ~/.local/bin/claude --plugin-dir <この repository>/
 - 操作は plugin の `dagq`（登録・参照）/ `dagq-maintain`（up / down、status、watch）/ `dagq-land`（review と着地）/ `dagq-session`（run の session への応答、needs_session の resume、workspace の close）/ `dagq-recover` skill に従う。compaction と `/clear` の後は plugin の SessionStart hook が `status` を出すので、それを起点に `dagq-maintain` の手順へ戻る。CLI の外で状態を持たず、DB は手で直さない（例外は無い。repository を移動したときの束縛の付け替えも `rebind` で行う。[ADR-0020](docs/adr/0020-rebind-queue-to-a-moved-repository.md)）。`cmux read-screen` は当面の一次情報として認める
 - バイナリは「作業中」のとおり固定した `~/.local/bin/dagq` だけを使う（`~/.local/bin` が PATH にあるので supervisor の起動でも同じものが動く）。キューは cwd から解決されるので、コマンドは repository の中（どの worktree でもよい）で実行する
 - runtime（`src/`）を変えた run は、`integrate` の前に receipt の `e2e` の evidence と run_dir の log を確認する。e2e は自分では再実行せず、evidence が無い・不十分なときだけ worker の session に差し戻す
-- push は maintainer だけが行う。着手と着地はユーザーに報告するが承認は待たない。ユーザーの判断が要るとき（受け入れ条件の変更、固定バイナリの更新、DB に触らずに解消できない詰まり）だけ報告して待つ
+- push は integrate が行う（[ADR-0019](docs/adr/0019-move-routine-maintainer-work-into-the-runtime.md)）。`push_failed` の attention（next: push main）が出たら原因を直して `git push origin main` を打つ。着手と着地はユーザーに報告するが承認は待たない。ユーザーの判断が要るとき（受け入れ条件の変更、固定バイナリの更新、DB に触らずに解消できない詰まり）だけ報告して待つ
 - 権限確認は worktree 内の編集・cargo・git など安全なものは maintainer が応答し、それ以外とユーザーの判断が要るものはユーザーに確認する
 
 ### worker

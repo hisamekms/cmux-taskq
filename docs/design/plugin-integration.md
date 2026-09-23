@@ -83,7 +83,7 @@ plugins/claude-dagq/
   skills/dagq-maintain/           maintainer のループ: 役割、up、status の読み方と attention の振り分け、watch の background 実行、権限の線引き、down
     reference/up-down.md            up / down の出力、別 version の入替、cmux の接続拒否と --in-cmux、in_cmux の down、log
     reference/status.md             status / watch / events / show のフィールド、run の状態一覧
-  skills/dagq-land/               review ID → subagent に review.md の path を渡して結論だけ受け取る → ユーザーの承認 → integrate → push、follow_ups の報告
+  skills/dagq-land/               review ID → subagent に review.md の path を渡して結論だけ受け取る → ユーザーの承認 → integrate（着地後に origin へ push する）、follow_ups の報告
     reference/integrate.md          review.md の中身、integrate の再検証と skip、outcome、--next
   skills/dagq-session/            run の session への操作: trust / permission prompt と質問への応答、exit_request_timed_out の /exit、failed / interrupted の workspace close、needs_session の resume
     reference/cmux.md               read-screen / send-key / send / workspace close の使い方

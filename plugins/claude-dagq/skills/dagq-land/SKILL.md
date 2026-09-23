@@ -1,6 +1,6 @@
 ---
 name: dagq-land
-description: Review a dagq run that is awaiting_integration and, once the user approves it, land it on main with integrate and push main. The review runs in a subagent from the review.md file that review ID writes, so the diff never enters this session. Use when status or watch reports "review and integrate", or when the user asks to review, approve, integrate, land, or push a finished dagq task. Not for fixing a needs_session run (dagq-session) or a stuck integrating lease (dagq-recover).
+description: Review a dagq run that is awaiting_integration and, once the user approves it, land it on main with integrate, which also pushes main to origin. The review runs in a subagent from the review.md file that review ID writes, so the diff never enters this session. Use when status or watch reports "review and integrate", or when the user asks to review, approve, integrate, land, or push a finished dagq task. Not for fixing a needs_session run (dagq-session) or a stuck integrating lease (dagq-recover).
 ---
 
 # dagq: review a run and land it on main
@@ -35,18 +35,14 @@ If the user wants changes, the run goes back to a session: see the `dagq-session
 
 `integrate` rebases the run onto the current `main`, re-validates it (rerunning the verification commands unless the rebase was a no-op on the head the supervisor already verified), squashes it into one commit on `main` and removes the worktree and branch. Read `outcome`:
 
-- `integrated`: `run.result_commit` is the new `main` head and the task is `completed`; dependents become candidates.
+- `integrated`: `run.result_commit` is the new `main` head and the task is `completed`; dependents become candidates. `push` says what became of pushing `main` to `origin`: `pushed`, `skipped` (`reason`: `--no-push`, or the repository has no `origin`) or `failed` (`error`). The landing stands in every case.
 - `needs_session`: nothing reached `main`; `reason` names the conflicting files or the failed verification. Report it and continue with the `dagq-session` skill.
 - `failed`: the run's receipt reported `failed`; the task stays `in_progress` (`ready ID` retries, `cancel ID` drops it).
 
 An error (exit status 1) leaves `main` untouched and puts the run back with the message in `last_error`; a `main` checkout with uncommitted changes that overlap the landing is a common cause. Fix it and run `integrate` again. `${CLAUDE_PLUGIN_ROOT}/skills/dagq-land/reference/integrate.md` has the details (`--next`, re-validation, logs, what review.md holds); read it only when an outcome is unclear.
 
-## 5. Push and report
+## 5. Report, and push only after a failed push
 
-After `integrated`, push the landed `main` when the repository's workflow has the maintainer push it:
-
-```sh
-git push origin main
-```
+`integrate` pushes `main` to `origin` itself; do not run `git push` after a `pushed` or `skipped` outcome (use `integrate ID --no-push` where the repository must not be pushed). When `push.outcome` is `failed`, or `status` / `watch` shows the attention `push main` (`kind: push_failed`), report `error` to the user, fix its cause (with the user's go-ahead when it needs one, such as a rejected non-fast-forward or credentials), then run `git push origin main`. The attention clears at the next successful push by `integrate`.
 
 Report the outcome: the task, the landed commit, what it unblocked, and the receipt's `follow_ups` again so the user can have them registered with the `dagq` skill (`add --goal ID` on the task's goal, or a plain `add`).

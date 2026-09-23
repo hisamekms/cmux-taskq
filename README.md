@@ -257,7 +257,7 @@ If the rebase conflicts, `integrate` aborts it, leaves the worktree on its valid
 
 An error before `main` moves (a missing worktree, a `main` checkout with local changes that collide with the landing, a Git failure) puts the run back where it was with the message in `last_error` and an `integration_error` event; fix the cause and run `integrate` again. An `integrate` process that dies leaves its run `integrating` with a stale lease: `doctor` lists it, and `recover RUN_ID` returns it to `awaiting_integration` once the process is gone. A task with no run awaiting integration or a session is an error, so a task cannot be landed twice.
 
-The landing happens in the working directory's repository; pass `--repo PATH` to name another checkout, for example when using `--db` from elsewhere. Either way it must be the repository the queue is bound to: a queue resolved from the working directory is bound by `init`, a `--db` queue by its first `supervise`, and a mismatch is an error. Pushing `main` stays with you.
+The landing happens in the working directory's repository; pass `--repo PATH` to name another checkout, for example when using `--db` from elsewhere. Either way it must be the repository the queue is bound to: a queue resolved from the working directory is bound by `init`, a `--db` queue by its first `supervise`, and a mismatch is an error. After landing, `integrate` pushes `main` to `origin` (`push` in its output: `pushed`, `skipped` when there is no `origin` or with `--no-push`, or `failed`). A failed push keeps the landing, is recorded as `push_failed` and shows in `status` as the attention `push main`; fix the cause and run `git push origin main`.
 
 ## Move the repository or the queue
 
@@ -298,7 +298,7 @@ The queue is the one of the repository you run Claude Code in, resolved by the b
 | --- | --- |
 | `/claude-dagq:dagq` | Locate the binary and queue, `init`, register a goal with `goal add` and decompose it into tasks with `add --goal` (description, acceptance, `--verify`, `--depends-on`, `--context`), `ready`, `list` / `show` / `candidates` / `locate` / `status` / `doctor`, how to read run states, close a goal |
 | `/claude-dagq:dagq-maintain` | The maintainer's loop: start the runtime with `up`, read `status` (supervisor health, attention, cursor), run `watch --after <cursor>` in the background and report each attention, stop the runtime with `down`; landing waits for the user's approval |
-| `/claude-dagq:dagq-land` | Write `review.md` with `review ID`, have a subagent review it and return only a verdict, then, after the user approves, `integrate` and push `main`, reporting a receipt's `follow_ups` |
+| `/claude-dagq:dagq-land` | Write `review.md` with `review ID`, have a subagent review it and return only a verdict, then, after the user approves, `integrate` (which pushes `main`), reporting a receipt's `follow_ups` |
 | `/claude-dagq:dagq-session` | Act on a run's session: answer its trust or permission prompt, send `/exit` after `exit_request_timed_out`, close the workspace of a failed run, resume a `needs_session` run |
 | `/claude-dagq:dagq-recover` | `doctor`, `recover RUN_ID` for one run without disturbing the others, retry with `ready` |
 

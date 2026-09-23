@@ -15,6 +15,7 @@ Read this when a field of `status`, `watch` or `show` is unclear.
   - `resume session`: `needs_session`.
   - `inspect and close workspace`: `failed`.
   - `send /exit`: a `running` run whose exit request timed out.
+  - `push main`: an `integrated` run (its task `completed`) whose push of `main` to `origin` failed (`kind` `push_failed`, `last_error` the Git error) with no successful push since.
   - `restart supervisor`: `kind` `supervisor_stale` (with its `pid`) or `supervisor_stopped` (nothing registered).
 - `cursor`: the newest event id.
 

@@ -297,6 +297,16 @@ pub trait AgentProvider {
     fn command(&self, run: &crate::domain::TaskRun, prompt: &str) -> Result<std::process::Command>;
 }
 
+/// The Git remote `integrate` pushes the landed `main` to (ADR-0019
+/// decision 3), replaceable in tests.
+pub trait MainRemote {
+    /// Whether the repository has a remote named `remote`.
+    fn has_remote(&self, remote: &str) -> Result<bool>;
+    /// Push `refs/heads/main` to the same branch of `remote`. An error is
+    /// the failed push, with Git's message.
+    fn push_main(&self, remote: &str) -> Result<()>;
+}
+
 /// The environment variables the LaunchAgent gives the supervisor, which
 /// is all a launchd-started process keeps of the shell that ran `up`: its
 /// PATH and, only when that shell exported it, the cmux socket password.

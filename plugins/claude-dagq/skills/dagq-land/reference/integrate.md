@@ -19,6 +19,8 @@ The `verify-N.log` files in `run_dir` (`show ID --full`) hold the supervisor's o
 
 When the rebase is a no-op and the worktree head is still the run's `result_commit` (the commit the supervisor's validation ran the commands on), `integrate` skips the rerun and writes no `integrate-verify-N.log`; this shows as an `integration_verification_skipped` event (`main`, `head`, `reason`) and `verification_skipped: true` in the output and the `run_integrated` payload. A head a session rewrote after `needs_session` is always rerun, which shows as `verification_command` events with `phase: "integration"` and writes `integrate-verify-N.log` in `run_dir`. Files left by an earlier attempt can remain, so judge by the events after the last `integration_rebased` (`show ID --full`), not by the files.
 
+After landing, `integrate` pushes `main` to `origin` (`git push origin main`) and reports it as `push: {outcome, remote, error, reason}` on `integrated`, with the event `push_finished`, `push_skipped` (`--no-push`, or no `origin` remote) or `push_failed` (attention `push main`) on the run. A failed push never undoes the landing or fails `integrate`.
+
 Outcomes: `integrated`, `needs_session` (the rebase was aborted and the worktree is back on `result_commit`, or the failed verification left the rebased tree in the worktree), `failed`, and `no_run_awaiting` (`--next` only; `needs_session` runs are not picked by `--next`).
 
 The landing happens in the current directory's repository; pass `--repo PATH` only when using `DAGQ_DB` from outside it.

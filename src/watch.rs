@@ -37,8 +37,9 @@ pub fn pulses(registrations: &[SupervisorRegistration], now: i64) -> Vec<Supervi
 
 /// What waits for the maintainer now: stale or missing supervisors first,
 /// then the latest run of every `in_progress` task that rests where only the
-/// maintainer or the user moves it on. `kind` is the event that brought the
-/// run there.
+/// maintainer or the user moves it on, then every landed run whose push of
+/// `main` failed with no successful push since. `kind` is the event that
+/// brought the run there.
 pub fn attention(
     queue: &SqliteQueue,
     registrations: &[SupervisorRegistration],
@@ -52,7 +53,7 @@ pub fn attention(
             .rev()
             .find(|e| matches!(e.kind.as_str(), "exit_request_timed_out" | "session_exited"))
             .is_some_and(|e| e.kind == "exit_request_timed_out");
-        let Some(next) = run_attention(run.status, exit_pending) else {
+        let Some(next) = run_attention(run.status, exit_pending, false) else {
             continue;
         };
         let kind = events
@@ -67,6 +68,26 @@ pub fn attention(
             status: run.status.as_str().into(),
             kind,
             last_error: run.last_error.as_deref().map(truncate),
+            next,
+        });
+    }
+    for run in queue.runs_with_pending_push()? {
+        let Some(next) = run_attention(run.status, false, true) else {
+            continue;
+        };
+        let error = queue
+            .run_events(&run.id)?
+            .into_iter()
+            .rev()
+            .find(|e| e.kind == "push_failed")
+            .and_then(|e| e.payload.get("error").and_then(Value::as_str).map(truncate));
+        attention.push(Attention {
+            run_id: Some(run.id),
+            task_id: Some(run.task_id),
+            pid: None,
+            status: run.status.as_str().into(),
+            kind: "push_failed".into(),
+            last_error: error,
             next,
         });
     }

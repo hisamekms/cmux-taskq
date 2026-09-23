@@ -5,11 +5,11 @@
 //! A run whose supervisor died while its session lives on is adopted by a
 //! supervisor with a free slot instead of being rerun (ADR-0012).
 use crate::{
-    application::{AgentProvider, TaskStore, WorkspaceBackend, dependency_graph},
+    application::{AgentProvider, MainRemote, TaskStore, WorkspaceBackend, dependency_graph},
     domain::{
-        ClaimOutcome, Goal, IntegrationOutcome, Predecessor, Receipt, ReceiptResult, RunLease,
-        RunPaths, RunProcess, RunStatus, SupervisorMode, SupervisorRegistration, Task, TaskRun,
-        heartbeat_stale,
+        ClaimOutcome, Goal, IntegrationOutcome, PUSH_REMOTE, Predecessor, PushReport, PushResult,
+        Receipt, ReceiptResult, RunLease, RunPaths, RunProcess, RunStatus, SupervisorMode,
+        SupervisorRegistration, Task, TaskRun, heartbeat_stale,
     },
     infrastructure::{
         adapters::{
@@ -1070,8 +1070,16 @@ pub enum IntegrateTarget {
 /// the run branch itself. A conflict or a failed re-validation parks the run
 /// as `needs_session` for a resumed session to fix; a rewritten receipt that
 /// reports `failed` ends the run. `repo` is any checkout of the repository
-/// the queue is bound to.
-pub fn integrate(db: &Path, target: IntegrateTarget, repo: &Path) -> Result<Value> {
+/// the queue is bound to. After a landing, `main` is pushed to `origin`
+/// through `remote` (ADR-0019 decision 3); `None` is `--no-push`. The push
+/// never changes the landing: its outcome is an event and the `push` of the
+/// result.
+pub fn integrate(
+    db: &Path,
+    target: IntegrateTarget,
+    repo: &Path,
+    remote: Option<&dyn MainRemote>,
+) -> Result<Value> {
     let db = db
         .canonicalize()
         .context("queue must already be initialized")?;
@@ -1160,10 +1168,12 @@ pub fn integrate(db: &Path, target: IntegrateTarget, repo: &Path) -> Result<Valu
                 task.id, landing.commit, run.id
             );
             remove_landed_worktree(&mut queue, &repository, &run);
+            let push = push_main(&queue, remote, &run.id, &landing.commit);
             IntegrationOutcome::Integrated {
                 task,
                 run: Box::new(run),
                 verification_skipped,
+                push: Box::new(push),
             }
         }
         Verdict::Deferred { reason, detail } => {
@@ -1186,6 +1196,70 @@ pub fn integrate(db: &Path, target: IntegrateTarget, repo: &Path) -> Result<Valu
     };
     drop(heartbeat); // Stops the lease heartbeat before this process reports.
     Ok(serde_json::to_value(outcome)?)
+}
+
+/// Push the landed `main` to [`PUSH_REMOTE`] and record the outcome as
+/// `push_finished`, `push_skipped` or `push_failed` on the landed run. A
+/// failure to record is only reported: the landing stands either way.
+fn push_main(
+    queue: &SqliteQueue,
+    remote: Option<&dyn MainRemote>,
+    run_id: &str,
+    commit: &str,
+) -> PushReport {
+    let skipped = |reason: &str| PushReport {
+        outcome: PushResult::Skipped,
+        remote: PUSH_REMOTE.to_owned(),
+        error: None,
+        reason: Some(reason.to_owned()),
+    };
+    let report = match remote {
+        None => skipped("--no-push"),
+        Some(remote) => match remote.has_remote(PUSH_REMOTE) {
+            Ok(false) => skipped(&format!("the repository has no remote {PUSH_REMOTE}")),
+            Ok(true) => match remote.push_main(PUSH_REMOTE) {
+                Ok(()) => PushReport {
+                    outcome: PushResult::Pushed,
+                    remote: PUSH_REMOTE.to_owned(),
+                    error: None,
+                    reason: None,
+                },
+                Err(error) => failed_push(&error),
+            },
+            Err(error) => failed_push(&error),
+        },
+    };
+    let (kind, payload) = match report.outcome {
+        PushResult::Pushed => (
+            "push_finished",
+            json!({"remote": report.remote, "commit": commit}),
+        ),
+        PushResult::Skipped => (
+            "push_skipped",
+            json!({"remote": report.remote, "commit": commit, "reason": report.reason}),
+        ),
+        PushResult::Failed => (
+            "push_failed",
+            json!({"remote": report.remote, "commit": commit, "error": report.error}),
+        ),
+    };
+    match &report.error {
+        Some(error) => eprintln!("run {run_id}: push of main failed: {error}"),
+        None => eprintln!("run {run_id}: {kind} ({PUSH_REMOTE})"),
+    }
+    if let Err(error) = queue.record_runtime_event(run_id, kind, payload) {
+        eprintln!("run {run_id}: could not record {kind}: {error:#}");
+    }
+    report
+}
+
+fn failed_push(error: &anyhow::Error) -> PushReport {
+    PushReport {
+        outcome: PushResult::Failed,
+        remote: PUSH_REMOTE.to_owned(),
+        error: Some(format!("{error:#}")),
+        reason: None,
+    }
 }
 
 enum Verdict {

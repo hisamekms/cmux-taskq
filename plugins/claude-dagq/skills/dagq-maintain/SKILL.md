@@ -33,6 +33,7 @@ Read, in this order:
    - `review and integrate` (`awaiting_integration`): the `dagq-land` skill.
    - `resume session` (`needs_session`), `inspect and close workspace` (`failed`), `send /exit` (exit request timed out): the `dagq-session` skill.
    - `restart supervisor` (`supervisor_stale`, `supervisor_stopped`): `up` as in step 1.
+   - `push main` (`push_failed` on an `integrated` run): `integrate` landed it but could not push; the `dagq-land` skill, step 5.
 3. `runs`: unfinished runs with their leases. A run in progress needs nothing from you.
 4. `cursor`: the newest event id, where the next `watch` starts.
 
@@ -51,7 +52,7 @@ Do not poll `status`, `show` or `doctor` in a loop. Wait for the next attention 
 
 ## 4. Where your authority ends
 
-- Report and wait: landing (`integrate`), pushing `main`, `down --force`, `recover`, changing a task's acceptance, and anything outside a run's own worktree need the user's go-ahead.
+- Report and wait: landing (`integrate`), pushing `main` by hand after a `push_failed`, `down --force`, `recover`, changing a task's acceptance, and anything outside a run's own worktree need the user's go-ahead.
 - Do yourself, without asking: `up`, `status`, `watch`, `show`, `review`, answering a run's trust or permission prompt about its own worktree (`dagq-session`), and reporting.
 - Registering new work (a receipt's `follow_ups`, a new goal) follows the `dagq` skill once the user agrees.
 

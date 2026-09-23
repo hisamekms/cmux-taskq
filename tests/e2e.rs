@@ -588,13 +588,32 @@ fn happy_path_runs_a_stub_agent_through_cmux_and_lands_on_main() {
     assert_eq!(status["supervisors"], Value::Array(vec![]), "{status}");
     assert_eq!(status["runs"], Value::Array(vec![]), "{status}");
 
-    // Landing is the runtime's job: one squash commit on main with the run's tree.
+    // Landing is the runtime's job: one squash commit on main with the run's
+    // tree, pushed to the repository's bare origin.
+    let origin = repo.parent().unwrap().join("origin.git");
+    git(
+        repo.parent().unwrap(),
+        &[
+            "init",
+            "-q",
+            "--bare",
+            "-b",
+            "main",
+            origin.to_str().unwrap(),
+        ],
+    );
+    git(repo, &["remote", "add", "origin", origin.to_str().unwrap()]);
     let integrated = dagq(env, &["integrate", &task_id]);
     assert_eq!(integrated["outcome"], "integrated", "{integrated}");
     assert_eq!(integrated["task"]["status"], "completed");
     assert_eq!(integrated["run"]["status"], "integrated");
     let main = git(repo, &["rev-parse", "main"]);
     assert_ne!(main, head);
+    assert_eq!(
+        integrated["push"],
+        serde_json::json!({"outcome": "pushed", "remote": "origin", "error": null})
+    );
+    assert_eq!(git(&origin, &["rev-parse", "main"]), main);
     assert_eq!(integrated["run"]["result_commit"], main.as_str());
     assert_eq!(git(repo, &["rev-parse", "main^"]), base);
     assert_eq!(
@@ -630,6 +649,7 @@ fn happy_path_runs_a_stub_agent_through_cmux_and_lands_on_main() {
         "integration_rebased",
         "run_integrated",
         "worktree_removed",
+        "push_finished",
     ] {
         assert!(kinds.contains(&expected), "missing {expected} in {kinds:?}");
     }
@@ -974,6 +994,12 @@ fn killed_supervisor_run_is_adopted_by_the_next_supervisor_and_lands() {
     let integrated = dagq(env, &["integrate", &task_id]);
     assert_eq!(integrated["outcome"], "integrated", "{integrated}");
     assert_eq!(integrated["task"]["status"], "completed");
+    // No origin in this repository: the push is skipped and the landing stands.
+    assert_eq!(integrated["push"]["outcome"], "skipped", "{integrated}");
+    assert_eq!(
+        integrated["push"]["reason"],
+        "the repository has no remote origin"
+    );
     assert_eq!(
         fs::read_to_string(repo.join("e2e.txt")).unwrap(),
         format!("written by the stub agent for {run_id}\n")

@@ -1,6 +1,7 @@
 use crate::{
     application::{
-        AgentProvider, DetachedRefusal, ProcessControl, SupervisorEnvironment, WorkspaceBackend,
+        AgentProvider, DetachedRefusal, MainRemote, ProcessControl, SupervisorEnvironment,
+        WorkspaceBackend,
     },
     domain::{Task, TaskRun},
 };
@@ -690,6 +691,43 @@ impl GitRepository {
                 .arg(&primary)
                 .args(["branch", "-D", branch]),
         )?;
+        Ok(())
+    }
+}
+
+/// How long `integrate` waits for `git push` before counting it as failed.
+const PUSH_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Run against (and from) the common directory, since `root`, or the
+/// working directory, may be a run worktree that the landing removed
+/// before the push.
+impl MainRemote for GitRepository {
+    fn has_remote(&self, remote: &str) -> Result<bool> {
+        let remotes = output(
+            Command::new(&self.git)
+                .current_dir(&self.common_dir)
+                .arg("--git-dir")
+                .arg(&self.common_dir)
+                .arg("remote"),
+        )?;
+        Ok(remotes.lines().any(|line| line.trim() == remote))
+    }
+
+    fn push_main(&self, remote: &str) -> Result<()> {
+        let (status, stdout, stderr) = capture(
+            Command::new(&self.git)
+                .current_dir(&self.common_dir)
+                .arg("--git-dir")
+                .arg(&self.common_dir)
+                .env("GIT_TERMINAL_PROMPT", "0")
+                .args(["push", remote, "refs/heads/main:refs/heads/main"]),
+            PUSH_TIMEOUT,
+        )?;
+        ensure!(
+            status.success(),
+            "git push {remote} main failed ({status}): {}",
+            format!("{}\n{}", stderr.trim(), stdout.trim()).trim()
+        );
         Ok(())
     }
 }

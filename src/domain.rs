@@ -657,7 +657,8 @@ pub enum ClaimOutcome {
 /// verification commands.
 /// `NeedsSession` parked the run for a session to resolve; `Failed` ended it
 /// because its rewritten receipt reported `failed`. `NoRunAwaiting` is
-/// `--next` on an empty queue.
+/// `--next` on an empty queue. `Integrated` also reports the push of the
+/// landed `main` (ADR-0019 decision 3); a failed push leaves the landing as it is.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "outcome", rename_all = "snake_case")]
 pub enum IntegrationOutcome {
@@ -666,6 +667,8 @@ pub enum IntegrationOutcome {
         run: Box<TaskRun>,
         #[serde(default)]
         verification_skipped: bool,
+        #[serde(default)]
+        push: Box<PushReport>,
     },
     NeedsSession {
         run: Box<TaskRun>,
@@ -677,6 +680,38 @@ pub enum IntegrationOutcome {
         reason: String,
     },
     NoRunAwaiting,
+}
+
+/// The remote `integrate` pushes the landed `main` to (ADR-0019 decision 3).
+pub const PUSH_REMOTE: &str = "origin";
+
+string_enum!(PushResult {
+    Pushed => "pushed",
+    Skipped => "skipped",
+    Failed => "failed",
+});
+
+/// What became of the push after a landing: `pushed` (`push_finished`),
+/// `skipped` with its `reason` (`--no-push` or no such remote,
+/// `push_skipped`) or `failed` with Git's `error` (`push_failed`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PushReport {
+    pub outcome: PushResult,
+    pub remote: String,
+    pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+impl Default for PushReport {
+    fn default() -> Self {
+        Self {
+            outcome: PushResult::Skipped,
+            remote: PUSH_REMOTE.to_owned(),
+            error: None,
+            reason: None,
+        }
+    }
 }
 
 /// Completion receipt written by the agent. Its claims are cross-checked by
@@ -896,6 +931,7 @@ string_enum!(AttentionNext {
     InspectAndClose => "inspect and close workspace",
     SendExit => "send /exit",
     RestartSupervisor => "restart supervisor",
+    PushMain => "push main",
 });
 
 /// The `run_events` kinds that can mark an attention. The kind names are a
@@ -908,6 +944,7 @@ pub const ATTENTION_KINDS: &[&str] = &[
     "integration_failed",
     "integration_error",
     "exit_request_timed_out",
+    "push_failed",
 ];
 
 /// Whether a run event is a transition that stops at the maintainer's or the
@@ -934,6 +971,7 @@ pub fn event_attention(kind: &str, payload: &serde_json::Value) -> Option<Attent
             Some(AttentionNext::ResumeSession)
         }
         ("exit_request_timed_out", _) => Some(AttentionNext::SendExit),
+        ("push_failed", _) => Some(AttentionNext::PushMain),
         _ => None,
     }
 }
@@ -941,9 +979,16 @@ pub fn event_attention(kind: &str, payload: &serde_json::Value) -> Option<Attent
 /// Whether a run in `status` waits for the maintainer now. `exit_pending` is
 /// a `running` run whose `/exit` request timed out with no session exit
 /// since. The caller passes only the latest run of an `in_progress` task, so
-/// a failed run stops counting once the task is retried or canceled.
-pub fn run_attention(status: RunStatus, exit_pending: bool) -> Option<AttentionNext> {
+/// a failed run stops counting once the task is retried or canceled, and
+/// the `integrated` run whose push of `main` failed with no successful push
+/// since (`push_pending`), which the task being completed does not end.
+pub fn run_attention(
+    status: RunStatus,
+    exit_pending: bool,
+    push_pending: bool,
+) -> Option<AttentionNext> {
     match status {
+        RunStatus::Integrated if push_pending => Some(AttentionNext::PushMain),
         RunStatus::AwaitingIntegration => Some(AttentionNext::ReviewAndIntegrate),
         RunStatus::NeedsSession => Some(AttentionNext::ResumeSession),
         RunStatus::Failed => Some(AttentionNext::InspectAndClose),
@@ -1075,6 +1120,21 @@ mod attention_tests {
                 json!({"workspace_id": "w", "timeout_secs": 120}),
                 Some(SendExit),
             ),
+            (
+                "push_failed",
+                json!({"remote": "origin", "commit": "c", "error": "x"}),
+                Some(PushMain),
+            ),
+            (
+                "push_finished",
+                json!({"remote": "origin", "commit": "c"}),
+                None,
+            ),
+            (
+                "push_skipped",
+                json!({"remote": "origin", "reason": "x"}),
+                None,
+            ),
             ("integration_rebase_aborted", json!({"reason": "x"}), None),
             ("run_integrated", json!({"result_commit": "x"}), None),
             (
@@ -1106,19 +1166,22 @@ mod attention_tests {
     fn run_attention_follows_the_resting_status() {
         use AttentionNext::*;
         assert_eq!(
-            run_attention(RunStatus::AwaitingIntegration, false),
+            run_attention(RunStatus::AwaitingIntegration, false, false),
             Some(ReviewAndIntegrate)
         );
         assert_eq!(
-            run_attention(RunStatus::NeedsSession, false),
+            run_attention(RunStatus::NeedsSession, false, false),
             Some(ResumeSession)
         );
         assert_eq!(
-            run_attention(RunStatus::Failed, false),
+            run_attention(RunStatus::Failed, false, false),
             Some(InspectAndClose)
         );
-        assert_eq!(run_attention(RunStatus::Running, true), Some(SendExit));
-        assert_eq!(run_attention(RunStatus::Running, false), None);
+        assert_eq!(
+            run_attention(RunStatus::Running, true, false),
+            Some(SendExit)
+        );
+        assert_eq!(run_attention(RunStatus::Running, false, false), None);
         for status in [
             RunStatus::Claimed,
             RunStatus::Starting,
@@ -1128,8 +1191,18 @@ mod attention_tests {
             RunStatus::Succeeded,
             RunStatus::Interrupted,
         ] {
-            assert_eq!(run_attention(status, true), None, "{}", status.as_str());
+            assert_eq!(
+                run_attention(status, true, false),
+                None,
+                "{}",
+                status.as_str()
+            );
         }
+        assert_eq!(
+            run_attention(RunStatus::Integrated, false, true),
+            Some(PushMain)
+        );
+        assert_eq!(run_attention(RunStatus::Succeeded, false, true), None);
     }
 
     #[test]

@@ -866,6 +866,22 @@ impl SqliteQueue {
             .collect::<rusqlite::Result<_>>()?)
     }
 
+    /// The `integrated` runs whose push of `main` failed after the latest
+    /// successful push (`push_finished`), oldest first. A later successful
+    /// push carries every earlier landing, so it clears them all.
+    pub fn runs_with_pending_push(&self) -> Result<Vec<TaskRun>> {
+        Ok(self
+            .conn
+            .prepare(
+                "SELECT r.* FROM task_runs r WHERE r.status='integrated'
+                 AND r.id IN (SELECT run_id FROM run_events WHERE kind='push_failed'
+                   AND id>(SELECT COALESCE(MAX(id),0) FROM run_events WHERE kind='push_finished'))
+                 ORDER BY r.rowid",
+            )?
+            .query_map([], run_row(&self.runs_dir))?
+            .collect::<rusqlite::Result<_>>()?)
+    }
+
     /// Every run in one status, oldest first; `up` reports the runs that
     /// wait for the maintainer (`awaiting_integration`, `needs_session`).
     pub fn runs_with_status(&self, status: crate::domain::RunStatus) -> Result<Vec<TaskRun>> {
