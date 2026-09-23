@@ -13,6 +13,7 @@ related:
   - adr-0010
   - adr-0016
   - adr-0018
+  - adr-0019
   - adr-0021
 ---
 
@@ -83,7 +84,7 @@ plugins/claude-dagq/
   skills/dagq-maintain/           maintainer のループ: 役割、up、status の読み方と attention の振り分け、watch の background 実行、権限の線引き、down
     reference/up-down.md            up / down の出力、別 version の入替、cmux の接続拒否と --in-cmux、in_cmux の down、log
     reference/status.md             status / watch / events / show のフィールド、run の状態一覧
-  skills/dagq-land/               review ID → subagent に review.md の path を渡して結論だけ受け取る → ユーザーの承認 → integrate（着地後に origin へ push する）、follow_ups の報告
+  skills/dagq-land/               review ID → subagent に review.md の path を渡して結論だけ受け取る → ユーザーの承認 → integrate（着地後に origin へ push し、follow_ups を draft task として登録する）、draft を ready にするかをユーザーに聞く
     reference/integrate.md          review.md の中身、integrate の再検証と skip、outcome、--next
   skills/dagq-session/            run の session への操作: trust / permission prompt と質問への応答、exit_request_timed_out の /exit、failed / interrupted の workspace close、needs_session の resume
     reference/cmux.md               read-screen / send-key / send / workspace close の使い方
@@ -117,7 +118,7 @@ skillはすべて`${CLAUDE_PLUGIN_ROOT}/bin/dagq`を呼ぶ。launcherはバイ�
 
 - 完了はStop hookやreceiptファイルの存在ではなく、`show`のrun `status`（`awaiting_integration` / `needs_session` / `integrated`）、`result_commit`、`last_error`、`validation_finished`イベントで判定する。
 - 登録の標準手順は「課題を聞く → `goal add`で登録 → taskに分解して`add --goal`で登録 → `ready`」（[ADR-0009](../adr/0009-goal-groups-tasks.md)）。goalなしを許すのは一発task（typo修正、clippy警告の解消など、1 taskで終わり判断を揃える相手がいないもの）だけで、判断基準は「2つ目のtaskが存在する、または後のtaskがこのtaskの決定（名前・境界・形式）を知る必要があるならgoalを作る」。`goal add`はtitle、description、acceptance（全task着地後にmaintainerがgoalの達成を判定する基準）、constraints（命名・境界・やらないこと）、doc（repository内の参照文書のパス。workerはworktreeで読むのでcommit済みであること）を集め、`add`は`--goal`と`--context`（goalの記述で足りないときの背景と最初に読むもの）を足す。`goal list` / `goal show`はInspectの要点と`reference/inspect.md`の表にあり、`set-goal`はdraft / readyのtaskだけ、`goal edit`は`goal_updated`イベントに新旧を残しclaim済みのrunには届かない、と書く。
-- goalのcloseはmaintainerがskillの手順で行い、runtimeは閉じない。`goal show`で全taskが`completed`（または`canceled`）になったら、各taskの`show --full`にある最後の`integration_receipt`イベント（着地前は`validation_finished`）のreceiptから`summary`と`follow_ups`を読み、goalのacceptanceに照らして未達があれば同じgoalに`add --goal`で後続taskを登録してから（閉じたgoalはtaskを拒否する）、なければ`goal close ID --verdict achieved`を呼ぶ。`abandoned`はdraft / readyのtaskをcancelしない（`in_progress`があるときだけ拒否する）ので、先にcancelする。`dagq-land` skillは、runのreceiptに`follow_ups`があれば`integrate`の前後でmaintainerがユーザーに報告し、`dagq` skillの`add --goal`で登録させる。
+- goalのcloseはmaintainerがskillの手順で行い、runtimeは閉じない。`goal show`で全taskが`completed`（または`canceled`）になったら、各taskの`show --full`にある最後の`integration_receipt`イベント（着地前は`validation_finished`）のreceiptから`summary`と`follow_ups`を読み、goalのacceptanceに照らして未達があれば同じgoalに`add --goal`で後続taskを登録してから（閉じたgoalはtaskを拒否する）、なければ`goal close ID --verdict achieved`を呼ぶ。`abandoned`はdraft / readyのtaskをcancelしない（`in_progress`があるときだけ拒否する）ので、先にcancelする。receiptの`follow_ups`は`integrate`が着地後に同じgoalのdraft taskとして登録する（[ADR-0019](../adr/0019-move-routine-maintainer-work-into-the-runtime.md)の決定4）。`dagq-land` skillは登録されたtaskを報告し、`ready`にするかをユーザーに聞く。goalのcloseの手順（`dagq` skillの`reference/goal-close.md`）はまずgoalのdraft taskの有無を見て、draftが残っていれば`ready`か`cancel`かをユーザーに聞く。
 - supervisorの起動は`dagq-maintain` skillが`"$DAGQ" up --plugin-dir "$CLAUDE_PLUGIN_ROOT"`（必要なら`--parallel N`）をlauncher経由で呼ぶ（[021](../journal/021-maintainer-up-down.md)、[supervisor-lifecycle](supervisor-lifecycle.md#up--down)）。`up`がlaunchdのLaunchAgentとしてsupervisorを常駐させ、maintainer workspaceの有無を判定し、生きているsupervisorがあれば`reused`を返すので、skillは重複起動の判定もworkspaceの作成も自分では行わず、`cmux workspace create`で`supervise`を起動する手順も持たない。maintainer session（`DAGQ_ROLE=maintainer`）の中から呼ぶと`maintainer`は`skipped`になり、これはerrorではないとskillに明記する。`status`のsupervisorが`stale`なら`up`を叩き直す（死んだ登録をpruneして起動し直す）。停止は`dagq down [--wait] [--force]`で、`--force`は実行中のrunを捨てるのでユーザーの同意が要る。supervisorのlogは`locate`の`log_dir`（`supervisor-<started_at>-<pid>.log`と`launchd.log`）。
 - mainへの着地はruntimeの`integrate ID` / `integrate --next`が行う（rebase → 再検証 → squash、[ADR-0008](../adr/0008-merge-queue-squash-landing.md)）。`dagq-land` skillは`review ID`の`review.md`をsubagentにレビューさせて結論だけ受け取り、ユーザーの承認後にこれを呼び（`watch`の結果やイベントの副作用としては呼ばない）、`outcome`（`integrated` / `needs_session` / `failed` / `no_run_awaiting`）を読んで結果を伝える。`needs_session`のrunは`dagq-session` skillに従いmaintainerが`claude --resume <run-id>`でworktreeに開き直すセッション（workspace名は`[<repo>]dagq resume <run ID>`、[ADR-0021](../adr/0021-maintainer-and-supervisor-workspace-names-follow-the-run-style.md)）が解消し、解消後は着地がworktreeを消すので`/exit`で終えてから`integrate`し直す。runのworkspace名は`[<repo>]dagq#<task-id> <task title>`、descriptionは`run <run-id>`で（[ADR-0018](../adr/0018-run-workspace-named-after-the-task.md)）、`failed` / `interrupted`のworkspaceはruntimeが閉じないのでmaintainerが`dagq-session`に従って`cmux workspace close`する。
 - `recover`はバイナリが拒否条件を判定する。skillはプロセスをkillせず、`doctor --full`の`blockers`をユーザーに示す。

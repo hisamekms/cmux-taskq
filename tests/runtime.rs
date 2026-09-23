@@ -5110,3 +5110,119 @@ fn rebind_is_refused_while_a_run_is_integrating() {
     let refused = runtime::rebind(&db, &other).unwrap_err().to_string();
     assert!(refused.contains("is integrating"), "{refused}");
 }
+
+#[test]
+fn integrate_registers_the_landed_follow_ups_as_draft_tasks_of_the_goal_once() {
+    let (_dir, repo, db) = fixture();
+    let mut queue = SqliteQueue::open(&db).unwrap();
+    let goal = queue
+        .add_goal(NewGoal {
+            title: "goal".into(),
+            description: String::new(),
+            acceptance: "done".into(),
+            constraints: String::new(),
+            doc: None,
+        })
+        .unwrap();
+    queue.set_goal(1, Some(goal.id)).unwrap();
+    let backend = TestWorkspace::new(&db, false, VALID_AGENT);
+    supervise(&db, &repo, &backend).unwrap();
+    backend.join();
+    let run = queue.show(1).unwrap().runs[0].clone();
+    assert_eq!(run.status, RunStatus::AwaitingIntegration);
+    let head = run.result_commit.clone().unwrap();
+    let follow_ups = json!([
+        {"title": "later work", "description": "outside the task"},
+        {"title": "  ", "description": "no title, not a task"},
+        {"title": "more work", "description": ""},
+        {"title": "no description"}
+    ]);
+
+    // A receipt that does not name the head parks the run: nothing landed,
+    // so nothing is registered.
+    let mut stale = session_receipt(&run, &run.base_commit, "succeeded", "stale");
+    stale["follow_ups"] = follow_ups.clone();
+    write_receipt_json(&run, stale);
+    let outcome = integrate(&db, 1, &repo).unwrap();
+    assert_eq!(outcome["outcome"], "needs_session", "{outcome}");
+    assert!(events_of(&db, &run.id, "follow_up_registered").is_empty());
+    assert_eq!(
+        queue.list(&Default::default()).unwrap().total,
+        1,
+        "only the task itself"
+    );
+
+    // The landing registers each titled follow-up as a draft task of the goal.
+    let mut receipt = session_receipt(&run, &head, "succeeded", "landed");
+    receipt["follow_ups"] = follow_ups.clone();
+    write_receipt_json(&run, receipt);
+    let outcome = integrate(&db, 1, &repo).unwrap();
+    assert_eq!(outcome["outcome"], "integrated", "{outcome}");
+    assert_eq!(
+        outcome["follow_ups"],
+        json!([
+            {"task_id": 2, "title": "later work"},
+            {"task_id": 3, "title": "more work"}
+        ])
+    );
+    let context = format!(
+        "task 1（test task）の run {} の receipt が提案した follow_up",
+        run.id
+    );
+    for (id, title, description) in [(2, "later work", "outside the task"), (3, "more work", "")] {
+        let detail = queue.show(id).unwrap();
+        assert_eq!(detail.task.status, TaskStatus::Draft);
+        assert_eq!(detail.task.title, title);
+        assert_eq!(detail.task.description, description);
+        assert_eq!(detail.task.goal_id, Some(goal.id));
+        assert_eq!(detail.task.context, context);
+        assert_eq!(detail.task.acceptance, "");
+        assert!(detail.task.verification_commands.is_empty());
+        assert!(detail.dependencies.is_empty());
+    }
+    assert_eq!(
+        events_of(&db, &run.id, "follow_up_registered"),
+        vec![
+            json!({"task_id": 2, "title": "later work", "index": 0}),
+            json!({
+                "task_id": null, "title": "  ", "index": 1,
+                "skipped": "title is not a non-blank string",
+                "follow_up": {"title": "  ", "description": "no title, not a task"},
+            }),
+            json!({"task_id": 3, "title": "more work", "index": 2}),
+            json!({
+                "task_id": null, "title": "no description", "index": 3,
+                "skipped": "description is not a string",
+                "follow_up": {"title": "no description"},
+            }),
+        ]
+    );
+    // Drafts are not picked up by the supervisor.
+    assert!(queue.candidates().unwrap().is_empty());
+
+    // The run is integrated: another integrate finds nothing to land, and
+    // registering the same run's follow-ups again adds nothing.
+    assert!(integrate(&db, 1, &repo).is_err());
+    let task = queue.show(1).unwrap().task;
+    assert!(runtime::register_follow_ups(&mut queue, &task, &run.id, Some(&follow_ups)).is_empty());
+    assert_eq!(queue.list(&Default::default()).unwrap().total, 2);
+    assert_eq!(events_of(&db, &run.id, "follow_up_registered").len(), 4);
+
+    // A closed goal takes no task: a new follow-up is registered without it.
+    queue
+        .close_goal(goal.id, dagq::domain::GoalVerdict::Abandoned)
+        .unwrap();
+    let mut extended = follow_ups.as_array().unwrap().clone();
+    extended.push(json!({"title": "after the goal", "description": "d"}));
+    let added = runtime::register_follow_ups(&mut queue, &task, &run.id, Some(&json!(extended)));
+    assert_eq!(added.len(), 1);
+    let detail = queue.show(added[0].task_id).unwrap();
+    assert_eq!(detail.task.status, TaskStatus::Draft);
+    assert_eq!(detail.task.goal_id, None);
+    assert_eq!(
+        events_of(&db, &run.id, "follow_up_registered")[4],
+        json!({"task_id": added[0].task_id, "title": "after the goal", "index": 4, "goal_closed": true})
+    );
+    // Nothing to register without follow_ups.
+    assert!(runtime::register_follow_ups(&mut queue, &task, &run.id, None).is_empty());
+}

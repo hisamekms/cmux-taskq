@@ -7,9 +7,9 @@
 use crate::{
     application::{AgentProvider, MainRemote, TaskStore, WorkspaceBackend, dependency_graph},
     domain::{
-        ClaimOutcome, Goal, IntegrationOutcome, PUSH_REMOTE, Predecessor, PushReport, PushResult,
-        Receipt, ReceiptResult, RunLease, RunPaths, RunProcess, RunStatus, SupervisorMode,
-        SupervisorRegistration, Task, TaskRun, heartbeat_stale,
+        ClaimOutcome, Goal, IntegrationOutcome, NewTask, PUSH_REMOTE, Predecessor, PushReport,
+        PushResult, Receipt, ReceiptResult, RegisteredFollowUp, RunLease, RunPaths, RunProcess,
+        RunStatus, SupervisorMode, SupervisorRegistration, Task, TaskRun, heartbeat_stale,
     },
     infrastructure::{
         adapters::{
@@ -1073,7 +1073,8 @@ pub enum IntegrateTarget {
 /// the queue is bound to. After a landing, `main` is pushed to `origin`
 /// through `remote` (ADR-0019 decision 3); `None` is `--no-push`. The push
 /// never changes the landing: its outcome is an event and the `push` of the
-/// result.
+/// result. The landed receipt's `follow_ups` become draft tasks
+/// (ADR-0019 decision 4), listed as the result's `follow_ups`.
 pub fn integrate(
     db: &Path,
     target: IntegrateTarget,
@@ -1153,7 +1154,7 @@ pub fn integrate(
         }
     };
     let outcome = match verdict {
-        Verdict::Landed(landing) => {
+        Verdict::Landed(landing, proposed) => {
             let verification_skipped = landing.verification_skipped;
             let (task, run) = queue
                 .finish_integration(&run.id, &token, &landing, &common_dir)
@@ -1169,11 +1170,13 @@ pub fn integrate(
             );
             remove_landed_worktree(&mut queue, &repository, &run);
             let push = push_main(&queue, remote, &run.id, &landing.commit);
+            let follow_ups = register_follow_ups(&mut queue, &task, &run.id, proposed.as_ref());
             IntegrationOutcome::Integrated {
                 task,
                 run: Box::new(run),
                 verification_skipped,
                 push: Box::new(push),
+                follow_ups,
             }
         }
         Verdict::Deferred { reason, detail } => {
@@ -1262,19 +1265,126 @@ fn failed_push(error: &anyhow::Error) -> PushReport {
     }
 }
 
+/// Register the landed receipt's `follow_ups` of `task`'s run `run_id` as
+/// draft tasks of the task's goal (ADR-0019 decision 4): the title and
+/// description as proposed, no acceptance, verification commands or
+/// dependencies, and a context naming where they came from. A closed goal
+/// takes no task, so the follow-up is registered without a goal and its
+/// `follow_up_registered` says `goal_closed: true`. An entry whose `title`
+/// is not a non-blank string or whose `description` is not a string is not
+/// registered: its `follow_up_registered` has `task_id: null`, the `skipped`
+/// reason and the entry itself as `follow_up`. Every event carries the
+/// entry's `index`, and an entry already recorded is not looked at again, so
+/// a second call for the same run adds nothing (the task and its event are
+/// written one after the other, so only a failure to record between them
+/// could let a later call register it twice). A registration that fails is
+/// only reported: the landing stands either way. Returns what this call
+/// registered.
+pub fn register_follow_ups(
+    queue: &mut SqliteQueue,
+    task: &Task,
+    run_id: &str,
+    follow_ups: Option<&Value>,
+) -> Vec<RegisteredFollowUp> {
+    let Some(entries) = follow_ups.and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let registered: Vec<u64> = match queue.run_events(run_id) {
+        Ok(events) => events
+            .iter()
+            .filter(|e| e.kind == "follow_up_registered")
+            .filter_map(|e| e.payload["index"].as_u64())
+            .collect(),
+        Err(error) => {
+            eprintln!("run {run_id}: follow_ups not registered: {error:#}");
+            return Vec::new();
+        }
+    };
+    let goal_closed = match task.goal_id {
+        Some(goal_id) => match queue.show_goal(goal_id) {
+            Ok(detail) => detail.closed,
+            Err(error) => {
+                eprintln!("run {run_id}: follow_ups not registered: {error:#}");
+                return Vec::new();
+            }
+        },
+        None => false,
+    };
+    let mut added = Vec::new();
+    for (index, entry) in entries.iter().enumerate() {
+        if registered.contains(&(index as u64)) {
+            continue;
+        }
+        let title = entry["title"].as_str().map(str::trim).unwrap_or_default();
+        let description = entry["description"].as_str();
+        let skipped = if title.is_empty() {
+            Some("title is not a non-blank string")
+        } else if description.is_none() {
+            Some("description is not a string")
+        } else {
+            None
+        };
+        if let Some(reason) = skipped {
+            eprintln!("run {run_id}: follow_up {index} was not registered: {reason}");
+            let payload = json!({
+                "task_id": null,
+                "title": entry["title"],
+                "index": index,
+                "skipped": reason,
+                "follow_up": entry,
+            });
+            if let Err(error) = queue.record_runtime_event(run_id, "follow_up_registered", payload)
+            {
+                eprintln!("run {run_id}: could not record follow_up_registered: {error:#}");
+            }
+            continue;
+        }
+        let new = NewTask {
+            title: title.to_owned(),
+            description: description.unwrap_or_default().to_owned(),
+            acceptance: String::new(),
+            verification_commands: Vec::new(),
+            dependencies: Vec::new(),
+            goal_id: task.goal_id.filter(|_| !goal_closed),
+            context: format!(
+                "task {}（{}）の run {run_id} の receipt が提案した follow_up",
+                task.id, task.title
+            ),
+        };
+        let created = match queue.add(new) {
+            Ok(created) => created,
+            Err(error) => {
+                eprintln!("run {run_id}: follow_up {title:?} was not registered: {error:#}");
+                continue;
+            }
+        };
+        let mut payload = json!({"task_id": created.id, "title": created.title, "index": index});
+        if goal_closed {
+            payload["goal_closed"] = json!(true);
+        }
+        if let Err(error) = queue.record_runtime_event(run_id, "follow_up_registered", payload) {
+            eprintln!("run {run_id}: could not record follow_up_registered: {error:#}");
+        }
+        eprintln!(
+            "run {run_id}: follow_up {:?} registered as draft task {}",
+            created.title, created.id
+        );
+        added.push(RegisteredFollowUp {
+            task_id: created.id,
+            title: created.title,
+        });
+    }
+    added
+}
+
 enum Verdict {
-    Landed(Landing),
+    /// Landed with the receipt's `follow_ups`.
+    Landed(Landing, Option<Value>),
     /// Re-validation did not pass; the worktree is left for a session.
-    Deferred {
-        reason: String,
-        detail: Value,
-    },
+    Deferred { reason: String, detail: Value },
     /// The session's rewritten receipt reports `failed`; `receipt` is its
     /// JSON, kept with the `integration_failed` event.
-    ReceiptFailed {
-        reason: String,
-        receipt: Value,
-    },
+    ReceiptFailed { reason: String, receipt: Value },
 }
 
 /// Rebase, re-validate and land one run. `Ok(Deferred)` and
@@ -1487,14 +1597,17 @@ fn land(
     let history_ref = format!("refs/dagq/runs/{}", run.id);
     repository.update_ref(&history_ref, &rebased)?;
     repository.advance_main(main, &commit)?;
-    Ok(Verdict::Landed(Landing {
-        commit,
-        source_commit: rebased,
-        main_before: main.to_owned(),
-        history_ref,
-        message: paragraphs.join("\n\n"),
-        verification_skipped,
-    }))
+    Ok(Verdict::Landed(
+        Landing {
+            commit,
+            source_commit: rebased,
+            main_before: main.to_owned(),
+            history_ref,
+            message: paragraphs.join("\n\n"),
+            verification_skipped,
+        },
+        receipt.follow_ups,
+    ))
 }
 
 /// Title, the receipt's summary, and the trailers that tie the commit to

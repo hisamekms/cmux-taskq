@@ -298,7 +298,7 @@ The queue is the one of the repository you run Claude Code in, resolved by the b
 | --- | --- |
 | `/claude-dagq:dagq` | Locate the binary and queue, `init`, register a goal with `goal add` and decompose it into tasks with `add --goal` (description, acceptance, `--verify`, `--depends-on`, `--context`), `ready`, `list` / `show` / `candidates` / `locate` / `status` / `doctor`, how to read run states, close a goal |
 | `/claude-dagq:dagq-maintain` | The maintainer's loop: start the runtime with `up`, read `status` (supervisor health, attention, cursor), run `watch --after <cursor>` in the background and report each attention, stop the runtime with `down`; landing waits for the user's approval |
-| `/claude-dagq:dagq-land` | Write `review.md` with `review ID`, have a subagent review it and return only a verdict, then, after the user approves, `integrate` (which pushes `main`), reporting a receipt's `follow_ups` |
+| `/claude-dagq:dagq-land` | Write `review.md` with `review ID`, have a subagent review it and return only a verdict, then, after the user approves, `integrate` (which pushes `main` and registers a receipt's `follow_ups` as draft tasks), asking the user which drafts become ready |
 | `/claude-dagq:dagq-session` | Act on a run's session: answer its trust or permission prompt, send `/exit` after `exit_request_timed_out`, close the workspace of a failed run, resume a `needs_session` run |
 | `/claude-dagq:dagq-recover` | `doctor`, `recover RUN_ID` for one run without disturbing the others, retry with `ready` |
 

@@ -659,6 +659,8 @@ pub enum ClaimOutcome {
 /// because its rewritten receipt reported `failed`. `NoRunAwaiting` is
 /// `--next` on an empty queue. `Integrated` also reports the push of the
 /// landed `main` (ADR-0019 decision 3); a failed push leaves the landing as it is.
+/// Its `follow_ups` are the draft tasks registered from the landed receipt's
+/// `follow_ups` (ADR-0019 decision 4).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "outcome", rename_all = "snake_case")]
 pub enum IntegrationOutcome {
@@ -669,6 +671,8 @@ pub enum IntegrationOutcome {
         verification_skipped: bool,
         #[serde(default)]
         push: Box<PushReport>,
+        #[serde(default)]
+        follow_ups: Vec<RegisteredFollowUp>,
     },
     NeedsSession {
         run: Box<TaskRun>,
@@ -680,6 +684,14 @@ pub enum IntegrationOutcome {
         reason: String,
     },
     NoRunAwaiting,
+}
+
+/// A draft task `integrate` registered from one of the landed receipt's
+/// `follow_ups` (ADR-0019 decision 4).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RegisteredFollowUp {
+    pub task_id: i64,
+    pub title: String,
 }
 
 /// The remote `integrate` pushes the landed `main` to (ADR-0019 decision 3).
@@ -727,8 +739,9 @@ pub struct Receipt {
     #[serde(default)]
     pub summary: String,
     /// Follow-up tasks the agent proposes, as `{"title", "description"}`
-    /// objects. Only its shape (an array) is checked; the supervisor reads it
-    /// from `show` and decides what to register.
+    /// objects. Only its shape (an array) is checked here; `integrate`
+    /// registers each entry with a title as a draft task once the run lands,
+    /// and a person decides whether it becomes ready.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub follow_ups: Option<serde_json::Value>,
 }

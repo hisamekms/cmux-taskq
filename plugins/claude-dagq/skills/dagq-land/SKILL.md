@@ -23,7 +23,7 @@ When the repository asks the maintainer to check something beyond the file (for 
 
 ## 3. Report and wait for approval
 
-Tell the user, in a few lines: the task and its title, `branch` and `head`, the diffstat numbers, the subagent's verdict and findings, and the receipt's `follow_ups` if any (they are in review.md; ask the subagent to list their titles). Then wait. **Do not run `integrate` until the user approves this run.** A watch returning, a passing review, or an earlier approval of another run is not approval.
+Tell the user, in a few lines: the task and its title, `branch` and `head`, the diffstat numbers, the subagent's verdict and findings, and the titles of the receipt's `follow_ups` if any (they are in review.md; ask the subagent to list them; `integrate` registers them as draft tasks when the run lands). Then wait. **Do not run `integrate` until the user approves this run.** A watch returning, a passing review, or an earlier approval of another run is not approval.
 
 If the user wants changes, the run goes back to a session: see the `dagq-session` skill, or have the user `ready` the task again after editing it.
 
@@ -35,7 +35,7 @@ If the user wants changes, the run goes back to a session: see the `dagq-session
 
 `integrate` rebases the run onto the current `main`, re-validates it (rerunning the verification commands unless the rebase was a no-op on the head the supervisor already verified), squashes it into one commit on `main` and removes the worktree and branch. Read `outcome`:
 
-- `integrated`: `run.result_commit` is the new `main` head and the task is `completed`; dependents become candidates. `push` says what became of pushing `main` to `origin`: `pushed`, `skipped` (`reason`: `--no-push`, or the repository has no `origin`) or `failed` (`error`). The landing stands in every case.
+- `integrated`: `run.result_commit` is the new `main` head and the task is `completed`; dependents become candidates. `push` says what became of pushing `main` to `origin`: `pushed`, `skipped` (`reason`: `--no-push`, or the repository has no `origin`) or `failed` (`error`). The landing stands in every case. `follow_ups` lists the draft tasks registered from the landed receipt's `follow_ups` (`[{task_id, title}]`, empty when there were none).
 - `needs_session`: nothing reached `main`; `reason` names the conflicting files or the failed verification. Report it and continue with the `dagq-session` skill.
 - `failed`: the run's receipt reported `failed`; the task stays `in_progress` (`ready ID` retries, `cancel ID` drops it).
 
@@ -45,4 +45,4 @@ An error (exit status 1) leaves `main` untouched and puts the run back with the 
 
 `integrate` pushes `main` to `origin` itself; do not run `git push` after a `pushed` or `skipped` outcome (use `integrate ID --no-push` where the repository must not be pushed). When `push.outcome` is `failed`, or `status` / `watch` shows the attention `push main` (`kind: push_failed`), report `error` to the user, fix its cause (with the user's go-ahead when it needs one, such as a rejected non-fast-forward or credentials), then run `git push origin main`. The attention clears at the next successful push by `integrate`.
 
-Report the outcome: the task, the landed commit, what it unblocked, and the receipt's `follow_ups` again so the user can have them registered with the `dagq` skill (`add --goal ID` on the task's goal, or a plain `add`).
+Report the outcome: the task, the landed commit, what it unblocked, and each draft task in `follow_ups` (ID and title). `integrate` already registered them as `draft` on the task's goal (without a goal when the goal is closed), so do not `add` them again; ask the user whether each should become `ready` (`ready ID`, after `edit` when it needs acceptance or verification commands) or be canceled, and leave it `draft` until they answer. The supervisor never picks up a draft.

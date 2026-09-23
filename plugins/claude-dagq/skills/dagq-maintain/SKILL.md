@@ -54,7 +54,7 @@ Do not poll `status`, `show` or `doctor` in a loop. Wait for the next attention 
 
 - Report and wait: landing (`integrate`), pushing `main` by hand after a `push_failed`, `down --force`, `recover`, changing a task's acceptance, and anything outside a run's own worktree need the user's go-ahead.
 - Do yourself, without asking: `up`, `status`, `watch`, `show`, `review`, answering a run's trust or permission prompt about its own worktree (`dagq-session`), and reporting.
-- Registering new work (a receipt's `follow_ups`, a new goal) follows the `dagq` skill once the user agrees.
+- A receipt's `follow_ups` are registered by `integrate` as `draft` tasks; making one `ready` waits for the user (`dagq-land`). Registering other new work (a new goal, a gap in a goal) follows the `dagq` skill once the user agrees.
 
 ## 5. Stop the runtime
 
