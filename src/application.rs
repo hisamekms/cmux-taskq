@@ -327,6 +327,11 @@ pub trait AgentProvider {
         let _ = (cwd, prompt, allowed_tools);
         anyhow::bail!("this provider has no headless execution")
     }
+    /// How often the session wrapper checks the agent for its exit and
+    /// heartbeats; tests shorten it.
+    fn wait_interval(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(1)
+    }
 }
 
 /// The Git remote `integrate` pushes the landed `main` to (ADR-0019

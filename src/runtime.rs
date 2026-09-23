@@ -77,6 +77,10 @@ pub struct SuperviseOptions {
     pub observe_interval: Duration,
     /// Also run the daily observation once every 24 hours.
     pub observe_daily: bool,
+    /// Pause between two passes over the active runs; tests shorten it.
+    pub tick: Duration,
+    /// Pause between two looks for claimable work while no run is active.
+    pub idle_poll: Duration,
 }
 
 impl SuperviseOptions {
@@ -88,6 +92,8 @@ impl SuperviseOptions {
             log_dir: None,
             observe_interval: Duration::ZERO,
             observe_daily: false,
+            tick: TICK,
+            idle_poll: IDLE_POLL,
         }
     }
 }
@@ -560,14 +566,14 @@ impl Supervisor<'_> {
                     break;
                 }
                 thread::sleep(if self.observer.is_some() {
-                    TICK
+                    options.tick
                 } else {
-                    IDLE_POLL
+                    options.idle_poll
                 });
                 continue;
             }
             self.tick();
-            thread::sleep(TICK);
+            thread::sleep(options.tick);
         }
         if let Some(message) = &self.provisioning_error {
             bail!(
@@ -4452,7 +4458,7 @@ fn drive_agent(
             // Keep owning/waiting on the existing child even during a DB outage.
             eprintln!("wrapper heartbeat failed: {error:#}");
         }
-        thread::sleep(Duration::from_secs(1));
+        thread::sleep(provider.wait_interval());
     }
 }
 

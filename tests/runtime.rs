@@ -95,9 +95,8 @@ idle() {
   printf '{"session_id":"%s","hook_event_name":"Stop","stop_hook_active":false}' "$RUN_ID" > "$IDLE.tmp"
   mv "$IDLE.tmp" "$IDLE"
 }
-await_exit() { while [ ! -f "$EXIT" ]; do sleep 0.2; done; }
+await_exit() { while [ ! -f "$EXIT" ]; do sleep 0.05; done; }
 commit() { printf 'change by %s\n' "$RUN_ID" > change.txt && git add change.txt && git commit -q -m "$1"; }
-sleep 2
 "#;
 const VALID_AGENT: &str = "commit work; receipt \"$(git rev-parse HEAD)\"";
 /// The first workspace the test backend hands out; see `workspace_id`.
@@ -120,17 +119,41 @@ idle() {
   printf '{"session_id":"%s","hook_event_name":"Stop","stop_hook_active":false}' "$RUN_ID" > "$IDLE.tmp"
   mv "$IDLE.tmp" "$IDLE"
 }
-await_exit() { while [ ! -f "$EXIT" ]; do sleep 0.2; done; }
+await_exit() { while [ ! -f "$EXIT" ]; do sleep 0.05; done; }
 await_message() {
-  while [ ! -f "$MESSAGE" ]; do sleep 0.1; done
+  while [ ! -f "$MESSAGE" ]; do sleep 0.05; done
   MAIN=$(sed -n 's/.*main is now \([0-9a-f]*\) .*/\1/p' "$MESSAGE" | head -n 1)
 }
+# The supervisor polls `git status` in the worktree, which holds its
+# index.lock for a moment and may write back an index it read before our
+# `git add`. `resolve` therefore looks at the rebase after every step, as a
+# person would: it resolves the conflict while the file or the index needs
+# it, skips a pick that is already in HEAD, and continues until the rebase
+# is over. A command that only found the lock is retried.
+unlocked() {
+  locked=0
+  until out=$("$@" 2>&1); do
+    case $out in *index.lock*) ;; *) return 1 ;; esac
+    locked=$((locked + 1))
+    [ "$locked" -lt 100 ] || return 1
+    sleep 0.05
+  done
+}
 resolve() {
-  git rebase -q "$MAIN" >/dev/null 2>&1 || {
-    printf 'resolved by the resumed session\n' > change.txt
-    git add change.txt
-    GIT_EDITOR=true git rebase --continue >/dev/null 2>&1
-  }
+  unlocked git rebase -q "$MAIN" && return
+  steps=0
+  while [ -d "$(git rev-parse --git-path rebase-merge)" ]; do
+    steps=$((steps + 1))
+    [ "$steps" -lt 100 ] || return 1
+    if [ "$(cat change.txt)" != 'resolved by the resumed session' ] || [ -n "$(git ls-files -u)" ]; then
+      printf 'resolved by the resumed session\n' > change.txt
+      git add change.txt >/dev/null 2>&1
+    elif git diff --cached --quiet HEAD; then
+      git rebase --skip >/dev/null 2>&1
+    else
+      GIT_EDITOR=true git rebase --continue >/dev/null 2>&1
+    fi || sleep 0.05
+  done
 }
 "#;
 
@@ -156,6 +179,9 @@ impl AgentProvider for TestProvider {
     }
     fn preflight(&self) -> Result<()> {
         Ok(())
+    }
+    fn wait_interval(&self) -> Duration {
+        TEST_TICK
     }
     fn command(&self, run: &TaskRun, prompt: &str) -> Result<Command> {
         assert!(prompt.contains("Acceptance criteria:"));
@@ -597,9 +623,23 @@ fn claude_stub(db: &Path) -> PathBuf {
     stub
 }
 
+/// The supervisor's pass and idle intervals and the wrapper's wait interval
+/// in these tests: short, so a run's steps follow each other without a
+/// second's pause.
+const TEST_TICK: Duration = Duration::from_millis(50);
+
+/// Supervisor options with the test tick.
+fn supervise_options(parallel: usize, once: bool) -> SuperviseOptions {
+    SuperviseOptions {
+        tick: TEST_TICK,
+        idle_poll: TEST_TICK,
+        ..SuperviseOptions::new(parallel, once)
+    }
+}
+
 /// One pass of the parallel supervisor: claim whatever is ready, finish it, exit.
 fn supervise(db: &Path, repo: &Path, backend: &TestWorkspace) -> Result<Value> {
-    supervise_with(db, repo, backend, &SuperviseOptions::new(4, true))
+    supervise_with(db, repo, backend, &supervise_options(4, true))
 }
 
 fn supervise_with(
@@ -627,7 +667,7 @@ fn wait_until(db: &Path, timeout: Duration, mut condition: impl FnMut(&mut Sqlit
             started.elapsed() < timeout,
             "condition not met within {timeout:?}"
         );
-        thread::sleep(Duration::from_millis(100));
+        thread::sleep(Duration::from_millis(20));
     }
 }
 
@@ -1079,8 +1119,8 @@ fn missing_or_stale_idle_marker_does_not_request_exit() {
     // No marker at all, then a marker older than the receipt (an earlier turn).
     // Both sessions end by themselves, as with a maintainer's /exit.
     for script in [
-        "commit work; receipt \"$(git rev-parse HEAD)\"; sleep 3",
-        "idle; sleep 1.1; commit work; receipt \"$(git rev-parse HEAD)\"; sleep 3",
+        "commit work; receipt \"$(git rev-parse HEAD)\"; sleep 1",
+        "idle; touch -t 200001010000 \"$IDLE\"; commit work; receipt \"$(git rev-parse HEAD)\"; sleep 1",
     ] {
         let (_dir, repo, db) = fixture();
         let backend = TestWorkspace::new(&db, false, script);
@@ -1101,8 +1141,8 @@ fn missing_or_stale_idle_marker_does_not_request_exit() {
 /// it back) and ends only once the test writes `$EXIT.held`, the way a person
 /// or maintainer would answer the dialog and exit.
 /// Blocks a fake session until the test calls `release_held_session`.
-const HOLD: &str = "while [ ! -f \"$EXIT.held\" ]; do sleep 0.2; done";
-const HELD_AGENT: &str = "commit work; receipt \"$(git rev-parse HEAD)\"; idle; while [ ! -f \"$EXIT.held\" ]; do sleep 0.2; done";
+const HOLD: &str = "while [ ! -f \"$EXIT.held\" ]; do sleep 0.05; done";
+const HELD_AGENT: &str = "commit work; receipt \"$(git rev-parse HEAD)\"; idle; while [ ! -f \"$EXIT.held\" ]; do sleep 0.05; done";
 
 fn release_held_session(run_dir: &str) {
     fs::write(Path::new(run_dir).join("exit-requested.held"), "").unwrap();
@@ -1121,10 +1161,10 @@ const WORK_SCREEN: &str = "⏺ Bash(cargo test)\n  ⎿  test result: ok\n\n│ �
 
 /// Fake agent that works (no receipt, no idle marker) until the test writes
 /// `$EXIT.go`, then finishes like `VALID_AGENT` and waits for `/exit`.
-const PROMPTED_AGENT: &str = "while [ ! -f \"$EXIT.go\" ]; do sleep 0.2; done; commit work; receipt \"$(git rev-parse HEAD)\"; idle; await_exit";
+const PROMPTED_AGENT: &str = "while [ ! -f \"$EXIT.go\" ]; do sleep 0.05; done; commit work; receipt \"$(git rev-parse HEAD)\"; idle; await_exit";
 
 /// Commits once, waits for `$EXIT.go` before a second commit and the receipt.
-const TWO_COMMIT_AGENT: &str = "commit first; while [ ! -f \"$EXIT.go\" ]; do sleep 0.2; done; printf 'more\\n' >> change.txt; git commit -q -am second; receipt \"$(git rev-parse HEAD)\"";
+const TWO_COMMIT_AGENT: &str = "commit first; while [ ! -f \"$EXIT.go\" ]; do sleep 0.05; done; printf 'more\\n' >> change.txt; git commit -q -am second; receipt \"$(git rev-parse HEAD)\"";
 
 /// The supervisor records `first_commit_observed` once, while the session
 /// still works, when the worktree's HEAD first leaves the base commit; a
@@ -1187,7 +1227,7 @@ fn the_first_commit_is_observed_once_while_the_session_works() {
 fn a_dialog_on_the_screen_is_recorded_once_and_cleared() {
     let (_dir, repo, db) = fixture();
     let mut backend = TestWorkspace::new(&db, false, PROMPTED_AGENT);
-    backend.prompt_wait = Duration::from_secs(1);
+    backend.prompt_wait = Duration::from_millis(300);
     *backend.screen.lock().unwrap() = WORK_SCREEN.into();
     let backend = Arc::new(backend);
     let supervisor = {
@@ -1204,7 +1244,7 @@ fn a_dialog_on_the_screen_is_recorded_once_and_cleared() {
     let started = Instant::now();
     while backend.captures.load(Ordering::SeqCst) < 2 {
         assert!(started.elapsed() < Duration::from_secs(30));
-        thread::sleep(Duration::from_millis(100));
+        thread::sleep(Duration::from_millis(20));
     }
     let mut queue = SqliteQueue::open(&db).unwrap();
     assert_eq!(prompts(&mut queue, "prompt_waiting"), 0);
@@ -1217,8 +1257,10 @@ fn a_dialog_on_the_screen_is_recorded_once_and_cleared() {
     });
     // The same screen is read again but not recorded again.
     let captured = backend.captures.load(Ordering::SeqCst);
+    let started = Instant::now();
     while backend.captures.load(Ordering::SeqCst) < captured + 2 {
-        thread::sleep(Duration::from_millis(100));
+        assert!(started.elapsed() < Duration::from_secs(30));
+        thread::sleep(Duration::from_millis(20));
     }
     assert_eq!(prompts(&mut queue, "prompt_waiting"), 1);
     let detail = queue.show(1).unwrap();
@@ -1283,9 +1325,9 @@ fn a_dialog_on_the_screen_is_recorded_once_and_cleared() {
 /// test backend's terminal); it commits the answer it got.
 const ASKING_AGENT: &str = r#"
 "$DAGQ" --db "$DB" ask --run "$RUN_ID" --kind worker_question --question 'Which word?' --cmux /usr/bin/true > /dev/null || exit 70
-while [ ! -f "$EXIT.idle" ]; do sleep 0.1; done
+while [ ! -f "$EXIT.idle" ]; do sleep 0.05; done
 idle
-while [ ! -f "$MESSAGE" ]; do sleep 0.1; done
+while [ ! -f "$MESSAGE" ]; do sleep 0.05; done
 cp "$MESSAGE" answer.txt
 git add answer.txt
 git commit -q -m answer
@@ -1314,7 +1356,7 @@ fn ask_attention(status: &Value, ask_id: i64) -> Vec<Value> {
 fn an_answered_worker_question_is_typed_into_the_idle_worker_and_closed() {
     let (_dir, repo, db) = fixture();
     let mut backend = TestWorkspace::new(&db, false, ASKING_AGENT);
-    backend.prompt_wait = Duration::from_secs(1);
+    backend.prompt_wait = Duration::from_millis(300);
     let backend = Arc::new(backend);
     let supervisor = {
         let (db, repo, backend) = (db.clone(), repo.clone(), backend.clone());
@@ -1338,9 +1380,10 @@ fn an_answered_worker_question_is_typed_into_the_idle_worker_and_closed() {
     // A dialog-like screen while the ask is unclosed is not read or recorded.
     *backend.screen.lock().unwrap() = DIALOG_SCREEN.into();
     // A poll that looked for the ask just before it was registered is over.
-    thread::sleep(Duration::from_millis(500));
+    thread::sleep(Duration::from_millis(200));
     let captured = backend.captures.load(Ordering::SeqCst);
-    thread::sleep(Duration::from_secs(3));
+    // Well past `prompt_wait`, when the screen would otherwise be read.
+    thread::sleep(Duration::from_millis(1000));
     assert_eq!(backend.captures.load(Ordering::SeqCst), captured);
     let status = runtime::status(&db).unwrap();
     assert!(
@@ -1354,7 +1397,7 @@ fn an_answered_worker_question_is_typed_into_the_idle_worker_and_closed() {
 
     // Answered while the worker has not gone idle since asking: not typed.
     queue.answer(ask.id, "use blue").unwrap();
-    thread::sleep(Duration::from_millis(1500));
+    thread::sleep(Duration::from_millis(500));
     assert!(backend.texts().is_empty());
     let status = runtime::status(&db).unwrap();
     let attention = ask_attention(&status, ask.id);
@@ -1437,7 +1480,8 @@ fn a_failed_answer_delivery_is_left_to_the_maintainer() {
     wait_until(&db, Duration::from_secs(30), |queue| {
         !payloads(&queue.show(1).unwrap(), "ask_delivery_failed").is_empty()
     });
-    thread::sleep(Duration::from_secs(2));
+    // Several passes later the send was not retried.
+    thread::sleep(Duration::from_millis(500));
     assert_eq!(backend.texts().len(), 1);
     let detail = queue.show(1).unwrap();
     let failed = payloads(&detail, "ask_delivery_failed");
@@ -1529,7 +1573,7 @@ fn a_failed_answer_delivery_is_left_to_the_maintainer() {
 fn unanswered_exit_request_times_out_and_keeps_the_run() {
     let (_dir, repo, db) = fixture();
     let mut backend = TestWorkspace::new(&db, false, HELD_AGENT);
-    backend.exit_timeout = Duration::from_secs(2);
+    backend.exit_timeout = Duration::from_secs(1);
     let screen = (1..=20)
         .map(|n| format!("line {n}"))
         .chain(["❯ 1. Exit anyway".into(), "  2. Cancel".into()])
@@ -1550,7 +1594,7 @@ fn unanswered_exit_request_times_out_and_keeps_the_run() {
     });
     // Let a few more polls pass: the timeout is not recorded again and the
     // run is not given up.
-    thread::sleep(Duration::from_millis(1500));
+    thread::sleep(Duration::from_millis(500));
     let mut queue = SqliteQueue::open(&db).unwrap();
     let detail = queue.show(1).unwrap();
     let run = detail.runs[0].clone();
@@ -1574,7 +1618,7 @@ fn unanswered_exit_request_times_out_and_keeps_the_run() {
         .unwrap();
     assert_eq!(
         timed_out.payload,
-        json!({"workspace_id": WORKSPACE_ID, "timeout_secs": 2})
+        json!({"workspace_id": WORKSPACE_ID, "timeout_secs": 1})
     );
     assert_eq!(backend.exits_sent.load(Ordering::SeqCst), 1);
     // One stuck_exit ask by the supervisor, with the screen's last 15 lines.
@@ -1992,7 +2036,7 @@ fn a_workspace_group_cmux_cannot_make_is_a_logged_warning() {
     add_ready_task(&mut queue, "grouped", &[]);
     let mut backend = TestWorkspace::new(&db, false, VALID_AGENT);
     backend.group_fails = true;
-    let mut options = SuperviseOptions::new(1, true);
+    let mut options = supervise_options(1, true);
     let logs = dir.path().join("logs");
     options.log_dir = Some(logs.clone());
     let outcome = supervise_with(&db, &repo, &backend, &options).unwrap();
@@ -2040,7 +2084,7 @@ fn supervisor_claims_the_candidate_that_releases_the_most_tasks_first() {
     let middle = add_ready_task(&mut queue, "middle", &[root]);
     add_ready_task(&mut queue, "leaf", &[middle]);
     let backend = TestWorkspace::new(&db, false, VALID_AGENT);
-    let outcome = supervise_with(&db, &repo, &backend, &SuperviseOptions::new(1, true)).unwrap();
+    let outcome = supervise_with(&db, &repo, &backend, &supervise_options(1, true)).unwrap();
     let claimed: Vec<i64> = outcome["runs"]
         .as_array()
         .unwrap()
@@ -2064,7 +2108,7 @@ fn supervisor_claims_the_candidate_that_releases_the_most_tasks_first() {
     let mut queue = SqliteQueue::open(&db).unwrap();
     add_ready_task(&mut queue, "second", &[]);
     let backend = TestWorkspace::new(&db, false, VALID_AGENT);
-    let outcome = supervise_with(&db, &repo, &backend, &SuperviseOptions::new(1, true)).unwrap();
+    let outcome = supervise_with(&db, &repo, &backend, &supervise_options(1, true)).unwrap();
     assert_eq!(outcome["runs"][0]["task_id"], 1);
     assert_eq!(outcome["runs"][1]["task_id"], 2);
 }
@@ -2320,7 +2364,7 @@ fn no_ready_task_ends_a_once_pass_without_creating_a_run_or_lease() {
     assert!(queue.run_leases().unwrap().is_empty());
     assert!(queue.supervisors().unwrap().is_empty());
     assert!(queue.show(1).unwrap().runs.is_empty());
-    assert!(supervise_with(&db, &repo, &backend, &SuperviseOptions::new(0, true)).is_err());
+    assert!(supervise_with(&db, &repo, &backend, &supervise_options(0, true)).is_err());
     assert!(queue.supervisors().unwrap().is_empty());
 }
 
@@ -2334,7 +2378,7 @@ fn resident_supervisor_without_runs_is_listed_until_it_stops() {
     queue.transition(1, TaskAction::Draft).unwrap();
     assert_eq!(runtime::status(&db).unwrap()["supervisors"], json!([]));
     let backend = Arc::new(TestWorkspace::new(&db, true, VALID_AGENT));
-    let options = SuperviseOptions::new(3, false);
+    let options = supervise_options(3, false);
     let supervisor = {
         let (db, repo, backend, options) =
             (db.clone(), repo.clone(), backend.clone(), options.clone());
@@ -2385,7 +2429,7 @@ fn resident_supervisor_without_runs_is_listed_until_it_stops() {
 
     // An error out of the loop itself (here: main vanished before a claim)
     // ends the process with nothing active, so it deregisters too.
-    let options = SuperviseOptions::new(1, false);
+    let options = supervise_options(1, false);
     let supervisor = {
         let (db, repo, backend, options) =
             (db.clone(), repo.clone(), backend.clone(), options.clone());
@@ -2409,7 +2453,7 @@ fn resident_supervisor_without_runs_is_listed_until_it_stops() {
 fn supervise_log_dir_records_each_start_in_its_own_file() {
     let (dir, repo, db) = fixture();
     let log_dir = dir.path().join("logs").join("nested");
-    let mut options = SuperviseOptions::new(2, true);
+    let mut options = supervise_options(2, true);
     options.log_dir = Some(log_dir.clone());
     let backend = TestWorkspace::new(&db, false, VALID_AGENT);
     let before = runtime::unix_time();
@@ -2469,8 +2513,10 @@ fn supervise_log_dir_records_each_start_in_its_own_file() {
         "] supervisor {token} exiting: {{\"errors\":[],\"outcome\":\"finished\""
     )));
 
-    // A second start gets its own file (same second or not, the name differs by token order at worst).
-    thread::sleep(Duration::from_millis(1100));
+    // A second start in a later second gets its own file.
+    while runtime::unix_time() <= started_at {
+        thread::sleep(Duration::from_millis(20));
+    }
     let outcome = supervise_with(&db, &repo, &backend, &options).unwrap();
     assert_eq!(outcome["outcome"], "finished");
     assert_eq!(outcome["runs"], json!([]));
@@ -4546,7 +4592,7 @@ fn unapproved_resumed_run_returns_to_awaiting_integration() {
 fn resuming_stops_after_three_attempts() {
     let (_dir, repo, db) = fixture();
     let mut backend = TestWorkspace::new(&db, false, VALID_AGENT);
-    backend.resume_timeout = Duration::from_secs(3);
+    backend.resume_timeout = Duration::from_secs(1);
     let (run, _) = parked_conflict(&repo, &db, &backend);
     let mut queue = SqliteQueue::open(&db).unwrap();
     let reason = run.last_error.clone().unwrap();
@@ -4736,7 +4782,16 @@ fn a_session_nobody_watches_blocks_the_resume_until_it_ends() {
     let detail = queue.show(2).unwrap();
     assert_landed(&repo, &detail.runs[0], "second", &first_landed);
     let started = payloads(&detail, "resume_started");
-    assert_eq!(started.len(), 2);
+    assert_eq!(
+        started.len(),
+        2,
+        "{:?}",
+        detail
+            .events
+            .iter()
+            .map(|e| (&e.kind, &e.payload))
+            .collect::<Vec<_>>()
+    );
     assert_eq!(started[1]["attempt"], 2);
     let acquired = detail
         .events
@@ -5075,7 +5130,7 @@ fn independent_tasks_run_concurrently_and_a_dependent_starts_after_integration()
     add_ready_task(&mut queue, "independent", &[]);
     add_ready_task(&mut queue, "dependent", &[1]);
     let backend = Arc::new(TestWorkspace::new(&db, false, IDLE_AGENT));
-    let options = SuperviseOptions::new(4, false);
+    let options = supervise_options(4, false);
     let supervisor = {
         let (db, repo, backend, options) =
             (db.clone(), repo.clone(), backend.clone(), options.clone());
@@ -5123,7 +5178,7 @@ fn independent_tasks_run_concurrently_and_a_dependent_starts_after_integration()
             .all(|task| queue.show(*task).unwrap().runs[0].status == RunStatus::AwaitingIntegration)
     });
     // Awaiting integration does not satisfy the dependency; the loop idles.
-    thread::sleep(Duration::from_secs(3));
+    thread::sleep(Duration::from_millis(500));
     assert!(queue.show(3).unwrap().runs.is_empty());
     assert!(queue.candidates().unwrap().is_empty());
     let first = queue.show(1).unwrap().runs[0].clone();
@@ -5187,7 +5242,7 @@ fn a_timed_out_run_is_kept_while_the_other_run_is_accepted() {
     add_ready_task(&mut queue, "healthy", &[]);
     let mut backend = TestWorkspace::new(&db, false, VALID_AGENT);
     backend.script_for(1, HELD_AGENT);
-    backend.exit_timeout = Duration::from_secs(2);
+    backend.exit_timeout = Duration::from_secs(1);
     let backend = Arc::new(backend);
     let supervisor = {
         let (db, repo, backend) = (db.clone(), repo.clone(), backend.clone());
@@ -5755,13 +5810,13 @@ fn integrating_run_with_a_stale_lease_is_not_adopted() {
 #[test]
 fn adopter_does_not_repeat_an_exit_request_the_previous_supervisor_sent() {
     let (_dir, repo, db) = fixture();
-    // The session ends on its own a few seconds after going idle, as it
-    // would after the /exit that was already typed.
-    let backend = TestWorkspace::new(
+    // The session ends on its own once the adopter has watched it for a
+    // while, as it would after the /exit that was already typed.
+    let backend = Arc::new(TestWorkspace::new(
         &db,
         false,
-        "commit work; receipt \"$(git rev-parse HEAD)\"; idle; sleep 4",
-    );
+        &format!("commit work; receipt \"$(git rev-parse HEAD)\"; idle; {HOLD}"),
+    ));
     let run = start_run_under_dead_supervisor(&repo, &db, &backend, "dead-supervisor");
     let receipt = PathBuf::from(run.receipt_path.as_ref().unwrap());
     wait_until(&db, Duration::from_secs(10), |_| receipt.is_file());
@@ -5785,7 +5840,17 @@ fn adopter_does_not_repeat_an_exit_request_the_previous_supervisor_sent() {
         )
         .unwrap();
     age_lease(&db, &run, 31);
-    let outcome = supervise(&db, &repo, &backend).unwrap();
+    let supervisor = {
+        let (db, repo, backend) = (db.clone(), repo.clone(), backend.clone());
+        thread::spawn(move || supervise(&db, &repo, &backend))
+    };
+    wait_until(&db, Duration::from_secs(30), |queue| {
+        !adoption_events(&queue.show(1).unwrap()).is_empty()
+    });
+    // Several passes over the idle session send nothing.
+    thread::sleep(Duration::from_millis(500));
+    release_held_session(run.run_dir.as_ref().unwrap());
+    let outcome = supervisor.join().unwrap().unwrap();
     backend.join();
     assert_eq!(
         outcome["runs"][0]["status"], "awaiting_integration",
@@ -5818,7 +5883,7 @@ fn adopter_does_not_repeat_an_exit_request_the_previous_supervisor_sent() {
 fn adopted_exit_request_times_out_from_the_adoption() {
     let (_dir, repo, db) = fixture();
     let mut backend = TestWorkspace::new(&db, false, IDLE_AGENT);
-    backend.exit_timeout = Duration::from_secs(2);
+    backend.exit_timeout = Duration::from_secs(1);
     let backend = Arc::new(backend);
     let run = start_run_under_dead_supervisor(&repo, &db, &backend, "dead-supervisor");
     let mut queue = SqliteQueue::open(&db).unwrap();
@@ -5891,7 +5956,7 @@ fn adopted_run_does_not_record_an_exit_timeout_twice() {
         !adoption_events(&queue.show(1).unwrap()).is_empty()
     });
     // Well past the adopter's own timeout.
-    thread::sleep(Duration::from_millis(2500));
+    thread::sleep(Duration::from_millis(1500));
     let kinds = event_kinds(&queue.show(1).unwrap())
         .into_iter()
         .map(str::to_owned)
@@ -6182,7 +6247,7 @@ fn two_supervisors_racing_for_one_stale_lease_adopt_it_once() {
 fn a_supervisor_that_lost_its_lease_stops_touching_the_run() {
     let (_dir, repo, db) = fixture();
     let backend = Arc::new(TestWorkspace::new(&db, false, IDLE_AGENT));
-    let options = SuperviseOptions::new(2, false);
+    let options = supervise_options(2, false);
     let original = {
         let (db, repo, backend, options) =
             (db.clone(), repo.clone(), backend.clone(), options.clone());

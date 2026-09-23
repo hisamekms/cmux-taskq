@@ -815,8 +815,6 @@ fn execute(cli: Cli) -> Result<Value> {
             use dagq::infrastructure::adapters::{Cmux, executable};
             use dagq::runtime::SuperviseOptions;
             let options = SuperviseOptions {
-                parallel: usize::from(parallel),
-                once,
                 stop: install_stop_signal()?,
                 log_dir,
                 // A one-shot pass observes only when asked to.
@@ -826,6 +824,7 @@ fn execute(cli: Cli) -> Result<Value> {
                     3600
                 })),
                 observe_daily,
+                ..SuperviseOptions::new(usize::from(parallel), once)
             };
             dagq::runtime::supervise(
                 &db,
