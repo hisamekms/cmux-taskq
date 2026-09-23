@@ -6128,7 +6128,7 @@ fn asks_of_a_run_are_attention_for_the_inbox_then_the_maintainer() {
     };
     let opened = queue.ask(new_ask(&"q".repeat(250))).unwrap();
     assert!(opened.created);
-    assert_eq!(opened.ask.task_id, run.task_id);
+    assert_eq!(opened.ask.task_id, Some(run.task_id));
     let woke = watcher.join().unwrap();
     assert_eq!(
         woke["events"],
@@ -7087,4 +7087,339 @@ fn a_resume_or_integrate_without_the_required_evidence_does_not_land() {
     assert_eq!(run.last_error.as_deref(), Some("evidence missing: e2e"));
     let parked = payloads(&detail, "integration_deferred");
     assert_eq!(parked.last().unwrap()["checks"], json!(["e2e"]));
+}
+
+/// The observer's provider double: the headless job is a shell script in the
+/// observation's directory, with the environment `observe` gives the agent.
+struct ObserverProvider {
+    script: String,
+}
+impl AgentProvider for ObserverProvider {
+    fn preflight(&self) -> Result<()> {
+        Ok(())
+    }
+    fn command(&self, _: &TaskRun, _: &str) -> Result<Command> {
+        bail!("the observer has no run")
+    }
+    fn resume_command(&self, _: &TaskRun) -> Result<Command> {
+        bail!("the observer has no run")
+    }
+    fn headless_command(&self, cwd: &Path, prompt: &str, allowed: &[&str]) -> Result<Command> {
+        assert!(prompt.contains("You are the observer"), "{prompt}");
+        assert_eq!(allowed, ["Bash(dagq:*)"]);
+        let mut command = Command::new("/bin/sh");
+        command.current_dir(cwd).arg("-c").arg(&self.script);
+        Ok(command)
+    }
+}
+
+fn observe_options(mode: dagq::observer::ObserveMode) -> dagq::observer::ObserveOptions {
+    dagq::observer::ObserveOptions {
+        mode,
+        since: None,
+        dry_run: false,
+        timeout: Duration::from_secs(60),
+        dagq: PathBuf::from(env!("CARGO_BIN_EXE_dagq")),
+    }
+}
+
+fn queue_events(db: &Path, kind: &str) -> Vec<Value> {
+    Connection::open(db)
+        .unwrap()
+        .prepare("SELECT payload FROM run_events WHERE kind=?1 ORDER BY id")
+        .unwrap()
+        .query_map([kind], |r| r.get::<_, String>(0))
+        .unwrap()
+        .map(|p| serde_json::from_str(&p.unwrap()).unwrap())
+        .collect()
+}
+
+#[test]
+fn observe_writes_a_note_a_blocked_ask_and_a_draft_goal_and_advances_the_cursor() {
+    use dagq::observer::{ObserveMode, observe, read_cursor};
+    let (_dir, _repo, db) = fixture();
+    // `dagq` is first on PATH and the queue is in DAGQ_QUEUE; the state
+    // changes the prompt forbids are refused by the CLI itself.
+    let provider = ObserverProvider {
+        script: r#"
+set -e
+printf '%s' "$DAGQ_ROLE" > role.txt
+q() { dagq --db "$DAGQ_QUEUE" "$@" > /dev/null; }
+q note --task 1 --kind stall --text 'task 1 waits for a slot'
+q ask --kind blocked --question 'slots idle while task 1 is ready' --option 'leave it'
+q ask --kind blocked --question 'the same alert again'
+q goal add --draft 'claim faster' --description 'evidence: the stall note'
+if q ready 1 2> ready.err; then exit 3; fi
+if q ask --kind decide --task 1 --question 'decide?' 2> ask.err; then exit 4; fi
+if q goal ready 1 2> goal.err; then exit 5; fi
+echo 'wrote 1 note, 1 ask, 1 draft goal'
+"#
+        .into(),
+    };
+    assert_eq!(read_cursor(&db).unwrap(), None);
+    let first = observe(&db, &provider, &observe_options(ObserveMode::Hourly)).unwrap();
+    assert_eq!(first["outcome"], "succeeded", "{first}");
+    assert_eq!(
+        (&first["notes"], &first["asks"], &first["goals"]),
+        (&json!(1), &json!(1), &json!(1))
+    );
+    assert_eq!(first["since"], Value::Null);
+    let cursor = first["cursor"].as_i64().unwrap();
+    assert!(cursor >= 0);
+    assert_eq!(read_cursor(&db).unwrap(), Some(cursor));
+    let dir = PathBuf::from(first["dir"].as_str().unwrap());
+    assert_eq!(
+        dir.parent().unwrap(),
+        db.canonicalize()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("observer")
+    );
+    assert_eq!(
+        fs::read_to_string(dir.join("role.txt")).unwrap(),
+        "observer"
+    );
+    for denied in ["ready.err", "ask.err", "goal.err"] {
+        assert!(
+            fs::read_to_string(dir.join(denied))
+                .unwrap()
+                .contains("observer may not change queue state"),
+            "{denied}"
+        );
+    }
+    assert!(
+        fs::read_to_string(dir.join("output.log"))
+            .unwrap()
+            .contains("wrote 1 note")
+    );
+    assert!(
+        fs::read_to_string(dir.join("prompt.md"))
+            .unwrap()
+            .contains("\"stats\"")
+    );
+    // Nothing changed state: the task is still ready and the goal a draft.
+    let mut queue = SqliteQueue::open(&db).unwrap();
+    assert_eq!(queue.show(1).unwrap().task.status, TaskStatus::Ready);
+    assert!(queue.show_goal(1).unwrap().goal.is_draft());
+    let asks = queue
+        .asks(dagq::infrastructure::asks::AskQuery::default())
+        .unwrap();
+    assert_eq!(asks.len(), 1);
+    assert_eq!(asks[0].kind.as_str(), "blocked");
+    assert_eq!(asks[0].task_id, None);
+    assert_eq!(asks[0].asked_by, "observer");
+    assert_eq!(queue_events(&db, "observe_started").len(), 1);
+    assert_eq!(
+        queue_events(&db, "observe_finished"),
+        std::slice::from_ref(&first)
+    );
+
+    // The next observation reads past the saved cursor; a failed one keeps it.
+    let failing = ObserverProvider {
+        script: "exit 7".into(),
+    };
+    let second = observe(&db, &failing, &observe_options(ObserveMode::Hourly)).unwrap();
+    assert_eq!(second["since"], cursor);
+    assert_eq!(second["outcome"], "failed");
+    assert_eq!(second["exit_code"], 7);
+    assert_eq!(second["cursor_saved"], false);
+    assert_eq!(read_cursor(&db).unwrap(), Some(cursor));
+
+    // A dry run only returns the prompt.
+    let dry = observe(
+        &db,
+        &failing,
+        &dagq::observer::ObserveOptions {
+            dry_run: true,
+            since: Some(0),
+            ..observe_options(ObserveMode::Daily)
+        },
+    )
+    .unwrap();
+    assert_eq!(dry["dry_run"], true);
+    assert_eq!(dry["since"], 0);
+    let prompt = dry["prompt"].as_str().unwrap();
+    assert!(prompt.contains("daily observation"), "{prompt}");
+    assert!(prompt.contains("ask --kind blocked"), "{prompt}");
+    assert!(prompt.contains("goal add --draft"), "{prompt}");
+    assert!(
+        prompt.contains("slots idle while task 1 is ready"),
+        "{prompt}"
+    );
+    assert!(prompt.contains("task 1 waits for a slot"), "{prompt}");
+    assert_eq!(queue_events(&db, "observe_started").len(), 2);
+
+    // An agent that cannot start is an error outcome, not a failed observe.
+    let broken = observe(
+        &db,
+        &TestProvider {
+            script: String::new(),
+            db: db.clone(),
+        },
+        &observe_options(ObserveMode::Daily),
+    )
+    .unwrap();
+    assert_eq!(broken["outcome"], "error");
+    assert!(
+        broken["error"]
+            .as_str()
+            .unwrap()
+            .contains("no headless execution")
+    );
+    // The daily one reads the last 24 hours and leaves the cursor alone.
+    assert_eq!(broken["since"], 0);
+    assert_eq!(read_cursor(&db).unwrap(), Some(cursor));
+}
+
+#[test]
+fn observe_kills_an_agent_past_its_timeout() {
+    use dagq::observer::{ObserveMode, observe};
+    let (_dir, _repo, db) = fixture();
+    let slow = ObserverProvider {
+        script: "sleep 30".into(),
+    };
+    let started = Instant::now();
+    let outcome = observe(
+        &db,
+        &slow,
+        &dagq::observer::ObserveOptions {
+            timeout: Duration::from_millis(300),
+            ..observe_options(ObserveMode::Hourly)
+        },
+    )
+    .unwrap();
+    assert!(started.elapsed() < Duration::from_secs(20));
+    assert_eq!(outcome["outcome"], "error");
+    assert!(
+        outcome["error"]
+            .as_str()
+            .unwrap()
+            .contains("did not finish")
+    );
+    assert_eq!(outcome["cursor_saved"], false);
+}
+
+/// A Claude Code stand-in for the supervisor's observer: `--version` for
+/// the preflight, and in print mode (`-p`) a note through the queue CLI it
+/// finds first on PATH.
+fn observer_claude_stub(db: &Path) -> PathBuf {
+    let stub = db.parent().unwrap().join("claude-observer-stub");
+    fs::write(
+        &stub,
+        r#"#!/bin/sh
+if [ "$1" = "-p" ]; then
+  mode=hourly
+  case "$*" in *"daily observation"*) mode=daily ;; esac
+  exec dagq --db "$DAGQ_QUEUE" note --goal 1 --kind "$mode" --text "observed by $DAGQ_ROLE"
+fi
+printf 'test provider\n'
+"#,
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).unwrap();
+    stub
+}
+
+#[test]
+fn supervisor_starts_the_observer_on_its_interval_without_a_run_slot() {
+    let (_dir, repo, db) = fixture();
+    {
+        let mut queue = SqliteQueue::open(&db).unwrap();
+        queue.transition(1, TaskAction::Cancel).unwrap();
+        queue
+            .add_goal(NewGoal {
+                title: "observed".into(),
+                description: String::new(),
+                acceptance: String::new(),
+                constraints: String::new(),
+                doc: None,
+                draft: false,
+            })
+            .unwrap();
+    }
+    let backend = TestWorkspace::new(&db, false, VALID_AGENT);
+    let options = SuperviseOptions {
+        observe_interval: Duration::from_secs(3600),
+        observe_daily: true,
+        ..SuperviseOptions::new(1, true)
+    };
+    let supervise_observed = || {
+        runtime::supervise(
+            &db,
+            &repo,
+            &backend,
+            &observer_claude_stub(&db),
+            Path::new(env!("CARGO_BIN_EXE_dagq")),
+            &options,
+        )
+        .unwrap()
+    };
+    // Nothing was ever observed: the daily observation is due, then the
+    // hourly one; `--once` waits for each before it exits.
+    let outcome = supervise_observed();
+    assert_eq!(outcome["runs"], json!([]));
+    let finished = queue_events(&db, "observe_finished");
+    assert_eq!(
+        finished
+            .iter()
+            .map(|f| (f["mode"].as_str().unwrap(), f["outcome"].as_str().unwrap()))
+            .collect::<Vec<_>>(),
+        [("daily", "succeeded"), ("hourly", "succeeded")]
+    );
+    assert!(finished.iter().all(|f| f["notes"] == 1));
+    let notes = SqliteQueue::open(&db)
+        .unwrap()
+        .notes(&dagq::domain::NoteQuery {
+            goal_id: Some(1),
+            task_id: None,
+            since: None,
+            limit: 10,
+        })
+        .unwrap()
+        .notes;
+    assert_eq!(
+        notes
+            .iter()
+            .map(|n| (
+                n.payload["kind"].as_str().unwrap(),
+                n.payload["text"].as_str().unwrap()
+            ))
+            .collect::<Vec<_>>(),
+        [
+            ("daily", "observed by observer"),
+            ("hourly", "observed by observer")
+        ]
+    );
+    assert!(dagq::observer::read_cursor(&db).unwrap().is_some());
+    // Within the interval nothing is due again, even for another supervisor.
+    supervise_observed();
+    assert_eq!(queue_events(&db, "observe_started").len(), 2);
+    // An interval of 0 disables the observer.
+    let disabled = SuperviseOptions {
+        observe_interval: Duration::ZERO,
+        ..options.clone()
+    };
+    fs::remove_file(db.parent().unwrap().join("observer/cursor")).unwrap();
+    Connection::open(&db)
+        .unwrap()
+        .execute(
+            "UPDATE run_events SET created_at='2000-01-01T00:00:00.000Z' WHERE kind LIKE 'observe_%'",
+            [],
+        )
+        .unwrap();
+    runtime::supervise(
+        &db,
+        &repo,
+        &backend,
+        &observer_claude_stub(&db),
+        Path::new(env!("CARGO_BIN_EXE_dagq")),
+        &disabled,
+    )
+    .unwrap();
+    assert_eq!(queue_events(&db, "observe_started").len(), 2);
+    // Once the interval passed, the next pass observes again.
+    supervise_observed();
+    assert_eq!(queue_events(&db, "observe_started").len(), 4);
 }

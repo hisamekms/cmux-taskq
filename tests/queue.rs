@@ -891,9 +891,10 @@ fn migration_from_v6_adds_goals_and_keeps_tasks_runs_and_events() {
     // 0007 (supervisors), 0008 (goals), 0009 (supervisor mode), 0010
     // (supervisor binary version), 0011 (session workspaces), 0012
     // (queue-level backend failures), 0013 (goal draft), 0014 (asks) and
-    // 0015 (required evidence) are applied together.
-    assert_eq!(SqliteQueue::SCHEMA_VERSION, 15);
-    assert_eq!(queue.schema_version().unwrap(), 15);
+    // 0015 (required evidence) and 0016 (observer events and task-less
+    // blocked asks) are applied together.
+    assert_eq!(SqliteQueue::SCHEMA_VERSION, 16);
+    assert_eq!(queue.schema_version().unwrap(), 16);
     assert_eq!(
         queue
             .session_workspace(dagq::domain::SessionRole::Maintainer)
@@ -941,12 +942,34 @@ fn migration_from_v6_adds_goals_and_keeps_tasks_runs_and_events() {
         )
         .is_err()
     );
-    // Only a failed backend call may belong to neither a task nor a goal.
+    // Only a failed backend call, the observer's own events and the events
+    // of a task-less ask may belong to neither a task nor a goal.
+    for kind in [
+        "backend_call_failed",
+        "observe_started",
+        "observe_finished",
+        "ask_opened",
+        "ask_answered",
+    ] {
+        raw.execute(
+            "INSERT INTO run_events(kind,payload) VALUES (?1,'{}')",
+            [kind],
+        )
+        .unwrap();
+    }
+    // Only a blocked ask may belong to no task, and then to no run either.
     raw.execute(
-        "INSERT INTO run_events(kind,payload) VALUES ('backend_call_failed','{}')",
+        "INSERT INTO asks(kind,question,asked_by) VALUES ('blocked','slots idle','observer')",
         [],
     )
     .unwrap();
+    assert!(
+        raw.execute(
+            "INSERT INTO asks(kind,question,asked_by) VALUES ('decide','x','observer')",
+            []
+        )
+        .is_err()
+    );
     assert!(
         raw.execute(
             "INSERT INTO run_events(run_id,kind,payload) VALUES ('run-landed','backend_call_failed','{}')",

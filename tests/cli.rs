@@ -875,6 +875,9 @@ fn observer_may_note_and_propose_but_not_change_queue_state() {
         &["ask", "--kind", "decide", "--question", "q", "--task", "1"],
         &["answer", "1", "--text", "x"],
         &["ask", "close", "1"],
+        // The observer does not start another observer.
+        &["observe", "--dry-run"],
+        &["supervise", "--once"],
     ] {
         denied(args);
     }
@@ -898,6 +901,56 @@ fn observer_may_note_and_propose_but_not_change_queue_state() {
         ok_as("observer", &db, args);
     }
     ok_as("observer", &db, &["note", "--goal", "1", "--text", "seen"]);
+    // A threshold crossing goes to the inbox as a blocked ask, on a task or
+    // on nothing; registering the same one again returns the open ask.
+    let on_task = ok_as(
+        "observer",
+        &db,
+        &[
+            "ask",
+            "--kind",
+            "blocked",
+            "--question",
+            "stuck",
+            "--task",
+            "1",
+        ],
+    );
+    assert_eq!(on_task["task_id"], 1);
+    assert_eq!(on_task["asked_by"], "observer");
+    let idle = ok_as(
+        "observer",
+        &db,
+        &[
+            "ask",
+            "--kind",
+            "blocked",
+            "--question",
+            "slots idle",
+            "--option",
+            "leave it",
+        ],
+    );
+    assert_eq!(idle["task_id"], Value::Null);
+    assert_eq!(idle["created"], true);
+    let again = ok_as(
+        "observer",
+        &db,
+        &["ask", "--kind", "blocked", "--question", "slots idle again"],
+    );
+    assert_eq!(
+        (again["id"].clone(), again["created"].clone()),
+        (idle["id"].clone(), Value::Bool(false))
+    );
+    let inbox = ok(&db, &["status", "--role", "inbox"]);
+    assert!(
+        inbox["attention"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|a| a["ask_id"] == idle["id"] && a["task_id"].is_null()),
+        "{inbox}"
+    );
     let draft = ok_as("observer", &db, &["goal", "add", "proposal", "--draft"]);
     assert_eq!(draft["status"], "draft");
     let task = ok_as(

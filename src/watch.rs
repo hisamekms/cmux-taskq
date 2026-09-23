@@ -199,7 +199,7 @@ pub fn attention(
         };
         attention.push(Attention {
             run_id: ask.run_id,
-            task_id: Some(ask.task_id),
+            task_id: ask.task_id,
             pid: None,
             ask_id: Some(ask.id),
             status: status.into(),

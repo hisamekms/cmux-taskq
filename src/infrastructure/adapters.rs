@@ -1280,6 +1280,23 @@ impl AgentProvider for ClaudeCode {
             .stderr(Stdio::inherit());
         Ok(command)
     }
+
+    /// `claude -p` (print mode): no terminal, no trust dialog; a tool that
+    /// needs permission and is not in `allowed_tools` is refused.
+    fn headless_command(
+        &self,
+        cwd: &Path,
+        prompt: &str,
+        allowed_tools: &[&str],
+    ) -> Result<Command> {
+        let mut command = Command::new(&self.executable);
+        command.current_dir(cwd).arg("-p");
+        if !allowed_tools.is_empty() {
+            command.arg("--allowedTools").args(allowed_tools);
+        }
+        command.arg("--").arg(prompt).stdin(Stdio::null());
+        Ok(command)
+    }
 }
 
 /// Claude Code's global config, where the folder trust of each project is
@@ -1347,6 +1364,26 @@ pub fn stop_hook_settings(idle_marker: &Path) -> Result<String> {
 mod tests {
     use super::*;
     use crate::domain::{Provider, RunStatus};
+
+    #[test]
+    fn claude_headless_command_prints_with_only_the_allowed_tools() {
+        let claude = ClaudeCode {
+            executable: "/bin/claude".into(),
+        };
+        let command = claude
+            .headless_command(Path::new("/tmp/obs"), "observe", &["Bash(dagq:*)"])
+            .unwrap();
+        assert_eq!(command.get_program(), "/bin/claude");
+        assert_eq!(command.get_current_dir(), Some(Path::new("/tmp/obs")));
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            ["-p", "--allowedTools", "Bash(dagq:*)", "--", "observe"]
+        );
+        let bare = claude
+            .headless_command(Path::new("/tmp"), "p", &[])
+            .unwrap();
+        assert_eq!(bare.get_args().collect::<Vec<_>>(), ["-p", "--", "p"]);
+    }
 
     fn run(repo_path: Option<&str>) -> TaskRun {
         TaskRun {

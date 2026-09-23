@@ -314,6 +314,19 @@ pub trait AgentProvider {
     /// run's own settings and idle marker, without a prompt; the supervisor
     /// sends the resolution request to the terminal once it is up.
     fn resume_command(&self, run: &crate::domain::TaskRun) -> Result<std::process::Command>;
+    /// A headless run of the agent for a job without a workspace (ADR-0024
+    /// decision 2): `prompt` in `cwd`, allowed only `allowed_tools` beyond
+    /// what needs no permission. The caller sets the environment and where
+    /// the output goes. A provider without one refuses.
+    fn headless_command(
+        &self,
+        cwd: &std::path::Path,
+        prompt: &str,
+        allowed_tools: &[&str],
+    ) -> Result<std::process::Command> {
+        let _ = (cwd, prompt, allowed_tools);
+        anyhow::bail!("this provider has no headless execution")
+    }
 }
 
 /// The Git remote `integrate` pushes the landed `main` to (ADR-0019

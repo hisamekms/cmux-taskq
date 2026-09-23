@@ -44,6 +44,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../../migrations/0013_goal_draft.sql"),
     include_str!("../../migrations/0014_asks.sql"),
     include_str!("../../migrations/0015_task_required_evidence.sql"),
+    include_str!("../../migrations/0016_observer.sql"),
 ];
 /// Ready tasks whose predecessors are completed, that own no unfinished run
 /// and whose goal, if any, is not a draft (ADR-0024 decision 5).

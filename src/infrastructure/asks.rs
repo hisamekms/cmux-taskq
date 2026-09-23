@@ -5,7 +5,7 @@ use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
 use serde_json::json;
 
-use super::sqlite::{SqliteQueue, enum_col, event, json_col};
+use super::sqlite::{SqliteQueue, enum_col, json_col};
 use crate::domain::{Ask, AskKind, AskOutcome, NewAsk, RunStatus, SessionRole};
 
 /// Which asks `asks` lists. By default the ones nobody closed; `all` adds
@@ -21,7 +21,8 @@ pub struct AskQuery {
 impl SqliteQueue {
     /// Register an ask, or return the open one of the same task, run and
     /// kind unchanged. A new ask writes `ask_opened` (with the run when it
-    /// has one) in the same transaction.
+    /// has one) in the same transaction. A `blocked` ask may name neither a
+    /// task nor a run: the observer's threshold that belongs to no task.
     pub fn ask(&mut self, ask: NewAsk) -> Result<AskOutcome> {
         ask.validate()?;
         let tx = self
@@ -33,7 +34,8 @@ impl SqliteQueue {
                     r.get::<_, i64>(0)
                 })
                 .optional()?
-                .with_context(|| format!("run {run_id} does not exist"))?,
+                .with_context(|| format!("run {run_id} does not exist"))
+                .map(Some)?,
             (None, Some(task_id)) => {
                 ensure!(
                     tx.query_row("SELECT count(*) FROM tasks WHERE id=?1", [task_id], |r| r
@@ -42,13 +44,14 @@ impl SqliteQueue {
                     ))? == 1,
                     "task {task_id} does not exist"
                 );
-                task_id
+                Some(task_id)
             }
-            (None, None) => anyhow::bail!("an ask needs a task or a run"),
+            // `validate` admits this for a blocked ask only.
+            (None, None) => None,
         };
         if let Some(existing) = tx
             .query_row(
-                "SELECT * FROM asks WHERE task_id=?1 AND ifnull(run_id,'')=ifnull(?2,'')
+                "SELECT * FROM asks WHERE ifnull(task_id,0)=ifnull(?1,0) AND ifnull(run_id,'')=ifnull(?2,'')
                  AND kind=?3 AND answered_at IS NULL AND closed_at IS NULL",
                 params![task_id, ask.run_id, ask.kind.as_str()],
                 ask_row,
@@ -73,7 +76,7 @@ impl SqliteQueue {
             ],
         )?;
         let id = tx.last_insert_rowid();
-        event(
+        ask_event(
             &tx,
             task_id,
             ask.run_id.as_deref(),
@@ -113,7 +116,7 @@ impl SqliteQueue {
                 })?;
             payload["runtime_delivers"] = json!(status == RunStatus::Running.as_str());
         }
-        event(
+        ask_event(
             &tx,
             ask.task_id,
             ask.run_id.as_deref(),
@@ -199,7 +202,7 @@ impl SqliteQueue {
         }
         ensure!(ask.answered_at.is_some(), "ask {id} is not answered");
         tx.execute("UPDATE asks SET closed_at=unixepoch() WHERE id=?1", [id])?;
-        event(
+        ask_event(
             &tx,
             ask.task_id,
             ask.run_id.as_deref(),
@@ -214,6 +217,22 @@ impl SqliteQueue {
     pub fn read_ask(&self, id: i64) -> Result<Ask> {
         read_ask(&self.conn, id)
     }
+}
+
+/// An ask's event: on its task (and run), or, for a task-less `blocked`
+/// ask, on nothing.
+fn ask_event(
+    conn: &Connection,
+    task_id: Option<i64>,
+    run_id: Option<&str>,
+    kind: &str,
+    payload: serde_json::Value,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO run_events(task_id,run_id,kind,payload) VALUES (?1,?2,?3,?4)",
+        params![task_id, run_id, kind, serde_json::to_string(&payload)?],
+    )?;
+    Ok(())
 }
 
 fn read_ask(conn: &Connection, id: i64) -> Result<Ask> {

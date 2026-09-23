@@ -640,6 +640,69 @@ impl SqliteQueue {
         }
     }
 
+    /// Record an event of the queue itself, on no task, goal or run (the
+    /// observer's `observe_started` / `observe_finished`); returns its id.
+    pub fn record_queue_event(&self, kind: &str, payload: serde_json::Value) -> Result<i64> {
+        self.conn.execute(
+            "INSERT INTO run_events(kind,payload) VALUES (?1,?2)",
+            params![kind, serde_json::to_string(&payload)?],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// The id of the last event recorded before `unix` (seconds), 0 when
+    /// there is none: a cursor that reads everything from that time on.
+    pub fn event_id_before(&self, unix: i64) -> Result<i64> {
+        Ok(self.conn.query_row(
+            "SELECT ifnull(max(id),0) FROM run_events
+             WHERE CAST(strftime('%s',created_at) AS INTEGER) < ?1",
+            [unix],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// When the observer of `mode` last started or finished (unix seconds).
+    pub fn last_observe(&self, mode: &str) -> Result<Option<i64>> {
+        Ok(self.conn.query_row(
+            "SELECT max(CAST(strftime('%s',created_at) AS INTEGER)) FROM run_events
+             WHERE kind IN ('observe_started','observe_finished')
+               AND json_extract(payload,'$.mode')=?1",
+            [mode],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// The highest ask id and goal id now, 0 when none exists: where the
+    /// observer's own asks and goals start.
+    pub fn ask_and_goal_high_water(&self) -> Result<(i64, i64)> {
+        Ok(self.conn.query_row(
+            "SELECT (SELECT ifnull(max(id),0) FROM asks), (SELECT ifnull(max(id),0) FROM goals)",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?)
+    }
+
+    /// What `role` wrote after the marks: notes recorded after `event_id`,
+    /// asks after `ask_id`, and draft goals after `goal_id` (goals do not
+    /// record who added them; the observer is the one that adds drafts).
+    pub fn written_by(
+        &self,
+        role: &str,
+        event_id: i64,
+        ask_id: i64,
+        goal_id: i64,
+    ) -> Result<(i64, i64, i64)> {
+        Ok(self.conn.query_row(
+            "SELECT
+               (SELECT count(*) FROM run_events WHERE id>?2 AND kind='observation'
+                  AND json_extract(payload,'$.by')=?1),
+               (SELECT count(*) FROM asks WHERE id>?3 AND asked_by=?1),
+               (SELECT count(*) FROM goals WHERE id>?4 AND status='draft')",
+            params![role, event_id, ask_id, goal_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )?)
+    }
+
     /// The latest run whose session opened in `workspace_id`, if any.
     pub fn run_in_workspace(&self, workspace_id: &str) -> Result<Option<String>> {
         Ok(self

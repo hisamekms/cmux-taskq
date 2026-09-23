@@ -39,7 +39,7 @@ Collect from the user, asking only for what is missing: title (the problem, one 
 "$DAGQ" goal add "TITLE" --description "..." --acceptance "..." --constraints "..." --doc docs/adr/NNNN-name.md
 ```
 
-A goal has no verification commands; a goal-level check belongs in a final task that depends on all the others. Its one state is draft or open: `goal add --draft` registers a proposal whose tasks are never claimed, even when `ready`. Adopt it with `goal ready ID` (its ready tasks become candidates), or reject it with `goal close ID --verdict abandoned`. Decide with the user; observer drafts cite their notes.
+A goal has no verification commands; a goal-level check belongs in a final task that depends on all the others. Its one state is draft or open: `goal add --draft` registers a proposal whose tasks are never claimed, even when `ready`. Adopt it with `goal ready ID`, or reject it with `goal close ID --verdict abandoned`. Review the observer job's drafts, notes and `blocked` asks with the user per `reference/observer.md`.
 
 ### Register the tasks
 

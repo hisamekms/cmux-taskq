@@ -188,6 +188,35 @@ enum Command {
         /// directory (created if missing) in addition to stderr.
         #[arg(long)]
         log_dir: Option<PathBuf>,
+        /// Start the observer job (`observe`) when this many seconds passed
+        /// since the last one started or finished; 0 disables the observer.
+        /// Default 3600, or 0 with --once.
+        #[arg(long)]
+        observe_interval: Option<u64>,
+        /// Also run the daily observation of the last 24 hours once a day.
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+        observe_daily: bool,
+    },
+    /// Run the observer job once: headless Claude under DAGQ_ROLE=observer reads stats past the
+    /// cursor, the latest notes, the open asks and the graph, and writes notes, blocked asks and
+    /// draft goals only. Records observe_started / observe_finished and saves the new cursor.
+    Observe {
+        /// Event id to read stats past; defaults to the cursor the last observe saved
+        /// (<queue dir>/observer/cursor), or with --daily the last event 24 hours ago.
+        #[arg(long)]
+        since: Option<i64>,
+        /// Print the prompt instead of starting the agent.
+        #[arg(long)]
+        dry_run: bool,
+        /// The daily observation: trends over the last 24 hours; leaves the cursor alone.
+        #[arg(long)]
+        daily: bool,
+        /// Seconds the agent may run before it is killed.
+        #[arg(long, default_value_t = 1800)]
+        timeout: u64,
+        /// Claude Code executable; a bare name is resolved on PATH.
+        #[arg(long, default_value = "claude")]
+        claude: PathBuf,
     },
     /// Start the queue's runtime: a launchd-resident supervisor and the maintainer's cmux workspace. Idempotent; replaces a live supervisor of another version.
     Up {
@@ -261,15 +290,15 @@ enum Command {
     Ask {
         #[command(subcommand)]
         command: Option<AskCommand>,
-        #[arg(long, required = true, value_parser = ["approve_landing", "answer_prompt", "decide", "worker_question"])]
+        #[arg(long, required = true, value_parser = ["approve_landing", "answer_prompt", "decide", "worker_question", "blocked"])]
         kind: Option<String>,
         #[arg(long, required = true)]
         question: Option<String>,
         /// A choice to offer; repeat for several.
         #[arg(long = "option")]
         options: Vec<String>,
-        /// Task the ask is about.
-        #[arg(long = "task", required_unless_present = "run", conflicts_with = "run")]
+        /// Task the ask is about. Only a blocked ask may name neither a task nor a run.
+        #[arg(long = "task", conflicts_with = "run")]
         task_id: Option<i64>,
         /// Run the ask is about (its task is implied).
         #[arg(long)]
@@ -455,7 +484,7 @@ enum ObserverAccess {
     DraftGoal(i64),
 }
 
-/// An allowlist: reads, notes, draft goals and tasks of a draft goal. Every
+/// An allowlist: reads, notes, blocked asks, draft goals and tasks of a draft goal. Every
 /// other command, including ones added later, is refused until listed here.
 fn observer_access(command: &Command) -> ObserverAccess {
     match command {
@@ -480,6 +509,12 @@ fn observer_access(command: &Command) -> ObserverAccess {
             goal_id: Some(goal_id),
             ..
         } => ObserverAccess::DraftGoal(*goal_id),
+        // The threshold crossings it raises to the inbox, and nothing else.
+        Command::Ask {
+            command: None,
+            kind: Some(kind),
+            ..
+        } if kind == AskKind::Blocked.as_str() => ObserverAccess::Allowed,
         _ => ObserverAccess::Denied,
     }
 }
@@ -758,6 +793,8 @@ fn execute(cli: Cli) -> Result<Value> {
             cmux,
             claude,
             log_dir,
+            observe_interval,
+            observe_daily,
         } => {
             use dagq::infrastructure::adapters::{Cmux, executable};
             use dagq::runtime::SuperviseOptions;
@@ -766,6 +803,13 @@ fn execute(cli: Cli) -> Result<Value> {
                 once,
                 stop: install_stop_signal()?,
                 log_dir,
+                // A one-shot pass observes only when asked to.
+                observe_interval: Duration::from_secs(observe_interval.unwrap_or(if once {
+                    0
+                } else {
+                    3600
+                })),
+                observe_daily,
             };
             dagq::runtime::supervise(
                 &db,
@@ -890,6 +934,37 @@ fn execute(cli: Cli) -> Result<Value> {
                 full,
             },
         )?,
+        Command::Observe {
+            since,
+            dry_run,
+            daily,
+            timeout,
+            claude,
+        } => {
+            use dagq::infrastructure::adapters::{ClaudeCode, executable};
+            use dagq::observer::{ObserveMode, ObserveOptions};
+            // A dry run starts nothing, so it needs no Claude Code.
+            let executable = if dry_run {
+                claude
+            } else {
+                executable(&claude)?
+            };
+            dagq::observer::observe(
+                &db,
+                &ClaudeCode { executable },
+                &ObserveOptions {
+                    mode: if daily {
+                        ObserveMode::Daily
+                    } else {
+                        ObserveMode::Hourly
+                    },
+                    since,
+                    dry_run,
+                    timeout: Duration::from_secs(timeout),
+                    dagq: env::current_exe()?,
+                },
+            )?
+        }
         Command::Doctor { full } => dagq::runtime::doctor(&db, full)?,
         Command::Recover { run } => dagq::runtime::recover(&db, &run)?,
         Command::Session {

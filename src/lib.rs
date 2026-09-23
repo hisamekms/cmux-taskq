@@ -2,6 +2,7 @@ pub mod application;
 pub mod domain;
 pub mod infrastructure;
 pub mod lifecycle;
+pub mod observer;
 pub mod runtime;
 pub mod view;
 pub mod watch;

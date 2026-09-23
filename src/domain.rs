@@ -101,6 +101,9 @@ string_enum!(AskKind {
     AnswerPrompt => "answer_prompt",
     Decide => "decide",
     WorkerQuestion => "worker_question",
+    // A threshold crossing the observer raises (ADR-0024 decision 4); the
+    // one kind that may belong to no task.
+    Blocked => "blocked",
 });
 
 string_enum!(ReceiptResult {
@@ -200,6 +203,10 @@ pub enum DomainError {
     InvalidNoteKind {
         kind: String,
     },
+    /// An ask of `kind` names neither a task nor a run; only `blocked` may.
+    AskWithoutTarget {
+        kind: AskKind,
+    },
 }
 
 impl fmt::Display for DomainError {
@@ -216,6 +223,11 @@ impl fmt::Display for DomainError {
                 status.as_str()
             ),
             Self::Blank { field } => write!(f, "{field} must not be blank"),
+            Self::AskWithoutTarget { kind } => write!(
+                f,
+                "a {} ask needs a task or a run; only a blocked ask may have neither",
+                kind.as_str()
+            ),
             Self::NonPositiveId { field } => write!(f, "{field} must be positive"),
             Self::GoalAlreadyClosed { goal_id, verdict } => write!(
                 f,
@@ -668,14 +680,15 @@ pub struct Predecessor {
 pub mod stats;
 
 /// A question for a person (ADR-0022): about a task, or one of its runs when
-/// `run_id` is set. It is open while `answered_at` and `closed_at` are
+/// `run_id` is set; a `blocked` ask of the observer may be about neither
+/// (ADR-0024 decision 4). It is open while `answered_at` and `closed_at` are
 /// unset; once answered it waits for the maintainer to read the answer and
 /// close it. Times are unix seconds.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Ask {
     pub id: i64,
     pub kind: AskKind,
-    pub task_id: i64,
+    pub task_id: Option<i64>,
     pub run_id: Option<String>,
     pub question: String,
     pub options: Vec<String>,
@@ -706,7 +719,7 @@ impl Ask {
 }
 
 /// An ask to register: `task_id` or `run_id` names what it is about (a run
-/// implies its task).
+/// implies its task). Only a `blocked` ask may name neither.
 #[derive(Debug, Clone)]
 pub struct NewAsk {
     pub kind: AskKind,
@@ -730,7 +743,11 @@ impl NewAsk {
         })?;
         require(self.task_id.is_none_or(|id| id > 0), || {
             DomainError::NonPositiveId { field: "task ID" }
-        })
+        })?;
+        require(
+            self.task_id.is_some() || self.run_id.is_some() || self.kind == AskKind::Blocked,
+            || DomainError::AskWithoutTarget { kind: self.kind },
+        )
     }
 }
 
@@ -1685,7 +1702,7 @@ mod attention_tests {
         let mut ask = Ask {
             id: 1,
             kind: AskKind::Decide,
-            task_id: 1,
+            task_id: Some(1),
             run_id: None,
             question: "q".into(),
             options: vec![],
@@ -1744,9 +1761,30 @@ mod attention_tests {
                 task_id: Some(0),
                 ..valid.clone()
             },
+            NewAsk {
+                task_id: None,
+                ..valid.clone()
+            },
         ] {
             assert!(broken.validate().is_err(), "{broken:?}");
         }
+        // Only the observer's blocked ask may be about no task.
+        let blocked = NewAsk {
+            kind: AskKind::Blocked,
+            task_id: None,
+            ..valid.clone()
+        };
+        assert!(blocked.validate().is_ok());
+        assert_eq!(
+            NewAsk {
+                task_id: None,
+                ..valid.clone()
+            }
+            .validate()
+            .unwrap_err()
+            .to_string(),
+            "a worker_question ask needs a task or a run; only a blocked ask may have neither"
+        );
         assert_eq!("decide".parse::<AskKind>().unwrap(), AskKind::Decide);
         assert!("bogus".parse::<AskKind>().is_err());
     }

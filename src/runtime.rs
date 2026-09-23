@@ -49,6 +49,8 @@ use std::{
 };
 use uuid::Uuid;
 
+use crate::observer::ObserveMode;
+
 pub fn unix_time() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -69,6 +71,12 @@ pub struct SuperviseOptions {
     /// Directory for one `supervisor-<started_at>-<pid>.log` per start,
     /// created if missing; `None` keeps the messages on stderr only.
     pub log_dir: Option<PathBuf>,
+    /// Start the observer job when this long passed since the last one
+    /// started or finished (ADR-0024 decision 4); zero disables the
+    /// observer, the daily one included.
+    pub observe_interval: Duration,
+    /// Also run the daily observation once every 24 hours.
+    pub observe_daily: bool,
 }
 
 impl SuperviseOptions {
@@ -78,6 +86,8 @@ impl SuperviseOptions {
             once,
             stop: Arc::new(AtomicBool::new(false)),
             log_dir: None,
+            observe_interval: Duration::ZERO,
+            observe_daily: false,
         }
     }
 }
@@ -254,6 +264,8 @@ pub fn supervise(
         claiming: true,
         provisioning_error: None,
         queue_hash,
+        observer: None,
+        observers_launched: Vec::new(),
     };
     let result = supervisor.run_loop(options);
     match &result {
@@ -466,6 +478,11 @@ struct Supervisor<'a> {
     /// The queue hash: the external ID of the queue's workspace group and
     /// part of every run workspace's description (ADR-0026).
     queue_hash: String,
+    /// The observer job running now: one at a time, outside the run slots.
+    observer: Option<(ObserveMode, std::process::Child)>,
+    /// When this process last launched each observation, so one that dies
+    /// before it records anything is not relaunched on every pass.
+    observers_launched: Vec<(ObserveMode, Instant)>,
 }
 
 /// One executing run between provisioning and rest.
@@ -531,11 +548,22 @@ impl Supervisor<'_> {
             if self.claiming && !stopping {
                 self.fill_slots(options.parallel)?;
             }
+            self.poll_observer();
+            // A supervisor that stopped claiming is draining, not observing.
+            if !stopping && self.claiming {
+                self.start_observer_when_due(options);
+            }
             if self.slots.is_empty() {
-                if options.once || stopping || !self.claiming {
+                // A running observer is waited for like a run: it is short
+                // and bounded by its own timeout.
+                if self.observer.is_none() && (options.once || stopping || !self.claiming) {
                     break;
                 }
-                thread::sleep(IDLE_POLL);
+                thread::sleep(if self.observer.is_some() {
+                    TICK
+                } else {
+                    IDLE_POLL
+                });
                 continue;
             }
             self.tick();
@@ -669,6 +697,111 @@ impl Supervisor<'_> {
                     ));
                     self.abandon(&slot.run, message);
                 }
+            }
+        }
+    }
+
+    /// The observation due now, if any: the daily one when it has not run
+    /// for 24 hours, else the hourly one when the interval passed since the
+    /// last one started or finished (from the queue, whichever supervisor
+    /// ran it) and since this process last launched it.
+    fn due_observation(&self, options: &SuperviseOptions) -> Result<Option<ObserveMode>> {
+        if options.observe_interval.is_zero() {
+            return Ok(None);
+        }
+        let now = unix_time();
+        let mut modes = vec![(
+            ObserveMode::Hourly,
+            i64::try_from(options.observe_interval.as_secs())?,
+        )];
+        if options.observe_daily {
+            modes.insert(0, (ObserveMode::Daily, crate::observer::DAILY_WINDOW_SECS));
+        }
+        for (mode, every) in modes {
+            let recorded = self
+                .queue
+                .last_observe(mode.as_str())?
+                .is_some_and(|last| now - last < every);
+            let launched = self.observers_launched.iter().any(|(launched, at)| {
+                *launched == mode && at.elapsed().as_secs() < every.unsigned_abs()
+            });
+            if !recorded && !launched {
+                return Ok(Some(mode));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Launch `dagq observe` as a child process when an observation is due
+    /// and none is running. It takes no run slot. A failure to launch is
+    /// logged and retried after the interval.
+    fn start_observer_when_due(&mut self, options: &SuperviseOptions) {
+        if self.observer.is_some() {
+            return;
+        }
+        let mode = match self.due_observation(options) {
+            Ok(Some(mode)) => mode,
+            Ok(None) => return,
+            Err(error) => {
+                self.log
+                    .note(&format!("observer schedule could not be read: {error:#}"));
+                return;
+            }
+        };
+        self.observers_launched
+            .retain(|(launched, _)| *launched != mode);
+        self.observers_launched.push((mode, Instant::now()));
+        let mut command = std::process::Command::new(self.runner);
+        command
+            .arg("--db")
+            .arg(&self.db)
+            .arg("observe")
+            .arg("--claude")
+            .arg(self.claude)
+            .current_dir(&self.repository.root)
+            .env_remove(crate::lifecycle::ROLE_ENV)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        if mode == ObserveMode::Daily {
+            command.arg("--daily");
+        }
+        match command.spawn() {
+            Ok(child) => {
+                self.log.note(&format!(
+                    "observer ({}) started: pid {}",
+                    mode.as_str(),
+                    child.id()
+                ));
+                self.observer = Some((mode, child));
+            }
+            Err(error) => self.log.note(&format!(
+                "observer ({}) could not start: {error:#}",
+                mode.as_str()
+            )),
+        }
+    }
+
+    /// Reap the observer once it exited; its own `observe_finished` is the
+    /// record.
+    fn poll_observer(&mut self) {
+        let Some((mode, child)) = self.observer.as_mut() else {
+            return;
+        };
+        let mode = *mode;
+        match child.try_wait() {
+            Ok(None) => {}
+            Ok(Some(status)) => {
+                self.log
+                    .note(&format!("observer ({}) exited: {status}", mode.as_str()));
+                self.observer = None;
+            }
+            Err(error) => {
+                self.log.note(&format!(
+                    "observer ({}) could not be waited for: {error:#}",
+                    mode.as_str()
+                ));
+                self.observer = None;
             }
         }
     }

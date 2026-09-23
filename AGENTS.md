@@ -49,9 +49,9 @@ cargo clippy --locked --all-targets -- -D warnings
 - run session は自分の run branch `dagq/<run-id>` にコミットする。main への着地は `dagq integrate` だけが行い（1 タスク 1 squash commit）、push は integrate が行う（`push_failed` の attention が出たら maintainer が原因を直して `git push origin main`）
 - メッセージは `feat:` / `fix:` / `docs:` / `test:` の接頭辞、本文は何をなぜ変えたか。着地時の commit メッセージはタスクの title と receipt の summary から runtime が作る
 
-## 役割: supervisor と maintainer と worker と inbox / planner
+## 役割: supervisor と maintainer と worker と inbox / planner と observer
 
-runtime の `supervise` プロセスが **supervisor**、登録・監視・レビュー・着地を行う常駐の Claude Code session が **maintainer**、run ごとに worktree で作業する Claude session が **worker**、人が queue の ask に答える session が **inbox**、人と対話して goal / task を登録する session が **planner**（[ADR-0010](docs/adr/0010-maintainer-and-resident-supervisor.md)、[ADR-0022](docs/adr/0022-ask-answer-inbox-planner-and-landing-on-doubt.md)、[docs/design/overview.md](docs/design/overview.md) の用語）。
+runtime の `supervise` プロセスが **supervisor**、登録・監視・レビュー・着地を行う常駐の Claude Code session が **maintainer**、run ごとに worktree で作業する Claude session が **worker**、人が queue の ask に答える session が **inbox**、人と対話して goal / task を登録する session が **planner**（[ADR-0010](docs/adr/0010-maintainer-and-resident-supervisor.md)、[ADR-0022](docs/adr/0022-ask-answer-inbox-planner-and-landing-on-doubt.md)、[docs/design/overview.md](docs/design/overview.md) の用語）。supervisor が timer で起動する headless の job が **observer**（[ADR-0024](docs/adr/0024-retire-maintainer-into-jobs-and-observer.md) の決定 4）。
 
 同じ commit に対する verification は `integrate` の 1 回が正で、validating は receipt・commit・clean・要求 evidence だけを見て `verification_commands` を実行しない。`integrate` は rebase の有無に関わらず rebase 後に必ず `verification_commands` を実行し（`integrate-verify-N.log`）、失敗すれば run は `needs_session` になって supervisor が resume する（[ADR-0023](docs/adr/0023-verify-once-review-in-supervisor-run-env-graph-and-stats.md) 決定 1）。
 
@@ -90,3 +90,10 @@ dagq up --in-cmux --claude ~/.local/bin/claude --plugin-dir <この repository>/
 - `up` が開き、初期 prompt（`inbox_prompt` / `planner_prompt`）で起動する。maintainer と同じく workspace の `--env` に `DAGQ_ROLE=inbox` / `planner` と `DAGQ_QUEUE` を持つ
 - inbox は `status --role inbox` から始め、`watch --role inbox` を background で回し、`ask_opened` の question と options を人に見せ、人の答えを `answer` で書く。自分では判断しない
 - planner は人の課題を聞き、dagq skill で goal と task を登録して ready にし、goal の全 task の完了を見たら receipt と acceptance を照合して `goal close` する
+
+### observer
+
+- supervisor が `--observe-interval`（既定 3600 秒、0 で無効）ごとと 1 日 1 回（`--observe-daily`、既定 on）、`dagq observe` を子プロセスで起動する。cmux workspace は持たず、`claude -p` を `DAGQ_ROLE=observer` で動かす。supervisor が居ないときは動かない。手で走らせるなら `dagq observe`（`--dry-run` で prompt だけ見る）
+- 入力は `stats --since <cursor>`、直近 20 件の note、open な ask、graph の candidates と critical。書けるのは note、`kind: blocked` の ask、draft の goal だけで、run / task / goal の状態を変えるコマンドは CLI が拒否する。個々の詰まりは解消しない
+- 経過は `observe_started` / `observe_finished`（書いた件数、cursor）と `<queue dir>/observer/<started_at>/`（prompt、入力、出力）に残る。note と draft goal は planner（`dagq` skill の `reference/observer.md`）が人と見て、draft goal を `goal ready` するか `goal close --verdict abandoned` にする。`blocked` の ask は inbox が人に見せる
+- 詳細は [supervisor-lifecycle](docs/design/supervisor-lifecycle.md) の Observer
