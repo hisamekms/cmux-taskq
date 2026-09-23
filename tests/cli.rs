@@ -473,3 +473,51 @@ fn show_goal_show_and_doctor_are_compact_unless_full() {
         assert_eq!(report["supervisors"], serde_json::json!([]), "{args:?}");
     }
 }
+
+#[test]
+fn graph_reports_unfinished_dependencies_releases_and_the_critical_chain() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("queue.db");
+    ok(&db, &["init"]);
+    let goal = ok(&db, &["goal", "add", "goal"])["id"].to_string();
+    ok(&db, &["add", "in goal", "--goal", &goal]);
+    ok(&db, &["add", "root"]);
+    ok(&db, &["add", "middle", "--depends-on", "2"]);
+    ok(&db, &["add", "leaf", "--depends-on", "3"]);
+    ok(&db, &["add", "canceled", "--depends-on", "2"]);
+    ok(
+        &db,
+        &["add", "after goal", "--goal", &goal, "--depends-on", "1"],
+    );
+    for id in ["1", "2", "3"] {
+        ok(&db, &["ready", id]);
+    }
+    ok(&db, &["cancel", "5"]);
+
+    let graph = ok(&db, &["graph"]);
+    let tasks = graph["tasks"].as_array().unwrap();
+    let ids: Vec<i64> = tasks.iter().map(|t| t["id"].as_i64().unwrap()).collect();
+    assert_eq!(ids, [1, 2, 3, 4, 6]);
+    assert_eq!(
+        tasks[1],
+        serde_json::json!({
+            "id": 2, "status": "ready", "title": "root", "goal_id": null,
+            "depends_on": [], "blocks": [3], "unblocks": 2, "ready_after": [],
+        })
+    );
+    assert_eq!(tasks[2]["ready_after"], serde_json::json!([2]));
+    assert_eq!(tasks[0]["unblocks"], 1);
+    assert_eq!(graph["candidates"], serde_json::json!([2, 1]));
+    assert_eq!(graph["critical"], serde_json::json!([2, 3, 4]));
+
+    let in_goal = ok(&db, &["graph", "--goal", &goal]);
+    let ids: Vec<i64> = in_goal["tasks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["id"].as_i64().unwrap())
+        .collect();
+    assert_eq!(ids, [1, 6]);
+    assert_eq!(in_goal["candidates"], serde_json::json!([1]));
+    assert_eq!(in_goal["critical"], serde_json::json!([1, 6]));
+}

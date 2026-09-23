@@ -119,6 +119,146 @@ impl TaskListItem {
     }
 }
 
+/// An unfinished task (draft, ready or in progress) with every direct
+/// predecessor, finished or not: the input of [`dependency_graph`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GraphTask {
+    pub id: i64,
+    pub status: TaskStatus,
+    pub title: String,
+    pub goal_id: Option<i64>,
+    /// IDs of the direct predecessors, ascending.
+    pub depends_on: Vec<i64>,
+}
+
+/// One read of the queue for `graph`: the unfinished tasks in ID order and
+/// the IDs of the claimable ones (`candidates`).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct GraphInput {
+    pub tasks: Vec<GraphTask>,
+    pub candidates: Vec<i64>,
+}
+
+/// An unfinished task as `graph` shows it (ADR-0023 decision 4).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct GraphNode {
+    pub id: i64,
+    pub status: TaskStatus,
+    pub title: String,
+    pub goal_id: Option<i64>,
+    /// Every direct predecessor, ascending.
+    pub depends_on: Vec<i64>,
+    /// Unfinished tasks that depend on this one directly, ascending.
+    pub blocks: Vec<i64>,
+    /// How many unfinished tasks depend on this one directly or transitively:
+    /// the tasks its completion moves closer to running.
+    pub unblocks: usize,
+    /// The direct predecessors that are still unfinished, ascending.
+    pub ready_after: Vec<i64>,
+}
+
+/// The dependency view of the unfinished tasks.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct DependencyGraph {
+    /// Unfinished tasks in ID order.
+    pub tasks: Vec<GraphNode>,
+    /// Claimable tasks in the order the supervisor claims them: most
+    /// `unblocks` first, then ascending ID.
+    pub candidates: Vec<i64>,
+    /// The chain from the task with the most `unblocks` (lowest ID on a tie),
+    /// each step to the directly blocked task with the most `unblocks`
+    /// (lowest ID on a tie), down to a task that blocks nothing. Empty when
+    /// no task blocks another.
+    pub critical: Vec<i64>,
+}
+
+/// Compute the dependency view. Counts always span every unfinished task;
+/// `goal_id` only narrows `tasks`, `candidates` and where `critical` starts
+/// (the chain may then leave the goal). The queue rejects cycles, so the
+/// dependencies form a DAG; a predecessor that is not in `input.tasks` is
+/// finished.
+pub fn dependency_graph(input: GraphInput, goal_id: Option<i64>) -> DependencyGraph {
+    use std::collections::{BTreeMap, BTreeSet};
+    let open: BTreeSet<i64> = input.tasks.iter().map(|task| task.id).collect();
+    let mut blocks: BTreeMap<i64, Vec<i64>> = BTreeMap::new();
+    for task in &input.tasks {
+        for predecessor in &task.depends_on {
+            if open.contains(predecessor) {
+                blocks.entry(*predecessor).or_default().push(task.id);
+            }
+        }
+    }
+    for dependents in blocks.values_mut() {
+        dependents.sort_unstable();
+        dependents.dedup();
+    }
+    let direct = |id: i64| blocks.get(&id).map(Vec::as_slice).unwrap_or_default();
+    let unblocks: BTreeMap<i64, usize> = open
+        .iter()
+        .map(|&id| {
+            let mut reached = BTreeSet::new();
+            let mut pending = direct(id).to_vec();
+            while let Some(next) = pending.pop() {
+                if reached.insert(next) {
+                    pending.extend_from_slice(direct(next));
+                }
+            }
+            (id, reached.len())
+        })
+        .collect();
+    let count = |id: i64| unblocks.get(&id).copied().unwrap_or(0);
+    // Most unblocks first, lowest ID on a tie.
+    let rank = |id: &i64| (std::cmp::Reverse(count(*id)), *id);
+    let in_goal = |task: &GraphTask| goal_id.is_none() || task.goal_id == goal_id;
+    let goal_ids: BTreeSet<i64> = input
+        .tasks
+        .iter()
+        .filter(|task| in_goal(task))
+        .map(|task| task.id)
+        .collect();
+    let mut candidates: Vec<i64> = input
+        .candidates
+        .iter()
+        .copied()
+        .filter(|id| goal_id.is_none() || goal_ids.contains(id))
+        .collect();
+    candidates.sort_by_key(rank);
+    let mut critical = Vec::new();
+    let mut step = goal_ids.iter().copied().min_by_key(rank);
+    if step.is_some_and(|id| count(id) == 0) {
+        step = None;
+    }
+    while let Some(id) = step {
+        critical.push(id);
+        step = direct(id).iter().copied().min_by_key(rank);
+    }
+    let tasks = input
+        .tasks
+        .into_iter()
+        .filter(|task| goal_ids.contains(&task.id))
+        .map(|task| GraphNode {
+            blocks: direct(task.id).to_vec(),
+            unblocks: count(task.id),
+            ready_after: task
+                .depends_on
+                .iter()
+                .copied()
+                .filter(|id| open.contains(id))
+                .collect(),
+            id: task.id,
+            status: task.status,
+            title: task.title,
+            goal_id: task.goal_id,
+            depends_on: task.depends_on,
+        })
+        .collect();
+    DependencyGraph {
+        tasks,
+        candidates,
+        critical,
+    }
+}
+
 pub trait TaskStore {
     fn add(&mut self, task: NewTask) -> Result<Task>;
     /// One page of tasks matching `query`, newest first.
@@ -129,6 +269,9 @@ pub trait TaskStore {
     fn remove_dependency(&mut self, task_id: i64, predecessor_id: i64) -> Result<()>;
     /// Dependency-ready tasks; each task is limited to one unfinished run.
     fn candidates(&self) -> Result<Vec<Task>>;
+    /// The unfinished tasks with their direct predecessors and the IDs of
+    /// `candidates`, read in one snapshot.
+    fn graph_input(&self) -> Result<GraphInput>;
     /// Reserve one run atomically, without a lease. Does not start a process or validate Git objects.
     fn claim(&mut self, base_commit: &str) -> Result<ClaimOutcome>;
     /// Direct predecessors of a task, each with the run that landed it, in ID order.
@@ -247,4 +390,83 @@ pub trait ProcessControl {
     fn interrupt(&self, pid: u32) -> Result<()>;
     /// End the process immediately (SIGKILL).
     fn kill(&self, pid: u32) -> Result<()>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn task(id: i64, goal_id: Option<i64>, depends_on: &[i64]) -> GraphTask {
+        GraphTask {
+            id,
+            status: if depends_on.is_empty() {
+                TaskStatus::Ready
+            } else {
+                TaskStatus::Draft
+            },
+            title: format!("task {id}"),
+            goal_id,
+            depends_on: depends_on.to_vec(),
+        }
+    }
+
+    /// 2 -> {3, 4} -> 5, 1 -> 6 (goal 1), and 7 waits only on the finished 9.
+    fn input() -> GraphInput {
+        GraphInput {
+            tasks: vec![
+                task(1, Some(1), &[]),
+                task(2, None, &[]),
+                task(3, None, &[2]),
+                task(4, None, &[2]),
+                task(5, None, &[3, 4]),
+                task(6, Some(1), &[1]),
+                task(7, None, &[9]),
+            ],
+            candidates: vec![1, 2, 7],
+        }
+    }
+
+    #[test]
+    fn graph_counts_transitive_releases_and_follows_the_critical_chain() {
+        let graph = dependency_graph(input(), None);
+        let unblocks: Vec<(i64, usize)> = graph.tasks.iter().map(|t| (t.id, t.unblocks)).collect();
+        assert_eq!(
+            unblocks,
+            [(1, 1), (2, 3), (3, 1), (4, 1), (5, 0), (6, 0), (7, 0)]
+        );
+        assert_eq!(graph.tasks[1].blocks, [3, 4]);
+        assert_eq!(graph.tasks[4].depends_on, [3, 4]);
+        assert_eq!(graph.tasks[4].ready_after, [3, 4]);
+        assert_eq!(graph.tasks[6].depends_on, [9]);
+        assert!(graph.tasks[6].ready_after.is_empty());
+        assert_eq!(graph.candidates, [2, 1, 7]);
+        assert_eq!(graph.critical, [2, 3, 5]);
+    }
+
+    #[test]
+    fn goal_narrows_tasks_candidates_and_the_critical_start() {
+        let graph = dependency_graph(input(), Some(1));
+        let ids: Vec<i64> = graph.tasks.iter().map(|t| t.id).collect();
+        assert_eq!(ids, [1, 6]);
+        assert_eq!(graph.candidates, [1]);
+        assert_eq!(graph.critical, [1, 6]);
+    }
+
+    #[test]
+    fn no_blocking_task_leaves_the_critical_chain_empty() {
+        let graph = dependency_graph(
+            GraphInput {
+                tasks: vec![task(2, None, &[]), task(1, None, &[])],
+                candidates: vec![2, 1],
+            },
+            None,
+        );
+        assert_eq!(graph.candidates, [1, 2]);
+        assert!(graph.critical.is_empty());
+        assert!(
+            dependency_graph(GraphInput::default(), None)
+                .tasks
+                .is_empty()
+        );
+    }
 }

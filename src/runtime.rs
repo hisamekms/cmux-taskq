@@ -5,7 +5,7 @@
 //! A run whose supervisor died while its session lives on is adopted by a
 //! supervisor with a free slot instead of being rerun (ADR-0012).
 use crate::{
-    application::{AgentProvider, TaskStore, WorkspaceBackend},
+    application::{AgentProvider, TaskStore, WorkspaceBackend, dependency_graph},
     domain::{
         ClaimOutcome, Goal, IntegrationOutcome, Predecessor, Receipt, ReceiptResult, RunLease,
         RunPaths, RunProcess, RunStatus, SupervisorMode, SupervisorRegistration, Task, TaskRun,
@@ -363,11 +363,17 @@ impl Supervisor<'_> {
             self.adopt_stale_runs(parallel)?;
         }
         while self.slots.len() < parallel {
-            if self.queue.candidates()?.is_empty() {
+            // Most-releasing candidate first, lowest ID on a tie (ADR-0023);
+            // `graph` shows the same order, so it is not recorded.
+            let order = dependency_graph(self.queue.graph_input()?, None).candidates;
+            if order.is_empty() {
                 break;
             }
             let base = self.repository.main_head()?;
-            let run = match self.queue.claim_for_supervisor(&base, &self.token)? {
+            let run = match self
+                .queue
+                .claim_for_supervisor_in_order(&base, &self.token, &order)?
+            {
                 ClaimOutcome::Claimed { run } => *run,
                 ClaimOutcome::NoReadyTask => break,
             };

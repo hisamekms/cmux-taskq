@@ -72,11 +72,22 @@ impl SqliteQueue {
     /// so a claimed run never exists without an owner. Concurrent supervisors
     /// on the same queue take different tasks.
     pub fn claim_for_supervisor(&mut self, base_commit: &str, token: &str) -> Result<ClaimOutcome> {
+        self.claim_for_supervisor_in_order(base_commit, token, &[])
+    }
+
+    /// [`Self::claim_for_supervisor`], taking the first task of `order` that
+    /// is still claimable (the lowest-ID candidate when none is).
+    pub fn claim_for_supervisor_in_order(
+        &mut self,
+        base_commit: &str,
+        token: &str,
+        order: &[i64],
+    ) -> Result<ClaimOutcome> {
         validate_base_commit(base_commit)?;
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let outcome = claim_task(&tx, &self.runs_dir, base_commit)?;
+        let outcome = claim_task(&tx, &self.runs_dir, base_commit, order)?;
         if let ClaimOutcome::Claimed { run } = &outcome {
             tx.execute(
                 "UPDATE task_runs SET supervisor_token=?2 WHERE id=?1",

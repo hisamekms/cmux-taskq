@@ -15,7 +15,7 @@ use clap::{Parser, Subcommand};
 use serde_json::{Value, json};
 
 use dagq::{
-    application::{StatusFilter, TaskQuery, TaskStore},
+    application::{StatusFilter, TaskQuery, TaskStore, dependency_graph},
     domain::{GoalEdit, GoalVerdict, NewGoal, NewTask, TaskAction, TaskStatus},
     infrastructure::{adapters::path_text, location::QueueLocation, sqlite::SqliteQueue},
 };
@@ -120,6 +120,14 @@ enum Command {
     },
     /// List ready tasks whose prerequisites are all completed; does not claim.
     Candidates,
+    /// Show the unfinished tasks' dependencies: per task its direct predecessors (`depends_on`),
+    /// the unfinished ones (`ready_after`), the tasks it blocks directly and how many it
+    /// releases transitively (`unblocks`); `candidates` in claim order and the `critical` chain.
+    Graph {
+        /// Only this goal's tasks and candidates; counts still span every goal.
+        #[arg(long = "goal")]
+        goal_id: Option<i64>,
+    },
     /// Run and monitor tasks in parallel until interrupted. Run this in a dedicated terminal.
     Supervise {
         /// Checkout of the repository whose `main` becomes the base commit;
@@ -475,6 +483,9 @@ fn execute(cli: Cli) -> Result<Value> {
             none: _,
         } => serde_json::to_value(queue.set_goal(task, goal)?)?,
         Command::Candidates => serde_json::to_value(queue.candidates()?)?,
+        Command::Graph { goal_id } => {
+            serde_json::to_value(dependency_graph(queue.graph_input()?, goal_id))?
+        }
         Command::Status => dagq::runtime::status(&db)?,
         Command::Events { after, limit, all } => {
             dagq::watch::events(&db, after, limit as usize, all)?

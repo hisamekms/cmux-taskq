@@ -14,7 +14,10 @@ use serde_json::json;
 use uuid::Uuid;
 
 use crate::{
-    application::{LatestRun, StatusFilter, TaskListItem, TaskPage, TaskQuery, TaskStore},
+    application::{
+        GraphInput, GraphTask, LatestRun, StatusFilter, TaskListItem, TaskPage, TaskQuery,
+        TaskStore,
+    },
     domain::{
         ClaimOutcome, DomainError, Goal, GoalDetail, GoalEdit, GoalSummary, GoalTask, GoalVerdict,
         NewGoal, NewTask, Predecessor, RunEvent, Task, TaskAction, TaskDetail, TaskRun, TaskStatus,
@@ -375,12 +378,44 @@ impl TaskStore for SqliteQueue {
             .collect::<rusqlite::Result<_>>()?)
     }
 
+    fn graph_input(&self) -> Result<GraphInput> {
+        let tx = self.conn.unchecked_transaction()?;
+        let tasks: Vec<Task> = tx
+            .prepare(
+                "SELECT * FROM tasks WHERE status IN ('draft','ready','in_progress') ORDER BY id",
+            )?
+            .query_map([], task_row)?
+            .collect::<rusqlite::Result<_>>()?;
+        let mut dependencies = tx.prepare(
+            "SELECT predecessor_id FROM task_dependencies WHERE task_id=?1 ORDER BY predecessor_id",
+        )?;
+        let tasks = tasks
+            .into_iter()
+            .map(|task| {
+                Ok(GraphTask {
+                    depends_on: dependencies
+                        .query_map([task.id], |r| r.get(0))?
+                        .collect::<rusqlite::Result<_>>()?,
+                    id: task.id,
+                    status: task.status,
+                    title: task.title,
+                    goal_id: task.goal_id,
+                })
+            })
+            .collect::<Result<_>>()?;
+        let candidates = tx
+            .prepare(READY_QUERY)?
+            .query_map([], |r| r.get("id"))?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(GraphInput { tasks, candidates })
+    }
+
     fn claim(&mut self, base_commit: &str) -> Result<ClaimOutcome> {
         validate_base_commit(base_commit)?;
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let outcome = claim_task(&tx, &self.runs_dir, base_commit)?;
+        let outcome = claim_task(&tx, &self.runs_dir, base_commit, &[])?;
         tx.commit()?;
         Ok(outcome)
     }
@@ -620,20 +655,29 @@ fn goal_event(
     Ok(())
 }
 
-/// Reserve the first dependency-ready task inside the caller's write
-/// transaction. There is no queue-wide execution slot; `one_unfinished_run_per_task`
-/// is the only limit, so concurrent claims take different tasks.
+/// Reserve a dependency-ready task inside the caller's write transaction:
+/// the first task of `order` that is still a candidate, or the lowest-ID
+/// candidate when none of them is (an empty `order` means ID order). There
+/// is no queue-wide execution slot; `one_unfinished_run_per_task` is the
+/// only limit, so concurrent claims take different tasks.
 pub(super) fn claim_task(
     tx: &Connection,
     runs_dir: &Path,
     base_commit: &str,
+    order: &[i64],
 ) -> Result<ClaimOutcome> {
-    let candidate = tx
-        .query_row(&format!("{READY_QUERY} LIMIT 1"), [], task_row)
-        .optional()?;
-    let Some(task) = candidate else {
+    let mut ready: Vec<Task> = tx
+        .prepare(READY_QUERY)?
+        .query_map([], task_row)?
+        .collect::<rusqlite::Result<_>>()?;
+    let preferred = order
+        .iter()
+        .find_map(|id| ready.iter().position(|task| task.id == *id))
+        .unwrap_or(0);
+    if ready.is_empty() {
         return Ok(ClaimOutcome::NoReadyTask);
-    };
+    }
+    let task = ready.swap_remove(preferred);
     let run_id = Uuid::new_v4().to_string();
     tx.execute("UPDATE tasks SET status='in_progress', updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?1",
         [task.id])?;

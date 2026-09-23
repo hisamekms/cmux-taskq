@@ -1019,6 +1019,46 @@ fn provisioning_failure_retains_the_run_and_stops_claiming_other_tasks() {
     assert_eq!(queue.show(1).unwrap().runs.len(), 1);
 }
 
+/// With one slot the supervisor claims the candidate whose completion
+/// releases the most unfinished tasks before the older task 1 (ADR-0023),
+/// and records no event for the reordering.
+#[test]
+fn supervisor_claims_the_candidate_that_releases_the_most_tasks_first() {
+    let (_dir, repo, db) = fixture();
+    let mut queue = SqliteQueue::open(&db).unwrap();
+    let root = add_ready_task(&mut queue, "root", &[]);
+    let middle = add_ready_task(&mut queue, "middle", &[root]);
+    add_ready_task(&mut queue, "leaf", &[middle]);
+    let backend = TestWorkspace::new(&db, false, VALID_AGENT);
+    let outcome = supervise_with(&db, &repo, &backend, &SuperviseOptions::new(1, true)).unwrap();
+    let claimed: Vec<i64> = outcome["runs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|run| run["task_id"].as_i64().unwrap())
+        .collect();
+    assert_eq!(claimed, [root, 1]);
+    let mut claim_event = |task: i64| {
+        let detail = queue.show(task).unwrap();
+        assert!(!event_kinds(&detail).contains(&"claim_reordered"));
+        detail
+            .events
+            .iter()
+            .find(|event| event.kind == "run_claimed")
+            .unwrap()
+            .id
+    };
+    assert!(claim_event(root) < claim_event(1));
+    // The same order ties back to ID once nothing is released.
+    let (_dir, repo, db) = fixture();
+    let mut queue = SqliteQueue::open(&db).unwrap();
+    add_ready_task(&mut queue, "second", &[]);
+    let backend = TestWorkspace::new(&db, false, VALID_AGENT);
+    let outcome = supervise_with(&db, &repo, &backend, &SuperviseOptions::new(1, true)).unwrap();
+    assert_eq!(outcome["runs"][0]["task_id"], 1);
+    assert_eq!(outcome["runs"][1]["task_id"], 2);
+}
+
 #[test]
 fn claim_creates_a_lease_that_only_its_owner_can_use_or_release() {
     use dagq::{domain::ClaimOutcome, infrastructure::runtime_store::RunPlan};

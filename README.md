@@ -130,6 +130,7 @@ Commands return JSON on stdout. Runtime errors return JSON on stderr with a nonz
 | `cancel ID` | Cancel a draft, ready, or retryable in-progress task; does not satisfy its dependents |
 | `dependency add TASK PREDECESSOR` / `dependency remove TASK PREDECESSOR` | Change prerequisites of a draft or ready task |
 | `candidates` | List dependency-ready tasks in registration order without reserving them |
+| `graph [--goal ID]` | Show unfinished tasks' dependencies, how many tasks each releases (`unblocks`), candidates in the supervisor's claim order and the critical chain |
 | `goal add TITLE [--description TEXT] [--acceptance TEXT] [--constraints TEXT] [--doc PATH]` | Register a goal: the higher-level problem a group of tasks solves. A goal has no state machine and no verification commands |
 | `goal list` / `goal show ID` | `list` gives each goal's `closed`, `verdict` and task counts by status; `show` adds the goal's tasks (id, title, status) and the `kind` and `created_at` of its latest 10 events, with long texts cut like `show`; `goal show ID --full` prints the goal and every event in full |
 | `goal edit ID [--title TEXT] [--description TEXT] [--acceptance TEXT] [--constraints TEXT] [--doc PATH]` | Replace fields (an empty `--doc` clears it); the old and new goal go into a `goal_updated` event. Runs already started keep their prompt snapshot |
