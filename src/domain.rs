@@ -94,6 +94,15 @@ string_enum!(GoalVerdict {
     Abandoned => "abandoned",
 });
 
+// What an ask (ADR-0022) waits for a person to decide. Only questions that
+// need an answer are asks; a notice is an attention.
+string_enum!(AskKind {
+    ApproveLanding => "approve_landing",
+    AnswerPrompt => "answer_prompt",
+    Decide => "decide",
+    WorkerQuestion => "worker_question",
+});
+
 string_enum!(ReceiptResult {
     Succeeded => "succeeded",
     Failed => "failed",
@@ -632,6 +641,82 @@ pub struct Predecessor {
 
 pub mod stats;
 
+/// A question for a person (ADR-0022): about a task, or one of its runs when
+/// `run_id` is set. It is open while `answered_at` and `closed_at` are
+/// unset; once answered it waits for the maintainer to read the answer and
+/// close it. Times are unix seconds.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Ask {
+    pub id: i64,
+    pub kind: AskKind,
+    pub task_id: i64,
+    pub run_id: Option<String>,
+    pub question: String,
+    pub options: Vec<String>,
+    pub answer: Option<String>,
+    /// The role of the session that registered it (`DAGQ_ROLE`).
+    pub asked_by: String,
+    pub created_at: i64,
+    pub answered_at: Option<i64>,
+    pub closed_at: Option<i64>,
+}
+
+impl Ask {
+    /// Nobody answered or withdrew it yet.
+    pub fn is_open(&self) -> bool {
+        self.answered_at.is_none() && self.closed_at.is_none()
+    }
+
+    /// The session role that acts on it now: the inbox answers an open ask,
+    /// the maintainer reads an answer nobody closed. A closed ask waits for
+    /// nobody.
+    pub fn waits_for(&self) -> Option<SessionRole> {
+        match (self.answered_at, self.closed_at) {
+            (_, Some(_)) => None,
+            (None, None) => Some(SessionRole::Inbox),
+            (Some(_), None) => Some(SessionRole::Maintainer),
+        }
+    }
+}
+
+/// An ask to register: `task_id` or `run_id` names what it is about (a run
+/// implies its task).
+#[derive(Debug, Clone)]
+pub struct NewAsk {
+    pub kind: AskKind,
+    pub task_id: Option<i64>,
+    pub run_id: Option<String>,
+    pub question: String,
+    pub options: Vec<String>,
+    pub asked_by: String,
+}
+
+impl NewAsk {
+    pub fn validate(&self) -> Result<(), DomainError> {
+        require(!self.question.trim().is_empty(), || DomainError::Blank {
+            field: "question",
+        })?;
+        require(self.options.iter().all(|o| !o.trim().is_empty()), || {
+            DomainError::Blank { field: "options" }
+        })?;
+        require(!self.asked_by.trim().is_empty(), || DomainError::Blank {
+            field: "asked_by",
+        })?;
+        require(self.task_id.is_none_or(|id| id > 0), || {
+            DomainError::NonPositiveId { field: "task ID" }
+        })
+    }
+}
+
+/// What `ask` returns: the open ask of the same (task, run, kind) when one
+/// exists (`created: false`), or the one just registered.
+#[derive(Debug, Clone, Serialize)]
+pub struct AskOutcome {
+    #[serde(flatten)]
+    pub ask: Ask,
+    pub created: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunEvent {
     pub id: i64,
@@ -1138,6 +1223,12 @@ pub enum AttentionNext {
     /// Not the maintainer's to act on: the supervisor resumes the
     /// `needs_session` run itself (ADR-0019 decision 1).
     Resuming,
+    AnswerAsk {
+        ask_id: i64,
+    },
+    ReadAnswer {
+        ask_id: i64,
+    },
 }
 
 /// How many times the supervisor resumes one `needs_session` run (one
@@ -1158,6 +1249,10 @@ impl fmt::Display for AttentionNext {
                 write!(f, "answer the prompt in workspace {workspace_id}")
             }
             Self::Resuming => f.write_str("resuming (runtime)"),
+            Self::AnswerAsk { ask_id } => write!(f, "answer ask {ask_id}"),
+            Self::ReadAnswer { ask_id } => {
+                write!(f, "read the answer of ask {ask_id} and close it")
+            }
         }
     }
 }
@@ -1182,7 +1277,13 @@ pub const ATTENTION_KINDS: &[&str] = &[
     "runtime_error",
     "prompt_waiting",
     "resume_finished",
+    "ask_opened",
+    "ask_answered",
 ];
+
+/// The attention kinds an ask writes (ADR-0022): about the ask, even when it
+/// names a run.
+pub const ASK_EVENT_KINDS: &[&str] = &["ask_opened", "ask_answered"];
 
 /// Whether a run event is a transition that stops at the maintainer's or the
 /// user's judgment, and what to do about it. The run comes to rest in
@@ -1201,6 +1302,8 @@ pub const ATTENTION_KINDS: &[&str] = &[
 /// unapproved run, `failed`), or when it was the last attempt and the run
 /// stays `needs_session` (`exhausted`); a resolved run the supervisor goes on
 /// to land is not.
+/// `ask_opened` waits for the inbox's answer and
+/// `ask_answered` for the maintainer to read it, see [`attention_role`].
 pub fn event_attention(kind: &str, payload: &serde_json::Value) -> Option<AttentionNext> {
     let status = payload
         .get("status")
@@ -1248,7 +1351,23 @@ pub fn event_attention(kind: &str, payload: &serde_json::Value) -> Option<Attent
         {
             Some(AttentionNext::ResumeSession)
         }
+        ("ask_opened", _) => ask_id(payload).map(|ask_id| AttentionNext::AnswerAsk { ask_id }),
+        ("ask_answered", _) => ask_id(payload).map(|ask_id| AttentionNext::ReadAnswer { ask_id }),
         _ => None,
+    }
+}
+
+fn ask_id(payload: &serde_json::Value) -> Option<i64> {
+    payload.get("ask_id").and_then(serde_json::Value::as_i64)
+}
+
+/// The session role an attention kind is addressed to (ADR-0022): an
+/// `ask_opened` to the inbox, everything else, `ask_answered` included, to
+/// the maintainer. No attention is the planner's.
+pub fn attention_role(kind: &str) -> SessionRole {
+    match kind {
+        "ask_opened" => SessionRole::Inbox,
+        _ => SessionRole::Maintainer,
     }
 }
 
@@ -1313,6 +1432,9 @@ pub struct Attention {
     pub task_id: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pid: Option<u32>,
+    /// The ask of an `ask_opened` / `ask_answered` attention.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ask_id: Option<i64>,
     pub status: String,
     pub kind: String,
     pub last_error: Option<String>,
@@ -1353,6 +1475,7 @@ pub fn supervisor_attention(pulses: &[SupervisorPulse]) -> Vec<Attention> {
         run_id: None,
         task_id: None,
         pid,
+        ask_id: None,
         status: status.into(),
         kind: kind.into(),
         last_error: None,
@@ -1375,6 +1498,77 @@ pub fn supervisor_attention(pulses: &[SupervisorPulse]) -> Vec<Attention> {
 mod attention_tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn asks_wait_for_the_inbox_then_the_maintainer() {
+        let mut ask = Ask {
+            id: 1,
+            kind: AskKind::Decide,
+            task_id: 1,
+            run_id: None,
+            question: "q".into(),
+            options: vec![],
+            answer: None,
+            asked_by: "maintainer".into(),
+            created_at: 0,
+            answered_at: None,
+            closed_at: None,
+        };
+        assert!(ask.is_open());
+        assert_eq!(ask.waits_for(), Some(SessionRole::Inbox));
+        ask.answer = Some("a".into());
+        ask.answered_at = Some(1);
+        assert!(!ask.is_open());
+        assert_eq!(ask.waits_for(), Some(SessionRole::Maintainer));
+        ask.closed_at = Some(2);
+        assert_eq!(ask.waits_for(), None);
+        assert_eq!(attention_role("ask_opened"), SessionRole::Inbox);
+        assert_eq!(attention_role("ask_answered"), SessionRole::Maintainer);
+        assert_eq!(attention_role("push_failed"), SessionRole::Maintainer);
+        // The resume kinds of ADR-0019 decision 1 are the maintainer's.
+        for kind in ["resume_finished", "resume_started", "integration_approved"] {
+            assert_eq!(attention_role(kind), SessionRole::Maintainer, "{kind}");
+        }
+        assert_eq!(
+            AttentionNext::ReadAnswer { ask_id: 4 }.to_string(),
+            "read the answer of ask 4 and close it"
+        );
+    }
+
+    #[test]
+    fn new_ask_rejects_blank_texts_and_bad_ids() {
+        let valid = NewAsk {
+            kind: AskKind::WorkerQuestion,
+            task_id: Some(1),
+            run_id: None,
+            question: "q".into(),
+            options: vec!["a".into()],
+            asked_by: "worker".into(),
+        };
+        assert!(valid.validate().is_ok());
+        for broken in [
+            NewAsk {
+                question: " ".into(),
+                ..valid.clone()
+            },
+            NewAsk {
+                options: vec!["".into()],
+                ..valid.clone()
+            },
+            NewAsk {
+                asked_by: "".into(),
+                ..valid.clone()
+            },
+            NewAsk {
+                task_id: Some(0),
+                ..valid.clone()
+            },
+        ] {
+            assert!(broken.validate().is_err(), "{broken:?}");
+        }
+        assert_eq!("decide".parse::<AskKind>().unwrap(), AskKind::Decide);
+        assert!("bogus".parse::<AskKind>().is_err());
+    }
 
     #[test]
     fn event_attention_covers_every_kind_by_its_status() {
@@ -1504,6 +1698,17 @@ mod attention_tests {
                 None,
             ),
             ("validation_finished", json!({"status": "bogus"}), None),
+            (
+                "ask_opened",
+                json!({"ask_id": 3, "kind": "decide"}),
+                Some(AnswerAsk { ask_id: 3 }),
+            ),
+            (
+                "ask_answered",
+                json!({"ask_id": 3, "kind": "decide"}),
+                Some(ReadAnswer { ask_id: 3 }),
+            ),
+            ("ask_opened", json!({}), None),
             ("validation_finished", json!({}), None),
         ];
         for (kind, payload, expected) in cases {

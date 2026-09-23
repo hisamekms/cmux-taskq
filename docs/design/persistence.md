@@ -20,6 +20,7 @@ related:
   - adr-0017
   - adr-0020
   - adr-0024
+  - adr-0022
   - design-domain-model
 ---
 
@@ -39,6 +40,8 @@ supervisors          -- 0007: 常駐superviseプロセスの登録（token主キ
                      -- 0009: mode（'launchd' | 'in_cmux' | null）とworkspace_id
 goals                -- 0008: 複数taskが解く課題（title、description、acceptance、constraints、doc、closed_at、verdict）
                      -- 0013: status（'draft' | 'open'、既定'open'）
+session_workspaces   -- 0011: up が開いた常駐sessionのworkspace UUID（role主キー）
+asks                 -- 0014: 人に答えを求める相談（kind、task / run、question、options、answer、asked_by、各時刻）
 ```
 
 `task_dependencies(task_id, predecessor_id)`は依存関係を保存する。TaskRunは試行ごとに新しい行を作り、Taskに履歴を持たせる。workspace、worktree、receipt、log、repo、run directory、supervisor token、last errorの参照列をtask_runsに置き、claim時点ではnullにする。`result_commit`は検証で確認したcommitで、着地後は`main`に積んだsquash commitに置き換わる（rebase後のrun headは`refs/dagq/runs/<run-id>`と`run_integrated`イベントの`source_commit`が持つ）。`last_error`は検証の拒否理由、`needs_session`の理由、cleanup失敗、またはruntime errorを持ち、着地で消える。`workspace_closed_at`（0003）はcmuxがcloseを確認した時刻で、nullの間はworkspaceを開いているものとして扱う。成果物hashは未実装。
@@ -48,6 +51,14 @@ goals                -- 0008: 複数taskが解く課題（title、description、
 `goals.status`（0013、[ADR-0024](../adr/0024-retire-maintainer-into-jobs-and-observer.md)の決定5）は`'draft'` | `'open'`（CHECK、`NOT NULL DEFAULT 'open'`）で、v12以前のgoalは移行後すべて`open`になる。`closed_at` / `verdict`とは独立で、閉じたdraftもありうる。`goal add --draft`が`draft`で挿入し、`goal ready`（`ready_goal`）が`BEGIN IMMEDIATE`の中でdraftかつ未closeを確かめて`open`に更新し、`goal_status_changed`を書く。候補の問い合わせ`READY_QUERY`（`candidates`、`graph_input`、`claim_task`が共有する）は、`goal_id`の指す`goals`の行が`status = 'draft'`のtaskを除く。
 
 note（ADR-0024の決定4）は表を作らず`run_events`のkind `observation`として書く（`add_note`）。`--task`は`task_id`、`--run`は`task_runs`から引いた`task_id`と`run_id`、`--goal`は`goal_id`だけを持つ行になり、payloadは`{"text", "kind", "by"}`。`notes`は`kind = 'observation'`に、`--goal`なら`goal_id`一致か所属taskの`task_id`、`--task`なら`task_id`一致を足し、`--since`があれば`id > since`を昇順に、無ければ降順に`LIMIT`件引いて古い順に並べ直す。indexは足していない（件数が小さく、goal / taskで絞るときは既存の`events_by_task` / `events_by_goal`が効く）。
+
+## asks
+
+`asks`（0014、[ADR-0022](../adr/0022-ask-answer-inbox-planner-and-landing-on-doubt.md)）は人の判断を要する相談を1行で持つ。列は`id`、`kind`（CHECKで`approve_landing` / `answer_prompt` / `decide` / `worker_question`）、`task_id`（`tasks(id)`、必須）、`run_id`（null可。`(run_id, task_id)`で`task_runs`を参照）、`question`（空でない）、`options`（選択肢のJSON配列、既定`'[]'`）、`answer`、`asked_by`（登録したsessionのrole）、`created_at` / `answered_at` / `closed_at`（unix秒。`session_workspaces`と同じく整数）。CHECK `(answer IS NULL) = (answered_at IS NULL)`。ADRの列に`closed_at`を足したのは、回答をmaintainerが読んだ印（`ask close`）を持つため。
+
+- **open**は`answered_at`も`closed_at`もnullの行。部分UNIQUE index `asks_open (task_id, ifnull(run_id,''), kind) WHERE answered_at IS NULL AND closed_at IS NULL`が（task、run、kind）ごとにopenなaskを1件に限る。`ask`は同じトランザクションで既存のopenな行を探し、あればそれを返して何も書かない。
+- 登録（`SqliteQueue::ask`）は行と`ask_opened`イベントを、回答（`answer`）は`answer` / `answered_at`と`ask_answered`イベントを、それぞれ1トランザクションで書く。どちらのイベントもaskの`task_id` / `run_id`に結び付き、payloadに`ask_id`を持つので、`watch`のcursor（run_eventsのid）に乗る。`close_ask`は回答済みのaskに`closed_at`だけを書き、イベントは書かない（未回答のaskはcloseできない。run_eventsでaskを終えるのは`ask_answered`だけで、`stats`はそれで未回答を判定する）。
+- 誰が動かすかは列から導出する（`Ask::waits_for`）: openはinbox、回答済みでcloseされていないものはmaintainer、closeされたものは誰も待たない。`status`のattentionとaskの一覧、`asks --role`はこれを読む（[supervisor-lifecycle](supervisor-lifecycle.md#ask--answer--asks)）。
 
 ## Runtime ownership
 
@@ -107,7 +118,7 @@ SQLiteはrusqliteのbundled機能で同梱する。初期化でWALを有効に�
 
 `application_id = 0x43545131`でdagqのDBを識別する。未知の新しいschemaや他アプリのDBは書き換えずに拒否する。`init`の再実行では登録済みデータを保持する。バイナリ更新時は既存DBをopenする際にも未適用migrationを確認する。
 
-SQLiteはCHECK制約を変更できないため、statusの追加はtableの作り直し（`CREATE ... _vN` → `INSERT ... SELECT`（rowidも複写） → `DROP` → `RENAME` → index再作成）で行う。`DROP TABLE`はforeign keyが有効だと参照元の行があるとき失敗するので、migration実行中はトランザクションの外で`foreign_keys=OFF`にし、commit前に`pragma_foreign_key_check`が0件であることを確認してからONに戻す。`0004_integration.sql`がこの形の最初の例。`0005_run_leases.sql`は`run_leases`を作り、v4の`supervisor_leases`の行を`supervisor_token`が一致する実行中runへ移してから`supervisor_leases`と`one_executing_run_per_queue`を落とす（tableの作り直しは不要）。`0006_merge_queue.sql`は0004と同じ手順で`task_runs`を作り直して`integrating`と`needs_session`をCHECKに加え、`one_unfinished_run_per_task`を2状態込みで作り直し、`one_integrating_run_per_queue`を足す。`run_leases`の外部キーは`task_runs`を名前で参照しているので作り直し後もそのまま有効で、`foreign_key_check`で確認する。`0007_supervisors.sql`は`supervisors`を作るだけで、既存の行には触れない。`0009_supervisor_mode.sql`は`supervisors`に`mode`（CHECK `mode IN ('launchd','in_cmux')`、既定null）と`workspace_id`を`ALTER TABLE ADD COLUMN`で足す（既定がnullなので作り直し不要）。migration中に動いているsupervisorの行は`mode`がnullになり、次の`up`まで手で起動したものと同じ扱いになる。v6のsupervisorが動いている最中にmigrationが走っても、そのsupervisorは登録を持たないままleaseだけで`status`/`doctor`に並ぶ。`0010_supervisor_binary_version.sql`は`supervisors`に`binary_version`を`ALTER TABLE ADD COLUMN`で足す（既定がnullなので作り直し不要。CHECKも置かない——versionはbinaryが名乗る文字列で、runtimeが列挙できない）。migration中に動いているsupervisorの行は`binary_version`がnullになり、次の`up`が「自分のversionではない」として入れ替える（[ADR-0014](../adr/0014-up-replaces-a-supervisor-of-another-binary-version.md)）。`0008_goals.sql`は`goals`を作り、`tasks`に`goal_id`と`context`を`ALTER TABLE ADD COLUMN`で足し（既定がnull / `''`なので作り直し不要）、`run_events`を0004と同じ手順で作り直す（`id`（AUTOINCREMENT）も複写するので、イベントIDと順序、`sqlite_sequence`の続きが保たれる）。`0012_queue_events.sql`は`run_events`を0008と同じ手順で作り直し、CHECKを`task_id IS NOT NULL OR goal_id IS NOT NULL OR kind = 'backend_call_failed'`に緩める（`run_id`があれば`task_id`も非null、の CHECK と複合外部キーはそのまま）。runに紐づかないcmuxの呼び出し（`up`のworkspace、queueのworkspace group、`down`のclose）の失敗をqueue単位のイベントとして残すためで、ほかのkindの規則は変えない。`0013_goal_draft.sql`は`goals`に`status`を`ALTER TABLE ADD COLUMN`で足す（既定`'open'`があるので作り直し不要。CHECKは列の定義に置く）。`SqliteQueue::SCHEMA_VERSION`（`MIGRATIONS`の長さ）が最新の`user_version`で、testはこの定数と比較する。
+SQLiteはCHECK制約を変更できないため、statusの追加はtableの作り直し（`CREATE ... _vN` → `INSERT ... SELECT`（rowidも複写） → `DROP` → `RENAME` → index再作成）で行う。`DROP TABLE`はforeign keyが有効だと参照元の行があるとき失敗するので、migration実行中はトランザクションの外で`foreign_keys=OFF`にし、commit前に`pragma_foreign_key_check`が0件であることを確認してからONに戻す。`0004_integration.sql`がこの形の最初の例。`0005_run_leases.sql`は`run_leases`を作り、v4の`supervisor_leases`の行を`supervisor_token`が一致する実行中runへ移してから`supervisor_leases`と`one_executing_run_per_queue`を落とす（tableの作り直しは不要）。`0006_merge_queue.sql`は0004と同じ手順で`task_runs`を作り直して`integrating`と`needs_session`をCHECKに加え、`one_unfinished_run_per_task`を2状態込みで作り直し、`one_integrating_run_per_queue`を足す。`run_leases`の外部キーは`task_runs`を名前で参照しているので作り直し後もそのまま有効で、`foreign_key_check`で確認する。`0007_supervisors.sql`は`supervisors`を作るだけで、既存の行には触れない。`0009_supervisor_mode.sql`は`supervisors`に`mode`（CHECK `mode IN ('launchd','in_cmux')`、既定null）と`workspace_id`を`ALTER TABLE ADD COLUMN`で足す（既定がnullなので作り直し不要）。migration中に動いているsupervisorの行は`mode`がnullになり、次の`up`まで手で起動したものと同じ扱いになる。v6のsupervisorが動いている最中にmigrationが走っても、そのsupervisorは登録を持たないままleaseだけで`status`/`doctor`に並ぶ。`0010_supervisor_binary_version.sql`は`supervisors`に`binary_version`を`ALTER TABLE ADD COLUMN`で足す（既定がnullなので作り直し不要。CHECKも置かない——versionはbinaryが名乗る文字列で、runtimeが列挙できない）。migration中に動いているsupervisorの行は`binary_version`がnullになり、次の`up`が「自分のversionではない」として入れ替える（[ADR-0014](../adr/0014-up-replaces-a-supervisor-of-another-binary-version.md)）。`0008_goals.sql`は`goals`を作り、`tasks`に`goal_id`と`context`を`ALTER TABLE ADD COLUMN`で足し（既定がnull / `''`なので作り直し不要）、`run_events`を0004と同じ手順で作り直す（`id`（AUTOINCREMENT）も複写するので、イベントIDと順序、`sqlite_sequence`の続きが保たれる）。`0012_queue_events.sql`は`run_events`を0008と同じ手順で作り直し、CHECKを`task_id IS NOT NULL OR goal_id IS NOT NULL OR kind = 'backend_call_failed'`に緩める（`run_id`があれば`task_id`も非null、の CHECK と複合外部キーはそのまま）。runに紐づかないcmuxの呼び出し（`up`のworkspace、queueのworkspace group、`down`のclose）の失敗をqueue単位のイベントとして残すためで、ほかのkindの規則は変えない。`0013_goal_draft.sql`は`goals`に`status`を`ALTER TABLE ADD COLUMN`で足す（既定`'open'`があるので作り直し不要。CHECKは列の定義に置く）。`0014_asks.sql`は`asks`と部分UNIQUE index `asks_open`を作るだけで、既存の表には触れない（schema version 14）。`SqliteQueue::SCHEMA_VERSION`（`MIGRATIONS`の長さ）が最新の`user_version`で、testはこの定数と比較する。
 
 ## Planned runtime persistence
 

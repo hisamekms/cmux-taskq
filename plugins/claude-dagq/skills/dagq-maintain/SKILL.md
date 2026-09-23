@@ -1,6 +1,6 @@
 ---
 name: dagq-maintain
-description: Keep a dagq queue running as its maintainer: start the runtime with up, stop it with down, read status (supervisor health, unfinished runs, attention, cursor), and wait for attention with watch in the background, then report it and route it. Use when the session starts or wakes up as a dagq maintainer, when the user asks to start, stop, or check the supervisor, or asks what in the queue needs attention now. Landing a run is dagq-land; answering, resuming, or closing a run's session is dagq-session; a stuck lease is dagq-recover.
+description: Keep a dagq queue running as its maintainer: start the runtime with up, stop it with down, read status (supervisor health, unfinished runs, attention, cursor), and wait for attention with watch in the background, then report it and route it; register an ask instead of waiting when a decision is the user's. Use when the session starts or wakes up as a dagq maintainer, when the user asks to start, stop, or check the supervisor, or asks what in the queue needs attention now. Landing a run is dagq-land; answering, resuming, or closing a run's session is dagq-session; a stuck lease is dagq-recover.
 ---
 
 # dagq: keep the queue running and watch it
@@ -36,8 +36,11 @@ Read, in this order:
    - `recover run` (`kind` `runtime_error`: an unfinished run its supervisor gave up, left without a lease): the `dagq-recover` skill.
    - `restart supervisor` (`supervisor_stale`, `supervisor_stopped`): `up` as in step 1.
    - `push main` (`push_failed` on an `integrated` run): `integrate` landed it but could not push; the `dagq-land` skill, step 5.
+   - `read the answer of ask <id> and close it` (`kind` `ask_answered`): the user answered an ask; act on it as in step 4.
+   - `answer ask <id>` (`kind` `ask_opened`): for the inbox, not for you; `status --role maintainer` leaves these out.
 3. `runs`: unfinished runs with their leases. A run in progress needs nothing from you.
-4. `cursor`: the newest event id, where the next `watch` starts.
+4. `asks`: the open asks (`id`, `kind`, the first 200 characters of `question`, `task_id`, `run_id`, `asked_by`, `age_secs`), waiting for the user's answer through the inbox.
+5. `cursor`: the newest event id, where the next `watch` starts.
 
 Report the attention entries to the user in one short list (task, status, `next`, the gist of `last_error`). `${CLAUDE_PLUGIN_ROOT}/skills/dagq-maintain/reference/status.md` lists every field and run state; read it only when an entry is unclear. For one task use `"$DAGQ" show ID` (compact; `--full` only when a step asks for it). Use `doctor` only to diagnose a stuck run, never to poll.
 
@@ -46,20 +49,31 @@ Report the attention entries to the user in one short list (task, status, `next`
 Do not poll `status`, `show` or `doctor` in a loop. Wait for the next attention with `watch`:
 
 1. Take `cursor` from the last `status` (or the last `watch`).
-2. Run `"$DAGQ" watch --after <cursor>` with the Bash tool's `run_in_background`. It blocks until an attention event arrives or the supervisors change (default `--timeout 600`).
+2. Run `"$DAGQ" watch --after <cursor> --role maintainer` with the Bash tool's `run_in_background`. It blocks until an attention event for the maintainer arrives (an `ask_answered` included, an `ask_opened` not) or the supervisors change (default `--timeout 600`).
 3. When it finishes, read its `events`, `supervisors_changed`, `supervisors` and `cursor`. Report each attention event to the user as in step 2; for a supervisor change, run `status` and act on step 2.1. On a timeout `events` is empty and the cursor is unchanged.
 4. Go back to 2 with the returned `cursor`. Keep exactly one watch running at a time.
 
 `watch` and `events --after <cursor>` (the same events without waiting) only read the queue. **Never call `integrate` because a watch returned**; landing goes through the `dagq-land` review, which lands on a pass and asks the user only on doubt (step 4).
 
-## 4. Where your authority ends
+## 4. Ask instead of waiting
 
-- Land without asking when the `dagq-land` review passes (`integrate` also pushes `main`); report and wait when it finds doubt (an acceptance mismatch, changes outside the task, review findings).
+When a run needs a decision you cannot make yourself (landing on doubt, a choice between options, anything the user must approve), do not wait at the terminal or use `AskUserQuestion`: register an ask and move on to the next attention.
+
+```sh
+"$DAGQ" ask --kind <approve_landing|answer_prompt|decide> --run <run_id> \
+  --question "<what to decide and why, self-contained>" --option "<choice>" --option "<choice>"
+```
+
+Leave that run alone until its answer arrives as an `ask_answered` from your `watch`; read it with `"$DAGQ" asks --role maintainer`, act on it, then `"$DAGQ" ask close <id>`. Before your first ask, read the asks section of `${CLAUDE_PLUGIN_ROOT}/skills/dagq-maintain/reference/status.md` (kinds, `--task`, duplicates, withdrawing).
+
+## 5. Where your authority ends
+
+- Land without asking when the `dagq-land` review passes (`integrate` also pushes `main`); on doubt (an acceptance mismatch, changes outside the task, review findings) register an `approve_landing` ask (step 4) and land only once its answer says so.
 - Report and wait: pushing `main` by hand after a `push_failed`, `down --force`, `recover`, changing a task's acceptance, and anything outside a run's own worktree need the user's go-ahead.
 - Do yourself, without asking: `up`, `status`, `watch`, `show`, `review`, `integrate` after a passing review, answering a run's trust or permission prompt about its own worktree (`dagq-session`), and reporting.
 - A receipt's `follow_ups` are registered by `integrate` as `draft` tasks; making one `ready` waits for the user (`dagq-land`). Registering other new work (a new goal, a gap in a goal) follows the `dagq` skill once the user agrees.
 
-## 5. Stop the runtime
+## 6. Stop the runtime
 
 ```sh
 "$DAGQ" down            # stop claiming; the supervisor drains its runs and exits

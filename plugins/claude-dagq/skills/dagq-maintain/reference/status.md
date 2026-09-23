@@ -20,11 +20,26 @@ Read this when a field of `status`, `watch` or `show` is unclear.
   - `push main`: an `integrated` run (its task `completed`) whose push of `main` to `origin` failed (`kind` `push_failed`, `last_error` the Git error) with no successful push since.
   - `recover run`: a `claimed` / `starting` / `running` / `validating` / `integrating` run without a lease, given up by its supervisor (`kind` `runtime_error` with `lease_released: true`). Nothing adopts it; handle it with the `dagq-recover` skill. It disappears once recovered. If `watch` reported it but `status` shows the run at rest, `status` wins.
   - `restart supervisor`: `kind` `supervisor_stale` (with its `pid`) or `supervisor_stopped` (nothing registered).
+  - `answer ask <id>`: an open ask (`kind` `ask_opened`, `status` `open`, with `ask_id`); the inbox's to answer.
+  - `read the answer of ask <id> and close it`: an answered ask nobody closed (`kind` `ask_answered`, `status` `answered`); the maintainer's. It disappears after `ask close <id>`.
+- `status --role <maintainer|inbox|planner>` keeps only the attention for that role: `ask_opened` is the inbox's, everything else the maintainer's, none the planner's.
+- `asks`: the open asks, each with `id`, `kind`, `question` (first 200 characters, `…` when cut), `task_id`, `run_id`, `asked_by` and `age_secs`.
 - `cursor`: the newest event id.
 
 ## watch and events
 
-`"$DAGQ" watch --after <cursor> [--timeout 600] [--interval 2]` blocks until an attention event arrives after the cursor or the supervisors' registrations or `alive` / `stale` change, then returns `{events, supervisors_changed, supervisors, cursor}`. On timeout `events` is empty and the cursor is unchanged. `"$DAGQ" events --after <cursor>` returns the same attention events without waiting (`--all` for every kind, `--limit N`, default 100). Each event is compact: `status`, `exit_code`, `reason` cut to 300 characters, and `next`.
+`"$DAGQ" watch --after <cursor> [--timeout 600] [--interval 2]` blocks until an attention event arrives after the cursor or the supervisors' registrations or `alive` / `stale` change, then returns `{events, supervisors_changed, supervisors, cursor}`. On timeout `events` is empty and the cursor is unchanged. `--role <maintainer|inbox|planner>` wakes only for that role's attention events; only `maintainer` also wakes for the supervisors. Asks ride the same cursor: registering one writes `ask_opened`, answering it `ask_answered`. `"$DAGQ" events --after <cursor>` returns the same attention events without waiting (`--all` for every kind, `--limit N`, default 100). Each event is compact: `status`, `exit_code`, `ask_id`, `reason` cut to 300 characters, and `next`.
+
+## asks
+
+`"$DAGQ" asks` lists the asks nobody closed, oldest first, with every field (`question`, `options`, `answer`, `answered_at`, `closed_at`). `--open` keeps the unanswered ones, `--role maintainer` the answered ones waiting for you, `--role inbox` the open ones, `--all` adds closed asks.
+
+Registering one (`"$DAGQ" ask --kind <kind> --question <text> [--option <text>]... (--run RUN_ID | --task ID)`):
+
+- `--run` for a question about one run, `--task` for one about a task as a whole; one of them is required. `approve_landing` is the `dagq-land` doubt, `answer_prompt` a dialog you cannot answer, `decide` anything else; `worker_question` is the workers' own kind.
+- Write the question so the user can answer it without your session's context: the task, what you found, the options and what each leads to.
+- The same run (or task) and kind is registered once: asking again returns the open ask with `created: false`.
+- `ask close <id>` marks an answered ask read. An unanswered ask cannot be closed: to withdraw one, answer it yourself first (`"$DAGQ" answer <id> --text "withdrawn: <why>"`), then close it.
 
 ## stats
 

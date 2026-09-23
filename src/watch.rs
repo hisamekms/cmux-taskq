@@ -6,11 +6,13 @@
 //! by `domain`.
 use crate::{
     domain::{
-        ATTENTION_KINDS, Attention, AttentionNext, MAX_RESUME_ATTEMPTS, RunEvent, RunStatus,
-        SupervisorPulse, SupervisorRegistration, event_attention, run_attention,
-        supervisor_attention,
+        ASK_EVENT_KINDS, ATTENTION_KINDS, Attention, AttentionNext, MAX_RESUME_ATTEMPTS, RunEvent,
+        RunStatus, SessionRole, SupervisorPulse, SupervisorRegistration, attention_role,
+        event_attention, run_attention, supervisor_attention,
     },
-    infrastructure::{adapters::process_alive, runtime_store::lease_is_stale, sqlite::SqliteQueue},
+    infrastructure::{
+        adapters::process_alive, asks::AskQuery, runtime_store::lease_is_stale, sqlite::SqliteQueue,
+    },
     runtime::{supervisors, unix_time},
 };
 use anyhow::Result;
@@ -40,7 +42,9 @@ pub fn pulses(registrations: &[SupervisorRegistration], now: i64) -> Vec<Supervi
 /// then the latest run of every `in_progress` task that rests where only the
 /// maintainer or the user moves it on or that is unfinished without a lease,
 /// then every landed run whose push of `main` failed with no successful push
-/// since. `kind` is the event that brought the run there (for a run without
+/// since, then every ask nobody closed: an open one as `ask_opened` for the
+/// inbox, an answered one as `ask_answered` for the maintainer (ADR-0022).
+/// `kind` is the event that brought the run there (for a run without
 /// a lease, its latest `runtime_error`).
 pub fn attention(
     queue: &SqliteQueue,
@@ -105,13 +109,18 @@ pub fn attention(
             .find(|e| match next {
                 // The error the owner gave up with, whatever its payload.
                 AttentionNext::RecoverRun => e.kind == "runtime_error",
-                _ => event_attention(&e.kind, &e.payload).is_some(),
+                // An ask about the run is its own attention, not the run's.
+                _ => {
+                    !ASK_EVENT_KINDS.contains(&e.kind.as_str())
+                        && event_attention(&e.kind, &e.payload).is_some()
+                }
             })
             .map_or_else(|| run.status.as_str().to_owned(), |e| e.kind.clone());
         attention.push(Attention {
             run_id: Some(run.id),
             task_id: Some(run.task_id),
             pid: None,
+            ask_id: None,
             status: run.status.as_str().into(),
             kind,
             last_error: run.last_error.as_deref().map(truncate),
@@ -132,9 +141,35 @@ pub fn attention(
             run_id: Some(run.id),
             task_id: Some(run.task_id),
             pid: None,
+            ask_id: None,
             status: run.status.as_str().into(),
             kind: "push_failed".into(),
             last_error: error,
+            next,
+        });
+    }
+    for ask in queue.asks(AskQuery::default())? {
+        let (status, kind, next) = if ask.is_open() {
+            (
+                "open",
+                "ask_opened",
+                AttentionNext::AnswerAsk { ask_id: ask.id },
+            )
+        } else {
+            (
+                "answered",
+                "ask_answered",
+                AttentionNext::ReadAnswer { ask_id: ask.id },
+            )
+        };
+        attention.push(Attention {
+            run_id: ask.run_id,
+            task_id: Some(ask.task_id),
+            pid: None,
+            ask_id: Some(ask.id),
+            status: status.into(),
+            kind: kind.into(),
+            last_error: None,
             next,
         });
     }
@@ -160,6 +195,18 @@ pub fn resume_pending(events: &[RunEvent], lease_fresh: bool, session_alive: boo
     }
 }
 
+/// Whether an attention of `kind` is for `role`; every attention is for no
+/// role in particular (`None`).
+pub fn for_role(kind: &str, role: Option<SessionRole>) -> bool {
+    role.is_none_or(|role| attention_role(kind) == role)
+}
+
+/// Whether a change in the supervisors' health is news for `role`: only the
+/// maintainer restarts supervisors.
+fn watches_supervisors(role: Option<SessionRole>) -> bool {
+    role.is_none_or(|role| role == SessionRole::Maintainer)
+}
+
 /// One event as the maintainer reads it: the row's ids and kind, and from the
 /// payload only `status`, `exit_code` and a truncated `reason` (from
 /// `reason`, `message` or `error`). Paths and receipts are left out.
@@ -183,6 +230,9 @@ pub fn compact_event(event: &RunEvent) -> Value {
     if let Some(code) = payload.get("exit_code") {
         object.insert("exit_code".into(), code.clone());
     }
+    if let Some(ask_id) = payload.get("ask_id") {
+        object.insert("ask_id".into(), ask_id.clone());
+    }
     if let Some(reason) = ["reason", "message", "error"]
         .iter()
         .find_map(|key| payload.get(*key).and_then(Value::as_str))
@@ -204,14 +254,15 @@ fn truncate(text: &str) -> String {
 }
 
 /// Up to `limit` events with `after < id <= upto` in compact form, attention
-/// only unless `all`, and the cursor to continue from: the last event
-/// returned when the limit was reached, `upto` otherwise.
+/// for `role` only unless `all`, and the cursor to continue from: the last
+/// event returned when the limit was reached, `upto` otherwise.
 fn read_events(
     queue: &SqliteQueue,
     after: i64,
     upto: i64,
     limit: usize,
     all: bool,
+    role: Option<SessionRole>,
 ) -> Result<(Vec<Value>, i64)> {
     let kinds = (!all).then_some(ATTENTION_KINDS);
     let mut events = Vec::new();
@@ -225,7 +276,10 @@ fn read_events(
         }
         for event in page {
             cursor = event.id;
-            if all || event_attention(&event.kind, &event.payload).is_some() {
+            if all
+                || (event_attention(&event.kind, &event.payload).is_some()
+                    && for_role(&event.kind, role))
+            {
                 events.push(compact_event(&event));
                 if events.len() == limit {
                     return Ok((events, cursor));
@@ -239,7 +293,7 @@ fn read_events(
 pub fn events(db: &Path, after: i64, limit: usize, all: bool) -> Result<Value> {
     let queue = SqliteQueue::open(db)?;
     let upto = queue.latest_event_id()?;
-    let (events, cursor) = read_events(&queue, after, upto, limit.max(1), all)?;
+    let (events, cursor) = read_events(&queue, after, upto, limit.max(1), all, None)?;
     Ok(json!({"events": events, "cursor": cursor}))
 }
 
@@ -249,13 +303,17 @@ pub struct WatchOptions {
     pub after: Option<i64>,
     pub timeout: Duration,
     pub interval: Duration,
+    /// Only the attention addressed to this role (ADR-0022); `None` is all.
+    pub role: Option<SessionRole>,
 }
 
 /// Block until an attention event past the cursor exists or the health of
 /// the registered supervisors (the set of tokens, their PIDs, `alive` and
 /// `stale`) differs from what it was when `watch` started, reading the queue
-/// every `interval`. A timeout returns no events and the cursor unchanged.
-/// Never writes and never integrates.
+/// every `interval`. With a `role`, only the attention events addressed to
+/// it count, and the supervisors' health only for the maintainer. A timeout
+/// returns no events and the cursor unchanged. Never writes and never
+/// integrates.
 pub fn watch(db: &Path, options: &WatchOptions) -> Result<Value> {
     let queue = SqliteQueue::open(db)?;
     let after = match options.after {
@@ -266,10 +324,10 @@ pub fn watch(db: &Path, options: &WatchOptions) -> Result<Value> {
     let deadline = Instant::now() + options.timeout;
     loop {
         let upto = queue.latest_event_id()?;
-        let (events, cursor) = read_events(&queue, after, upto, WATCH_LIMIT, false)?;
+        let (events, cursor) = read_events(&queue, after, upto, WATCH_LIMIT, false, options.role)?;
         let registrations = queue.supervisors()?;
         let now = unix_time();
-        let changed = pulses(&registrations, now) != baseline;
+        let changed = watches_supervisors(options.role) && pulses(&registrations, now) != baseline;
         let remaining = deadline.saturating_duration_since(Instant::now());
         if !events.is_empty() || changed || remaining.is_zero() {
             let cursor = if events.is_empty() && !changed {

@@ -5888,6 +5888,152 @@ fn a_supervisor_that_lost_its_lease_stops_touching_the_run() {
     assert!(queue.supervisors().unwrap().is_empty());
 }
 
+fn watch_role(
+    db: &Path,
+    after: Option<i64>,
+    timeout: Duration,
+    role: dagq::domain::SessionRole,
+) -> Value {
+    use dagq::watch::{WatchOptions, watch};
+    watch(
+        db,
+        &WatchOptions {
+            after,
+            timeout,
+            interval: Duration::from_millis(50),
+            role: Some(role),
+        },
+    )
+    .unwrap()
+}
+
+#[test]
+fn asks_of_a_run_are_attention_for_the_inbox_then_the_maintainer() {
+    use dagq::domain::{AskKind, NewAsk, SessionRole};
+    let (_dir, _repo, db, run) = awaiting_run();
+    let mut queue = SqliteQueue::open(&db).unwrap();
+    let before = queue.latest_event_id().unwrap();
+    let new_ask = |question: &str| NewAsk {
+        kind: AskKind::ApproveLanding,
+        task_id: None,
+        run_id: Some(run.id.clone()),
+        question: question.into(),
+        options: vec!["land".into(), "send back".into()],
+        asked_by: "maintainer".into(),
+    };
+
+    // An inbox watch started before the ask wakes on ask_opened alone.
+    let watcher = {
+        let db = db.clone();
+        thread::spawn(move || {
+            watch_role(
+                &db,
+                Some(before),
+                Duration::from_secs(20),
+                SessionRole::Inbox,
+            )
+        })
+    };
+    let opened = queue.ask(new_ask(&"q".repeat(250))).unwrap();
+    assert!(opened.created);
+    assert_eq!(opened.ask.task_id, run.task_id);
+    let woke = watcher.join().unwrap();
+    assert_eq!(
+        woke["events"],
+        json!([{"id": before + 1, "kind": "ask_opened", "task_id": 1, "run_id": run.id,
+                "ask_id": opened.ask.id, "next": format!("answer ask {}", opened.ask.id),
+                "created_at": woke["events"][0]["created_at"]}])
+    );
+    assert_eq!(woke["supervisors_changed"], false);
+    // The same run and kind is registered once.
+    let again = queue.ask(new_ask("other")).unwrap();
+    assert!(!again.created);
+    assert_eq!(again.ask.id, opened.ask.id);
+    assert_eq!(queue.latest_event_id().unwrap(), before + 1);
+
+    // status lists the open ask and splits the attention by role.
+    let status = runtime::status_for(&db, Some(SessionRole::Inbox)).unwrap();
+    assert_eq!(
+        status["attention"],
+        json!([{"run_id": run.id, "task_id": 1, "ask_id": opened.ask.id, "status": "open",
+                "kind": "ask_opened", "last_error": null,
+                "next": format!("answer ask {}", opened.ask.id)}])
+    );
+    let asks = status["asks"].as_array().unwrap();
+    assert_eq!(asks.len(), 1);
+    assert_eq!(asks[0]["kind"], "approve_landing");
+    assert_eq!(asks[0]["asked_by"], "maintainer");
+    assert_eq!(asks[0]["run_id"], json!(run.id));
+    assert!(asks[0]["age_secs"].as_i64().unwrap() >= 0);
+    assert_eq!(
+        asks[0]["question"].as_str().unwrap().chars().count(),
+        201,
+        "200 characters and the ellipsis"
+    );
+    let maintainer = runtime::status_for(&db, Some(SessionRole::Maintainer)).unwrap();
+    assert!(
+        maintainer["attention"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|a| a["kind"] != "ask_opened")
+    );
+    // The run's own attention keeps the event that brought it there.
+    assert_eq!(
+        run_attention_of(&maintainer, &run.id).unwrap()["kind"],
+        "validation_finished"
+    );
+    assert!(
+        runtime::status_for(&db, Some(SessionRole::Planner)).unwrap()["attention"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    // The maintainer's watch does not wake for an ask_opened.
+    let quiet = watch_role(
+        &db,
+        Some(before),
+        Duration::from_millis(200),
+        SessionRole::Maintainer,
+    );
+    assert_eq!(quiet["events"], json!([]));
+    assert_eq!(quiet["cursor"], json!(before));
+
+    // The answer is the maintainer's attention until the ask is closed.
+    let answered = queue.answer(opened.ask.id, "land").unwrap();
+    assert_eq!(answered.answer.as_deref(), Some("land"));
+    let events = queue.run_events(&run.id).unwrap();
+    let last = events.last().unwrap();
+    assert_eq!(last.kind, "ask_answered");
+    assert_eq!(last.payload["ask_id"], json!(opened.ask.id));
+    let woke = watch_role(
+        &db,
+        Some(before + 1),
+        Duration::from_secs(20),
+        SessionRole::Maintainer,
+    );
+    assert_eq!(woke["events"][0]["kind"], "ask_answered");
+    assert_eq!(
+        woke["events"][0]["next"],
+        format!("read the answer of ask {} and close it", opened.ask.id)
+    );
+    let status = runtime::status_for(&db, None).unwrap();
+    assert_eq!(status["asks"], json!([]));
+    assert!(status["attention"].as_array().unwrap().iter().any(|a| {
+        a["kind"] == "ask_answered" && a["status"] == "answered" && a["ask_id"] == opened.ask.id
+    }));
+    queue.close_ask(opened.ask.id).unwrap();
+    assert!(
+        runtime::status(&db).unwrap()["attention"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|a| a.get("ask_id").is_none())
+    );
+    // A closed ask frees its (run, kind) for a new one.
+    assert!(queue.ask(new_ask("again")).unwrap().created);
+}
+
 fn watch_for(db: &Path, after: Option<i64>, timeout: Duration) -> Value {
     use dagq::watch::{WatchOptions, watch};
     watch(
@@ -5896,6 +6042,7 @@ fn watch_for(db: &Path, after: Option<i64>, timeout: Duration) -> Value {
             after,
             timeout,
             interval: Duration::from_millis(50),
+            role: None,
         },
     )
     .unwrap()

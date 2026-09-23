@@ -42,6 +42,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../../migrations/0011_session_workspaces.sql"),
     include_str!("../../migrations/0012_queue_events.sql"),
     include_str!("../../migrations/0013_goal_draft.sql"),
+    include_str!("../../migrations/0014_asks.sql"),
 ];
 /// Ready tasks whose predecessors are completed, that own no unfinished run
 /// and whose goal, if any, is not a draft (ADR-0024 decision 5).
@@ -910,7 +911,7 @@ pub(super) fn enum_col<T: FromStr<Err = DomainError>>(
     })
 }
 
-fn json_col<T: DeserializeOwned>(row: &Row<'_>, name: &str) -> rusqlite::Result<T> {
+pub(super) fn json_col<T: DeserializeOwned>(row: &Row<'_>, name: &str) -> rusqlite::Result<T> {
     let value: String = row.get(name)?;
     serde_json::from_str(&value).map_err(|error| {
         rusqlite::Error::FromSqlConversionFailure(

@@ -889,10 +889,10 @@ fn migration_from_v6_adds_goals_and_keeps_tasks_runs_and_events() {
     let mut queue = SqliteQueue::open(&path).unwrap();
     // 0007 (supervisors), 0008 (goals), 0009 (supervisor mode), 0010
     // (supervisor binary version), 0011 (session workspaces), 0012
-    // (queue-level backend failures) and 0013 (goal draft) are applied
-    // together.
-    assert_eq!(SqliteQueue::SCHEMA_VERSION, 13);
-    assert_eq!(queue.schema_version().unwrap(), 13);
+    // (queue-level backend failures), 0013 (goal draft) and 0014 (asks) are
+    // applied together.
+    assert_eq!(SqliteQueue::SCHEMA_VERSION, 14);
+    assert_eq!(queue.schema_version().unwrap(), 14);
     assert_eq!(
         queue
             .session_workspace(dagq::domain::SessionRole::Maintainer)
@@ -998,7 +998,7 @@ fn goals_of_a_version_12_queue_migrate_as_open() {
     .unwrap();
     drop(raw);
     let mut queue = SqliteQueue::open(&path).unwrap();
-    assert_eq!(queue.schema_version().unwrap(), 13);
+    assert_eq!(queue.schema_version().unwrap(), SqliteQueue::SCHEMA_VERSION);
     let goal = queue.show_goal(1).unwrap().goal;
     assert_eq!(goal.status, GoalStatus::Open);
     assert_eq!(queue.list_goals().unwrap()[0].status, GoalStatus::Open);

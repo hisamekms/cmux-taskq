@@ -17,8 +17,8 @@ use serde_json::{Value, json};
 use dagq::{
     application::{StatusFilter, TaskQuery, TaskStore, dependency_graph},
     domain::{
-        GoalEdit, GoalVerdict, NewGoal, NewNote, NewTask, NoteQuery, NoteTarget, TaskAction,
-        TaskStatus,
+        AskKind, GoalEdit, GoalVerdict, NewAsk, NewGoal, NewNote, NewTask, NoteQuery, NoteTarget,
+        SessionRole, TaskAction, TaskStatus,
     },
     infrastructure::{adapters::path_text, location::QueueLocation, sqlite::SqliteQueue},
 };
@@ -245,8 +245,50 @@ enum Command {
         /// Task whose run awaits integration or comes back from a session.
         id: i64,
     },
-    /// List supervisors, unfinished runs, what waits for the maintainer (attention) and the event cursor, without changing anything.
-    Status,
+    /// List supervisors, unfinished runs, what waits for the maintainer (attention), the open asks and the event cursor, without changing anything.
+    Status {
+        /// Only the attention addressed to this role: inbox gets ask_opened, maintainer the rest.
+        #[arg(long, value_parser = ROLES)]
+        role: Option<String>,
+    },
+    /// Register a question for a person about a task or one of its runs; prints the ask.
+    /// An open ask of the same task, run and kind is returned instead (`created: false`).
+    #[command(args_conflicts_with_subcommands = true, subcommand_negates_reqs = true)]
+    Ask {
+        #[command(subcommand)]
+        command: Option<AskCommand>,
+        #[arg(long, required = true, value_parser = ["approve_landing", "answer_prompt", "decide", "worker_question"])]
+        kind: Option<String>,
+        #[arg(long, required = true)]
+        question: Option<String>,
+        /// A choice to offer; repeat for several.
+        #[arg(long = "option")]
+        options: Vec<String>,
+        /// Task the ask is about.
+        #[arg(long = "task", required_unless_present = "run", conflicts_with = "run")]
+        task_id: Option<i64>,
+        /// Run the ask is about (its task is implied).
+        #[arg(long)]
+        run: Option<String>,
+    },
+    /// Write the answer of an open ask; the maintainer then sees ask_answered.
+    Answer {
+        id: i64,
+        #[arg(long)]
+        text: String,
+    },
+    /// List asks nobody closed, oldest first.
+    Asks {
+        /// Only the unanswered ones.
+        #[arg(long)]
+        open: bool,
+        /// Only the ones this role acts on: inbox answers open asks, maintainer reads answers.
+        #[arg(long, value_parser = ROLES)]
+        role: Option<String>,
+        /// Include closed asks.
+        #[arg(long)]
+        all: bool,
+    },
     /// Print the run events after a cursor, oldest first: attention events only unless --all. Reads only.
     Events {
         /// Event id to read past (the `cursor` of `status`, `events` or `watch`).
@@ -270,6 +312,10 @@ enum Command {
         /// Seconds between reads of the queue.
         #[arg(long, default_value_t = 2, value_parser = clap::value_parser!(u64).range(1..))]
         interval: u64,
+        /// Wake only for the attention addressed to this role: inbox for ask_opened,
+        /// maintainer for the rest and the supervisors' health.
+        #[arg(long, value_parser = ROLES)]
+        role: Option<String>,
     },
     /// Per-run times in seconds (work, validate, wait_to_land, startup) and counts, per-goal and
     /// overall count/total/median, and alerts over thresholds, derived from run events. The latest
@@ -317,6 +363,19 @@ enum Command {
         #[arg(long)]
         resume: bool,
     },
+}
+
+/// The session roles attention is addressed to.
+const ROLES: [&str; 3] = ["maintainer", "inbox", "planner"];
+
+fn parse_role(value: Option<String>) -> Result<Option<SessionRole>> {
+    Ok(value.map(|value| value.parse()).transpose()?)
+}
+
+#[derive(Subcommand)]
+enum AskCommand {
+    /// Mark an answered ask read. An open ask is withdrawn by answering it first.
+    Close { id: i64 },
 }
 
 #[derive(Subcommand)]
@@ -401,7 +460,8 @@ fn observer_access(command: &Command) -> ObserverAccess {
         | Command::Show { .. }
         | Command::Candidates
         | Command::Graph { .. }
-        | Command::Status
+        | Command::Status { .. }
+        | Command::Asks { .. }
         | Command::Events { .. }
         | Command::Watch { .. }
         | Command::Stats { .. }
@@ -634,7 +694,35 @@ fn execute(cli: Cli) -> Result<Value> {
         Command::Graph { goal_id } => {
             serde_json::to_value(dependency_graph(queue.graph_input()?, goal_id))?
         }
-        Command::Status => dagq::runtime::status(&db)?,
+        Command::Status { role: r } => dagq::runtime::status_for(&db, parse_role(r)?)?,
+        Command::Ask {
+            command: Some(AskCommand::Close { id }),
+            ..
+        } => serde_json::to_value(queue.close_ask(id)?)?,
+        Command::Ask {
+            command: None,
+            kind,
+            question,
+            options,
+            task_id,
+            run,
+        } => serde_json::to_value(queue.ask(NewAsk {
+            kind: kind.unwrap_or_default().parse::<AskKind>()?,
+            task_id,
+            run_id: run,
+            question: question.unwrap_or_default(),
+            options,
+            // The session's role; a person at a plain terminal has none.
+            asked_by: role.unwrap_or_else(|| "human".into()),
+        })?)?,
+        Command::Answer { id, text } => serde_json::to_value(queue.answer(id, &text)?)?,
+        Command::Asks { open, role: r, all } => {
+            json!({"asks": queue.asks(dagq::infrastructure::asks::AskQuery {
+            all,
+            open,
+            role: parse_role(r)?,
+        })?})
+        }
         Command::Events { after, limit, all } => {
             dagq::watch::events(&db, after, limit as usize, all)?
         }
@@ -642,12 +730,14 @@ fn execute(cli: Cli) -> Result<Value> {
             after,
             timeout,
             interval,
+            role: r,
         } => dagq::watch::watch(
             &db,
             &dagq::watch::WatchOptions {
                 after,
                 timeout: Duration::from_secs(timeout),
                 interval: Duration::from_secs(interval),
+                role: parse_role(r)?,
             },
         )?,
         Command::Supervise {

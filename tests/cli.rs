@@ -108,6 +108,7 @@ fn reads_do_not_create_a_queue_and_unknown_tasks_fail() {
                 "run_id": null, "task_id": null, "status": "stopped",
                 "kind": "supervisor_stopped", "last_error": null, "next": "restart supervisor",
             }]);
+            expected["asks"] = serde_json::json!([]);
             expected["cursor"] = serde_json::json!(0);
         }
         assert_eq!(report, expected, "{command}");
@@ -386,6 +387,169 @@ fn events_and_watch_read_past_a_cursor() {
     let quiet = ok(&db, &["watch", "--timeout", "0"]);
     assert_eq!(quiet["cursor"], cursor);
     assert!(!invoke(&db, &["watch", "--interval", "0"]).status.success());
+}
+
+#[test]
+fn ask_answer_asks_and_close_through_the_cli() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("queue.db");
+    ok(&db, &["init"]);
+    ok(&db, &["add", "first"]);
+    let cursor = ok(&db, &["status"])["cursor"].as_i64().unwrap();
+    let asked = ok(
+        &db,
+        &[
+            "ask",
+            "--kind",
+            "decide",
+            "--question",
+            "Which ADR number?",
+            "--option",
+            "0029",
+            "--option",
+            "0030",
+            "--task",
+            "1",
+        ],
+    );
+    assert_eq!(asked["created"], true);
+    assert_eq!(asked["kind"], "decide");
+    assert_eq!(asked["task_id"], 1);
+    assert_eq!(asked["options"], serde_json::json!(["0029", "0030"]));
+    assert!(asked["answer"].is_null());
+    let id = asked["id"].as_i64().unwrap();
+    let id_text = id.to_string();
+    // The same task and kind is not registered twice.
+    let again = ok(
+        &db,
+        &[
+            "ask",
+            "--kind",
+            "decide",
+            "--question",
+            "again",
+            "--task",
+            "1",
+        ],
+    );
+    assert_eq!(again["created"], false);
+    assert_eq!(again["id"], id);
+    assert_eq!(again["question"], "Which ADR number?");
+    // Missing target, unknown kind, unknown task and a blank question fail.
+    for args in [
+        &["ask", "--kind", "decide", "--question", "q"][..],
+        &["ask", "--kind", "bogus", "--question", "q", "--task", "1"],
+        &["ask", "--kind", "decide", "--question", "q", "--task", "9"],
+        &["ask", "--kind", "decide", "--question", " ", "--task", "1"],
+        &[
+            "ask",
+            "--kind",
+            "decide",
+            "--question",
+            "q",
+            "--run",
+            "nope",
+        ],
+        &["status", "--role", "worker"],
+    ] {
+        assert!(!invoke(&db, args).status.success(), "{args:?}");
+    }
+
+    let status = ok(&db, &["status", "--role", "inbox"]);
+    assert_eq!(status["asks"][0]["id"], id);
+    assert_eq!(status["asks"][0]["question"], "Which ADR number?");
+    assert_eq!(status["attention"][0]["kind"], "ask_opened");
+    assert_eq!(status["attention"].as_array().unwrap().len(), 1);
+    let maintainer = ok(&db, &["status", "--role", "maintainer"]);
+    assert_eq!(maintainer["attention"][0]["kind"], "supervisor_stopped");
+    assert_eq!(maintainer["attention"].as_array().unwrap().len(), 1);
+    assert_eq!(ok(&db, &["asks", "--open"])["asks"][0]["id"], id);
+    assert_eq!(
+        ok(&db, &["asks", "--role", "maintainer"])["asks"],
+        serde_json::json!([])
+    );
+
+    // watch --role inbox wakes on ask_opened; the maintainer's times out.
+    let after = cursor.to_string();
+    let inbox = ok(&db, &["watch", "--after", &after, "--role", "inbox"]);
+    assert_eq!(inbox["events"][0]["kind"], "ask_opened");
+    assert_eq!(inbox["events"][0]["ask_id"], id);
+    let quiet = ok(
+        &db,
+        &[
+            "watch",
+            "--after",
+            &after,
+            "--role",
+            "maintainer",
+            "--timeout",
+            "0",
+        ],
+    );
+    assert_eq!(quiet["events"], serde_json::json!([]));
+
+    let answered = ok(&db, &["answer", &id_text, "--text", "0030"]);
+    assert_eq!(answered["answer"], "0030");
+    assert!(answered["answered_at"].is_i64());
+    assert!(
+        !invoke(&db, &["answer", &id_text, "--text", "x"])
+            .status
+            .success()
+    );
+    let opened = inbox["cursor"].as_i64().unwrap().to_string();
+    let woke = ok(&db, &["watch", "--after", &opened, "--role", "maintainer"]);
+    assert_eq!(woke["events"][0]["kind"], "ask_answered");
+    assert_eq!(
+        woke["events"][0]["next"],
+        format!("read the answer of ask {id} and close it")
+    );
+    let quiet = ok(
+        &db,
+        &[
+            "watch",
+            "--after",
+            &opened,
+            "--role",
+            "inbox",
+            "--timeout",
+            "0",
+        ],
+    );
+    assert_eq!(quiet["events"], serde_json::json!([]));
+    assert_eq!(ok(&db, &["status"])["asks"], serde_json::json!([]));
+    assert_eq!(
+        ok(&db, &["asks", "--role", "maintainer"])["asks"][0]["id"],
+        id
+    );
+
+    let closed = ok(&db, &["ask", "close", &id_text]);
+    assert!(closed["closed_at"].is_i64());
+    assert!(!invoke(&db, &["ask", "close", &id_text]).status.success());
+    assert_eq!(ok(&db, &["asks"])["asks"], serde_json::json!([]));
+    assert_eq!(ok(&db, &["asks", "--all"])["asks"][0]["id"], id);
+    // An open ask is not closed; it is withdrawn by answering it.
+    let next = ok(
+        &db,
+        &[
+            "ask",
+            "--kind",
+            "decide",
+            "--question",
+            "next",
+            "--task",
+            "1",
+        ],
+    );
+    assert_eq!(next["created"], true);
+    let next_id = next["id"].to_string();
+    assert!(!invoke(&db, &["ask", "close", &next_id]).status.success());
+    ok(&db, &["answer", &next_id, "--text", "withdrawn"]);
+    ok(&db, &["ask", "close", &next_id]);
+    assert!(!invoke(&db, &["ask", "close", "99"]).status.success());
+    assert_eq!(
+        ok(&db, &["asks", "--role", "inbox"])["asks"],
+        serde_json::json!([])
+    );
 }
 
 #[test]
@@ -708,6 +872,9 @@ fn observer_may_note_and_propose_but_not_change_queue_state() {
         &["init"],
         &["review", "1"],
         &["down"],
+        &["ask", "--kind", "decide", "--question", "q", "--task", "1"],
+        &["answer", "1", "--text", "x"],
+        &["ask", "close", "1"],
     ] {
         denied(args);
     }
@@ -725,6 +892,8 @@ fn observer_may_note_and_propose_but_not_change_queue_state() {
         &["goal", "list"],
         &["goal", "show", "1"],
         &["notes"],
+        &["asks"],
+        &["status", "--role", "inbox"],
     ] {
         ok_as("observer", &db, args);
     }

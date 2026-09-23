@@ -3531,6 +3531,16 @@ pub struct DoctorReport {
 /// maintainer (`attention`) and the newest event id (`cursor`) to `watch`
 /// from (ADR-0016).
 pub fn status(db: &Path) -> Result<Value> {
+    status_for(db, None)
+}
+
+/// Characters of an ask's question `status` keeps before `…`.
+const ASK_QUESTION_CHARS: usize = 200;
+
+/// `status --role`: the attention narrowed to what `role` acts on
+/// (ADR-0022; `None` is all of it), and every open ask with its question
+/// cut to 200 characters.
+pub fn status_for(db: &Path, role: Option<crate::domain::SessionRole>) -> Result<Value> {
     let queue = SqliteQueue::open(db)?;
     // Read before the state it describes, so a transition in between is
     // seen again by `watch --after cursor` rather than missed.
@@ -3556,11 +3566,34 @@ pub fn status(db: &Path) -> Result<Value> {
             })
         })
         .collect::<Vec<_>>();
+    let asks = queue
+        .asks(crate::infrastructure::asks::AskQuery {
+            open: true,
+            ..Default::default()
+        })?
+        .into_iter()
+        .map(|ask| {
+            json!({
+                "id": ask.id,
+                "kind": ask.kind,
+                "question": crate::view::truncate(&ask.question, ASK_QUESTION_CHARS)
+                    .unwrap_or(ask.question),
+                "task_id": ask.task_id,
+                "run_id": ask.run_id,
+                "asked_by": ask.asked_by,
+                "age_secs": now - ask.created_at,
+            })
+        })
+        .collect::<Vec<_>>();
     Ok(json!({
         "checked_at": now,
         "supervisors": supervisors(&registrations, &leases, now),
         "runs": runs,
-        "attention": crate::watch::attention(&queue, &registrations, now)?,
+        "attention": crate::watch::attention(&queue, &registrations, now)?
+            .into_iter()
+            .filter(|a| crate::watch::for_role(&a.kind, role))
+            .collect::<Vec<_>>(),
+        "asks": asks,
         "cursor": cursor,
     }))
 }
