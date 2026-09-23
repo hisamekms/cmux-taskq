@@ -573,6 +573,8 @@ pub struct Predecessor {
     pub integrated_run: Option<TaskRun>,
 }
 
+pub mod stats;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunEvent {
     pub id: i64,

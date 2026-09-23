@@ -2241,6 +2241,45 @@ pub fn status(db: &Path) -> Result<Value> {
     }))
 }
 
+/// `stats` (ADR-0023 decision 5): per-run and per-goal times and the
+/// thresholds crossed, derived from `run_events` by
+/// [`crate::domain::stats::stats`]. The idle alert looks at the live
+/// supervisors' slots now. Reads only.
+pub fn stats(db: &Path, query: &crate::domain::stats::StatsQuery) -> Result<Value> {
+    use crate::domain::stats::{SlotSnapshot, stats};
+    let queue = SqliteQueue::open(db)?;
+    let now = unix_time();
+    let events = queue.all_events()?;
+    let goals = queue.task_goals()?;
+    let registrations = queue.supervisors()?;
+    let slots: i64 = crate::watch::pulses(&registrations, now)
+        .iter()
+        .zip(&registrations)
+        .filter(|(pulse, _)| !pulse.stale)
+        .map(|(_, registration)| i64::from(registration.parallel))
+        .sum();
+    let executing = queue
+        .active_runs()?
+        .iter()
+        .filter(|run| run.status != RunStatus::Integrating)
+        .count();
+    let ready = queue
+        .list(&crate::application::TaskQuery {
+            status: crate::application::StatusFilter::Only(vec![crate::domain::TaskStatus::Ready]),
+            limit: 1,
+            ..Default::default()
+        })?
+        .total;
+    let snapshot = SlotSnapshot {
+        free_slots: slots - i64::try_from(executing)?,
+        candidates: queue.candidates()?.len(),
+        ready,
+    };
+    Ok(serde_json::to_value(stats(
+        &events, &goals, now, snapshot, query,
+    ))?)
+}
+
 /// Inspect every registered supervisor and every unfinished run with its
 /// lease, processes and paths. Reads only.
 /// `doctor`: with `full`, every unfinished run with its lease, processes

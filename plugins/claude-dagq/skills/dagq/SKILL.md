@@ -63,6 +63,7 @@ A one-shot task omits `--goal`. `add` registers a `draft`; `ready` makes it runn
 - `"$DAGQ" list`: one page of unfinished tasks, newest first, as `{"tasks", "next", "total"}`. More pages exist only when `next` is not null; then pass `--before NEXT` with the same filters. Filters: `--status`, `--all`, `--goal ID`.
 - `"$DAGQ" show ID`: the task, its dependencies, the latest run and the latest 10 events.
 - `"$DAGQ" graph [--goal ID]`: unfinished tasks with what they wait for and how many they release; `critical` is the chain that holds back the most work, and `candidates` the order the supervisor claims in. Use it to decide what to make `ready` next.
+- `"$DAGQ" stats [--since CURSOR] [--goal ID]`: where time goes per run and goal (work, validation, waiting to land) and `alerts` over thresholds; pass `next_cursor` to `--since` for only newer runs.
 
 `show`, `goal show` and `doctor` are compact: long texts are cut to 300 characters ending in `…` with `truncated: true`. Add `--full` only for the whole text, every run, every event payload (a receipt) or `run_dir`. Field lists and statuses are in `reference/inspect.md`.
 

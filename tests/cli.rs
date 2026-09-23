@@ -521,3 +521,407 @@ fn graph_reports_unfinished_dependencies_releases_and_the_critical_chain() {
     assert_eq!(in_goal["candidates"], serde_json::json!([1]));
     assert_eq!(in_goal["critical"], serde_json::json!([1, 6]));
 }
+
+mod stats {
+    use std::collections::HashMap;
+
+    use dagq::domain::{
+        RunEvent,
+        stats::{SlotSnapshot, StatsQuery, stats, timestamp_millis},
+    };
+    use serde_json::{Value, json};
+
+    use super::{invoke, ok};
+
+    /// Builds run events one after another; `at` is minutes after 12:00.
+    #[derive(Default)]
+    struct Events(Vec<RunEvent>);
+
+    impl Events {
+        fn push(&mut self, task: i64, run: Option<&str>, kind: &str, minute: i64, payload: Value) {
+            self.0.push(RunEvent {
+                id: i64::try_from(self.0.len()).unwrap() + 1,
+                task_id: Some(task),
+                goal_id: None,
+                run_id: run.map(str::to_owned),
+                kind: kind.to_owned(),
+                payload,
+                created_at: format!(
+                    "2026-09-23T{:02}:{:02}:00.000Z",
+                    12 + minute / 60,
+                    minute % 60
+                ),
+            });
+        }
+
+        fn run(&mut self, task: i64, run: &str, kind: &str, minute: i64) {
+            self.push(task, Some(run), kind, minute, json!({}));
+        }
+
+        fn status(&mut self, task: i64, run: &str, kind: &str, minute: i64, status: &str) {
+            self.push(task, Some(run), kind, minute, json!({"status": status}));
+        }
+
+        fn last_id(&self) -> i64 {
+            self.0.last().unwrap().id
+        }
+    }
+
+    /// 12:00 plus `minute` minutes, in unix seconds.
+    fn at(minute: i64) -> i64 {
+        timestamp_millis("2026-09-23T12:00:00Z").unwrap() / 1000 + minute * 60
+    }
+
+    fn value(stats: &impl serde::Serialize) -> Value {
+        serde_json::to_value(stats).unwrap()
+    }
+
+    #[test]
+    fn timestamps_parse_the_queue_format() {
+        assert_eq!(timestamp_millis("1970-01-01T00:00:00.000Z"), Some(0));
+        assert_eq!(timestamp_millis("1970-01-02T00:00:01.5Z"), Some(86_401_500));
+        assert_eq!(
+            timestamp_millis("2026-09-23 12:00:00"),
+            Some(1_790_164_800_000)
+        );
+        assert_eq!(
+            timestamp_millis("2000-02-29T00:00:00Z"),
+            Some(951_782_400_000)
+        );
+        for bad in [
+            "",
+            "2026-09-23",
+            "2026-13-01T00:00:00Z",
+            "2026-09-23Tx:00:00Z",
+        ] {
+            assert_eq!(timestamp_millis(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn runs_goals_and_alerts_come_from_the_event_sequence() {
+        let mut events = Events::default();
+        // Task 1 (goal 7): integrated after 10 min of work, 2 of validation,
+        // 20 waiting to land; startup 3 min; one resume and a pass review.
+        events.run(1, "a", "run_claimed", 0);
+        events.run(1, "a", "agent_started", 1);
+        events.run(1, "a", "first_commit_observed", 4);
+        events.run(1, "a", "receipt_observed", 10);
+        events.status(1, "a", "validation_finished", 12, "awaiting_integration");
+        events.run(1, "a", "resume_started", 13);
+        events.push(
+            1,
+            Some("a"),
+            "review_finished",
+            14,
+            json!({"verdict": "pass"}),
+        );
+        events.run(1, "a", "integration_started", 30);
+        events.run(1, "a", "run_integrated", 32);
+        // Task 2 (goal 7): 40 min of work — twice the goal median is 2 × 25 —
+        // then three needs_session and the landing.
+        events.run(2, "b", "run_claimed", 0);
+        events.run(2, "b", "receipt_observed", 40);
+        events.status(2, "b", "validation_finished", 41, "awaiting_integration");
+        for minute in [42, 43, 44] {
+            events.status(2, "b", "integration_deferred", minute, "needs_session");
+        }
+        // An `integrate` that errors puts `needs_session` back; not a new park.
+        events.status(2, "b", "integration_error", 44, "needs_session");
+        events.run(2, "b", "run_integrated", 45);
+        // Task 3 (no goal) failed twice in two runs; no receipt the second time.
+        events.run(3, "c1", "run_claimed", 0);
+        events.run(3, "c1", "receipt_observed", 5);
+        events.status(3, "c1", "validation_finished", 6, "failed");
+        events.run(3, "c2", "run_claimed", 10);
+        events.status(3, "c2", "supervision_finished", 15, "failed");
+        // Task 4 (goal 7) still waits to land since minute 50; an ask on it
+        // has been open since minute 55, another was answered.
+        events.run(4, "d", "run_claimed", 46);
+        events.run(4, "d", "receipt_observed", 48);
+        events.status(4, "d", "validation_finished", 50, "awaiting_integration");
+        // A failed landing attempt does not restart the wait.
+        events.run(4, "d", "integration_started", 52);
+        events.status(4, "d", "integration_error", 53, "awaiting_integration");
+        events.push(4, Some("d"), "ask_opened", 55, json!({"ask_id": 1}));
+        events.push(4, None, "ask_opened", 56, json!({"ask_id": 2}));
+        events.push(4, None, "ask_answered", 57, json!({"ask_id": 2}));
+        let goals = HashMap::from([(1, Some(7)), (2, Some(7)), (3, None), (4, Some(7))]);
+        let slots = SlotSnapshot {
+            free_slots: 2,
+            candidates: 0,
+            ready: 1,
+        };
+
+        let report = value(&stats(
+            &events.0,
+            &goals,
+            at(120),
+            slots,
+            &StatsQuery::default(),
+        ));
+        let runs = report["runs"].as_array().unwrap();
+        let ids = runs.iter().map(|r| r["run_id"].clone()).collect::<Vec<_>>();
+        // Finished runs in the order they finished; `d` is still in flight.
+        assert_eq!(ids, [json!("a"), json!("b"), json!("c1"), json!("c2")]);
+        assert_eq!(
+            runs[0],
+            json!({
+                "run_id": "a", "task_id": 1, "goal_id": 7, "status": "integrated",
+                "finished_event_id": 9, "work": 600, "validate": 120,
+                "wait_to_land": 1200, "startup": 180, "resumes": 1,
+                "review_verdict": "pass", "needs_session": 0, "failed": 0,
+            })
+        );
+        assert_eq!(runs[1]["needs_session"], 3);
+        assert!(runs[1]["startup"].is_null());
+        assert!(runs[1]["review_verdict"].is_null());
+        assert_eq!(runs[2]["status"], "failed");
+        assert_eq!(runs[3]["work"], Value::Null);
+        assert_eq!(
+            report["goals"],
+            json!([
+                {"goal_id": 7, "runs": 2,
+                 "work": {"count": 2, "total": 3000, "median": 1500},
+                 "validate": {"count": 2, "total": 180, "median": 90},
+                 "wait_to_land": {"count": 2, "total": 1440, "median": 720},
+                 "startup": {"count": 1, "total": 180, "median": 180}},
+                {"goal_id": null, "runs": 2,
+                 "work": {"count": 1, "total": 300, "median": 300},
+                 "validate": {"count": 1, "total": 60, "median": 60},
+                 "wait_to_land": {"count": 0, "total": 0, "median": null},
+                 "startup": {"count": 0, "total": 0, "median": null}},
+            ])
+        );
+        assert_eq!(report["overall"]["runs"], 4);
+        assert_eq!(report["overall"]["work"]["median"], 600);
+        assert_eq!(report["next_cursor"], events.last_id());
+        let alerts = report["alerts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| {
+                (
+                    a["kind"].as_str().unwrap(),
+                    a["run_id"].clone(),
+                    a["value"].as_i64().unwrap(),
+                    a["threshold"].as_i64().unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            alerts,
+            [
+                ("awaiting_integration", json!("a"), 1200, 900),
+                ("needs_session", json!("b"), 3, 3),
+                ("awaiting_integration", json!("d"), 4200, 900),
+                ("task_failed", json!("c2"), 2, 2),
+                ("ask_unanswered", json!("d"), 3900, 3600),
+                ("idle_slots", Value::Null, 2, 0),
+            ]
+        );
+        // Task 2's 40 minutes are under twice goal 7's median (2 × 25 minutes).
+        assert_eq!(report["alerts"][2]["task_id"], 4);
+        assert!(report["alerts"][5]["task_id"].is_null());
+
+        // --goal keeps the runs and alerts of goal 7's tasks only.
+        let goal = value(&stats(
+            &events.0,
+            &goals,
+            at(120),
+            SlotSnapshot::default(),
+            &StatsQuery {
+                goal_id: Some(7),
+                ..Default::default()
+            },
+        ));
+        assert_eq!(goal["runs"].as_array().unwrap().len(), 2);
+        assert_eq!(goal["goals"].as_array().unwrap().len(), 1);
+        assert!(
+            goal["alerts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|a| a["task_id"] != 3 && a["kind"] != "idle_slots")
+        );
+
+        // --since: only runs that finished after the cursor.
+        let since = value(&stats(
+            &events.0,
+            &goals,
+            at(120),
+            SlotSnapshot::default(),
+            &StatsQuery {
+                since: Some(runs[1]["finished_event_id"].as_i64().unwrap()),
+                ..Default::default()
+            },
+        ));
+        let ids = since["runs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["run_id"].clone())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, [json!("c1"), json!("c2")]);
+        assert_eq!(since["next_cursor"], events.last_id());
+
+        // Task 3's first failure is before the cursor, and still counts.
+        let later = value(&stats(
+            &events.0,
+            &goals,
+            at(120),
+            SlotSnapshot::default(),
+            &StatsQuery {
+                since: Some(since["runs"][0]["finished_event_id"].as_i64().unwrap()),
+                ..Default::default()
+            },
+        ));
+        assert_eq!(later["runs"].as_array().unwrap().len(), 1);
+        assert!(later["alerts"].as_array().unwrap().contains(&json!({
+            "kind": "task_failed", "task_id": 3, "run_id": "c2", "value": 2, "threshold": 2
+        })));
+    }
+
+    #[test]
+    fn work_over_the_goal_median_is_an_alert() {
+        let mut events = Events::default();
+        for (task, work) in [(1, 10), (2, 10), (3, 30)] {
+            let run = format!("r{task}");
+            events.run(task, &run, "run_claimed", 0);
+            events.run(task, &run, "receipt_observed", work);
+            events.status(
+                task,
+                &run,
+                "validation_finished",
+                work,
+                "awaiting_integration",
+            );
+            events.run(task, &run, "run_integrated", work + 1);
+        }
+        let goals = HashMap::from([(1, Some(1)), (2, Some(1)), (3, Some(1))]);
+        let report = value(&stats(
+            &events.0,
+            &goals,
+            at(60),
+            SlotSnapshot::default(),
+            &StatsQuery::default(),
+        ));
+        assert_eq!(
+            report["alerts"],
+            json!([{"kind": "work_over_median", "task_id": 3, "run_id": "r3",
+                    "value": 1800, "threshold": 1200}])
+        );
+    }
+
+    #[test]
+    fn at_most_fifty_runs_unless_full_and_since_pages_forward() {
+        let mut events = Events::default();
+        for task in 1..=60 {
+            let run = format!("r{task}");
+            events.run(task, &run, "run_claimed", 0);
+            events.status(task, &run, "supervision_finished", 1, "failed");
+        }
+        let goals = HashMap::new();
+        let run = |query: StatsQuery| {
+            value(&stats(
+                &events.0,
+                &goals,
+                at(2),
+                SlotSnapshot::default(),
+                &query,
+            ))
+        };
+        let latest = run(StatsQuery::default());
+        assert_eq!(latest["runs"].as_array().unwrap().len(), 50);
+        assert_eq!(latest["runs"][0]["run_id"], "r11");
+        assert_eq!(latest["next_cursor"], events.last_id());
+        assert_eq!(
+            run(StatsQuery {
+                full: true,
+                ..Default::default()
+            })["runs"]
+                .as_array()
+                .unwrap()
+                .len(),
+            60
+        );
+        let first = run(StatsQuery {
+            since: Some(0),
+            ..Default::default()
+        });
+        assert_eq!(first["runs"].as_array().unwrap().len(), 50);
+        assert_eq!(first["runs"][49]["run_id"], "r50");
+        assert_eq!(first["next_cursor"], 100);
+        let rest = run(StatsQuery {
+            since: Some(100),
+            ..Default::default()
+        });
+        assert_eq!(rest["runs"].as_array().unwrap().len(), 10);
+        assert_eq!(rest["runs"][0]["run_id"], "r51");
+        assert_eq!(rest["next_cursor"], events.last_id());
+        assert_eq!(
+            run(StatsQuery {
+                since: Some(events.last_id()),
+                ..Default::default()
+            })["runs"],
+            json!([])
+        );
+    }
+
+    #[test]
+    fn cli_stats_reads_the_queue_and_since_returns_only_new_runs() {
+        use dagq::{domain::ClaimOutcome, infrastructure::sqlite::SqliteQueue};
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("queue.db");
+        ok(&db, &["init"]);
+        let empty = ok(&db, &["stats"]);
+        assert_eq!(empty["runs"], json!([]));
+        assert_eq!(empty["alerts"], json!([]));
+        assert_eq!(empty["overall"]["work"]["median"], Value::Null);
+        ok(&db, &["goal", "add", "measured"]);
+        ok(&db, &["add", "first", "--goal", "1"]);
+        ok(&db, &["add", "second"]);
+        ok(&db, &["ready", "1"]);
+        ok(&db, &["ready", "2"]);
+        let base = "0123456789abcdef0123456789abcdef01234567";
+        let finish = |queue: &mut SqliteQueue| {
+            let ClaimOutcome::Claimed { run } = queue.claim_for_supervisor(base, "t").unwrap()
+            else {
+                panic!("nothing to claim");
+            };
+            queue
+                .record_runtime_event(&run.id, "receipt_observed", json!({}))
+                .unwrap();
+            queue
+                .record_runtime_event(&run.id, "validation_finished", json!({"status": "failed"}))
+                .unwrap();
+            run.id
+        };
+        let mut queue = SqliteQueue::open(&db).unwrap();
+        let first = finish(&mut queue);
+        let report = ok(&db, &["stats"]);
+        assert_eq!(report["runs"][0]["run_id"], first.as_str());
+        assert_eq!(report["runs"][0]["goal_id"], 1);
+        assert_eq!(report["runs"][0]["failed"], 1);
+        assert!(report["runs"][0]["work"].is_i64());
+        let cursor = report["next_cursor"].as_i64().unwrap();
+        assert_eq!(cursor, ok(&db, &["status"])["cursor"].as_i64().unwrap());
+
+        let second = finish(&mut queue);
+        let since = ok(&db, &["stats", "--since", &cursor.to_string()]);
+        assert_eq!(since["runs"].as_array().unwrap().len(), 1);
+        assert_eq!(since["runs"][0]["run_id"], second.as_str());
+        assert!(since["next_cursor"].as_i64().unwrap() > cursor);
+        assert_eq!(
+            ok(&db, &["stats", "--full"])["runs"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        let goal = ok(&db, &["stats", "--goal", "1"]);
+        assert_eq!(goal["runs"].as_array().unwrap().len(), 1);
+        assert_eq!(goal["goals"][0]["goal_id"], 1);
+        assert!(!invoke(&db, &["stats", "--since", "x"]).status.success());
+    }
+}

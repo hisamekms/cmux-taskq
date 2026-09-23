@@ -24,6 +24,7 @@ related:
   - adr-0020
   - adr-0021
   - adr-0022
+  - adr-0023
   - adr-0025
   - design-persistence
   - design-provider-lifecycle
@@ -57,7 +58,7 @@ ready task (dependencies completed)
 
 ## Implementation status
 
-ステップ3で`claim`から`running`、セッション終了検知までを、ステップ4の[005](../journal/005-receipt-validation.md)でreceiptの検証と`awaiting_integration`への遷移を、[006](../journal/006-workspace-close.md)で受理後のworkspace終了を、[007](../journal/007-session-exit-request.md)でreceipt受領後の終了要求を、[009](../journal/009-doctor-recover.md)で`doctor`/`recover`を、[008](../journal/008-integration-confirm.md)で統合確認`integrate`と`completed`への遷移を`src/runtime.rs`に実装した。ステップ6の[017](../journal/017-parallel-runs.md)（[ADR-0007](../adr/0007-run-level-leases-parallel-execution.md)）でleaseをrun単位にし、`supervise`を上限付き並列の常駐ループにした。ステップ7の[018](../journal/018-merge-queue.md)（[ADR-0008](../adr/0008-merge-queue-squash-landing.md)）で`integrate`を手動mergeの確認からruntimeによる着地（rebase → 再検証 → squash）に置き換えた。[021](../journal/021-maintainer-up-down.md)で`up` / `down`（`src/lifecycle.rs`）、launchdによる常駐、`supervise --log-dir`、maintainer promptを足した。task 24（[ADR-0012](../adr/0012-adopt-stale-lease-of-live-wrapper.md)）で、supervisorが死んだ後もwrapperが生きているrunを次のsupervisorが引き継ぐ（adopt）ようにした。[ADR-0011](../adr/0011-cmux-socket-password-and-in-cmux-fallback.md)のtask 21で`up`にcmux外接続のpreflightを、task 22で`up --in-cmux`（launchdなしのfallback）と`supervisors.mode`を足した。task 30（[ADR-0014](../adr/0014-up-replaces-a-supervisor-of-another-binary-version.md)）で`supervisors.binary_version`を足し、`up`がversionの違うliveなsupervisorをdrainして入れ替えるようにした（`--no-wait`は走行中のrunがあれば入れ替えない）。task 57（[ADR-0016](../adr/0016-maintainer-notification-and-compact-output.md)）で`status`に`attention`と`cursor`を足し、`events --after`と`watch`（`src/watch.rs`、判定は`src/domain.rs`）を足した。task 75（task 58の登録し直し）で`WorkspaceBackend::notify`とcmux adapterの`cmux notify`を足した。supervisorはまだ通知を送らない（[人への通知](#人への通知cmux-notify)）。task 70（[ADR-0019](../adr/0019-move-routine-maintainer-work-into-the-runtime.md)の決定3）で`integrate`が着地後に`main`を`origin`へpushするようにし（`--no-push`、`push_finished` / `push_skipped` / `push_failed`）、`push_failed`をattention（`push main`）にした。task 79（[ADR-0025](../adr/0025-leaseless-unfinished-run-is-a-recover-run-attention.md)）で、supervisorが手放した（leaseの無い）未完了runを`recover run`のattentionにした。
+ステップ3で`claim`から`running`、セッション終了検知までを、ステップ4の[005](../journal/005-receipt-validation.md)でreceiptの検証と`awaiting_integration`への遷移を、[006](../journal/006-workspace-close.md)で受理後のworkspace終了を、[007](../journal/007-session-exit-request.md)でreceipt受領後の終了要求を、[009](../journal/009-doctor-recover.md)で`doctor`/`recover`を、[008](../journal/008-integration-confirm.md)で統合確認`integrate`と`completed`への遷移を`src/runtime.rs`に実装した。ステップ6の[017](../journal/017-parallel-runs.md)（[ADR-0007](../adr/0007-run-level-leases-parallel-execution.md)）でleaseをrun単位にし、`supervise`を上限付き並列の常駐ループにした。ステップ7の[018](../journal/018-merge-queue.md)（[ADR-0008](../adr/0008-merge-queue-squash-landing.md)）で`integrate`を手動mergeの確認からruntimeによる着地（rebase → 再検証 → squash）に置き換えた。[021](../journal/021-maintainer-up-down.md)で`up` / `down`（`src/lifecycle.rs`）、launchdによる常駐、`supervise --log-dir`、maintainer promptを足した。task 24（[ADR-0012](../adr/0012-adopt-stale-lease-of-live-wrapper.md)）で、supervisorが死んだ後もwrapperが生きているrunを次のsupervisorが引き継ぐ（adopt）ようにした。[ADR-0011](../adr/0011-cmux-socket-password-and-in-cmux-fallback.md)のtask 21で`up`にcmux外接続のpreflightを、task 22で`up --in-cmux`（launchdなしのfallback）と`supervisors.mode`を足した。task 30（[ADR-0014](../adr/0014-up-replaces-a-supervisor-of-another-binary-version.md)）で`supervisors.binary_version`を足し、`up`がversionの違うliveなsupervisorをdrainして入れ替えるようにした（`--no-wait`は走行中のrunがあれば入れ替えない）。task 57（[ADR-0016](../adr/0016-maintainer-notification-and-compact-output.md)）で`status`に`attention`と`cursor`を足し、`events --after`と`watch`（`src/watch.rs`、判定は`src/domain.rs`）を足した。task 75（task 58の登録し直し）で`WorkspaceBackend::notify`とcmux adapterの`cmux notify`を足した。supervisorはまだ通知を送らない（[人への通知](#人への通知cmux-notify)）。task 70（[ADR-0019](../adr/0019-move-routine-maintainer-work-into-the-runtime.md)の決定3）で`integrate`が着地後に`main`を`origin`へpushするようにし（`--no-push`、`push_finished` / `push_skipped` / `push_failed`）、`push_failed`をattention（`push main`）にした。task 79（[ADR-0025](../adr/0025-leaseless-unfinished-run-is-a-recover-run-attention.md)）で、supervisorが手放した（leaseの無い）未完了runを`recover run`のattentionにした。task 94（[ADR-0023](../adr/0023-verify-once-review-in-supervisor-run-env-graph-and-stats.md)の決定5）でrun_eventsから時間と閾値超えを導出する`stats`（集計は`src/domain/stats.rs`）を足した。
 
 ## Roles
 
@@ -278,6 +279,26 @@ supervisorの再起動ではrunごとのleaseとheartbeatを確認し、孤児�
 attentionイベントの判定は`domain::event_attention(kind, payload)`（候補kindは`ATTENTION_KINDS`）: `validation_finished`で`status`が`awaiting_integration`（`review and integrate`）か`failed`、`supervision_finished`と`integration_failed`で`failed`（`inspect and close workspace`）、`integration_deferred`と`integration_error`で`needs_session`（`resume session`）、`exit_request_timed_out`（`send /exit`）、`push_failed`（`push main`）、`runtime_error`でpayloadの`lease_released`が`true`のもの（supervisorのabandon。`recover run`）。leaseを手放さない`runtime_error`（`record_runtime_error`など、`lease_released`が無いかfalse）はattentionにしない。`push_finished`と`push_skipped`もattentionにしない。validation後の後始末（workspaceのclose）の失敗によるabandonは、runが`awaiting_integration`に着いた後でも`lease_released: true`の`runtime_error`を書くので、`events` / `watch`は`recover run`を返すが、`status`はstatusどおり`review and integrate`を出す（`status`の判定を正とする）。`integration_error`で`awaiting_integration`に戻ったものは`integrate`の呼び手がerrorを受け取っているのでattentionにしない。`integration_rebase_aborted`はstatusを変えず着地が続くので、その結果（`integration_deferred`など）の方がattentionになる。既存のkind名とpayloadは変えていない。
 
 `dagq watch [--after <id>] [--timeout SECS（既定600）] [--interval SECS（既定2）]`はqueueをinterval秒ごとに読み、idより後にattentionイベントが1件以上あるか、登録済みsupervisorの健全性（tokenの集合と各`pid`・`alive`・`stale`、`domain::SupervisorPulse`）がwatch開始時のsnapshotと変わるまでblockする。返り値は`{events, supervisors_changed, supervisors, cursor}`で、`supervisors`は`status`と同じ形。timeoutでは`events`が空、`supervisors_changed: false`、`cursor`は渡したままで、exit codeは0。`--after`を省くと開始時の最新idから待つ。`watch`はqueueを読むだけで何も書かず、`integrate`を呼ばない。
+
+### `stats`
+
+`dagq stats [--since <event id>] [--goal ID] [--full]`は、run_eventsから時間と閾値超えを導出して返す読むだけのコマンド（[ADR-0023](../adr/0023-verify-once-review-in-supervisor-run-env-graph-and-stats.md)の決定5）。新しい表は持たず、集計は`domain::stats::stats`（events、task→goalの対応、今の時刻、supervisorの空きslotのsnapshotを受ける純粋関数）が行い、`runtime::stats`はqueueを読んで渡すだけ。
+
+- **対象のrun**: 終わったrun。終わりのイベントは`run_integrated`か、payloadの`status`が`failed` / `interrupted`になった最初のイベントで、そのidが`finished_event_id`。既定は終わった順の直近50件、`--full`で全件。`--since`はそのidがcursorより大きいrunだけにし、50件を超えるときは古い方から50件を返して`next_cursor`をその最後の`finished_event_id`にする（続きは同じ`--since next_cursor`で読める）。それ以外の`next_cursor`は読んだ時点のrun_eventsの最新id（`status`の`cursor`と同じ値）。`--goal`はそのgoalのtaskのrunだけに絞る（alertsも同じ）。
+- **`runs`**: runごとに`run_id`、`task_id`、`goal_id`、`status`（`integrated` / `failed` / `interrupted`）、`finished_event_id`と、秒の区間と回数。区間は端のイベントが無ければnull。
+  - `work`: `run_claimed`→最初の`receipt_observed`
+  - `validate`: 最初の`receipt_observed`→最初の`validation_finished`
+  - `wait_to_land`: 最初の`validation_finished`→`run_integrated`
+  - `startup`: `agent_started`→`first_commit_observed`（task E11が記録するまではnull）
+  - `resumes`: `resume_started`（ADR-0019の自動resume。記録されるまでは0）の数、`review_verdict`: 最後の`review_finished`の`verdict`（goal 11のreview工程が記録するまではnull）、`needs_session` / `failed`: payloadの`status`がその値のイベントの数。`integration_error`は試行前のstatusに戻すだけなので`needs_session`に数えない
+- **`goals`と`overall`**: goalごと（goal昇順、goalの無いrunは`goal_id: null`で最後）と全体で、`runs`（件数）と区間ごとの`{count, total, median}`。区間の無いrunは数えない。中央値は偶数個なら中央2つの平均の切り捨て。
+- **`alerts`**: `[{kind, task_id, run_id, value, threshold}]`（`value`と`threshold`は秒か回数）。対象のrunに加えて、まだ終わっていないrunも見る。
+  - `awaiting_integration`: `wait_to_land`が15分（900秒）を超えたrun。まだ`awaiting_integration`にいるrunは最初に`awaiting_integration`になってからの経過で判定する（着地の失敗で戻っても起点は変えない）
+  - `needs_session`: `needs_session`が3回目に達したrun
+  - `ask_unanswered`: `ask_opened`から60分答えられていないask（ADR-0022。`ask_answered`とはpayloadの`ask_id`（無ければ`id`）とrun・taskで対にする）
+  - `task_failed`: 同じtaskのrunの`failed`が合わせて2回。回数はpageに関係なく全runで数え、`run_id`はその最後に失敗したrunで、そのrunが対象に入るときに出す（`--since`で2回目だけが新しくても出る）
+  - `work_over_median`: `work`がそのgoal（goalの無いrunはgoalの無いrun同士）の中央値の2倍を超えたrun
+  - `idle_slots`: staleでないsupervisorの`parallel`の合計から実行中（`integrating`以外の未完了）runを引いた空きslotがあるのに、candidatesがゼロで`ready`のtaskが残っている（依存で詰まっている）。`value`は空きslot数で、`task_id` / `run_id`はnull。readyのtaskが無い空のqueueは詰まりではないので出さない。`stats`を読んだ時点のsnapshotで判定し、時間帯の履歴は持たない
 
 ### `doctor`
 

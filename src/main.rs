@@ -238,6 +238,20 @@ enum Command {
         #[arg(long, default_value_t = 2, value_parser = clap::value_parser!(u64).range(1..))]
         interval: u64,
     },
+    /// Per-run times in seconds (work, validate, wait_to_land, startup) and counts, per-goal and
+    /// overall count/total/median, and alerts over thresholds, derived from run events. The latest
+    /// 50 finished runs unless --full; pass `next_cursor` to --since for only the runs finished later.
+    Stats {
+        /// Event id (a previous `next_cursor`): only runs that finished after it.
+        #[arg(long)]
+        since: Option<i64>,
+        /// Only runs of tasks in this goal.
+        #[arg(long = "goal")]
+        goal_id: Option<i64>,
+        /// Every finished run instead of the latest 50 (or the next 50 past --since).
+        #[arg(long)]
+        full: bool,
+    },
     /// Report every unfinished run and supervisor, one line's worth each, without changing state.
     Doctor {
         /// Include each run's lease, processes, heartbeats and paths, and every supervisor field.
@@ -628,6 +642,18 @@ fn execute(cli: Cli) -> Result<Value> {
             )?
         }
         Command::Review { id } => dagq::runtime::review(&db, id)?,
+        Command::Stats {
+            since,
+            goal_id,
+            full,
+        } => dagq::runtime::stats(
+            &db,
+            &dagq::domain::stats::StatsQuery {
+                since,
+                goal_id,
+                full,
+            },
+        )?,
         Command::Doctor { full } => dagq::runtime::doctor(&db, full)?,
         Command::Recover { run } => dagq::runtime::recover(&db, &run)?,
         Command::Session { run, lease, claude } => {

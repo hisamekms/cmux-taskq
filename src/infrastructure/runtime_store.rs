@@ -1,4 +1,6 @@
 //! Durable per-run supervisor ownership and one-shot wrapper registration.
+use std::collections::HashMap;
+
 use anyhow::{Context, Result, bail, ensure};
 use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
 use serde::Serialize;
@@ -815,6 +817,24 @@ impl SqliteQueue {
             .query_row("SELECT COALESCE(MAX(id),0) FROM run_events", [], |r| {
                 r.get(0)
             })?)
+    }
+
+    /// Every run event, oldest first, for `stats`. A pure read.
+    pub fn all_events(&self) -> Result<Vec<RunEvent>> {
+        Ok(self
+            .conn
+            .prepare("SELECT * FROM run_events ORDER BY id")?
+            .query_map([], event_row)?
+            .collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// The goal of every task, for `stats`. A pure read.
+    pub fn task_goals(&self) -> Result<HashMap<i64, Option<i64>>> {
+        Ok(self
+            .conn
+            .prepare("SELECT id, goal_id FROM tasks")?
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?)
     }
 
     /// Events with `after < id <= upto`, oldest first, at most `limit`;
