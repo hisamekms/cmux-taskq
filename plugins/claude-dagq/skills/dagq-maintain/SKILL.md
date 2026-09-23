@@ -32,12 +32,13 @@ Read, in this order:
 2. `attention`: what waits for the user or you now. Each entry has `run_id`, `task_id`, `status`, `kind`, `last_error` and a fixed `next`. Route it:
    - `review and integrate` (`awaiting_integration`): the `dagq-land` skill.
    - `resuming (runtime)` (`needs_session`): the supervisor is resolving it; nothing to do.
-   - `resume session` (`needs_session` the runtime could not resolve), `inspect and close workspace` (`failed`), `send /exit` (exit request timed out), `answer the prompt in workspace <id>` (`kind` `prompt_waiting`: a worker stopped at a dialog): the `dagq-session` skill.
+   - `resume session` (`needs_session` the runtime could not resolve), `inspect and close workspace` (`failed`), `send /exit` (exit request timed out), `answer the prompt in workspace <id>` (`kind` `prompt_waiting`: a worker stopped at a dialog), `send the answer of ask <id> to the worker and close it`: the `dagq-session` skill.
    - `recover run` (`kind` `runtime_error`: an unfinished run its supervisor gave up, left without a lease): the `dagq-recover` skill.
    - `restart supervisor` (`supervisor_stale`, `supervisor_stopped`): `up` as in step 1.
    - `push main` (`push_failed` on an `integrated` run): `integrate` landed it but could not push; the `dagq-land` skill, step 5.
    - `read the answer of ask <id> and close it` (`kind` `ask_answered`): the user answered an ask; act on it as in step 4.
-   - `answer ask <id>` (`kind` `ask_opened`): for the inbox, not for you; `status --role maintainer` leaves these out.
+   - `answer ask <id>` (`kind` `ask_opened`): for the inbox, not for you; `status --role maintainer` leaves these out. A `worker_question` is yours: `dagq-session`, section 2.
+   - `delivering the answer of ask <id> (runtime)`: nothing to do.
 3. `runs`: unfinished runs with their leases. A run in progress needs nothing from you.
 4. `asks`: the open asks (`id`, `kind`, the first 200 characters of `question`, `task_id`, `run_id`, `asked_by`, `age_secs`), waiting for the user's answer through the inbox.
 5. `cursor`: the newest event id, where the next `watch` starts.

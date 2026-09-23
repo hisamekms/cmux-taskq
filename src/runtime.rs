@@ -1492,6 +1492,9 @@ impl SessionWatch {
                 unix_time() - wrapper.heartbeat_at <= HEARTBEAT_TIMEOUT_SECS,
                 "wrapper heartbeat expired; session may still be alive"
             );
+            if self.exit_requested.is_none() {
+                self.deliver_answers(queue, cmux, run, log)?;
+            }
             if let Some(agent) = processes.iter().find(|p| p.role == "agent") {
                 self.watch_prompt(queue, cmux, run, agent, log)?;
             }
@@ -1587,9 +1590,13 @@ impl SessionWatch {
             self.prompt_hash = None;
             return Ok(());
         }
-        if self.idle_marker.exists() || !process_alive(agent.pid) {
-            // The agent finished a response or is gone: no dialog holds it
-            // now, and a recorded one must not stay an attention.
+        if self.idle_marker.exists()
+            || !process_alive(agent.pid)
+            || queue.has_unclosed_worker_question(&run.id)?
+        {
+            // The agent finished a response, is gone, or stopped at an ask
+            // that waits for its answer: no dialog holds it now, and a
+            // recorded one must not stay an attention.
             return self.clear_prompt(queue, run, log);
         }
         // A recorded dialog (also one adopted from the previous supervisor)
@@ -1637,6 +1644,76 @@ impl SessionWatch {
                 }
             }
             None => self.clear_prompt(queue, run, log)?,
+        }
+        Ok(())
+    }
+
+    /// Type the answer of each answered `worker_question` of the run into
+    /// the worker's terminal, prefixed `answer to ask <id>:`, once the worker
+    /// went idle after asking (its idle marker is no older than the ask, to
+    /// the second), then close the ask and record `ask_delivered` (ADR-0022
+    /// decision 2). Each answer is sent at most once: a failed send records
+    /// `ask_delivery_failed` and leaves the ask unclosed for the maintainer.
+    fn deliver_answers(
+        &mut self,
+        queue: &mut SqliteQueue,
+        cmux: &dyn WorkspaceBackend,
+        run: &TaskRun,
+        log: &SupervisorLog,
+    ) -> Result<()> {
+        let answers = queue.undelivered_answers(&run.id)?;
+        if answers.is_empty() {
+            return Ok(());
+        }
+        let idle_at = match fs::metadata(&self.idle_marker) {
+            Ok(meta) => unix_seconds(meta.modified()?),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error).context("inspect idle marker"),
+        };
+        let failed: Vec<i64> = queue
+            .run_events(&run.id)?
+            .iter()
+            .filter(|e| e.kind == "ask_delivery_failed")
+            .filter_map(|e| e.payload.get("ask_id").and_then(Value::as_i64))
+            .collect();
+        for ask in answers {
+            if failed.contains(&ask.id) || idle_at < ask.created_at {
+                continue;
+            }
+            let text = format!(
+                "answer to ask {}: {}",
+                ask.id,
+                ask.answer.as_deref().unwrap_or_default()
+            );
+            match cmux.send_text(&self.workspace, &text) {
+                // Sent: failing to record it must not cost the live run its
+                // lease, so it is only noted (the ask then shows unclosed).
+                Ok(()) => match queue.ask_delivered(ask.id, &self.workspace) {
+                    Ok(_) => log.note(&format!(
+                        "answer of ask {} sent to run {} in workspace {}",
+                        ask.id, run.id, self.workspace
+                    )),
+                    Err(error) => log.note(&format!(
+                        "answer of ask {} was sent to run {} but could not be recorded: {error:#}",
+                        ask.id, run.id
+                    )),
+                },
+                Err(error) => {
+                    queue.record_runtime_event(
+                        &run.id,
+                        "ask_delivery_failed",
+                        json!({
+                            "ask_id": ask.id,
+                            "workspace_id": self.workspace,
+                            "error": format!("{error:#}"),
+                        }),
+                    )?;
+                    log.note(&format!(
+                        "answer of ask {} could not be sent to run {} in workspace {}: {error:#}; it is left to the maintainer",
+                        ask.id, run.id, self.workspace
+                    ));
+                }
+            }
         }
         Ok(())
     }
@@ -3383,6 +3460,7 @@ pub fn prompt(
          follow_ups is optional: an array of work you found outside this task, each with a title and a description, for the maintainer to register; omit it when there is none.\n\
          You may write this receipt outside the worktree. Keep the worktree clean after committing.\n\
          The supervisor rejects the run unless the commit is the clean head of your branch on top of the base commit, and it reruns the verification commands itself.\n\
+         When you need a decision you cannot make from the task and the repository, do not write the question to the terminal and wait: run `dagq ask --run {run_id} --kind worker_question --question '...'` in the worktree (one ask at a time, with everything you need decided in its question), report briefly that you asked, and stop. The answer arrives in this terminal as `answer to ask <id>: ...`; continue from it.\n\
          After submitting, report the outcome briefly and stop; do not run /exit yourself. Once you are idle the supervisor ends the session, and the maintainer can still send /exit. A receipt does not itself end the session.\n",
         task_id = task.id,
         run_id = run.id,

@@ -6,8 +6,8 @@
 //! by `domain`.
 use crate::{
     domain::{
-        ASK_EVENT_KINDS, ATTENTION_KINDS, Attention, AttentionNext, MAX_RESUME_ATTEMPTS, RunEvent,
-        RunStatus, SessionRole, SupervisorPulse, SupervisorRegistration, attention_role,
+        ASK_EVENT_KINDS, ATTENTION_KINDS, AskKind, Attention, AttentionNext, MAX_RESUME_ATTEMPTS,
+        RunEvent, RunStatus, SessionRole, SupervisorPulse, SupervisorRegistration, attention_role,
         event_attention, run_attention, supervisor_attention,
     },
     infrastructure::{
@@ -66,7 +66,9 @@ pub fn attention(
             .rev()
             .find(|e| matches!(e.kind.as_str(), "exit_request_timed_out" | "session_exited"))
             .is_some_and(|e| e.kind == "exit_request_timed_out");
-        // A dialog is waiting until the screen clears or the receipt arrives.
+        // A dialog is waiting until the screen clears or the receipt arrives;
+        // a run stopped at an ask waits for its answer, not at a dialog.
+        let asking = queue.has_unclosed_worker_question(&run.id)?;
         let prompt_waiting = events
             .iter()
             .rev()
@@ -76,7 +78,7 @@ pub fn attention(
                     "prompt_waiting" | "prompt_cleared" | "receipt_observed"
                 )
             })
-            .filter(|e| e.kind == "prompt_waiting")
+            .filter(|e| e.kind == "prompt_waiting" && !asking)
             .map(|e| {
                 e.payload
                     .get("workspace_id")
@@ -155,6 +157,39 @@ pub fn attention(
                 "ask_opened",
                 AttentionNext::AnswerAsk { ask_id: ask.id },
             )
+        } else if ask.kind == AskKind::WorkerQuestion
+            && let Some(run_id) = ask.run_id.as_deref()
+        {
+            // The supervisor holding a running worker's lease types the
+            // answer into its terminal; a failed send, a run no longer
+            // running or one nobody supervises leaves it to the maintainer.
+            let failed = queue.run_events(run_id)?.iter().any(|e| {
+                e.kind == "ask_delivery_failed"
+                    && e.payload.get("ask_id").and_then(Value::as_i64) == Some(ask.id)
+            });
+            if failed {
+                (
+                    "answered",
+                    "ask_delivery_failed",
+                    AttentionNext::DeliverAnswer { ask_id: ask.id },
+                )
+            } else if queue.run(run_id)?.status == RunStatus::Running
+                && queue
+                    .run_lease(run_id)?
+                    .is_some_and(|lease| !lease_is_stale(&lease, now))
+            {
+                (
+                    "answered",
+                    "ask_answered",
+                    AttentionNext::DeliveringAnswer { ask_id: ask.id },
+                )
+            } else {
+                (
+                    "answered",
+                    "ask_answered",
+                    AttentionNext::DeliverAnswer { ask_id: ask.id },
+                )
+            }
         } else {
             (
                 "answered",

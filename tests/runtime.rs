@@ -131,6 +131,8 @@ resolve() {
 
 struct TestProvider {
     script: String,
+    /// The queue, for a script that runs `$DAGQ --db "$DB" ...` as a worker would.
+    db: PathBuf,
 }
 impl AgentProvider for TestProvider {
     fn resume_command(&self, run: &TaskRun) -> Result<Command> {
@@ -158,6 +160,11 @@ impl AgentProvider for TestProvider {
         assert!(prompt.contains("Context"));
         assert!(prompt.contains("Predecessor tasks"));
         assert!(prompt.contains("Sibling tasks in progress"));
+        // A question goes to the queue as an ask, not to the terminal.
+        assert!(prompt.contains(&format!(
+            "`dagq ask --run {} --kind worker_question --question '...'`",
+            run.id
+        )));
         let mut command = Command::new("/bin/sh");
         command
             .current_dir(run.worktree_path.as_ref().unwrap())
@@ -167,6 +174,12 @@ impl AgentProvider for TestProvider {
             .env("BASE", &run.base_commit)
             .env("IDLE", run.idle_marker_path().unwrap())
             .env("EXIT", exit_request_path(run.run_dir.as_ref().unwrap()))
+            .env(
+                "MESSAGE",
+                resume_message_path(run.run_dir.as_ref().unwrap()),
+            )
+            .env("DAGQ", env!("CARGO_BIN_EXE_dagq"))
+            .env("DB", &self.db)
             .arg("-c")
             .arg(format!("{AGENT_PRELUDE}\n{}", self.script));
         Ok(command)
@@ -231,6 +244,9 @@ struct TestWorkspace {
     resumes: Mutex<Vec<(String, String)>>,
     /// `send_text` calls: the workspace and the text.
     texts: Mutex<Vec<(String, String)>>,
+    /// `send_text` records the call and then fails, as a `cmux send` to a
+    /// workspace that went away does.
+    text_fails: bool,
     /// Resume workspaces opened and not closed yet, for `exists`.
     open_resumes: Mutex<Vec<String>>,
 }
@@ -261,6 +277,7 @@ impl TestWorkspace {
             resume_scripts: Mutex::new(HashMap::new()),
             resumes: Mutex::new(Vec::new()),
             texts: Mutex::new(Vec::new()),
+            text_fails: false,
             open_resumes: Mutex::new(Vec::new()),
         }
     }
@@ -357,7 +374,11 @@ impl WorkspaceBackend for TestWorkspace {
             return Ok(workspace);
         }
         let worker = thread::spawn(move || {
-            runtime::session_with_provider(&db, &id, &token, &TestProvider { script })
+            let provider = TestProvider {
+                script,
+                db: db.clone(),
+            };
+            runtime::session_with_provider(&db, &id, &token, &provider)
         });
         sessions.push((
             workspace.clone(),
@@ -419,7 +440,11 @@ impl WorkspaceBackend for TestWorkspace {
         // Listed until closed, as cmux does.
         self.open_resumes.lock().unwrap().push(workspace.clone());
         let worker = thread::spawn(move || {
-            runtime::resume_session_with_provider(&db, &id, &token, &TestProvider { script })
+            let provider = TestProvider {
+                script,
+                db: db.clone(),
+            };
+            runtime::resume_session_with_provider(&db, &id, &token, &provider)
         });
         sessions.push((
             workspace.clone(),
@@ -436,6 +461,9 @@ impl WorkspaceBackend for TestWorkspace {
             .lock()
             .unwrap()
             .push((workspace_id.into(), text.into()));
+        if self.text_fails {
+            bail!("injected cmux send failure");
+        }
         let path = resume_message_path(&self.session_run_dir(workspace_id));
         fs::write(path.with_extension("tmp"), text)?;
         fs::rename(path.with_extension("tmp"), path)?;
@@ -1221,6 +1249,249 @@ fn a_dialog_on_the_screen_is_recorded_once_and_cleared() {
             .filter(|k| k.starts_with("prompt_"))
             .count(),
         2
+    );
+}
+
+/// A worker that registers a `worker_question` ask, goes idle once
+/// `$EXIT.idle` exists and then waits for the answer in `$MESSAGE` (the
+/// test backend's terminal); it commits the answer it got.
+const ASKING_AGENT: &str = r#"
+"$DAGQ" --db "$DB" ask --run "$RUN_ID" --kind worker_question --question 'Which word?' > /dev/null || exit 70
+while [ ! -f "$EXIT.idle" ]; do sleep 0.1; done
+idle
+while [ ! -f "$MESSAGE" ]; do sleep 0.1; done
+cp "$MESSAGE" answer.txt
+git add answer.txt
+git commit -q -m answer
+receipt "$(git rev-parse HEAD)"
+idle
+await_exit
+"#;
+
+/// The attention entries of `status` for one ask.
+fn ask_attention(status: &Value, ask_id: i64) -> Vec<Value> {
+    status["attention"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|a| a["ask_id"] == ask_id)
+        .cloned()
+        .collect()
+}
+
+/// A worker's `dagq ask` shows in `status` as an open `worker_question`;
+/// while it is unclosed the screen is not read for a dialog. Its answer is
+/// not typed until the worker went idle after asking, then it is typed once
+/// into the worker's terminal as `answer to ask <id>: ...`, the ask is
+/// closed, and `ask_delivered` is recorded.
+#[test]
+fn an_answered_worker_question_is_typed_into_the_idle_worker_and_closed() {
+    let (_dir, repo, db) = fixture();
+    let mut backend = TestWorkspace::new(&db, false, ASKING_AGENT);
+    backend.prompt_wait = Duration::from_secs(1);
+    let backend = Arc::new(backend);
+    let supervisor = {
+        let (db, repo, backend) = (db.clone(), repo.clone(), backend.clone());
+        thread::spawn(move || supervise(&db, &repo, &backend))
+    };
+    wait_until(&db, Duration::from_secs(30), |queue| {
+        !queue.asks(Default::default()).unwrap().is_empty()
+    });
+    let mut queue = SqliteQueue::open(&db).unwrap();
+    let ask = queue.asks(Default::default()).unwrap().remove(0);
+    let run = queue.show(1).unwrap().runs[0].clone();
+    assert_eq!(ask.kind.as_str(), "worker_question");
+    assert_eq!(ask.run_id.as_deref(), Some(run.id.as_str()));
+    let status = runtime::status(&db).unwrap();
+    assert_eq!(status["asks"][0]["id"], ask.id, "{status}");
+    assert_eq!(
+        ask_attention(&status, ask.id)[0]["next"],
+        format!("answer ask {}", ask.id)
+    );
+
+    // A dialog-like screen while the ask is unclosed is not read or recorded.
+    *backend.screen.lock().unwrap() = DIALOG_SCREEN.into();
+    // A poll that looked for the ask just before it was registered is over.
+    thread::sleep(Duration::from_millis(500));
+    let captured = backend.captures.load(Ordering::SeqCst);
+    thread::sleep(Duration::from_secs(3));
+    assert_eq!(backend.captures.load(Ordering::SeqCst), captured);
+    let status = runtime::status(&db).unwrap();
+    assert!(
+        status["attention"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|a| a["kind"] != "prompt_waiting"),
+        "{status}"
+    );
+
+    // Answered while the worker has not gone idle since asking: not typed.
+    queue.answer(ask.id, "use blue").unwrap();
+    thread::sleep(Duration::from_millis(1500));
+    assert!(backend.texts().is_empty());
+    let status = runtime::status(&db).unwrap();
+    let attention = ask_attention(&status, ask.id);
+    assert_eq!(attention.len(), 1, "{status}");
+    assert_eq!(attention[0]["kind"], "ask_answered");
+    assert_eq!(
+        attention[0]["next"],
+        format!("delivering the answer of ask {} (runtime)", ask.id)
+    );
+    // The answer of a worker_question does not wake the maintainer.
+    let events = dagq::watch::events(&db, 0, 100, false).unwrap();
+    assert!(
+        events["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|e| e["kind"] != "ask_answered"),
+        "{events}"
+    );
+
+    fs::write(
+        exit_request_path(run.run_dir.as_ref().unwrap()).with_extension("idle"),
+        "",
+    )
+    .unwrap();
+    wait_until(&db, Duration::from_secs(30), |queue| {
+        queue.read_ask(ask.id).unwrap().closed_at.is_some()
+    });
+    let outcome = supervisor.join().unwrap().unwrap();
+    backend.join();
+    assert_eq!(outcome["errors"], json!([]), "{outcome}");
+    assert_eq!(outcome["runs"][0]["status"], "awaiting_integration");
+    // Typed once, with its prefix.
+    assert_eq!(
+        backend.texts(),
+        vec![(
+            WORKSPACE_ID.to_owned(),
+            format!("answer to ask {}: use blue", ask.id)
+        )]
+    );
+    let worktree = Path::new(run.worktree_path.as_ref().unwrap());
+    assert_eq!(
+        fs::read_to_string(worktree.join("answer.txt")).unwrap(),
+        format!("answer to ask {}: use blue", ask.id)
+    );
+    let detail = queue.show(1).unwrap();
+    let delivered = payloads(&detail, "ask_delivered");
+    assert_eq!(
+        delivered,
+        vec![&json!({"ask_id": ask.id, "workspace_id": WORKSPACE_ID})]
+    );
+    assert!(payloads(&detail, "prompt_waiting").is_empty());
+    assert!(ask_attention(&runtime::status(&db).unwrap(), ask.id).is_empty());
+}
+
+/// A send that fails is not retried: `ask_delivery_failed` is recorded
+/// once, the ask stays unclosed and surfaces for the maintainer to deliver.
+#[test]
+fn a_failed_answer_delivery_is_left_to_the_maintainer() {
+    let (_dir, repo, db) = fixture();
+    let mut backend = TestWorkspace::new(
+        &db,
+        false,
+        &format!(
+            "\"$DAGQ\" --db \"$DB\" ask --run \"$RUN_ID\" --kind worker_question --question 'Which?' >/dev/null; idle; {HOLD}; commit work; receipt \"$(git rev-parse HEAD)\"; idle; await_exit"
+        ),
+    );
+    backend.text_fails = true;
+    let backend = Arc::new(backend);
+    let supervisor = {
+        let (db, repo, backend) = (db.clone(), repo.clone(), backend.clone());
+        thread::spawn(move || supervise(&db, &repo, &backend))
+    };
+    wait_until(&db, Duration::from_secs(30), |queue| {
+        !queue.asks(Default::default()).unwrap().is_empty()
+    });
+    let mut queue = SqliteQueue::open(&db).unwrap();
+    let ask = queue.asks(Default::default()).unwrap().remove(0);
+    queue.answer(ask.id, "blue").unwrap();
+    wait_until(&db, Duration::from_secs(30), |queue| {
+        !payloads(&queue.show(1).unwrap(), "ask_delivery_failed").is_empty()
+    });
+    thread::sleep(Duration::from_secs(2));
+    assert_eq!(backend.texts().len(), 1);
+    let detail = queue.show(1).unwrap();
+    let failed = payloads(&detail, "ask_delivery_failed");
+    assert_eq!(failed.len(), 1);
+    assert_eq!(failed[0]["ask_id"], ask.id);
+    assert!(
+        failed[0]["error"]
+            .as_str()
+            .unwrap()
+            .contains("injected cmux send failure")
+    );
+    assert!(queue.read_ask(ask.id).unwrap().closed_at.is_none());
+    let status = runtime::status(&db).unwrap();
+    let attention = ask_attention(&status, ask.id);
+    assert_eq!(attention.len(), 1, "{status}");
+    assert_eq!(attention[0]["kind"], "ask_delivery_failed");
+    assert_eq!(
+        attention[0]["next"],
+        format!(
+            "send the answer of ask {} to the worker and close it",
+            ask.id
+        )
+    );
+    let events = dagq::watch::events(&db, 0, 100, false).unwrap();
+    assert!(
+        events["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["kind"] == "ask_delivery_failed"),
+        "{events}"
+    );
+
+    let run = detail.runs[0].clone();
+    release_held_session(run.run_dir.as_ref().unwrap());
+    let outcome = supervisor.join().unwrap().unwrap();
+    backend.join();
+    assert_eq!(outcome["runs"][0]["status"], "awaiting_integration");
+    assert_eq!(backend.texts().len(), 1);
+    // The run is at rest: the maintainer delivers by hand, then closes it.
+    let status = runtime::status(&db).unwrap();
+    assert_eq!(
+        ask_attention(&status, ask.id)[0]["next"],
+        format!(
+            "send the answer of ask {} to the worker and close it",
+            ask.id
+        )
+    );
+    queue.close_ask(ask.id).unwrap();
+    assert!(ask_attention(&runtime::status(&db).unwrap(), ask.id).is_empty());
+
+    // Answered after the run stopped running: nobody types it, so its
+    // `ask_answered` wakes the maintainer.
+    let cursor = queue.latest_event_id().unwrap();
+    let late = queue
+        .ask(dagq::domain::NewAsk {
+            kind: "worker_question".parse().unwrap(),
+            task_id: None,
+            run_id: Some(run.id.clone()),
+            question: "Late?".into(),
+            options: vec![],
+            asked_by: "worker".into(),
+        })
+        .unwrap()
+        .ask;
+    queue.answer(late.id, "yes").unwrap();
+    let events = dagq::watch::events(&db, cursor, 100, false).unwrap();
+    let answered: Vec<&Value> = events["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["kind"] == "ask_answered")
+        .collect();
+    assert_eq!(answered.len(), 1, "{events}");
+    assert_eq!(
+        answered[0]["next"],
+        format!(
+            "send the answer of ask {} to the worker and close it",
+            late.id
+        )
     );
 }
 

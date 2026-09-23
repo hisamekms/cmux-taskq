@@ -22,6 +22,8 @@ Read this when a field of `status`, `watch` or `show` is unclear.
   - `restart supervisor`: `kind` `supervisor_stale` (with its `pid`) or `supervisor_stopped` (nothing registered).
   - `answer ask <id>`: an open ask (`kind` `ask_opened`, `status` `open`, with `ask_id`); the inbox's to answer.
   - `read the answer of ask <id> and close it`: an answered ask nobody closed (`kind` `ask_answered`, `status` `answered`); the maintainer's. It disappears after `ask close <id>`.
+  - `delivering the answer of ask <id> (runtime)`: an answered `worker_question` of a `running` run; the supervisor types the answer into the worker's terminal once the worker is idle after asking, closes the ask and records `ask_delivered`. Nothing to do; its `ask_answered` is not a `watch` event.
+  - `send the answer of ask <id> to the worker and close it`: an answered `worker_question` the supervisor could not type (`kind` `ask_delivery_failed`, tried once), or whose run is no longer `running`. Handle it with the `dagq-session` skill.
 - `status --role <maintainer|inbox|planner>` keeps only the attention for that role: `ask_opened` is the inbox's, everything else the maintainer's, none the planner's.
 - `asks`: the open asks, each with `id`, `kind`, `question` (first 200 characters, `…` when cut), `task_id`, `run_id`, `asked_by` and `age_secs`.
 - `cursor`: the newest event id.
@@ -36,7 +38,7 @@ Read this when a field of `status`, `watch` or `show` is unclear.
 
 Registering one (`"$DAGQ" ask --kind <kind> --question <text> [--option <text>]... (--run RUN_ID | --task ID)`):
 
-- `--run` for a question about one run, `--task` for one about a task as a whole; one of them is required. `approve_landing` is the `dagq-land` doubt, `answer_prompt` a dialog you cannot answer, `decide` anything else; `worker_question` is the workers' own kind.
+- `--run` for a question about one run, `--task` for one about a task as a whole; one of them is required. `approve_landing` is the `dagq-land` doubt, `answer_prompt` a dialog you cannot answer, `decide` anything else; `worker_question` is the workers' own kind (a worker registers it with `--run` and stops; see the `dagq-session` skill).
 - Write the question so the user can answer it without your session's context: the task, what you found, the options and what each leads to.
 - The same run (or task) and kind is registered once: asking again returns the open ask with `created: false`.
 - `ask close <id>` marks an answered ask read. An unanswered ask cannot be closed: to withdraw one, answer it yourself first (`"$DAGQ" answer <id> --text "withdrawn: <why>"`), then close it.

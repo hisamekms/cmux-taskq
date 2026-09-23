@@ -1229,6 +1229,16 @@ pub enum AttentionNext {
     ReadAnswer {
         ask_id: i64,
     },
+    /// Not the maintainer's to act on: the supervisor types the answer of a
+    /// `worker_question` into the worker's terminal once the worker is idle.
+    DeliveringAnswer {
+        ask_id: i64,
+    },
+    /// The supervisor could not type the answer of a `worker_question` into
+    /// the worker's terminal (it tries once), or the worker's session is gone.
+    DeliverAnswer {
+        ask_id: i64,
+    },
 }
 
 /// How many times the supervisor resumes one `needs_session` run (one
@@ -1252,6 +1262,15 @@ impl fmt::Display for AttentionNext {
             Self::AnswerAsk { ask_id } => write!(f, "answer ask {ask_id}"),
             Self::ReadAnswer { ask_id } => {
                 write!(f, "read the answer of ask {ask_id} and close it")
+            }
+            Self::DeliveringAnswer { ask_id } => {
+                write!(f, "delivering the answer of ask {ask_id} (runtime)")
+            }
+            Self::DeliverAnswer { ask_id } => {
+                write!(
+                    f,
+                    "send the answer of ask {ask_id} to the worker and close it"
+                )
             }
         }
     }
@@ -1279,11 +1298,17 @@ pub const ATTENTION_KINDS: &[&str] = &[
     "resume_finished",
     "ask_opened",
     "ask_answered",
+    "ask_delivery_failed",
 ];
 
 /// The attention kinds an ask writes (ADR-0022): about the ask, even when it
 /// names a run.
-pub const ASK_EVENT_KINDS: &[&str] = &["ask_opened", "ask_answered"];
+pub const ASK_EVENT_KINDS: &[&str] = &[
+    "ask_opened",
+    "ask_answered",
+    "ask_delivered",
+    "ask_delivery_failed",
+];
 
 /// Whether a run event is a transition that stops at the maintainer's or the
 /// user's judgment, and what to do about it. The run comes to rest in
@@ -1303,7 +1328,10 @@ pub const ASK_EVENT_KINDS: &[&str] = &["ask_opened", "ask_answered"];
 /// stays `needs_session` (`exhausted`); a resolved run the supervisor goes on
 /// to land is not.
 /// `ask_opened` waits for the inbox's answer and
-/// `ask_answered` for the maintainer to read it, see [`attention_role`].
+/// `ask_answered` for the maintainer to read it, see [`attention_role`],
+/// except the answer of a `worker_question`, which the supervisor types into
+/// the worker's terminal itself (`runtime_delivers: true`); its answer to a
+/// run no longer running and its `ask_delivery_failed` are the maintainer's.
 pub fn event_attention(kind: &str, payload: &serde_json::Value) -> Option<AttentionNext> {
     let status = payload
         .get("status")
@@ -1352,7 +1380,21 @@ pub fn event_attention(kind: &str, payload: &serde_json::Value) -> Option<Attent
             Some(AttentionNext::ResumeSession)
         }
         ("ask_opened", _) => ask_id(payload).map(|ask_id| AttentionNext::AnswerAsk { ask_id }),
+        ("ask_answered", _)
+            if payload.get("kind").and_then(serde_json::Value::as_str)
+                == Some(AskKind::WorkerQuestion.as_str()) =>
+        {
+            match payload.get("runtime_delivers") {
+                Some(serde_json::Value::Bool(false)) => {
+                    ask_id(payload).map(|ask_id| AttentionNext::DeliverAnswer { ask_id })
+                }
+                _ => None,
+            }
+        }
         ("ask_answered", _) => ask_id(payload).map(|ask_id| AttentionNext::ReadAnswer { ask_id }),
+        ("ask_delivery_failed", _) => {
+            ask_id(payload).map(|ask_id| AttentionNext::DeliverAnswer { ask_id })
+        }
         _ => None,
     }
 }
@@ -1709,6 +1751,22 @@ mod attention_tests {
                 Some(ReadAnswer { ask_id: 3 }),
             ),
             ("ask_opened", json!({}), None),
+            (
+                "ask_answered",
+                json!({"ask_id": 4, "kind": "worker_question", "runtime_delivers": true}),
+                None,
+            ),
+            (
+                "ask_answered",
+                json!({"ask_id": 4, "kind": "worker_question", "runtime_delivers": false}),
+                Some(DeliverAnswer { ask_id: 4 }),
+            ),
+            ("ask_delivered", json!({"ask_id": 4}), None),
+            (
+                "ask_delivery_failed",
+                json!({"ask_id": 4, "error": "x"}),
+                Some(DeliverAnswer { ask_id: 4 }),
+            ),
             ("validation_finished", json!({}), None),
         ];
         for (kind, payload, expected) in cases {
@@ -1724,6 +1782,14 @@ mod attention_tests {
         assert_eq!(SendExit.to_string(), "send /exit");
         assert_eq!(RecoverRun.to_string(), "recover run");
         assert_eq!(PushMain.to_string(), "push main");
+        assert_eq!(
+            DeliveringAnswer { ask_id: 2 }.to_string(),
+            "delivering the answer of ask 2 (runtime)"
+        );
+        assert_eq!(
+            DeliverAnswer { ask_id: 2 }.to_string(),
+            "send the answer of ask 2 to the worker and close it"
+        );
         assert_eq!(
             serde_json::to_value(RestartSupervisor).unwrap(),
             json!("restart supervisor")

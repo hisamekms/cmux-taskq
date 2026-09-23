@@ -99,6 +99,25 @@ run_id=$(printf '%s\n' "$prompt" | sed -n 's/^You are executing dagq task [0-9]*
 [ "$run_id" = "$session_id" ] || { printf 'stub: prompt run %s != session %s\n' "$run_id" "$session_id" >&2; exit 65; }
 receipt=$(printf '%s\n' "$prompt" | sed -n 's/^Write a completion receipt to \(.*\) using a temporary file in the same directory.*/\1/p')
 [ -n "$receipt" ] || { printf 'stub: prompt does not name the receipt path\n' >&2; exit 65; }
+case "$prompt" in
+  *E2E-ASK*)
+    # A question: register it as a worker_question ask, go idle, and wait
+    # for the supervisor to type the answer into this terminal.
+    "$add_dir/runner" --db "$DAGQ_QUEUE" ask --run "$session_id" --kind worker_question \
+      --question 'Which word goes into answer.txt?' > "$add_dir/ask.json"
+    idle="$add_dir/idle.json"
+    printf '{"hook_event_name":"Stop","session_id":"%s","stop_hook_active":false}\n' "$session_id" > "$idle.tmp"
+    mv "$idle.tmp" "$idle"
+    printf 'asked; waiting for the answer\n'
+    answer=
+    while IFS= read -r line; do
+      case "$line" in 'answer to ask '*) answer=$line; break ;; esac
+    done
+    [ -n "$answer" ] || { printf 'stub: no answer arrived\n' >&2; exit 66; }
+    printf '%s\n' "$answer" > answer.txt
+    git add answer.txt
+    ;;
+esac
 printf 'written by the stub agent for %s\n' "$session_id" > e2e.txt
 git add e2e.txt
 git commit -q -m 'feat: e2e stub change'
@@ -851,6 +870,93 @@ fn happy_path_runs_a_stub_agent_through_cmux_and_lands_on_main() {
         "no_run_awaiting"
     );
     assert_eq!(dagq(env, &["status"])["runs"], Value::Array(vec![]));
+}
+
+/// The stub worker asks a `worker_question` (its task says `E2E-ASK`) and
+/// goes idle; once the ask is answered the supervisor types the answer into
+/// the worker's cmux terminal, closes the ask, and the worker commits it.
+#[test]
+#[ignore = "needs a running cmux; run with --ignored"]
+fn a_worker_question_is_answered_through_the_worker_terminal() {
+    let fixture = fixture();
+    let Fixture { cmux, env, .. } = &fixture;
+    let task_id = dagq(
+        env,
+        &[
+            "add",
+            "e2e asking task",
+            "--description",
+            "E2E-ASK: ask which word goes into answer.txt, then add e2e.txt",
+            "--acceptance",
+            "answer.txt holds the answer and e2e.txt is committed",
+            "--verify",
+            "test -f answer.txt",
+            "--verify",
+            "test -f e2e.txt",
+        ],
+    )["id"]
+        .to_string();
+    assert_eq!(dagq(env, &["ready", &task_id])["status"], "ready");
+    let mut guard = WorkspaceGuard {
+        cmux: cmux.clone(),
+        ids: Vec::new(),
+    };
+    // Answers the ask as the inbox would, once the worker registered it.
+    let answerer = {
+        let env = Env {
+            repo: env.repo.clone(),
+            data_home: env.data_home.clone(),
+        };
+        thread::spawn(move || {
+            let started = Instant::now();
+            loop {
+                assert!(
+                    started.elapsed() < SUPERVISE_TIMEOUT,
+                    "the worker asked nothing"
+                );
+                let asks = dagq(&env, &["asks", "--open"]);
+                if let Some(ask) = asks["asks"].as_array().unwrap().first() {
+                    assert_eq!(ask["kind"], "worker_question", "{ask}");
+                    assert_eq!(ask["asked_by"], "worker", "{ask}");
+                    let id = ask["id"].to_string();
+                    dagq(&env, &["answer", &id, "--text", "blue"]);
+                    return ask["id"].as_i64().unwrap();
+                }
+                thread::sleep(Duration::from_millis(200));
+            }
+        })
+    };
+    let pass = supervise_once(&fixture, &[], &[&task_id], &mut guard);
+    let ask_id = answerer.join().unwrap();
+    assert_eq!(
+        pass.outcome["errors"],
+        Value::Array(vec![]),
+        "{}",
+        pass.outcome
+    );
+    assert_eq!(
+        pass.outcome["runs"][0]["status"], "awaiting_integration",
+        "{}",
+        pass.outcome
+    );
+    let detail = dagq(env, &["show", &task_id, "--full"]);
+    let run = &detail["runs"][0];
+    let worktree = Path::new(run["worktree_path"].as_str().unwrap());
+    assert_eq!(
+        fs::read_to_string(worktree.join("answer.txt")).unwrap(),
+        format!("answer to ask {ask_id}: blue\n")
+    );
+    let delivered: Vec<&Value> = detail["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["kind"] == "ask_delivered")
+        .collect();
+    assert_eq!(delivered.len(), 1, "{detail}");
+    assert_eq!(delivered[0]["payload"]["ask_id"], ask_id);
+    let asks = dagq(env, &["asks", "--all"]);
+    assert!(asks["asks"][0]["closed_at"].is_number(), "{asks}");
+    assert!(dagq(env, &["asks"])["asks"].as_array().unwrap().is_empty());
 }
 
 /// Two independent tasks run in two cmux workspaces at once; the task that

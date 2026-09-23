@@ -81,5 +81,5 @@ dagq up --in-cmux --claude ~/.local/bin/claude --plugin-dir <この repository>/
 - runtime の prompt に従う。割り当てられた worktree（branch `dagq/<run-id>`）の中だけで作業し、main、queue DB、`runs/` 配下の runtime ファイル、他の run の worktree は触らない。merge も push も workspace の close もしない
 - 変更後は「変更後に必ず通す」の 3 本（fmt / test / clippy）とタスクの verify コマンドを worktree で実行する。e2e と subagent review は該当するときに実行し、しないときは理由を receipt に書く。runtime（`src/`）を変えた run では e2e（`cargo test --locked --test e2e -- --ignored`）は必須で、結果を receipt の `e2e` に evidence として書く
 - コミットしてから receipt を書く。receipt の commit は run branch の clean head で、base commit の上に乗っている
-- 判断が要るときは terminal に質問を書いて待つ。maintainer が `read-screen` で拾い、同じ terminal に返答する
+- 判断が要るときは terminal に質問を書いて待つのではなく、`dagq ask --run <run-id> --kind worker_question --question '...'` を打ち、短く報告して止まる。回答は supervisor が `answer to ask <id>: ...` として同じ terminal に送る（ADR-0022 決定 2）
 - receipt を書いたら結果を短く報告して止まる。`/exit` は自分で打たない。supervisor が idle を見て送る

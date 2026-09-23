@@ -6,7 +6,7 @@ use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
 use serde_json::json;
 
 use super::sqlite::{SqliteQueue, enum_col, event, json_col};
-use crate::domain::{Ask, AskOutcome, NewAsk, SessionRole};
+use crate::domain::{Ask, AskKind, AskOutcome, NewAsk, RunStatus, SessionRole};
 
 /// Which asks `asks` lists. By default the ones nobody closed; `all` adds
 /// the closed ones, `open` keeps only the unanswered ones, and `role` keeps
@@ -101,12 +101,24 @@ impl SqliteQueue {
             "UPDATE asks SET answer=?2, answered_at=unixepoch() WHERE id=?1",
             params![id, text],
         )?;
+        let mut payload = json!({"ask_id": id, "kind": ask.kind});
+        if ask.kind == AskKind::WorkerQuestion
+            && let Some(run_id) = ask.run_id.as_deref()
+        {
+            // The supervisor types it into a running worker's terminal; the
+            // answer of a run that stopped running is the maintainer's.
+            let status: String =
+                tx.query_row("SELECT status FROM task_runs WHERE id=?1", [run_id], |r| {
+                    r.get(0)
+                })?;
+            payload["runtime_delivers"] = json!(status == RunStatus::Running.as_str());
+        }
         event(
             &tx,
             ask.task_id,
             ask.run_id.as_deref(),
             "ask_answered",
-            json!({"ask_id": id, "kind": ask.kind}),
+            payload,
         )?;
         let answered = read_ask(&tx, id)?;
         tx.commit()?;
@@ -147,6 +159,56 @@ impl SqliteQueue {
             .into_iter()
             .filter(|ask| query.role.is_none() || ask.waits_for() == query.role)
             .collect())
+    }
+
+    /// The answered `worker_question` asks of a run that nobody closed yet,
+    /// oldest first: answers the supervisor still has to type into the
+    /// worker's terminal.
+    pub fn undelivered_answers(&self, run_id: &str) -> Result<Vec<Ask>> {
+        Ok(self
+            .conn
+            .prepare(
+                "SELECT * FROM asks WHERE run_id=?1 AND kind='worker_question'
+                 AND answered_at IS NOT NULL AND closed_at IS NULL ORDER BY id",
+            )?
+            .query_map([run_id], ask_row)?
+            .collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Whether the run has a `worker_question` nobody closed, answered or
+    /// not: its worker stopped at the ask and waits for the answer.
+    pub fn has_unclosed_worker_question(&self, run_id: &str) -> Result<bool> {
+        Ok(self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM asks WHERE run_id=?1 AND kind='worker_question'
+             AND closed_at IS NULL)",
+            [run_id],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// Close an answered `worker_question` whose answer was typed into the
+    /// worker's terminal, and record `ask_delivered` in the same transaction.
+    /// An ask someone closed meanwhile is left as it is.
+    pub fn ask_delivered(&mut self, id: i64, workspace_id: &str) -> Result<Ask> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let ask = read_ask(&tx, id)?;
+        if ask.closed_at.is_some() {
+            return Ok(ask);
+        }
+        ensure!(ask.answered_at.is_some(), "ask {id} is not answered");
+        tx.execute("UPDATE asks SET closed_at=unixepoch() WHERE id=?1", [id])?;
+        event(
+            &tx,
+            ask.task_id,
+            ask.run_id.as_deref(),
+            "ask_delivered",
+            json!({"ask_id": id, "workspace_id": workspace_id}),
+        )?;
+        let closed = read_ask(&tx, id)?;
+        tx.commit()?;
+        Ok(closed)
     }
 
     pub fn read_ask(&self, id: i64) -> Result<Ask> {
