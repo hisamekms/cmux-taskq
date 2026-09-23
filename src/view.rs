@@ -58,7 +58,7 @@ fn latest<T>(items: &[T], count: usize) -> &[T] {
 
 /// `show` without `--full`: the task with long texts truncated, the latest
 /// run's identity and outcome, its processes, and the latest `events`
-/// events with the gist of their payload (no paths).
+/// events with their run and the gist of their payload (no paths).
 pub fn task_detail(detail: &TaskDetail, events: usize) -> Value {
     let mut task = object(&detail.task);
     truncate_fields(&mut task, &["description", "acceptance", "context"]);
@@ -104,6 +104,9 @@ pub fn task_detail(detail: &TaskDetail, events: usize) -> Value {
 
 fn event_gist(event: &RunEvent) -> Value {
     let mut compact = pick(&object(event), &["id", "kind", "created_at"]);
+    if let Some(run_id) = &event.run_id {
+        compact.insert("run_id".into(), json!(run_id));
+    }
     if let Value::Object(payload) = &event.payload {
         let mut gist = pick(payload, &EVENT_GIST);
         if !gist.is_empty() {
@@ -222,7 +225,10 @@ mod tests {
                         json!({"path": "/run/receipt.json", "status": "failed", "reason": "x"}),
                     )
                 })
-                .chain([event(13, json!({"path": "/p"}))])
+                .chain([RunEvent {
+                    run_id: None,
+                    ..event(13, json!({"path": "/p"}))
+                }])
                 .collect(),
             processes: vec![process("a"), process("b")],
         };
@@ -250,10 +256,13 @@ mod tests {
         );
         assert_eq!(
             events[0],
-            json!({"id": 11, "kind": "kind11", "created_at": "t11",
+            json!({"id": 11, "kind": "kind11", "created_at": "t11", "run_id": "b",
                    "payload": {"status": "failed", "reason": "x"}})
         );
-        assert!(events[2].get("payload").is_none());
+        assert_eq!(
+            events[2],
+            json!({"id": 13, "kind": "kind13", "created_at": "t13"})
+        );
     }
 
     #[test]
