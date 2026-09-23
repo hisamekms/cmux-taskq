@@ -226,7 +226,15 @@ fn predecessors_carry_the_integrated_run_and_in_progress_tasks_are_listed() {
     assert_eq!(landed.id, run.id);
     assert_eq!(landed.status, RunStatus::Integrated);
     assert_eq!(landed.result_commit.as_deref(), Some(BASE));
-    assert_eq!(landed.run_dir.as_deref(), Some("/nowhere"));
+    // The stored path is not trusted: the run directory is resolved under the
+    // queue's own `runs/` (ADR-0017).
+    let run_dir = dir
+        .path()
+        .canonicalize()
+        .unwrap()
+        .join("runs")
+        .join(&run.id);
+    assert_eq!(landed.run_dir.as_deref(), run_dir.to_str());
     assert!(predecessors[1].integrated_run.is_none());
     // A task that does not exist has no predecessors rather than an error.
     assert!(queue.predecessors(99).unwrap().is_empty());
@@ -377,11 +385,22 @@ fn awaiting_integration_keeps_dependents_blocked_but_frees_execution_slot() {
     let detail = queue.show(a).unwrap();
     assert_eq!(detail.task.status, TaskStatus::InProgress);
     assert_eq!(detail.runs[0].status, RunStatus::AwaitingIntegration);
-    assert_eq!(detail.runs[0].worktree_path.as_deref(), Some("/tmp/a"));
+    // Stored paths are resolved again under the queue's `runs/<run-id>/`.
+    let run_dir = dir
+        .path()
+        .canonicalize()
+        .unwrap()
+        .join("runs")
+        .join(&run.id);
+    assert_eq!(
+        detail.runs[0].worktree_path.as_deref(),
+        run_dir.join("worktree").to_str()
+    );
     assert_eq!(
         detail.runs[0].receipt_path.as_deref(),
-        Some("/tmp/receipt.json")
+        run_dir.join("receipt.json").to_str()
     );
+    assert!(detail.runs[0].run_dir.is_none());
     assert_eq!(
         queue
             .candidates()

@@ -509,7 +509,49 @@ pub struct TaskRun {
     pub created_at: String,
 }
 
+/// Where a run's files live: `<runs dir>/<run id>/` holds the worktree, the
+/// receipt and the provider log. The layout is fixed, so these paths are
+/// derived from the run ID and the queue's current `runs/` directory rather
+/// than trusted from the database (ADR-0017).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunPaths {
+    pub run_dir: std::path::PathBuf,
+    pub worktree: std::path::PathBuf,
+    pub receipt: std::path::PathBuf,
+    pub log: std::path::PathBuf,
+}
+
+impl RunPaths {
+    pub fn new(runs_dir: &std::path::Path, run_id: &str) -> Self {
+        let run_dir = runs_dir.join(run_id);
+        Self {
+            worktree: run_dir.join("worktree"),
+            receipt: run_dir.join("receipt.json"),
+            log: run_dir.join("claude.debug.log"),
+            run_dir,
+        }
+    }
+}
+
 impl TaskRun {
+    /// The run with its queue-local paths re-derived under `runs_dir`. The
+    /// stored values are the absolute paths of the queue at claim time and go
+    /// stale when the queue directory moves; a path that was never planned
+    /// stays absent. `repo_path` names the repository, not the queue, and is kept.
+    pub fn relocated(self, runs_dir: &std::path::Path) -> Self {
+        let paths = RunPaths::new(runs_dir, &self.id);
+        let resolve = |stored: Option<String>, path: &std::path::Path| {
+            stored.map(|_| path.to_string_lossy().into_owned())
+        };
+        Self {
+            run_dir: resolve(self.run_dir, &paths.run_dir),
+            worktree_path: resolve(self.worktree_path, &paths.worktree),
+            receipt_path: resolve(self.receipt_path, &paths.receipt),
+            log_path: resolve(self.log_path, &paths.log),
+            ..self
+        }
+    }
+
     /// Written by the provider's stop hook each time the agent finishes a
     /// response; newer than the receipt means the session is idle after submitting.
     pub fn idle_marker_path(&self) -> Result<std::path::PathBuf, DomainError> {

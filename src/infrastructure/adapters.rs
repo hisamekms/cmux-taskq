@@ -541,6 +541,26 @@ impl GitRepository {
         Ok(())
     }
 
+    /// Point the repository's record of a linked worktree back at `worktree`
+    /// after the directory moved (`git worktree repair`); a no-op otherwise.
+    pub fn repair_worktree(&self, worktree: &Path) -> Result<()> {
+        let primary = self.primary_worktree()?;
+        output(
+            Command::new(&self.git)
+                .arg("-C")
+                .arg(&primary)
+                .args(["worktree", "repair"])
+                .arg(worktree),
+        )
+        .with_context(|| {
+            format!(
+                "repair worktree {} (was its record pruned after the queue moved? see ADR-0017)",
+                worktree.display()
+            )
+        })?;
+        Ok(())
+    }
+
     /// Remove a landed run's worktree and branch. Administered from the
     /// main working tree, since `root` may be the worktree being removed.
     pub fn remove_worktree_and_branch(&self, worktree: &Path, branch: &str) -> Result<()> {

@@ -76,7 +76,7 @@ impl SqliteQueue {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let outcome = claim_task(&tx, base_commit)?;
+        let outcome = claim_task(&tx, &self.runs_dir, base_commit)?;
         if let ClaimOutcome::Claimed { run } = &outcome {
             tx.execute(
                 "UPDATE task_runs SET supervisor_token=?2 WHERE id=?1",
@@ -228,7 +228,7 @@ impl SqliteQueue {
         )?;
         let rows = statement
             .query_map([token], |r| {
-                let run = run_row(r)?;
+                let run = run_row(&self.runs_dir)(r)?;
                 let lease = RunLease {
                     run_id: run.id.clone(),
                     token: r.get("token")?,
@@ -323,7 +323,11 @@ impl SqliteQueue {
                 "pid": pid,
             }),
         )?;
-        let result = tx.query_row("SELECT * FROM task_runs WHERE id=?1", [id], run_row)?;
+        let result = tx.query_row(
+            "SELECT * FROM task_runs WHERE id=?1",
+            [id],
+            run_row(&self.runs_dir),
+        )?;
         tx.commit()?;
         Ok(Some(result))
     }
@@ -374,7 +378,11 @@ impl SqliteQueue {
             "runtime_error",
             json!({"message": message, "lease_released": released == 1}),
         )?;
-        let result = tx.query_row("SELECT * FROM task_runs WHERE id=?1", [id], run_row)?;
+        let result = tx.query_row(
+            "SELECT * FROM task_runs WHERE id=?1",
+            [id],
+            run_row(&self.runs_dir),
+        )?;
         tx.commit()?;
         Ok(result)
     }
@@ -450,7 +458,11 @@ impl SqliteQueue {
 
     pub fn run(&self, id: &str) -> Result<TaskRun> {
         self.conn
-            .query_row("SELECT * FROM task_runs WHERE id=?1", [id], run_row)
+            .query_row(
+                "SELECT * FROM task_runs WHERE id=?1",
+                [id],
+                run_row(&self.runs_dir),
+            )
             .optional()?
             .with_context(|| format!("run {id} does not exist"))
     }
@@ -604,7 +616,7 @@ impl SqliteQueue {
         Ok(self
             .conn
             .prepare("SELECT * FROM task_runs WHERE status IN ('claimed','starting','running','validating','integrating') ORDER BY rowid")?
-            .query_map([], run_row)?
+            .query_map([], run_row(&self.runs_dir))?
             .collect::<rusqlite::Result<_>>()?)
     }
 
@@ -664,7 +676,11 @@ impl SqliteQueue {
         report["lease_deleted"] = json!(leases_deleted == 1);
         run_event(&tx, id, "run_recovered", report)?;
         // The task stays in_progress; a retry is an explicit `ready` and a new run.
-        let result = tx.query_row("SELECT * FROM task_runs WHERE id=?1", [id], run_row)?;
+        let result = tx.query_row(
+            "SELECT * FROM task_runs WHERE id=?1",
+            [id],
+            run_row(&self.runs_dir),
+        )?;
         tx.commit()?;
         Ok(result)
     }
@@ -697,7 +713,11 @@ impl SqliteQueue {
             json!({"status": status, "exit_code": code}),
         )?;
         // Completion and dependency release belong to the next validation stage.
-        let result = tx.query_row("SELECT * FROM task_runs WHERE id=?1", [id], run_row)?;
+        let result = tx.query_row(
+            "SELECT * FROM task_runs WHERE id=?1",
+            [id],
+            run_row(&self.runs_dir),
+        )?;
         tx.commit()?;
         Ok(result)
     }
@@ -735,7 +755,11 @@ impl SqliteQueue {
         payload["status"] = json!(status);
         run_event(&tx, id, "validation_finished", payload)?;
         // Task completion still waits for integration into main.
-        let result = tx.query_row("SELECT * FROM task_runs WHERE id=?1", [id], run_row)?;
+        let result = tx.query_row(
+            "SELECT * FROM task_runs WHERE id=?1",
+            [id],
+            run_row(&self.runs_dir),
+        )?;
         tx.commit()?;
         Ok(result)
     }
@@ -746,7 +770,7 @@ impl SqliteQueue {
         Ok(self
             .conn
             .prepare("SELECT * FROM task_runs WHERE status=?1 ORDER BY rowid")?
-            .query_map([status.as_str()], run_row)?
+            .query_map([status.as_str()], run_row(&self.runs_dir))?
             .collect::<rusqlite::Result<_>>()?)
     }
 
@@ -763,7 +787,7 @@ impl SqliteQueue {
                           r.rowid
                  LIMIT 1",
                 [],
-                run_row,
+                run_row(&self.runs_dir),
             )
             .optional()?)
     }
@@ -815,7 +839,11 @@ impl SqliteQueue {
             "integration_started",
             json!({"main": main, "previous_status": previous, "pid": std::process::id()}),
         )?;
-        let result = tx.query_row("SELECT * FROM task_runs WHERE id=?1", [id], run_row)?;
+        let result = tx.query_row(
+            "SELECT * FROM task_runs WHERE id=?1",
+            [id],
+            run_row(&self.runs_dir),
+        )?;
         tx.commit()?;
         Ok(result)
     }
@@ -907,7 +935,11 @@ impl SqliteQueue {
         detail["reason"] = json!(reason);
         run_event(&tx, id, kind, detail)?;
         run_event(&tx, id, "lease_released", json!({"reason": kind}))?;
-        let result = tx.query_row("SELECT * FROM task_runs WHERE id=?1", [id], run_row)?;
+        let result = tx.query_row(
+            "SELECT * FROM task_runs WHERE id=?1",
+            [id],
+            run_row(&self.runs_dir),
+        )?;
         tx.commit()?;
         Ok(result)
     }
@@ -939,7 +971,11 @@ impl SqliteQueue {
             "DELETE FROM run_leases WHERE run_id=?1 AND token=?2",
             params![id, token],
         )?;
-        let run = tx.query_row("SELECT * FROM task_runs WHERE id=?1", [id], run_row)?;
+        let run = tx.query_row(
+            "SELECT * FROM task_runs WHERE id=?1",
+            [id],
+            run_row(&self.runs_dir),
+        )?;
         ensure!(
             tx.execute(
                 "UPDATE tasks SET status='completed', updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
@@ -1001,7 +1037,11 @@ impl SqliteQueue {
             )? == 1,
             "run is not awaiting integration with an open workspace under this supervisor"
         );
-        let result = tx.query_row("SELECT * FROM task_runs WHERE id=?1", [id], run_row)?;
+        let result = tx.query_row(
+            "SELECT * FROM task_runs WHERE id=?1",
+            [id],
+            run_row(&self.runs_dir),
+        )?;
         run_event(
             &tx,
             id,
@@ -1027,7 +1067,11 @@ impl SqliteQueue {
             )? == 1,
             "run is not awaiting integration with an open workspace under this supervisor"
         );
-        let result = tx.query_row("SELECT * FROM task_runs WHERE id=?1", [id], run_row)?;
+        let result = tx.query_row(
+            "SELECT * FROM task_runs WHERE id=?1",
+            [id],
+            run_row(&self.runs_dir),
+        )?;
         run_event(
             &tx,
             id,

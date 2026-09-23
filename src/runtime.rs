@@ -8,7 +8,7 @@ use crate::{
     application::{AgentProvider, TaskStore, WorkspaceBackend},
     domain::{
         ClaimOutcome, Goal, IntegrationOutcome, Predecessor, Receipt, ReceiptResult, RunLease,
-        RunProcess, RunStatus, SupervisorMode, SupervisorRegistration, Task, TaskRun,
+        RunPaths, RunProcess, RunStatus, SupervisorMode, SupervisorRegistration, Task, TaskRun,
     },
     infrastructure::{
         adapters::{
@@ -637,14 +637,15 @@ impl Supervisor<'_> {
     /// error leaves what was created for inspection.
     fn provision(&mut self, claimed: &TaskRun) -> Result<SessionWatch> {
         let state_dir = runs_dir(&self.db);
-        let run_dir = state_dir.join(&claimed.id);
+        let paths = RunPaths::new(&state_dir, &claimed.id);
+        let run_dir = paths.run_dir.clone();
         let plan = RunPlan {
             repo_path: path_text(&self.repository.root)?,
             run_dir: path_text(&run_dir)?,
             branch: format!("dagq/{}", claimed.id),
-            worktree_path: path_text(&run_dir.join("worktree"))?,
-            receipt_path: path_text(&run_dir.join("receipt.json"))?,
-            log_path: path_text(&run_dir.join("claude.debug.log"))?,
+            worktree_path: path_text(&paths.worktree)?,
+            receipt_path: path_text(&paths.receipt)?,
+            log_path: path_text(&paths.log)?,
         };
         // Save intended paths before any external resource is created.
         self.queue.plan_run(&claimed.id, &self.token, &plan)?;
@@ -1192,6 +1193,10 @@ fn land(
         "worktree {} is missing",
         worktree.display()
     );
+    // A worktree whose queue directory moved is still found through its own
+    // `.git` file, but the repository's record of it points at the old path
+    // until repaired, and removing it after landing would fail (ADR-0017).
+    repository.repair_worktree(worktree)?;
     let branch = run.branch.as_ref().context("missing branch")?;
     let run_dir = Path::new(run.run_dir.as_ref().context("missing run directory")?);
     // A rebase left behind by a crashed landing or an unfinished session is undone first.
@@ -1718,6 +1723,7 @@ pub fn status(db: &Path) -> Result<Value> {
                 "task_id": run.task_id,
                 "status": run.status,
                 "workspace_id": run.workspace_id,
+                "worktree_path": run.worktree_path,
                 "lease": lease,
             })
         })

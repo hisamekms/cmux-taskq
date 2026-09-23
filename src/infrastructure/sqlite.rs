@@ -1,4 +1,8 @@
-use std::{path::Path, str::FromStr, time::Duration};
+use std::{
+    path::{Path, PathBuf},
+    str::FromStr,
+    time::Duration,
+};
 
 use anyhow::{Context, Result, ensure};
 use rusqlite::{
@@ -16,6 +20,7 @@ use crate::{
         NewGoal, NewTask, Predecessor, RunEvent, Task, TaskAction, TaskDetail, TaskRun, TaskStatus,
         TaskStatusCounts, validate_base_commit,
     },
+    infrastructure::location::runs_dir,
 };
 
 const APPLICATION_ID: i64 = 0x43545131;
@@ -47,6 +52,10 @@ const READY_QUERY: &str = "
 
 pub struct SqliteQueue {
     pub(super) conn: Connection,
+    /// `runs/` next to the database as opened now. A run's directory, worktree,
+    /// receipt and log are resolved under it by run ID, never read from the
+    /// absolute paths stored at claim time, so a moved queue keeps its runs.
+    pub(super) runs_dir: PathBuf,
 }
 
 impl SqliteQueue {
@@ -82,7 +91,13 @@ impl SqliteQueue {
             .with_context(|| format!("open queue at {} (use init to create it)", path.display()))?;
         conn.busy_timeout(Duration::from_secs(5))?;
         conn.pragma_update(None, "foreign_keys", true)?;
-        Ok(Self { conn })
+        // Canonical, like the paths `supervise` plans under, so a relative or
+        // symlinked `--db` still names the queue's real `runs/`.
+        let db = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        Ok(Self {
+            conn,
+            runs_dir: runs_dir(&db),
+        })
     }
 
     fn migrate(&mut self, allow_initialize: bool) -> Result<()> {
@@ -276,7 +291,7 @@ impl TaskStore for SqliteQueue {
         )?.query_map([task_id], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
         let runs = tx
             .prepare("SELECT * FROM task_runs WHERE task_id=?1 ORDER BY rowid")?
-            .query_map([task_id], run_row)?
+            .query_map([task_id], run_row(&self.runs_dir))?
             .collect::<rusqlite::Result<_>>()?;
         let events = tx
             .prepare("SELECT * FROM run_events WHERE task_id=?1 ORDER BY id")?
@@ -365,7 +380,7 @@ impl TaskStore for SqliteQueue {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let outcome = claim_task(&tx, base_commit)?;
+        let outcome = claim_task(&tx, &self.runs_dir, base_commit)?;
         tx.commit()?;
         Ok(outcome)
     }
@@ -388,7 +403,7 @@ impl TaskStore for SqliteQueue {
                     .query_row(
                         "SELECT * FROM task_runs WHERE task_id = ?1 AND status = 'integrated'",
                         [task.id],
-                        run_row,
+                        run_row(&self.runs_dir),
                     )
                     .optional()?;
                 Ok(Predecessor {
@@ -608,7 +623,11 @@ fn goal_event(
 /// Reserve the first dependency-ready task inside the caller's write
 /// transaction. There is no queue-wide execution slot; `one_unfinished_run_per_task`
 /// is the only limit, so concurrent claims take different tasks.
-pub(super) fn claim_task(tx: &Connection, base_commit: &str) -> Result<ClaimOutcome> {
+pub(super) fn claim_task(
+    tx: &Connection,
+    runs_dir: &Path,
+    base_commit: &str,
+) -> Result<ClaimOutcome> {
     let candidate = tx
         .query_row(&format!("{READY_QUERY} LIMIT 1"), [], task_row)
         .optional()?;
@@ -630,7 +649,11 @@ pub(super) fn claim_task(tx: &Connection, base_commit: &str) -> Result<ClaimOutc
         "run_claimed",
         json!({"from": "ready", "to": "in_progress", "provider": "claude"}),
     )?;
-    let run = tx.query_row("SELECT * FROM task_runs WHERE id=?1", [&run_id], run_row)?;
+    let run = tx.query_row(
+        "SELECT * FROM task_runs WHERE id=?1",
+        [&run_id],
+        run_row(runs_dir),
+    )?;
     Ok(ClaimOutcome::Claimed { run: Box::new(run) })
 }
 
@@ -769,7 +792,12 @@ fn goal_row(row: &Row<'_>) -> rusqlite::Result<Goal> {
     })
 }
 
-pub(super) fn run_row(row: &Row<'_>) -> rusqlite::Result<TaskRun> {
+/// Reads a run with its queue-local paths resolved under `runs_dir`.
+pub(super) fn run_row(runs_dir: &Path) -> impl Fn(&Row<'_>) -> rusqlite::Result<TaskRun> + '_ {
+    move |row| Ok(stored_run_row(row)?.relocated(runs_dir))
+}
+
+fn stored_run_row(row: &Row<'_>) -> rusqlite::Result<TaskRun> {
     Ok(TaskRun {
         id: row.get("id")?,
         task_id: row.get("task_id")?,

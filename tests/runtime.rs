@@ -1487,8 +1487,8 @@ fn orphan_run(repo: &Path, db: &Path, token: &str, wrapper: u32, agent: u32) -> 
     else {
         panic!()
     };
-    let run_dir = db.parent().unwrap().join(format!("orphan-{}", run.id));
-    fs::create_dir(&run_dir).unwrap();
+    let run_dir = dagq::infrastructure::location::runs_dir(db).join(&run.id);
+    fs::create_dir_all(&run_dir).unwrap();
     queue
         .plan_run(
             &run.id,
@@ -1499,7 +1499,7 @@ fn orphan_run(repo: &Path, db: &Path, token: &str, wrapper: u32, agent: u32) -> 
                 branch: format!("dagq/{}", run.id),
                 worktree_path: path_text(&run_dir.join("worktree")).unwrap(),
                 receipt_path: path_text(&run_dir.join("receipt.json")).unwrap(),
-                log_path: path_text(&run_dir.join("log")).unwrap(),
+                log_path: path_text(&run_dir.join("claude.debug.log")).unwrap(),
             },
         )
         .unwrap();
@@ -1957,6 +1957,103 @@ fn conflict_free_run_lands_as_one_squash_commit_and_releases_dependents() {
         .is_err()
     );
     assert_eq!(queue.show(1).unwrap().runs.len(), 1);
+}
+
+/// Move everything the queue at `db` owns (the database with its WAL files,
+/// `runs/`, logs) from its directory into `to`, leaving the repository. The
+/// runs keep the absolute paths they stored at claim time, as every queue
+/// written before ADR-0017 does. Returns the database's new path.
+fn move_queue(db: &Path, repo: &Path, to: &Path) -> PathBuf {
+    fs::create_dir(to).unwrap();
+    for entry in fs::read_dir(db.parent().unwrap()).unwrap() {
+        let path = entry.unwrap().path();
+        if path != repo && path != to {
+            fs::rename(&path, to.join(path.file_name().unwrap())).unwrap();
+        }
+    }
+    to.join(db.file_name().unwrap())
+}
+
+#[test]
+fn moved_queue_directory_resolves_run_paths_and_lands_awaiting_runs() {
+    let (dir, repo, db, run) = awaiting_run();
+    let seed = git_out(&repo, &["rev-parse", "main"]);
+    let old_runs = dagq::infrastructure::location::runs_dir(&db.canonicalize().unwrap());
+    // An unfinished run next to the awaiting one, for `status` and `doctor`.
+    let other = {
+        let mut queue = SqliteQueue::open(&db).unwrap();
+        add_ready_task(&mut queue, "unfinished", &[])
+    };
+    let unfinished = orphan_run(&repo, &db, "old-supervisor", dead_pid(), dead_pid());
+    assert_eq!(unfinished.task_id, other);
+
+    let moved = dir.path().join("moved queue");
+    let db = move_queue(&db, &repo, &moved);
+    let runs = moved.canonicalize().unwrap().join("runs");
+    assert!(!old_runs.exists());
+    // The database still holds the paths of the old location: nothing is
+    // migrated, they are resolved again from the run ID on every read.
+    let raw = Connection::open(&db).unwrap();
+    let stored: String = raw
+        .query_row(
+            "SELECT worktree_path FROM task_runs WHERE id=?1",
+            [&run.id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(stored, run.worktree_path.clone().unwrap());
+    assert!(stored.starts_with(old_runs.to_str().unwrap()), "{stored}");
+    // Git still records the worktrees at their old paths.
+    assert!(git_out(&repo, &["worktree", "list"]).contains("prunable"));
+
+    let text = |path: PathBuf| Some(path.to_str().unwrap().to_owned());
+    let expected = |id: &str| dagq::domain::RunPaths::new(&runs, id);
+    let mut queue = SqliteQueue::open(&db).unwrap();
+    let shown = queue.show(1).unwrap().runs[0].clone();
+    let paths = expected(&run.id);
+    assert_eq!(shown.run_dir, text(paths.run_dir.clone()));
+    assert_eq!(shown.worktree_path, text(paths.worktree.clone()));
+    assert_eq!(shown.receipt_path, text(paths.receipt.clone()));
+    assert_eq!(shown.log_path, text(paths.log.clone()));
+    assert_eq!(shown.repo_path, run.repo_path);
+    assert!(paths.worktree.is_dir() && paths.receipt.is_file());
+
+    let status = runtime::status(&db).unwrap();
+    let entry = &status["runs"].as_array().unwrap()[0];
+    assert_eq!(entry["run_id"], json!(unfinished.id), "{status}");
+    assert_eq!(
+        entry["worktree_path"],
+        json!(text(expected(&unfinished.id).worktree)),
+        "{status}"
+    );
+    let doctor = runtime::doctor(&db).unwrap();
+    let health = &doctor["runs"].as_array().unwrap()[0];
+    assert_eq!(health["run_id"], json!(unfinished.id), "{doctor}");
+    assert_eq!(
+        health["worktree_path"],
+        json!(text(expected(&unfinished.id).worktree))
+    );
+    assert_eq!(health["worktree_exists"], json!(true), "{doctor}");
+    assert_eq!(
+        health["run_dir"],
+        json!(text(expected(&unfinished.id).run_dir))
+    );
+    assert_eq!(health["run_dir_exists"], json!(true), "{doctor}");
+
+    // The awaiting run lands from the new location, and its worktree, whose
+    // Git record is repaired on the way, is removed with its branch.
+    let outcome = integrate(&db, 1, &repo).unwrap();
+    assert_eq!(outcome["outcome"], "integrated", "{outcome}");
+    let landed = queue.show(1).unwrap().runs[0].clone();
+    assert_landed(&repo, &landed, "test task", &seed);
+    let kinds = event_kinds(&queue.show(1).unwrap())
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    assert!(kinds.contains(&"worktree_removed".to_owned()), "{kinds:?}");
+    assert!(!kinds.contains(&"cleanup_failed".to_owned()), "{kinds:?}");
+    let listing = git_out(&repo, &["worktree", "list", "--porcelain"]);
+    assert!(!listing.contains(&run.id), "{listing}");
 }
 
 /// A dependent's prompt names each predecessor with the commit `integrate`
