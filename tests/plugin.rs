@@ -1,6 +1,7 @@
 //! The Claude Code plugin in `plugins/claude-dagq` is data plus one launcher
-//! script. These tests catch a broken manifest, skill frontmatter, or launcher
-//! before `claude plugin validate` or a real session would.
+//! script and one hook script. These tests catch a broken manifest, skill
+//! frontmatter, hook, or launcher before `claude plugin validate` or a real
+//! session would.
 
 use std::{
     fs,
@@ -77,9 +78,26 @@ fn every_skill_has_valid_frontmatter_and_uses_the_launcher() {
         .iter()
         .map(|d| d.file_name().unwrap().to_string_lossy().into_owned())
         .collect();
-    assert_eq!(names, ["dagq", "dagq-maintain", "dagq-recover"]);
+    assert_eq!(
+        names,
+        [
+            "dagq",
+            "dagq-land",
+            "dagq-maintain",
+            "dagq-recover",
+            "dagq-session"
+        ]
+    );
     for dir in &dirs {
         let skill = fs::read_to_string(dir.join("SKILL.md")).unwrap();
+        // A skill is reloaded on every use and after each compaction, so its
+        // body stays small; lists of fields and states live in reference/.
+        assert!(
+            skill.len() <= 8 * 1024,
+            "{}: SKILL.md is {} bytes",
+            dir.display(),
+            skill.len()
+        );
         let fields = frontmatter(&skill);
         let get = |key: &str| {
             fields
@@ -109,6 +127,178 @@ fn every_skill_has_valid_frontmatter_and_uses_the_launcher() {
             "{name} must not open the database directly"
         );
     }
+}
+
+/// Every `reference/<file>.md` a skill names exists, and every file under a
+/// skill's `reference/` is named by its SKILL.md, so none is unreachable.
+#[test]
+fn skills_point_at_their_reference_files() {
+    let mut with_reference = Vec::new();
+    for dir in skill_dirs() {
+        let name = dir.file_name().unwrap().to_string_lossy().into_owned();
+        let skill = fs::read_to_string(dir.join("SKILL.md")).unwrap();
+        let reference = dir.join("reference");
+        if reference.is_dir() {
+            with_reference.push(name.clone());
+            for entry in fs::read_dir(&reference).unwrap() {
+                let file = entry.unwrap().file_name().to_string_lossy().into_owned();
+                assert!(file.ends_with(".md"), "{name}: {file}");
+                assert!(skill.contains(&file), "{name} never names reference/{file}");
+            }
+        }
+        for (index, _) in skill.match_indices("reference/") {
+            let file: String = skill[index + "reference/".len()..]
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '.')
+                .collect();
+            let file = file.trim_end_matches('.');
+            assert!(reference.join(file).is_file(), "{name}: reference/{file}");
+        }
+    }
+    with_reference.sort();
+    assert_eq!(
+        with_reference,
+        ["dagq", "dagq-land", "dagq-maintain", "dagq-session"]
+    );
+    // The watch loop never lands a run on its own.
+    let maintain = fs::read_to_string(plugin_root().join("skills/dagq-maintain/SKILL.md")).unwrap();
+    assert!(maintain.contains("watch --after <cursor>"));
+    assert!(maintain.contains("run_in_background"));
+    assert!(maintain.contains("Never call `integrate` because a watch returned"));
+    let land = fs::read_to_string(plugin_root().join("skills/dagq-land/SKILL.md")).unwrap();
+    assert!(land.contains("\"$DAGQ\" review ID"));
+    assert!(land.contains("Do not run `integrate` until the user approves this run"));
+}
+
+fn hooks_manifest() -> Value {
+    serde_json::from_str(&fs::read_to_string(plugin_root().join("hooks/hooks.json")).unwrap())
+        .unwrap()
+}
+
+#[test]
+fn hooks_json_runs_the_session_start_script_on_compact_and_clear_only() {
+    let hooks = hooks_manifest();
+    let events = hooks["hooks"].as_object().expect("hooks object");
+    assert_eq!(events.keys().collect::<Vec<_>>(), ["SessionStart"]);
+    let groups = events["SessionStart"].as_array().unwrap();
+    assert_eq!(groups.len(), 1);
+    // startup is the maintainer prompt's job; resume keeps its context.
+    let matcher = groups[0]["matcher"].as_str().unwrap();
+    let mut sources: Vec<&str> = matcher.split('|').collect();
+    sources.sort();
+    assert_eq!(sources, ["clear", "compact"]);
+    let commands = groups[0]["hooks"].as_array().unwrap();
+    assert_eq!(commands.len(), 1);
+    assert_eq!(commands[0]["type"], "command");
+    assert_eq!(
+        commands[0]["command"],
+        "${CLAUDE_PLUGIN_ROOT}/hooks/session-start.sh"
+    );
+    let script = plugin_root().join("hooks/session-start.sh");
+    let mode = fs::metadata(&script).unwrap().permissions().mode();
+    assert_ne!(mode & 0o111, 0, "session-start.sh must be executable");
+}
+
+/// Runs the SessionStart hook with a clean environment plus `env`.
+fn session_start(env: &[(&str, &str)], data_home: &Path, cwd: &Path) -> Output {
+    let mut command = Command::new(plugin_root().join("hooks/session-start.sh"));
+    command
+        .env_clear()
+        .env("XDG_DATA_HOME", data_home)
+        .env("PATH", "/usr/bin:/bin")
+        .current_dir(cwd);
+    for (key, value) in env {
+        command.env(key, value);
+    }
+    command.output().unwrap()
+}
+
+#[test]
+fn session_start_hook_prints_status_only_in_a_maintainer_session() {
+    let dir = tempfile::tempdir().unwrap();
+    let data_home = dir.path().join("xdg");
+    let repo = dir.path().join("repo");
+    fs::create_dir(&repo).unwrap();
+    assert!(
+        Command::new("git")
+            .args(["init", "-q", "-b", "main"])
+            .current_dir(&repo)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let binary = env!("CARGO_BIN_EXE_dagq");
+    stdout_json(&launcher(
+        &[("DAGQ_BIN", binary)],
+        &data_home,
+        &repo,
+        &["init"],
+    ));
+
+    // No role, or another role: nothing at all, whatever else is set.
+    for env in [
+        vec![("DAGQ_BIN", binary)],
+        vec![("DAGQ_BIN", binary), ("DAGQ_ROLE", "worker")],
+        vec![("DAGQ_ROLE", "")],
+    ] {
+        let output = session_start(&env, &data_home, &repo);
+        assert!(output.status.success(), "{env:?}");
+        assert_eq!(output.stdout, b"", "{env:?}");
+        assert_eq!(output.stderr, b"", "{env:?}");
+    }
+
+    // The maintainer gets status, with its attention and cursor.
+    let maintainer = [("DAGQ_BIN", binary), ("DAGQ_ROLE", "maintainer")];
+    let status = stdout_json(&session_start(&maintainer, &data_home, &repo));
+    assert!(status["supervisors"].is_array());
+    assert!(status["attention"].is_array());
+    assert_eq!(status["attention"][0]["kind"], "supervisor_stopped");
+    assert!(status["cursor"].is_number());
+
+    // `up` names the queue in DAGQ_QUEUE, which works outside the repository.
+    let db = stdout_json(&launcher(
+        &[("DAGQ_BIN", binary)],
+        &data_home,
+        &repo,
+        &["locate"],
+    ))["db"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let with_queue = [
+        ("DAGQ_BIN", binary),
+        ("DAGQ_ROLE", "maintainer"),
+        ("DAGQ_QUEUE", db.as_str()),
+    ];
+    let status = stdout_json(&session_start(&with_queue, &data_home, dir.path()));
+    assert!(status["cursor"].is_number());
+
+    // A failure is one line of explanation, never a failed session start.
+    let one_line = |output: &Output| {
+        assert!(output.status.success());
+        let text = String::from_utf8(output.stdout.clone()).unwrap();
+        assert_eq!(text.lines().count(), 1, "{text}");
+        text
+    };
+    let missing = one_line(&session_start(
+        &[("DAGQ_ROLE", "maintainer")],
+        &data_home,
+        &repo,
+    ));
+    assert!(missing.contains("dagq was not found"), "{missing}");
+    let bogus = dir.path().join("not-executable");
+    fs::write(&bogus, "").unwrap();
+    let bad = one_line(&session_start(
+        &[
+            ("DAGQ_ROLE", "maintainer"),
+            ("DAGQ_BIN", bogus.to_str().unwrap()),
+        ],
+        &data_home,
+        &repo,
+    ));
+    assert!(bad.contains("not an executable"), "{bad}");
+    let outside = one_line(&session_start(&maintainer, &data_home, dir.path()));
+    assert!(outside.starts_with("dagq status failed: "), "{outside}");
 }
 
 /// `XDG_DATA_HOME` is always pointed away from the developer's real queues.

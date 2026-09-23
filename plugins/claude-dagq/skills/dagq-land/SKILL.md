@@ -1,0 +1,52 @@
+---
+name: dagq-land
+description: Review a dagq run that is awaiting_integration and, once the user approves it, land it on main with integrate and push main. The review runs in a subagent from the review.md file that review ID writes, so the diff never enters this session. Use when status or watch reports "review and integrate", or when the user asks to review, approve, integrate, land, or push a finished dagq task. Not for fixing a needs_session run (dagq-session) or a stuck integrating lease (dagq-recover).
+---
+
+# dagq: review a run and land it on main
+
+Prerequisite: `DAGQ="${CLAUDE_PLUGIN_ROOT}/bin/dagq"` resolved as in the `dagq` skill. Never merge, rebase, cherry-pick or fast-forward a run's branch yourself: landing is the runtime's job, and it keeps `main` linear with one squash commit per task. Never read the full diff in this session.
+
+## 1. Write the review file
+
+```sh
+"$DAGQ" review ID
+```
+
+It takes the task's run in `awaiting_integration` (or `needs_session` after a session fixed it), writes `<run_dir>/review.md` and prints only `{"run_id", "task_id", "path", "base", "head", "files_changed", "insertions", "deletions"}`. It refuses a task with no such run.
+
+## 2. Review in a subagent
+
+Start a subagent (the Agent tool) with `path` and this request: read the file; check the diff against the task's acceptance, the goal's constraints and the receipt's claims (tests, e2e, subagent review); answer with a verdict (`approve` or `changes needed`) and at most a few findings with file and line, never the diff itself. Take only that answer back.
+
+When the repository asks the maintainer to check something beyond the file (for example the receipt's `e2e` evidence and the run's logs for a run that changed the runtime), add it to the same request with the paths from `"$DAGQ" show ID --full` (`run_dir`).
+
+## 3. Report and wait for approval
+
+Tell the user, in a few lines: the task and its title, `branch` and `head`, the diffstat numbers, the subagent's verdict and findings, and the receipt's `follow_ups` if any (they are in review.md; ask the subagent to list their titles). Then wait. **Do not run `integrate` until the user approves this run.** A watch returning, a passing review, or an earlier approval of another run is not approval.
+
+If the user wants changes, the run goes back to a session: see the `dagq-session` skill, or have the user `ready` the task again after editing it.
+
+## 4. Land it
+
+```sh
+"$DAGQ" integrate ID
+```
+
+`integrate` rebases the run onto the current `main`, re-validates it (rerunning the verification commands unless the rebase was a no-op on the head the supervisor already verified), squashes it into one commit on `main` and removes the worktree and branch. Read `outcome`:
+
+- `integrated`: `run.result_commit` is the new `main` head and the task is `completed`; dependents become candidates.
+- `needs_session`: nothing reached `main`; `reason` names the conflicting files or the failed verification. Report it and continue with the `dagq-session` skill.
+- `failed`: the run's receipt reported `failed`; the task stays `in_progress` (`ready ID` retries, `cancel ID` drops it).
+
+An error (exit status 1) leaves `main` untouched and puts the run back with the message in `last_error`; a `main` checkout with uncommitted changes that overlap the landing is a common cause. Fix it and run `integrate` again. `${CLAUDE_PLUGIN_ROOT}/skills/dagq-land/reference/integrate.md` has the details (`--next`, re-validation, logs, what review.md holds); read it only when an outcome is unclear.
+
+## 5. Push and report
+
+After `integrated`, push the landed `main` when the repository's workflow has the maintainer push it:
+
+```sh
+git push origin main
+```
+
+Report the outcome: the task, the landed commit, what it unblocked, and the receipt's `follow_ups` again so the user can have them registered with the `dagq` skill (`add --goal ID` on the task's goal, or a plain `add`).

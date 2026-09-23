@@ -104,11 +104,11 @@ cmux workspaceの名前は複数repositoryで同じcmuxを使うためrepository
 
 ### Maintainer prompt
 
-`src/runtime.rs`の`maintainer_prompt(db, log_dir)`がworker promptの隣で生成する。内容: この queue（db path）のmaintainer sessionであること、役割名の1行（supervisor / maintainer / worker）、supervisorのlog dir、dagq pluginの`dagq-maintain` skillで`status`と`doctor`を確認し、staleなsupervisor・未完了run・`awaiting_integration`・`needs_session`を報告してユーザーの指示を待つこと、skillが無ければそう報告すること、queue DBを直接触らずCLIだけを使うこと。CLIの手順はpromptに書かずskillに置くので、skillを変えてもpromptは変わらない。
+`src/runtime.rs`の`maintainer_prompt(db, log_dir)`がworker promptの隣で生成する（[ADR-0016](../adr/0016-maintainer-notification-and-compact-output.md)の決定8で5行以内に縮めた）。内容: この queue（db path）のmaintainerであることとsupervisorのlog dir、`dagq status`から始めてdagq pluginの`dagq-maintain` skillに従い`dagq watch --after <cursor>`をbackgroundで走らせ終了で起きること、attentionをユーザーに報告して承認を待ち自分では`integrate`しないこと、queue DBを直接開かずCLIだけを使うこと、skillが無ければそう報告して待つこと。CLIの手順はpromptに書かずskillに置くので、skillを変えてもpromptは変わらない。compactionと`/clear`からの起き直しはpromptではなくpluginの`SessionStart` hookが`status`を出して担う（[plugin-integration](plugin-integration.md#起き直しhookadr-0016)）。
 
 ### Maintainerへの通知（ADR-0016で決定、一部実装済み）
 
-[ADR-0016](../adr/0016-maintainer-notification-and-compact-output.md)で次を決めた。`status`のattentionとcursor、`events --after`、`watch`は実装済み（[`status`](#status)、[`events` / `watch`](#events--watch)）。`review`は実装済み（下記「`review`」）。`cmux notify`はbackendの操作だけ実装済みで、送る条件と宛先は[ADR-0022](../adr/0022-ask-answer-inbox-planner-and-landing-on-doubt.md)で改められた（[人への通知](#人への通知cmux-notify)）。圧縮出力と`--full`の残り、短い`maintainer_prompt`はgoal 6の残りのtaskで実装する。
+[ADR-0016](../adr/0016-maintainer-notification-and-compact-output.md)で次を決めた。`status`のattentionとcursor、`events --after`、`watch`は実装済み（[`status`](#status)、[`events` / `watch`](#events--watch)）。`review`は実装済み（下記「`review`」）。`cmux notify`はbackendの操作だけ実装済みで、送る条件と宛先は[ADR-0022](../adr/0022-ask-answer-inbox-planner-and-landing-on-doubt.md)で改められた（[人への通知](#人への通知cmux-notify)）。圧縮出力と`--full`はtask 59、短い`maintainer_prompt`とpluginの`SessionStart` hookはtask 65で実装済み。
 
 - maintainerは状態を持たない使い捨てのsessionで、compaction・`/clear`・再起動からの起き直しは`status`の1コマンドで行う。`status`はsupervisorの健全性、未完了run、attention、次のcursorを上限のある大きさで返す。
 - `watch --after <cursor>`はcursorより後のattentionイベントかsupervisor健全性の変化までblockし、attentionと新しいcursorを返して終わる。maintainerはこれをbackgroundで走らせて終了で起きる。`doctor`は診断専用で、pollingには使わない。

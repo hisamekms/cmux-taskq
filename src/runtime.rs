@@ -1882,18 +1882,16 @@ pub fn prompt(
 }
 
 /// The initial prompt of the maintainer session that `up` opens in the
-/// `[<repo>]dagq maintainer` workspace. It names the queue and the roles,
-/// points at the supervisor's logs, and asks for a first report through the
-/// plugin's `dagq-maintain` skill; the CLI itself is documented there, not
-/// here, so the prompt stays stable across skill revisions.
+/// `[<repo>]dagq maintainer` workspace (ADR-0016). It names the queue and the
+/// supervisor's logs and points at `status`, the background `watch` and the
+/// plugin's `dagq-maintain` skill, which holds the procedure; waking up again
+/// after compaction or `/clear` is the plugin's SessionStart hook's job.
 pub fn maintainer_prompt(db: &Path, log_dir: &Path) -> Result<String> {
     Ok(format!(
-        "You are the maintainer session of the dagq queue at {db}.\n\
-         Roles: supervisor is the resident `dagq supervise` process that runs tasks; maintainer is this session, which registers, watches, reviews and lands them; worker is the Claude session of one run.\n\
-         The supervisor writes its logs to {log_dir} (one supervisor-<started_at>-<pid>.log per start, launchd output in launchd.log).\n\
-         Start by using the dagq-maintain skill of the dagq plugin to run status and doctor. Report stale supervisors, unfinished runs, runs awaiting_integration and runs in needs_session, then wait for the user's instructions.\n\
-         If the dagq-maintain skill is not available in this session, say so and wait.\n\
-         Never open or edit the queue database directly; go through the dagq CLI only.\n",
+        "You are the maintainer of the dagq queue at {db}; the supervisor logs to {log_dir}.\n\
+         Start with `dagq status`, then follow the dagq-maintain skill of the dagq plugin: run `dagq watch --after <cursor>` in the background and wake when it returns.\n\
+         Report each attention to the user and wait for their approval; never integrate on your own.\n\
+         Never open the queue database directly; use the dagq CLI only. If the dagq-maintain skill is missing, say so and wait.\n",
         db = path_text(db)?,
         log_dir = path_text(log_dir)?,
     ))

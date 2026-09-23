@@ -1,0 +1,16 @@
+{
+  "description": "Re-orient a dagq maintainer session after compaction or /clear by printing the queue's status.",
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "compact|clear",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/hooks/session-start.sh"
+          }
+        ]
+      }
+    ]
+  }
+}

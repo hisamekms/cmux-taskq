@@ -277,7 +277,7 @@ The reverse order also works: move the queue directory to `dagq locate`'s `queue
 
 ## Use from Claude Code
 
-`plugins/claude-dagq` is a Claude Code plugin whose skills drive the binary; it has no hooks and never opens the queue database itself. This repository is also its marketplace (`.claude-plugin/marketplace.json`), so installing it takes two commands:
+`plugins/claude-dagq` is a Claude Code plugin whose skills drive the binary, plus one `SessionStart` hook that prints `status` into a maintainer session after compaction or `/clear`; it never opens the queue database itself. This repository is also its marketplace (`.claude-plugin/marketplace.json`), so installing it takes two commands:
 
 ```sh
 claude plugin marketplace add hisamekms/dagq
@@ -297,10 +297,12 @@ The queue is the one of the repository you run Claude Code in, resolved by the b
 | Skill | Covers |
 | --- | --- |
 | `/claude-dagq:dagq` | Locate the binary and queue, `init`, register a goal with `goal add` and decompose it into tasks with `add --goal` (description, acceptance, `--verify`, `--depends-on`, `--context`), `ready`, `list` / `show` / `candidates` / `locate` / `status` / `doctor`, how to read run states, close a goal |
-| `/claude-dagq:dagq-maintain` | The maintainer's side: start the runtime with `up`, read `status` for a stale supervisor, watch runs with `show`, judge completion from the run state and receipt rather than a Stop hook, answer a run's prompts, review and land with `integrate`, resume a `needs_session` run, close the workspace of a failed run, report a receipt's `follow_ups`, stop the runtime with `down`, and find the supervisor's logs |
+| `/claude-dagq:dagq-maintain` | The maintainer's loop: start the runtime with `up`, read `status` (supervisor health, attention, cursor), run `watch --after <cursor>` in the background and report each attention, stop the runtime with `down`; landing waits for the user's approval |
+| `/claude-dagq:dagq-land` | Write `review.md` with `review ID`, have a subagent review it and return only a verdict, then, after the user approves, `integrate` and push `main`, reporting a receipt's `follow_ups` |
+| `/claude-dagq:dagq-session` | Act on a run's session: answer its trust or permission prompt, send `/exit` after `exit_request_timed_out`, close the workspace of a failed run, resume a `needs_session` run |
 | `/claude-dagq:dagq-recover` | `doctor`, `recover RUN_ID` for one run without disturbing the others, retry with `ready` |
 
-Claude picks the skill from the request ("queue a task to …", "start the runtime", "did task 3 finish?", "the supervisor died"). `up` opens the maintainer session with this plugin loaded when it is given `--plugin-dir`. `claude plugin validate plugins/claude-dagq` checks the manifest and skills; `tests/plugin.rs` checks them and the launcher in `cargo test`.
+Claude picks the skill from the request ("queue a task to …", "start the runtime", "did task 3 finish?", "the supervisor died"). Each skill keeps its field lists and state tables in its own `reference/` directory, read only when needed. `up` opens the maintainer session with this plugin loaded when it is given `--plugin-dir`. The plugin's `SessionStart` hook (on `compact` and `clear`) prints `dagq status` into a session started with `DAGQ_ROLE=maintainer`, so the maintainer re-orients itself after compaction or `/clear`; every other session gets no output. `claude plugin validate plugins/claude-dagq` checks the manifest and skills; `tests/plugin.rs` checks them and the launcher in `cargo test`.
 
 ## Development
 

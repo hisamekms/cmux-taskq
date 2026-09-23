@@ -505,7 +505,7 @@ fn up_starts_the_agent_and_the_maintainer_once_and_reuses_them_after() {
     assert!(command.starts_with("'env' 'DAGQ_ROLE=maintainer' 'DAGQ_QUEUE="));
     assert!(command.contains(&format!("'{}'", fixture.options.claude.display())));
     assert!(command.contains("'--plugin-dir'"));
-    assert!(command.contains("You are the maintainer session"));
+    assert!(command.contains("You are the maintainer of"));
     drop(workspaces);
 
     let second = up(&fixture, &cmux, &launchd, &processes);
@@ -1739,22 +1739,16 @@ fn down_force_kills_after_the_unload_and_drops_the_registration() {
 fn maintainer_prompt_names_the_queue_the_logs_the_skill_and_the_rules() {
     let prompt =
         maintainer_prompt(Path::new("/data/q/queue.db"), Path::new("/data/q/logs")).unwrap();
-    assert!(
-        prompt
-            .starts_with("You are the maintainer session of the dagq queue at /data/q/queue.db.\n")
-    );
-    assert!(prompt.contains("supervisor is the resident `dagq supervise` process"));
-    assert!(prompt.contains("maintainer is this session"));
-    assert!(prompt.contains("worker is the Claude session of one run"));
+    assert!(prompt.starts_with("You are the maintainer of the dagq queue at /data/q/queue.db;"));
+    assert!(prompt.lines().count() <= 5, "{prompt}");
     assert!(prompt.contains("logs to /data/q/logs"));
+    assert!(prompt.contains("Start with `dagq status`"));
     assert!(prompt.contains("dagq-maintain skill"));
-    assert!(prompt.contains("run status and doctor"));
-    assert!(prompt.contains(
-        "stale supervisors, unfinished runs, runs awaiting_integration and runs in needs_session"
-    ));
-    assert!(prompt.contains("wait for the user's instructions"));
-    assert!(prompt.contains("If the dagq-maintain skill is not available in this session, say so"));
-    assert!(prompt.contains("Never open or edit the queue database directly"));
+    assert!(prompt.contains("`dagq watch --after <cursor>` in the background"));
+    assert!(prompt.contains("Report each attention to the user and wait for their approval"));
+    assert!(prompt.contains("never integrate on your own"));
+    assert!(prompt.contains("Never open the queue database directly"));
+    assert!(prompt.contains("If the dagq-maintain skill is missing, say so"));
 
     // The workspace command carries the role, the queue, the plugin and the
     // prompt, each shell-quoted on its own.
@@ -1766,7 +1760,7 @@ fn maintainer_prompt_names_the_queue_the_logs_the_skill_and_the_rules() {
     )
     .unwrap();
     assert!(command.starts_with(
-        "'env' 'DAGQ_ROLE=maintainer' 'DAGQ_QUEUE=/data/q'\"'\"'s/queue.db' '/opt/claude' '--plugin-dir' '/plugins/claude-dagq' '--' 'You are the maintainer session"
+        "'env' 'DAGQ_ROLE=maintainer' 'DAGQ_QUEUE=/data/q'\"'\"'s/queue.db' '/opt/claude' '--plugin-dir' '/plugins/claude-dagq' '--' 'You are the maintainer of"
     ), "{command}");
     assert_eq!(ROLE_ENV, "DAGQ_ROLE");
     assert_eq!(QUEUE_ENV, "DAGQ_QUEUE");
@@ -1778,7 +1772,7 @@ fn maintainer_prompt_names_the_queue_the_logs_the_skill_and_the_rules() {
     )
     .unwrap();
     assert!(!bare.contains("--plugin-dir"));
-    assert!(bare.contains("'/opt/claude' '--' 'You are the maintainer session"));
+    assert!(bare.contains("'/opt/claude' '--' 'You are the maintainer of"));
 }
 
 /// A live supervisor of another build is not reused: `up` unloads its
