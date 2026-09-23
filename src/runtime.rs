@@ -1432,6 +1432,199 @@ fn remove_landed_worktree(queue: &mut SqliteQueue, repository: &GitRepository, r
     }
 }
 
+/// Write the review material of the task's run that awaits integration or a
+/// session to `<run_dir>/review.md` (temporary file, then rename) and report
+/// where it is with the size of the diff (ADR-0016, decision 7). The file holds the
+/// task, its goal, the receipt, the commits, the diffstat and the full diff
+/// `<base>...<head>`, `base` being the run's base commit and `head` the
+/// receipt's commit. When a session already rebased `head` onto the current
+/// `main`, `base` is that `main` instead, so the review does not repeat
+/// what other tasks landed meanwhile. The diff itself is never returned, so the maintainer
+/// hands the path to a subagent instead of reading it.
+pub fn review(db: &Path, task_id: i64) -> Result<Value> {
+    let mut queue = SqliteQueue::open(db)?;
+    let detail = queue.show(task_id)?;
+    let run = detail
+        .runs
+        .iter()
+        .find(|r| {
+            matches!(
+                r.status,
+                RunStatus::AwaitingIntegration | RunStatus::NeedsSession
+            )
+        })
+        .cloned()
+        .with_context(|| {
+            format!(
+                "task {task_id} ({}) has no run awaiting integration or a session",
+                detail.task.status.as_str()
+            )
+        })?;
+    let task = detail.task;
+    let goal = match task.goal_id {
+        Some(goal_id) => Some(queue.show_goal(goal_id)?.goal),
+        None => None,
+    };
+    let run_dir = Path::new(run.run_dir.as_ref().context("missing run directory")?);
+    let receipt_path = Path::new(run.receipt_path.as_ref().context("missing receipt path")?);
+    let receipt = Receipt::parse(
+        &fs::read_to_string(receipt_path)
+            .with_context(|| format!("read receipt {}", receipt_path.display()))?,
+    )?;
+    let checkout = run
+        .repo_path
+        .as_ref()
+        .or(run.worktree_path.as_ref())
+        .context("run has no repository path")?;
+    let repository = GitRepository::inspect(Path::new(checkout))?;
+    let head = receipt.commit.to_ascii_lowercase();
+    let main = repository.main_head()?;
+    let base = if main != run.base_commit && repository.is_ancestor(&main, &head)? {
+        main
+    } else {
+        run.base_commit.clone()
+    };
+    let log = repository.log_oneline(&base, &head)?;
+    let stat = repository.diff_stat(&base, &head)?;
+    let diff = repository.diff(&base, &head)?;
+    let numbers = repository.diff_numbers(&base, &head)?;
+    let text = review_markdown(
+        &task,
+        &run,
+        goal.as_ref(),
+        &receipt,
+        &base,
+        &head,
+        &log,
+        &stat,
+        &diff,
+    );
+    let path = run_dir.join("review.md");
+    let temporary = run_dir.join(format!(".review.md.{}.tmp", std::process::id()));
+    fs::write(&temporary, text).with_context(|| format!("write {}", temporary.display()))?;
+    fs::rename(&temporary, &path).with_context(|| format!("write {}", path.display()))?;
+    Ok(json!({
+        "run_id": run.id,
+        "task_id": task.id,
+        "path": path_text(&path)?,
+        "base": base,
+        "head": head,
+        "files_changed": numbers.files_changed,
+        "insertions": numbers.insertions,
+        "deletions": numbers.deletions,
+    }))
+}
+
+/// A fenced block whose fence is longer than any backtick run in `text`,
+/// so a diff of Markdown cannot close it early.
+fn fenced(info: &str, text: &str) -> String {
+    let longest = text.split(|c| c != '`').map(str::len).max().unwrap_or(0);
+    let fence = "`".repeat(longest.max(2) + 1);
+    let body = text.trim_end_matches('\n');
+    if body.is_empty() {
+        format!("{fence}{info}\n{fence}\n")
+    } else {
+        format!("{fence}{info}\n{body}\n{fence}\n")
+    }
+}
+
+/// `text`, or `(none)` when it is blank.
+fn or_none(text: &str) -> &str {
+    if text.trim().is_empty() {
+        "(none)"
+    } else {
+        text.trim_end()
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn review_markdown(
+    task: &Task,
+    run: &TaskRun,
+    goal: Option<&Goal>,
+    receipt: &Receipt,
+    base: &str,
+    head: &str,
+    log: &str,
+    stat: &str,
+    diff: &str,
+) -> String {
+    let mut out = format!(
+        "# Review of task {id}: {title}\n\n\
+         - run: {run_id} ({status})\n\
+         - base: {base} (run base {run_base})\n\
+         - head: {head}\n\
+         - branch: {branch}\n\
+         - worktree: {worktree}\n\
+         - verification logs: {run_dir}/verify-N.log\n\n\
+         ## Task\n\n\
+         ### Description\n\n{description}\n\n\
+         ### Acceptance\n\n{acceptance}\n\n\
+         ### Verification commands\n\n{verify}\n",
+        id = task.id,
+        title = task.title,
+        run_id = run.id,
+        status = run.status.as_str(),
+        run_base = run.base_commit,
+        branch = run.branch.as_deref().unwrap_or("(none)"),
+        worktree = run.worktree_path.as_deref().unwrap_or("(none)"),
+        run_dir = run.run_dir.as_deref().unwrap_or("(none)"),
+        description = or_none(&task.description),
+        acceptance = or_none(&task.acceptance),
+        verify = fenced("sh", &task.verification_commands.join("\n")),
+    );
+    if let Some(goal) = goal {
+        out.push_str(&format!(
+            "\n## Goal {id}: {title}\n\n\
+             ### Goal acceptance\n\n{acceptance}\n\n\
+             ### Goal constraints\n\n{constraints}\n",
+            id = goal.id,
+            title = goal.title,
+            acceptance = or_none(&goal.acceptance),
+            constraints = or_none(&goal.constraints),
+        ));
+    }
+    out.push_str(&format!(
+        "\n## Receipt\n\n### Summary\n\n{summary}\n",
+        summary = or_none(&receipt.summary)
+    ));
+    for (name, check) in [
+        ("Tests", &receipt.tests),
+        ("E2E", &receipt.e2e),
+        ("Subagent review", &receipt.subagent_review),
+    ] {
+        out.push_str(&format!(
+            "\n### {name}: {status}\n\n{evidence}\n",
+            status = check.status.as_str(),
+            evidence = or_none(&check.evidence_or_reason),
+        ));
+    }
+    let follow_ups = match &receipt.follow_ups {
+        Some(Value::Array(items)) if !items.is_empty() => items
+            .iter()
+            .map(|item| {
+                format!(
+                    "- {}: {}",
+                    item["title"].as_str().unwrap_or("(untitled)"),
+                    item["description"].as_str().unwrap_or("")
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => "(none)".to_owned(),
+    };
+    out.push_str(&format!("\n### Follow-ups\n\n{follow_ups}\n"));
+    out.push_str(&format!(
+        "\n## Commits\n\n`git log --oneline {base}..{head}`\n\n{log}\n\
+         ## Diffstat\n\n`git diff --stat {base}...{head}`\n\n{stat}\n\
+         ## Diff\n\n`git diff {base}...{head}`\n\n{diff}",
+        log = fenced("", log),
+        stat = fenced("", stat),
+        diff = fenced("diff", diff),
+    ));
+    out
+}
+
 fn tail(text: &str, max_bytes: usize) -> &str {
     if text.len() <= max_bytes {
         return text;

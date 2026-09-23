@@ -263,6 +263,14 @@ fn main_head(git: &Path, root: &Path) -> Result<String> {
     .to_owned())
 }
 
+/// The size of a diff, as `git diff --numstat` counts it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+pub struct DiffNumbers {
+    pub files_changed: u64,
+    pub insertions: u64,
+    pub deletions: u64,
+}
+
 #[derive(Clone)]
 pub struct GitRepository {
     pub root: PathBuf,
@@ -422,6 +430,56 @@ impl GitRepository {
             .map(str::to_owned)
             .collect(),
         )
+    }
+
+    /// `git log --oneline <base>..<head>`: the commits a run added.
+    pub fn log_oneline(&self, base: &str, head: &str) -> Result<String> {
+        output(Command::new(&self.git).arg("-C").arg(&self.root).args([
+            "log",
+            "--oneline",
+            "--no-decorate",
+            "--no-color",
+            &format!("{base}..{head}"),
+        ]))
+    }
+
+    /// `git diff <args> <base>...<head>`: the change since the merge base,
+    /// without color, external diff drivers or textconv filters.
+    fn diff_since(&self, base: &str, head: &str, args: &[&str]) -> Result<String> {
+        output(
+            Command::new(&self.git)
+                .arg("-C")
+                .arg(&self.root)
+                .args(["diff", "--no-color", "--no-ext-diff", "--no-textconv"])
+                .args(args)
+                .arg(format!("{base}...{head}"))
+                .arg("--"),
+        )
+    }
+
+    /// `git diff --stat <base>...<head>`.
+    pub fn diff_stat(&self, base: &str, head: &str) -> Result<String> {
+        self.diff_since(base, head, &["--stat"])
+    }
+
+    /// Full `git diff <base>...<head>`.
+    pub fn diff(&self, base: &str, head: &str) -> Result<String> {
+        self.diff_since(base, head, &[])
+    }
+
+    /// Files changed, lines inserted and lines deleted in
+    /// `<base>...<head>`, summed from `--numstat` (binary files count as a
+    /// changed file with no lines).
+    pub fn diff_numbers(&self, base: &str, head: &str) -> Result<DiffNumbers> {
+        let numstat = self.diff_since(base, head, &["--numstat"])?;
+        let mut numbers = DiffNumbers::default();
+        for line in numstat.lines().filter(|line| !line.is_empty()) {
+            let mut fields = line.split('\t');
+            numbers.files_changed += 1;
+            numbers.insertions += fields.next().and_then(|n| n.parse().ok()).unwrap_or(0);
+            numbers.deletions += fields.next().and_then(|n| n.parse().ok()).unwrap_or(0);
+        }
+        Ok(numbers)
     }
 
     pub fn tree_of(&self, commit: &str) -> Result<String> {

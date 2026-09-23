@@ -106,13 +106,13 @@ cmux workspaceの名前は複数repositoryで同じcmuxを使うためrepository
 
 ### Maintainerへの通知（ADR-0016で決定、一部実装済み）
 
-[ADR-0016](../adr/0016-maintainer-notification-and-compact-output.md)で次を決めた。`status`のattentionとcursor、`events --after`、`watch`は実装済み（[`status`](#status)、[`events` / `watch`](#events--watch)）。`cmux notify`、圧縮出力と`--full`、`review`、短い`maintainer_prompt`はgoal 6の残りのtaskで実装する。
+[ADR-0016](../adr/0016-maintainer-notification-and-compact-output.md)で次を決めた。`status`のattentionとcursor、`events --after`、`watch`は実装済み（[`status`](#status)、[`events` / `watch`](#events--watch)）。`review`は実装済み（下記「`review`」）。`cmux notify`、圧縮出力と`--full`の残り、短い`maintainer_prompt`はgoal 6の残りのtaskで実装する。
 
 - maintainerは状態を持たない使い捨てのsessionで、compaction・`/clear`・再起動からの起き直しは`status`の1コマンドで行う。`status`はsupervisorの健全性、未完了run、attention、次のcursorを上限のある大きさで返す。
 - `watch --after <cursor>`はcursorより後のattentionイベントかsupervisor健全性の変化までblockし、attentionと新しいcursorを返して終わる。maintainerはこれをbackgroundで走らせて終了で起きる。`doctor`は診断専用で、pollingには使わない。
 - attentionはrun_eventsのkind（公開契約。既存のkind名とpayloadは変えず追加だけ）からdomainが判定する: runの`awaiting_integration`・`needs_session`・`failed`、`exit_request_timed_out`、supervisorの停止/stale。supervisorの状態はrun_eventsに載せず`supervisors`表から導出し、schemaは変えない。
 - supervisorはattentionのたびにmaintainer workspaceへ`cmux notify`を送る（人向け）。runtimeはmaintainerのterminalに`cmux send`で打ち込まない（workerへの`/exit`は従来どおり）。`integrate`は`watch`からもイベントの副作用としても呼ばない。
-- maintainer経路のコマンドは既定で圧縮し（既存キー名を変えずに省く・切り詰める）、全文は`--full`。`show`・`goal show`・`doctor`は実装済み（`doctor`は上、`show`と`goal show`は[domain-model](domain-model.md)）。レビューは`review ID`が`<run_dir>/review.md`を書き、maintainerはsubagentにpathを渡す。
+- maintainer経路のコマンドは既定で圧縮し（既存キー名を変えずに省く・切り詰める）、全文は`--full`。`show`・`goal show`・`doctor`は実装済み（`doctor`は上、`show`と`goal show`は[domain-model](domain-model.md)）。レビューは`review ID`が`<run_dir>/review.md`を書き、maintainerはsubagentにpathを渡す（`review`は実装済み。下記「`review`」）。
 - `maintainer_prompt`は「`status`から始め、`watch`をbackgroundで回し、attentionを報告して承認を待つ」に縮める。
 
 ## `supervise`
@@ -198,6 +198,14 @@ receiptの形式は`src/domain.rs`の`Receipt`で、promptとREADMEに同じ契�
 6. taskの`verification_commands`を順に`/bin/sh -c`でworktree内で実行する。出力は`<run-dir>/verify-N.log`、終了コードと末尾は`verification_command`イベントに記録する。1件でも非0なら失敗。各コマンドは30分でタイムアウトし、その場合は検証処理のエラーとして扱う。
 
 結果は`validation_finished`イベント（`status`、`result_commit`、`reason`、receiptの内容）と`task_runs.result_commit`/`last_error`に保存する。4以降で拒否した場合もcommitは確認済みなので`result_commit`を残す。成功しても`awaiting_integration`はTaskを`in_progress`のまま保持し、下記の統合確認まで依存taskを解放しない。
+
+## `review`
+
+`dagq review ID`は、taskの`awaiting_integration`または`needs_session`のrun（`integrate ID`と同じ選び方）のレビュー資料を`<run_dir>/review.md`に書く（[ADR-0016](../adr/0016-maintainer-notification-and-compact-output.md)の決定7）。どちらのrunも無ければerrorで、何も書かない。DBは読むだけで、eventも状態も変えない。`head`は`<run_dir>/receipt.json`の`commit`（読めなければerror）。`base`はrunの`base_commit`だが、セッションが`head`を現在の`main`の上にrebase済み（`main`が`base_commit`と異なり`head`の祖先）なら`main`にする。そうしないと`needs_session`から戻るrunのレビューに、その間に着地した他taskの変更が混ざる。Gitは`GitRepository`（runの`repo_path`、無ければworktreeで`inspect`）を通して呼ぶ。
+
+`review.md`の節は順に: 見出し（task id・title、run id・status、base（とrunの`base_commit`）、head、branch、worktree、`verify-N.log`の場所）、Task（description、acceptance、verification commands）、Goal（taskにgoalがあるときだけ。acceptanceとconstraints）、Receipt（summary、tests / e2e / subagent_reviewのstatusとevidence_or_reason、follow_ups）、Commits（`git log --oneline <base>..<head>`）、Diffstat（`git diff --stat <base>...<head>`）、最後にDiff（`git diff <base>...<head>`の全文）。diffは`--no-color --no-ext-diff --no-textconv`で取り、コードフェンスは本文のどのbacktick列より長くする。ファイルは`<run_dir>/.review.md.<pid>.tmp`に書いてからrenameする。diffの取得は他のGit呼び出しと同じ30秒のtimeoutとUTF-8の要求を持つ。
+
+stdoutは`{"run_id","task_id","path","base","head","files_changed","insertions","deletions"}`だけで（数値は`git diff --numstat`の合計。binaryは1ファイル0行）、diff本文は返さない。maintainerは`path`をsubagentに渡して結論だけを受け取り、自分のコンテキストでdiff全文を読まない。
 
 ## `integrate`
 

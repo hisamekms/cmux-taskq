@@ -196,6 +196,11 @@ enum Command {
         #[arg(long)]
         repo: Option<PathBuf>,
     },
+    /// Write the review material of the task's run awaiting integration or a session to <run_dir>/review.md and report its path and diff size; the diff itself is only in the file.
+    Review {
+        /// Task whose run awaits integration or comes back from a session.
+        id: i64,
+    },
     /// List supervisors, unfinished runs, what waits for the maintainer (attention) and the event cursor, without changing anything.
     Status,
     /// Print the run events after a cursor, oldest first: attention events only unless --all. Reads only.
@@ -577,6 +582,7 @@ fn execute(cli: Cli) -> Result<Value> {
             };
             dagq::runtime::integrate(&db, target, &checkout(repo))?
         }
+        Command::Review { id } => dagq::runtime::review(&db, id)?,
         Command::Doctor { full } => dagq::runtime::doctor(&db, full)?,
         Command::Recover { run } => dagq::runtime::recover(&db, &run)?,
         Command::Session { run, lease, claude } => {

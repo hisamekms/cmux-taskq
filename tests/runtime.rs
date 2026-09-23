@@ -1861,6 +1861,99 @@ fn awaiting_run() -> (TempDir, PathBuf, PathBuf, TaskRun) {
 }
 
 #[test]
+fn review_writes_the_run_material_to_review_md_and_returns_only_its_size() {
+    let (_dir, repo, db) = fixture();
+    let mut queue = SqliteQueue::open(&db).unwrap();
+    let goal = queue
+        .add_goal(NewGoal {
+            title: "goal title".into(),
+            description: String::new(),
+            acceptance: "goal acceptance".into(),
+            constraints: "goal constraints".into(),
+            doc: None,
+        })
+        .unwrap();
+    queue.set_goal(1, Some(goal.id)).unwrap();
+    // A task without a run to review is refused.
+    let error = format!("{:#}", runtime::review(&db, 1).unwrap_err());
+    assert!(
+        error.contains("task 1 (ready) has no run awaiting integration or a session"),
+        "{error}"
+    );
+    let backend = TestWorkspace::new(&db, false, VALID_AGENT);
+    supervise(&db, &repo, &backend).unwrap();
+    backend.join();
+    let run = queue.show(1).unwrap().runs[0].clone();
+    assert_eq!(run.status, RunStatus::AwaitingIntegration);
+    let head = run.result_commit.clone().unwrap();
+    let mut receipt = session_receipt(&run, &head, "succeeded", "summary of the change");
+    receipt["follow_ups"] = json!([{"title": "later work", "description": "outside the task"}]);
+    write_receipt_json(&run, receipt);
+
+    let outcome = runtime::review(&db, 1).unwrap();
+    let path = Path::new(run.run_dir.as_ref().unwrap()).join("review.md");
+    assert_eq!(
+        outcome,
+        json!({
+            "run_id": run.id,
+            "task_id": 1,
+            "path": path.to_str().unwrap(),
+            "base": run.base_commit,
+            "head": head,
+            "files_changed": 1,
+            "insertions": 1,
+            "deletions": 0,
+        })
+    );
+    assert!(!outcome.to_string().contains("diff --git"));
+    assert!(!path.with_file_name(".review.md.tmp").exists());
+    let text = fs::read_to_string(&path).unwrap();
+    let sections = [
+        "# Review of task 1: test task",
+        "## Task",
+        "### Description\n\nsmall change",
+        "### Acceptance\n\nworks",
+        "### Verification commands\n\n```sh\ntest -f seed.txt\n```",
+        "## Goal 1: goal title",
+        "### Goal acceptance\n\ngoal acceptance",
+        "### Goal constraints\n\ngoal constraints",
+        "## Receipt",
+        "### Summary\n\nsummary of the change",
+        "### Tests: passed\n\nreran",
+        "### E2E: not_applicable\n\nnone",
+        "### Subagent review: not_applicable\n\nsession",
+        "### Follow-ups\n\n- later work: outside the task",
+        "## Commits",
+        "## Diffstat",
+        "## Diff",
+    ];
+    let mut at = 0;
+    for section in sections {
+        let found = text[at..]
+            .find(section)
+            .unwrap_or_else(|| panic!("{section:?} missing after byte {at}:\n{text}"));
+        at += found + section.len();
+    }
+    let commits = &text[text.find("## Commits").unwrap()..text.find("## Diffstat").unwrap()];
+    assert!(commits.contains(&head[..7]), "{commits}");
+    assert!(commits.contains(" work\n"), "{commits}");
+    let stat = &text[text.find("## Diffstat").unwrap()..text.find("## Diff\n").unwrap()];
+    assert!(stat.contains("change.txt | 1 +"), "{stat}");
+    let diff = &text[text.find("## Diff\n").unwrap()..];
+    assert!(
+        diff.contains("```diff\ndiff --git a/change.txt b/change.txt"),
+        "{diff}"
+    );
+    assert!(diff.contains(&format!("+change by {}", run.id)), "{diff}");
+    assert!(diff.ends_with("\n```\n"), "{diff}");
+
+    // A landed run is no longer reviewable.
+    assert_eq!(integrate(&db, 1, &repo).unwrap()["outcome"], "integrated");
+    let error = format!("{:#}", runtime::review(&db, 1).unwrap_err());
+    assert!(error.contains("task 1 (completed) has no run"), "{error}");
+}
+
+#[test]
 fn conflict_free_run_lands_as_one_squash_commit_and_releases_dependents() {
     let (dir, repo, db, run) = awaiting_run();
     let seed = git_out(&repo, &["rev-parse", "main"]);
@@ -2735,6 +2828,10 @@ fn conflicting_run_needs_a_session_and_lands_after_the_session_resolves_it() {
     assert_eq!(parked.status, RunStatus::NeedsSession);
     assert_eq!(parked.last_error.as_deref(), Some(reason));
     assert_eq!(parked.result_commit.as_deref(), Some(source.as_str()));
+    // A parked run is reviewable against its own base.
+    let review = runtime::review(&db, 2).unwrap();
+    assert_eq!(review["head"], json!(source));
+    assert_eq!(review["base"], json!(seed));
     // The rebase was aborted: the worktree is back on its validated head, clean.
     assert_eq!(git_out(&worktree, &["rev-parse", "HEAD"]), source);
     assert_eq!(git_out(&worktree, &["status", "--porcelain"]), "");
@@ -2813,6 +2910,18 @@ fn conflicting_run_needs_a_session_and_lands_after_the_session_resolves_it() {
         {"title": "dedupe change.txt", "description": "both tasks wrote it"}
     ]);
     write_receipt_json(&parked, rewritten.clone());
+    // The session's head sits on the landed main, so the review is taken
+    // against that main and leaves out the first task's landing.
+    let review = runtime::review(&db, 2).unwrap();
+    assert_eq!(review["base"], json!(first_landed));
+    assert_eq!(review["head"], json!(resolved));
+    assert_eq!(review["files_changed"], json!(1));
+    let text = fs::read_to_string(review["path"].as_str().unwrap()).unwrap();
+    assert!(text.contains("+resolved by the session"), "{text}");
+    let commits = &text[text.find("## Commits").unwrap()..text.find("## Diffstat").unwrap()];
+    let listed = &commits[commits.find("```").unwrap()..];
+    assert_eq!(listed.matches(" work\n").count(), 1, "{commits}");
+    assert!(!listed.contains(&first_landed[..7]), "{commits}");
     let outcome = integrate(&db, 2, &repo).unwrap();
     assert_eq!(outcome["outcome"], "integrated", "{outcome}");
     // The session rebased the branch itself, so this rebase is a no-op -- but
