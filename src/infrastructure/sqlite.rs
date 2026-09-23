@@ -11,8 +11,8 @@ use uuid::Uuid;
 use crate::{
     application::TaskStore,
     domain::{
-        ClaimOutcome, Goal, GoalDetail, GoalEdit, GoalSummary, GoalTask, GoalVerdict, NewGoal,
-        NewTask, Predecessor, RunEvent, Task, TaskAction, TaskDetail, TaskRun, TaskStatus,
+        ClaimOutcome, DomainError, Goal, GoalDetail, GoalEdit, GoalSummary, GoalTask, GoalVerdict,
+        NewGoal, NewTask, Predecessor, RunEvent, Task, TaskAction, TaskDetail, TaskRun, TaskStatus,
         TaskStatusCounts, validate_base_commit,
     },
 };
@@ -419,30 +419,8 @@ impl TaskStore for SqliteQueue {
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let goal = read_goal(&tx, goal_id)?;
-        ensure!(
-            !goal.is_closed(),
-            "goal {goal_id} is already closed as {}",
-            goal.verdict.map_or("?", GoalVerdict::as_str)
-        );
         let counts = task_counts(&tx, goal_id)?;
-        let blocking: Vec<(TaskStatus, usize)> = [
-            (TaskStatus::Draft, counts.draft),
-            (TaskStatus::Ready, counts.ready),
-            (TaskStatus::InProgress, counts.in_progress),
-        ]
-        .into_iter()
-        .filter(|(status, n)| *n > 0 && !verdict.allows(*status))
-        .collect();
-        ensure!(
-            blocking.is_empty(),
-            "goal {goal_id} cannot be closed as {}: {}",
-            verdict.as_str(),
-            blocking
-                .iter()
-                .map(|(status, n)| format!("{n} task(s) {}", status.as_str()))
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
+        verdict.check_close(&goal, &counts)?;
         tx.execute(
             "UPDATE goals SET closed_at=strftime('%Y-%m-%dT%H:%M:%fZ','now'), verdict=?1,
              updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?2",
@@ -642,16 +620,16 @@ pub(super) fn event(
     Ok(())
 }
 
-pub(super) fn enum_col<T: FromStr<Err = anyhow::Error>>(
+pub(super) fn enum_col<T: FromStr<Err = DomainError>>(
     row: &Row<'_>,
     name: &str,
 ) -> rusqlite::Result<T> {
     let value: String = row.get(name)?;
-    value.parse().map_err(|error: anyhow::Error| {
+    value.parse().map_err(|error: DomainError| {
         rusqlite::Error::FromSqlConversionFailure(
             row.as_ref().column_index(name).unwrap_or(0),
             Type::Text,
-            std::io::Error::other(error.to_string()).into(),
+            Box::new(error),
         )
     })
 }

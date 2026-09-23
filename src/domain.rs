@@ -1,4 +1,5 @@
-use anyhow::{Context, Result, bail, ensure};
+use std::fmt;
+
 use serde::{Deserialize, Serialize};
 
 macro_rules! string_enum {
@@ -15,11 +16,14 @@ macro_rules! string_enum {
         }
 
         impl std::str::FromStr for $name {
-            type Err = anyhow::Error;
-            fn from_str(value: &str) -> Result<Self> {
+            type Err = DomainError;
+            fn from_str(value: &str) -> Result<Self, DomainError> {
                 match value {
                     $($value => Ok(Self::$variant)),+,
-                    _ => bail!("unknown {}: {value}", stringify!($name)),
+                    _ => Err(DomainError::UnknownValue {
+                        kind: stringify!($name),
+                        value: value.to_owned(),
+                    }),
                 }
             }
         }
@@ -77,8 +81,153 @@ string_enum!(CheckStatus {
     NotApplicable => "not_applicable",
 });
 
+/// A business rejection by the domain: an invalid value, a transition the
+/// task's status does not allow, or a condition that does not hold. Each
+/// variant carries only what its message needs, and `Display` is the message
+/// the CLI prints and the runtime writes to `last_error`. I/O failures are not
+/// domain errors; the layers that perform I/O convert this at their boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DomainError {
+    /// A stored or given string is not a value of the enum `kind`.
+    UnknownValue {
+        kind: &'static str,
+        value: String,
+    },
+    /// A manual transition of an in-progress task that still owns an unfinished run.
+    TaskHasUnfinishedRun {
+        action: TaskAction,
+    },
+    /// `action` is not allowed from `status`.
+    TransitionNotAllowed {
+        status: TaskStatus,
+        action: TaskAction,
+    },
+    /// A required text field is blank.
+    Blank {
+        field: &'static str,
+    },
+    /// An ID field is zero or negative.
+    NonPositiveId {
+        field: &'static str,
+    },
+    /// A goal records its verdict once.
+    GoalAlreadyClosed {
+        goal_id: i64,
+        verdict: Option<GoalVerdict>,
+    },
+    /// Tasks in `blocking` (status and count) do not allow `verdict`.
+    GoalCloseBlocked {
+        goal_id: i64,
+        verdict: GoalVerdict,
+        blocking: Vec<(TaskStatus, usize)>,
+    },
+    /// The receipt text is not a completion receipt; `reason` is the parser's.
+    MalformedReceipt {
+        reason: String,
+    },
+    ReceiptRunMismatch {
+        receipt_run_id: String,
+        run_id: String,
+    },
+    /// The agent itself reported the run as not succeeded.
+    AgentReportedResult {
+        result: ReceiptResult,
+        summary: String,
+    },
+    /// The receipt reports the check `check` as failed.
+    ReceiptCheckFailed {
+        check: &'static str,
+        evidence_or_reason: String,
+    },
+    /// The receipt claims `status` for `check` without evidence or reason.
+    ReceiptCheckUnexplained {
+        check: &'static str,
+        status: CheckStatus,
+    },
+    /// `field` is not a full Git object ID.
+    InvalidCommit {
+        field: &'static str,
+    },
+    FollowUpsNotArray,
+    /// The run has no run directory yet.
+    MissingRunDirectory,
+}
+
+impl fmt::Display for DomainError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnknownValue { kind, value } => write!(f, "unknown {kind}: {value}"),
+            Self::TaskHasUnfinishedRun { action } => write!(
+                f,
+                "task has an unfinished run; recover or integrate it before applying {action:?}"
+            ),
+            Self::TransitionNotAllowed { status, action } => write!(
+                f,
+                "cannot apply {action:?} to task in {} state",
+                status.as_str()
+            ),
+            Self::Blank { field } => write!(f, "{field} must not be blank"),
+            Self::NonPositiveId { field } => write!(f, "{field} must be positive"),
+            Self::GoalAlreadyClosed { goal_id, verdict } => write!(
+                f,
+                "goal {goal_id} is already closed as {}",
+                verdict.map_or("?", GoalVerdict::as_str)
+            ),
+            Self::GoalCloseBlocked {
+                goal_id,
+                verdict,
+                blocking,
+            } => write!(
+                f,
+                "goal {goal_id} cannot be closed as {}: {}",
+                verdict.as_str(),
+                blocking
+                    .iter()
+                    .map(|(status, n)| format!("{n} task(s) {}", status.as_str()))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            Self::MalformedReceipt { reason } => {
+                write!(f, "receipt is not a valid completion receipt: {reason}")
+            }
+            Self::ReceiptRunMismatch {
+                receipt_run_id,
+                run_id,
+            } => write!(
+                f,
+                "receipt run_id {receipt_run_id} does not match run {run_id}"
+            ),
+            Self::AgentReportedResult { result, summary } => {
+                write!(f, "agent reported result {}: {summary}", result.as_str())
+            }
+            Self::ReceiptCheckFailed {
+                check,
+                evidence_or_reason,
+            } => write!(f, "receipt reports {check} as failed: {evidence_or_reason}"),
+            Self::ReceiptCheckUnexplained { check, status } => write!(
+                f,
+                "receipt {check} is {} without evidence or reason",
+                status.as_str()
+            ),
+            Self::InvalidCommit { field } => write!(
+                f,
+                "{field}: must be a full 40- or 64-character hexadecimal Git object ID"
+            ),
+            Self::FollowUpsNotArray => f.write_str("receipt follow_ups must be an array"),
+            Self::MissingRunDirectory => f.write_str("missing run directory"),
+        }
+    }
+}
+
+impl std::error::Error for DomainError {}
+
+/// Fails with `error()` unless `condition` holds.
+fn require(condition: bool, error: impl FnOnce() -> DomainError) -> Result<(), DomainError> {
+    if condition { Ok(()) } else { Err(error()) }
+}
+
 /// User operations cannot mark a task in progress or completed.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TaskAction {
     Ready,
     Draft,
@@ -89,18 +238,21 @@ impl TaskStatus {
     /// `unfinished_run` is whether the task still owns a run that is executing,
     /// awaiting or undergoing integration, or waiting for a session. An in-progress task whose runs have all failed or
     /// been interrupted may be retried or canceled by hand; a retry is a new run.
-    pub fn transition(self, action: TaskAction, unfinished_run: bool) -> Result<Self> {
+    pub fn transition(self, action: TaskAction, unfinished_run: bool) -> Result<Self, DomainError> {
         match (self, action) {
             (Self::Draft, TaskAction::Ready) => Ok(Self::Ready),
             (Self::Ready, TaskAction::Draft) => Ok(Self::Draft),
             (Self::Draft | Self::Ready, TaskAction::Cancel) => Ok(Self::Canceled),
-            (Self::InProgress, _) if unfinished_run => bail!(
-                "task has an unfinished run; recover or integrate it before applying {action:?}"
-            ),
+            (Self::InProgress, _) if unfinished_run => {
+                Err(DomainError::TaskHasUnfinishedRun { action })
+            }
             (Self::InProgress, TaskAction::Ready) => Ok(Self::Ready),
             (Self::InProgress, TaskAction::Draft) => Ok(Self::Draft),
             (Self::InProgress, TaskAction::Cancel) => Ok(Self::Canceled),
-            _ => bail!("cannot apply {action:?} to task in {} state", self.as_str()),
+            _ => Err(DomainError::TransitionNotAllowed {
+                status: self,
+                action,
+            }),
         }
     }
 
@@ -123,6 +275,29 @@ impl GoalVerdict {
             Self::Abandoned => task != TaskStatus::InProgress,
         }
     }
+
+    /// Whether `goal`, whose tasks number `counts` by status, may be closed
+    /// with this verdict. A goal is closed once; the rejection names the
+    /// statuses that do not allow the verdict.
+    pub fn check_close(self, goal: &Goal, counts: &TaskStatusCounts) -> Result<(), DomainError> {
+        require(!goal.is_closed(), || DomainError::GoalAlreadyClosed {
+            goal_id: goal.id,
+            verdict: goal.verdict,
+        })?;
+        let blocking: Vec<(TaskStatus, usize)> = [
+            (TaskStatus::Draft, counts.draft),
+            (TaskStatus::Ready, counts.ready),
+            (TaskStatus::InProgress, counts.in_progress),
+        ]
+        .into_iter()
+        .filter(|(status, n)| *n > 0 && !self.allows(*status))
+        .collect();
+        require(blocking.is_empty(), || DomainError::GoalCloseBlocked {
+            goal_id: goal.id,
+            verdict: self,
+            blocking,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -139,26 +314,26 @@ pub struct NewTask {
 }
 
 impl NewTask {
-    pub fn validate(&self) -> Result<()> {
-        ensure!(
-            !self.title.trim().is_empty(),
-            "task title must not be blank"
-        );
-        ensure!(
+    pub fn validate(&self) -> Result<(), DomainError> {
+        require(!self.title.trim().is_empty(), || DomainError::Blank {
+            field: "task title",
+        })?;
+        require(
             self.verification_commands
                 .iter()
                 .all(|s| !s.trim().is_empty()),
-            "verification commands must not be blank"
-        );
-        ensure!(
-            self.dependencies.iter().all(|id| *id > 0),
-            "dependency IDs must be positive"
-        );
-        ensure!(
-            self.goal_id.is_none_or(|id| id > 0),
-            "goal ID must be positive"
-        );
-        Ok(())
+            || DomainError::Blank {
+                field: "verification commands",
+            },
+        )?;
+        require(self.dependencies.iter().all(|id| *id > 0), || {
+            DomainError::NonPositiveId {
+                field: "dependency IDs",
+            }
+        })?;
+        require(self.goal_id.is_none_or(|id| id > 0), || {
+            DomainError::NonPositiveId { field: "goal ID" }
+        })
     }
 }
 
@@ -210,14 +385,14 @@ pub struct NewGoal {
 }
 
 impl NewGoal {
-    pub fn validate(&self) -> Result<()> {
-        ensure!(
-            !self.title.trim().is_empty(),
-            "goal title must not be blank"
-        );
-        Ok(())
+    pub fn validate(&self) -> Result<(), DomainError> {
+        require(!self.title.trim().is_empty(), || GOAL_TITLE_BLANK)
     }
 }
+
+const GOAL_TITLE_BLANK: DomainError = DomainError::Blank {
+    field: "goal title",
+};
 
 /// Fields of a goal to replace; `None` keeps the current value. An empty
 /// `doc` clears the reference.
@@ -240,10 +415,10 @@ impl GoalEdit {
     }
 
     /// The goal as it would be after this edit.
-    pub fn apply(&self, goal: &Goal) -> Result<Goal> {
+    pub fn apply(&self, goal: &Goal) -> Result<Goal, DomainError> {
         let mut next = goal.clone();
         if let Some(title) = &self.title {
-            ensure!(!title.trim().is_empty(), "goal title must not be blank");
+            require(!title.trim().is_empty(), || GOAL_TITLE_BLANK)?;
             next.title = title.clone();
         }
         if let Some(description) = &self.description {
@@ -337,11 +512,12 @@ pub struct TaskRun {
 impl TaskRun {
     /// Written by the provider's stop hook each time the agent finishes a
     /// response; newer than the receipt means the session is idle after submitting.
-    pub fn idle_marker_path(&self) -> Result<std::path::PathBuf> {
-        Ok(
-            std::path::Path::new(self.run_dir.as_ref().context("missing run directory")?)
-                .join("idle.json"),
-        )
+    pub fn idle_marker_path(&self) -> Result<std::path::PathBuf, DomainError> {
+        let run_dir = self
+            .run_dir
+            .as_ref()
+            .ok_or(DomainError::MissingRunDirectory)?;
+        Ok(std::path::Path::new(run_dir).join("idle.json"))
     }
 }
 
@@ -488,56 +664,179 @@ pub struct ReceiptCheck {
 }
 
 impl Receipt {
-    pub fn parse(text: &str) -> Result<Self> {
-        serde_json::from_str(text).context("receipt is not a valid completion receipt")
+    pub fn parse(text: &str) -> Result<Self, DomainError> {
+        serde_json::from_str(text).map_err(|error| DomainError::MalformedReceipt {
+            reason: error.to_string(),
+        })
     }
 
     /// Structural consistency only; Git state and verification commands are checked by the supervisor.
-    pub fn check(&self, run_id: &str) -> Result<()> {
-        ensure!(
-            self.run_id == run_id,
-            "receipt run_id {} does not match run {run_id}",
-            self.run_id
-        );
-        ensure!(
-            self.result == ReceiptResult::Succeeded,
-            "agent reported result {}: {}",
-            self.result.as_str(),
-            self.summary
-        );
+    pub fn check(&self, run_id: &str) -> Result<(), DomainError> {
+        require(self.run_id == run_id, || DomainError::ReceiptRunMismatch {
+            receipt_run_id: self.run_id.clone(),
+            run_id: run_id.to_owned(),
+        })?;
+        require(self.result == ReceiptResult::Succeeded, || {
+            DomainError::AgentReportedResult {
+                result: self.result,
+                summary: self.summary.clone(),
+            }
+        })?;
         for (name, check) in [
             ("tests", &self.tests),
             ("e2e", &self.e2e),
             ("subagent_review", &self.subagent_review),
         ] {
-            ensure!(
-                check.status != CheckStatus::Failed,
-                "receipt reports {name} as failed: {}",
-                check.evidence_or_reason
-            );
-            ensure!(
-                !check.evidence_or_reason.trim().is_empty(),
-                "receipt {name} is {} without evidence or reason",
-                check.status.as_str()
-            );
+            require(check.status != CheckStatus::Failed, || {
+                DomainError::ReceiptCheckFailed {
+                    check: name,
+                    evidence_or_reason: check.evidence_or_reason.clone(),
+                }
+            })?;
+            require(!check.evidence_or_reason.trim().is_empty(), || {
+                DomainError::ReceiptCheckUnexplained {
+                    check: name,
+                    status: check.status,
+                }
+            })?;
         }
-        validate_commit(&self.commit).context("receipt commit")?;
-        ensure!(
+        validate_commit(&self.commit, "receipt commit")?;
+        require(
             self.follow_ups.as_ref().is_none_or(|f| f.is_array()),
-            "receipt follow_ups must be an array"
-        );
-        Ok(())
+            || DomainError::FollowUpsNotArray,
+        )
     }
 }
 
-pub fn validate_base_commit(commit: &str) -> Result<()> {
-    validate_commit(commit).context("base commit")
+pub fn validate_base_commit(commit: &str) -> Result<(), DomainError> {
+    validate_commit(commit, "base commit")
 }
 
-fn validate_commit(commit: &str) -> Result<()> {
-    ensure!(
+fn validate_commit(commit: &str, field: &'static str) -> Result<(), DomainError> {
+    require(
         matches!(commit.len(), 40 | 64) && commit.bytes().all(|c| c.is_ascii_hexdigit()),
-        "must be a full 40- or 64-character hexadecimal Git object ID"
-    );
-    Ok(())
+        || DomainError::InvalidCommit { field },
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn goal(verdict: Option<GoalVerdict>) -> Goal {
+        Goal {
+            id: 7,
+            title: "g".into(),
+            description: String::new(),
+            acceptance: String::new(),
+            constraints: String::new(),
+            doc: None,
+            closed_at: verdict.map(|_| "2026-09-23T00:00:00Z".into()),
+            verdict,
+            created_at: String::new(),
+            updated_at: String::new(),
+        }
+    }
+
+    #[test]
+    fn rejections_carry_their_facts_and_keep_the_cli_messages() {
+        assert_eq!(
+            "bogus".parse::<TaskStatus>(),
+            Err(DomainError::UnknownValue {
+                kind: "TaskStatus",
+                value: "bogus".into()
+            })
+        );
+        assert_eq!(
+            "x".parse::<GoalVerdict>().unwrap_err().to_string(),
+            "unknown GoalVerdict: x"
+        );
+        let error = TaskStatus::Completed
+            .transition(TaskAction::Ready, false)
+            .unwrap_err();
+        assert_eq!(
+            error,
+            DomainError::TransitionNotAllowed {
+                status: TaskStatus::Completed,
+                action: TaskAction::Ready
+            }
+        );
+        assert_eq!(
+            error.to_string(),
+            "cannot apply Ready to task in completed state"
+        );
+        assert_eq!(
+            TaskStatus::InProgress
+                .transition(TaskAction::Cancel, true)
+                .unwrap_err()
+                .to_string(),
+            "task has an unfinished run; recover or integrate it before applying Cancel"
+        );
+        let task = NewTask {
+            title: "t".into(),
+            description: String::new(),
+            acceptance: String::new(),
+            verification_commands: vec![],
+            dependencies: vec![0],
+            goal_id: None,
+            context: String::new(),
+        };
+        assert_eq!(
+            task.validate().unwrap_err().to_string(),
+            "dependency IDs must be positive"
+        );
+        let edit = GoalEdit {
+            title: Some(" ".into()),
+            ..GoalEdit::default()
+        };
+        assert_eq!(
+            edit.apply(&goal(None)).unwrap_err().to_string(),
+            "goal title must not be blank"
+        );
+        assert_eq!(
+            validate_base_commit("abc").unwrap_err().to_string(),
+            "base commit: must be a full 40- or 64-character hexadecimal Git object ID"
+        );
+        assert!(
+            Receipt::parse("{}")
+                .unwrap_err()
+                .to_string()
+                .starts_with("receipt is not a valid completion receipt: ")
+        );
+    }
+
+    #[test]
+    fn a_goal_closes_once_and_only_when_its_tasks_allow_the_verdict() {
+        let mut counts = TaskStatusCounts::default();
+        counts.count(TaskStatus::Ready, 2);
+        counts.count(TaskStatus::InProgress, 1);
+        assert_eq!(
+            GoalVerdict::Achieved
+                .check_close(&goal(None), &counts)
+                .unwrap_err()
+                .to_string(),
+            "goal 7 cannot be closed as achieved: 2 task(s) ready, 1 task(s) in_progress"
+        );
+        assert_eq!(
+            GoalVerdict::Abandoned
+                .check_close(&goal(None), &counts)
+                .unwrap_err(),
+            DomainError::GoalCloseBlocked {
+                goal_id: 7,
+                verdict: GoalVerdict::Abandoned,
+                blocking: vec![(TaskStatus::InProgress, 1)]
+            }
+        );
+        counts.in_progress = 0;
+        GoalVerdict::Abandoned
+            .check_close(&goal(None), &counts)
+            .unwrap();
+        assert_eq!(
+            GoalVerdict::Abandoned
+                .check_close(&goal(Some(GoalVerdict::Achieved)), &counts)
+                .unwrap_err()
+                .to_string(),
+            "goal 7 is already closed as achieved"
+        );
+    }
 }

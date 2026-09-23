@@ -51,9 +51,33 @@ related:
 - `RunEvent.run_id`はtask登録・依存変更などrun作成前のイベントではnullになる。goal単位のイベント（`goal_created`、`goal_updated`、`goal_closed`）は`task_id`がnullで`goal_id`を持ち、`goal show`に並ぶ。`task_goal_changed`はtaskのイベントで、`from`と`to`にgoal IDを持つ。
 - `goal add`でgoalを作り、`add --goal ID`と`set-goal TASK GOAL`でtaskを所属させ、`set-goal TASK --none`で外す。所属の変更は依存の追加・削除と同じくdraft/readyのtaskだけに許し、閉じたgoalへの追加と付け替えは拒否する。`task_created`のpayloadは`goal_id`を持ち、`set-goal`は変化があったときだけ`task_goal_changed`を記録する。
 - `goal edit`はtitle、description、acceptance、constraints、docを差し替え、`goal_updated`のpayloadに`old`と`new`のgoal全体を残す。閉じたgoalも編集できる（記録の訂正のため）。走行中のrunは`prompt.txt`のスナップショットのままで、次のclaimから新しい記述が使われる。
-- `goal close ID --verdict achieved|abandoned`はverdictを1回だけ記録する。`achieved`は所属taskに`completed` / `canceled`以外があれば拒否し、`abandoned`は`in_progress`があれば拒否する（`GoalVerdict::allows`）。閉じたgoalを再び閉じることはできず、続きは新しいgoalに登録する。`goal_closed`のpayloadはverdictとclose時点のstatus別件数を持つ。
+- `goal close ID --verdict achieved|abandoned`はverdictを1回だけ記録する。`achieved`は所属taskに`completed` / `canceled`以外があれば拒否し、`abandoned`は`in_progress`があれば拒否する（`GoalVerdict::allows`、判断の入口は`GoalVerdict::check_close`）。閉じたgoalを再び閉じることはできず、続きは新しいgoalに登録する。`goal_closed`のpayloadはverdictとclose時点のstatus別件数を持つ。
 - `goal list`はgoalごとに`closed`、`verdict`、所属taskのstatus別件数（`TaskStatusCounts`）を返し、`goal show`はgoal、所属taskのid/title/status、goalのイベントを返す。
 - scheduling（`candidates`、`claim`）はgoalを見ない。ID順のまま、goalをまたぐ依存も許す。
+
+## DomainError
+
+domainの関数は業務上の拒否を`DomainError`（`src/domain.rs`）で返す。`std::error::Error`と`Display`を実装し、`anyhow`・`rusqlite`などI/OやDBのライブラリには依存しない。I/Oを行うapplication / infrastructure / runtimeは境界で`?`により`anyhow::Error`へ変換し、原因の説明が要る場所だけ`context`を足す。`Display`はCLIが`{"error": ...}`に出す文、runtimeが`last_error`に書く文そのもので、`DomainError`の導入前の文字列と一致する。variantは業務上の拒否だけで、汎用の`Other(String)`は持たない。
+
+| variant | 返す関数 | 持つ情報 | `Display` |
+| --- | --- | --- | --- |
+| `UnknownValue` | `string_enum!`の`FromStr`（`TaskStatus`、`RunStatus`、`Provider`、`SupervisorMode`、`GoalVerdict`、`ReceiptResult`、`CheckStatus`） | enum名、値 | `unknown <Enum>: <value>` |
+| `TaskHasUnfinishedRun` | `TaskStatus::transition` | action | `task has an unfinished run; recover or integrate it before applying <Action>` |
+| `TransitionNotAllowed` | `TaskStatus::transition` | 現在のstatus、action | `cannot apply <Action> to task in <status> state` |
+| `Blank` | `NewTask::validate`、`NewGoal::validate`、`GoalEdit::apply` | field名（`task title`、`verification commands`、`goal title`） | `<field> must not be blank` |
+| `NonPositiveId` | `NewTask::validate` | field名（`dependency IDs`、`goal ID`） | `<field> must be positive` |
+| `GoalAlreadyClosed` | `GoalVerdict::check_close` | goal ID、記録済みのverdict | `goal <id> is already closed as <verdict>` |
+| `GoalCloseBlocked` | `GoalVerdict::check_close` | goal ID、verdict、verdictを許さないstatusと件数 | `goal <id> cannot be closed as <verdict>: <n> task(s) <status>, ...` |
+| `MalformedReceipt` | `Receipt::parse` | パーサーの理由 | `receipt is not a valid completion receipt: <reason>` |
+| `ReceiptRunMismatch` | `Receipt::check` | receiptのrun_id、runのID | `receipt run_id <a> does not match run <b>` |
+| `AgentReportedResult` | `Receipt::check` | result、summary | `agent reported result <result>: <summary>` |
+| `ReceiptCheckFailed` | `Receipt::check` | check名、evidence_or_reason | `receipt reports <check> as failed: <evidence>` |
+| `ReceiptCheckUnexplained` | `Receipt::check` | check名、status | `receipt <check> is <status> without evidence or reason` |
+| `InvalidCommit` | `Receipt::check`、`validate_base_commit` | field名（`receipt commit`、`base commit`） | `<field>: must be a full 40- or 64-character hexadecimal Git object ID` |
+| `FollowUpsNotArray` | `Receipt::check` | なし | `receipt follow_ups must be an array` |
+| `MissingRunDirectory` | `TaskRun::idle_marker_path` | なし | `missing run directory` |
+
+`goal close`の判断（閉じたgoalは閉じられない、verdictが所属taskのstatusを許すか）は`GoalVerdict::check_close`が持ち、`SqliteQueue::close_goal`はgoalとstatus別件数を読んで渡し、結果を書くだけである。DBに保存された文字列が既知のenum値でないときは、`enum_col`が`UnknownValue`を`rusqlite`の変換エラーの原因として包む。
 
 ## Invariants
 
