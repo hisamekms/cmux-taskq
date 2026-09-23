@@ -9,6 +9,7 @@ use crate::{
     domain::{
         ClaimOutcome, Goal, IntegrationOutcome, Predecessor, Receipt, ReceiptResult, RunLease,
         RunPaths, RunProcess, RunStatus, SupervisorMode, SupervisorRegistration, Task, TaskRun,
+        heartbeat_stale,
     },
     infrastructure::{
         adapters::{
@@ -1704,9 +1705,14 @@ pub struct DoctorReport {
 }
 
 /// Registered supervisors, lease holders and the unfinished runs with their
-/// leases, without inspecting the runs' processes.
+/// leases, without inspecting the runs' processes, plus what waits for the
+/// maintainer (`attention`) and the newest event id (`cursor`) to `watch`
+/// from (ADR-0016).
 pub fn status(db: &Path) -> Result<Value> {
     let queue = SqliteQueue::open(db)?;
+    // Read before the state it describes, so a transition in between is
+    // seen again by `watch --after cursor` rather than missed.
+    let cursor = queue.latest_event_id()?;
     let now = unix_time();
     let registrations = queue.supervisors()?;
     let leases = queue.run_leases()?;
@@ -1732,6 +1738,8 @@ pub fn status(db: &Path) -> Result<Value> {
         "checked_at": now,
         "supervisors": supervisors(&registrations, &leases, now),
         "runs": runs,
+        "attention": crate::watch::attention(&queue, &registrations, now)?,
+        "cursor": cursor,
     }))
 }
 
@@ -1808,7 +1816,7 @@ fn lease_health(lease: &RunLease, now: i64) -> LeaseHealth {
 
 /// Registered supervisors in registration order, then any other lease
 /// holder (an `integrate` process) in lease order; leases join by token.
-fn supervisors(
+pub(crate) fn supervisors(
     registrations: &[SupervisorRegistration],
     leases: &[RunLease],
     now: i64,
@@ -1827,7 +1835,7 @@ fn supervisors(
             started_at: registration.map(|r| r.started_at),
             heartbeat_at,
             heartbeat_age_secs: age,
-            stale: !alive || age > HEARTBEAT_TIMEOUT_SECS,
+            stale: heartbeat_stale(alive, age),
             run_ids: Vec::new(),
         }
     };
@@ -1855,7 +1863,7 @@ fn supervisors(
             if age < entry.heartbeat_age_secs {
                 entry.heartbeat_at = lease.heartbeat_at;
                 entry.heartbeat_age_secs = age;
-                entry.stale = !entry.alive || age > HEARTBEAT_TIMEOUT_SECS;
+                entry.stale = heartbeat_stale(entry.alive, age);
             }
         }
     }

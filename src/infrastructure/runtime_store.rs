@@ -6,14 +6,14 @@ use serde_json::json;
 
 use super::{
     adapters::process_alive,
-    sqlite::{SqliteQueue, claim_task, enum_col, event, read_task, run_row},
+    sqlite::{SqliteQueue, claim_task, enum_col, event, event_row, read_task, run_row},
 };
 use crate::domain::{
-    ClaimOutcome, RunLease, RunProcess, SupervisorMode, SupervisorRegistration, Task, TaskRun,
-    validate_base_commit,
+    ClaimOutcome, RunEvent, RunLease, RunProcess, SupervisorMode, SupervisorRegistration, Task,
+    TaskRun, validate_base_commit,
 };
 
-pub const HEARTBEAT_TIMEOUT_SECS: i64 = 30;
+pub use crate::domain::HEARTBEAT_TIMEOUT_SECS;
 
 /// Whether a lease no longer has a working process behind it: its pid is
 /// dead or its heartbeat is older than `HEARTBEAT_TIMEOUT_SECS`. The rule
@@ -762,6 +762,65 @@ impl SqliteQueue {
         )?;
         tx.commit()?;
         Ok(result)
+    }
+
+    /// The newest `run_events` id, 0 for an empty queue: the cursor that
+    /// `status` hands out and `watch` starts from.
+    pub fn latest_event_id(&self) -> Result<i64> {
+        Ok(self
+            .conn
+            .query_row("SELECT COALESCE(MAX(id),0) FROM run_events", [], |r| {
+                r.get(0)
+            })?)
+    }
+
+    /// Events with `after < id <= upto`, oldest first, at most `limit`;
+    /// `kinds` narrows them to those kinds. A pure read.
+    pub fn events_between(
+        &self,
+        after: i64,
+        upto: i64,
+        kinds: Option<&[&str]>,
+        limit: usize,
+    ) -> Result<Vec<RunEvent>> {
+        let kinds = kinds.map(serde_json::to_string).transpose()?;
+        Ok(self
+            .conn
+            .prepare(
+                "SELECT * FROM run_events WHERE id>?1 AND id<=?2
+                 AND (?3 IS NULL OR kind IN (SELECT value FROM json_each(?3)))
+                 ORDER BY id LIMIT ?4",
+            )?
+            .query_map(
+                params![after, upto, kinds, i64::try_from(limit)?],
+                event_row,
+            )?
+            .collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Every event of one run, oldest first.
+    pub fn run_events(&self, id: &str) -> Result<Vec<RunEvent>> {
+        Ok(self
+            .conn
+            .prepare("SELECT * FROM run_events WHERE run_id=?1 ORDER BY id")?
+            .query_map([id], event_row)?
+            .collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// The latest run of every `in_progress` task, oldest first: the runs
+    /// `status` judges for attention. An older run of a retried task is
+    /// history, and a completed or canceled task needs nobody.
+    pub fn latest_runs_in_progress(&self) -> Result<Vec<TaskRun>> {
+        Ok(self
+            .conn
+            .prepare(
+                "SELECT r.* FROM task_runs r JOIN tasks t ON t.id=r.task_id
+                 WHERE t.status='in_progress'
+                 AND r.rowid=(SELECT MAX(rowid) FROM task_runs WHERE task_id=r.task_id)
+                 ORDER BY r.rowid",
+            )?
+            .query_map([], run_row(&self.runs_dir))?
+            .collect::<rusqlite::Result<_>>()?)
     }
 
     /// Every run in one status, oldest first; `up` reports the runs that

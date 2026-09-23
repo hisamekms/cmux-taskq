@@ -187,8 +187,32 @@ enum Command {
         #[arg(long)]
         repo: Option<PathBuf>,
     },
-    /// List live supervisors and unfinished runs with their leases without changing anything.
+    /// List supervisors, unfinished runs, what waits for the maintainer (attention) and the event cursor, without changing anything.
     Status,
+    /// Print the run events after a cursor, oldest first: attention events only unless --all. Reads only.
+    Events {
+        /// Event id to read past (the `cursor` of `status`, `events` or `watch`).
+        #[arg(long, default_value_t = 0)]
+        after: i64,
+        /// Maximum number of events returned; the cursor then points at the last one.
+        #[arg(long, default_value_t = 100, value_parser = clap::value_parser!(u32).range(1..))]
+        limit: u32,
+        /// Every event kind, not only attention.
+        #[arg(long)]
+        all: bool,
+    },
+    /// Block until an attention event after the cursor arrives or the supervisors' health changes; returns empty on timeout. Reads only, never integrates.
+    Watch {
+        /// Event id to wait past; defaults to the newest event now.
+        #[arg(long)]
+        after: Option<i64>,
+        /// Seconds to wait before returning with no events.
+        #[arg(long, default_value_t = 600)]
+        timeout: u64,
+        /// Seconds between reads of the queue.
+        #[arg(long, default_value_t = 2, value_parser = clap::value_parser!(u64).range(1..))]
+        interval: u64,
+    },
     /// Report every unfinished run with its lease, processes, heartbeats and paths without changing state.
     Doctor,
     /// Mark one unfinished run interrupted once its processes and supervisor are gone; keeps its worktree and workspace and leaves other runs alone.
@@ -401,6 +425,21 @@ fn execute(cli: Cli) -> Result<Value> {
         } => serde_json::to_value(queue.set_goal(task, goal)?)?,
         Command::Candidates => serde_json::to_value(queue.candidates()?)?,
         Command::Status => dagq::runtime::status(&db)?,
+        Command::Events { after, limit, all } => {
+            dagq::watch::events(&db, after, limit as usize, all)?
+        }
+        Command::Watch {
+            after,
+            timeout,
+            interval,
+        } => dagq::watch::watch(
+            &db,
+            &dagq::watch::WatchOptions {
+                after,
+                timeout: Duration::from_secs(timeout),
+                interval: Duration::from_secs(interval),
+            },
+        )?,
         Command::Supervise {
             repo,
             parallel,

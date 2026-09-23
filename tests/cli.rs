@@ -85,11 +85,16 @@ fn reads_do_not_create_a_queue_and_unknown_tasks_fail() {
             checked_at.is_some_and(|value| value.is_u64()),
             "{command} reports checked_at as unix seconds"
         );
-        assert_eq!(
-            report,
-            serde_json::json!({"supervisors": [], "runs": []}),
-            "{command}"
-        );
+        let mut expected = serde_json::json!({"supervisors": [], "runs": []});
+        if command == "status" {
+            // Nothing supervises a fresh queue; no event exists yet.
+            expected["attention"] = serde_json::json!([{
+                "run_id": null, "task_id": null, "status": "stopped",
+                "kind": "supervisor_stopped", "last_error": null, "next": "restart supervisor",
+            }]);
+            expected["cursor"] = serde_json::json!(0);
+        }
+        assert_eq!(report, expected, "{command}");
     }
     assert!(!invoke(&db, &["recover", "missing-run"]).status.success());
     assert!(!invoke(&db, &["show", "1"]).status.success());
@@ -324,4 +329,45 @@ fn list_options_filter_page_and_expand_tasks() {
     assert!(output.stdout.is_empty());
     let error: Value = serde_json::from_slice(&output.stderr).unwrap();
     assert!(error["error"].as_str().unwrap().contains("done"));
+}
+
+#[test]
+fn events_and_watch_read_past_a_cursor() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("queue.db");
+    ok(&db, &["init"]);
+    ok(&db, &["add", "first"]);
+    ok(&db, &["add", "second"]);
+    let cursor = ok(&db, &["status"])["cursor"].as_i64().unwrap();
+    assert!(cursor >= 2);
+    // Registering tasks is no attention; --all shows every kind, oldest first.
+    assert_eq!(
+        ok(&db, &["events", "--after", "0"]),
+        serde_json::json!({"events": [], "cursor": cursor})
+    );
+    let all = ok(&db, &["events", "--after", "0", "--all", "--limit", "1"]);
+    assert_eq!(all["events"].as_array().unwrap().len(), 1);
+    assert_eq!(all["events"][0]["kind"], "task_created");
+    assert_eq!(all["events"][0]["task_id"], 1);
+    let first = all["cursor"].as_i64().unwrap();
+    assert_eq!(first, all["events"][0]["id"].as_i64().unwrap());
+    let rest = ok(&db, &["events", "--after", &first.to_string(), "--all"]);
+    assert_eq!(rest["events"][0]["task_id"], 2);
+    assert_eq!(rest["cursor"], cursor);
+    assert!(!invoke(&db, &["events", "--limit", "0"]).status.success());
+
+    // With nothing to report, watch times out empty with the cursor unchanged.
+    let started = std::time::Instant::now();
+    let quiet = ok(
+        &db,
+        &["watch", "--after", "0", "--timeout", "1", "--interval", "1"],
+    );
+    assert!(started.elapsed() >= std::time::Duration::from_secs(1));
+    assert_eq!(
+        quiet,
+        serde_json::json!({"events": [], "supervisors_changed": false, "supervisors": [], "cursor": 0})
+    );
+    let quiet = ok(&db, &["watch", "--timeout", "0"]);
+    assert_eq!(quiet["cursor"], cursor);
+    assert!(!invoke(&db, &["watch", "--interval", "0"]).status.success());
 }

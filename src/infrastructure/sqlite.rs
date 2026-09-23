@@ -819,7 +819,7 @@ fn stored_run_row(row: &Row<'_>) -> rusqlite::Result<TaskRun> {
     })
 }
 
-fn event_row(row: &Row<'_>) -> rusqlite::Result<RunEvent> {
+pub(super) fn event_row(row: &Row<'_>) -> rusqlite::Result<RunEvent> {
     Ok(RunEvent {
         id: row.get("id")?,
         task_id: row.get("task_id")?,

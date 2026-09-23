@@ -4154,3 +4154,244 @@ fn a_supervisor_that_lost_its_lease_stops_touching_the_run() {
     assert_eq!(adopted[0]["previous_token"], "taken");
     assert!(queue.supervisors().unwrap().is_empty());
 }
+
+fn watch_for(db: &Path, after: Option<i64>, timeout: Duration) -> Value {
+    use dagq::watch::{WatchOptions, watch};
+    watch(
+        db,
+        &WatchOptions {
+            after,
+            timeout,
+            interval: Duration::from_millis(50),
+        },
+    )
+    .unwrap()
+}
+
+/// `watch` in a thread, started once it has read its baseline.
+fn spawn_watch(db: &Path, after: Option<i64>) -> thread::JoinHandle<Value> {
+    let db = db.to_owned();
+    let handle = thread::spawn(move || watch_for(&db, after, Duration::from_secs(20)));
+    thread::sleep(Duration::from_millis(300));
+    handle
+}
+
+fn run_attention_of<'a>(status: &'a Value, run_id: &str) -> Option<&'a Value> {
+    status["attention"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["run_id"] == run_id)
+}
+
+#[test]
+fn attention_events_are_read_past_a_cursor_and_wake_watch() {
+    let (_dir, repo, db, run) = awaiting_run();
+    let queue = SqliteQueue::open(&db).unwrap();
+    let latest = queue.latest_event_id().unwrap();
+
+    // `status` derives the attention from the queue as it is now.
+    let status = runtime::status(&db).unwrap();
+    assert_eq!(status["cursor"], json!(latest));
+    assert_eq!(
+        run_attention_of(&status, &run.id).unwrap(),
+        &json!({
+            "run_id": run.id, "task_id": 1, "status": "awaiting_integration",
+            "kind": "validation_finished", "last_error": null, "next": "review and integrate",
+        })
+    );
+    // `supervise --once` exited, so nothing supervises the queue.
+    assert_eq!(status["attention"][0]["kind"], "supervisor_stopped");
+    assert_eq!(status["attention"][0]["next"], "restart supervisor");
+
+    // `events` defaults to attention, compact and without paths.
+    let events = dagq::watch::events(&db, 0, 100, false).unwrap();
+    assert_eq!(events["cursor"], json!(latest));
+    let listed = events["events"].as_array().unwrap();
+    assert_eq!(listed.len(), 1, "{events}");
+    assert_eq!(listed[0]["kind"], "validation_finished");
+    assert_eq!(listed[0]["status"], "awaiting_integration");
+    assert_eq!(listed[0]["next"], "review and integrate");
+    assert_eq!(listed[0]["run_id"], json!(run.id));
+    let all = dagq::watch::events(&db, 0, 1000, true).unwrap();
+    let all_events = all["events"].as_array().unwrap();
+    assert_eq!(all_events.len() as i64, latest);
+    assert_eq!(all["cursor"], json!(latest));
+    let ids: Vec<i64> = all_events
+        .iter()
+        .map(|e| e["id"].as_i64().unwrap())
+        .collect();
+    assert!(ids.windows(2).all(|w| w[0] < w[1]), "oldest first");
+    let text = all.to_string();
+    assert!(
+        !text.contains(run.worktree_path.as_deref().unwrap()),
+        "{text}"
+    );
+    assert!(!text.contains("\"receipt\""), "{text}");
+    // A limit leaves the cursor on the last event returned.
+    let page = dagq::watch::events(&db, 0, 2, true).unwrap();
+    assert_eq!(page["events"].as_array().unwrap().len(), 2);
+    assert_eq!(page["cursor"], json!(ids[1]));
+    let rest = dagq::watch::events(&db, ids[1], 1000, true).unwrap();
+    assert_eq!(rest["events"][0]["id"], json!(ids[2]));
+    assert_eq!(
+        dagq::watch::events(&db, latest, 100, false).unwrap(),
+        json!({"events": [], "cursor": latest})
+    );
+
+    // An attention event already past the cursor returns at once.
+    let started = Instant::now();
+    let woke = watch_for(&db, Some(0), Duration::from_secs(20));
+    assert!(started.elapsed() < Duration::from_secs(5));
+    assert_eq!(woke["events"], events["events"]);
+    assert_eq!(woke["cursor"], json!(latest));
+    assert_eq!(woke["supervisors_changed"], false);
+    assert_eq!(woke["supervisors"], json!([]));
+    // Nothing new: the timeout returns empty and keeps the cursor.
+    let started = Instant::now();
+    let quiet = watch_for(&db, Some(latest), Duration::from_millis(300));
+    assert!(started.elapsed() >= Duration::from_millis(300));
+    assert_eq!(
+        quiet,
+        json!({"events": [], "supervisors_changed": false, "supervisors": [], "cursor": latest})
+    );
+
+    // A landing parked for a session wakes a watch started before it, and
+    // the non-attention events around it do not.
+    let watcher = spawn_watch(&db, None);
+    fs::remove_file(run.receipt_path.as_ref().unwrap()).unwrap();
+    assert_eq!(
+        integrate(&db, 1, &repo).unwrap()["outcome"],
+        "needs_session"
+    );
+    let woke = watcher.join().unwrap();
+    let woke_events = woke["events"].as_array().unwrap();
+    assert_eq!(woke_events.len(), 1, "{woke}");
+    assert_eq!(woke_events[0]["kind"], "integration_deferred");
+    assert_eq!(woke_events[0]["status"], "needs_session");
+    assert_eq!(woke_events[0]["next"], "resume session");
+    assert!(
+        woke_events[0]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("receipt is missing")
+    );
+    let latest = queue.latest_event_id().unwrap();
+    assert_eq!(woke["cursor"], json!(latest));
+    let status = runtime::status(&db).unwrap();
+    let parked = run_attention_of(&status, &run.id).unwrap();
+    assert_eq!(parked["status"], "needs_session");
+    assert_eq!(parked["kind"], "integration_deferred");
+    assert_eq!(parked["next"], "resume session");
+    assert!(
+        parked["last_error"]
+            .as_str()
+            .unwrap()
+            .contains("receipt is missing")
+    );
+    assert_eq!(status["cursor"], json!(latest));
+
+    // A canceled task needs nobody, whatever its last run was.
+    Connection::open(&db)
+        .unwrap()
+        .execute("UPDATE tasks SET status='canceled' WHERE id=1", [])
+        .unwrap();
+    assert!(run_attention_of(&runtime::status(&db).unwrap(), &run.id).is_none());
+}
+
+#[test]
+fn status_reports_failed_runs_and_unanswered_exit_requests() {
+    let (_dir, db, detail) = run_agent("commit work; receipt \"$(git rev-parse HEAD)\"; exit 7");
+    let run = &detail.runs[0];
+    let status = runtime::status(&db).unwrap();
+    let failed = run_attention_of(&status, &run.id).unwrap();
+    assert_eq!(failed["status"], "failed");
+    assert_eq!(failed["kind"], "supervision_finished");
+    assert_eq!(failed["last_error"], "session exited with code 7");
+    assert_eq!(failed["next"], "inspect and close workspace");
+    let events = dagq::watch::events(&db, 0, 100, false).unwrap();
+    assert_eq!(events["events"][0]["kind"], "supervision_finished");
+    assert_eq!(events["events"][0]["exit_code"], 7);
+
+    // A running run whose /exit request went unanswered, until its session exits.
+    let (_dir, repo, db) = fixture();
+    let pid = std::process::id();
+    let orphan = orphan_run(&repo, &db, "owner", pid, pid);
+    assert!(run_attention_of(&runtime::status(&db).unwrap(), &orphan.id).is_none());
+    let mut queue = SqliteQueue::open(&db).unwrap();
+    let watcher = spawn_watch(&db, None);
+    queue
+        .record_runtime_event(
+            &orphan.id,
+            "exit_request_timed_out",
+            json!({"workspace_id": "ws-1", "timeout_secs": 120}),
+        )
+        .unwrap();
+    let woke = watcher.join().unwrap();
+    assert_eq!(woke["events"][0]["kind"], "exit_request_timed_out");
+    assert_eq!(woke["events"][0]["next"], "send /exit");
+    let status = runtime::status(&db).unwrap();
+    let pending = run_attention_of(&status, &orphan.id).unwrap();
+    assert_eq!(pending["status"], "running");
+    assert_eq!(pending["next"], "send /exit");
+    queue.wrapper_exited(&orphan.id, pid, 0).unwrap();
+    assert!(run_attention_of(&runtime::status(&db).unwrap(), &orphan.id).is_none());
+}
+
+#[test]
+fn watch_returns_when_supervisor_registrations_or_health_change() {
+    let (_dir, _repo, db) = fixture();
+    let mut queue = SqliteQueue::open(&db).unwrap();
+    let cursor = queue.latest_event_id().unwrap();
+    let pid = std::process::id();
+
+    // A supervisor registers.
+    let watcher = spawn_watch(&db, Some(cursor));
+    queue.register_supervisor("first", pid, 2, VERSION).unwrap();
+    let woke = watcher.join().unwrap();
+    assert_eq!(woke["events"], json!([]));
+    assert_eq!(woke["supervisors_changed"], true);
+    assert_eq!(woke["cursor"], json!(cursor));
+    assert_eq!(woke["supervisors"][0]["pid"], json!(pid));
+    assert_eq!(woke["supervisors"][0]["stale"], false);
+    // A healthy supervisor clears the stopped attention.
+    let status = runtime::status(&db).unwrap();
+    assert!(
+        status["attention"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|a| a["next"] != "restart supervisor"),
+        "{status}"
+    );
+
+    // Its heartbeat goes stale.
+    let watcher = spawn_watch(&db, Some(cursor));
+    Connection::open(&db)
+        .unwrap()
+        .execute("UPDATE supervisors SET heartbeat_at=0", [])
+        .unwrap();
+    let woke = watcher.join().unwrap();
+    assert_eq!(woke["supervisors_changed"], true);
+    assert_eq!(woke["supervisors"][0]["stale"], true);
+    let status = runtime::status(&db).unwrap();
+    assert_eq!(status["attention"][0]["kind"], "supervisor_stale");
+    assert_eq!(status["attention"][0]["status"], "stale");
+    assert_eq!(status["attention"][0]["pid"], json!(pid));
+    assert_eq!(status["attention"][0]["next"], "restart supervisor");
+
+    // A stale supervisor that stays stale does not wake a watch.
+    let quiet = watch_for(&db, Some(cursor), Duration::from_millis(300));
+    assert_eq!(quiet["supervisors_changed"], false);
+
+    // Its registration disappears.
+    let watcher = spawn_watch(&db, Some(cursor));
+    assert!(queue.deregister_supervisor("first").unwrap());
+    let woke = watcher.join().unwrap();
+    assert_eq!(woke["supervisors_changed"], true);
+    assert_eq!(woke["supervisors"], json!([]));
+    assert_eq!(
+        runtime::status(&db).unwrap()["attention"][0]["kind"],
+        "supervisor_stopped"
+    );
+}

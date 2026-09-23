@@ -51,7 +51,7 @@ ready task (dependencies completed)
 
 ## Implementation status
 
-ステップ3で`claim`から`running`、セッション終了検知までを、ステップ4の[005](../journal/005-receipt-validation.md)でreceiptの検証と`awaiting_integration`への遷移を、[006](../journal/006-workspace-close.md)で受理後のworkspace終了を、[007](../journal/007-session-exit-request.md)でreceipt受領後の終了要求を、[009](../journal/009-doctor-recover.md)で`doctor`/`recover`を、[008](../journal/008-integration-confirm.md)で統合確認`integrate`と`completed`への遷移を`src/runtime.rs`に実装した。ステップ6の[017](../journal/017-parallel-runs.md)（[ADR-0007](../adr/0007-run-level-leases-parallel-execution.md)）でleaseをrun単位にし、`supervise`を上限付き並列の常駐ループにした。ステップ7の[018](../journal/018-merge-queue.md)（[ADR-0008](../adr/0008-merge-queue-squash-landing.md)）で`integrate`を手動mergeの確認からruntimeによる着地（rebase → 再検証 → squash）に置き換えた。[021](../journal/021-maintainer-up-down.md)で`up` / `down`（`src/lifecycle.rs`）、launchdによる常駐、`supervise --log-dir`、maintainer promptを足した。task 24（[ADR-0012](../adr/0012-adopt-stale-lease-of-live-wrapper.md)）で、supervisorが死んだ後もwrapperが生きているrunを次のsupervisorが引き継ぐ（adopt）ようにした。[ADR-0011](../adr/0011-cmux-socket-password-and-in-cmux-fallback.md)のtask 21で`up`にcmux外接続のpreflightを、task 22で`up --in-cmux`（launchdなしのfallback）と`supervisors.mode`を足した。task 30（[ADR-0014](../adr/0014-up-replaces-a-supervisor-of-another-binary-version.md)）で`supervisors.binary_version`を足し、`up`がversionの違うliveなsupervisorをdrainして入れ替えるようにした（`--no-wait`は走行中のrunがあれば入れ替えない）。
+ステップ3で`claim`から`running`、セッション終了検知までを、ステップ4の[005](../journal/005-receipt-validation.md)でreceiptの検証と`awaiting_integration`への遷移を、[006](../journal/006-workspace-close.md)で受理後のworkspace終了を、[007](../journal/007-session-exit-request.md)でreceipt受領後の終了要求を、[009](../journal/009-doctor-recover.md)で`doctor`/`recover`を、[008](../journal/008-integration-confirm.md)で統合確認`integrate`と`completed`への遷移を`src/runtime.rs`に実装した。ステップ6の[017](../journal/017-parallel-runs.md)（[ADR-0007](../adr/0007-run-level-leases-parallel-execution.md)）でleaseをrun単位にし、`supervise`を上限付き並列の常駐ループにした。ステップ7の[018](../journal/018-merge-queue.md)（[ADR-0008](../adr/0008-merge-queue-squash-landing.md)）で`integrate`を手動mergeの確認からruntimeによる着地（rebase → 再検証 → squash）に置き換えた。[021](../journal/021-maintainer-up-down.md)で`up` / `down`（`src/lifecycle.rs`）、launchdによる常駐、`supervise --log-dir`、maintainer promptを足した。task 24（[ADR-0012](../adr/0012-adopt-stale-lease-of-live-wrapper.md)）で、supervisorが死んだ後もwrapperが生きているrunを次のsupervisorが引き継ぐ（adopt）ようにした。[ADR-0011](../adr/0011-cmux-socket-password-and-in-cmux-fallback.md)のtask 21で`up`にcmux外接続のpreflightを、task 22で`up --in-cmux`（launchdなしのfallback）と`supervisors.mode`を足した。task 30（[ADR-0014](../adr/0014-up-replaces-a-supervisor-of-another-binary-version.md)）で`supervisors.binary_version`を足し、`up`がversionの違うliveなsupervisorをdrainして入れ替えるようにした（`--no-wait`は走行中のrunがあれば入れ替えない）。task 57（[ADR-0016](../adr/0016-maintainer-notification-and-compact-output.md)）で`status`に`attention`と`cursor`を足し、`events --after`と`watch`（`src/watch.rs`、判定は`src/domain.rs`）を足した。
 
 ## Roles
 
@@ -103,9 +103,9 @@ cmux workspaceの名前は複数repositoryで同じcmuxを使うためrepository
 
 `src/runtime.rs`の`maintainer_prompt(db, log_dir)`がworker promptの隣で生成する。内容: この queue（db path）のmaintainer sessionであること、役割名の1行（supervisor / maintainer / worker）、supervisorのlog dir、dagq pluginの`dagq-maintain` skillで`status`と`doctor`を確認し、staleなsupervisor・未完了run・`awaiting_integration`・`needs_session`を報告してユーザーの指示を待つこと、skillが無ければそう報告すること、queue DBを直接触らずCLIだけを使うこと。CLIの手順はpromptに書かずskillに置くので、skillを変えてもpromptは変わらない。
 
-### Maintainerへの通知（ADR-0016で決定、goal 6のtaskで実装予定）
+### Maintainerへの通知（ADR-0016で決定、一部実装済み）
 
-[ADR-0016](../adr/0016-maintainer-notification-and-compact-output.md)で次を決めた。未実装で、現在の接点は上の初期promptだけ。
+[ADR-0016](../adr/0016-maintainer-notification-and-compact-output.md)で次を決めた。`status`のattentionとcursor、`events --after`、`watch`は実装済み（[`status`](#status)、[`events` / `watch`](#events--watch)）。`cmux notify`、圧縮出力と`--full`、`review`、短い`maintainer_prompt`はgoal 6の残りのtaskで実装する。
 
 - maintainerは状態を持たない使い捨てのsessionで、compaction・`/clear`・再起動からの起き直しは`status`の1コマンドで行う。`status`はsupervisorの健全性、未完了run、attention、次のcursorを上限のある大きさで返す。
 - `watch --after <cursor>`はcursorより後のattentionイベントかsupervisor健全性の変化までblockし、attentionと新しいcursorを返して終わる。maintainerはこれをbackgroundで走らせて終了で起きる。`doctor`は診断専用で、pollingには使わない。
@@ -240,6 +240,19 @@ supervisorの再起動ではrunごとのleaseとheartbeatを確認し、孤児�
 ### `status`
 
 `dagq status`はrunのprocessを調べずに登録とleaseだけを返す。引き継がれたrunは引き継いだsupervisorのtokenのleaseを持つので、他のrunと同じくそのsupervisorの`run_ids`に並ぶ。`supervisors`は`supervisors`表の登録を`started_at`順に、続けて登録のないtokenのlease保持者（着地中の`integrate`プロセス、または登録表以前のsupervisor）をlease順に並べ、leaseはtokenで登録に結び付ける。各項目は`pid`、`alive`（`kill -0`）、`registered`、`mode`と`workspace_id`、`binary_version`（そのプロセスが動いているdagqのversion。登録がなければnull、列より古いbinaryの登録もnull。[ADR-0014](../adr/0014-up-replaces-a-supervisor-of-another-binary-version.md)）、`parallel`と`started_at`（登録がなければnull）、`heartbeat_at`、`heartbeat_age_secs`、`stale`（PIDが死んでいるかheartbeatが30秒より古い）、`run_ids`（そのtokenのlease）。runを持たない常駐supervisorは`run_ids: []`で並ぶ。`runs`は未完了run（`claimed`/`starting`/`running`/`validating`/`integrating`）ごとに`run_id`、`task_id`、`status`、`workspace_id`、`worktree_path`（queueの今の`runs/`から解決したpath。[ADR-0017](../adr/0017-resolve-run-paths-from-the-queue-directory.md)）、`lease`（なければnull。`pid`でどのsupervisorが持つかが分かる）。`awaiting_integration`と`needs_session`はプロセスを持たないので並ばない。
+
+`status`は続けて`attention`と`cursor`を返す（[ADR-0016](../adr/0016-maintainer-notification-and-compact-output.md)）。`cursor`はrun_eventsの最新id（空のqueueは0）で、状態を読む前に取るので、その後の遷移は`watch --after cursor`で必ず拾える（重複はありうるが取りこぼさない）。`attention`はmaintainerか人の判断で止まっているものを今の状態から導出し、supervisorを先、runを後に並べる。各項目は`run_id`、`task_id`、`status`、`kind`、`last_error`（300文字で切り詰め）、`next`（定型の短い句）で、supervisorの項目は`run_id`/`task_id`がnullで`pid`を持つ。
+
+- supervisor: `supervisors`表の登録のうちstale（PIDが死んでいる、またはheartbeatが`HEARTBEAT_TIMEOUT_SECS`より古い）なものが`kind: supervisor_stale`（`status`は`dead`か`stale`）、登録が1件もなければ`kind: supervisor_stopped`（`status: stopped`、`pid`なし）。`next`は`restart supervisor`。lease保持者だけの`integrate`は数えない。この2つのkindはrun_eventsに書かれない導出値。
+- run: `in_progress`のtaskの最新runを`domain::run_attention`で判定する。`awaiting_integration`→`review and integrate`、`needs_session`→`resume session`、`failed`→`inspect and close workspace`、`exit_request_timed_out`の後に`session_exited`がない`running`→`send /exit`。`kind`はそのrunでattentionと判定された最後のイベントのkind（無ければstatus名）、`last_error`はrunの`last_error`。taskが再試行・cancel・完了されたrunは出ない。
+
+### `events` / `watch`
+
+`dagq events --after <id> [--limit N（既定100）] [--all]`はidより後のrun_eventsを古い順に返す純粋なクエリで、既定はattentionイベントだけ、`--all`で全kind。返り値は`{events, cursor}`で、`cursor`はlimitに達したら最後に返したイベントのid、そうでなければ読んだ時点の最新id。各イベントは圧縮形で、`id`、`kind`、`task_id`/`goal_id`/`run_id`（あるものだけ）、`created_at`と、payloadから`status`（なければ`to`）、`exit_code`、`reason`（`reason`/`message`/`error`のどれか、300文字で切り詰め）だけを取り、path・receipt・出力は省く。attentionイベントは`next`も持つ。
+
+attentionイベントの判定は`domain::event_attention(kind, payload)`（候補kindは`ATTENTION_KINDS`）: `validation_finished`で`status`が`awaiting_integration`（`review and integrate`）か`failed`、`supervision_finished`と`integration_failed`で`failed`（`inspect and close workspace`）、`integration_deferred`と`integration_error`で`needs_session`（`resume session`）、`exit_request_timed_out`（`send /exit`）。`integration_error`で`awaiting_integration`に戻ったものは`integrate`の呼び手がerrorを受け取っているのでattentionにしない。`integration_rebase_aborted`はstatusを変えず着地が続くので、その結果（`integration_deferred`など）の方がattentionになる。既存のkind名とpayloadは変えていない。
+
+`dagq watch [--after <id>] [--timeout SECS（既定600）] [--interval SECS（既定2）]`はqueueをinterval秒ごとに読み、idより後にattentionイベントが1件以上あるか、登録済みsupervisorの健全性（tokenの集合と各`pid`・`alive`・`stale`、`domain::SupervisorPulse`）がwatch開始時のsnapshotと変わるまでblockする。返り値は`{events, supervisors_changed, supervisors, cursor}`で、`supervisors`は`status`と同じ形。timeoutでは`events`が空、`supervisors_changed: false`、`cursor`は渡したままで、exit codeは0。`--after`を省くと開始時の最新idから待つ。`watch`はqueueを読むだけで何も書かず、`integrate`を呼ばない。
 
 ### `doctor`
 

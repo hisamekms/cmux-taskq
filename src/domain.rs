@@ -882,3 +882,302 @@ mod tests {
         );
     }
 }
+
+/// A process whose heartbeat is older than this has no working process behind
+/// it, whatever its PID says: the rule for leases, wrappers and supervisors.
+pub const HEARTBEAT_TIMEOUT_SECS: i64 = 30;
+
+// What the maintainer (or the user) does about an attention (ADR-0016). The
+// values are short fixed phrases, part of the public contract of `status`,
+// `events` and `watch`.
+string_enum!(AttentionNext {
+    ReviewAndIntegrate => "review and integrate",
+    ResumeSession => "resume session",
+    InspectAndClose => "inspect and close workspace",
+    SendExit => "send /exit",
+    RestartSupervisor => "restart supervisor",
+});
+
+/// The `run_events` kinds that can mark an attention. The kind names are a
+/// public contract (ADR-0016); whether one of these events is an attention
+/// also depends on its payload, see [`event_attention`].
+pub const ATTENTION_KINDS: &[&str] = &[
+    "validation_finished",
+    "supervision_finished",
+    "integration_deferred",
+    "integration_failed",
+    "integration_error",
+    "exit_request_timed_out",
+];
+
+/// Whether a run event is a transition that stops at the maintainer's or the
+/// user's judgment, and what to do about it. The run comes to rest in
+/// `status` (`awaiting_integration`, `needs_session`, `failed`), or the
+/// session did not answer `/exit`. `integration_error` back to
+/// `awaiting_integration` is not one: the `integrate` caller got the error.
+/// `integration_rebase_aborted` is not one either: the landing goes on and
+/// its outcome is its own event.
+pub fn event_attention(kind: &str, payload: &serde_json::Value) -> Option<AttentionNext> {
+    let status = payload
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|status| status.parse::<RunStatus>().ok());
+    match (kind, status) {
+        ("validation_finished", Some(RunStatus::AwaitingIntegration)) => {
+            Some(AttentionNext::ReviewAndIntegrate)
+        }
+        (
+            "validation_finished" | "supervision_finished" | "integration_failed",
+            Some(RunStatus::Failed),
+        ) => Some(AttentionNext::InspectAndClose),
+        ("integration_deferred" | "integration_error", Some(RunStatus::NeedsSession)) => {
+            Some(AttentionNext::ResumeSession)
+        }
+        ("exit_request_timed_out", _) => Some(AttentionNext::SendExit),
+        _ => None,
+    }
+}
+
+/// Whether a run in `status` waits for the maintainer now. `exit_pending` is
+/// a `running` run whose `/exit` request timed out with no session exit
+/// since. The caller passes only the latest run of an `in_progress` task, so
+/// a failed run stops counting once the task is retried or canceled.
+pub fn run_attention(status: RunStatus, exit_pending: bool) -> Option<AttentionNext> {
+    match status {
+        RunStatus::AwaitingIntegration => Some(AttentionNext::ReviewAndIntegrate),
+        RunStatus::NeedsSession => Some(AttentionNext::ResumeSession),
+        RunStatus::Failed => Some(AttentionNext::InspectAndClose),
+        RunStatus::Running if exit_pending => Some(AttentionNext::SendExit),
+        _ => None,
+    }
+}
+
+/// One thing that waits for the maintainer or the user: a run (`run_id`,
+/// `task_id`) or a supervisor (`pid`, or neither when none is registered).
+/// `kind` is the run event that brought the run there, or
+/// `supervisor_stale` / `supervisor_stopped`, which are derived from the
+/// `supervisors` table and never written to `run_events`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Attention {
+    pub run_id: Option<String>,
+    pub task_id: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
+    pub status: String,
+    pub kind: String,
+    pub last_error: Option<String>,
+    pub next: AttentionNext,
+}
+
+/// Whether a process no longer works: its PID is dead or its heartbeat is
+/// older than [`HEARTBEAT_TIMEOUT_SECS`].
+pub fn heartbeat_stale(alive: bool, heartbeat_age_secs: i64) -> bool {
+    !alive || heartbeat_age_secs > HEARTBEAT_TIMEOUT_SECS
+}
+
+/// The health of one registered supervisor that `watch` compares: a change
+/// in the set of tokens, a PID, `alive` or `stale` wakes the maintainer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SupervisorPulse {
+    pub token: String,
+    pub pid: u32,
+    pub alive: bool,
+    pub stale: bool,
+}
+
+impl SupervisorPulse {
+    pub fn judge(registration: &SupervisorRegistration, alive: bool, now: i64) -> Self {
+        Self {
+            token: registration.token.clone(),
+            pid: registration.pid,
+            alive,
+            stale: heartbeat_stale(alive, now - registration.heartbeat_at),
+        }
+    }
+}
+
+/// Supervisors that need a restart: every stale registration, or a queue
+/// with no registration at all (stopped, or never started).
+pub fn supervisor_attention(pulses: &[SupervisorPulse]) -> Vec<Attention> {
+    let restart = |pid, status: &str, kind: &str| Attention {
+        run_id: None,
+        task_id: None,
+        pid,
+        status: status.into(),
+        kind: kind.into(),
+        last_error: None,
+        next: AttentionNext::RestartSupervisor,
+    };
+    if pulses.is_empty() {
+        return vec![restart(None, "stopped", "supervisor_stopped")];
+    }
+    pulses
+        .iter()
+        .filter(|pulse| pulse.stale)
+        .map(|pulse| {
+            let status = if pulse.alive { "stale" } else { "dead" };
+            restart(Some(pulse.pid), status, "supervisor_stale")
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod attention_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn event_attention_covers_every_kind_by_its_status() {
+        use AttentionNext::*;
+        let cases = [
+            (
+                "validation_finished",
+                json!({"status": "awaiting_integration"}),
+                Some(ReviewAndIntegrate),
+            ),
+            (
+                "validation_finished",
+                json!({"status": "failed", "reason": "x"}),
+                Some(InspectAndClose),
+            ),
+            (
+                "supervision_finished",
+                json!({"status": "failed", "exit_code": 1}),
+                Some(InspectAndClose),
+            ),
+            (
+                "supervision_finished",
+                json!({"status": "validating", "exit_code": 0}),
+                None,
+            ),
+            (
+                "integration_deferred",
+                json!({"status": "needs_session", "reason": "x"}),
+                Some(ResumeSession),
+            ),
+            (
+                "integration_failed",
+                json!({"status": "failed", "reason": "x"}),
+                Some(InspectAndClose),
+            ),
+            (
+                "integration_error",
+                json!({"status": "needs_session", "reason": "x"}),
+                Some(ResumeSession),
+            ),
+            (
+                "integration_error",
+                json!({"status": "awaiting_integration"}),
+                None,
+            ),
+            (
+                "exit_request_timed_out",
+                json!({"workspace_id": "w", "timeout_secs": 120}),
+                Some(SendExit),
+            ),
+            ("integration_rebase_aborted", json!({"reason": "x"}), None),
+            ("run_integrated", json!({"result_commit": "x"}), None),
+            (
+                "lease_released",
+                json!({"reason": "integration_failed"}),
+                None,
+            ),
+            ("validation_finished", json!({"status": "bogus"}), None),
+            ("validation_finished", json!({}), None),
+        ];
+        for (kind, payload, expected) in cases {
+            assert_eq!(
+                event_attention(kind, &payload),
+                expected,
+                "{kind} {payload}"
+            );
+            if expected.is_some() {
+                assert!(ATTENTION_KINDS.contains(&kind), "{kind}");
+            }
+        }
+        assert_eq!(SendExit.as_str(), "send /exit");
+        assert_eq!(
+            "restart supervisor".parse::<AttentionNext>().unwrap(),
+            RestartSupervisor
+        );
+    }
+
+    #[test]
+    fn run_attention_follows_the_resting_status() {
+        use AttentionNext::*;
+        assert_eq!(
+            run_attention(RunStatus::AwaitingIntegration, false),
+            Some(ReviewAndIntegrate)
+        );
+        assert_eq!(
+            run_attention(RunStatus::NeedsSession, false),
+            Some(ResumeSession)
+        );
+        assert_eq!(
+            run_attention(RunStatus::Failed, false),
+            Some(InspectAndClose)
+        );
+        assert_eq!(run_attention(RunStatus::Running, true), Some(SendExit));
+        assert_eq!(run_attention(RunStatus::Running, false), None);
+        for status in [
+            RunStatus::Claimed,
+            RunStatus::Starting,
+            RunStatus::Validating,
+            RunStatus::Integrating,
+            RunStatus::Integrated,
+            RunStatus::Succeeded,
+            RunStatus::Interrupted,
+        ] {
+            assert_eq!(run_attention(status, true), None, "{}", status.as_str());
+        }
+    }
+
+    #[test]
+    fn supervisor_attention_reports_stale_registrations_or_a_stopped_queue() {
+        let registration = |token: &str, heartbeat_at| SupervisorRegistration {
+            token: token.into(),
+            pid: 7,
+            parallel: 1,
+            started_at: 0,
+            heartbeat_at,
+            mode: None,
+            workspace_id: None,
+            binary_version: None,
+        };
+        let fresh =
+            SupervisorPulse::judge(&registration("a", 100), true, 100 + HEARTBEAT_TIMEOUT_SECS);
+        let hung =
+            SupervisorPulse::judge(&registration("b", 100), true, 101 + HEARTBEAT_TIMEOUT_SECS);
+        let dead = SupervisorPulse::judge(&registration("c", 100), false, 100);
+        assert!(!fresh.stale && hung.stale && dead.stale);
+        assert_eq!(supervisor_attention(std::slice::from_ref(&fresh)), vec![]);
+        let stale = supervisor_attention(&[fresh, hung, dead]);
+        let summary: Vec<_> = stale
+            .iter()
+            .map(|a| (a.kind.as_str(), a.status.as_str(), a.pid))
+            .collect();
+        assert_eq!(
+            summary,
+            [
+                ("supervisor_stale", "stale", Some(7)),
+                ("supervisor_stale", "dead", Some(7))
+            ]
+        );
+        assert!(
+            stale
+                .iter()
+                .all(|a| a.next == AttentionNext::RestartSupervisor && a.run_id.is_none())
+        );
+        let stopped = supervisor_attention(&[]);
+        assert_eq!(stopped.len(), 1);
+        assert_eq!(stopped[0].kind, "supervisor_stopped");
+        assert_eq!(stopped[0].pid, None);
+        assert_eq!(
+            serde_json::to_value(&stopped[0]).unwrap(),
+            json!({
+                "run_id": null, "task_id": null, "status": "stopped", "kind": "supervisor_stopped",
+                "last_error": null, "next": "restart supervisor",
+            })
+        );
+    }
+}
