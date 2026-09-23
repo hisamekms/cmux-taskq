@@ -55,7 +55,7 @@ Empty `supervisors` means nothing serves this queue: run `up`.
 
 ## 3. Answer the prompts a run stops at
 
-Claude stops at its folder-trust prompt in a run's workspace only when the repository itself has never been trusted (the prompt is decided by the repository root, not the worktree), so the user should run `claude` once in the repository root before the first run. When a run stays `running` right after `agent_started` and nothing happens in its worktree, it is waiting at a prompt. Take `workspace_id` from `"$DAGQ" show ID` (the workspace is named `dagq <repo> <task-id> <run-id>`, where `<repo>` is the repository directory's name), read the screen and answer there:
+Claude stops at its folder-trust prompt in a run's workspace only when the repository itself has never been trusted (the prompt is decided by the repository root, not the worktree), so the user should run `claude` once in the repository root before the first run. When a run stays `running` right after `agent_started` and nothing happens in its worktree, it is waiting at a prompt. Take `workspace_id` from `"$DAGQ" show ID` (the workspace is named `[<repo>]dagq#<task-id> <task title>`, where `<repo>` is the repository directory's name, and its description is `run <run-id>`), read the screen and answer there:
 
 ```sh
 cmux read-screen --workspace <workspace_id> --lines 40

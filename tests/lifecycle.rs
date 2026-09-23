@@ -10,7 +10,7 @@ use dagq::{
         AgentState, DetachedRefusal, LaunchAgent, ProcessControl, SupervisorEnvironment, TaskStore,
         WorkspaceBackend,
     },
-    domain::{NewTask, SupervisorMode, TaskAction, TaskRun},
+    domain::{NewTask, SupervisorMode, Task, TaskAction, TaskRun},
     infrastructure::{
         adapters::{Cmux, GitRepository, SOCKET_PASSWORD_ENV, detach, process_alive, shell_quote},
         location::QueueLocation,
@@ -236,7 +236,7 @@ impl WorkspaceBackend for FakeCmux {
         }
         Ok(())
     }
-    fn create(&self, _: &TaskRun, _: &str) -> Result<String> {
+    fn create(&self, _: &Task, _: &TaskRun, _: &str) -> Result<String> {
         bail!("up does not create run workspaces")
     }
     fn capture(&self, _: &str) -> Result<String> {
@@ -1049,7 +1049,7 @@ fn up_requires_cmux_claude_and_an_initialized_queue() {
         fn preflight_detached(&self, _: &SupervisorEnvironment) -> Result<()> {
             unreachable!()
         }
-        fn create(&self, _: &TaskRun, _: &str) -> Result<String> {
+        fn create(&self, _: &Task, _: &TaskRun, _: &str) -> Result<String> {
             unreachable!()
         }
         fn capture(&self, _: &str) -> Result<String> {

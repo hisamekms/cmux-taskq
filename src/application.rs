@@ -190,7 +190,14 @@ pub trait WorkspaceBackend {
     /// admits such a process only by socket password). A refusal is a
     /// [`DetachedRefusal`]; any other error means cmux could not be asked.
     fn preflight_detached(&self, environment: &SupervisorEnvironment) -> Result<()>;
-    fn create(&self, run: &crate::domain::TaskRun, command: &str) -> Result<String>;
+    /// Open the workspace a run's session works in. `task` is the run's
+    /// task; the backend names the workspace after it (ADR-0018).
+    fn create(
+        &self,
+        task: &crate::domain::Task,
+        run: &crate::domain::TaskRun,
+        command: &str,
+    ) -> Result<String>;
     fn capture(&self, workspace_id: &str) -> Result<String>;
     /// Close the workspace; the worktree and branch are not touched.
     fn close(&self, workspace_id: &str) -> Result<()>;

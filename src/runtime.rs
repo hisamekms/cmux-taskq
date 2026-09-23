@@ -690,7 +690,7 @@ impl Supervisor<'_> {
             "--claude".into(),
             path_text(self.claude)?,
         ]);
-        let workspace = self.cmux.create(&run, &command)?;
+        let workspace = self.cmux.create(&task, &run, &command)?;
         self.queue
             .workspace_created(&run.id, &self.token, &workspace)?;
         self.log.note(&format!(

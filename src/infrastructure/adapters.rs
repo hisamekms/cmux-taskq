@@ -2,7 +2,7 @@ use crate::{
     application::{
         AgentProvider, DetachedRefusal, ProcessControl, SupervisorEnvironment, WorkspaceBackend,
     },
-    domain::TaskRun,
+    domain::{Task, TaskRun},
 };
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::Value;
@@ -631,9 +631,10 @@ impl WorkspaceBackend for Cmux {
     fn preflight_detached(&self, environment: &SupervisorEnvironment) -> Result<()> {
         self.preflight_detached_within(environment, DETACHED_PING_TIMEOUT)
     }
-    fn create(&self, run: &TaskRun, command: &str) -> Result<String> {
+    fn create(&self, task: &Task, run: &TaskRun, command: &str) -> Result<String> {
         let raw = self.create_workspace(
-            &run_workspace_name(run)?,
+            &run_workspace_name(task, run)?,
+            Some(&run_workspace_description(run)),
             Path::new(run.worktree_path.as_ref().context("missing worktree")?),
             command,
         )?;
@@ -700,7 +701,7 @@ impl WorkspaceBackend for Cmux {
     }
 
     fn create_named(&self, name: &str, cwd: &Path, command: &str) -> Result<String> {
-        let raw = self.create_workspace(name, cwd, command)?;
+        let raw = self.create_workspace(name, None, cwd, command)?;
         self.identify(workspace_handle(&raw)?)
     }
 }
@@ -760,10 +761,21 @@ impl Cmux {
     }
 
     /// `cmux workspace create`; the raw reply carries the `OK workspace:N` handle.
-    fn create_workspace(&self, name: &str, cwd: &Path, command: &str) -> Result<String> {
+    fn create_workspace(
+        &self,
+        name: &str,
+        description: Option<&str>,
+        cwd: &Path,
+        command: &str,
+    ) -> Result<String> {
+        let mut create = Command::new(&self.executable);
+        create.args(["workspace", "create", "--name", name]);
+        if let Some(description) = description {
+            create.args(["--description", description]);
+        }
         output(
-            Command::new(&self.executable)
-                .args(["workspace", "create", "--name", name, "--cwd"])
+            create
+                .arg("--cwd")
                 .arg(cwd)
                 .args(["--command", command, "--focus", "false"]),
         )
@@ -801,16 +813,23 @@ pub fn workspace_named<'a>(listing: &'a Value, name: &str) -> Option<&'a str> {
 }
 
 /// Workspaces are named per repository because one cmux serves several
-/// queues: `dagq <repo> <task-id> <run-id>` for a worker, where `<repo>`
-/// is the basename of the repository root the run was planned from.
-pub fn run_workspace_name(run: &TaskRun) -> Result<String> {
+/// queues: `[<repo>]dagq#<task-id> <task title>` for a worker, where
+/// `<repo>` is the basename of the repository root the run was planned
+/// from and the title is the task's, unabridged (ADR-0018).
+pub fn run_workspace_name(task: &Task, run: &TaskRun) -> Result<String> {
     let repo = Path::new(run.repo_path.as_ref().context("missing repository path")?);
     Ok(format!(
-        "dagq {} {} {}",
+        "[{}]dagq#{} {}",
         repository_name(repo),
         run.task_id,
-        run.id
+        task.title
     ))
+}
+
+/// `run <run-id>`: the run a worker workspace belongs to, kept in the
+/// workspace description rather than its name (ADR-0018).
+pub fn run_workspace_description(run: &TaskRun) -> String {
+    format!("run {}", run.id)
 }
 
 /// `dagq <repo> maintainer`: the one resident Claude session of a repository's queue.
@@ -931,23 +950,52 @@ mod tests {
         }
     }
 
+    fn task(title: &str) -> Task {
+        Task {
+            id: 15,
+            title: title.into(),
+            description: String::new(),
+            acceptance: String::new(),
+            verification_commands: Vec::new(),
+            status: crate::domain::TaskStatus::InProgress,
+            goal_id: None,
+            context: String::new(),
+            created_at: "2026-09-22 00:00:00".into(),
+            updated_at: "2026-09-22 00:00:00".into(),
+        }
+    }
+
     /// One cmux serves several repositories, so every workspace name
-    /// carries the repository (the basename of its root).
+    /// carries the repository (the basename of its root). A worker's name
+    /// carries the task and its title as is; the run ID goes to the
+    /// description instead (ADR-0018).
     #[test]
-    fn workspace_names_carry_the_repository_the_task_and_the_run() {
+    fn workspace_names_carry_the_repository_and_the_task() {
+        let title = "Set last_error when a run fails";
         assert_eq!(
-            run_workspace_name(&run(Some("/home/u/ghq/dagq"))).unwrap(),
-            "dagq dagq 15 0d8e3f1a-7c1b-4e35-9a11-3f6d2c9b8e47"
+            run_workspace_name(&task(title), &run(Some("/home/u/ghq/dagq"))).unwrap(),
+            "[dagq]dagq#15 Set last_error when a run fails"
         );
+        // The title is neither trimmed nor shortened.
+        let long = format!("  {}  ", "x".repeat(200));
         assert_eq!(
-            run_workspace_name(&run(Some("/tmp/my repo/"))).unwrap(),
-            "dagq my repo 15 0d8e3f1a-7c1b-4e35-9a11-3f6d2c9b8e47"
+            run_workspace_name(&task(&long), &run(Some("/tmp/my repo/"))).unwrap(),
+            format!("[my repo]dagq#15 {long}")
         );
         assert!(
-            run_workspace_name(&run(None))
+            !run_workspace_name(&task(title), &run(Some("/home/u/ghq/dagq")))
+                .unwrap()
+                .contains("0d8e3f1a")
+        );
+        assert!(
+            run_workspace_name(&task(title), &run(None))
                 .unwrap_err()
                 .to_string()
                 .contains("missing repository path")
+        );
+        assert_eq!(
+            run_workspace_description(&run(None)),
+            "run 0d8e3f1a-7c1b-4e35-9a11-3f6d2c9b8e47"
         );
         assert_eq!(
             maintainer_workspace_name(Path::new("/home/u/ghq/dagq")),
@@ -981,5 +1029,67 @@ mod tests {
         );
         assert_eq!(workspace_named(&listing, "dagq other maintainer"), None);
         assert_eq!(workspace_named(&serde_json::json!({}), "x"), None);
+    }
+
+    /// `create` passes the run's name and description to `cmux workspace
+    /// create`, keeps the raw reply in the run directory and returns the
+    /// UUID `identify` resolves.
+    #[cfg(unix)]
+    #[test]
+    fn create_names_the_run_workspace_and_describes_it_with_the_run() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("args.log");
+        let executable = dir.path().join("cmux");
+        fs::write(
+            &executable,
+            format!(
+                r#"#!/bin/sh
+for arg in "$@"; do printf '%s\n' "$arg" >> '{log}'; done
+printf -- '--\n' >> '{log}'
+case "$1" in
+  workspace) echo "OK workspace:7" ;;
+  --json) echo '{{"caller":{{"workspace_id":"4AC63CB7-3BE1-40A1-BCC4-CA0461685F01"}}}}' ;;
+esac
+"#,
+                log = log.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+        let run_dir = dir.path().join("run");
+        fs::create_dir(&run_dir).unwrap();
+        let mut run = run(Some("/home/u/ghq/dagq"));
+        run.worktree_path = Some(dir.path().display().to_string());
+        run.run_dir = Some(run_dir.display().to_string());
+        let cmux = Cmux { executable };
+        let id = cmux
+            .create(&task("Set last_error when a run fails"), &run, "true")
+            .unwrap();
+        assert_eq!(id, "4AC63CB7-3BE1-40A1-BCC4-CA0461685F01");
+        assert_eq!(
+            fs::read_to_string(run_dir.join("workspace-create.txt")).unwrap(),
+            "OK workspace:7\n"
+        );
+        let calls = fs::read_to_string(&log).unwrap();
+        let create: Vec<&str> = calls.split("--\n").next().unwrap().lines().collect();
+        assert_eq!(
+            create,
+            [
+                "workspace",
+                "create",
+                "--name",
+                "[dagq]dagq#15 Set last_error when a run fails",
+                "--description",
+                "run 0d8e3f1a-7c1b-4e35-9a11-3f6d2c9b8e47",
+                "--cwd",
+                &dir.path().display().to_string(),
+                "--command",
+                "true",
+                "--focus",
+                "false",
+            ]
+        );
+        assert!(calls.contains("identify\n--workspace\nworkspace:7\n"));
     }
 }

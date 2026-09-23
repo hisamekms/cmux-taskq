@@ -19,6 +19,7 @@ related:
   - adr-0012
   - adr-0014
   - adr-0016
+  - adr-0018
   - design-persistence
   - design-provider-lifecycle
   - design-plugin-integration
@@ -57,7 +58,7 @@ ready task (dependencies completed)
 
 - **supervisor**: runtimeの`supervise`プロセス。taskをclaimし、runごとにworktreeとworkspaceを作って監視し、receiptを検証する。`up`がlaunchdのLaunchAgentとして常駐させるか（既定）、`--in-cmux`なら`dagq <repo> supervisor` workspaceの中で動かす。
 - **maintainer**: 常駐のClaude Code session（旧称SV / operator）。登録・監視・レビュー・着地を行う。`up`が`dagq <repo> maintainer`のcmux workspaceで、runtimeが生成した初期prompt付きで起動する。CLIの使い方はpluginの`dagq-maintain` skillが持つ。
-- **worker**: run session。runごとのcmux workspace `dagq <repo> <task-id> <run-id>`で動くClaude session。
+- **worker**: run session。runごとのcmux workspace `[<repo>]dagq#<task-id> <task title>`（descriptionは`run <run-id>`）で動くClaude session。
 
 runtimeの中で人が打つ`/exit`や復旧を指す語はすべてmaintainerに寄せた（`src/`に`operator`は残らない）。
 
@@ -97,7 +98,7 @@ in-cmux modeのsupervisor workspaceは`down`が閉じる。判定はどの経路
 
 ### Naming
 
-cmux workspaceの名前は複数repositoryで同じcmuxを使うためrepository名を含む: workerは`dagq <repo> <task-id> <run-id>`（`run_workspace_name`。`<repo>`はrunの`repo_path`のbasename）、maintainerは`dagq <repo> maintainer`（`maintainer_workspace_name`）、in-cmux modeのsupervisorは`dagq <repo> supervisor`（`supervisor_workspace_name`。[ADR-0011](../adr/0011-cmux-socket-password-and-in-cmux-fallback.md)の決定3）。`up`はtitleの完全一致でmaintainer workspaceとsupervisor workspaceを探す。
+cmux workspaceの名前は複数repositoryで同じcmuxを使うためrepository名を含む: workerは`[<repo>]dagq#<task-id> <task title>`（`run_workspace_name`。`<repo>`はrunの`repo_path`のbasename、titleはtaskのtitleを切り詰めずにそのまま）で、run IDは名前に入れず`--description "run <run-id>"`（`run_workspace_description`）に置く（[ADR-0018](../adr/0018-run-workspace-named-after-the-task.md)。runtimeはrunのworkspaceを名前で探さず`workspace_id`で扱うので、旧名`dagq <repo> <task> <run>`のまま開いているworkspaceも扱える）、maintainerは`dagq <repo> maintainer`（`maintainer_workspace_name`）、in-cmux modeのsupervisorは`dagq <repo> supervisor`（`supervisor_workspace_name`。[ADR-0011](../adr/0011-cmux-socket-password-and-in-cmux-fallback.md)の決定3）。`up`はtitleの完全一致でmaintainer workspaceとsupervisor workspaceを探す。
 
 ### Maintainer prompt
 
@@ -129,7 +130,7 @@ cmux workspaceの名前は複数repositoryで同じcmuxを使うためrepository
 
 5. **adopt**（[ADR-0012](../adr/0012-adopt-stale-lease-of-live-wrapper.md)）: active runが上限未満なら、claimの前に、他のtokenのleaseを持つ`running` / `validating`のrunを`runs_leased_by_others`で読み、leaseがstale（pidが死んでいるかheartbeatが30秒より古い）で、wrapperが生きていてheartbeatが30秒以内か`exited_at`が記録済みのものを`adopt_run`で引き継ぐ。`adopt_run`は`BEGIN IMMEDIATE`の中でstatusとstaleを再検査し、lease行の`token` / `pid` / `heartbeat_at`と`task_runs.supervisor_token`を自分のものにして`run_adopted`を書く（同じrunを2つのsupervisorが取ろうとしても1つしか通らない。負けた方は何もしない）。引き継いだrunのslotはDBから組み立てる: pathは`run_planned`のもの、`receipt_seen`はreceiptファイルと`receipt_observed`イベントの有無、`exit_requested`イベントがあれば`/exit`を再送せずtimeoutをいまから数え直し、wrapperの登録待ちは持たない。`validating`のrunは9の検証をはじめから行う。`claimed` / `starting`（wrapperの登録にclaimしたtokenが要る）、leaseのないrun（abandon済み・`recover`済み）、`integrating`、wrapperが死んでいるか黙っているrunは引き継がず、[`recover`](#recover-run_id)に残す。引き継ぎはlogに1行で残す。
    **claim**: 続けて、`candidates`が空でなければ、`refs/heads/main`を読み直してbase commitにし、`claim_for_supervisor`でrun・`supervisor_token`・lease行を1トランザクションで作る。`integrate`で依存が解けたtaskは次のループで、先行taskを含む`main`から始まる。
-6. **provision**: run管理領域（DBと同じdirの`runs/<run-id>/`）のpath、branch `dagq/<run-id>`、worktree（`runs/<run-id>/worktree`）、receipt、logのpathを`run_planned`として先にDBへ保存し、ディレクトリ、`prompt.txt`、runtimeバイナリのスナップショット`runner`、worktreeを作り、cmux workspaceを`--name "dagq <repo> <task-id> <run-id>" --cwd worktree --command '<runner> --db ... session --run ... --lease <token> --claude ...'`で作成して、`identify`で解決したUUIDを`workspace_created`として保存する。wrapperにはDBのpathを`--db`で明示的に渡す。provisioningの失敗は環境要因とみなし、そのrunをabandon（下記）した上で以後のclaimを止め、active runをdrainしてから非0で終了する。`prompt.txt`の内容は下記[Prompt](#prompt)。
+6. **provision**: run管理領域（DBと同じdirの`runs/<run-id>/`）のpath、branch `dagq/<run-id>`、worktree（`runs/<run-id>/worktree`）、receipt、logのpathを`run_planned`として先にDBへ保存し、ディレクトリ、`prompt.txt`、runtimeバイナリのスナップショット`runner`、worktreeを作り、cmux workspaceを`--name "[<repo>]dagq#<task-id> <task title>" --description "run <run-id>" --cwd worktree --command '<runner> --db ... session --run ... --lease <token> --claude ...'`で作成して、`identify`で解決したUUIDを`workspace_created`として保存する。wrapperにはDBのpathを`--db`で明示的に渡す。provisioningの失敗は環境要因とみなし、そのrunをabandon（下記）した上で以後のclaimを止め、active runをdrainしてから非0で終了する。`prompt.txt`の内容は下記[Prompt](#prompt)。
 7. **監視**: 各tickの先頭で、そのrunのlease行がまだ自分のtokenであることを確認する。なければ（別のsupervisorが引き継いだ、または`recover`された）そのrunをslotから外し、DBには何も書かず結果の`errors`に載せる。tickの途中でleaseを失ってlease付きの書き込みが失敗した場合も同じで、abandonしない（`last_error`を書かない）。検証threadが動いていればそのまま終わらせる（結果は記録されない。引き継いだ側が検証をやり直す）。続けてrunごとの`SessionWatch`が、wrapperの登録（45秒以内）、wrapper heartbeat（30秒以内）、receiptファイルの出現、idle marker、wrapperの終了を確認する。receiptの出現は`receipt_observed`（`validated: false`）として記録するだけで、セッション終了とは別に扱う。receipt観測後にidle markerがreceiptより新しければ`session_idle_observed`を記録し、`WorkspaceBackend::send_exit`で一度だけ終了を要求して`exit_requested`を記録する（下記）。wrapperが`exited_at`を記録済みのsession（自分で終わった、maintainerが`/exit`を打った、引き継ぐ前に終わっていた）には終了を要求しない。
 8. wrapper終了後に画面を`terminal-final.txt`へ保存し、`supervision_finished`でrunを終了コード0なら`validating`、それ以外なら`failed`にする。非0のときは同じトランザクションで`last_error`に`session exited with code N`を書き、`show`だけで理由が分かるようにする。Taskは`in_progress`のまま残す。
 9. `validating`のrunはreceipt検証（下記）をrunごとのthread（専用SQLite接続）で行い、ループは完了を待ちながら他のrunを監視し続ける。完了したら`validation_finished`でrunを`awaiting_integration`または`failed`にする。

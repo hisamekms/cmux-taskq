@@ -145,7 +145,8 @@ fn dagq_with(env: &Env, extra: &[(&str, &Path)], args: &[&str]) -> Value {
     serde_json::from_slice(&output.stdout).unwrap()
 }
 
-fn workspace_listed(cmux: &Path, id: &str) -> bool {
+/// The workspace's entry in `cmux --json workspace list`, while it is listed.
+fn listed_workspace(cmux: &Path, id: &str) -> Option<Value> {
     let output = Command::new(cmux)
         .args(["--json", "--id-format", "uuids", "workspace", "list"])
         .output()
@@ -156,7 +157,12 @@ fn workspace_listed(cmux: &Path, id: &str) -> bool {
         .as_array()
         .unwrap()
         .iter()
-        .any(|w| w["id"].as_str().is_some_and(|w| w.eq_ignore_ascii_case(id)))
+        .find(|w| w["id"].as_str().is_some_and(|w| w.eq_ignore_ascii_case(id)))
+        .cloned()
+}
+
+fn workspace_listed(cmux: &Path, id: &str) -> bool {
+    listed_workspace(cmux, id).is_some()
 }
 
 /// cmux confirms a `workspace close` before the workspace leaves its
@@ -308,6 +314,8 @@ struct Pass {
     /// Whether every workspace was listed by cmux at one moment; for one task
     /// this is simply "it was listed".
     listed_together: bool,
+    /// Each workspace's cmux listing entry from the moment they were listed together.
+    listings: Vec<Value>,
 }
 
 /// Run `supervise --once` with the given extra arguments and watch the runs of
@@ -341,6 +349,7 @@ fn supervise_once(
     let stderr = reader(child.0.stderr.take().unwrap());
     let mut workspaces: Vec<(String, String)> = Vec::new();
     let mut listed_together = false;
+    let mut listings = Vec::new();
     let status = loop {
         if let Some(status) = child.0.try_wait().unwrap() {
             break status;
@@ -370,9 +379,14 @@ fn supervise_once(
             }
         }
         if workspaces.len() == tasks.len() && !listed_together {
-            listed_together = workspaces
+            let entries: Vec<Value> = workspaces
                 .iter()
-                .all(|(_, id)| workspace_listed(&fixture.cmux, id));
+                .filter_map(|(_, id)| listed_workspace(&fixture.cmux, id))
+                .collect();
+            listed_together = entries.len() == workspaces.len();
+            if listed_together {
+                listings = entries;
+            }
         }
         thread::sleep(Duration::from_millis(200));
     };
@@ -388,6 +402,7 @@ fn supervise_once(
         stderr,
         workspaces,
         listed_together,
+        listings,
     }
 }
 
@@ -438,6 +453,18 @@ fn happy_path_runs_a_stub_agent_through_cmux_and_lands_on_main() {
     assert_eq!(run["workspace_id"], workspace.as_str());
     assert_eq!(run["base_commit"], base);
     assert!(run["last_error"].is_null());
+    // ADR-0018: the name carries the repository, task and title; the run
+    // ID lives in the description.
+    let listing = &pass.listings[0];
+    assert_eq!(
+        listing["custom_title"],
+        format!(
+            "[{}]dagq#{task_id} e2e stub task",
+            repo.file_name().unwrap().to_string_lossy()
+        ),
+        "{listing}"
+    );
+    assert_eq!(listing["description"], format!("run {run_id}"), "{listing}");
     assert_eq!(run["branch"], format!("dagq/{run_id}"));
     assert!(run["workspace_closed_at"].is_number(), "{run}");
     assert!(

@@ -2,7 +2,7 @@ use anyhow::{Result, bail};
 use dagq::{
     VERSION,
     application::{AgentProvider, SupervisorEnvironment, TaskStore, WorkspaceBackend},
-    domain::{GoalEdit, NewGoal, NewTask, RunStatus, TaskAction, TaskRun, TaskStatus},
+    domain::{GoalEdit, NewGoal, NewTask, RunStatus, Task, TaskAction, TaskRun, TaskStatus},
     infrastructure::{
         adapters::{shell_join, workspace_handle},
         sqlite::SqliteQueue,
@@ -204,7 +204,8 @@ impl WorkspaceBackend for TestWorkspace {
     fn preflight_detached(&self, _: &SupervisorEnvironment) -> Result<()> {
         unreachable!("only up preflights the detached connection")
     }
-    fn create(&self, run: &TaskRun, command: &str) -> Result<String> {
+    fn create(&self, task: &Task, run: &TaskRun, command: &str) -> Result<String> {
+        assert_eq!(task.id, run.task_id);
         assert!(
             Path::new(run.worktree_path.as_ref().unwrap())
                 .join("seed.txt")
@@ -3514,7 +3515,7 @@ fn start_run_under_dead_supervisor(
         path_text(db).unwrap(),
         "session".into(),
     ]);
-    let workspace = backend.create(&run, &command).unwrap();
+    let workspace = backend.create(&task, &run, &command).unwrap();
     queue.workspace_created(&run.id, token, &workspace).unwrap();
     wait_until(db, Duration::from_secs(10), |queue| {
         queue.run(&run.id).unwrap().status == RunStatus::Running
