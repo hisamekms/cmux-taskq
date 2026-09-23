@@ -1,5 +1,5 @@
 {
-  "description": "Re-orient a dagq maintainer session after compaction or /clear by printing the queue's status.",
+  "description": "Re-orient a dagq maintainer, inbox or planner session after compaction or /clear by printing the queue's status for its role.",
   "hooks": {
     "SessionStart": [
       {

@@ -1,6 +1,6 @@
 # Closing a goal
 
-A goal is closed once, by the maintainer, after reviewing it; the runtime never closes it. When `goal show ID` lists every task as `completed` (or `canceled`):
+A goal is closed once, by the planner (the `dagq-planner` skill), after reviewing it; the runtime never closes it. When `goal show ID` lists every task as `completed` (or `canceled`):
 
 1. Look for `draft` tasks in `goal show ID`. `integrate` registered each landed receipt's `follow_ups` as a draft task on the goal (its context reads "task <id>（<title>）の run <run-id> の receipt が提案した follow_up"; the run's `follow_up_registered` events list them). Every draft blocks `achieved`: ask the user whether each becomes `ready` (the goal stays open until it is completed) or is canceled. A run integrated by a binary older than this registration has no `follow_up_registered` events, and a `follow_up_registered` with `task_id: null` is an entry that was not registered: read those runs' receipt `follow_ups` (step 2) and treat them as gaps.
 2. For each completed task, read the `summary` of the receipt of its integrated run in `show TASK --full` (the `receipt` in the run's last `integration_receipt` event; `validation_finished` holds the receipt seen before landing) and compare what landed against the goal's `acceptance`. Anything the acceptance asks for that no task delivered, and no draft from step 1 covers, is a gap in the decomposition.

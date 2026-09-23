@@ -134,14 +134,14 @@ queue hashは`QueueLocation::hash()`: repositoryのqueueはqueueディレクト�
 
 ### Maintainer prompt
 
-`src/runtime.rs`の`maintainer_prompt(db, log_dir)`がworker promptの隣で生成する（[ADR-0016](../adr/0016-maintainer-notification-and-compact-output.md)の決定8で5行以内に縮めた）。内容: この queue（db path）のmaintainerであることとsupervisorのlog dir、`dagq status`から始めてdagq pluginの`dagq-maintain` skillに従い`dagq watch --after <cursor>`をbackgroundで走らせ終了で起きること、subagentレビューが通ったrunは着地し、疑義（受け入れ条件との食い違い・指示外の変更・レビューの指摘）のときだけユーザーに聞き、`watch`が返っただけでは`integrate`しないこと（[ADR-0022](../adr/0022-ask-answer-inbox-planner-and-landing-on-doubt.md)決定3）、queue DBを直接開かずCLIだけを使うこと、skillが無ければそう報告して待つこと。CLIの手順はpromptに書かずskillに置くので、skillを変えてもpromptは変わらない。compactionと`/clear`からの起き直しはpromptではなくpluginの`SessionStart` hookが`status`を出して担う（[plugin-integration](plugin-integration.md#起き直しhookadr-0016)）。
+`src/runtime.rs`の`maintainer_prompt(db, log_dir)`がworker promptの隣で生成する（[ADR-0016](../adr/0016-maintainer-notification-and-compact-output.md)の決定8で5行以内に縮めた）。内容: この queue（db path）のmaintainerであることとsupervisorのlog dir、`dagq status --role maintainer`から始めてdagq pluginの`dagq-maintain` skillに従い`dagq watch --role maintainer --after <cursor>`をbackgroundで走らせ、終了で起きてattentionを処理すること、subagentレビューが通ったrunは着地し、判断できないもの（着地の疑義なら`approve_landing`）は`dagq ask`に登録してterminalで待たずに次へ進むこと、`watch`が返っただけでは`integrate`しないこと（[ADR-0022](../adr/0022-ask-answer-inbox-planner-and-landing-on-doubt.md)決定3）、goal / taskの登録はplanner、askへの回答はinboxの役目であること（task 88）、queue DBを直接開かずCLIだけを使うこと、skillが無ければそう報告して待つこと。CLIの手順はpromptに書かずskillに置くので、skillを変えてもpromptは変わらない。compactionと`/clear`からの起き直しはpromptではなくpluginの`SessionStart` hookが`status --role <role>`を出して担う（inbox / plannerも同じ）（[plugin-integration](plugin-integration.md#起き直しhookadr-0016)）。
 
 ### Session prompts
 
 inboxとplannerの初期promptは`src/runtime.rs`の`inbox_prompt(db)` / `planner_prompt(db)`が`maintainer_prompt`の隣で生成し、どちらも5行以内（[ADR-0022](../adr/0022-ask-answer-inbox-planner-and-landing-on-doubt.md)）。workspaceのcommandは`lifecycle`の`inbox_command` / `planner_command`で、maintainerと同じく`<claude> [--plugin-dir PATH] -- '<prompt>'`。
 
-- **inbox**: このqueue（db path）のinboxで、askを人に取り次ぎ自分では判断しないこと。`dagq status --role inbox`から始め、`dagq watch --role inbox --after <cursor>`をbackgroundで回して終了で起き、返ったcursorからwatchし直すこと。`ask_opened`が来たら`dagq asks --open --role inbox`でaskを読み、questionとoptionsを人に見せ（AskUserQuestionが使えるなら使う）、人の答えを`dagq answer ID --text '<answer>'`で書くこと。queue DBを直接開かずCLIだけを使うこと。
-- **planner**: このqueueのplannerで、人の課題を聞いてgoalとtaskにすること。dagq pluginの`dagq` skillで登録してtaskを`ready`にすること。goalの全taskが完了したらreceiptをgoalのacceptanceと照合して`dagq goal close ID --verdict achieved`で閉じること。queue DBを直接開かずCLIだけを使うこと。observerのnoteとdraft goalを見せる一文は後続goalで足す（今は書かない）。
+- **inbox**: このqueue（db path）のinboxで、askを人に取り次ぎ自分では判断しないこと。`dagq status --role inbox`から始めてdagq pluginの`dagq-inbox` skillに従い、`dagq watch --role inbox --after <cursor>`をbackgroundで回して終了で起き、返ったcursorからwatchし直すこと。`ask_opened`が来たら`dagq asks --open --role inbox`でaskを読み、questionとoptionsを人に見せ（AskUserQuestionが使えるなら使う）、人の答えを`dagq answer ID --text '<answer>'`で書くこと。queue DBを直接開かずCLIだけを使うこと。
+- **planner**: このqueueのplannerで、人の課題を聞いてgoalとtaskにすること。dagq pluginの`dagq-planner` skillに従い、その`dagq` skillの手順で登録してtaskを`ready`にすること、runの着地とaskへの回答はしないこと。goalの全taskが完了したらreceiptをgoalのacceptanceと照合して`dagq goal close ID --verdict achieved`で閉じること。queue DBを直接開かずCLIだけを使うこと。observerのnoteとdraft goal、follow_upsのdraft taskの扱いはpromptに書かず`dagq-planner` skillが持つ。
 
 ### Maintainerへの通知（ADR-0016で決定、一部実装済み）
 

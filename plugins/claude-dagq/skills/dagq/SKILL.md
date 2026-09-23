@@ -7,7 +7,7 @@ description: Register and inspect dagq goals and tasks through the locally built
 
 dagq runs development tasks in cmux workspaces and isolated Git worktrees. This skill drives the `dagq` binary; every command prints JSON on stdout, and a runtime error prints `{"error": ...}` on stderr with exit status 1. Never read or modify the SQLite queue file directly (no `sqlite3`, no editing); the binary is the only interface.
 
-A goal is the problem several tasks solve together; a task is one unit of work a session executes in its own worktree. Running the queue and watching it is the `dagq-maintain` skill, landing a run is `dagq-land`, acting on a run's session is `dagq-session`, and recovering a stuck run is `dagq-recover`.
+A goal is the problem several tasks solve together; a task is one unit of work a session executes in its own worktree. Registering and closing belong to the planner session (`dagq-planner`); asks go to the inbox (`dagq-inbox`); the maintainer runs the queue (`dagq-maintain`), lands runs (`dagq-land`), acts on sessions (`dagq-session`) and recovers stuck runs (`dagq-recover`).
 
 Reference files, read only when needed: `${CLAUDE_PLUGIN_ROOT}/skills/dagq/reference/locate.md` (install, version warnings, missing or moved queue), `reference/inspect.md` (every inspect command, its fields, task and run statuses, `graph`, goal editing) and `reference/goal-close.md` (closing a goal), all in the same directory.
 
@@ -71,6 +71,6 @@ A one-shot task omits `--goal`. `add` registers a `draft`; `ready` makes it runn
 
 ## 4. Report results
 
-Judge completion only from `show`: the run's `status`, `result_commit`, `last_error`, and the `validation_finished` event. A Stop hook, an idle session or a receipt file is not success; the supervisor validates the receipt against Git before a run becomes `awaiting_integration`; `integrate` runs the verification commands. Summarize for the user: task status, latest run status, branch and commit, and the next step (`dagq-land` to land, `dagq-session` for a session, `dagq-recover` for a stuck run).
+Judge completion only from `show`: the run's `status`, `result_commit`, `last_error`, and the `validation_finished` event. A Stop hook, an idle session or a receipt file is not success; the supervisor validates the receipt against Git before a run becomes `awaiting_integration`; `integrate` runs the verification commands. Summarize: task status, latest run status, branch and commit, and the next step.
 
-A goal is closed once, by the maintainer, after every task is `completed` or `canceled`, the draft tasks `integrate` registered from receipts' `follow_ups` were made ready or canceled by the user, and the receipts' `summary` was compared with the goal's acceptance; gaps become new tasks on the same goal first. Read `reference/goal-close.md` before running `goal close`.
+A goal is closed once, by the planner, after every task is `completed` or `canceled`, the draft tasks `integrate` registered from receipts' `follow_ups` were made ready or canceled by the user, and the receipts' `summary` was compared with the goal's acceptance; gaps become new tasks on the same goal first. Read `reference/goal-close.md` before running `goal close`.

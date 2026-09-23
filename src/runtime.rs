@@ -3610,16 +3610,19 @@ pub fn prompt(
 }
 
 /// The initial prompt of the maintainer session that `up` opens in the
-/// `[<repo>]maintainer` workspace (ADR-0016). It names the queue and the
-/// supervisor's logs and points at `status`, the background `watch` and the
-/// plugin's `dagq-maintain` skill, which holds the procedure; waking up again
+/// `[<repo>]maintainer` workspace (ADR-0016, ADR-0022). It names the queue
+/// and the supervisor's logs and points at `status --role maintainer`, the
+/// background `watch --role maintainer` and the plugin's `dagq-maintain`
+/// skill, which holds the procedure: land on a passing review, turn anything
+/// else it cannot decide into an ask, and leave registering to the planner
+/// and answering to the inbox; waking up again
 /// after compaction or `/clear` is the plugin's SessionStart hook's job.
 pub fn maintainer_prompt(db: &Path, log_dir: &Path) -> Result<String> {
     Ok(format!(
         "You are the maintainer of the dagq queue at {db}; the supervisor logs to {log_dir}.\n\
-         Start with `dagq status`, then follow the dagq-maintain skill of the dagq plugin: run `dagq watch --after <cursor>` in the background and wake when it returns.\n\
-         Land a run when its subagent review passes; ask the user only on doubt (acceptance mismatch, changes outside the task, review findings). Never integrate because a watch returned.\n\
-         Never open the queue database directly; use the dagq CLI only. If the dagq-maintain skill is missing, say so and wait.\n",
+         Start with `dagq status --role maintainer`, then follow the dagq-maintain skill of the dagq plugin: run `dagq watch --role maintainer --after <cursor>` in the background, wake when it returns and handle its attention.\n\
+         Land a run when its subagent review passes; register what you cannot decide as a `dagq ask` (on doubt about a landing, an approve_landing ask) and move on instead of waiting at the terminal. Never integrate because a watch returned.\n\
+         Registering goals and tasks is the planner's and answering asks the inbox's. Never open the queue database directly; use the dagq CLI only. If the dagq-maintain skill is missing, say so and wait.\n",
         db = path_text(db)?,
         log_dir = path_text(log_dir)?,
     ))
@@ -3631,7 +3634,7 @@ pub fn maintainer_prompt(db: &Path, log_dir: &Path) -> Result<String> {
 pub fn inbox_prompt(db: &Path) -> Result<String> {
     Ok(format!(
         "You are the inbox of the dagq queue at {db}: you relay its asks to a person and never decide anything yourself.\n\
-         Start with `dagq status --role inbox`, then run `dagq watch --role inbox --after <cursor>` in the background, wake when it returns and watch again from the cursor it returns.\n\
+         Start with `dagq status --role inbox` and follow the dagq-inbox skill of the dagq plugin: run `dagq watch --role inbox --after <cursor>` in the background, wake when it returns and watch again from the cursor it returns.\n\
          On ask_opened, read the ask with `dagq asks --open --role inbox`, show the person its question and options (use AskUserQuestion when it is available), then write the person's answer with `dagq answer ID --text '<answer>'`.\n\
          Never open the queue database directly; use the dagq CLI only.\n",
         db = path_text(db)?,
@@ -3644,7 +3647,7 @@ pub fn inbox_prompt(db: &Path) -> Result<String> {
 pub fn planner_prompt(db: &Path) -> Result<String> {
     Ok(format!(
         "You are the planner of the dagq queue at {db}: listen to the person's problems and turn them into goals and tasks.\n\
-         Register them with the dagq skill of the dagq plugin and make the tasks ready.\n\
+         Follow the dagq-planner skill of the dagq plugin: register them as its dagq skill describes and make the tasks ready. You do not land runs or answer asks.\n\
          When every task of a goal is completed, check their receipts against the goal's acceptance and close the goal (`dagq goal close ID --verdict achieved`).\n\
          Never open the queue database directly; use the dagq CLI only.\n",
         db = path_text(db)?,

@@ -82,8 +82,10 @@ fn every_skill_has_valid_frontmatter_and_uses_the_launcher() {
         names,
         [
             "dagq",
+            "dagq-inbox",
             "dagq-land",
             "dagq-maintain",
+            "dagq-planner",
             "dagq-recover",
             "dagq-session"
         ]
@@ -129,8 +131,10 @@ fn every_skill_has_valid_frontmatter_and_uses_the_launcher() {
     }
 }
 
-/// Every `reference/<file>.md` a skill names exists, and every file under a
-/// skill's `reference/` is named by its SKILL.md, so none is unreachable.
+/// Every `reference/<file>.md` a skill names exists (in its own directory,
+/// or in the skill a `skills/<name>/reference/` path names), and every file
+/// under a skill's `reference/` is named by its SKILL.md, so none is
+/// unreachable.
 #[test]
 fn skills_point_at_their_reference_files() {
     let mut with_reference = Vec::new();
@@ -152,7 +156,19 @@ fn skills_point_at_their_reference_files() {
                 .take_while(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '.')
                 .collect();
             let file = file.trim_end_matches('.');
-            assert!(reference.join(file).is_file(), "{name}: reference/{file}");
+            let owner = skill[..index]
+                .strip_suffix('/')
+                .and_then(|before| before.rsplit_once("skills/"))
+                .map(|(_, other)| other)
+                .filter(|other| !other.contains('/'))
+                .map_or(reference.clone(), |other| {
+                    plugin_root().join("skills").join(other).join("reference")
+                });
+            assert!(
+                owner.join(file).is_file(),
+                "{name}: {}",
+                owner.join(file).display()
+            );
         }
     }
     with_reference.sort();
@@ -165,10 +181,88 @@ fn skills_point_at_their_reference_files() {
     assert!(maintain.contains("watch --after <cursor>"));
     assert!(maintain.contains("run_in_background"));
     assert!(maintain.contains("Never call `integrate` because a watch returned"));
+    assert!(maintain.contains("\"$DAGQ\" status --role maintainer"));
+    assert!(maintain.contains("watch --after <cursor> --role maintainer"));
     let land = fs::read_to_string(plugin_root().join("skills/dagq-land/SKILL.md")).unwrap();
     assert!(land.contains("\"$DAGQ\" review ID"));
     assert!(land.contains("Land on a pass, ask only on doubt"));
-    assert!(land.contains("Do not run `integrate` on a run with doubt until the user approves it"));
+    assert!(land.contains("On `pass`, go straight to step 4: nobody is asked."));
+    assert!(land.contains("--option land --option send_back --option cancel"));
+    assert!(land.contains(
+        "Never run `integrate` on a run with a concern until its ask is answered `land`."
+    ));
+}
+
+/// ADR-0022: landing asks the person only on doubt, through an
+/// `approve_landing` ask rather than the maintainer's terminal, and the
+/// ask's answers are acted on in the same skill.
+#[test]
+fn dagq_land_asks_only_on_a_concern() {
+    let land = fs::read_to_string(plugin_root().join("skills/dagq-land/SKILL.md")).unwrap();
+    // One ask command, and it sits in the concern branch of step 3.
+    assert_eq!(land.matches("ask --kind approve_landing").count(), 1);
+    let step3 = &land[land.find("## 3.").unwrap()..land.find("## 4.").unwrap()];
+    assert!(step3.contains("ask --kind approve_landing"));
+    assert!(step3.find("On `pass`").unwrap() < step3.find("On `concern`").unwrap());
+    assert!(!land.contains("wait for their answer"), "{land}");
+    assert!(!land.contains("AskUserQuestion"));
+    let step5 = &land[land.find("## 5.").unwrap()..land.find("## 6.").unwrap()];
+    for answer in ["`land`", "`send_back`", "`cancel`"] {
+        assert!(step5.contains(answer), "{answer}");
+    }
+    assert!(step5.contains("\"$DAGQ\" asks --role maintainer"));
+    assert!(step5.contains("ask close <id>"));
+}
+
+/// ADR-0022: registering and closing goals and tasks is the planner's,
+/// answering asks the inbox's; the maintainer's skills neither register nor
+/// close, and turn what they cannot decide into asks.
+#[test]
+fn skills_split_the_roles_of_maintainer_inbox_and_planner() {
+    let read = |name: &str| {
+        fs::read_to_string(plugin_root().join(format!("skills/{name}/SKILL.md"))).unwrap()
+    };
+    for name in ["dagq-maintain", "dagq-session", "dagq-land"] {
+        let skill = read(name);
+        for forbidden in [
+            "\"$DAGQ\" goal close",
+            "\"$DAGQ\" goal add",
+            "\"$DAGQ\" add ",
+            "follows the `dagq` skill once the user agrees",
+        ] {
+            assert!(!skill.contains(forbidden), "{name} mentions {forbidden}");
+        }
+        assert!(
+            !skill.contains("AskUserQuestion") || name == "dagq-maintain",
+            "{name}"
+        );
+    }
+    let maintain = read("dagq-maintain");
+    assert!(maintain.contains("are the planner's (`dagq-planner`)"));
+    assert!(maintain.contains("`decide` you forwarded from a worker's `worker_question`"));
+    assert!(maintain.contains("\"$DAGQ\" ask --kind <approve_landing|answer_prompt|decide>"));
+    let session = read("dagq-session");
+    assert!(session.contains("ask --kind answer_prompt"));
+    assert!(session.contains("a `decide` ask on the same run"));
+
+    let inbox = read("dagq-inbox");
+    assert!(inbox.contains("\"$DAGQ\" status --role inbox"));
+    assert!(inbox.contains("\"$DAGQ\" watch --role inbox --after <cursor>"));
+    assert!(inbox.contains("run_in_background"));
+    assert!(inbox.contains("\"$DAGQ\" asks --open --role inbox"));
+    assert!(inbox.contains("\"$DAGQ\" answer <id> --text"));
+    assert!(inbox.contains("Add no recommendation of your own"));
+    assert!(inbox.contains("never `ask close`, `integrate`"));
+
+    let planner = read("dagq-planner");
+    assert!(planner.contains("skills/dagq/SKILL.md"));
+    assert!(planner.contains("skills/dagq/reference/goal-close.md"));
+    assert!(planner.contains("skills/dagq/reference/observer.md"));
+    assert!(planner.contains("follow_ups"));
+    assert!(planner.contains("\"$DAGQ\" goal close ID --verdict achieved"));
+    assert!(planner.contains("Never: `integrate`, `review`, `answer`"));
+    let dagq = read("dagq");
+    assert!(dagq.contains("A goal is closed once, by the planner"));
 }
 
 /// The runtime resumes `needs_session` runs (ADR-0019): no skill or
@@ -242,7 +336,7 @@ fn session_start(env: &[(&str, &str)], data_home: &Path, cwd: &Path) -> Output {
 }
 
 #[test]
-fn session_start_hook_prints_status_only_in_a_maintainer_session() {
+fn session_start_hook_prints_status_only_in_the_sessions_up_opens() {
     let dir = tempfile::tempdir().unwrap();
     let data_home = dir.path().join("xdg");
     let repo = dir.path().join("repo");
@@ -267,6 +361,8 @@ fn session_start_hook_prints_status_only_in_a_maintainer_session() {
     for env in [
         vec![("DAGQ_BIN", binary)],
         vec![("DAGQ_BIN", binary), ("DAGQ_ROLE", "worker")],
+        vec![("DAGQ_BIN", binary), ("DAGQ_ROLE", "observer")],
+        vec![("DAGQ_BIN", binary), ("DAGQ_ROLE", "inboxes")],
         vec![("DAGQ_ROLE", "")],
     ] {
         let output = session_start(&env, &data_home, &repo);
@@ -282,6 +378,48 @@ fn session_start_hook_prints_status_only_in_a_maintainer_session() {
     assert!(status["attention"].is_array());
     assert_eq!(status["attention"][0]["kind"], "supervisor_stopped");
     assert!(status["cursor"].is_number());
+
+    // The inbox and the planner get the status of their role: an open ask is
+    // the inbox's attention, and the supervisors' health is the maintainer's.
+    stdout_json(&launcher(
+        &[("DAGQ_BIN", binary), ("PATH", "/usr/bin:/bin")],
+        &data_home,
+        &repo,
+        &[
+            "ask",
+            "--kind",
+            "blocked",
+            "--question",
+            "stuck?",
+            "--cmux",
+            "/usr/bin/true",
+        ],
+    ));
+    let inbox = stdout_json(&session_start(
+        &[("DAGQ_BIN", binary), ("DAGQ_ROLE", "inbox")],
+        &data_home,
+        &repo,
+    ));
+    let kinds = |status: &Value| -> Vec<String> {
+        status["attention"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["kind"].as_str().unwrap().to_string())
+            .collect()
+    };
+    assert_eq!(kinds(&inbox), ["ask_opened"]);
+    assert_eq!(inbox["asks"][0]["question"], "stuck?");
+    assert!(inbox["cursor"].is_number());
+    let planner = stdout_json(&session_start(
+        &[("DAGQ_BIN", binary), ("DAGQ_ROLE", "planner")],
+        &data_home,
+        &repo,
+    ));
+    assert!(kinds(&planner).is_empty(), "{planner}");
+    assert!(planner["cursor"].is_number());
+    let maintainer_status = stdout_json(&session_start(&maintainer, &data_home, &repo));
+    assert!(!kinds(&maintainer_status).contains(&"ask_opened".to_string()));
 
     // `up` names the queue in DAGQ_QUEUE, which works outside the repository.
     let db = stdout_json(&launcher(
