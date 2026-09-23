@@ -4644,3 +4644,141 @@ fn watch_returns_when_supervisor_registrations_or_health_change() {
         "supervisor_stopped"
     );
 }
+
+/// The repository moves after a run was validated: every check against the
+/// old binding fails until `rebind`, which is refused while a supervisor or
+/// an `integrate` lives, and afterwards the queue lists, reports and lands
+/// the awaiting run from the new checkout (ADR-0020).
+#[test]
+fn rebind_follows_a_moved_repository_and_the_awaiting_run_lands() {
+    use dagq::infrastructure::adapters::{GitRepository, path_text};
+    let (dir, repo, db, run) = awaiting_run();
+    let seed = git_out(&repo, &["rev-parse", "main"]);
+    let old_common_dir = path_text(&GitRepository::inspect(&repo).unwrap().common_dir).unwrap();
+    let moved = dir.path().join("moved repo");
+    fs::rename(&repo, &moved).unwrap();
+    let new_common_dir = path_text(&GitRepository::inspect(&moved).unwrap().common_dir).unwrap();
+    let worktree = PathBuf::from(run.worktree_path.clone().unwrap());
+    // The run worktree's `.git` file still points into the old repository.
+    assert!(
+        !Command::new("git")
+            .arg("-C")
+            .arg(&worktree)
+            .arg("status")
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+
+    // Nothing rebinds implicitly.
+    let mut queue = SqliteQueue::open(&db).unwrap();
+    assert!(queue.assert_repository(&new_common_dir).is_err());
+    assert!(queue.bind_repository(&new_common_dir).is_err());
+    let refused = integrate(&db, 1, &moved).unwrap_err().to_string();
+    assert!(refused.contains("the queue is bound to"), "{refused}");
+
+    // A live supervisor, even one of another binary, blocks the rebind.
+    queue
+        .register_supervisor("live", std::process::id(), 1, "0.0.1")
+        .unwrap();
+    let refused = runtime::rebind(&db, &moved).unwrap_err().to_string();
+    assert!(refused.contains("supervisor is running"), "{refused}");
+    assert_eq!(
+        queue.repository_binding().unwrap().as_deref(),
+        Some(old_common_dir.as_str())
+    );
+    // A registration left behind by a dead one does not.
+    assert!(queue.deregister_supervisor("live").unwrap());
+    queue
+        .register_supervisor("dead", dead_pid(), 1, VERSION)
+        .unwrap();
+
+    let rebound = runtime::rebind(&db, &moved).unwrap();
+    assert_eq!(rebound["outcome"], "rebound", "{rebound}");
+    assert_eq!(rebound["previous_git_common_dir"], json!(old_common_dir));
+    assert_eq!(rebound["git_common_dir"], json!(new_common_dir));
+    assert_eq!(
+        rebound["worktrees"],
+        json!([{"run_id": run.id, "worktree_path": worktree, "repaired": true, "error": null}]),
+        "{rebound}"
+    );
+    assert_eq!(
+        queue.repository_binding().unwrap().as_deref(),
+        Some(new_common_dir.as_str())
+    );
+    queue.assert_repository(&new_common_dir).unwrap();
+    assert!(queue.assert_repository(&old_common_dir).is_err());
+    // The change is recorded next to the supervisor logs.
+    let log = fs::read_to_string(
+        db.canonicalize()
+            .unwrap()
+            .with_file_name("logs")
+            .join(runtime::REBIND_LOG),
+    )
+    .unwrap();
+    let entry: Value = serde_json::from_str(log.trim()).unwrap();
+    assert_eq!(entry["previous_git_common_dir"], json!(old_common_dir));
+    assert_eq!(entry["git_common_dir"], json!(new_common_dir));
+    // The worktree works again, so a resumed session could use it.
+    git(&worktree, &["status"]);
+    // Rebinding to the same repository changes nothing and logs nothing.
+    let again = runtime::rebind(&db, &moved).unwrap();
+    assert_eq!(again["outcome"], "unchanged", "{again}");
+    assert_eq!(
+        fs::read_to_string(
+            db.canonicalize()
+                .unwrap()
+                .with_file_name("logs")
+                .join(runtime::REBIND_LOG),
+        )
+        .unwrap(),
+        log
+    );
+
+    let listed = queue
+        .list(&dagq::application::TaskQuery {
+            status: dagq::application::StatusFilter::Any,
+            goal_id: None,
+            limit: 20,
+            before: None,
+            full: false,
+        })
+        .unwrap();
+    assert_eq!(serde_json::to_value(listed).unwrap()["total"], 2);
+    runtime::status(&db).unwrap();
+    let outcome = integrate(&db, 1, &moved).unwrap();
+    assert_eq!(outcome["outcome"], "integrated", "{outcome}");
+    let landed = queue.show(1).unwrap().runs[0].clone();
+    assert_landed(&moved, &landed, "test task", &seed);
+}
+
+/// An `integrate` in progress holds the old repository's paths as well.
+#[test]
+fn rebind_is_refused_while_a_run_is_integrating() {
+    let (dir, repo, db, run) = awaiting_run();
+    let main = git_out(&repo, &["rev-parse", "main"]);
+    let mut queue = SqliteQueue::open(&db).unwrap();
+    queue
+        .begin_integration(&run.id, "integrator", &main)
+        .unwrap();
+    let other = dir.path().join("other");
+    fs::create_dir(&other).unwrap();
+    git(&other, &["init", "-q", "-b", "main"]);
+    git(
+        &other,
+        &[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@example.invalid",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "seed",
+        ],
+    );
+    let refused = runtime::rebind(&db, &other).unwrap_err().to_string();
+    assert!(refused.contains("is integrating"), "{refused}");
+}

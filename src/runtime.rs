@@ -2057,6 +2057,117 @@ pub fn recover(db: &Path, id: &str) -> Result<Value> {
     Ok(json!({"outcome": "recovered", "run": run}))
 }
 
+/// `rebind`: bind the queue at `db` to the repository containing `repo`
+/// after the repository moved, the only way the binding changes (ADR-0020).
+/// Refused while a registered supervisor or an `integrate` still lives,
+/// since both hold paths of the old repository. The change is appended to
+/// `logs/rebind.jsonl`, the queue directory's `repository` file (if any)
+/// is rewritten, and every run worktree still on disk gets its Git link
+/// repaired from the new repository. Reports where a repository-resolved
+/// queue now lives, which differs from the queue's own directory until it
+/// is moved there.
+pub fn rebind(db: &Path, repo: &Path) -> Result<Value> {
+    let db = db
+        .canonicalize()
+        .context("queue must already be initialized")?;
+    let mut queue = SqliteQueue::open(&db)?;
+    let repository = GitRepository::inspect(repo)?;
+    let common_dir = path_text(&repository.common_dir)?;
+    let live = queue
+        .supervisors()?
+        .into_iter()
+        .filter(|registration| process_alive(registration.pid))
+        .map(|registration| registration.pid)
+        .collect::<Vec<_>>();
+    ensure!(
+        live.is_empty(),
+        "refusing to rebind while a supervisor is running (pid {live:?}); stop it with `down --wait` first"
+    );
+    let leases = queue.run_leases()?;
+    if let Some(run) = queue
+        .runs_with_status(RunStatus::Integrating)?
+        .into_iter()
+        .find(|run| {
+            leases
+                .iter()
+                .any(|lease| lease.run_id == run.id && process_alive(lease.pid))
+        })
+    {
+        bail!(
+            "refusing to rebind while run {} of task {} is integrating",
+            run.id,
+            run.task_id
+        );
+    }
+    let previous = queue.rebind_repository(&common_dir)?;
+    let changed = previous.as_deref() != Some(common_dir.as_str());
+    let location = crate::infrastructure::location::QueueLocation::explicit(&db);
+    if changed {
+        fs::create_dir_all(&location.log_dir)?;
+        let mut log = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(location.log_dir.join(REBIND_LOG))?;
+        writeln!(
+            log,
+            "{}",
+            json!({
+                "at": unix_time(),
+                "previous_git_common_dir": previous,
+                "git_common_dir": common_dir,
+                "binary_version": crate::VERSION,
+            })
+        )?;
+        let pointer = location
+            .queue_dir
+            .join(crate::infrastructure::location::REPOSITORY_FILE_NAME);
+        if pointer.is_file() {
+            fs::write(&pointer, format!("{common_dir}\n"))?;
+        }
+    }
+    let worktrees = queue
+        .all_runs()?
+        .into_iter()
+        .filter_map(|run| run.worktree_path.map(|path| (run.id, PathBuf::from(path))))
+        .filter(|(_, path)| path.is_dir())
+        .map(|(run_id, path)| {
+            let error = repository.repair_worktree(&path).err();
+            json!({
+                "run_id": run_id,
+                "worktree_path": path,
+                "repaired": error.is_none(),
+                "error": error.map(|e| format!("{e:#}")),
+            })
+        })
+        .collect::<Vec<_>>();
+    let resolved = crate::infrastructure::location::data_home()
+        .ok()
+        .map(|home| {
+            crate::infrastructure::location::QueueLocation::for_repository(
+                &repository.common_dir,
+                &home,
+            )
+            .queue_dir
+        });
+    let move_to = resolved
+        .clone()
+        .filter(|dir| dir.canonicalize().ok().as_deref() != Some(location.queue_dir.as_path()));
+    Ok(json!({
+        "outcome": if changed { "rebound" } else { "unchanged" },
+        "db": db,
+        "previous_git_common_dir": previous,
+        "git_common_dir": common_dir,
+        "queue_dir": location.queue_dir,
+        "repository_queue_dir": resolved,
+        "move_to": move_to,
+        "worktrees": worktrees,
+    }))
+}
+
+/// Append-only record of `rebind` under the queue's `logs/`, one JSON
+/// object per changed binding; the schema has no queue-level event.
+pub const REBIND_LOG: &str = "rebind.jsonl";
+
 fn lease_health(lease: &RunLease, now: i64) -> LeaseHealth {
     let age = now - lease.heartbeat_at;
     LeaseHealth {

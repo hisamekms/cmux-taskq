@@ -411,6 +411,38 @@ impl SqliteQueue {
         Ok(())
     }
 
+    /// Point the queue at `common_dir` whatever it was bound to, and return
+    /// the previous binding. Only the explicit `rebind` command calls this
+    /// (ADR-0020); `init` and `supervise` go through `bind_repository`.
+    pub fn rebind_repository(&mut self, common_dir: &str) -> Result<Option<String>> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let previous: Option<String> = tx
+            .query_row(
+                "SELECT git_common_dir FROM queue_repository WHERE singleton=1",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+        tx.execute(
+            "INSERT INTO queue_repository VALUES (1,?1)
+             ON CONFLICT(singleton) DO UPDATE SET git_common_dir=excluded.git_common_dir",
+            [common_dir],
+        )?;
+        tx.commit()?;
+        Ok(previous)
+    }
+
+    /// Every run of the queue, oldest first.
+    pub fn all_runs(&self) -> Result<Vec<TaskRun>> {
+        Ok(self
+            .conn
+            .prepare("SELECT * FROM task_runs ORDER BY rowid")?
+            .query_map([], run_row(&self.runs_dir))?
+            .collect::<rusqlite::Result<_>>()?)
+    }
+
     /// Refuse a queue that belongs to another repository. An unbound queue
     /// (created with `--db` and never supervised) passes.
     pub fn assert_repository(&self, common_dir: &str) -> Result<()> {

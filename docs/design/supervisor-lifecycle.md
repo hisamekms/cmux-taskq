@@ -20,6 +20,7 @@ related:
   - adr-0014
   - adr-0016
   - adr-0018
+  - adr-0020
   - design-persistence
   - design-provider-lifecycle
   - design-plugin-integration
@@ -280,3 +281,13 @@ cmux workspaceの存在は確認しない（cmuxなしで動く）。IDを見て
 3. `BEGIN IMMEDIATE`の中でそのrunのleaseが新鮮でないことと`run_processes`の行数が確認時と同じことを再検査し、runを`interrupted`（`integrating`なら`awaiting_integration`: 検証済みの成果は残っており、次の`integrate`が途中のrebaseをabortしてやり直す）にし、確認した内容を`run_recovered`イベント（`previous_status`、`status`、`lease_deleted`、`run`）に記録し、そのrunのleaseだけを削除する。
 
 他のrun、そのlease・process、`run_processes`、worktree、branch、workspace、run directoryは触らない。Taskは`in_progress`のまま残る。再試行は`ready ID`（編集するなら`draft ID`）で行い、動いているsupervisor（または次のsupervisor）が新しいTaskRunと新しいworktreeを作る。`recover`はTaskを`ready`に戻さない: 復旧と再実行は別の判断であり、`failed`で止まったTaskの再試行と同じ経路にまとめるため。
+
+### `rebind`
+
+`dagq rebind [--repo REPO]`はrepositoryを移動した後に、開いたqueueの`queue_repository`を`--repo`（既定はcwd）の`GitRepository::inspect`が返すcanonicalなcommon directoryに付け替える（[ADR-0020](../adr/0020-rebind-queue-to-a-moved-repository.md)）。repositoryから解決したqueueでopen直後の`assert_repository`を通らない唯一のコマンドで、`bind_repository`を使う`init`・`supervise`は今までどおり別のrepositoryを拒否する。
+
+1. **拒否**: `supervisors`の登録のうちPIDが生きているものがあれば失敗する（heartbeatの古いhungも含む。PIDの死んだ登録は無視する）。`integrating`のrunのleaseのPIDが生きていれば（着地中の`integrate`）失敗する。どちらも束縛は変えない。
+2. **付け替え**: `rebind_repository`が1トランザクションで旧値を読み、新しいcommon directoryをupsertする。旧値と同じなら`outcome: unchanged`。
+3. **記録**: 変わったときだけ`<queue dir>/logs/rebind.jsonl`に1行追記し、`<queue dir>/repository`があれば新しいpathに書き換える。`run_events`には書かない。
+4. **worktreeのrepair**: runのうちworktree（queueの今の`runs/`から解決したpath）が残っているものに、新しいrepositoryの主working treeで`git worktree repair <worktree>`を実行する。main working treeの移動で壊れた`.git`ファイルが直る。失敗は`worktrees[].error`に出すだけで`rebind`は成功する。
+5. **出力**: `previous_git_common_dir`、`git_common_dir`、`db`、`queue_dir`、`repository_queue_dir`（新しいcommon directoryから解決されるqueueディレクトリ。data homeが決まらなければnull）、`move_to`（それが`queue_dir`と違うときだけ。data homeが決まらないときもnull。行き先が既にあるかは見ないので、手順で「存在しないこと」を求める）、`worktrees`。

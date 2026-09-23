@@ -142,6 +142,7 @@ Commands return JSON on stdout. Runtime errors return JSON on stderr with a nonz
 | `review ID` | Write the review material of the task's run awaiting integration or a session to `<run_dir>/review.md` (task, goal, receipt, `git log`, diffstat and the full `git diff <base>...<head>`) and print only its path, `base`, `head` and the diff's `files_changed` / `insertions` / `deletions` |
 | `status` | List every registered supervisor (PID, liveness, heartbeat age, `mode` and `workspace_id`, `binary_version`, `parallel`, the runs it holds), any other lease holder such as an `integrate` process, and the unfinished runs with their worktree paths and leases |
 | `doctor [--full]` | Report the same supervisors and every unfinished run without changing state, one line's worth each (`run_id`, `task_id`, `status`, `lease_stale`, `recoverable`, `blocker_count`, `workspace_id`, `worktree_path`). `--full` adds each run's lease, wrapper/agent processes, heartbeats, paths, and recovery blockers |
+| `rebind [--repo PATH]` | Bind the queue to the repository containing the working directory (or `--repo`) after that repository moved: the only command that changes the binding, and the only one that accepts a repository-resolved queue bound elsewhere. Refused while a registered supervisor or an `integrate` is alive. Prints the previous and new `git_common_dir`, `move_to` (where the repository now resolves its queue, when that is not where this one is), and `worktrees` (each remaining run worktree, repaired with `git worktree repair`); a change is appended to `<queue dir>/logs/rebind.jsonl`. See [Move the repository or the queue](#move-the-repository-or-the-queue) |
 | `recover RUN_ID` | Mark one unfinished run `interrupted` and drop its lease once its processes and supervisor are gone; keeps its worktree and workspace, and leaves other runs alone |
 
 Verification commands are shell lines that the supervisor runs in the worktree (`/bin/sh -c`) after the session exits; the agent is asked to run them too. Task descriptions and acceptance criteria are optional during registration.
@@ -256,6 +257,22 @@ If the rebase conflicts, `integrate` aborts it, leaves the worktree on its valid
 An error before `main` moves (a missing worktree, a `main` checkout with local changes that collide with the landing, a Git failure) puts the run back where it was with the message in `last_error` and an `integration_error` event; fix the cause and run `integrate` again. An `integrate` process that dies leaves its run `integrating` with a stale lease: `doctor` lists it, and `recover RUN_ID` returns it to `awaiting_integration` once the process is gone. A task with no run awaiting integration or a session is an error, so a task cannot be landed twice.
 
 The landing happens in the working directory's repository; pass `--repo PATH` to name another checkout, for example when using `--db` from elsewhere. Either way it must be the repository the queue is bound to: a queue resolved from the working directory is bound by `init`, a `--db` queue by its first `supervise`, and a mismatch is an error. Pushing `main` stays with you.
+
+## Move the repository or the queue
+
+The queue directory can be moved as a whole on its own: stop the supervisor with `down --wait`, land or resolve `needs_session` runs, move `queue.db` with its WAL files, `runs/`, `logs/` and `repository` together, and point `--db` (or `DAGQ_DB`) at the new place; run paths are resolved from where the queue is opened, and `integrate` repairs each worktree's Git record (ADR-0017). Do not `git worktree prune` before those runs have landed.
+
+Moving the repository (a directory move, or a GitHub rename that moves a ghq checkout) changes its Git common directory, so the checkout resolves to a new, empty queue location, and the old queue is still bound to the old path: once it sits where the new checkout resolves, every command fails with `queue is bound to another Git repository`, and through `--db` `supervise` and `integrate` do; `init` does not rebind it. `rebind` does, explicitly (ADR-0020). In this order:
+
+1. In the old checkout, `dagq down --wait`: the supervisor drains its runs and its LaunchAgent (named after the old queue hash) is removed. Resolve and land `needs_session` runs; runs awaiting integration survive the move.
+2. Move the repository. Do not run `init` in the new checkout: it would create an empty queue where the old one has to go.
+3. From the new checkout, rebind the old queue in place: `dagq --db <old queue dir>/queue.db rebind` (with the plugin launcher, `DAGQ_DB=<old queue dir>/queue.db`). It prints `previous_git_common_dir` and `git_common_dir`, repairs the Git link of each run worktree still on disk, and names the new location as `move_to`. A running supervisor or `integrate` makes it fail before anything changed.
+4. Move the old queue directory to `move_to` as a whole, e.g. `mv <old queue dir> <move_to>`. `move_to` must not exist yet; if it does (an `init` ran in the new checkout), check that it holds no tasks and remove it first, or `mv` puts the old queue inside it.
+5. From the new checkout, `dagq list` and `dagq status` work without flags; start the runtime again with `up`.
+
+If the repository was already moved without step 1, the old checkout is gone: stop an in-cmux supervisor with `dagq --db <old queue dir>/queue.db down --wait`, but the LaunchAgent is named after the old repository's hash, not the `--db` path, so remove it by hand with `launchctl bootout gui/$(id -u)/com.dagq.<old hash>` and delete its plist under `~/Library/LaunchAgents` (the old hash is the old queue directory's name).
+
+The reverse order also works: move the queue directory to `dagq locate`'s `queue_dir` first, then run `dagq rebind` without `--db` (every other command, `init` included, refuses the queue until then). Rebinding first is preferred because the step that can be refused happens before anything was moved, and `move_to` says where to go. `rebind` from the repository the queue is already bound to reports `unchanged`. The database is never edited by hand for any of this.
 
 ## Use from Claude Code
 

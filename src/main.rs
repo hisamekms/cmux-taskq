@@ -233,6 +233,15 @@ enum Command {
         #[arg(long)]
         full: bool,
     },
+    /// Bind the queue to the repository containing the working directory (or
+    /// --repo) after the repository moved; the one command that changes the
+    /// binding. Refused while a supervisor runs. Pass --db for a queue still
+    /// in its old directory; `move_to` names where the repository now looks for it.
+    Rebind {
+        /// Checkout of the repository to bind to; defaults to the working directory.
+        #[arg(long)]
+        repo: Option<PathBuf>,
+    },
     /// Mark one unfinished run interrupted once its processes and supervisor are gone; keeps its worktree and workspace and leaves other runs alone.
     Recover {
         /// Run ID from `show` or `doctor`.
@@ -334,15 +343,19 @@ fn execute(cli: Cli) -> Result<Value> {
             "git_common_dir": common_dir,
         }));
     }
+    // A repository queue already resolved the working directory; `--repo`
+    // overrides it for a `--db` queue used from elsewhere or a moved checkout.
+    let checkout = |repo: Option<PathBuf>| repo.unwrap_or_else(|| cwd.clone());
+    // `rebind` is the one command that runs on a queue bound elsewhere.
+    if let Command::Rebind { repo } = cli.command {
+        return dagq::runtime::rebind(&db, &checkout(repo));
+    }
     let mut queue = SqliteQueue::open(&db)?;
     if let Some(common_dir) = &common_dir {
         queue.assert_repository(common_dir)?;
     }
-    // A repository queue already resolved the working directory; `--repo`
-    // overrides it for a `--db` queue used from elsewhere or a moved checkout.
-    let checkout = |repo: Option<PathBuf>| repo.unwrap_or_else(|| cwd.clone());
     Ok(match cli.command {
-        Command::Init | Command::Locate => unreachable!(),
+        Command::Init | Command::Locate | Command::Rebind { .. } => unreachable!(),
         Command::Add {
             title,
             description,

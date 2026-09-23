@@ -347,3 +347,138 @@ fn a_repository_queue_bound_elsewhere_is_refused_by_every_command() {
     assert!(queue.assert_repository("/somewhere/else/.git").is_ok());
     assert!(queue.assert_repository("/third/.git").is_err());
 }
+
+/// A moved repository resolves to a new queue directory. `rebind --db` on
+/// the old queue binds it to the new common directory and names where to
+/// move it (`move_to`); after the move every command works from the new
+/// checkout. `init` never rebinds (ADR-0020).
+#[test]
+fn rebind_with_db_then_move_the_queue_directory() {
+    let (dir, data_home, repo) = fixture();
+    let env = [("XDG_DATA_HOME", data_home.as_path())];
+    ok(&repo, &env, &["init"]);
+    ok(&repo, &env, &["add", "kept"]);
+    let old_db = expected_db(&data_home, &repo);
+    let old_common_dir = repo.join(".git").canonicalize().unwrap();
+    let moved = dir.path().join("renamed");
+    fs::rename(&repo, &moved).unwrap();
+    let new_db = expected_db(&data_home, &moved);
+    let new_common_dir = moved.join(".git").canonicalize().unwrap();
+    assert_ne!(old_db, new_db);
+
+    // The new checkout resolves to a queue that does not exist yet.
+    assert!(error(&moved, &env, &["list"]).contains("use init"));
+    assert!(error(&moved, &env, &["rebind"]).contains("initialized"));
+
+    let old = old_db.to_str().unwrap();
+    let rebound = ok(&moved, &env, &["--db", old, "rebind"]);
+    assert_eq!(rebound["outcome"], "rebound");
+    assert_eq!(
+        rebound["previous_git_common_dir"],
+        old_common_dir.to_str().unwrap()
+    );
+    assert_eq!(rebound["git_common_dir"], new_common_dir.to_str().unwrap());
+    assert_eq!(
+        rebound["move_to"],
+        new_db.parent().unwrap().to_str().unwrap()
+    );
+    assert_eq!(
+        fs::read_to_string(old_db.with_file_name("repository")).unwrap(),
+        format!("{}\n", new_common_dir.display())
+    );
+
+    fs::rename(old_db.parent().unwrap(), new_db.parent().unwrap()).unwrap();
+    assert_eq!(ok(&moved, &env, &["list"])["total"], 1);
+    ok(&moved, &env, &["status"]);
+    assert_eq!(
+        ok(&moved, &env, &["init"])["git_common_dir"],
+        new_common_dir.to_str().unwrap()
+    );
+    let again = ok(&moved, &env, &["rebind"]);
+    assert_eq!(again["outcome"], "unchanged");
+    assert_eq!(again["move_to"], Value::Null);
+}
+
+/// The other order: move the queue directory first, then `rebind` without
+/// `--db`. Until then every command, `init` included, refuses the queue;
+/// a live supervisor refuses the rebind itself.
+#[test]
+fn move_the_queue_directory_then_rebind() {
+    let (dir, data_home, repo) = fixture();
+    let env = [("XDG_DATA_HOME", data_home.as_path())];
+    ok(&repo, &env, &["init"]);
+    ok(&repo, &env, &["add", "kept"]);
+    let old_db = expected_db(&data_home, &repo);
+    let old_common_dir = repo.join(".git").canonicalize().unwrap();
+    let moved = dir.path().join("renamed");
+    fs::rename(&repo, &moved).unwrap();
+    let new_db = expected_db(&data_home, &moved);
+    fs::rename(old_db.parent().unwrap(), new_db.parent().unwrap()).unwrap();
+
+    for args in [&["list"][..], &["status"], &["init"], &["add", "x"]] {
+        let message = error(&moved, &env, args);
+        assert!(
+            message.contains("bound to another Git repository"),
+            "{args:?}: {message}"
+        );
+    }
+
+    let supervisor = SqliteQueue::open(&new_db)
+        .unwrap()
+        .register_supervisor("live", std::process::id(), 1, "0.0.1")
+        .unwrap();
+    let message = error(&moved, &env, &["rebind"]);
+    assert!(message.contains("supervisor is running"), "{message}");
+    assert_eq!(
+        SqliteQueue::open(&new_db)
+            .unwrap()
+            .repository_binding()
+            .unwrap()
+            .as_deref(),
+        old_common_dir.to_str()
+    );
+    SqliteQueue::open(&new_db)
+        .unwrap()
+        .deregister_supervisor(&supervisor.token)
+        .unwrap();
+
+    let rebound = ok(&moved, &env, &["rebind"]);
+    assert_eq!(rebound["outcome"], "rebound");
+    assert_eq!(rebound["move_to"], Value::Null);
+    assert_eq!(rebound["worktrees"], serde_json::json!([]));
+    assert_eq!(ok(&moved, &env, &["list"])["total"], 1);
+    ok(&moved, &env, &["doctor"]);
+}
+
+/// A `--db` queue that was never supervised has no binding; `rebind --repo`
+/// from outside any repository binds it, and the log records no previous one.
+#[test]
+fn rebind_binds_an_unbound_db_queue_to_the_repo_flag() {
+    let (dir, data_home, repo) = fixture();
+    let env = [("XDG_DATA_HOME", data_home.as_path())];
+    let db = dir.path().join("queues").join("q.db");
+    let db_text = db.to_str().unwrap();
+    ok(dir.path(), &env, &["--db", db_text, "init"]);
+    let rebound = ok(
+        dir.path(),
+        &env,
+        &["--db", db_text, "rebind", "--repo", repo.to_str().unwrap()],
+    );
+    let common_dir = repo.join(".git").canonicalize().unwrap();
+    assert_eq!(rebound["outcome"], "rebound");
+    assert_eq!(rebound["previous_git_common_dir"], Value::Null);
+    assert_eq!(rebound["git_common_dir"], common_dir.to_str().unwrap());
+    assert_eq!(
+        rebound["move_to"],
+        expected_db(&data_home, &repo)
+            .parent()
+            .unwrap()
+            .to_str()
+            .unwrap()
+    );
+    let log = fs::read_to_string(db.with_file_name("logs").join("rebind.jsonl")).unwrap();
+    let entry: Value = serde_json::from_str(log.trim()).unwrap();
+    assert_eq!(entry["previous_git_common_dir"], Value::Null);
+    // No `repository` pointer is created for a `--db` queue.
+    assert!(!db.with_file_name("repository").exists());
+}
