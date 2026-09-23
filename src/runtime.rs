@@ -598,7 +598,8 @@ impl Supervisor<'_> {
     /// Rebuild the slot of an adopted run from what the queue and the run
     /// directory hold: the planned paths, whether the receipt is already on
     /// disk and whether `/exit` was already requested (never sent twice; its
-    /// timeout restarts now). The wrapper is registered, so no registration
+    /// timeout restarts now, and an `exit_request_timed_out` already recorded
+    /// is not recorded again). The wrapper is registered, so no registration
     /// timeout applies. A `validating` run restarts validation from the
     /// beginning: it is a function of the receipt and the worktree alone.
     fn resume(&self, run: &TaskRun) -> Result<Phase> {
@@ -618,6 +619,9 @@ impl Supervisor<'_> {
                     .queue
                     .has_run_event(&run.id, "exit_requested")?
                     .then(Instant::now);
+                let exit_timed_out = self
+                    .queue
+                    .has_run_event(&run.id, "exit_request_timed_out")?;
                 Phase::Session(SessionWatch {
                     workspace: run
                         .workspace_id
@@ -629,6 +633,7 @@ impl Supervisor<'_> {
                     startup: Instant::now(),
                     receipt_seen,
                     exit_requested,
+                    exit_timed_out,
                 })
             }
         })
@@ -705,6 +710,7 @@ impl Supervisor<'_> {
             startup: Instant::now(),
             receipt_seen: false,
             exit_requested: None,
+            exit_timed_out: false,
         })
     }
 }
@@ -719,6 +725,8 @@ struct SessionWatch {
     startup: Instant,
     receipt_seen: bool,
     exit_requested: Option<Instant>,
+    /// `exit_request_timed_out` is recorded once per run; the lease is kept.
+    exit_timed_out: bool,
 }
 
 impl SessionWatch {
@@ -791,20 +799,27 @@ impl SessionWatch {
                 "wrapper did not register within 45 seconds"
             );
         }
-        if let Some(requested) = self.exit_requested {
+        if let Some(requested) = self.exit_requested
+            && !self.exit_timed_out
+        {
             let timeout = cmux.exit_timeout();
             if requested.elapsed() >= timeout {
-                // The session is still alive; leave it to a human instead of forcing it.
+                // Something in the session (for example a dialog) held the
+                // /exit back. Keep the lease and keep watching: the run
+                // proceeds to validation once the session exits. /exit is not
+                // sent again, since it could pick another option of a dialog.
                 queue.record_runtime_event(
                     &run.id,
                     "exit_request_timed_out",
                     json!({"workspace_id": self.workspace, "timeout_secs": timeout.as_secs()}),
                 )?;
-                bail!(
-                    "session did not exit within {}s of the exit request; send /exit in workspace {} or recover the run",
+                log.note(&format!(
+                    "session for {} did not exit within {}s of the exit request; keeping the run and waiting (send /exit in workspace {})",
+                    run.id,
                     timeout.as_secs(),
                     self.workspace
-                );
+                ));
+                self.exit_timed_out = true;
             }
         }
         Ok(None)

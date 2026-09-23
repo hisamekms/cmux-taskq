@@ -737,84 +737,94 @@ fn missing_or_stale_idle_marker_does_not_request_exit() {
     }
 }
 
+/// Fake agent that ignores the supervisor's `/exit` (as when a dialog holds
+/// it back) and ends only once the test writes `$EXIT.held`, the way a person
+/// or maintainer would answer the dialog and exit.
+const HELD_AGENT: &str = "commit work; receipt \"$(git rev-parse HEAD)\"; idle; while [ ! -f \"$EXIT.held\" ]; do sleep 0.2; done";
+
+fn release_held_session(run_dir: &str) {
+    fs::write(Path::new(run_dir).join("exit-requested.held"), "").unwrap();
+}
+
+/// An unanswered `/exit` is recorded once and surfaces as `send /exit`, but
+/// the supervisor keeps the lease and keeps watching: when the session ends
+/// later, the run is validated as usual.
 #[test]
-fn unanswered_exit_request_times_out_and_retains_run() {
+fn unanswered_exit_request_times_out_and_keeps_the_run() {
     let (_dir, repo, db) = fixture();
-    let mut backend = TestWorkspace::new(
-        &db,
-        false,
-        "commit work; receipt \"$(git rev-parse HEAD)\"; idle; sleep 6",
-    );
+    let mut backend = TestWorkspace::new(&db, false, HELD_AGENT);
     backend.exit_timeout = Duration::from_secs(2);
-    // The run is given up, not the supervisor: the pass ends normally with the
-    // error listed per run.
-    let outcome = supervise(&db, &repo, &backend).unwrap();
-    assert_eq!(outcome["outcome"], "finished");
-    assert_eq!(outcome["runs"], json!([]));
-    let error = outcome["errors"][0]["message"].as_str().unwrap();
-    assert!(error.contains("did not exit within 2s"), "{error}");
-    assert_eq!(backend.exits_sent.load(Ordering::SeqCst), 1);
-    // The session was never killed; it is still alive when supervise gives up.
+    let backend = Arc::new(backend);
+    let supervisor = {
+        let (db, repo, backend) = (db.clone(), repo.clone(), backend.clone());
+        thread::spawn(move || supervise(&db, &repo, &backend))
+    };
+    wait_until(&db, Duration::from_secs(30), |queue| {
+        event_kinds(&queue.show(1).unwrap()).contains(&"exit_request_timed_out")
+    });
+    // Let a few more polls pass: the timeout is not recorded again and the
+    // run is not given up.
+    thread::sleep(Duration::from_millis(1500));
     let mut queue = SqliteQueue::open(&db).unwrap();
     let detail = queue.show(1).unwrap();
-    let run = &detail.runs[0];
-    assert_eq!(outcome["errors"][0]["run_id"], json!(run.id));
+    let run = detail.runs[0].clone();
     assert_eq!(run.status, RunStatus::Running);
-    assert!(run.last_error.as_ref().unwrap().contains("did not exit"));
-    assert!(Path::new(run.worktree_path.as_ref().unwrap()).exists());
-    // The lease is dropped so recovery can judge the run by its processes alone.
-    assert!(queue.run_leases().unwrap().is_empty());
+    assert!(run.last_error.is_none());
+    assert!(queue.run_lease(&run.id).unwrap().is_some());
     let kinds = event_kinds(&detail);
-    assert!(kinds.contains(&"exit_requested"));
-    assert!(kinds.contains(&"exit_request_timed_out"));
+    assert_eq!(
+        kinds
+            .iter()
+            .filter(|k| **k == "exit_request_timed_out")
+            .count(),
+        1
+    );
+    assert!(!kinds.contains(&"runtime_error"));
     assert!(!kinds.contains(&"session_exited"));
-    assert!(!kinds.contains(&"lease_released"));
     let timed_out = detail
         .events
         .iter()
         .find(|e| e.kind == "exit_request_timed_out")
         .unwrap();
-    assert_eq!(timed_out.payload["timeout_secs"], 2);
-    let runtime_error = detail
-        .events
-        .iter()
-        .find(|e| e.kind == "runtime_error")
-        .unwrap();
-    assert_eq!(runtime_error.payload["lease_released"], true);
-    // Still alive: doctor sees the wrapper and refuses recovery.
-    let report = runtime::doctor(&db, true).unwrap();
-    assert_eq!(report["supervisors"], json!([]));
-    assert_eq!(report["runs"][0]["lease"], Value::Null);
-    assert_eq!(report["runs"][0]["recoverable"], false);
-    // The default report keeps one line's worth per run: no lease, processes or run_dir.
-    let blockers = report["runs"][0]["blockers"].as_array().unwrap().len();
-    assert!(blockers > 0);
     assert_eq!(
-        runtime::doctor(&db, false).unwrap()["runs"],
-        json!([{
-            "run_id": run.id,
-            "task_id": 1,
-            "status": "running",
-            "lease_stale": null,
-            "recoverable": false,
-            "blocker_count": blockers,
-            "workspace_id": run.workspace_id,
-            "worktree_path": run.worktree_path,
-        }])
+        timed_out.payload,
+        json!({"workspace_id": WORKSPACE_ID, "timeout_secs": 2})
     );
+    assert_eq!(backend.exits_sent.load(Ordering::SeqCst), 1);
+    // The maintainer is told to send /exit; recovery is refused while the
+    // supervisor holds the lease.
+    let status = runtime::status(&db).unwrap();
+    let attention = run_attention_of(&status, &run.id).unwrap();
+    assert_eq!(attention["kind"], "exit_request_timed_out");
+    assert_eq!(attention["next"], "send /exit");
     assert!(runtime::recover(&db, &run.id).is_err());
-    // A later manual exit is still recorded by the wrapper; nothing restarts the run.
+
+    release_held_session(run.run_dir.as_ref().unwrap());
+    let outcome = supervisor.join().unwrap().unwrap();
     backend.join();
+    assert_eq!(outcome["errors"], json!([]), "{outcome}");
+    assert_eq!(outcome["runs"][0]["status"], "awaiting_integration");
+    assert_eq!(backend.exits_sent.load(Ordering::SeqCst), 1);
     let detail = queue.show(1).unwrap();
-    assert_eq!(detail.runs[0].status, RunStatus::Running);
-    assert!(event_kinds(&detail).contains(&"session_exited"));
-    let again = supervise(&db, &repo, &backend).unwrap();
-    assert_eq!(again["runs"], json!([]));
-    assert_eq!(queue.show(1).unwrap().runs.len(), 1);
-    // Recovery is per run and needs no supervisor to be stopped.
+    assert_eq!(detail.runs[0].status, RunStatus::AwaitingIntegration);
+    assert!(queue.run_leases().unwrap().is_empty());
+    let kinds = event_kinds(&detail);
+    let position = |kind: &str| kinds.iter().position(|k| *k == kind).unwrap();
+    assert!(position("exit_request_timed_out") < position("session_exited"));
+    assert!(position("session_exited") < position("validation_finished"));
     assert_eq!(
-        runtime::recover(&db, &run.id).unwrap()["run"]["status"],
-        "interrupted"
+        kinds
+            .iter()
+            .filter(|k| **k == "exit_request_timed_out")
+            .count(),
+        1
+    );
+    assert!(!kinds.contains(&"runtime_error"));
+    // The session exited, so the attention is the landing now, not /exit.
+    let status = runtime::status(&db).unwrap();
+    assert_eq!(
+        run_attention_of(&status, &run.id).unwrap()["next"],
+        "review and integrate"
     );
 }
 
@@ -3405,48 +3415,57 @@ fn independent_tasks_run_concurrently_and_a_dependent_starts_after_integration()
     drop(dir);
 }
 
-/// A run that never answers the exit request is given up without disturbing
-/// the run next to it, and can be recovered by itself once its session ends.
+/// A run that does not answer the exit request keeps its lease without
+/// disturbing the run next to it, and is validated once its session ends.
 #[test]
-fn a_timed_out_run_is_abandoned_while_the_other_run_is_accepted() {
+fn a_timed_out_run_is_kept_while_the_other_run_is_accepted() {
     let (_dir, repo, db) = fixture();
     let mut queue = SqliteQueue::open(&db).unwrap();
     add_ready_task(&mut queue, "healthy", &[]);
     let mut backend = TestWorkspace::new(&db, false, VALID_AGENT);
-    backend.script_for(
-        1,
-        "commit work; receipt \"$(git rev-parse HEAD)\"; idle; sleep 6",
-    );
+    backend.script_for(1, HELD_AGENT);
     backend.exit_timeout = Duration::from_secs(2);
-    let outcome = supervise(&db, &repo, &backend).unwrap();
-    assert_eq!(outcome["outcome"], "finished");
+    let backend = Arc::new(backend);
+    let supervisor = {
+        let (db, repo, backend) = (db.clone(), repo.clone(), backend.clone());
+        thread::spawn(move || supervise(&db, &repo, &backend))
+    };
+    wait_until(&db, Duration::from_secs(30), |queue| {
+        event_kinds(&queue.show(1).unwrap()).contains(&"exit_request_timed_out")
+            && queue
+                .show(2)
+                .unwrap()
+                .runs
+                .first()
+                .is_some_and(|r| r.status == RunStatus::AwaitingIntegration)
+    });
     let stuck = queue.show(1).unwrap().runs[0].clone();
     let healthy = queue.show(2).unwrap().runs[0].clone();
-    assert_eq!(outcome["runs"].as_array().unwrap().len(), 1);
-    assert_eq!(outcome["runs"][0]["id"], json!(healthy.id));
-    assert_eq!(outcome["errors"].as_array().unwrap().len(), 1);
-    assert_eq!(outcome["errors"][0]["run_id"], json!(stuck.id));
-    assert_eq!(outcome["errors"][0]["task_id"], 1);
-    assert_eq!(healthy.status, RunStatus::AwaitingIntegration);
     assert!(healthy.last_error.is_none());
     assert!(healthy.workspace_closed_at.is_some());
     assert_eq!(stuck.status, RunStatus::Running);
-    assert!(stuck.last_error.as_ref().unwrap().contains("did not exit"));
-    assert!(queue.run_leases().unwrap().is_empty());
-    // Only the stuck run is unfinished; its live wrapper still blocks recovery.
+    assert!(stuck.last_error.is_none());
+    assert!(queue.run_lease(&stuck.id).unwrap().is_some());
+    assert!(queue.run_lease(&healthy.id).unwrap().is_none());
+    // Only the stuck run is unfinished, and its supervisor still holds it.
     let report = runtime::doctor(&db, true).unwrap();
     assert_eq!(report["runs"].as_array().unwrap().len(), 1);
     assert_eq!(report["runs"][0]["run_id"], json!(stuck.id));
     assert_eq!(report["runs"][0]["recoverable"], false);
+
+    release_held_session(stuck.run_dir.as_ref().unwrap());
+    let outcome = supervisor.join().unwrap().unwrap();
     backend.join();
-    assert_eq!(
-        runtime::recover(&db, &stuck.id).unwrap()["run"]["status"],
-        "interrupted"
-    );
-    assert_eq!(
-        queue.show(2).unwrap().runs[0].status,
-        RunStatus::AwaitingIntegration
-    );
+    assert_eq!(outcome["outcome"], "finished");
+    assert_eq!(outcome["errors"], json!([]), "{outcome}");
+    assert_eq!(outcome["runs"].as_array().unwrap().len(), 2);
+    for task in [1, 2] {
+        assert_eq!(
+            queue.show(task).unwrap().runs[0].status,
+            RunStatus::AwaitingIntegration
+        );
+    }
+    assert!(queue.run_leases().unwrap().is_empty());
 }
 
 /// A nonzero session exit and a rejected receipt in one pass leave the
@@ -4027,13 +4046,15 @@ fn adopter_does_not_repeat_an_exit_request_the_previous_supervisor_sent() {
 }
 
 /// The exit timeout of an adopted run restarts at adoption: a session that
-/// still ignores the earlier request is given up after the adopter's own
-/// timeout, with one `exit_requested` event in total.
+/// still ignores the earlier request is reported after the adopter's own
+/// timeout, with one `exit_requested` event in total, and the adopter keeps
+/// the run until the session ends.
 #[test]
 fn adopted_exit_request_times_out_from_the_adoption() {
     let (_dir, repo, db) = fixture();
     let mut backend = TestWorkspace::new(&db, false, IDLE_AGENT);
     backend.exit_timeout = Duration::from_secs(2);
+    let backend = Arc::new(backend);
     let run = start_run_under_dead_supervisor(&repo, &db, &backend, "dead-supervisor");
     let mut queue = SqliteQueue::open(&db).unwrap();
     queue
@@ -4044,24 +4065,96 @@ fn adopted_exit_request_times_out_from_the_adoption() {
         )
         .unwrap();
     age_lease(&db, &run, 31);
-    let outcome = supervise(&db, &repo, &backend).unwrap();
-    assert_eq!(outcome["runs"], json!([]), "{outcome}");
-    let error = outcome["errors"][0]["message"].as_str().unwrap();
-    assert!(error.contains("did not exit within 2s"), "{error}");
+    let supervisor = {
+        let (db, repo, backend) = (db.clone(), repo.clone(), backend.clone());
+        thread::spawn(move || supervise(&db, &repo, &backend))
+    };
+    wait_until(&db, Duration::from_secs(30), |queue| {
+        event_kinds(&queue.show(1).unwrap()).contains(&"exit_request_timed_out")
+    });
+    assert_eq!(queue.run(&run.id).unwrap().status, RunStatus::Running);
+    let lease = queue.run_lease(&run.id).unwrap().unwrap();
+    assert_ne!(lease.token, "dead-supervisor");
+    // Let the fake session out, the way a person answering it would.
+    fs::write(exit_request_path(run.run_dir.as_ref().unwrap()), "").unwrap();
+    let outcome = supervisor.join().unwrap().unwrap();
+    backend.join();
+    assert_eq!(outcome["errors"], json!([]), "{outcome}");
+    assert_eq!(outcome["runs"][0]["status"], "awaiting_integration");
     assert_eq!(backend.exits_sent.load(Ordering::SeqCst), 0);
     let detail = queue.show(1).unwrap();
     assert_eq!(adoption_events(&detail).len(), 1);
     let kinds = event_kinds(&detail);
     assert_eq!(kinds.iter().filter(|k| **k == "exit_requested").count(), 1);
-    assert!(kinds.contains(&"exit_request_timed_out"));
-    assert_eq!(queue.run(&run.id).unwrap().status, RunStatus::Running);
+    assert_eq!(
+        kinds
+            .iter()
+            .filter(|k| **k == "exit_request_timed_out")
+            .count(),
+        1
+    );
+    assert!(!kinds.contains(&"runtime_error"));
     assert!(queue.run_leases().unwrap().is_empty());
-    // Let the fake session out; nothing adopts a lease-less run afterwards.
+}
+
+/// A run whose exit request already timed out under the previous supervisor
+/// is adopted without recording the timeout again, and is validated once
+/// its session ends.
+#[test]
+fn adopted_run_does_not_record_an_exit_timeout_twice() {
+    let (_dir, repo, db) = fixture();
+    let mut backend = TestWorkspace::new(&db, false, IDLE_AGENT);
+    backend.exit_timeout = Duration::from_secs(1);
+    let backend = Arc::new(backend);
+    let run = start_run_under_dead_supervisor(&repo, &db, &backend, "dead-supervisor");
+    let mut queue = SqliteQueue::open(&db).unwrap();
+    for kind in ["exit_requested", "exit_request_timed_out"] {
+        queue
+            .record_runtime_event(
+                &run.id,
+                kind,
+                json!({"workspace_id": WORKSPACE_ID, "timeout_secs": 120}),
+            )
+            .unwrap();
+    }
+    age_lease(&db, &run, 31);
+    let supervisor = {
+        let (db, repo, backend) = (db.clone(), repo.clone(), backend.clone());
+        thread::spawn(move || supervise(&db, &repo, &backend))
+    };
+    wait_until(&db, Duration::from_secs(30), |queue| {
+        !adoption_events(&queue.show(1).unwrap()).is_empty()
+    });
+    // Well past the adopter's own timeout.
+    thread::sleep(Duration::from_millis(2500));
+    let kinds = event_kinds(&queue.show(1).unwrap())
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        kinds
+            .iter()
+            .filter(|k| *k == "exit_request_timed_out")
+            .count(),
+        1
+    );
+    assert!(queue.run_lease(&run.id).unwrap().is_some());
     fs::write(exit_request_path(run.run_dir.as_ref().unwrap()), "").unwrap();
+    let outcome = supervisor.join().unwrap().unwrap();
     backend.join();
-    let again = supervise(&db, &repo, &backend).unwrap();
-    assert_eq!(again["runs"], json!([]));
-    assert_eq!(adoption_events(&queue.show(1).unwrap()).len(), 1);
+    assert_eq!(outcome["errors"], json!([]), "{outcome}");
+    assert_eq!(outcome["runs"][0]["status"], "awaiting_integration");
+    assert_eq!(backend.exits_sent.load(Ordering::SeqCst), 0);
+    let detail = queue.show(1).unwrap();
+    let kinds = event_kinds(&detail);
+    assert_eq!(
+        kinds
+            .iter()
+            .filter(|k| **k == "exit_request_timed_out")
+            .count(),
+        1
+    );
+    assert!(!kinds.contains(&"runtime_error"));
 }
 
 /// The supervisor died after the wrapper reported its exit but before
