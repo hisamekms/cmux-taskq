@@ -20,6 +20,8 @@ depends_on:
   - adr-0008
   - adr-0010
   - adr-0012
+  - adr-0016
+  - adr-0019
 ---
 
 # Rust runtime MVP
@@ -157,7 +159,7 @@ receiptにはrun ID、結果、commit SHA、実施したunit test/E2E/subagent r
 - maintainerの操作をruntimeへ移す。次の3つに分ける。
   - 通知経路と圧縮出力（goal 6、[ADR-0016](../adr/0016-maintainer-notification-and-compact-output.md)）。maintainerを使い捨てのsessionにし、`status` / `watch` / `doctor`の3入口、run_eventsのkind名の公開契約とdomainでのattention判定、`cmux notify`、既定の圧縮出力と`--full`、`review`による`review.md`、pluginの`SessionStart` hookとskill分割、`maintainer_prompt`の縮約を実装する。`status`のattentionとcursor、`events --after`、`watch`、domainのattention判定はtask 57で実装済み。
   - `ask` / `answer`によるworkerからmaintainerへの相談経路。後続ADRで決め、maintainerへの経路は`watch`を使う。
-  - `needs_session`のrunをruntimeがresumeして定型の解消依頼を送る仕組みと、承認なしの自動着地。first dogfoodingの対象外のまま。
+  - maintainerの定型作業のruntimeへの移管（goal 8、[ADR-0019](../adr/0019-move-routine-maintainer-work-into-the-runtime.md)）。`needs_session`のrunをsupervisorがresumeして定型の解消依頼を送り、`integrate`を呼び済みのrunは着地まで進める。`exit_request_timed_out`でleaseを手放さない、`integrate`の着地後のpush、receiptの`follow_ups`のdraft登録、taskが要求するevidence（`add --evidence`）の検証、workerのダイアログ待ち（`prompt_waiting`）の検知を加える。承認なしの自動着地はfirst dogfoodingの対象外のまま。
 - Codex provider、明示選択、Claude起動不能時のfallbackを追加する。
 - バイナリリリース、checksum、pluginとのバージョン互換性はgoal 2「claude-taskqを配布可能なMVP (v0.1.0)にする」（当時の名前。現`claude-dagq`）で実装した（2026-09-22）。`v*`のtag pushで`aarch64-apple-darwin`のtar.gzと`SHA256SUMS`をGitHub Releaseに添付する`.github/workflows/release.yml`（task 28）、repository rootの`.claude-plugin/marketplace.json`による`claude plugin marketplace add` / `install`とlauncherのmajor.minor不一致警告（task 29）、`up`がversionの違うsupervisorをdrainして入れ替える更新手順（task 30、[ADR-0014](../adr/0014-up-replaces-a-supervisor-of-another-binary-version.md)）、READMEのGetting startedとUpgrade（task 31）。LICENSE（MIT）とmainのCIも同じgoalで入れた。Codex pluginは未着手で、goal 2の制約でも対象外。
 - 既存Pythonキューからtask ID、依存、run履歴、ログ参照を移行する。
