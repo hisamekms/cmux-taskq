@@ -110,6 +110,27 @@ impl QueueLocation {
         }
     }
 
+    /// The queue hash that names the queue's workspace group and appears in
+    /// its workspaces' descriptions (ADR-0026). A repository queue's
+    /// directory is named after it, and so it stays when the same queue is
+    /// reached by `--db` (as `up` starts `supervise`): a `queue.db` beside
+    /// the `repository` file `prepare` writes is such a queue. Any other
+    /// `--db` queue is identified by the hash its label carries.
+    pub fn hash(&self) -> String {
+        if self.source == QueueSource::DbFlag
+            && self.db.file_name() == Some(DB_FILE_NAME.as_ref())
+            && self.queue_dir.join(REPOSITORY_FILE_NAME).is_file()
+            && let Some(name) = canonical(&self.queue_dir).file_name()
+        {
+            return name.to_string_lossy().into_owned();
+        }
+        self.label
+            .strip_prefix(LAUNCH_AGENT_PREFIX)
+            .and_then(|rest| rest.strip_prefix('.'))
+            .unwrap_or(&self.label)
+            .to_owned()
+    }
+
     /// Create the queue directory before `init`. A repository queue also gets a
     /// `repository` file naming its Git common directory for humans.
     pub fn prepare(&self) -> Result<()> {
@@ -299,6 +320,36 @@ mod tests {
             !QueueLocation::explicit_in(Path::new("/x/y/other.db"), Path::new(""))
                 .launch_agent
                 .is_absolute()
+        );
+    }
+
+    /// The workspace group of a repository queue has the same external ID
+    /// whether `up` resolved the queue from the repository or `supervise`
+    /// was given its database by `--db`.
+    #[test]
+    fn queue_hash_is_the_repository_hash_however_the_queue_is_reached() {
+        let dir = tempfile::tempdir().unwrap();
+        let repository = QueueLocation::for_repository(Path::new("/repo/.git"), dir.path());
+        let hash = repository_hash(Path::new("/repo/.git"));
+        assert_eq!(repository.hash(), hash);
+        // Before `prepare` writes the `repository` pointer, `--db` cannot
+        // tell the directory from any other and hashes the path.
+        let by_db = QueueLocation::explicit(&repository.db);
+        assert_ne!(by_db.hash(), hash);
+        repository.prepare().unwrap();
+        assert_eq!(QueueLocation::explicit(&repository.db).hash(), hash);
+        // A symlink to the directory names the same queue.
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&repository.queue_dir, &link).unwrap();
+        assert_eq!(
+            QueueLocation::explicit(&link.join(DB_FILE_NAME)).hash(),
+            hash
+        );
+        // Another file name in that directory is a queue of its own.
+        let other = QueueLocation::explicit(&repository.queue_dir.join("other.db"));
+        assert_eq!(
+            other.hash(),
+            repository_hash(&canonical(&repository.queue_dir.join("other.db")))
         );
     }
 

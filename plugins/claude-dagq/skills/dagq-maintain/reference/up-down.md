@@ -7,7 +7,8 @@ Read this when `up` or `down` returns something the `dagq-maintain` skill does n
 `up` preflights cmux, Claude Code, the repository and an initialized queue (run `init` from the `dagq` skill first if the queue does not exist), deletes supervisor registrations whose process is dead (`pruned_supervisors`), keeps one supervisor resident as a launchd LaunchAgent, opens the maintainer's cmux workspace (`[<repo>]dagq maintainer`), and ends with a `doctor` summary. Pass `--plugin-dir "$CLAUDE_PLUGIN_ROOT"` so the maintainer session it opens loads this plugin; add `--repo PATH` only for a checkout other than the working directory, and `--cmux EXE` / `--claude EXE` when those are not on PATH.
 
 - `supervisor`: `{"outcome": "started" | "reused" | "restarted", "mode", "version", "pid", "token", "workspace_id", "plist", "log_dir"}`. `reused` means a live, heartbeating supervisor of this binary's own version already served this queue and nothing was touched. `mode` is `launchd`, or `in_cmux` with the `workspace_id` it runs in; it is null for a supervisor someone started by hand.
-- `maintainer`: `{"outcome": "created" | "reused" | "skipped", "workspace_id", "name"}`. `skipped` is the normal answer when `up` is called from inside the maintainer session: that session is marked with `DAGQ_ROLE=maintainer` and `DAGQ_QUEUE`, so `up` does not open a second one. The supervisor was still started or reused.
+- `maintainer`: `{"outcome": "created" | "reused" | "skipped", "workspace_id", "name"}`. `up` finds the maintainer workspace by the UUID it recorded in the queue, never by its title: `reused` while cmux still lists it (renaming it changes nothing), `created` when it is gone. `skipped` is the normal answer when `up` is called from inside the maintainer session: the workspace carries `DAGQ_ROLE=maintainer` and `DAGQ_QUEUE` in its own environment (`cmux workspace env <id> --json`), so `up` does not open a second one. The supervisor was still started or reused.
+- `warnings`: why the queue's workspace group (`[<repo>]`, external ID the queue hash) could not be made; the workspace opened outside it. Report it; nothing else failed.
 - `pruned_supervisors`: dead registrations `up` removed.
 - `doctor`: `unfinished_runs` (with `lease_stale`), `awaiting_integration`, `needs_session`: the open work to report.
 
@@ -31,7 +32,7 @@ If `up` fails because cmux refuses a connection from outside its own terminals, 
 
 The `outcome` is `draining` (plain `down`), `stopped` (`--wait`), `killed` (`--force`), or `not_running` when no live supervisor was registered; a lingering agent is unloaded in that case too, and `--force` also drops the dead registrations.
 
-An `in_cmux` supervisor has no launchd agent, so `down` sends it SIGINT and closes its `[<repo>]dagq supervisor` workspace once it has seen the stop through (after the drain with `--wait`, after the kill with `--force`). Plain `down` returns while it still drains, leaves the workspace open and reports it under `supervisor_workspaces` as `left_open`; run `down --wait` (or have the user close it) before the next `up --in-cmux`, which refuses to open a second supervisor workspace over a leftover one.
+An `in_cmux` supervisor has no launchd agent, so `down` sends it SIGINT and closes its `[<repo>]dagq supervisor` workspace once it has seen the stop through (after the drain with `--wait`, after the kill with `--force`). Plain `down` returns while it still drains, leaves the workspace open and reports it under `supervisor_workspaces` as `left_open`; run `down --wait` (or have the user close it) before the next `up --in-cmux`, which refuses to open a second supervisor workspace while the one it recorded for the queue is still open.
 
 ## Logs
 

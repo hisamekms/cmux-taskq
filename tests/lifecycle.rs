@@ -8,9 +8,9 @@ use dagq::{
     VERSION,
     application::{
         AgentState, DetachedRefusal, LaunchAgent, ProcessControl, SupervisorEnvironment, TaskStore,
-        WorkspaceBackend,
+        WorkspaceBackend, WorkspaceTags,
     },
-    domain::{NewTask, SupervisorMode, Task, TaskAction, TaskRun},
+    domain::{NewTask, SessionRole, SupervisorMode, Task, TaskAction, TaskRun},
     infrastructure::{
         adapters::{Cmux, GitRepository, SOCKET_PASSWORD_ENV, detach, process_alive, shell_quote},
         location::QueueLocation,
@@ -214,6 +214,35 @@ struct FakeCmux {
     /// Queue a `[…]dagq supervisor` workspace registers a supervisor in,
     /// the way the `supervise` cmux runs in its terminal would.
     registers_supervisor_in: Option<PathBuf>,
+    /// The tags each workspace was opened with, in `workspaces` order.
+    tags: Mutex<Vec<WorkspaceTags>>,
+    /// Every `ensure_group` call, as (external ID, name).
+    groups: Mutex<Vec<(String, String)>>,
+    /// `workspace-group create` fails.
+    group_fails: bool,
+}
+
+impl FakeCmux {
+    /// Rename a workspace the way a person would in cmux's sidebar.
+    fn rename(&self, id: &str, title: &str) {
+        for workspace in self.workspaces.lock().unwrap().iter_mut() {
+            if workspace.2 == id {
+                workspace.0 = title.into();
+            }
+        }
+    }
+
+    /// An open workspace put there directly, the way one opened by an
+    /// earlier process is: nothing registers for it.
+    fn open(&self, name: &str, cwd: &Path, id: &str) {
+        self.workspaces.lock().unwrap().push((
+            name.into(),
+            cwd.into(),
+            id.into(),
+            "supervise".into(),
+        ));
+        self.tags.lock().unwrap().push(WorkspaceTags::default());
+    }
 }
 
 impl WorkspaceBackend for FakeCmux {
@@ -236,7 +265,7 @@ impl WorkspaceBackend for FakeCmux {
         }
         Ok(())
     }
-    fn create(&self, _: &Task, _: &TaskRun, _: &str) -> Result<String> {
+    fn create(&self, _: &Task, _: &TaskRun, _: &str, _: &WorkspaceTags) -> Result<String> {
         bail!("up does not create run workspaces")
     }
     fn capture(&self, _: &str) -> Result<String> {
@@ -245,11 +274,14 @@ impl WorkspaceBackend for FakeCmux {
     fn close(&self, workspace_id: &str) -> Result<()> {
         self.closed.lock().unwrap().push(workspace_id.to_owned());
         let mut workspaces = self.workspaces.lock().unwrap();
-        let before = workspaces.len();
-        workspaces.retain(|(_, _, id, _)| id != workspace_id);
-        if workspaces.len() == before {
+        let Some(index) = workspaces
+            .iter()
+            .position(|(_, _, id, _)| id == workspace_id)
+        else {
             bail!("no such workspace: {workspace_id}")
-        }
+        };
+        workspaces.remove(index);
+        self.tags.lock().unwrap().remove(index);
         Ok(())
     }
     fn send_exit(&self, _: &str) -> Result<()> {
@@ -258,21 +290,38 @@ impl WorkspaceBackend for FakeCmux {
     fn notify(&self, _: &str, _: &str, _: Option<&str>) -> Result<()> {
         bail!("up does not notify")
     }
-    fn find_named(&self, name: &str) -> Result<Option<String>> {
+    fn exists(&self, workspace_id: &str) -> Result<bool> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         Ok(self
             .workspaces
             .lock()
             .unwrap()
             .iter()
-            .find(|(n, ..)| n == name)
-            .map(|(_, _, id, _)| id.clone()))
+            .any(|(_, _, id, _)| id == workspace_id))
     }
-    fn create_named(&self, name: &str, cwd: &Path, command: &str) -> Result<String> {
+    fn ensure_group(&self, external_id: &str, name: &str) -> Result<String> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.groups
+            .lock()
+            .unwrap()
+            .push((external_id.into(), name.into()));
+        if self.group_fails {
+            bail!("workspace-group create failed")
+        }
+        Ok(format!("group-{external_id}"))
+    }
+    fn create_named(
+        &self,
+        name: &str,
+        cwd: &Path,
+        command: &str,
+        tags: &WorkspaceTags,
+    ) -> Result<String> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         let mut workspaces = self.workspaces.lock().unwrap();
         let id = format!("01234567-89ab-4def-8123-{:012x}", workspaces.len());
         workspaces.push((name.into(), cwd.into(), id.clone(), command.into()));
+        self.tags.lock().unwrap().push(tags.clone());
         if let Some(db) = self.registers_supervisor_in.as_deref()
             && name.ends_with(" supervisor")
         {
@@ -495,19 +544,49 @@ fn up_starts_the_agent_and_the_maintainer_once_and_reuses_them_after() {
     drop(installs);
 
     // The maintainer workspace: repository root as cwd, role and queue in
-    // the environment, the plugin directory and the prompt on the command.
+    // the workspace's own environment (not a prefix of the command), the
+    // plugin directory and the prompt on the command, and the queue's group.
     let workspaces = cmux.workspaces.lock().unwrap();
     assert_eq!(workspaces.len(), 1);
     let (name, cwd, id, command) = &workspaces[0];
     assert_eq!(name, "[my repo]dagq maintainer");
     assert_eq!(cwd, &root);
     assert_eq!(first["maintainer"]["workspace_id"], json!(id));
-    assert!(command.starts_with("'env' 'DAGQ_ROLE=maintainer' 'DAGQ_QUEUE="));
-    assert!(command.contains(&format!("'{}'", fixture.options.claude.display())));
+    assert!(command.starts_with(&format!("'{}'", fixture.options.claude.display())));
+    assert!(!command.contains("DAGQ_"), "{command}");
+    let hash = fixture.location.hash();
+    assert_eq!(
+        cmux.tags.lock().unwrap()[0],
+        WorkspaceTags {
+            env: vec![
+                ("DAGQ_ROLE".into(), "maintainer".into()),
+                ("DAGQ_QUEUE".into(), db.to_str().unwrap().into()),
+            ],
+            description: Some(format!("dagq role=maintainer queue={hash}")),
+            group: Some(format!("group-{hash}")),
+        }
+    );
+    assert_eq!(
+        *cmux.groups.lock().unwrap(),
+        vec![(hash.clone(), "[my repo]".to_owned())]
+    );
+    assert_eq!(first["warnings"], json!([]));
+    // The queue records the workspace by its UUID.
+    assert_eq!(
+        SqliteQueue::open(&fixture.location.db)
+            .unwrap()
+            .session_workspace(SessionRole::Maintainer)
+            .unwrap()
+            .as_deref(),
+        Some(id.as_str())
+    );
     assert!(command.contains("'--plugin-dir'"));
     assert!(command.contains("You are the maintainer of"));
     drop(workspaces);
 
+    // A person renames the maintainer workspace; it is still the one.
+    let maintainer_id = first["maintainer"]["workspace_id"].as_str().unwrap();
+    cmux.rename(maintainer_id, "my own title");
     let second = up(&fixture, &cmux, &launchd, &processes);
     assert_eq!(second["supervisor"]["outcome"], "reused", "{second}");
     assert_eq!(second["supervisor"]["mode"], "launchd");
@@ -521,6 +600,8 @@ fn up_starts_the_agent_and_the_maintainer_once_and_reuses_them_after() {
     assert_eq!(launchd.installs.lock().unwrap().len(), 1);
     assert!(launchd.uninstalls.lock().unwrap().is_empty());
     assert_eq!(cmux.workspaces.lock().unwrap().len(), 1);
+    // Reusing everything asks for no group.
+    assert_eq!(cmux.groups.lock().unwrap().len(), 1);
     // A reused supervisor already reaches cmux; nothing is proved again.
     assert_eq!(cmux.detached_preflights.lock().unwrap().len(), 1);
     assert_eq!(
@@ -1069,6 +1150,83 @@ fn up_skips_the_maintainer_workspace_inside_a_maintainer_session_of_the_same_que
     assert_eq!(report["maintainer"]["outcome"], "created", "{report}");
 }
 
+/// The recorded maintainer workspace is the one `up` reuses, whatever it
+/// is called; one cmux no longer has is forgotten and opened again, and a
+/// workspace that merely carries the maintainer's title is not taken for it.
+#[test]
+fn up_opens_the_maintainer_again_when_its_recorded_workspace_is_gone() {
+    let fixture = fixture();
+    let cmux = FakeCmux::default();
+    let launchd = FakeLaunchd::new(&fixture.location.db);
+    let processes = FakeProcesses::default();
+    let first = up(&fixture, &cmux, &launchd, &processes);
+    let id = first["maintainer"]["workspace_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    cmux.close(&id).unwrap();
+    // Someone opened a workspace with the maintainer's title by hand.
+    cmux.open(
+        "[my repo]dagq maintainer",
+        &fixture.repo,
+        "01234567-89ab-4def-8123-0000000000dd",
+    );
+
+    let second = up(&fixture, &cmux, &launchd, &processes);
+    assert_eq!(second["maintainer"]["outcome"], "created", "{second}");
+    let reopened = second["maintainer"]["workspace_id"].as_str().unwrap();
+    assert_ne!(reopened, id);
+    assert_ne!(reopened, "01234567-89ab-4def-8123-0000000000dd");
+    let queue = SqliteQueue::open(&fixture.location.db).unwrap();
+    assert_eq!(
+        queue
+            .session_workspace(SessionRole::Maintainer)
+            .unwrap()
+            .as_deref(),
+        Some(reopened)
+    );
+    // The group is asked for again by the same external ID; cmux returns
+    // the same group.
+    let groups = cmux.groups.lock().unwrap();
+    assert_eq!(groups.len(), 2);
+    assert_eq!(groups[0], groups[1]);
+    drop(groups);
+    assert!(
+        queue
+            .remove_session_workspace(SessionRole::Maintainer)
+            .unwrap()
+    );
+    assert!(
+        !queue
+            .remove_session_workspace(SessionRole::Maintainer)
+            .unwrap()
+    );
+}
+
+/// A group cmux cannot make does not stop `up`: the workspace opens outside
+/// it and the result says why.
+#[test]
+fn up_warns_and_goes_on_when_the_workspace_group_cannot_be_made() {
+    let fixture = fixture();
+    let cmux = FakeCmux {
+        group_fails: true,
+        ..FakeCmux::default()
+    };
+    let launchd = FakeLaunchd::new(&fixture.location.db);
+    let processes = FakeProcesses::default();
+    let report = up(&fixture, &cmux, &launchd, &processes);
+    assert_eq!(report["maintainer"]["outcome"], "created", "{report}");
+    assert_eq!(cmux.tags.lock().unwrap()[0].group, None);
+    let warnings = report["warnings"].as_array().unwrap();
+    assert_eq!(warnings.len(), 1, "{report}");
+    let warning = warnings[0].as_str().unwrap();
+    assert!(
+        warning.contains("workspace-group create failed"),
+        "{warning}"
+    );
+    assert!(warning.contains(&fixture.location.hash()), "{warning}");
+}
+
 #[test]
 fn up_requires_cmux_claude_and_an_initialized_queue() {
     let fixture = fixture();
@@ -1082,7 +1240,7 @@ fn up_requires_cmux_claude_and_an_initialized_queue() {
         fn preflight_detached(&self, _: &SupervisorEnvironment) -> Result<()> {
             unreachable!()
         }
-        fn create(&self, _: &Task, _: &TaskRun, _: &str) -> Result<String> {
+        fn create(&self, _: &Task, _: &TaskRun, _: &str, _: &WorkspaceTags) -> Result<String> {
             unreachable!()
         }
         fn capture(&self, _: &str) -> Result<String> {
@@ -1094,10 +1252,13 @@ fn up_requires_cmux_claude_and_an_initialized_queue() {
         fn send_exit(&self, _: &str) -> Result<()> {
             unreachable!()
         }
-        fn find_named(&self, _: &str) -> Result<Option<String>> {
+        fn exists(&self, _: &str) -> Result<bool> {
             unreachable!()
         }
-        fn create_named(&self, _: &str, _: &Path, _: &str) -> Result<String> {
+        fn create_named(&self, _: &str, _: &Path, _: &str, _: &WorkspaceTags) -> Result<String> {
+            unreachable!()
+        }
+        fn ensure_group(&self, _: &str, _: &str) -> Result<String> {
             unreachable!()
         }
         fn notify(&self, _: &str, _: &str, _: Option<&str>) -> Result<()> {
@@ -1204,7 +1365,36 @@ fn up_in_cmux_starts_the_supervisor_in_a_workspace_and_leaves_launchd_alone() {
     // into a login shell, so every argument is quoted on its own.
     assert!(command.contains(r#"queue'"'"'s dir"#), "{command}");
     assert_eq!(workspaces[1].0, "[my repo]dagq maintainer");
+    let tags = cmux.tags.lock().unwrap();
+    assert_eq!(
+        tags[0].env,
+        vec![
+            ("DAGQ_ROLE".to_owned(), "supervisor".to_owned()),
+            ("DAGQ_QUEUE".to_owned(), db.to_str().unwrap().to_owned()),
+        ]
+    );
+    let hash = fixture.location.hash();
+    assert_eq!(
+        tags[0].description.as_deref(),
+        Some(format!("dagq role=supervisor queue={hash}").as_str())
+    );
+    // Both workspaces join the one group, asked for once.
+    assert_eq!(tags[0].group, Some(format!("group-{hash}")));
+    assert_eq!(tags[1].group, tags[0].group);
+    assert_eq!(cmux.groups.lock().unwrap().len(), 1);
+    drop(tags);
+    assert_eq!(
+        SqliteQueue::open(&fixture.location.db)
+            .unwrap()
+            .session_workspace(SessionRole::Supervisor)
+            .unwrap()
+            .as_deref(),
+        Some(id.as_str())
+    );
     drop(workspaces);
+    // Titles are for people: renaming both changes nothing below.
+    cmux.rename(first["supervisor"]["workspace_id"].as_str().unwrap(), "sv");
+    cmux.rename(first["maintainer"]["workspace_id"].as_str().unwrap(), "mt");
 
     // The registration carries the mode and the workspace, and `status`
     // reports both.
@@ -1236,6 +1426,7 @@ fn up_in_cmux_starts_the_supervisor_in_a_workspace_and_leaves_launchd_alone() {
         second["supervisor"]["workspace_id"],
         first["supervisor"]["workspace_id"]
     );
+    assert_eq!(second["maintainer"]["outcome"], "reused", "{second}");
     assert_eq!(cmux.workspaces.lock().unwrap().len(), 2);
     assert!(launchd.installs.lock().unwrap().is_empty());
 }
@@ -1300,8 +1491,13 @@ fn up_in_cmux_refuses_to_open_a_second_supervisor_workspace() {
     let cmux = FakeCmux::default();
     let launchd = FakeLaunchd::new(&fixture.location.db);
     let processes = FakeProcesses::default();
-    let leftover = cmux
-        .create_named("[my repo]dagq supervisor", &fixture.repo, "dagq supervise")
+    // Recorded as the queue's supervisor workspace by the `up` that
+    // opened it, and renamed since: the title plays no part.
+    let leftover = "01234567-89ab-4def-8123-0000000000cc";
+    cmux.open("renamed by hand", &fixture.repo, leftover);
+    SqliteQueue::open(&fixture.location.db)
+        .unwrap()
+        .register_session_workspace(SessionRole::Supervisor, leftover)
         .unwrap();
     let error = lifecycle::up(
         &fixture.location,
@@ -1314,8 +1510,8 @@ fn up_in_cmux_refuses_to_open_a_second_supervisor_workspace() {
     )
     .unwrap_err();
     let message = format!("{error:#}");
-    assert!(message.contains(&leftover), "{message}");
-    assert!(message.contains("[my repo]dagq supervisor"), "{message}");
+    assert!(message.contains(leftover), "{message}");
+    assert!(message.contains("supervisor workspace"), "{message}");
     assert!(
         message.contains(&format!("cmux workspace close {leftover}")),
         "{message}"
@@ -1332,6 +1528,36 @@ fn up_in_cmux_refuses_to_open_a_second_supervisor_workspace() {
     );
 }
 
+/// A recorded supervisor workspace that cmux no longer lists (a person
+/// closed it after reading it) is forgotten, and `up --in-cmux` opens a new
+/// one and records that instead.
+#[test]
+fn up_in_cmux_forgets_a_supervisor_workspace_that_was_closed() {
+    let mut fixture = fixture();
+    fixture.options.in_cmux = true;
+    let cmux = FakeCmux {
+        registers_supervisor_in: Some(fixture.location.db.clone()),
+        ..FakeCmux::default()
+    };
+    let queue = SqliteQueue::open(&fixture.location.db).unwrap();
+    queue
+        .register_session_workspace(
+            SessionRole::Supervisor,
+            "01234567-89ab-4def-8123-0000000000ee",
+        )
+        .unwrap();
+    let launchd = FakeLaunchd::new(&fixture.location.db);
+    let processes = FakeProcesses::default();
+    let report = up(&fixture, &cmux, &launchd, &processes);
+    assert_eq!(report["supervisor"]["outcome"], "started", "{report}");
+    assert_eq!(
+        queue.session_workspace(SessionRole::Supervisor).unwrap(),
+        report["supervisor"]["workspace_id"]
+            .as_str()
+            .map(str::to_owned)
+    );
+}
+
 /// An in-cmux supervisor has no service manager to signal it, so `down`
 /// sends the SIGINT itself and closes its workspace once the process is
 /// gone: never while it drains, after the drain under `--wait`, and after
@@ -1343,13 +1569,21 @@ fn down_interrupts_an_in_cmux_supervisor_and_closes_its_workspace_once_it_is_gon
     let pid = std::process::id();
     let cmux = FakeCmux::default();
     let workspace = cmux
-        .create_named("[my repo]dagq supervisor", &fixture.repo, "supervise")
+        .create_named(
+            "[my repo]dagq supervisor",
+            &fixture.repo,
+            "supervise",
+            &WorkspaceTags::default(),
+        )
         .unwrap();
     queue
         .register_supervisor("in-cmux", pid, 2, VERSION)
         .unwrap();
     queue
         .set_supervisor_mode("in-cmux", SupervisorMode::InCmux, Some(&workspace))
+        .unwrap();
+    queue
+        .register_session_workspace(SessionRole::Supervisor, &workspace)
         .unwrap();
     let launchd = FakeLaunchd::new(&fixture.location.db);
     let processes = FakeProcesses::default();
@@ -1403,8 +1637,13 @@ fn down_interrupts_an_in_cmux_supervisor_and_closes_its_workspace_once_it_is_gon
     );
     assert!(cmux.workspaces.lock().unwrap().is_empty());
     assert!(processes.alive(pid), "the fake never reaped the pid");
-    // The supervisor removed its own row at the end of the drain.
+    // The supervisor removed its own row at the end of the drain, and the
+    // record of its workspace went with the close.
     assert!(queue.supervisors().unwrap().is_empty());
+    assert_eq!(
+        queue.session_workspace(SessionRole::Supervisor).unwrap(),
+        None
+    );
 }
 
 /// `--force` kills the in-cmux supervisor, drops its registration and
@@ -1417,7 +1656,12 @@ fn down_force_kills_an_in_cmux_supervisor_and_closes_or_reports_its_workspace() 
     let pid = std::process::id();
     let cmux = FakeCmux::default();
     let workspace = cmux
-        .create_named("[my repo]dagq supervisor", &fixture.repo, "supervise")
+        .create_named(
+            "[my repo]dagq supervisor",
+            &fixture.repo,
+            "supervise",
+            &WorkspaceTags::default(),
+        )
         .unwrap();
     queue
         .register_supervisor("in-cmux", pid, 2, VERSION)
@@ -1543,7 +1787,12 @@ fn down_stops_a_launchd_and_an_in_cmux_supervisor_in_one_call() {
     let in_cmux_pid = dead_pid(); // any pid the fake treats as alive
     let cmux = FakeCmux::default();
     let workspace = cmux
-        .create_named("[my repo]dagq supervisor", &fixture.repo, "supervise")
+        .create_named(
+            "[my repo]dagq supervisor",
+            &fixture.repo,
+            "supervise",
+            &WorkspaceTags::default(),
+        )
         .unwrap();
     queue
         .register_supervisor("agent", agent_pid, 4, VERSION)
@@ -1760,9 +2009,12 @@ fn maintainer_prompt_names_the_queue_the_logs_the_skill_and_the_rules() {
         Some(Path::new("/plugins/claude-dagq")),
     )
     .unwrap();
-    assert!(command.starts_with(
-        "'env' 'DAGQ_ROLE=maintainer' 'DAGQ_QUEUE=/data/q'\"'\"'s/queue.db' '/opt/claude' '--plugin-dir' '/plugins/claude-dagq' '--' 'You are the maintainer of"
-    ), "{command}");
+    assert!(
+        command.starts_with(
+            "'/opt/claude' '--plugin-dir' '/plugins/claude-dagq' '--' 'You are the maintainer of"
+        ),
+        "{command}"
+    );
     assert_eq!(ROLE_ENV, "DAGQ_ROLE");
     assert_eq!(QUEUE_ENV, "DAGQ_QUEUE");
     let bare = maintainer_command(
@@ -1904,12 +2156,12 @@ fn up_in_cmux_replaces_an_in_cmux_supervisor_of_another_version() {
     // The workspace the replaced supervisor runs in, put there directly:
     // going through `create_named` would register a supervisor for it.
     let workspace = "01234567-89ab-4def-8123-0000000000ff".to_owned();
-    cmux.workspaces.lock().unwrap().push((
-        "[my repo]dagq supervisor".into(),
-        fixture.repo.clone(),
-        workspace.clone(),
-        "supervise".into(),
-    ));
+    cmux.open("[my repo]dagq supervisor", &fixture.repo, &workspace);
+    // The `up` that started it recorded the same workspace; this one is
+    // closed by the replacement, so it must not refuse it.
+    queue
+        .register_session_workspace(SessionRole::Supervisor, &workspace)
+        .unwrap();
     queue.register_supervisor("old", pid, 2, VERSION).unwrap();
     queue
         .set_supervisor_mode("old", SupervisorMode::InCmux, Some(&workspace))
@@ -1950,6 +2202,10 @@ fn up_in_cmux_replaces_an_in_cmux_supervisor_of_another_version() {
         std::slice::from_ref(&workspace)
     );
     assert_ne!(supervisor["workspace_id"], json!(workspace), "{report}");
+    assert_eq!(
+        queue.session_workspace(SessionRole::Supervisor).unwrap(),
+        supervisor["workspace_id"].as_str().map(str::to_owned)
+    );
     let started = queue
         .supervisors()
         .unwrap()
@@ -2116,12 +2372,10 @@ fn up_in_cmux_refuses_a_leftover_supervisor_workspace_before_draining() {
     let cmux = FakeCmux::default();
     // Left by a supervisor that is no longer registered at all.
     let orphan = "01234567-89ab-4def-8123-0000000000aa".to_owned();
-    cmux.workspaces.lock().unwrap().push((
-        "[my repo]dagq supervisor".into(),
-        fixture.repo.clone(),
-        orphan.clone(),
-        "supervise".into(),
-    ));
+    cmux.open("[my repo]dagq supervisor", &fixture.repo, &orphan);
+    queue
+        .register_session_workspace(SessionRole::Supervisor, &orphan)
+        .unwrap();
     // The supervisor being replaced runs under launchd, so the drain would
     // close nothing and the name would still be taken.
     queue.register_supervisor("old", pid, 4, VERSION).unwrap();
@@ -2206,12 +2460,7 @@ fn up_drops_the_row_of_a_replaced_supervisor_that_died_without_deregistering() {
         ..FakeCmux::default()
     };
     let workspace = "01234567-89ab-4def-8123-0000000000bb".to_owned();
-    cmux.workspaces.lock().unwrap().push((
-        "[my repo]dagq supervisor".into(),
-        fixture.repo.clone(),
-        workspace.clone(),
-        "supervise".into(),
-    ));
+    cmux.open("[my repo]dagq supervisor", &fixture.repo, &workspace);
     queue
         .register_supervisor("killed", pid, 2, VERSION)
         .unwrap();

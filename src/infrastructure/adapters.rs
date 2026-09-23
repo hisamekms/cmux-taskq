@@ -1,9 +1,9 @@
 use crate::{
     application::{
         AgentProvider, DetachedRefusal, MainRemote, ProcessControl, SupervisorEnvironment,
-        WorkspaceBackend,
+        WorkspaceBackend, WorkspaceTags,
     },
-    domain::{Task, TaskRun},
+    domain::{SessionRole, Task, TaskRun},
 };
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::Value;
@@ -781,12 +781,18 @@ impl WorkspaceBackend for Cmux {
     fn preflight_detached(&self, environment: &SupervisorEnvironment) -> Result<()> {
         self.preflight_detached_within(environment, DETACHED_PING_TIMEOUT)
     }
-    fn create(&self, task: &Task, run: &TaskRun, command: &str) -> Result<String> {
+    fn create(
+        &self,
+        task: &Task,
+        run: &TaskRun,
+        command: &str,
+        tags: &WorkspaceTags,
+    ) -> Result<String> {
         let raw = self.create_workspace(
             &run_workspace_name(task, run)?,
-            Some(&run_workspace_description(run)),
             Path::new(run.worktree_path.as_ref().context("missing worktree")?),
             command,
+            tags,
         )?;
         // Persist the returned handle before resolving its stable UUID.
         fs::write(
@@ -837,7 +843,7 @@ impl WorkspaceBackend for Cmux {
         Ok(())
     }
 
-    fn find_named(&self, name: &str) -> Result<Option<String>> {
+    fn exists(&self, workspace_id: &str) -> Result<bool> {
         let listing = output(Command::new(&self.executable).args([
             "--json",
             "--id-format",
@@ -847,12 +853,35 @@ impl WorkspaceBackend for Cmux {
         ]))?;
         let listing: Value =
             serde_json::from_str(&listing).context("decode cmux workspace list")?;
-        Ok(workspace_named(&listing, name).map(str::to_owned))
+        Ok(workspace_listed(&listing, workspace_id))
     }
 
-    fn create_named(&self, name: &str, cwd: &Path, command: &str) -> Result<String> {
-        let raw = self.create_workspace(name, None, cwd, command)?;
+    fn create_named(
+        &self,
+        name: &str,
+        cwd: &Path,
+        command: &str,
+        tags: &WorkspaceTags,
+    ) -> Result<String> {
+        let raw = self.create_workspace(name, cwd, command, tags)?;
         self.identify(workspace_handle(&raw)?)
+    }
+
+    fn ensure_group(&self, external_id: &str, name: &str) -> Result<String> {
+        let reply = output(Command::new(&self.executable).args([
+            "--json",
+            "--id-format",
+            "uuids",
+            "workspace-group",
+            "create",
+            "--name",
+            name,
+            "--external-id",
+            external_id,
+        ]))?;
+        let reply: Value =
+            serde_json::from_str(&reply).context("decode cmux workspace-group create")?;
+        Ok(created_group_id(&reply)?.to_owned())
     }
 
     fn notify(&self, title: &str, body: &str, workspace: Option<&str>) -> Result<()> {
@@ -924,21 +953,13 @@ impl Cmux {
     fn create_workspace(
         &self,
         name: &str,
-        description: Option<&str>,
         cwd: &Path,
         command: &str,
+        tags: &WorkspaceTags,
     ) -> Result<String> {
         let mut create = Command::new(&self.executable);
-        create.args(["workspace", "create", "--name", name]);
-        if let Some(description) = description {
-            create.args(["--description", description]);
-        }
-        output(
-            create
-                .arg("--cwd")
-                .arg(cwd)
-                .args(["--command", command, "--focus", "false"]),
-        )
+        create.args(workspace_create_arguments(name, command, tags));
+        output(create.arg("--cwd").arg(cwd))
     }
 
     /// Resolve a numeric handle to the workspace's stable UUID.
@@ -959,17 +980,55 @@ impl Cmux {
     }
 }
 
-/// The ID of the workspace titled exactly `name` in a `cmux --json workspace
-/// list` reply, if any. Titles are what `--name` set, so a match is a
-/// workspace this runtime opened (or a human named the same way on purpose).
-pub fn workspace_named<'a>(listing: &'a Value, name: &str) -> Option<&'a str> {
+/// `workspace create` and its flags but `--cwd` (a path, added by the
+/// caller): the title, the description, one `--env KEY=VALUE` per variable
+/// and the group from `tags`, and the command, opened without focus.
+pub fn workspace_create_arguments(name: &str, command: &str, tags: &WorkspaceTags) -> Vec<String> {
+    let mut arguments: Vec<String> = ["workspace", "create", "--name", name]
+        .map(str::to_owned)
+        .into();
+    if let Some(description) = &tags.description {
+        arguments.extend(["--description".into(), description.clone()]);
+    }
+    for (key, value) in &tags.env {
+        arguments.extend(["--env".into(), format!("{key}={value}")]);
+    }
+    if let Some(group) = &tags.group {
+        arguments.extend(["--group".into(), group.clone()]);
+    }
+    arguments.extend([
+        "--command".into(),
+        command.into(),
+        "--focus".into(),
+        "false".into(),
+    ]);
+    arguments
+}
+
+/// Whether a `cmux --json --id-format uuids workspace list` reply lists the
+/// workspace `id` (UUIDs compared without regard to case).
+pub fn workspace_listed(listing: &Value, id: &str) -> bool {
     listing
-        .get("workspaces")?
-        .as_array()?
-        .iter()
-        .find(|workspace| workspace.get("title").and_then(Value::as_str) == Some(name))
-        .and_then(|workspace| workspace.get("id"))
+        .get("workspaces")
+        .and_then(Value::as_array)
+        .is_some_and(|workspaces| {
+            workspaces.iter().any(|workspace| {
+                workspace
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .is_some_and(|listed| listed.eq_ignore_ascii_case(id))
+            })
+        })
+}
+
+/// The group's UUID in a `cmux --json --id-format uuids workspace-group
+/// create` reply, which is the same whether the call created the group or
+/// found it by its external ID.
+pub fn created_group_id(reply: &Value) -> Result<&str> {
+    reply
+        .pointer("/group/id")
         .and_then(Value::as_str)
+        .context("cmux did not return the workspace group's ID")
 }
 
 /// Workspaces are named per repository because one cmux serves several
@@ -986,10 +1045,29 @@ pub fn run_workspace_name(task: &Task, run: &TaskRun) -> Result<String> {
     ))
 }
 
-/// `run <run-id>`: the run a worker workspace belongs to, kept in the
-/// workspace description rather than its name (ADR-0018).
-pub fn run_workspace_description(run: &TaskRun) -> String {
-    format!("run {}", run.id)
+/// `dagq role=<role> queue=<queue hash>[ run=<run-id>][ task=<id>]`: the one
+/// machine-readable description line every workspace of a queue carries,
+/// for people reading `cmux workspace list`; the runtime never reads it back
+/// (ADR-0026).
+pub fn workspace_description(
+    role: SessionRole,
+    queue_hash: &str,
+    run: Option<&str>,
+    task: Option<i64>,
+) -> String {
+    let mut description = format!("dagq role={} queue={queue_hash}", role.as_str());
+    if let Some(run) = run {
+        description.push_str(&format!(" run={run}"));
+    }
+    if let Some(task) = task {
+        description.push_str(&format!(" task={task}"));
+    }
+    description
+}
+
+/// `[<repo>]`: the name of the workspace group a queue's workspaces join.
+pub fn workspace_group_name(repo_root: &Path) -> String {
+    format!("[{}]", repository_name(repo_root))
 }
 
 /// `[<repo>]dagq maintainer`: the one resident Claude session of a repository's queue.
@@ -1154,10 +1232,6 @@ mod tests {
                 .contains("missing repository path")
         );
         assert_eq!(
-            run_workspace_description(&run(None)),
-            "run 0d8e3f1a-7c1b-4e35-9a11-3f6d2c9b8e47"
-        );
-        assert_eq!(
             maintainer_workspace_name(Path::new("/home/u/ghq/dagq")),
             "[dagq]dagq maintainer"
         );
@@ -1172,31 +1246,114 @@ mod tests {
         );
     }
 
+    /// Every workspace of a queue says what it is in one line; the run and
+    /// the task appear only where the workspace has them (ADR-0026).
     #[test]
-    fn workspace_named_matches_the_exact_title_only() {
+    fn workspace_descriptions_are_one_machine_readable_line() {
+        assert_eq!(
+            workspace_description(
+                SessionRole::Worker,
+                "77067154921b9014",
+                Some("0d8e3f1a-7c1b-4e35-9a11-3f6d2c9b8e47"),
+                Some(15)
+            ),
+            "dagq role=worker queue=77067154921b9014 run=0d8e3f1a-7c1b-4e35-9a11-3f6d2c9b8e47 task=15"
+        );
+        assert_eq!(
+            workspace_description(SessionRole::Maintainer, "abc", None, None),
+            "dagq role=maintainer queue=abc"
+        );
+        assert_eq!(
+            workspace_description(SessionRole::Supervisor, "abc", None, None),
+            "dagq role=supervisor queue=abc"
+        );
+        assert_eq!(
+            workspace_group_name(Path::new("/home/u/ghq/dagq")),
+            "[dagq]"
+        );
+        assert_eq!(workspace_group_name(Path::new("/")), "[/]");
+    }
+
+    /// A workspace is found by its UUID, never its title, and cmux may
+    /// print the UUID in either case.
+    #[test]
+    fn workspace_listed_matches_the_id_only() {
         let listing = serde_json::json!({
             "window_id": "W",
             "workspaces": [
-                {"id": "AAAA", "title": "dagq repo maintainer extra"},
-                {"id": "BBBB", "title": "dagq repo maintainer"},
-                {"id": "CCCC", "title": "dagq repo maintainer"},
-                {"id": "DDDD"}
+                {"id": "4AC63CB7-3BE1-40A1-BCC4-CA0461685F01", "title": "[dagq]dagq maintainer"},
+                {"title": "no id"}
             ]
         });
-        assert_eq!(
-            workspace_named(&listing, "dagq repo maintainer"),
-            Some("BBBB")
-        );
-        assert_eq!(workspace_named(&listing, "dagq other maintainer"), None);
-        assert_eq!(workspace_named(&serde_json::json!({}), "x"), None);
+        assert!(workspace_listed(
+            &listing,
+            "4AC63CB7-3BE1-40A1-BCC4-CA0461685F01"
+        ));
+        assert!(workspace_listed(
+            &listing,
+            "4ac63cb7-3be1-40a1-bcc4-ca0461685f01"
+        ));
+        assert!(!workspace_listed(&listing, "[dagq]dagq maintainer"));
+        assert!(!workspace_listed(&serde_json::json!({}), "x"));
     }
 
-    /// `create` passes the run's name and description to `cmux workspace
-    /// create`, keeps the raw reply in the run directory and returns the
+    #[test]
+    fn created_group_id_reads_the_group_uuid() {
+        let reply = serde_json::json!({
+            "created": false,
+            "group": {"id": "F5FCC58F-D44B-4CA0-871F-D4C6AED704D6", "external_id": "abc"}
+        });
+        assert_eq!(
+            created_group_id(&reply).unwrap(),
+            "F5FCC58F-D44B-4CA0-871F-D4C6AED704D6"
+        );
+        assert!(created_group_id(&serde_json::json!({"created": true})).is_err());
+    }
+
+    /// `ensure_group` asks for the group by its external ID and `exists`
+    /// reads the UUID listing, both through the real argv.
+    #[cfg(unix)]
+    #[test]
+    fn ensure_group_and_exists_call_cmux() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("args.log");
+        let executable = dir.path().join("cmux");
+        fs::write(
+            &executable,
+            format!(
+                r#"#!/bin/sh
+printf '%s ' "$@" >> '{log}'; printf '\n' >> '{log}'
+case "$4" in
+  workspace-group) echo '{{"created":true,"group":{{"id":"G-1"}}}}' ;;
+  workspace) echo '{{"workspaces":[{{"id":"W-1"}}]}}' ;;
+esac
+"#,
+                log = log.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+        let cmux = Cmux { executable };
+        assert_eq!(cmux.ensure_group("abc", "[dagq]").unwrap(), "G-1");
+        assert!(cmux.exists("w-1").unwrap());
+        assert!(!cmux.exists("W-2").unwrap());
+        let calls = fs::read_to_string(&log).unwrap();
+        assert!(
+            calls.contains(
+                "--json --id-format uuids workspace-group create --name [dagq] --external-id abc"
+            ),
+            "{calls}"
+        );
+        assert!(calls.contains("--json --id-format uuids workspace list"));
+    }
+
+    /// `create` passes the run's name and its tags (description, env,
+    /// group) to `cmux workspace create`, keeps the raw reply in the run directory and returns the
     /// UUID `identify` resolves.
     #[cfg(unix)]
     #[test]
-    fn create_names_the_run_workspace_and_describes_it_with_the_run() {
+    fn create_names_the_run_workspace_and_tags_it() {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("args.log");
@@ -1223,8 +1380,21 @@ esac
         run.worktree_path = Some(dir.path().display().to_string());
         run.run_dir = Some(run_dir.display().to_string());
         let cmux = Cmux { executable };
+        let tags = WorkspaceTags {
+            env: vec![
+                ("DAGQ_ROLE".into(), "worker".into()),
+                ("DAGQ_QUEUE".into(), "/q/queue.db".into()),
+            ],
+            description: Some("dagq role=worker queue=abc".into()),
+            group: Some("G-1".into()),
+        };
         let id = cmux
-            .create(&task("Set last_error when a run fails"), &run, "true")
+            .create(
+                &task("Set last_error when a run fails"),
+                &run,
+                "true",
+                &tags,
+            )
             .unwrap();
         assert_eq!(id, "4AC63CB7-3BE1-40A1-BCC4-CA0461685F01");
         assert_eq!(
@@ -1241,13 +1411,19 @@ esac
                 "--name",
                 "[dagq]dagq#15 Set last_error when a run fails",
                 "--description",
-                "run 0d8e3f1a-7c1b-4e35-9a11-3f6d2c9b8e47",
-                "--cwd",
-                &dir.path().display().to_string(),
+                "dagq role=worker queue=abc",
+                "--env",
+                "DAGQ_ROLE=worker",
+                "--env",
+                "DAGQ_QUEUE=/q/queue.db",
+                "--group",
+                "G-1",
                 "--command",
                 "true",
                 "--focus",
                 "false",
+                "--cwd",
+                &dir.path().display().to_string(),
             ]
         );
         assert!(calls.contains("identify\n--workspace\nworkspace:7\n"));

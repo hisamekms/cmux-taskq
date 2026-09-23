@@ -10,7 +10,7 @@ macro_rules! string_enum {
         }
 
         impl $name {
-            pub fn as_str(self) -> &'static str {
+            pub const fn as_str(self) -> &'static str {
                 match self { $(Self::$variant => $value),+ }
             }
         }
@@ -61,6 +61,18 @@ string_enum!(Provider { Claude => "claude" });
 string_enum!(SupervisorMode {
     Launchd => "launchd",
     InCmux => "in_cmux",
+});
+
+// The part a cmux workspace plays for a queue, carried in its `DAGQ_ROLE`
+// environment variable and its description (ADR-0026). `Planner` and `Inbox`
+// are named here for the sessions `up` is to open later; no workspace of
+// theirs exists yet.
+string_enum!(SessionRole {
+    Maintainer => "maintainer",
+    Supervisor => "supervisor",
+    Worker => "worker",
+    Planner => "planner",
+    Inbox => "inbox",
 });
 
 // How a goal was closed. A goal has no state machine: it is open until one

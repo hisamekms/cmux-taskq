@@ -334,6 +334,19 @@ impl std::fmt::Display for DetachedRefusal {
 
 impl std::error::Error for DetachedRefusal {}
 
+/// What a workspace carries besides its title and command (ADR-0026).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WorkspaceTags {
+    /// Environment every shell of the workspace inherits: `DAGQ_ROLE` and
+    /// `DAGQ_QUEUE`, which the workspace keeps however its session is
+    /// started again.
+    pub env: Vec<(String, String)>,
+    /// One machine-readable line for people; never read back.
+    pub description: Option<String>,
+    /// The queue's workspace group, when it could be made.
+    pub group: Option<String>,
+}
+
 pub trait WorkspaceBackend {
     fn preflight(&self) -> Result<()>;
     /// Check that cmux accepts a connection from a process that is not a
@@ -344,23 +357,37 @@ pub trait WorkspaceBackend {
     /// [`DetachedRefusal`]; any other error means cmux could not be asked.
     fn preflight_detached(&self, environment: &SupervisorEnvironment) -> Result<()>;
     /// Open the workspace a run's session works in. `task` is the run's
-    /// task; the backend names the workspace after it (ADR-0018).
+    /// task; the backend names the workspace after it (ADR-0018) and gives
+    /// it `tags`.
     fn create(
         &self,
         task: &crate::domain::Task,
         run: &crate::domain::TaskRun,
         command: &str,
+        tags: &WorkspaceTags,
     ) -> Result<String>;
     fn capture(&self, workspace_id: &str) -> Result<String>;
     /// Close the workspace; the worktree and branch are not touched.
     fn close(&self, workspace_id: &str) -> Result<()>;
     /// Ask the agent session to end the way the maintainer would, without killing it.
     fn send_exit(&self, workspace_id: &str) -> Result<()>;
-    /// The workspace whose title is exactly `name`, if one is open.
-    fn find_named(&self, name: &str) -> Result<Option<String>>;
-    /// Open a workspace that is not tied to a run (the maintainer session)
-    /// and return its stable ID.
-    fn create_named(&self, name: &str, cwd: &std::path::Path, command: &str) -> Result<String>;
+    /// Whether the workspace with this stable ID is still open. Workspaces
+    /// are found by the ID the queue recorded, never by their title, which
+    /// people may rename (ADR-0026).
+    fn exists(&self, workspace_id: &str) -> Result<bool>;
+    /// Open a workspace that is not tied to a run (the maintainer session,
+    /// the in-cmux supervisor) and return its stable ID.
+    fn create_named(
+        &self,
+        name: &str,
+        cwd: &std::path::Path,
+        command: &str,
+        tags: &WorkspaceTags,
+    ) -> Result<String>;
+    /// The handle of the workspace group whose external ID is
+    /// `external_id`, created under `name` when there is none yet; asking
+    /// again returns the same group.
+    fn ensure_group(&self, external_id: &str, name: &str) -> Result<String>;
     /// Tell a person that something waits for them: a notification, never
     /// keystrokes into a terminal. `workspace` is the workspace it belongs
     /// to; `None` sends it without one. The supervisor sends none yet:

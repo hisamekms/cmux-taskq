@@ -11,8 +11,8 @@ use super::{
     sqlite::{SqliteQueue, claim_task, enum_col, event, event_row, read_task, run_row},
 };
 use crate::domain::{
-    ClaimOutcome, RunEvent, RunLease, RunProcess, SupervisorMode, SupervisorRegistration, Task,
-    TaskRun, validate_base_commit,
+    ClaimOutcome, RunEvent, RunLease, RunProcess, SessionRole, SupervisorMode,
+    SupervisorRegistration, Task, TaskRun, validate_base_commit,
 };
 
 pub use crate::domain::HEARTBEAT_TIMEOUT_SECS;
@@ -208,6 +208,39 @@ impl SqliteQueue {
             .prepare("SELECT * FROM supervisors ORDER BY started_at, rowid")?
             .query_map([], supervisor_row)?
             .collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Record the cmux workspace `up` opened for `role`, replacing any
+    /// earlier one: the UUID is how `up` finds it again, never its title
+    /// (ADR-0026).
+    pub fn register_session_workspace(&self, role: SessionRole, workspace_id: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO session_workspaces(role,workspace_id) VALUES (?1,?2)
+             ON CONFLICT(role) DO UPDATE SET workspace_id=excluded.workspace_id,
+                                              created_at=unixepoch()",
+            params![role.as_str(), workspace_id],
+        )?;
+        Ok(())
+    }
+
+    /// The workspace last recorded for `role`, whether or not cmux still has it.
+    pub fn session_workspace(&self, role: SessionRole) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT workspace_id FROM session_workspaces WHERE role=?1",
+                [role.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
+    /// Forget the workspace of `role`; `false` when none was recorded.
+    pub fn remove_session_workspace(&self, role: SessionRole) -> Result<bool> {
+        Ok(self.conn.execute(
+            "DELETE FROM session_workspaces WHERE role=?1",
+            [role.as_str()],
+        )? == 1)
     }
 
     /// Give up ownership of a run that came to rest (`awaiting_integration`

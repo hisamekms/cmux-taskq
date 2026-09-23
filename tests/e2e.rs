@@ -51,6 +51,7 @@ grep -q '"Stop"' "$settings" || { printf 'stub: settings lack a Stop hook\n' >&2
 {
   printf 'argv: --session-id %s --debug-file %s --add-dir %s --settings %s\n' "$session_id" "$debug_file" "$add_dir" "$settings"
   printf 'cwd: %s\n' "$(pwd)"
+  printf 'env: DAGQ_ROLE=%s DAGQ_QUEUE=%s\n' "${DAGQ_ROLE:-}" "${DAGQ_QUEUE:-}"
 } > "$debug_file"
 run_id=$(printf '%s\n' "$prompt" | sed -n 's/^You are executing dagq task [0-9]*, run \(.*\)\.$/\1/p')
 [ "$run_id" = "$session_id" ] || { printf 'stub: prompt run %s != session %s\n' "$run_id" "$session_id" >&2; exit 65; }
@@ -211,6 +212,65 @@ impl Drop for WorkspaceGuard {
     }
 }
 
+/// The queue's workspace group in `cmux --json workspace-group list`,
+/// found by its external ID (the queue hash).
+fn listed_group(cmux: &Path, external_id: &str) -> Option<Value> {
+    let output = Command::new(cmux)
+        .args(["--json", "--id-format", "uuids", "workspace-group", "list"])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "cmux workspace-group list failed");
+    let list: Value = serde_json::from_slice(&output.stdout).unwrap();
+    list["groups"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|group| group["external_id"] == external_id)
+        .cloned()
+}
+
+/// `cmux workspace env <id> --json`: the environment the workspace was
+/// created with.
+fn workspace_env(cmux: &Path, id: &str) -> Value {
+    let output = Command::new(cmux)
+        .args(["workspace", "env", id, "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "cmux workspace env {id}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice::<Value>(&output.stdout).unwrap()["env"].clone()
+}
+
+/// Deletes the queue's workspace group and closes what is left in it (the
+/// anchor cmux generated with it) when the test ends.
+struct GroupGuard {
+    cmux: PathBuf,
+    external_id: String,
+}
+
+impl Drop for GroupGuard {
+    fn drop(&mut self) {
+        let Some(group) = listed_group(&self.cmux, &self.external_id) else {
+            return;
+        };
+        let id = group["id"].as_str().unwrap_or_default().to_owned();
+        match Command::new(&self.cmux)
+            .args(["workspace-group", "delete", &id, "--close-workspaces"])
+            .output()
+        {
+            Ok(output) if output.status.success() => eprintln!("deleted workspace group {id}"),
+            Ok(output) => eprintln!(
+                "deleting workspace group {id} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            ),
+            Err(error) => eprintln!("deleting workspace group {id} failed: {error}"),
+        }
+    }
+}
+
 /// Kills a still-running supervisor when an assertion fails mid-run.
 struct ChildGuard(Child);
 
@@ -233,6 +293,7 @@ fn reader(mut source: impl Read + Send + 'static) -> thread::JoinHandle<String> 
 
 /// Disposable repository, queue and stub agent, all outside this repository.
 struct Fixture {
+    group: GroupGuard,
     _dir: tempfile::TempDir,
     cmux: PathBuf,
     repo: PathBuf,
@@ -273,6 +334,19 @@ fn fixture() -> Fixture {
     assert!(db.starts_with(env.data_home.join("dagq")));
     assert_eq!(dagq(&env, &["locate"])["db_exists"], true);
     Fixture {
+        // A repository queue's directory is named after the queue hash,
+        // which is the external ID of its workspace group.
+        group: GroupGuard {
+            cmux: cmux.clone(),
+            external_id: db
+                .parent()
+                .unwrap()
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_owned(),
+        },
         _dir: dir,
         cmux,
         repo,
@@ -280,6 +354,12 @@ fn fixture() -> Fixture {
         base,
         db,
         env,
+    }
+}
+
+impl Fixture {
+    fn group(&self) -> Option<Value> {
+        listed_group(&self.cmux, &self.group.external_id)
     }
 }
 
@@ -464,7 +544,14 @@ fn happy_path_runs_a_stub_agent_through_cmux_and_lands_on_main() {
         ),
         "{listing}"
     );
-    assert_eq!(listing["description"], format!("run {run_id}"), "{listing}");
+    assert_eq!(
+        listing["description"],
+        format!(
+            "dagq role=worker queue={} run={run_id} task={task_id}",
+            fixture.group.external_id
+        ),
+        "{listing}"
+    );
     assert_eq!(run["branch"], format!("dagq/{run_id}"));
     assert!(run["workspace_closed_at"].is_number(), "{run}");
     assert!(
@@ -520,6 +607,19 @@ fn happy_path_runs_a_stub_agent_through_cmux_and_lands_on_main() {
             run_dir = run["run_dir"].as_str().unwrap()
         )),
         "{log}"
+    );
+    // The run workspace's `--env` reached the agent through its shell.
+    assert!(
+        log.contains(&format!(
+            "env: DAGQ_ROLE=worker DAGQ_QUEUE={}",
+            fixture.db.canonicalize().unwrap().display()
+        )),
+        "{log}"
+    );
+    // The run workspace joined the queue's group, made by its external ID.
+    assert!(
+        fixture.group().is_some(),
+        "no workspace group for the queue"
     );
 
     let kinds: Vec<&str> = detail["events"]
@@ -1291,6 +1391,45 @@ fn up_in_cmux_starts_a_supervisor_in_a_workspace_that_down_wait_stops_and_closes
     workspaces.ids.push(maintainer.clone());
     assert_eq!(first["maintainer"]["outcome"], "created", "{first}");
 
+    // Both workspaces carry their role and the queue in their own
+    // environment, and both joined the queue's group (ADR-0026).
+    let db = fixture.db.canonicalize().unwrap();
+    for (id, role) in [
+        (&supervisor_workspace, "supervisor"),
+        (&maintainer, "maintainer"),
+    ] {
+        let env = workspace_env(cmux, id);
+        assert_eq!(env["DAGQ_ROLE"], role, "{env}");
+        assert_eq!(env["DAGQ_QUEUE"], db.to_str().unwrap(), "{env}");
+    }
+    let group = fixture.group().expect("the queue's workspace group exists");
+    assert_eq!(group["name"], format!("[{repo_name}]"), "{group}");
+    let members: Vec<String> = group["member_workspace_ids"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|id| id.as_str().unwrap().to_ascii_lowercase())
+        .collect();
+    for id in [&supervisor_workspace, &maintainer] {
+        assert!(members.contains(&id.to_ascii_lowercase()), "{group}");
+    }
+    assert_eq!(
+        listed_workspace(cmux, &maintainer).unwrap()["description"],
+        format!("dagq role=maintainer queue={}", fixture.group.external_id)
+    );
+    // A person renames the maintainer workspace; `up` still knows it.
+    let rename = Command::new(cmux)
+        .args([
+            "workspace",
+            "rename",
+            &maintainer,
+            "--title",
+            "renamed by hand",
+        ])
+        .output()
+        .unwrap();
+    assert!(rename.status.success(), "{rename:?}");
+
     // launchd knows nothing about this queue, and no plist was written.
     assert!(!plist.exists(), "{} exists", plist.display());
     assert!(
@@ -1347,6 +1486,7 @@ fn up_in_cmux_starts_a_supervisor_in_a_workspace_that_down_wait_stops_and_closes
         second["supervisor"]["workspace_id"],
         supervisor_workspace.as_str()
     );
+    assert_eq!(second["maintainer"]["outcome"], "reused", "{second}");
     assert_eq!(second["maintainer"]["workspace_id"], maintainer.as_str());
 
     let started = Instant::now();

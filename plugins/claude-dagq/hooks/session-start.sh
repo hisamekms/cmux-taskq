@@ -1,7 +1,8 @@
 #!/bin/sh
 # SessionStart hook (matcher compact|clear) of the claude-dagq plugin.
 #
-# Only a maintainer session (DAGQ_ROLE=maintainer, set by `dagq up`) is
+# Only a maintainer session (DAGQ_ROLE=maintainer, which `dagq up` puts in
+# the maintainer workspace's environment with --env) is
 # affected: it gets `dagq status` (supervisors, unfinished runs, attention and
 # the next cursor) on stdout, which Claude Code adds to the context, so the
 # session re-orients itself after compaction or /clear. Every other session,

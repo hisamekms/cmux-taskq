@@ -23,13 +23,13 @@ use crate::{
     VERSION,
     application::{
         AgentProvider, DetachedRefusal, LaunchAgent, ProcessControl, SupervisorEnvironment,
-        WorkspaceBackend,
+        WorkspaceBackend, WorkspaceTags,
     },
-    domain::{RunStatus, SupervisorMode, SupervisorRegistration},
+    domain::{RunStatus, SessionRole, SupervisorMode, SupervisorRegistration},
     infrastructure::{
         adapters::{
             ClaudeCode, GitRepository, maintainer_workspace_name, path_text, shell_join,
-            supervisor_workspace_name,
+            supervisor_workspace_name, workspace_description, workspace_group_name,
         },
         launchd::LaunchAgentSpec,
         location::QueueLocation,
@@ -41,18 +41,22 @@ use crate::{
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Value, json};
 use std::{
+    cell::{OnceCell, RefCell},
     collections::HashSet,
     path::{Path, PathBuf},
     thread,
     time::{Duration, Instant},
 };
 
-/// Set in the maintainer workspace's command so that `up`, run from inside
-/// that session (the plugin skill calls it), does not open a second one.
+/// Set in the environment of every workspace of a queue (`--env`, which
+/// every shell of the workspace inherits): the role the workspace plays, so
+/// that `up`, run from inside the maintainer session (the plugin skill calls
+/// it), does not open a second one, and the plugin's hook knows the session
+/// however it was started (ADR-0026).
 pub const ROLE_ENV: &str = "DAGQ_ROLE";
-/// The queue database the maintainer session belongs to.
+/// The queue database the workspace belongs to.
 pub const QUEUE_ENV: &str = "DAGQ_QUEUE";
-pub const MAINTAINER_ROLE: &str = "maintainer";
+pub const MAINTAINER_ROLE: &str = SessionRole::Maintainer.as_str();
 /// File under the queue's log directory that launchd appends the
 /// supervisor's stdout and stderr to.
 pub const LAUNCHD_LOG_NAME: &str = "launchd.log";
@@ -144,6 +148,7 @@ pub fn up(
         })
         .transpose()?;
     let queue = SqliteQueue::open(&db)?;
+    let workspaces = QueueWorkspaces::new(cmux, &db, location.hash(), &repository.root);
 
     let mut pruned = Vec::new();
     let mut live = Vec::new();
@@ -187,7 +192,7 @@ pub fn up(
             &db,
             &repository,
             &queue,
-            cmux,
+            &workspaces,
             launchd,
             processes,
             environment,
@@ -199,7 +204,7 @@ pub fn up(
             &db,
             &repository,
             &queue,
-            cmux,
+            &workspaces,
             launchd,
             processes,
             environment,
@@ -218,7 +223,7 @@ pub fn up(
             .is_some_and(|queue| queue == db);
     let maintainer = if inside_maintainer {
         json!({"outcome": "skipped", "workspace_id": Value::Null, "name": name})
-    } else if let Some(id) = cmux.find_named(&name)? {
+    } else if let Some(id) = recorded_workspace(&queue, cmux, SessionRole::Maintainer)? {
         json!({"outcome": "reused", "workspace_id": id, "name": name})
     } else {
         let command = maintainer_command(
@@ -227,7 +232,13 @@ pub fn up(
             &options.claude,
             plugin_dir.as_deref(),
         )?;
-        let id = cmux.create_named(&name, &repository.root, &command)?;
+        let id = cmux.create_named(
+            &name,
+            &repository.root,
+            &command,
+            &workspaces.tags(SessionRole::Maintainer)?,
+        )?;
+        queue.register_session_workspace(SessionRole::Maintainer, &id)?;
         json!({"outcome": "created", "workspace_id": id, "name": name})
     };
 
@@ -235,8 +246,97 @@ pub fn up(
         "supervisor": supervisor,
         "maintainer": maintainer,
         "pruned_supervisors": pruned,
+        "warnings": workspaces.warnings.take(),
         "doctor": open_work(&queue, processes)?,
     }))
+}
+
+/// `DAGQ_ROLE=<role>` and `DAGQ_QUEUE=<db>`: the environment every
+/// workspace of the queue at `db` is opened with (ADR-0026).
+pub fn session_env(role: SessionRole, db: &Path) -> Result<Vec<(String, String)>> {
+    Ok(vec![
+        (ROLE_ENV.to_owned(), role.as_str().to_owned()),
+        (QUEUE_ENV.to_owned(), path_text(db)?),
+    ])
+}
+
+/// What every workspace `up` opens for a queue carries (ADR-0026): its role
+/// and queue in the environment, the description line, and the queue's
+/// workspace group. The group is made when the first workspace needs it
+/// (cmux opens an anchor workspace with it), so an `up` that reuses
+/// everything touches no group. A group cmux cannot make is a warning in
+/// `up`'s result, and the workspace opens outside it.
+pub struct QueueWorkspaces<'a> {
+    cmux: &'a dyn WorkspaceBackend,
+    db: &'a Path,
+    hash: String,
+    group_name: String,
+    group: OnceCell<Option<String>>,
+    warnings: RefCell<Vec<String>>,
+}
+
+impl<'a> QueueWorkspaces<'a> {
+    pub fn new(
+        cmux: &'a dyn WorkspaceBackend,
+        db: &'a Path,
+        hash: String,
+        repo_root: &Path,
+    ) -> Self {
+        Self {
+            cmux,
+            db,
+            hash,
+            group_name: workspace_group_name(repo_root),
+            group: OnceCell::new(),
+            warnings: RefCell::new(Vec::new()),
+        }
+    }
+
+    /// The tags of a workspace of `role` that belongs to no run.
+    pub fn tags(&self, role: SessionRole) -> Result<WorkspaceTags> {
+        Ok(WorkspaceTags {
+            env: session_env(role, self.db)?,
+            description: Some(workspace_description(role, &self.hash, None, None)),
+            group: self.group(),
+        })
+    }
+
+    fn group(&self) -> Option<String> {
+        self.group
+            .get_or_init(
+                || match self.cmux.ensure_group(&self.hash, &self.group_name) {
+                    Ok(group) => Some(group),
+                    Err(error) => {
+                        self.warnings.borrow_mut().push(format!(
+                            "cmux workspace group {:?} (external ID {}) could not be made, so the \
+workspace opens outside it: {error:#}",
+                            self.group_name, self.hash
+                        ));
+                        None
+                    }
+                },
+            )
+            .clone()
+    }
+}
+
+/// The workspace the queue recorded for `role`, while cmux still lists it.
+/// A recorded UUID cmux no longer lists (the workspace was closed, or cmux
+/// restarted) is forgotten, so the caller opens a new one. The title is
+/// never consulted: people rename workspaces (ADR-0026).
+fn recorded_workspace(
+    queue: &SqliteQueue,
+    cmux: &dyn WorkspaceBackend,
+    role: SessionRole,
+) -> Result<Option<String>> {
+    let Some(id) = queue.session_workspace(role)? else {
+        return Ok(None);
+    };
+    if cmux.exists(&id)? {
+        return Ok(Some(id));
+    }
+    queue.remove_session_workspace(role)?;
+    Ok(None)
 }
 
 /// Start one supervisor in the mode this `up` was asked for. The mode of a
@@ -249,7 +349,7 @@ fn start_supervisor(
     db: &Path,
     repository: &GitRepository,
     queue: &SqliteQueue,
-    cmux: &dyn WorkspaceBackend,
+    workspaces: &QueueWorkspaces,
     launchd: &dyn LaunchAgent,
     processes: &dyn ProcessControl,
     environment: &UpEnvironment,
@@ -263,7 +363,7 @@ fn start_supervisor(
             db,
             repository,
             queue,
-            cmux,
+            workspaces,
             processes,
             environment,
             options,
@@ -275,7 +375,7 @@ fn start_supervisor(
             db,
             repository,
             queue,
-            cmux,
+            workspaces.cmux,
             launchd,
             processes,
             environment,
@@ -311,7 +411,7 @@ fn replace_supervisors(
     db: &Path,
     repository: &GitRepository,
     queue: &SqliteQueue,
-    cmux: &dyn WorkspaceBackend,
+    workspaces: &QueueWorkspaces,
     launchd: &dyn LaunchAgent,
     processes: &dyn ProcessControl,
     environment: &UpEnvironment,
@@ -321,6 +421,7 @@ fn replace_supervisors(
     // The version reported as replaced is an outdated one, not merely the
     // first: a mixed set is drained whole, but naming a version that
     // matched would read as if nothing had been out of date.
+    let cmux = workspaces.cmux;
     let previous_version = live
         .iter()
         .find(|registration| registration.binary_version.as_deref() != Some(VERSION))
@@ -347,9 +448,9 @@ to finish",
     // touched: draining a working supervisor and then failing to start its
     // replacement would leave the queue with nothing serving it. For
     // launchd that is the out-of-cmux connection (not asked again below);
-    // for `--in-cmux` it is the workspace name.
+    // for `--in-cmux` it is the recorded supervisor workspace.
     if options.in_cmux {
-        ensure_supervisor_workspace_free(cmux, repository, live)?;
+        ensure_supervisor_workspace_free(queue, cmux, live)?;
     } else {
         let spec = launch_agent_spec(location, db, repository, environment, options)?;
         prove_detached_cmux(cmux, &spec)?;
@@ -426,9 +527,9 @@ once `status` shows it gone",
         }
     }
     // The drain is over, so every workspace of a replaced supervisor is
-    // ours to close; one left open would hold the name the next in-cmux
-    // supervisor needs.
-    let workspaces = close_supervisor_workspaces(cmux, processes, live, Stop::SeenThrough);
+    // ours to close; one left open would stop the next in-cmux supervisor
+    // from opening its own.
+    let closed = close_supervisor_workspaces(queue, cmux, processes, live, Stop::SeenThrough);
     // Whatever survived the drain (an alive-but-silent supervisor `up`
     // neither reuses nor kills) belongs to another process, not to the one
     // started below.
@@ -442,7 +543,7 @@ once `status` shows it gone",
         db,
         repository,
         queue,
-        cmux,
+        workspaces,
         launchd,
         processes,
         environment,
@@ -456,24 +557,23 @@ once `status` shows it gone",
     object.insert("outcome".into(), json!("restarted"));
     object.insert("previous_version".into(), json!(previous_version));
     object.insert("replaced".into(), json!(replaced));
-    object.insert("supervisor_workspaces".into(), json!(workspaces));
+    object.insert("supervisor_workspaces".into(), json!(closed));
     Ok(started)
 }
 
-/// Refuse, before anything is stopped, when the name an in-cmux supervisor
-/// needs is held by a workspace this replacement will not close. `up`
-/// prunes a dead registration without closing its workspace and cmux keeps
-/// a workspace open after its command exits, so `[<repo>]dagq supervisor`
-/// can be held by a crashed supervisor that is no longer registered at all.
-/// Finding that only after the drain would cost a working supervisor and
-/// leave the queue with nothing serving it.
+/// Refuse, before anything is stopped, when the queue's recorded
+/// supervisor workspace is still open and this replacement will not close
+/// it. `up` prunes a dead registration without closing its workspace and
+/// cmux keeps a workspace open after its command exits, so the workspace of
+/// a crashed supervisor that is no longer registered at all can still be
+/// open. Finding that only after the drain would cost a working supervisor
+/// and leave the queue with nothing serving it.
 fn ensure_supervisor_workspace_free(
+    queue: &SqliteQueue,
     cmux: &dyn WorkspaceBackend,
-    repository: &GitRepository,
     live: &[SupervisorRegistration],
 ) -> Result<()> {
-    let name = supervisor_workspace_name(&repository.root);
-    let Some(id) = cmux.find_named(&name)? else {
+    let Some(id) = recorded_workspace(queue, cmux, SessionRole::Supervisor)? else {
         return Ok(());
     };
     ensure!(
@@ -481,9 +581,9 @@ fn ensure_supervisor_workspace_free(
             registration.mode == Some(SupervisorMode::InCmux)
                 && registration.workspace_id.as_deref() == Some(id.as_str())
         }),
-        "cmux workspace {id} is already named {name:?} but belongs to no supervisor this `up` \
-would drain, so the replacement could not open its own; read its screen, then close it \
-(`cmux workspace close {id}`) and run `up --in-cmux` again"
+        "cmux workspace {id}, recorded as this queue's supervisor workspace, is still open but \
+belongs to no supervisor this `up` would drain, so the replacement could not open its own; read \
+its screen, then close it (`cmux workspace close {id}`) and run `up --in-cmux` again"
     );
     Ok(())
 }
@@ -565,22 +665,31 @@ fn start_in_cmux(
     db: &Path,
     repository: &GitRepository,
     queue: &SqliteQueue,
-    cmux: &dyn WorkspaceBackend,
+    workspaces: &QueueWorkspaces,
     processes: &dyn ProcessControl,
     environment: &UpEnvironment,
     options: &UpOptions,
     existing: &HashSet<String>,
 ) -> Result<Value> {
+    let cmux = workspaces.cmux;
     let name = supervisor_workspace_name(&repository.root);
-    if let Some(id) = cmux.find_named(&name)? {
+    if let Some(id) = recorded_workspace(queue, cmux, SessionRole::Supervisor)? {
         bail!(
-            "cmux workspace {id} is already named {name:?} but no supervisor of this queue is \
-registered and heartbeating; read its screen, then close it (`cmux workspace close {id}`) \
-and run `up --in-cmux` again"
+            "cmux workspace {id}, recorded as this queue's supervisor workspace, is still open \
+but no supervisor of this queue is registered and heartbeating; read its screen, then close it \
+(`cmux workspace close {id}`) and run `up --in-cmux` again"
         );
     }
     let command = supervise_command(location, db, environment, options)?;
-    let workspace_id = cmux.create_named(&name, &repository.root, &command)?;
+    let workspace_id = cmux.create_named(
+        &name,
+        &repository.root,
+        &command,
+        &workspaces.tags(SessionRole::Supervisor)?,
+    )?;
+    // Recorded before the wait, so a supervisor that never registers still
+    // leaves its workspace where the next `up` finds it.
+    queue.register_session_workspace(SessionRole::Supervisor, &workspace_id)?;
     let registration =
         wait_for_registration(queue, processes, options, existing).with_context(|| {
             format!(
@@ -707,21 +816,17 @@ pub fn launch_agent_spec(
     })
 }
 
-/// The maintainer workspace's command: `claude` with the role and queue in
-/// its environment (so `up` from inside recognizes the session) and the
-/// generated prompt as its first message.
+/// The maintainer workspace's command: `claude` with the generated prompt as
+/// its first message. The role and queue are the workspace's own `--env`
+/// (ADR-0026), not a prefix of this command, so a `claude` started again in
+/// that workspace still has them.
 pub fn maintainer_command(
     db: &Path,
     log_dir: &Path,
     claude: &Path,
     plugin_dir: Option<&Path>,
 ) -> Result<String> {
-    let mut argv = vec![
-        "env".to_owned(),
-        format!("{ROLE_ENV}={MAINTAINER_ROLE}"),
-        format!("{QUEUE_ENV}={}", path_text(db)?),
-        path_text(claude)?,
-    ];
+    let mut argv = vec![path_text(claude)?];
     if let Some(dir) = plugin_dir {
         argv.push("--plugin-dir".into());
         argv.push(path_text(dir)?);
@@ -825,6 +930,7 @@ pub fn down(
             "launch_agent_unloaded": unloaded,
             "pruned_supervisors": pruned,
             "supervisor_workspaces": close_supervisor_workspaces(
+                &queue,
                 cmux,
                 processes,
                 &registrations,
@@ -865,6 +971,7 @@ pub fn down(
             "launch_agent_unloaded": unloaded,
             "pruned_supervisors": pruned,
             "supervisor_workspaces": close_supervisor_workspaces(
+                &queue,
                 cmux,
                 processes,
                 &registrations,
@@ -893,6 +1000,7 @@ pub fn down(
             "pids": pids,
             "launch_agent_unloaded": unloaded,
             "supervisor_workspaces": close_supervisor_workspaces(
+                &queue,
                 cmux,
                 processes,
                 &registrations,
@@ -906,6 +1014,7 @@ pub fn down(
         "pids": pids,
         "launch_agent_unloaded": unloaded,
         "supervisor_workspaces": close_supervisor_workspaces(
+            &queue,
             cmux,
             processes,
             &registrations,
@@ -938,6 +1047,7 @@ enum Stop {
 /// `kill(2)` returns before the target is reaped, so `kill(pid, 0)` still
 /// succeeds for a process that is already dying.
 fn close_supervisor_workspaces(
+    queue: &SqliteQueue,
     cmux: &dyn WorkspaceBackend,
     processes: &dyn ProcessControl,
     registrations: &[SupervisorRegistration],
@@ -959,7 +1069,20 @@ fn close_supervisor_workspaces(
                 }));
             }
             Some(match cmux.close(id) {
-                Ok(()) => json!({"workspace_id": id, "outcome": "closed"}),
+                Ok(()) => {
+                    // The record goes with the workspace. Forgetting it is
+                    // tidiness only: `up` drops a UUID cmux no longer lists.
+                    if queue
+                        .session_workspace(SessionRole::Supervisor)
+                        .ok()
+                        .flatten()
+                        .as_deref()
+                        == Some(id)
+                    {
+                        let _ = queue.remove_session_workspace(SessionRole::Supervisor);
+                    }
+                    json!({"workspace_id": id, "outcome": "closed"})
+                }
                 Err(error) => json!({
                     "workspace_id": id,
                     "outcome": "close_failed",

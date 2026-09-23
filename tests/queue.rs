@@ -886,10 +886,17 @@ fn migration_from_v6_adds_goals_and_keeps_tasks_runs_and_events() {
     .unwrap();
     drop(raw);
     let mut queue = SqliteQueue::open(&path).unwrap();
-    // 0007 (supervisors), 0008 (goals), 0009 (supervisor mode) and 0010
-    // (supervisor binary version) are applied together.
-    assert_eq!(SqliteQueue::SCHEMA_VERSION, 10);
-    assert_eq!(queue.schema_version().unwrap(), 10);
+    // 0007 (supervisors), 0008 (goals), 0009 (supervisor mode), 0010
+    // (supervisor binary version) and 0011 (session workspaces) are applied
+    // together.
+    assert_eq!(SqliteQueue::SCHEMA_VERSION, 11);
+    assert_eq!(queue.schema_version().unwrap(), 11);
+    assert_eq!(
+        queue
+            .session_workspace(dagq::domain::SessionRole::Maintainer)
+            .unwrap(),
+        None
+    );
     let landed = queue.show(1).unwrap();
     assert_eq!(landed.task.title, "landed");
     assert_eq!(landed.task.description, "why");

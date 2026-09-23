@@ -5,22 +5,27 @@
 //! A run whose supervisor died while its session lives on is adopted by a
 //! supervisor with a free slot instead of being rerun (ADR-0012).
 use crate::{
-    application::{AgentProvider, MainRemote, TaskStore, WorkspaceBackend, dependency_graph},
+    application::{
+        AgentProvider, MainRemote, TaskStore, WorkspaceBackend, WorkspaceTags, dependency_graph,
+    },
     domain::{
         ClaimOutcome, Goal, IntegrationOutcome, NewTask, PUSH_REMOTE, Predecessor, PushReport,
         PushResult, Receipt, ReceiptResult, RegisteredFollowUp, RunLease, RunPaths, RunProcess,
-        RunStatus, SupervisorMode, SupervisorRegistration, Task, TaskRun, heartbeat_stale,
+        RunStatus, SessionRole, SupervisorMode, SupervisorRegistration, Task, TaskRun,
+        heartbeat_stale,
     },
     infrastructure::{
         adapters::{
             ClaudeCode, GitRepository, path_text, process_alive, run_shell_to_log, shell_join,
+            workspace_description, workspace_group_name,
         },
-        location::runs_dir,
+        location::{QueueLocation, runs_dir},
         runtime_store::{
             HEARTBEAT_TIMEOUT_SECS, Landing, LeasedRun, RunPlan, Validation, lease_is_stale,
         },
         sqlite::SqliteQueue,
     },
+    lifecycle::session_env,
 };
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use serde::Serialize;
@@ -226,6 +231,7 @@ pub fn supervise(
         repository.root.display()
     ));
     let heartbeat = Heartbeat::start(db.clone(), token.clone());
+    let queue_hash = QueueLocation::explicit(&db).hash();
     let mut supervisor = Supervisor {
         queue,
         db,
@@ -241,6 +247,7 @@ pub fn supervise(
         errors: Vec::new(),
         claiming: true,
         provisioning_error: None,
+        queue_hash,
     };
     let result = supervisor.run_loop(options);
     match &result {
@@ -273,6 +280,9 @@ struct Supervisor<'a> {
     /// does not burn through every candidate.
     claiming: bool,
     provisioning_error: Option<String>,
+    /// The queue hash: the external ID of the queue's workspace group and
+    /// part of every run workspace's description (ADR-0026).
+    queue_hash: String,
 }
 
 /// One executing run between provisioning and rest.
@@ -647,6 +657,26 @@ impl Supervisor<'_> {
 
     /// Plan paths, create the run directory, worktree and workspace. Any
     /// error leaves what was created for inspection.
+    /// The queue's workspace group, asked for with every run workspace:
+    /// the call is idempotent by external ID, and cmux removes a group whose
+    /// last workspace closes, so a handle kept from an earlier run could
+    /// name a group that is gone. A group cmux cannot make is a warning in
+    /// the log, and the run opens outside it.
+    fn workspace_group(&self) -> Option<String> {
+        let name = workspace_group_name(&self.repository.root);
+        match self.cmux.ensure_group(&self.queue_hash, &name) {
+            Ok(group) => Some(group),
+            Err(error) => {
+                self.log.note(&format!(
+                    "warning: cmux workspace group {name:?} (external ID {}) could not be made, \
+so the run workspace opens outside it: {error:#}",
+                    self.queue_hash
+                ));
+                None
+            }
+        }
+    }
+
     fn provision(&mut self, claimed: &TaskRun) -> Result<SessionWatch> {
         let state_dir = runs_dir(&self.db);
         let paths = RunPaths::new(&state_dir, &claimed.id);
@@ -701,7 +731,17 @@ impl Supervisor<'_> {
             "--claude".into(),
             path_text(self.claude)?,
         ]);
-        let workspace = self.cmux.create(&task, &run, &command)?;
+        let tags = WorkspaceTags {
+            env: session_env(SessionRole::Worker, &self.db)?,
+            description: Some(workspace_description(
+                SessionRole::Worker,
+                &self.queue_hash,
+                Some(&run.id),
+                Some(run.task_id),
+            )),
+            group: self.workspace_group(),
+        };
+        let workspace = self.cmux.create(&task, &run, &command, &tags)?;
         self.queue
             .workspace_created(&run.id, &self.token, &workspace)?;
         self.log.note(&format!(

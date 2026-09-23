@@ -1,10 +1,14 @@
 use anyhow::{Result, bail, ensure};
 use dagq::{
     VERSION,
-    application::{AgentProvider, MainRemote, SupervisorEnvironment, TaskStore, WorkspaceBackend},
+    application::{
+        AgentProvider, MainRemote, SupervisorEnvironment, TaskStore, WorkspaceBackend,
+        WorkspaceTags,
+    },
     domain::{GoalEdit, NewGoal, NewTask, RunStatus, Task, TaskAction, TaskRun, TaskStatus},
     infrastructure::{
         adapters::{GitRepository, shell_join, workspace_handle},
+        location::QueueLocation,
         sqlite::SqliteQueue,
     },
     runtime::{self, IntegrateTarget, SuperviseOptions},
@@ -161,6 +165,12 @@ struct TestWorkspace {
     closed: Mutex<Vec<String>>,
     /// `notify` calls; the supervisor sends none (ADR-0022).
     notifications: AtomicUsize,
+    /// The tags each run workspace was opened with.
+    tags: Mutex<Vec<WorkspaceTags>>,
+    /// Every `ensure_group` call, as (external ID, name).
+    groups: Mutex<Vec<(String, String)>>,
+    /// `workspace-group create` fails.
+    group_fails: bool,
 }
 impl TestWorkspace {
     fn new(db: &Path, fail: bool, script: &str) -> Self {
@@ -178,6 +188,9 @@ impl TestWorkspace {
             sessions: Mutex::new(Vec::new()),
             closed: Mutex::new(Vec::new()),
             notifications: AtomicUsize::new(0),
+            tags: Mutex::new(Vec::new()),
+            groups: Mutex::new(Vec::new()),
+            group_fails: false,
         }
     }
     /// Agent script for one task; other tasks use the default script.
@@ -217,8 +230,15 @@ impl WorkspaceBackend for TestWorkspace {
     fn preflight_detached(&self, _: &SupervisorEnvironment) -> Result<()> {
         unreachable!("only up preflights the detached connection")
     }
-    fn create(&self, task: &Task, run: &TaskRun, command: &str) -> Result<String> {
+    fn create(
+        &self,
+        task: &Task,
+        run: &TaskRun,
+        command: &str,
+        tags: &WorkspaceTags,
+    ) -> Result<String> {
         assert_eq!(task.id, run.task_id);
+        self.tags.lock().unwrap().push(tags.clone());
         assert!(
             Path::new(run.worktree_path.as_ref().unwrap())
                 .join("seed.txt")
@@ -330,11 +350,21 @@ impl WorkspaceBackend for TestWorkspace {
         self.registration_timeout
     }
     // The maintainer workspace is `up`'s business; the supervisor never asks.
-    fn find_named(&self, _: &str) -> Result<Option<String>> {
+    fn exists(&self, _: &str) -> Result<bool> {
         bail!("not used by the supervisor")
     }
-    fn create_named(&self, _: &str, _: &Path, _: &str) -> Result<String> {
+    fn create_named(&self, _: &str, _: &Path, _: &str, _: &WorkspaceTags) -> Result<String> {
         bail!("not used by the supervisor")
+    }
+    fn ensure_group(&self, external_id: &str, name: &str) -> Result<String> {
+        self.groups
+            .lock()
+            .unwrap()
+            .push((external_id.into(), name.into()));
+        if self.group_fails {
+            bail!("workspace-group create failed")
+        }
+        Ok(format!("group-{external_id}"))
     }
     fn notify(&self, _: &str, _: &str, _: Option<&str>) -> Result<()> {
         self.notifications.fetch_add(1, Ordering::SeqCst);
@@ -433,6 +463,25 @@ fn run_agent_with(script: &str, close_fail: bool) -> (TempDir, PathBuf, dagq::do
     assert_eq!(kinds.contains(&"cleanup_failed"), close_fail);
     // A run at rest is reported through `watch`, not a notification (ADR-0022).
     assert_eq!(backend.notifications.load(Ordering::SeqCst), 0);
+    // The run workspace carries its role and queue in its environment, a
+    // description naming the run and task, and the queue's group.
+    let canonical = db.canonicalize().unwrap();
+    let hash = QueueLocation::explicit(&canonical).hash();
+    assert_eq!(
+        *backend.tags.lock().unwrap(),
+        vec![WorkspaceTags {
+            env: vec![
+                ("DAGQ_ROLE".into(), "worker".into()),
+                ("DAGQ_QUEUE".into(), canonical.to_str().unwrap().into()),
+            ],
+            description: Some(format!(
+                "dagq role=worker queue={hash} run={} task={}",
+                run.id, run.task_id
+            )),
+            group: Some(format!("group-{hash}")),
+        }]
+    );
+    assert_eq!(backend.groups.lock().unwrap().len(), 1);
     // The run came to rest: its lease is gone, and the task still owns it.
     assert!(kinds.contains(&"lease_acquired"));
     assert!(kinds.contains(&"lease_released"));
@@ -1047,6 +1096,37 @@ fn provisioning_failure_retains_the_run_and_stops_claiming_other_tasks() {
         "interrupted"
     );
     assert_eq!(queue.show(1).unwrap().runs.len(), 1);
+}
+
+/// A workspace group cmux cannot make leaves a warning in the supervisor
+/// log, and the run opens outside any group (ADR-0026).
+#[test]
+fn a_workspace_group_cmux_cannot_make_is_a_logged_warning() {
+    let (dir, repo, db) = fixture();
+    let mut queue = SqliteQueue::open(&db).unwrap();
+    add_ready_task(&mut queue, "grouped", &[]);
+    let mut backend = TestWorkspace::new(&db, false, VALID_AGENT);
+    backend.group_fails = true;
+    let mut options = SuperviseOptions::new(1, true);
+    let logs = dir.path().join("logs");
+    options.log_dir = Some(logs.clone());
+    let outcome = supervise_with(&db, &repo, &backend, &options).unwrap();
+    backend.join();
+    assert_eq!(outcome["errors"], json!([]), "{outcome}");
+    assert_eq!(
+        queue.show(1).unwrap().runs[0].status,
+        RunStatus::AwaitingIntegration
+    );
+    assert_eq!(backend.tags.lock().unwrap()[0].group, None);
+    let log = fs::read_dir(&logs)
+        .unwrap()
+        .map(|entry| fs::read_to_string(entry.unwrap().path()).unwrap())
+        .collect::<String>();
+    assert!(
+        log.contains("warning: cmux workspace group")
+            && log.contains("workspace-group create failed"),
+        "{log}"
+    );
 }
 
 /// With one slot the supervisor claims the candidate whose completion
@@ -3991,7 +4071,9 @@ fn start_run_under_dead_supervisor(
         path_text(db).unwrap(),
         "session".into(),
     ]);
-    let workspace = backend.create(&task, &run, &command).unwrap();
+    let workspace = backend
+        .create(&task, &run, &command, &WorkspaceTags::default())
+        .unwrap();
     queue.workspace_created(&run.id, token, &workspace).unwrap();
     wait_until(db, Duration::from_secs(10), |queue| {
         queue.run(&run.id).unwrap().status == RunStatus::Running
