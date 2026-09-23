@@ -2,7 +2,7 @@ use std::sync::{Arc, Barrier};
 
 use dagq::{
     VERSION,
-    application::TaskStore,
+    application::{StatusFilter, TaskQuery, TaskStore},
     domain::{
         ClaimOutcome, GoalEdit, GoalVerdict, NewGoal, NewTask, Provider, RunStatus, SupervisorMode,
         TaskAction, TaskStatus,
@@ -96,7 +96,7 @@ fn invalid_registration_rolls_back_task_dependencies_and_events() {
     let mut spec = new_task("blank verification");
     spec.verification_commands = vec![" ".into()];
     assert!(queue.add(spec).is_err());
-    assert_eq!(queue.list().unwrap().len(), 1);
+    assert_eq!(queue.list(&TaskQuery::default()).unwrap().total, 1);
     let b = queue.add(new_task("next")).unwrap();
     assert_eq!(queue.show(b.id).unwrap().events.len(), 1);
     assert!(queue.show(b.id).unwrap().dependencies.is_empty());
@@ -404,7 +404,7 @@ fn initialization_is_repeatable_and_preserves_existing_tasks() {
     drop(queue);
     let queue = SqliteQueue::init(dir.path().join("queue.db")).unwrap();
     assert_eq!(queue.schema_version().unwrap(), SqliteQueue::SCHEMA_VERSION);
-    assert_eq!(queue.list().unwrap().len(), 1);
+    assert_eq!(queue.list(&TaskQuery::default()).unwrap().total, 1);
     assert!(SqliteQueue::open(dir.path().join("typo.db")).is_err());
     assert!(!dir.path().join("typo.db").exists());
 }
@@ -1013,7 +1013,7 @@ fn set_goal_and_add_with_goal_follow_the_dependency_rules() {
     let mut spec = new_task("invalid goal id");
     spec.goal_id = Some(0);
     assert!(queue.add(spec).is_err());
-    assert!(queue.list().unwrap().is_empty());
+    assert_eq!(queue.list(&TaskQuery::default()).unwrap().total, 0);
 
     let task = queue.add(new_task("movable")).unwrap().id;
     assert_eq!(
@@ -1127,4 +1127,145 @@ fn goal_events_are_recorded_without_a_run() {
     assert_eq!(task_events[1].payload["to"], goal.id);
     assert_eq!(task_events[2].payload["from"], goal.id);
     assert!(task_events[2].payload["to"].is_null());
+}
+
+fn listed_ids(queue: &SqliteQueue, query: &TaskQuery) -> Vec<i64> {
+    let page = queue.list(query).unwrap();
+    page.tasks.iter().map(|task| task.id).collect()
+}
+
+#[test]
+fn list_defaults_to_unfinished_tasks_newest_first_with_compact_items() {
+    let (dir, mut queue) = fixture();
+    let goal = queue.add_goal(new_goal("grouped")).unwrap().id;
+    let a = queue.add(new_task("landed")).unwrap().id;
+    let b = queue.add(new_task("dropped")).unwrap().id;
+    let mut spec = new_task("claimed");
+    spec.dependencies = vec![a];
+    spec.goal_id = Some(goal);
+    let c = queue.add(spec).unwrap().id;
+    let d = queue.add(new_task("waiting")).unwrap().id;
+    let raw = Connection::open(dir.path().join("queue.db")).unwrap();
+    raw.execute("UPDATE tasks SET status='completed' WHERE id=?1", [a])
+        .unwrap();
+    queue.transition(b, TaskAction::Cancel).unwrap();
+    queue.transition(c, TaskAction::Ready).unwrap();
+    let ClaimOutcome::Claimed { run } = queue.claim(BASE).unwrap() else {
+        panic!()
+    };
+    queue.transition(d, TaskAction::Ready).unwrap();
+
+    let page = queue.list(&TaskQuery::default()).unwrap();
+    assert_eq!(page.total, 2);
+    assert_eq!(page.next, None);
+    assert_eq!(
+        serde_json::to_value(&page).unwrap(),
+        serde_json::json!({
+            "tasks": [
+                {"id": d, "status": "ready", "title": "waiting", "goal_id": null,
+                 "dependencies": [], "latest_run": null},
+                {"id": c, "status": "in_progress", "title": "claimed", "goal_id": goal,
+                 "dependencies": [a], "latest_run": {"id": run.id, "status": "claimed"}},
+            ],
+            "next": null,
+            "total": 2,
+        })
+    );
+
+    let all = TaskQuery {
+        status: StatusFilter::Any,
+        ..TaskQuery::default()
+    };
+    assert_eq!(listed_ids(&queue, &all), vec![d, c, b, a]);
+    let only = TaskQuery {
+        status: StatusFilter::Only(vec![TaskStatus::Ready, TaskStatus::Canceled]),
+        ..TaskQuery::default()
+    };
+    assert_eq!(listed_ids(&queue, &only), vec![d, b]);
+    let of_goal = TaskQuery {
+        goal_id: Some(goal),
+        ..TaskQuery::default()
+    };
+    assert_eq!(listed_ids(&queue, &of_goal), vec![c]);
+    // Status and goal combine with AND.
+    let ready_of_goal = TaskQuery {
+        status: StatusFilter::Only(vec![TaskStatus::Ready]),
+        goal_id: Some(goal),
+        ..TaskQuery::default()
+    };
+    let page = queue.list(&ready_of_goal).unwrap();
+    assert!(page.tasks.is_empty());
+    assert_eq!(page.total, 0);
+}
+
+#[test]
+fn list_full_items_carry_every_task_field() {
+    let (_dir, mut queue) = fixture();
+    let mut spec = new_task("detailed");
+    spec.context = "why it exists".into();
+    let task = queue.add(spec).unwrap();
+    let full = TaskQuery {
+        full: true,
+        ..TaskQuery::default()
+    };
+    let item = serde_json::to_value(&queue.list(&full).unwrap().tasks[0]).unwrap();
+    let mut expected = serde_json::to_value(&task).unwrap();
+    expected["dependencies"] = serde_json::json!([]);
+    expected["latest_run"] = serde_json::Value::Null;
+    assert_eq!(item, expected);
+}
+
+#[test]
+fn list_pages_by_limit_with_next_as_the_following_before() {
+    let (_dir, mut queue) = fixture();
+    let ids: Vec<i64> = (0..21)
+        .map(|n| queue.add(new_task(&format!("task {n}"))).unwrap().id)
+        .collect();
+    let newest_first: Vec<i64> = ids.iter().rev().copied().collect();
+
+    // limit + 1 tasks: the extra one is the next page.
+    let first = queue.list(&TaskQuery::default()).unwrap();
+    assert_eq!(first.total, 21);
+    assert_eq!(first.tasks.len(), 20);
+    assert_eq!(
+        first.tasks.iter().map(|t| t.id).collect::<Vec<_>>(),
+        newest_first[..20]
+    );
+    assert_eq!(first.next, Some(ids[0]));
+    let second = queue
+        .list(&TaskQuery {
+            before: first.next,
+            ..TaskQuery::default()
+        })
+        .unwrap();
+    assert_eq!(
+        second.tasks.iter().map(|t| t.id).collect::<Vec<_>>(),
+        vec![ids[0]]
+    );
+    assert_eq!(second.next, None);
+    assert_eq!(second.total, 21, "total ignores the page");
+
+    // Exactly limit tasks: no next page.
+    queue.transition(ids[0], TaskAction::Cancel).unwrap();
+    let exact = queue.list(&TaskQuery::default()).unwrap();
+    assert_eq!(exact.tasks.len(), 20);
+    assert_eq!(exact.next, None);
+    assert_eq!(exact.total, 20);
+
+    let small = TaskQuery {
+        limit: 3,
+        before: Some(ids[10]),
+        ..TaskQuery::default()
+    };
+    let page = queue.list(&small).unwrap();
+    assert_eq!(
+        page.tasks.iter().map(|t| t.id).collect::<Vec<_>>(),
+        vec![ids[10], ids[9], ids[8]]
+    );
+    assert_eq!(page.next, Some(ids[7]));
+    let zero = TaskQuery {
+        limit: 0,
+        ..TaskQuery::default()
+    };
+    assert!(queue.list(&zero).is_err());
 }

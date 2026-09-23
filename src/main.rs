@@ -15,8 +15,8 @@ use clap::{Parser, Subcommand};
 use serde_json::{Value, json};
 
 use dagq::{
-    application::TaskStore,
-    domain::{GoalEdit, GoalVerdict, NewGoal, NewTask, TaskAction},
+    application::{StatusFilter, TaskQuery, TaskStore},
+    domain::{GoalEdit, GoalVerdict, NewGoal, NewTask, TaskAction, TaskStatus},
     infrastructure::{adapters::path_text, location::QueueLocation, sqlite::SqliteQueue},
 };
 
@@ -58,8 +58,28 @@ enum Command {
         #[arg(long, default_value = "")]
         context: String,
     },
-    /// List all tasks in registration order.
-    List,
+    /// List one page of tasks, newest first: unfinished ones unless --status or --all says otherwise.
+    /// Prints {"tasks", "next", "total"}; pass `next` to --before for the following page (null: none).
+    List {
+        /// Only these statuses (comma-separated, any of them): draft, ready, in_progress, completed, canceled.
+        #[arg(long, value_delimiter = ',', conflicts_with = "all")]
+        status: Vec<String>,
+        /// Include completed and canceled tasks.
+        #[arg(long)]
+        all: bool,
+        /// Only tasks of this goal.
+        #[arg(long = "goal")]
+        goal_id: Option<i64>,
+        /// Page size.
+        #[arg(long, default_value_t = 20, value_parser = clap::value_parser!(u32).range(1..))]
+        limit: u32,
+        /// Start the page at this task ID (the previous page's `next`); lists IDs up to it.
+        #[arg(long)]
+        before: Option<i64>,
+        /// Include description, acceptance, context, verification commands and timestamps.
+        #[arg(long)]
+        full: bool,
+    },
     /// Show a task, its dependencies, run history, and events.
     Show { id: i64 },
     /// Make a draft task ready (dependencies may still block execution).
@@ -292,7 +312,34 @@ fn execute(cli: Cli) -> Result<Value> {
             goal_id,
             context,
         })?)?,
-        Command::List => serde_json::to_value(queue.list()?)?,
+        Command::List {
+            status,
+            all,
+            goal_id,
+            limit,
+            before,
+            full,
+        } => {
+            let status = if all {
+                StatusFilter::Any
+            } else if status.is_empty() {
+                StatusFilter::Open
+            } else {
+                StatusFilter::Only(
+                    status
+                        .iter()
+                        .map(|value| value.trim().parse::<TaskStatus>())
+                        .collect::<Result<_, _>>()?,
+                )
+            };
+            serde_json::to_value(queue.list(&TaskQuery {
+                status,
+                goal_id,
+                limit: usize::try_from(limit)?,
+                before,
+                full,
+            })?)?
+        }
         Command::Show { id } => serde_json::to_value(queue.show(id)?)?,
         Command::Ready { id } => serde_json::to_value(queue.transition(id, TaskAction::Ready)?)?,
         Command::Draft { id } => serde_json::to_value(queue.transition(id, TaskAction::Draft)?)?,

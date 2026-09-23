@@ -181,8 +181,13 @@ fn every_worktree_of_a_repository_shares_one_queue_under_the_data_home() {
     for cwd in [&nested, &second, &run_worktree] {
         assert_eq!(ok(cwd, &env, &["locate"])["db"], db.to_str().unwrap());
         let listed = ok(cwd, &env, &["list"]);
-        assert_eq!(listed.as_array().unwrap().len(), 1, "{}", cwd.display());
-        assert_eq!(listed[0]["id"], added["id"]);
+        assert_eq!(
+            listed["tasks"].as_array().unwrap().len(),
+            1,
+            "{}",
+            cwd.display()
+        );
+        assert_eq!(listed["tasks"][0]["id"], added["id"]);
     }
     ok(&second, &env, &["ready", &added["id"].to_string()]);
     assert_eq!(
@@ -191,7 +196,7 @@ fn every_worktree_of_a_repository_shares_one_queue_under_the_data_home() {
     );
     // Re-running init keeps the queue and its binding.
     assert_eq!(ok(&second, &env, &["init"])["db"], db.to_str().unwrap());
-    assert_eq!(ok(&repo, &env, &["list"]).as_array().unwrap().len(), 1);
+    assert_eq!(ok(&repo, &env, &["list"])["total"], 1);
 }
 
 #[test]
@@ -216,8 +221,8 @@ fn another_repository_gets_its_own_queue_and_outside_a_repository_fails() {
     assert!(error(&other, &env, &["list"]).contains("use init"));
     assert!(!other_db.exists());
     ok(&other, &env, &["init"]);
-    assert_eq!(ok(&other, &env, &["list"]), serde_json::json!([]));
-    assert_eq!(ok(&repo, &env, &["list"]).as_array().unwrap().len(), 1);
+    assert_eq!(ok(&other, &env, &["list"])["total"], 0);
+    assert_eq!(ok(&repo, &env, &["list"])["total"], 1);
 
     let outside = dir.path().join("plain");
     fs::create_dir(&outside).unwrap();
@@ -257,13 +262,7 @@ fn db_flag_overrides_the_repository_queue_and_stays_unbound() {
     let queue = SqliteQueue::open(&explicit).unwrap();
     assert_eq!(queue.repository_binding().unwrap(), None);
     ok(&repo, &env, &["--db", flag, "add", "explicit task"]);
-    assert_eq!(
-        ok(dir.path(), &env, &["--db", flag, "list"])
-            .as_array()
-            .unwrap()
-            .len(),
-        1
-    );
+    assert_eq!(ok(dir.path(), &env, &["--db", flag, "list"])["total"], 1);
     assert!(!expected_db(&data_home, &repo).exists());
 }
 
@@ -339,8 +338,8 @@ fn a_repository_queue_bound_elsewhere_is_refused_by_every_command() {
     // The same file is still usable through --db, which performs no binding check
     // until a supervisor claims it.
     assert_eq!(
-        ok(&repo, &env, &["--db", db.to_str().unwrap(), "list"]),
-        serde_json::json!([])
+        ok(&repo, &env, &["--db", db.to_str().unwrap(), "list"])["total"],
+        0
     );
     let mut queue = SqliteQueue::open(&db).unwrap();
     assert!(queue.bind_repository("/somewhere/else/.git").is_ok());

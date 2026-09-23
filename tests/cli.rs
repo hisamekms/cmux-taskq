@@ -62,7 +62,7 @@ fn cli_persists_across_processes_and_reports_dependency_errors_as_json() {
     let detail = ok(&db, &["show", &a]);
     assert_eq!(detail["task"]["title"], first["title"]);
     assert_eq!(detail["dependencies"], serde_json::json!([]));
-    assert_eq!(ok(&db, &["list"]).as_array().unwrap().len(), 2);
+    assert_eq!(ok(&db, &["list"])["tasks"].as_array().unwrap().len(), 2);
     ok(&db, &["cancel", &a]);
     assert_eq!(ok(&db, &["candidates"]), serde_json::json!([]));
     ok(&db, &["dependency", "remove", &b, &a]);
@@ -94,7 +94,10 @@ fn reads_do_not_create_a_queue_and_unknown_tasks_fail() {
     assert!(!invoke(&db, &["recover", "missing-run"]).status.success());
     assert!(!invoke(&db, &["show", "1"]).status.success());
     assert!(!invoke(&db, &["add", "  "]).status.success());
-    assert_eq!(ok(&db, &["list"]), serde_json::json!([]));
+    assert_eq!(
+        ok(&db, &["list"]),
+        serde_json::json!({"tasks": [], "next": null, "total": 0})
+    );
     ok(&db, &["add", "never run"]);
     // A `--db` queue that was never supervised is bound to no repository, so
     // there is nothing to land in; the run lookup comes first for a task.
@@ -258,4 +261,67 @@ fn goals_group_tasks_and_report_counts_by_status() {
             .len(),
         3
     );
+}
+
+#[test]
+fn list_options_filter_page_and_expand_tasks() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("queue.db");
+    ok(&db, &["init"]);
+    let goal = ok(&db, &["goal", "add", "grouped"])["id"].to_string();
+    let a = ok(&db, &["add", "first", "--goal", &goal])["id"]
+        .as_i64()
+        .unwrap();
+    let b = ok(&db, &["add", "second", "--description", "long"])["id"]
+        .as_i64()
+        .unwrap();
+    let c = ok(&db, &["add", "third"])["id"].as_i64().unwrap();
+    ok(&db, &["ready", &a.to_string()]);
+    ok(&db, &["cancel", &c.to_string()]);
+
+    let ids = |value: &Value| -> Vec<i64> {
+        value["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|task| task["id"].as_i64().unwrap())
+            .collect()
+    };
+    let listed = ok(&db, &["list"]);
+    assert_eq!(ids(&listed), vec![b, a]);
+    assert_eq!(listed["total"], 2);
+    assert!(listed["tasks"][0].get("description").is_none());
+    assert_eq!(ids(&ok(&db, &["list", "--all"])), vec![c, b, a]);
+    assert_eq!(
+        ids(&ok(&db, &["list", "--status", "ready,canceled"])),
+        vec![c, a]
+    );
+    assert_eq!(ids(&ok(&db, &["list", "--goal", &goal])), vec![a]);
+    assert!(ids(&ok(&db, &["list", "--goal", &goal, "--status", "draft"])).is_empty());
+    let page = ok(&db, &["list", "--all", "--limit", "2"]);
+    assert_eq!(ids(&page), vec![c, b]);
+    assert_eq!(page["next"], a);
+    let rest = ok(
+        &db,
+        &["list", "--all", "--limit", "2", "--before", &a.to_string()],
+    );
+    assert_eq!(ids(&rest), vec![a]);
+    assert_eq!(rest["next"], Value::Null);
+    let full = ok(&db, &["list", "--full", "--status", "draft"]);
+    assert_eq!(full["tasks"][0]["description"], "long");
+    for key in [
+        "acceptance",
+        "context",
+        "verification_commands",
+        "created_at",
+        "updated_at",
+    ] {
+        assert!(full["tasks"][0].get(key).is_some(), "{key}");
+    }
+
+    let output = invoke(&db, &["list", "--status", "ready,done"]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    let error: Value = serde_json::from_slice(&output.stderr).unwrap();
+    assert!(error["error"].as_str().unwrap().contains("done"));
 }

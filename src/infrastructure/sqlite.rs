@@ -2,14 +2,15 @@ use std::{path::Path, str::FromStr, time::Duration};
 
 use anyhow::{Context, Result, ensure};
 use rusqlite::{
-    Connection, OpenFlags, OptionalExtension, Row, TransactionBehavior, params, types::Type,
+    Connection, OpenFlags, OptionalExtension, Row, TransactionBehavior, params, params_from_iter,
+    types::{Type, Value},
 };
 use serde::de::DeserializeOwned;
 use serde_json::json;
 use uuid::Uuid;
 
 use crate::{
-    application::TaskStore,
+    application::{LatestRun, StatusFilter, TaskListItem, TaskPage, TaskQuery, TaskStore},
     domain::{
         ClaimOutcome, DomainError, Goal, GoalDetail, GoalEdit, GoalSummary, GoalTask, GoalVerdict,
         NewGoal, NewTask, Predecessor, RunEvent, Task, TaskAction, TaskDetail, TaskRun, TaskStatus,
@@ -168,12 +169,102 @@ impl TaskStore for SqliteQueue {
         Ok(result)
     }
 
-    fn list(&self) -> Result<Vec<Task>> {
-        Ok(self
-            .conn
-            .prepare("SELECT * FROM tasks ORDER BY id")?
-            .query_map([], task_row)?
-            .collect::<rusqlite::Result<_>>()?)
+    fn list(&self, query: &TaskQuery) -> Result<TaskPage> {
+        ensure!(query.limit > 0, "limit must be at least 1");
+        let mut filters = Vec::new();
+        let mut values = Vec::new();
+        let statuses: Vec<TaskStatus> = match &query.status {
+            StatusFilter::Open => [
+                TaskStatus::Draft,
+                TaskStatus::Ready,
+                TaskStatus::InProgress,
+                TaskStatus::Completed,
+                TaskStatus::Canceled,
+            ]
+            .into_iter()
+            .filter(|status| !status.is_terminal())
+            .collect(),
+            StatusFilter::Any => Vec::new(),
+            StatusFilter::Only(statuses) => statuses.clone(),
+        };
+        if !matches!(query.status, StatusFilter::Any) {
+            filters.push(format!(
+                "status IN ({})",
+                vec!["?"; statuses.len()].join(",")
+            ));
+            values.extend(statuses.iter().map(|s| Value::from(s.as_str().to_owned())));
+        }
+        if let Some(goal_id) = query.goal_id {
+            filters.push("goal_id = ?".into());
+            values.push(Value::from(goal_id));
+        }
+        let matching = if filters.is_empty() {
+            String::new()
+        } else {
+            format!(" WHERE {}", filters.join(" AND "))
+        };
+        // One read snapshot keeps the page, its count and its runs consistent.
+        let tx = self.conn.unchecked_transaction()?;
+        let total: i64 = tx.query_row(
+            &format!("SELECT count(*) FROM tasks{matching}"),
+            params_from_iter(&values),
+            |r| r.get(0),
+        )?;
+        if let Some(before) = query.before {
+            filters.push("id <= ?".into());
+            values.push(Value::from(before));
+        }
+        let page = if filters.is_empty() {
+            String::new()
+        } else {
+            format!(" WHERE {}", filters.join(" AND "))
+        };
+        // One extra row tells whether another page follows.
+        values.push(Value::from(i64::try_from(query.limit)?.saturating_add(1)));
+        let mut tasks: Vec<Task> = tx
+            .prepare(&format!(
+                "SELECT * FROM tasks{page} ORDER BY id DESC LIMIT ?"
+            ))?
+            .query_map(params_from_iter(&values), task_row)?
+            .collect::<rusqlite::Result<_>>()?;
+        let next = if tasks.len() > query.limit {
+            tasks.pop().map(|task| task.id)
+        } else {
+            None
+        };
+        let mut dependencies = tx.prepare(
+            "SELECT predecessor_id FROM task_dependencies WHERE task_id=?1 ORDER BY predecessor_id",
+        )?;
+        let mut latest_run = tx.prepare(
+            "SELECT id, status FROM task_runs WHERE task_id=?1 ORDER BY rowid DESC LIMIT 1",
+        )?;
+        let tasks = tasks
+            .into_iter()
+            .map(|task| {
+                let dependencies = dependencies
+                    .query_map([task.id], |r| r.get(0))?
+                    .collect::<rusqlite::Result<_>>()?;
+                let latest_run = latest_run
+                    .query_row([task.id], |row| {
+                        Ok(LatestRun {
+                            id: row.get("id")?,
+                            status: enum_col(row, "status")?,
+                        })
+                    })
+                    .optional()?;
+                Ok(TaskListItem::new(
+                    task,
+                    dependencies,
+                    latest_run,
+                    query.full,
+                ))
+            })
+            .collect::<Result<_>>()?;
+        Ok(TaskPage {
+            tasks,
+            next,
+            total: usize::try_from(total)?,
+        })
     }
 
     fn show(&mut self, task_id: i64) -> Result<TaskDetail> {

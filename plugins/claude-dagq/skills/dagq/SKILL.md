@@ -104,12 +104,19 @@ A one-shot task omits `--goal`. The task is registered as `draft` and the JSON i
 | --- | --- |
 | `"$DAGQ" goal list` | All goals with `id`, `title`, `closed`, `verdict`, and `tasks` counts (`total`, `draft`, `ready`, `in_progress`, `completed`, `canceled`) |
 | `"$DAGQ" goal show ID` | `goal` (all fields), `tasks` (`id`, `title`, `status`), `closed`, `events` (`goal_created`, `goal_updated`, `goal_closed`) |
-| `"$DAGQ" list` | All tasks with `id`, `title`, `status`, `goal_id` |
+| `"$DAGQ" list` | One page of unfinished tasks, newest first: `{"tasks", "next", "total"}` (see below) |
 | `"$DAGQ" show ID` | `task` (with `goal_id` and `context`), `dependencies`, `runs`, `events`, `processes` |
 | `"$DAGQ" candidates` | What the next `supervise` would pick |
 | `"$DAGQ" locate` | The queue this directory resolves to (`db`, `runs_dir`, `git_common_dir`, `db_exists`) without opening it |
 | `"$DAGQ" status` | `supervisors`: every registered `supervise` process (`pid`, `alive`, `parallel`, `heartbeat_age_secs`, `stale`, `run_ids`; listed even while it holds no run) plus any `integrate` process holding a lease (`registered: false`); `runs`: unfinished runs with their leases |
 | `"$DAGQ" doctor` | The same `supervisors`; per run: lease liveness, processes, worktree/receipt existence, `blockers`, `recoverable` |
+
+`list` answers "which tasks are moving or can move" and "how far is this goal". It prints `{"tasks": [...], "next": ID | null, "total": N}`:
+
+- `tasks`: at most `--limit` (default 20) tasks in ID descending order (newest first). By default only unfinished ones (`draft`, `ready`, `in_progress`); `--status ready,in_progress` picks statuses (any of them; an unknown status exits 1 with an error), `--all` adds `completed` and `canceled`, `--goal ID` keeps one goal's tasks. `--status` / `--all` and `--goal` combine with AND.
+- Each task has only `id`, `status`, `title`, `goal_id`, `dependencies` (predecessor IDs) and `latest_run` (`{"id", "status"}` of the newest run, or null). `--full` adds `description`, `acceptance`, `context`, `verification_commands`, `created_at`, `updated_at`; prefer `show ID` for one task.
+- `next`: null means this page is the last one. Otherwise pass it as `--before NEXT` (with the same filters) for the following page; it is the ID of the first task of that page. Decide whether more pages exist from `next` alone — never by counting `tasks`.
+- `total`: how many tasks match the filters across all pages.
 
 Task `status`: `draft` → `ready` → `in_progress` → `completed`, or `canceled`. A task stays `in_progress` while any run is unfinished or awaiting integration.
 

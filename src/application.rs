@@ -4,12 +4,125 @@ use anyhow::Result;
 
 use crate::domain::{
     ClaimOutcome, Goal, GoalDetail, GoalEdit, GoalSummary, GoalVerdict, NewGoal, NewTask,
-    Predecessor, Task, TaskAction, TaskDetail,
+    Predecessor, RunStatus, Task, TaskAction, TaskDetail, TaskStatus,
 };
+
+/// Which task statuses `list` returns.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum StatusFilter {
+    /// Every status except the terminal ones (completed, canceled).
+    #[default]
+    Open,
+    /// Every status, terminal ones included.
+    Any,
+    /// Only these statuses (any of them).
+    Only(Vec<TaskStatus>),
+}
+
+/// Filter and page of a task listing. Filters combine with AND; tasks come
+/// newest first (ID descending).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskQuery {
+    pub status: StatusFilter,
+    pub goal_id: Option<i64>,
+    /// Page size; at least one.
+    pub limit: usize,
+    /// Start the page at this task ID: only tasks whose ID is at most this.
+    /// The previous page's `next` is the first task of the following page.
+    pub before: Option<i64>,
+    /// Include description, acceptance, context, verification commands and timestamps.
+    pub full: bool,
+}
+
+impl TaskQuery {
+    pub const DEFAULT_LIMIT: usize = 20;
+}
+
+impl Default for TaskQuery {
+    fn default() -> Self {
+        Self {
+            status: StatusFilter::Open,
+            goal_id: None,
+            limit: Self::DEFAULT_LIMIT,
+            before: None,
+            full: false,
+        }
+    }
+}
+
+/// One page of tasks. `next` is the ID of the first task past this page,
+/// to pass as `before` for the following page, and null on the last one;
+/// `total` counts every task the filter matches, regardless of the page.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct TaskPage {
+    pub tasks: Vec<TaskListItem>,
+    pub next: Option<i64>,
+    pub total: usize,
+}
+
+/// A task as `list` shows it: what the maintainer decides on, plus the
+/// long fields only with `full`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct TaskListItem {
+    pub id: i64,
+    pub status: TaskStatus,
+    pub title: String,
+    pub goal_id: Option<i64>,
+    /// IDs of the direct predecessors, ascending.
+    pub dependencies: Vec<i64>,
+    /// The most recently created run, if any.
+    pub latest_run: Option<LatestRun>,
+    #[serde(flatten)]
+    pub details: Option<TaskListDetails>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct LatestRun {
+    pub id: String,
+    pub status: RunStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct TaskListDetails {
+    pub description: String,
+    pub acceptance: String,
+    pub verification_commands: Vec<String>,
+    pub context: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+impl TaskListItem {
+    pub fn new(
+        task: Task,
+        dependencies: Vec<i64>,
+        latest_run: Option<LatestRun>,
+        full: bool,
+    ) -> Self {
+        let details = full.then_some(TaskListDetails {
+            description: task.description,
+            acceptance: task.acceptance,
+            verification_commands: task.verification_commands,
+            context: task.context,
+            created_at: task.created_at,
+            updated_at: task.updated_at,
+        });
+        Self {
+            id: task.id,
+            status: task.status,
+            title: task.title,
+            goal_id: task.goal_id,
+            dependencies,
+            latest_run,
+            details,
+        }
+    }
+}
 
 pub trait TaskStore {
     fn add(&mut self, task: NewTask) -> Result<Task>;
-    fn list(&self) -> Result<Vec<Task>>;
+    /// One page of tasks matching `query`, newest first.
+    fn list(&self, query: &TaskQuery) -> Result<TaskPage>;
     fn show(&mut self, task_id: i64) -> Result<TaskDetail>;
     fn transition(&mut self, task_id: i64, action: TaskAction) -> Result<Task>;
     fn add_dependency(&mut self, task_id: i64, predecessor_id: i64) -> Result<()>;

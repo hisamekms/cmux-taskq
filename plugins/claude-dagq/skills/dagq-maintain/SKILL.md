@@ -68,7 +68,7 @@ Answer permission prompts about the run's own worktree yourself (edits inside it
 
 ## 4. Watch the runs
 
-Poll with `"$DAGQ" show ID` (and `"$DAGQ" status`), not by reading the workspace screen. Read the latest entry of `runs`:
+Poll with `"$DAGQ" show ID` (and `"$DAGQ" status`), not by reading the workspace screen. To find the tasks worth a `show`, use `"$DAGQ" list --status in_progress` (or plain `list` for every unfinished task, `list --goal ID` for one goal): each entry's `latest_run` gives the newest run's `id` and `status` without the task's long fields. More tasks exist only when `next` is not null; then ask for `list --before NEXT` with the same filters instead of counting the entries. Read the latest entry of `runs`:
 
 - `claimed` / `starting` / `running`: in progress. `events` shows `lease_acquired`, `workspace_created`, `agent_started`, `receipt_observed`, `session_idle_observed`, `exit_requested`.
 - `validating`: the session exited; the supervisor is checking the receipt, commit, clean worktree, and rerunning the task's verification commands.

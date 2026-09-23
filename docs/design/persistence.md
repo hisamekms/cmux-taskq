@@ -65,6 +65,7 @@ goals                -- 0008: 複数taskが解く課題（title、description、
 - 部分UNIQUE index `one_integrating_run_per_queue`で、queue全体の`integrating` runを1件に制限する（統合スロット）。
 - foreign key、statusのCHECK制約、依存の複合主キーを設ける。自己依存はDBとapplicationの両方で拒否し、循環はトランザクション内の再帰CTEで検証する。
 - Task詳細は一つのread transactionで読むため、Task・run・イベント間のスナップショットが揃う。
+- `list`は`TaskQuery`（application層。`StatusFilter`は`Open`（既定、`completed` / `canceled`以外）/ `Any`（`--all`）/ `Only`（`--status a,b`、どれか）、`goal_id`、`limit`（既定20）、`before`、`full`）を受け、`SqliteQueue::list`がWHERE（status・goal・`id <= before`をAND）を組み立ててID降順に`limit + 1`件引く。余った1件があればそのIDを`next`にしてページから落とし、なければ`next`はnull。`total`は`before`とlimitを除いたフィルタだけの`count(*)`で、ページ・依存・最新runと同じread transactionで数える。各要素（`TaskListItem`）はid/status/title/goal_id、`dependencies`（先行task IDの昇順）、`latest_run`（rowidが最大のrunの`id`と`status`、なければnull）で、`full`のときだけdescription/acceptance/verification_commands/context/created_at/updated_atを同じ階層に足す。
 
 SQLiteの書き込みトランザクションとIMMEDIATEの挙動は[公式仕様](https://www.sqlite.org/lang_transaction.html)に従う。
 
