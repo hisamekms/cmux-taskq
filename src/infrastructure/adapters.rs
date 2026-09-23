@@ -170,6 +170,19 @@ pub fn output(command: &mut Command) -> Result<String> {
 
 /// Run to completion with a deadline; the caller interprets the exit status.
 pub fn capture(command: &mut Command, timeout: Duration) -> Result<(ExitStatus, String, String)> {
+    let (status, stdout, stderr) = capture_bytes(command, timeout)?;
+    Ok((
+        status,
+        String::from_utf8(stdout).context("command output is not UTF-8")?,
+        stderr,
+    ))
+}
+
+/// [`capture`] without the UTF-8 requirement on stdout.
+fn capture_bytes(
+    command: &mut Command,
+    timeout: Duration,
+) -> Result<(ExitStatus, Vec<u8>, String)> {
     let label = format!("{:?}", command.get_program());
     let mut child = command
         .stdout(Stdio::piped())
@@ -178,27 +191,66 @@ pub fn capture(command: &mut Command, timeout: Duration) -> Result<(ExitStatus, 
         .spawn()
         .with_context(|| format!("start {label}"))?;
     let mut stdout = child.stdout.take().context("stdout unavailable")?;
-    let mut stderr = child.stderr.take().context("stderr unavailable")?;
     let out = thread::spawn(move || {
         let mut bytes = Vec::new();
         stdout.read_to_end(&mut bytes).map(|_| bytes)
     });
-    let err = thread::spawn(move || {
-        let mut bytes = Vec::new();
-        stderr.read_to_end(&mut bytes).map(|_| bytes)
-    });
+    let err = read_stderr(&mut child)?;
     let status = wait_with_deadline(&mut child, &label, timeout)?;
     let stdout = out
         .join()
         .map_err(|_| anyhow::anyhow!("stdout reader failed"))??;
-    let stderr = err
+    Ok((status, stdout, join_stderr(err)?))
+}
+
+type StderrReader = thread::JoinHandle<std::io::Result<Vec<u8>>>;
+
+fn read_stderr(child: &mut Child) -> Result<StderrReader> {
+    let mut stderr = child.stderr.take().context("stderr unavailable")?;
+    Ok(thread::spawn(move || {
+        let mut bytes = Vec::new();
+        stderr.read_to_end(&mut bytes).map(|_| bytes)
+    }))
+}
+
+fn join_stderr(reader: StderrReader) -> Result<String> {
+    let stderr = reader
         .join()
         .map_err(|_| anyhow::anyhow!("stderr reader failed"))??;
-    Ok((
-        status,
-        String::from_utf8(stdout).context("command output is not UTF-8")?,
-        String::from_utf8_lossy(&stderr).into_owned(),
-    ))
+    Ok(String::from_utf8_lossy(&stderr).into_owned())
+}
+
+/// Deadline of the Git commands that gather a review: a large diff takes far
+/// longer to produce than the 30 seconds of [`output`].
+pub const REVIEW_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Like [`output`] with [`REVIEW_TIMEOUT`], reading stdout lossily so text in
+/// any encoding (Latin-1 files, non-UTF-8 commit messages) does not fail.
+fn review_output(command: &mut Command) -> Result<String> {
+    let (status, stdout, stderr) = capture_bytes(command, REVIEW_TIMEOUT)?;
+    ensure!(
+        status.success(),
+        "{:?} failed ({status}): {stderr}",
+        command.get_program()
+    );
+    Ok(String::from_utf8_lossy(&stdout).into_owned())
+}
+
+/// Run `command` with its stdout appended to `file` as raw bytes, never
+/// holding it in memory, under [`REVIEW_TIMEOUT`].
+fn review_output_to(command: &mut Command, file: &fs::File) -> Result<()> {
+    let label = format!("{:?}", command.get_program());
+    let mut child = command
+        .stdout(Stdio::from(file.try_clone()?))
+        .stderr(Stdio::piped())
+        .stdin(Stdio::null())
+        .spawn()
+        .with_context(|| format!("start {label}"))?;
+    let err = read_stderr(&mut child)?;
+    let status = wait_with_deadline(&mut child, &label, REVIEW_TIMEOUT)?;
+    let stderr = join_stderr(err)?;
+    ensure!(status.success(), "{label} failed ({status}): {stderr}");
+    Ok(())
 }
 
 fn wait_with_deadline(child: &mut Child, label: &str, timeout: Duration) -> Result<ExitStatus> {
@@ -432,9 +484,10 @@ impl GitRepository {
         )
     }
 
-    /// `git log --oneline <base>..<head>`: the commits a run added.
+    /// `git log --oneline <base>..<head>`: the commits a run added. Messages
+    /// that are not UTF-8 are read lossily.
     pub fn log_oneline(&self, base: &str, head: &str) -> Result<String> {
-        output(Command::new(&self.git).arg("-C").arg(&self.root).args([
+        review_output(Command::new(&self.git).arg("-C").arg(&self.root).args([
             "log",
             "--oneline",
             "--no-decorate",
@@ -445,33 +498,34 @@ impl GitRepository {
 
     /// `git diff <args> <base>...<head>`: the change since the merge base,
     /// without color, external diff drivers or textconv filters.
-    fn diff_since(&self, base: &str, head: &str, args: &[&str]) -> Result<String> {
-        output(
-            Command::new(&self.git)
-                .arg("-C")
-                .arg(&self.root)
-                .args(["diff", "--no-color", "--no-ext-diff", "--no-textconv"])
-                .args(args)
-                .arg(format!("{base}...{head}"))
-                .arg("--"),
-        )
+    fn diff_since(&self, base: &str, head: &str, args: &[&str]) -> Command {
+        let mut command = Command::new(&self.git);
+        command
+            .arg("-C")
+            .arg(&self.root)
+            .args(["diff", "--no-color", "--no-ext-diff", "--no-textconv"])
+            .args(args)
+            .arg(format!("{base}...{head}"))
+            .arg("--");
+        command
     }
 
-    /// `git diff --stat <base>...<head>`.
+    /// `git diff --stat <base>...<head>`, read lossily.
     pub fn diff_stat(&self, base: &str, head: &str) -> Result<String> {
-        self.diff_since(base, head, &["--stat"])
+        review_output(&mut self.diff_since(base, head, &["--stat"]))
     }
 
-    /// Full `git diff <base>...<head>`.
-    pub fn diff(&self, base: &str, head: &str) -> Result<String> {
-        self.diff_since(base, head, &[])
+    /// Full `git diff <base>...<head>` appended to `file` as Git's raw bytes,
+    /// whatever the encoding of the files; the diff never passes through memory.
+    pub fn diff_to(&self, base: &str, head: &str, file: &fs::File) -> Result<()> {
+        review_output_to(&mut self.diff_since(base, head, &[]), file)
     }
 
     /// Files changed, lines inserted and lines deleted in
     /// `<base>...<head>`, summed from `--numstat` (binary files count as a
     /// changed file with no lines).
     pub fn diff_numbers(&self, base: &str, head: &str) -> Result<DiffNumbers> {
-        let numstat = self.diff_since(base, head, &["--numstat"])?;
+        let numstat = review_output(&mut self.diff_since(base, head, &["--numstat"]))?;
         let mut numbers = DiffNumbers::default();
         for line in numstat.lines().filter(|line| !line.is_empty()) {
             let mut fields = line.split('\t');
@@ -1149,5 +1203,41 @@ esac
             ]
         );
         assert!(calls.contains("identify\n--workspace\nworkspace:7\n"));
+    }
+
+    #[test]
+    fn review_output_reads_non_utf8_lossily_where_output_refuses_it() {
+        let latin1 = || {
+            let mut command = Command::new("/bin/sh");
+            command.args(["-c", r"printf 'caf\351\n'"]);
+            command
+        };
+        let error = format!("{:#}", output(&mut latin1()).unwrap_err());
+        assert!(error.contains("command output is not UTF-8"), "{error}");
+        assert_eq!(review_output(&mut latin1()).unwrap(), "caf\u{fffd}\n");
+        let error = review_output(Command::new("/bin/sh").args(["-c", "echo no >&2; exit 3"]))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("failed") && error.contains("no"), "{error}");
+    }
+
+    #[test]
+    fn review_output_to_streams_raw_bytes_into_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("out");
+        let file = fs::File::create(&path).unwrap();
+        review_output_to(
+            Command::new("/bin/sh").args(["-c", r"printf 'caf\351\n'"]),
+            &file,
+        )
+        .unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"caf\xe9\n");
+        let error = review_output_to(
+            Command::new("/bin/sh").args(["-c", "echo broken >&2; exit 2"]),
+            &file,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("broken"), "{error}");
     }
 }

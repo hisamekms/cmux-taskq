@@ -27,7 +27,7 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use std::{
     fs,
-    io::{IsTerminal, Write},
+    io::{self, BufWriter, IsTerminal, Read, Write},
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
@@ -1506,7 +1506,6 @@ pub fn review(db: &Path, task_id: i64) -> Result<Value> {
     };
     let log = repository.log_oneline(&base, &head)?;
     let stat = repository.diff_stat(&base, &head)?;
-    let diff = repository.diff(&base, &head)?;
     let numbers = repository.diff_numbers(&base, &head)?;
     let text = review_markdown(
         &task,
@@ -1517,12 +1516,19 @@ pub fn review(db: &Path, task_id: i64) -> Result<Value> {
         &head,
         &log,
         &stat,
-        &diff,
     );
     let path = run_dir.join("review.md");
     let temporary = run_dir.join(format!(".review.md.{}.tmp", std::process::id()));
-    fs::write(&temporary, text).with_context(|| format!("write {}", temporary.display()))?;
-    fs::rename(&temporary, &path).with_context(|| format!("write {}", path.display()))?;
+    let diff = run_dir.join(format!(".review.md.{}.diff.tmp", std::process::id()));
+    let written =
+        write_review(&repository, &base, &head, &text, &diff, &temporary).and_then(|()| {
+            fs::rename(&temporary, &path).with_context(|| format!("write {}", path.display()))
+        });
+    let _ = fs::remove_file(&diff);
+    if let Err(error) = written {
+        let _ = fs::remove_file(&temporary);
+        return Err(error);
+    }
     Ok(json!({
         "run_id": run.id,
         "task_id": task.id,
@@ -1533,6 +1539,59 @@ pub fn review(db: &Path, task_id: i64) -> Result<Value> {
         "insertions": numbers.insertions,
         "deletions": numbers.deletions,
     }))
+}
+
+/// Write `text` and then the full diff `<base>...<head>` as a fenced block to
+/// `temporary`. Git streams the diff to the file `diff` first, as raw bytes
+/// and never through memory, because the fence must be longer than any
+/// backtick run in it; the file is then copied under the fence.
+fn write_review(
+    repository: &GitRepository,
+    base: &str,
+    head: &str,
+    text: &str,
+    diff: &Path,
+    temporary: &Path,
+) -> Result<()> {
+    let file = fs::File::create(diff).with_context(|| format!("create {}", diff.display()))?;
+    repository.diff_to(base, head, &file)?;
+    drop(file);
+    let (longest, last) = backtick_run_and_last_byte(diff)?;
+    let fence = "`".repeat(longest.max(2) + 1);
+    let mut out = BufWriter::new(
+        fs::File::create(temporary).with_context(|| format!("create {}", temporary.display()))?,
+    );
+    writeln!(out, "{text}{fence}diff")?;
+    io::copy(
+        &mut fs::File::open(diff).with_context(|| format!("open {}", diff.display()))?,
+        &mut out,
+    )?;
+    if last.is_some_and(|byte| byte != b'\n') {
+        out.write_all(b"\n")?;
+    }
+    writeln!(out, "{fence}")?;
+    out.into_inner()
+        .map_err(|error| error.into_error())?
+        .sync_all()
+        .with_context(|| format!("write {}", temporary.display()))
+}
+
+/// The longest run of backticks in the file and its last byte, read in chunks.
+fn backtick_run_and_last_byte(path: &Path) -> Result<(usize, Option<u8>)> {
+    let mut file = fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
+    let mut buffer = [0u8; 64 * 1024];
+    let (mut longest, mut run, mut last) = (0, 0, None);
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            return Ok((longest, last));
+        }
+        for &byte in &buffer[..read] {
+            run = if byte == b'`' { run + 1 } else { 0 };
+            longest = longest.max(run);
+        }
+        last = Some(buffer[read - 1]);
+    }
 }
 
 /// A fenced block whose fence is longer than any backtick run in `text`,
@@ -1567,7 +1626,6 @@ fn review_markdown(
     head: &str,
     log: &str,
     stat: &str,
-    diff: &str,
 ) -> String {
     let mut out = format!(
         "# Review of task {id}: {title}\n\n\
@@ -1637,10 +1695,9 @@ fn review_markdown(
     out.push_str(&format!(
         "\n## Commits\n\n`git log --oneline {base}..{head}`\n\n{log}\n\
          ## Diffstat\n\n`git diff --stat {base}...{head}`\n\n{stat}\n\
-         ## Diff\n\n`git diff {base}...{head}`\n\n{diff}",
+         ## Diff\n\n`git diff {base}...{head}`\n\n",
         log = fenced("", log),
         stat = fenced("", stat),
-        diff = fenced("diff", diff),
     ));
     out
 }

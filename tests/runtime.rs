@@ -2015,6 +2015,45 @@ fn review_writes_the_run_material_to_review_md_and_returns_only_its_size() {
     assert!(error.contains("task 1 (completed) has no run"), "{error}");
 }
 
+/// A run whose file is Latin-1 text with a backtick run and whose commit
+/// message is not UTF-8 still gets its review: Git's raw bytes go into
+/// review.md under a longer fence, and the commit list is read lossily.
+#[test]
+fn review_writes_a_non_utf8_diff_as_raw_bytes() {
+    let (_dir, db, detail) = run_agent(
+        r#"printf 'caf\351 ````\n' > latin1.txt && git add latin1.txt && git commit -q -m "$(printf 'caf\351')"; receipt "$(git rev-parse HEAD)""#,
+    );
+    let run = detail.runs[0].clone();
+    assert_eq!(run.status, RunStatus::AwaitingIntegration);
+    let outcome = runtime::review(&db, 1).unwrap();
+    assert_eq!(outcome["files_changed"], 1, "{outcome}");
+    assert_eq!(outcome["insertions"], 1, "{outcome}");
+    let run_dir = Path::new(run.run_dir.as_ref().unwrap());
+    let bytes = fs::read(run_dir.join("review.md")).unwrap();
+    assert!(String::from_utf8(bytes.clone()).is_err());
+    let text = String::from_utf8_lossy(&bytes);
+    let commits = &text[text.find("## Commits").unwrap()..text.find("## Diffstat").unwrap()];
+    // Git may re-encode the message on output; either way it is listed.
+    assert!(commits.contains(" caf"), "{commits}");
+    let diff_at = bytes.windows(8).position(|w| w == b"## Diff\n").unwrap();
+    let diff = &bytes[diff_at..];
+    let needle = b"+caf\xe9 ````\n";
+    assert!(diff.windows(needle.len()).any(|w| w == needle), "{text}");
+    assert!(
+        text[text.find("## Diff\n").unwrap()..]
+            .contains("`````diff\ndiff --git a/latin1.txt b/latin1.txt"),
+        "{text}"
+    );
+    assert!(diff.ends_with(b"\n`````\n"), "{text}");
+    // Only review.md is left in the run directory, no temporary file.
+    let leftovers: Vec<_> = fs::read_dir(run_dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .filter(|name| name.contains("review"))
+        .collect();
+    assert_eq!(leftovers, ["review.md"]);
+}
+
 #[test]
 fn conflict_free_run_lands_as_one_squash_commit_and_releases_dependents() {
     let (dir, repo, db, run) = awaiting_run();
