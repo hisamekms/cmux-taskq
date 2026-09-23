@@ -1,9 +1,10 @@
 //! `up` and `down`: the cold start and the stop of one queue's runtime. `up`
 //! makes sure a supervisor is resident (as a launchd LaunchAgent, restarted
-//! after any exit) and that the maintainer's Claude session has a cmux
-//! workspace, and reports what the maintainer should look at first. `down`
-//! unloads the agent so the supervisor drains and is not restarted. Both
-//! are idempotent: a second `up` reuses what the first one started.
+//! after any exit) and that the maintainer's, the inbox's and the planner's
+//! Claude sessions each have a cmux workspace, and reports what the
+//! maintainer should look at first. `down` unloads the agent so the
+//! supervisor drains and is not restarted. Both are idempotent: a second
+//! `up` reuses what the first one started.
 //!
 //! A launchd-started supervisor is not a child of a cmux terminal, and cmux
 //! admits such a process only by socket password. `up` therefore proves the
@@ -28,16 +29,16 @@ use crate::{
     domain::{RunStatus, SessionRole, SupervisorMode, SupervisorRegistration},
     infrastructure::{
         adapters::{
-            ClaudeCode, GitRepository, claude_trusts_repository, maintainer_workspace_name,
-            path_text, shell_join, supervisor_workspace_name, workspace_description,
-            workspace_group_name,
+            ClaudeCode, GitRepository, claude_trusts_repository, inbox_workspace_name,
+            maintainer_workspace_name, path_text, planner_workspace_name, shell_join,
+            supervisor_workspace_name, workspace_description, workspace_group_name,
         },
         launchd::LaunchAgentSpec,
         location::QueueLocation,
         runtime_store::HEARTBEAT_TIMEOUT_SECS,
         sqlite::SqliteQueue,
     },
-    runtime::{RecordingBackend, maintainer_prompt, unix_time},
+    runtime::{RecordingBackend, inbox_prompt, maintainer_prompt, planner_prompt, unix_time},
 };
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Value, json};
@@ -61,10 +62,10 @@ pub const MAINTAINER_ROLE: &str = SessionRole::Maintainer.as_str();
 /// `DAGQ_ROLE` of a run's workspace (and of the resume workspace of its run).
 pub const WORKER_ROLE: &str = SessionRole::Worker.as_str();
 /// `DAGQ_ROLE` of the session that talks with a person to register goals and
-/// tasks. `up` is to open it in a later goal; no workspace of it exists yet.
+/// tasks. `up` opens its workspace `[<repo>]planner` next to the maintainer's.
 pub const PLANNER_ROLE: &str = SessionRole::Planner.as_str();
-/// `DAGQ_ROLE` of the session where a person answers the maintainer's asks.
-/// `up` is to open it in a later goal; no workspace of it exists yet.
+/// `DAGQ_ROLE` of the session where a person answers the queue's asks. `up`
+/// opens its workspace `[<repo>]inbox` next to the maintainer's.
 pub const INBOX_ROLE: &str = SessionRole::Inbox.as_str();
 /// `DAGQ_ROLE` of the periodic observer job (ADR-0024 decision 4). The CLI
 /// refuses every command that changes queue state from this environment,
@@ -141,14 +142,14 @@ pub struct UpOptions {
     pub poll: Duration,
 }
 
-/// Ensure the supervisor and the maintainer workspace exist and report the
-/// queue's open work. Preflight first (cmux, claude, Claude Code's trust of
+/// Ensure the supervisor and the maintainer, inbox and planner workspaces
+/// exist and report the queue's open work. Preflight first (cmux, claude, Claude Code's trust of
 /// the repository root, an initialized queue, the repository), then prune registrations whose process is gone, start
 /// the agent only when no live registration of this binary's version
 /// remains (after proving that cmux admits a process with the agent's
 /// environment) — draining and replacing a live supervisor of any other
-/// version — and open the maintainer workspace only outside a maintainer
-/// session.
+/// version — and open each of the maintainer, inbox and planner workspaces
+/// only outside that session itself.
 pub fn up(
     location: &QueueLocation,
     repo: &Path,
@@ -263,41 +264,85 @@ pub fn up(
         )?,
     };
 
-    let name = maintainer_workspace_name(&repository.root);
-    let inside_maintainer = environment.role.as_deref() == Some(MAINTAINER_ROLE)
-        && environment
-            .queue
-            .as_deref()
-            .and_then(|queue| queue.canonicalize().ok())
-            .is_some_and(|queue| queue == db);
-    let maintainer = if inside_maintainer {
-        json!({"outcome": "skipped", "workspace_id": Value::Null, "name": name})
-    } else if let Some(id) = recorded_workspace(&queue, cmux, SessionRole::Maintainer)? {
-        json!({"outcome": "reused", "workspace_id": id, "name": name})
-    } else {
-        let command = maintainer_command(
-            &db,
-            &location.log_dir,
-            &options.claude,
-            plugin_dir.as_deref(),
-        )?;
-        let id = cmux.create_named(
-            &name,
-            &repository.root,
-            &command,
-            &workspaces.tags(SessionRole::Maintainer)?,
-        )?;
-        queue.register_session_workspace(SessionRole::Maintainer, &id)?;
-        json!({"outcome": "created", "workspace_id": id, "name": name})
+    let sessions = Sessions {
+        queue: &queue,
+        workspaces: &workspaces,
+        environment,
+        db: &db,
+        root: &repository.root,
     };
+    let maintainer = sessions.open(
+        SessionRole::Maintainer,
+        maintainer_workspace_name(&repository.root),
+        || {
+            maintainer_command(
+                &db,
+                &location.log_dir,
+                &options.claude,
+                plugin_dir.as_deref(),
+            )
+        },
+    )?;
+    let inbox = sessions.open(
+        SessionRole::Inbox,
+        inbox_workspace_name(&repository.root),
+        || inbox_command(&db, &options.claude, plugin_dir.as_deref()),
+    )?;
+    let planner = sessions.open(
+        SessionRole::Planner,
+        planner_workspace_name(&repository.root),
+        || planner_command(&db, &options.claude, plugin_dir.as_deref()),
+    )?;
 
     Ok(json!({
         "supervisor": supervisor,
         "maintainer": maintainer,
+        "inbox": inbox,
+        "planner": planner,
         "pruned_supervisors": pruned,
         "warnings": workspaces.warnings.take(),
         "doctor": open_work(&queue, processes)?,
     }))
+}
+
+/// The Claude sessions `up` keeps a workspace open for: the maintainer, the
+/// inbox and the planner (ADR-0022). Each is opened the same way: skipped
+/// when `up` runs inside that very session of this queue (its `DAGQ_ROLE`
+/// and `DAGQ_QUEUE`), reused while its recorded UUID is still listed, and
+/// otherwise created and recorded in `session_workspaces`.
+struct Sessions<'a> {
+    queue: &'a SqliteQueue,
+    workspaces: &'a QueueWorkspaces<'a>,
+    environment: &'a UpEnvironment,
+    db: &'a Path,
+    root: &'a Path,
+}
+
+impl Sessions<'_> {
+    fn open(
+        &self,
+        role: SessionRole,
+        name: String,
+        command: impl FnOnce() -> Result<String>,
+    ) -> Result<Value> {
+        let inside = self.environment.role.as_deref() == Some(role.as_str())
+            && self
+                .environment
+                .queue
+                .as_deref()
+                .and_then(|queue| queue.canonicalize().ok())
+                .is_some_and(|queue| queue == self.db);
+        if inside {
+            return Ok(json!({"outcome": "skipped", "workspace_id": Value::Null, "name": name}));
+        }
+        let cmux = self.workspaces.cmux;
+        if let Some(id) = recorded_workspace(self.queue, cmux, role)? {
+            return Ok(json!({"outcome": "reused", "workspace_id": id, "name": name}));
+        }
+        let id = cmux.create_named(&name, self.root, &command()?, &self.workspaces.tags(role)?)?;
+        self.queue.register_session_workspace(role, &id)?;
+        Ok(json!({"outcome": "created", "workspace_id": id, "name": name}))
+    }
 }
 
 /// `DAGQ_ROLE=<role>` and `DAGQ_QUEUE=<db>`: the environment every
@@ -875,13 +920,29 @@ pub fn maintainer_command(
     claude: &Path,
     plugin_dir: Option<&Path>,
 ) -> Result<String> {
+    session_command(claude, plugin_dir, maintainer_prompt(db, log_dir)?)
+}
+
+/// The inbox workspace's command: `claude` with `inbox_prompt`, the way the
+/// maintainer's is built.
+pub fn inbox_command(db: &Path, claude: &Path, plugin_dir: Option<&Path>) -> Result<String> {
+    session_command(claude, plugin_dir, inbox_prompt(db)?)
+}
+
+/// The planner workspace's command: `claude` with `planner_prompt`, the way
+/// the maintainer's is built.
+pub fn planner_command(db: &Path, claude: &Path, plugin_dir: Option<&Path>) -> Result<String> {
+    session_command(claude, plugin_dir, planner_prompt(db)?)
+}
+
+fn session_command(claude: &Path, plugin_dir: Option<&Path>, prompt: String) -> Result<String> {
     let mut argv = vec![path_text(claude)?];
     if let Some(dir) = plugin_dir {
         argv.push("--plugin-dir".into());
         argv.push(path_text(dir)?);
     }
     argv.push("--".into());
-    argv.push(maintainer_prompt(db, log_dir)?);
+    argv.push(prompt);
     Ok(shell_join(&argv))
 }
 
@@ -944,8 +1005,8 @@ pub struct DownOptions {
 /// kill under `--force`, or straight away when it had already exited.
 /// Closing it earlier would cut the drain short, so the default (which
 /// returns while the supervisor drains) leaves it open and says so; the
-/// maintainer closes it or runs `down --wait`. The maintainer workspace is
-/// never touched.
+/// maintainer closes it or runs `down --wait`. The maintainer, inbox and
+/// planner workspaces are never touched.
 pub fn down(
     location: &QueueLocation,
     cmux: &dyn WorkspaceBackend,

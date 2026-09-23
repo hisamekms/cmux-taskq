@@ -31,15 +31,15 @@ dagqは、依存関係を持つ開発タスクをSQLiteで管理し、着手可�
 
 ## 用語集
 
-役割は3つで、名前は[ADR-0010](../adr/0010-maintainer-and-resident-supervisor.md)で統一した。後続goalで`up`が開く予定のplannerとinboxを加えた5つが`DAGQ_ROLE`の値で、cmux workspaceのtitleは`[<repo>]<role>`（workerは`[<repo>]worker#<task-id> - <task title>`、[ADR-0028](../adr/0028-workspace-titles-are-repo-and-role.md)）。
+役割は3つで、名前は[ADR-0010](../adr/0010-maintainer-and-resident-supervisor.md)で統一した。`up`がmaintainerと並べて開くplannerとinboxを加えた5つが`DAGQ_ROLE`の値で、cmux workspaceのtitleは`[<repo>]<role>`（workerは`[<repo>]worker#<task-id> - <task title>`、[ADR-0028](../adr/0028-workspace-titles-are-repo-and-role.md)）。
 
 | 用語 | 指すもの | 旧称 |
 | --- | --- | --- |
 | **supervisor** | runtimeの`dagq supervise`プロセス。依存が解けたtaskをclaimし、runごとにworktreeとcmux workspaceを作ってworkerを起動し、receiptを検証してworkspaceを閉じる（[ADR-0003](../adr/0003-supervisor-owns-lifecycle.md)、[ADR-0007](../adr/0007-run-level-leases-parallel-execution.md)）。ADR-0010以降はlaunchdのLaunchAgentとして常駐する予定（T2で実装）。 | （変更なし） |
 | **maintainer** | 1 repositoryに1つ常駐する対話モードのClaude Code session。taskの登録、runの監視と権限確認・質問への応答、差分と証跡のレビュー、`integrate`の呼び出し、`doctor`/`recover`、`push_failed`のときの手動pushを行う（pushそのものは`integrate`が行う）。`needs_session`のrunはsupervisorがresumeして解消させ（[ADR-0019](../adr/0019-move-routine-maintainer-work-into-the-runtime.md)）、maintainerは3回で解消しなかったrunだけを人に返す。人が同じ操作をしてもよい。 | "SV"（supervisorの略。旧称）、operator（designとcodeでこの役割を指していたもの）、main session（[ADR-0003](../adr/0003-supervisor-owns-lifecycle.md)） |
 | **worker** | runごとにsupervisorが起動するClaude（将来はCodex）のsession。割り当てられたworktreeの中だけで作業し、commitしてreceiptを書く。 | agent session、run session |
-| **planner** | 人と対話してgoal / taskを登録するsession（[ADR-0022](../adr/0022-ask-answer-inbox-planner-and-landing-on-doubt.md)）。後続goalで`up`が`[<repo>]planner`に開く。いまは名前とrole値の定義だけ。 | （新設） |
-| **inbox** | 人がmaintainerからのaskに答えるsession（[ADR-0022](../adr/0022-ask-answer-inbox-planner-and-landing-on-doubt.md)）。後続goalで`up`が`[<repo>]inbox`に開く。いまは名前とrole値の定義だけ。 | （新設） |
+| **planner** | 人と対話してgoal / taskを登録するsession（[ADR-0022](../adr/0022-ask-answer-inbox-planner-and-landing-on-doubt.md)）。`up`が`[<repo>]planner`のworkspaceに`planner_prompt`付きで開く。 | （新設） |
+| **inbox** | 人がqueueのask（maintainerとworkerの質問）に答えるsession（[ADR-0022](../adr/0022-ask-answer-inbox-planner-and-landing-on-doubt.md)）。`up`が`[<repo>]inbox`のworkspaceに`inbox_prompt`付きで開く。 | （新設） |
 
 既存のADR（0001〜0009）とjournalは書き換えないので、そこに残る旧称はこの表で読み替える。runtimeのCLI名（`supervise`）と`supervisors`表は変えない。
 

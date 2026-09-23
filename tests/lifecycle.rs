@@ -17,10 +17,10 @@ use dagq::{
         sqlite::SqliteQueue,
     },
     lifecycle::{
-        self, DownOptions, MAINTAINER_ROLE, QUEUE_ENV, ROLE_ENV, UpEnvironment, UpOptions,
-        maintainer_command,
+        self, DownOptions, INBOX_ROLE, MAINTAINER_ROLE, PLANNER_ROLE, QUEUE_ENV, ROLE_ENV,
+        UpEnvironment, UpOptions, inbox_command, maintainer_command, planner_command,
     },
-    runtime::maintainer_prompt,
+    runtime::{inbox_prompt, maintainer_prompt, planner_prompt},
 };
 use rusqlite::Connection;
 use serde_json::{Value, json};
@@ -563,7 +563,7 @@ fn up_starts_the_agent_and_the_maintainer_once_and_reuses_them_after() {
     // the workspace's own environment (not a prefix of the command), the
     // plugin directory and the prompt on the command, and the queue's group.
     let workspaces = cmux.workspaces.lock().unwrap();
-    assert_eq!(workspaces.len(), 1);
+    assert_eq!(workspaces.len(), 3);
     let (name, cwd, id, command) = &workspaces[0];
     assert_eq!(name, "[my repo]maintainer");
     assert_eq!(cwd, &root);
@@ -598,6 +598,45 @@ fn up_starts_the_agent_and_the_maintainer_once_and_reuses_them_after() {
     );
     assert!(command.contains("'--plugin-dir'"));
     assert!(command.contains("You are the maintainer of"));
+
+    // The inbox and the planner open the same way, each with its own role,
+    // title, prompt and recorded UUID, in the same group.
+    let queue = SqliteQueue::open(&fixture.location.db).unwrap();
+    let tags = cmux.tags.lock().unwrap();
+    for (index, (key, role, opening)) in [
+        ("inbox", SessionRole::Inbox, "You are the inbox of"),
+        ("planner", SessionRole::Planner, "You are the planner of"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let (name, cwd, id, command) = &workspaces[index + 1];
+        assert_eq!(name, &format!("[my repo]{key}"));
+        assert_eq!(cwd, &root);
+        assert_eq!(
+            first[key],
+            json!({"outcome": "created", "workspace_id": id, "name": name})
+        );
+        assert!(command.contains("'--plugin-dir'"), "{command}");
+        assert!(command.contains(opening), "{command}");
+        assert!(!command.contains("DAGQ_"), "{command}");
+        assert_eq!(
+            tags[index + 1],
+            WorkspaceTags {
+                env: vec![
+                    ("DAGQ_ROLE".into(), key.into()),
+                    ("DAGQ_QUEUE".into(), db.to_str().unwrap().into()),
+                ],
+                description: Some(format!("dagq role={key} queue={hash}")),
+                group: Some(format!("group-{hash}")),
+            }
+        );
+        assert_eq!(
+            queue.session_workspace(role).unwrap().as_deref(),
+            Some(id.as_str())
+        );
+    }
+    drop(tags);
     drop(workspaces);
 
     // A person renames the maintainer workspace; it is still the one.
@@ -612,10 +651,15 @@ fn up_starts_the_agent_and_the_maintainer_once_and_reuses_them_after() {
         second["maintainer"]["workspace_id"],
         first["maintainer"]["workspace_id"]
     );
+    for key in ["inbox", "planner"] {
+        assert_eq!(second[key]["outcome"], "reused", "{second}");
+        assert_eq!(second[key]["workspace_id"], first[key]["workspace_id"]);
+        assert_eq!(second[key]["name"], first[key]["name"]);
+    }
     assert_eq!(second["pruned_supervisors"], json!([]));
     assert_eq!(launchd.installs.lock().unwrap().len(), 1);
     assert!(launchd.uninstalls.lock().unwrap().is_empty());
-    assert_eq!(cmux.workspaces.lock().unwrap().len(), 1);
+    assert_eq!(cmux.workspaces.lock().unwrap().len(), 3);
     // Reusing everything asks for no group.
     assert_eq!(cmux.groups.lock().unwrap().len(), 1);
     // A reused supervisor already reaches cmux; nothing is proved again.
@@ -1312,8 +1356,9 @@ fn up_reports_runs_that_wait_for_the_maintainer() {
     );
 }
 
-/// Inside the maintainer session of this queue `up` opens no workspace
-/// and does not even ask cmux; inside one of another queue it does.
+/// Inside the maintainer session of this queue `up` opens no maintainer
+/// workspace and does not ask cmux about one; inside one of another queue
+/// it does. The inbox and the planner are still opened from there.
 #[test]
 fn up_skips_the_maintainer_workspace_inside_a_maintainer_session_of_the_same_queue() {
     let mut fixture = fixture();
@@ -1328,19 +1373,163 @@ fn up_skips_the_maintainer_workspace_inside_a_maintainer_session_of_the_same_que
         report["maintainer"],
         json!({"outcome": "skipped", "workspace_id": null, "name": "[my repo]maintainer"})
     );
-    assert_eq!(cmux.calls.load(Ordering::SeqCst), 0);
-    assert!(cmux.workspaces.lock().unwrap().is_empty());
+    assert_eq!(report["inbox"]["outcome"], "created", "{report}");
+    assert_eq!(report["planner"]["outcome"], "created", "{report}");
+    let names: Vec<String> = cmux
+        .workspaces
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|workspace| workspace.0.clone())
+        .collect();
+    assert_eq!(names, ["[my repo]inbox", "[my repo]planner"]);
+    assert_eq!(
+        SqliteQueue::open(&fixture.location.db)
+            .unwrap()
+            .session_workspace(SessionRole::Maintainer)
+            .unwrap(),
+        None
+    );
 
     // The same role for another queue: this queue still needs its maintainer.
     fixture.environment.queue = Some(fixture._dir.path().join("elsewhere.db"));
     let report = up(&fixture, &cmux, &launchd, &processes);
     assert_eq!(report["maintainer"]["outcome"], "created", "{report}");
-    assert_eq!(cmux.workspaces.lock().unwrap().len(), 1);
+    assert_eq!(report["inbox"]["outcome"], "reused", "{report}");
+    assert_eq!(cmux.workspaces.lock().unwrap().len(), 3);
     // The role alone, without a queue, does not count either.
     let cmux = FakeCmux::default();
     fixture.environment.queue = None;
     let report = up(&fixture, &cmux, &launchd, &processes);
     assert_eq!(report["maintainer"]["outcome"], "created", "{report}");
+}
+
+/// Inside the inbox or the planner session of this queue, `up` skips that
+/// one workspace and still opens (or reuses) the others; the role of a
+/// session of another queue does not count.
+#[test]
+fn up_skips_the_inbox_and_the_planner_inside_their_own_sessions() {
+    for (role, key, other) in [
+        (INBOX_ROLE, "inbox", "planner"),
+        (PLANNER_ROLE, "planner", "inbox"),
+    ] {
+        let mut fixture = fixture();
+        fixture.environment.role = Some(role.into());
+        fixture.environment.queue = Some(fixture.location.db.clone());
+        let cmux = FakeCmux::default();
+        let launchd = FakeLaunchd::new(&fixture.location.db);
+        let processes = FakeProcesses::default();
+        let report = up(&fixture, &cmux, &launchd, &processes);
+        assert_eq!(
+            report[key],
+            json!({"outcome": "skipped", "workspace_id": null, "name": format!("[my repo]{key}")})
+        );
+        assert_eq!(report["maintainer"]["outcome"], "created", "{report}");
+        assert_eq!(report[other]["outcome"], "created", "{report}");
+        let queue = SqliteQueue::open(&fixture.location.db).unwrap();
+        let session_role = |name: &str| match name {
+            "inbox" => SessionRole::Inbox,
+            _ => SessionRole::Planner,
+        };
+        assert_eq!(queue.session_workspace(session_role(key)).unwrap(), None);
+        assert!(
+            queue
+                .session_workspace(session_role(other))
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            cmux.workspaces
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|workspace| workspace.0 != format!("[my repo]{key}"))
+        );
+
+        // A second `up` from the same session reuses the others and still
+        // skips its own.
+        let second = up(&fixture, &cmux, &launchd, &processes);
+        assert_eq!(second[key]["outcome"], "skipped", "{second}");
+        assert_eq!(second[other]["outcome"], "reused", "{second}");
+        assert_eq!(second["maintainer"]["outcome"], "reused", "{second}");
+        assert_eq!(cmux.workspaces.lock().unwrap().len(), 2);
+
+        // From a session of that role in another queue, this queue's
+        // workspace is opened.
+        fixture.environment.queue = Some(fixture._dir.path().join("elsewhere.db"));
+        let third = up(&fixture, &cmux, &launchd, &processes);
+        assert_eq!(third[key]["outcome"], "created", "{third}");
+        assert_eq!(cmux.workspaces.lock().unwrap().len(), 3);
+    }
+}
+
+/// An inbox or planner workspace that was closed is forgotten and opened
+/// again under a new UUID, and `down` closes none of the three sessions'
+/// workspaces, only the supervisor's.
+#[test]
+fn up_reopens_a_closed_inbox_and_down_leaves_the_sessions_open() {
+    let mut fixture = fixture();
+    fixture.options.in_cmux = true;
+    let cmux = FakeCmux {
+        registers_supervisor_in: Some(fixture.location.db.clone()),
+        ..FakeCmux::default()
+    };
+    let launchd = FakeLaunchd::new(&fixture.location.db);
+    let processes = FakeProcesses::default();
+    let first = up(&fixture, &cmux, &launchd, &processes);
+    let inbox = first["inbox"]["workspace_id"].as_str().unwrap().to_owned();
+    cmux.close(&inbox).unwrap();
+
+    let second = up(&fixture, &cmux, &launchd, &processes);
+    assert_eq!(second["inbox"]["outcome"], "created", "{second}");
+    assert_eq!(second["planner"]["outcome"], "reused", "{second}");
+    let reopened = second["inbox"]["workspace_id"].as_str().unwrap();
+    assert_ne!(reopened, inbox);
+    let queue = SqliteQueue::open(&fixture.location.db).unwrap();
+    assert_eq!(
+        queue
+            .session_workspace(SessionRole::Inbox)
+            .unwrap()
+            .as_deref(),
+        Some(reopened)
+    );
+
+    // The supervisor is gone; `down` closes its workspace and nothing else.
+    processes
+        .dead
+        .lock()
+        .unwrap()
+        .insert(first["supervisor"]["pid"].as_u64().unwrap() as u32);
+    let report = down(&fixture, &cmux, &launchd, &processes, false, false);
+    assert_eq!(report["outcome"], "not_running", "{report}");
+    assert_eq!(
+        cmux.closed.lock().unwrap().as_slice(),
+        [
+            inbox,
+            first["supervisor"]["workspace_id"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        ]
+    );
+    let names: Vec<String> = cmux
+        .workspaces
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|workspace| workspace.0.clone())
+        .collect();
+    assert_eq!(
+        names,
+        ["[my repo]maintainer", "[my repo]planner", "[my repo]inbox"]
+    );
+    for role in [
+        SessionRole::Maintainer,
+        SessionRole::Inbox,
+        SessionRole::Planner,
+    ] {
+        assert!(queue.session_workspace(role).unwrap().is_some(), "{role:?}");
+    }
 }
 
 /// The recorded maintainer workspace is the one `up` reuses, whatever it
@@ -1572,7 +1761,7 @@ fn up_in_cmux_starts_the_supervisor_in_a_workspace_and_leaves_launchd_alone() {
     // The supervisor workspace runs this binary's `supervise` on this
     // queue from the repository root, with the queue's log directory.
     let workspaces = cmux.workspaces.lock().unwrap();
-    assert_eq!(workspaces.len(), 2, "{workspaces:?}");
+    assert_eq!(workspaces.len(), 4, "{workspaces:?}");
     let (name, cwd, id, command) = &workspaces[0];
     assert_eq!(name, "[my repo]supervisor");
     assert_eq!(cwd, &root);
@@ -1593,6 +1782,8 @@ fn up_in_cmux_starts_the_supervisor_in_a_workspace_and_leaves_launchd_alone() {
     // into a login shell, so every argument is quoted on its own.
     assert!(command.contains(r#"queue'"'"'s dir"#), "{command}");
     assert_eq!(workspaces[1].0, "[my repo]maintainer");
+    assert_eq!(workspaces[2].0, "[my repo]inbox");
+    assert_eq!(workspaces[3].0, "[my repo]planner");
     let tags = cmux.tags.lock().unwrap();
     assert_eq!(
         tags[0].env,
@@ -1606,9 +1797,9 @@ fn up_in_cmux_starts_the_supervisor_in_a_workspace_and_leaves_launchd_alone() {
         tags[0].description.as_deref(),
         Some(format!("dagq role=supervisor queue={hash}").as_str())
     );
-    // Both workspaces join the one group, asked for once.
+    // Every workspace joins the one group, asked for once.
     assert_eq!(tags[0].group, Some(format!("group-{hash}")));
-    assert_eq!(tags[1].group, tags[0].group);
+    assert!(tags.iter().all(|tag| tag.group == tags[0].group));
     assert_eq!(cmux.groups.lock().unwrap().len(), 1);
     drop(tags);
     assert_eq!(
@@ -1655,7 +1846,9 @@ fn up_in_cmux_starts_the_supervisor_in_a_workspace_and_leaves_launchd_alone() {
         first["supervisor"]["workspace_id"]
     );
     assert_eq!(second["maintainer"]["outcome"], "reused", "{second}");
-    assert_eq!(cmux.workspaces.lock().unwrap().len(), 2);
+    assert_eq!(second["inbox"]["outcome"], "reused", "{second}");
+    assert_eq!(second["planner"]["outcome"], "reused", "{second}");
+    assert_eq!(cmux.workspaces.lock().unwrap().len(), 4);
     assert!(launchd.installs.lock().unwrap().is_empty());
 }
 
@@ -2264,6 +2457,55 @@ fn maintainer_prompt_names_the_queue_the_logs_the_skill_and_the_rules() {
     .unwrap();
     assert!(!bare.contains("--plugin-dir"));
     assert!(bare.contains("'/opt/claude' '--' 'You are the maintainer of"));
+}
+
+#[test]
+fn inbox_and_planner_prompts_name_the_queue_and_their_one_job() {
+    let db = Path::new("/data/q/queue.db");
+    let inbox = inbox_prompt(db).unwrap();
+    assert!(inbox.starts_with("You are the inbox of the dagq queue at /data/q/queue.db:"));
+    assert!(inbox.lines().count() <= 5, "{inbox}");
+    assert!(inbox.contains("never decide anything yourself"));
+    assert!(inbox.contains("Start with `dagq status --role inbox`"));
+    assert!(inbox.contains("`dagq watch --role inbox --after <cursor>` in the background"));
+    assert!(inbox.contains("watch again from the cursor it returns"));
+    assert!(inbox.contains("On ask_opened, read the ask with `dagq asks --open --role inbox`"));
+    assert!(inbox.contains("show the person its question and options"));
+    assert!(inbox.contains("AskUserQuestion"));
+    assert!(inbox.contains("`dagq answer ID --text '<answer>'`"));
+    assert!(inbox.contains("Never open the queue database directly"));
+
+    let planner = planner_prompt(db).unwrap();
+    assert!(planner.starts_with("You are the planner of the dagq queue at /data/q/queue.db:"));
+    assert!(planner.lines().count() <= 5, "{planner}");
+    assert!(planner.contains("the person's problems"));
+    assert!(planner.contains("dagq skill"));
+    assert!(planner.contains("make the tasks ready"));
+    assert!(planner.contains("check their receipts against the goal's acceptance"));
+    assert!(planner.contains("`dagq goal close ID --verdict achieved`"));
+    // Observer notes and draft goals are a later goal's; until then the
+    // prompt says nothing about them.
+    assert!(!planner.contains("note"), "{planner}");
+    assert!(!planner.contains("draft"), "{planner}");
+
+    for (command, opening) in [
+        (
+            inbox_command(db, Path::new("/opt/claude"), Some(Path::new("/p"))).unwrap(),
+            "You are the inbox of",
+        ),
+        (
+            planner_command(db, Path::new("/opt/claude"), None).unwrap(),
+            "You are the planner of",
+        ),
+    ] {
+        assert!(command.starts_with("'/opt/claude' '"), "{command}");
+        assert!(command.contains(&format!("'--' '{opening}")), "{command}");
+    }
+    assert!(
+        inbox_command(db, Path::new("/opt/claude"), Some(Path::new("/p")))
+            .unwrap()
+            .contains("'--plugin-dir' '/p'")
+    );
 }
 
 /// A live supervisor of another build is not reused: `up` unloads its

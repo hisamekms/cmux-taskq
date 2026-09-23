@@ -82,4 +82,4 @@ Leave that run alone until its answer arrives as an `ask_answered` from your `wa
 "$DAGQ" down --force    # kill it now; only with the user's consent
 ```
 
-Use `--wait` before replacing the binary or shutting down, and send `/exit` to any run whose exit request timed out first (`dagq-session`), since the drain waits for it. `down` never closes the maintainer workspace or the workers' sessions. `${CLAUDE_PLUGIN_ROOT}/skills/dagq-maintain/reference/up-down.md` has the outcomes, the in-cmux case and where the logs are.
+Use `--wait` before replacing the binary or shutting down, and send `/exit` to any run whose exit request timed out first (`dagq-session`), since the drain waits for it. `down` never closes the maintainer, inbox or planner workspaces or the workers' sessions. `${CLAUDE_PLUGIN_ROOT}/skills/dagq-maintain/reference/up-down.md` has the outcomes, the in-cmux case and where the logs are.

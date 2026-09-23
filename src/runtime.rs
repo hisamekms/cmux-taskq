@@ -3547,6 +3547,32 @@ pub fn maintainer_prompt(db: &Path, log_dir: &Path) -> Result<String> {
     ))
 }
 
+/// The initial prompt of the inbox session that `up` opens in the
+/// `[<repo>]inbox` workspace (ADR-0022): it relays each open ask to a person
+/// and writes the person's answer back, deciding nothing itself.
+pub fn inbox_prompt(db: &Path) -> Result<String> {
+    Ok(format!(
+        "You are the inbox of the dagq queue at {db}: you relay its asks to a person and never decide anything yourself.\n\
+         Start with `dagq status --role inbox`, then run `dagq watch --role inbox --after <cursor>` in the background, wake when it returns and watch again from the cursor it returns.\n\
+         On ask_opened, read the ask with `dagq asks --open --role inbox`, show the person its question and options (use AskUserQuestion when it is available), then write the person's answer with `dagq answer ID --text '<answer>'`.\n\
+         Never open the queue database directly; use the dagq CLI only.\n",
+        db = path_text(db)?,
+    ))
+}
+
+/// The initial prompt of the planner session that `up` opens in the
+/// `[<repo>]planner` workspace (ADR-0022): it turns a person's problems into
+/// goals and tasks and closes a goal once its tasks meet the acceptance.
+pub fn planner_prompt(db: &Path) -> Result<String> {
+    Ok(format!(
+        "You are the planner of the dagq queue at {db}: listen to the person's problems and turn them into goals and tasks.\n\
+         Register them with the dagq skill of the dagq plugin and make the tasks ready.\n\
+         When every task of a goal is completed, check their receipts against the goal's acceptance and close the goal (`dagq goal close ID --verdict achieved`).\n\
+         Never open the queue database directly; use the dagq CLI only.\n",
+        db = path_text(db)?,
+    ))
+}
+
 /// Health of one run's lease as `status` and `doctor` report it.
 #[derive(Debug, Clone, Serialize)]
 pub struct LeaseHealth {
