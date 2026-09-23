@@ -20,6 +20,7 @@ fn new_task(title: &str) -> NewTask {
         description: "A small development task".into(),
         acceptance: "The regression test passes".into(),
         verification_commands: vec!["cargo test".into()],
+        required_evidence: Vec::new(),
         dependencies: vec![],
         goal_id: None,
         context: String::new(),
@@ -889,10 +890,10 @@ fn migration_from_v6_adds_goals_and_keeps_tasks_runs_and_events() {
     let mut queue = SqliteQueue::open(&path).unwrap();
     // 0007 (supervisors), 0008 (goals), 0009 (supervisor mode), 0010
     // (supervisor binary version), 0011 (session workspaces), 0012
-    // (queue-level backend failures), 0013 (goal draft) and 0014 (asks) are
-    // applied together.
-    assert_eq!(SqliteQueue::SCHEMA_VERSION, 14);
-    assert_eq!(queue.schema_version().unwrap(), 14);
+    // (queue-level backend failures), 0013 (goal draft), 0014 (asks) and
+    // 0015 (required evidence) are applied together.
+    assert_eq!(SqliteQueue::SCHEMA_VERSION, 15);
+    assert_eq!(queue.schema_version().unwrap(), 15);
     assert_eq!(
         queue
             .session_workspace(dagq::domain::SessionRole::Maintainer)
@@ -999,6 +1000,8 @@ fn goals_of_a_version_12_queue_migrate_as_open() {
     drop(raw);
     let mut queue = SqliteQueue::open(&path).unwrap();
     assert_eq!(queue.schema_version().unwrap(), SqliteQueue::SCHEMA_VERSION);
+    // 0015: an existing task requires no evidence.
+    assert!(queue.show(1).unwrap().task.required_evidence.is_empty());
     let goal = queue.show_goal(1).unwrap().goal;
     assert_eq!(goal.status, GoalStatus::Open);
     assert_eq!(queue.list_goals().unwrap()[0].status, GoalStatus::Open);

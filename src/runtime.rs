@@ -10,10 +10,10 @@ use crate::{
         WorkspaceTags, dependency_graph,
     },
     domain::{
-        ClaimOutcome, Goal, IntegrationOutcome, MAX_RESUME_ATTEMPTS, NewTask, PUSH_REMOTE,
-        Predecessor, PushReport, PushResult, Receipt, ReceiptResult, RegisteredFollowUp, RunLease,
-        RunPaths, RunProcess, RunStatus, SessionRole, SupervisorMode, SupervisorRegistration, Task,
-        TaskRun, heartbeat_stale,
+        ClaimOutcome, EvidenceCheck, Goal, IntegrationOutcome, MAX_RESUME_ATTEMPTS, NewTask,
+        PUSH_REMOTE, Predecessor, PushReport, PushResult, Receipt, ReceiptResult,
+        RegisteredFollowUp, RunLease, RunPaths, RunProcess, RunStatus, SessionRole, SupervisorMode,
+        SupervisorRegistration, Task, TaskRun, evidence_missing_reason, heartbeat_stale,
     },
     infrastructure::{
         adapters::{
@@ -914,8 +914,13 @@ impl Supervisor<'_> {
                 let run = self
                     .queue
                     .finish_validation(&slot.run.id, &self.token, &validation)?;
-                // Only an accepted run gives up its workspace; failures keep it for inspection.
-                let run = if run.status == RunStatus::AwaitingIntegration {
+                // An accepted run gives up its workspace, and so does one
+                // parked for evidence: its session ended, and a resume opens
+                // a workspace of its own. Failures keep it for inspection.
+                let run = if matches!(
+                    run.status,
+                    RunStatus::AwaitingIntegration | RunStatus::NeedsSession
+                ) {
                     close_workspace(&mut self.queue, self.cmux, &self.token, &run, &self.log)?
                 } else {
                     run
@@ -1068,6 +1073,7 @@ impl Supervisor<'_> {
             agent_seen: None,
             message_sent: None,
             exit_requested: None,
+            required_evidence: task.required_evidence.clone(),
         })
     }
 
@@ -1847,7 +1853,8 @@ struct ResumeRequest {
 /// `integration_deferred` / `integration_error` / `evidence_missing` event
 /// (a runtime error since, such as a failed resume, may have replaced
 /// `last_error`), else `last_error`; and whether that event was
-/// `evidence_missing`.
+/// `evidence_missing` (or a landing deferred for missing evidence, whose
+/// payload names the `checks`).
 fn resume_reason(queue: &SqliteQueue, run: &TaskRun) -> Result<(Option<String>, bool)> {
     let events = queue.run_events(&run.id)?;
     let parked = events.iter().rev().find(|e| {
@@ -1860,7 +1867,9 @@ fn resume_reason(queue: &SqliteQueue, run: &TaskRun) -> Result<(Option<String>, 
         .and_then(|e| e.payload.get("reason").and_then(Value::as_str))
         .map(str::to_owned)
         .or_else(|| run.last_error.clone());
-    Ok((reason, parked.is_some_and(|e| e.kind == "evidence_missing")))
+    let evidence =
+        parked.is_some_and(|e| e.kind == "evidence_missing" || e.payload.get("checks").is_some());
+    Ok((reason, evidence))
 }
 
 /// The tasks landed on `main` since the run's base, oldest first, from the
@@ -1978,6 +1987,9 @@ struct ResumeWatch {
     /// idle marker of the response to it).
     message_sent: Option<(Instant, SystemTime)>,
     exit_requested: Option<Instant>,
+    /// The task's required checks: a rewritten receipt still without them
+    /// has not resolved the run.
+    required_evidence: Vec<EvidenceCheck>,
 }
 
 /// What a resumed session left behind when it exited.
@@ -2028,7 +2040,8 @@ impl ResumeWatch {
                 format!("session reported the run as failed: {}", receipt.summary),
             ),
             Some(receipt)
-                if head.is_some_and(|head| head == receipt.commit.to_ascii_lowercase()) =>
+                if head.is_some_and(|head| head == receipt.commit.to_ascii_lowercase())
+                    && receipt.missing_evidence(&self.required_evidence).is_empty() =>
             {
                 ResumeOutcome::Resolved
             }
@@ -2228,6 +2241,7 @@ fn spawn_validation(
                 result_commit: Some(commit),
                 reason: None,
                 receipt: serde_json::to_value(receipt)?,
+                evidence_missing: Vec::new(),
             },
             Err(rejection) => {
                 log.note(&format!("run {} rejected: {}", run.id, rejection.reason));
@@ -2240,6 +2254,7 @@ fn spawn_validation(
                         .map(serde_json::to_value)
                         .transpose()?
                         .unwrap_or(Value::Null),
+                    evidence_missing: rejection.evidence_missing,
                 }
             }
         })
@@ -2271,6 +2286,9 @@ struct Rejection {
     reason: String,
     commit: Option<String>,
     receipt: Option<Receipt>,
+    /// The task's required checks the receipt does not back, when that is
+    /// all that is wrong: the run waits for a session instead of failing.
+    evidence_missing: Vec<EvidenceCheck>,
 }
 
 fn check_receipt(
@@ -2285,6 +2303,7 @@ fn check_receipt(
             reason,
             commit,
             receipt,
+            evidence_missing: Vec::new(),
         }))
     };
     let receipt_path = Path::new(run.receipt_path.as_ref().context("missing receipt path")?);
@@ -2303,7 +2322,7 @@ fn check_receipt(
         Ok(receipt) => receipt,
         Err(error) => return reject(format!("{error:#}"), None, None),
     };
-    if let Err(error) = receipt.check(&run.id) {
+    if let Err(error) = receipt.check_requiring(&run.id, &task.required_evidence) {
         return reject(format!("{error:#}"), None, Some(receipt));
     }
     // The commit must be the head of the run branch, checked out in the worktree,
@@ -2395,6 +2414,17 @@ fn check_receipt(
                 Some(receipt),
             );
         }
+    }
+    // Checked last: only a run that is otherwise sound waits for a session
+    // to add the evidence (ADR-0019 decision 5).
+    let missing = receipt.missing_evidence(&task.required_evidence);
+    if !missing.is_empty() {
+        return Ok(Err(Rejection {
+            reason: evidence_missing_reason(&missing),
+            commit: Some(commit),
+            receipt: Some(receipt),
+            evidence_missing: missing,
+        }));
     }
     Ok(Ok((receipt, commit)))
 }
@@ -2559,7 +2589,7 @@ fn land_integrating(
             let push = push_main(queue, remote, &run.id, &landing.commit);
             let follow_ups = register_follow_ups(queue, &task, &run.id, proposed.as_ref());
             IntegrationOutcome::Integrated {
-                task,
+                task: Box::new(task),
                 run: Box::new(run),
                 verification_skipped,
                 push: Box::new(push),
@@ -2733,6 +2763,7 @@ pub fn register_follow_ups(
             description: description.unwrap_or_default().to_owned(),
             acceptance: String::new(),
             verification_commands: Vec::new(),
+            required_evidence: Vec::new(),
             dependencies: Vec::new(),
             goal_id: task.goal_id.filter(|_| !goal_closed),
             context: format!(
@@ -2846,8 +2877,17 @@ fn land(
             receipt: serde_json::to_value(&receipt)?,
         });
     }
-    if let Err(error) = receipt.check(&run.id) {
+    if let Err(error) = receipt.check_requiring(&run.id, &task.required_evidence) {
         return defer(format!("{error:#}"), json!({}));
+    }
+    // A resumed session may have come back without the evidence it was
+    // asked for; `checks` tells the next resume to ask for it again.
+    let missing = receipt.missing_evidence(&task.required_evidence);
+    if !missing.is_empty() {
+        return defer(
+            evidence_missing_reason(&missing),
+            json!({"checks": missing}),
+        );
     }
     // The receipt read here is the one that lands (or the one a session
     // rewrote after resolving), so it is recorded whatever happens next: the
@@ -3443,6 +3483,16 @@ pub fn prompt(
         }
         text
     };
+    // Known up front, so the receipt carries it (ADR-0019 decision 5).
+    let evidence = if task.required_evidence.is_empty() {
+        String::new()
+    } else {
+        let names: Vec<&str> = task.required_evidence.iter().map(|c| c.as_str()).collect();
+        format!(
+            "Required evidence: {} (each must be passed with evidence in the receipt, or the run waits for a session to add it)\n",
+            names.join(", ")
+        )
+    };
     Ok(format!(
         "You are executing dagq task {task_id}, run {run_id}.\n\
          Work only in the assigned Git worktree.\n\
@@ -3452,7 +3502,7 @@ pub fn prompt(
          Perform applicable unit tests, E2E, and subagent review. Record evidence or an explicit reason when not applicable.\n\
          Task title: {title}\nDescription:\n{description}\nAcceptance criteria:\n{acceptance}\n\
          Verification commands (run in the worktree):\n{verification}\n\
-         {goal}{context}{predecessors}{siblings}\
+         {evidence}{goal}{context}{predecessors}{siblings}\
          Your assignment is this task only. Do not change what a sibling task owns; if you find work outside this task, record it in the receipt as follow_ups instead of doing it.\n\
          Write a completion receipt to {receipt} using a temporary file in the same directory and atomic rename.\n\
          Receipt JSON: {{\"run_id\":\"{run_id}\",\"result\":\"succeeded or failed\",\"commit\":\"full Git SHA of the branch head\",\"tests\":{{\"status\":\"passed, failed or not_applicable\",\"evidence_or_reason\":\"...\"}},\"e2e\":{{\"status\":\"...\",\"evidence_or_reason\":\"...\"}},\"subagent_review\":{{\"status\":\"...\",\"evidence_or_reason\":\"...\"}},\"summary\":\"...\",\"follow_ups\":[{{\"title\":\"...\",\"description\":\"...\"}}]}}\n\

@@ -179,6 +179,7 @@ mod tests {
             description: description.into(),
             acceptance: "short".into(),
             verification_commands: vec!["true".into()],
+            required_evidence: Vec::new(),
             status: TaskStatus::InProgress,
             goal_id: None,
             context: String::new(),

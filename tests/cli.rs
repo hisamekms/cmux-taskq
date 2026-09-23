@@ -1429,3 +1429,51 @@ mod stats {
         assert!(!invoke(&db, &["stats", "--since", "x"]).status.success());
     }
 }
+
+#[test]
+fn add_evidence_is_stored_and_shown() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("queue.db");
+    ok(&db, &["init"]);
+    let added = ok(
+        &db,
+        &[
+            "add",
+            "runtime change",
+            "--evidence",
+            "e2e",
+            "--evidence",
+            "subagent_review",
+            "--evidence",
+            "e2e",
+        ],
+    );
+    // Each check once, in the order given.
+    let expected = serde_json::json!(["e2e", "subagent_review"]);
+    assert_eq!(added["required_evidence"], expected);
+    let id = added["id"].to_string();
+    assert_eq!(
+        ok(&db, &["show", &id])["task"]["required_evidence"],
+        expected
+    );
+    assert_eq!(
+        ok(&db, &["show", &id, "--full"])["task"]["required_evidence"],
+        expected
+    );
+    assert_eq!(
+        ok(&db, &["list", "--full"])["tasks"][0]["required_evidence"],
+        expected
+    );
+    assert!(
+        ok(&db, &["list"])["tasks"][0]
+            .get("required_evidence")
+            .is_none()
+    );
+    // Without --evidence nothing is required.
+    let plain = ok(&db, &["add", "docs change"]);
+    assert_eq!(plain["required_evidence"], serde_json::json!([]));
+    // Only receipt check names are accepted.
+    let output = invoke(&db, &["add", "bad", "--evidence", "coverage"]);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("coverage"));
+}

@@ -1377,6 +1377,7 @@ mod tests {
             description: String::new(),
             acceptance: String::new(),
             verification_commands: Vec::new(),
+            required_evidence: Vec::new(),
             status: crate::domain::TaskStatus::InProgress,
             goal_id: None,
             context: String::new(),

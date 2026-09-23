@@ -114,6 +114,14 @@ string_enum!(CheckStatus {
     NotApplicable => "not_applicable",
 });
 
+// A receipt check a task can demand evidence for (ADR-0019 decision 5): the
+// names of the receipt's `tests`, `e2e` and `subagent_review`.
+string_enum!(EvidenceCheck {
+    Tests => "tests",
+    E2e => "e2e",
+    SubagentReview => "subagent_review",
+});
+
 /// A business rejection by the domain: an invalid value, a transition the
 /// task's status does not allow, or a condition that does not hold. Each
 /// variant carries only what its message needs, and `Display` is the message
@@ -357,9 +365,23 @@ pub struct NewTask {
     pub goal_id: Option<i64>,
     /// Why the task exists and what to read first; carried into the prompt.
     pub context: String,
+    /// Receipt checks validation requires to be `passed` with evidence.
+    #[serde(default)]
+    pub required_evidence: Vec<EvidenceCheck>,
 }
 
 impl NewTask {
+    /// The required checks in the order given, each once.
+    pub fn required_evidence(&self) -> Vec<EvidenceCheck> {
+        let mut checks = Vec::new();
+        for check in &self.required_evidence {
+            if !checks.contains(check) {
+                checks.push(*check);
+            }
+        }
+        checks
+    }
+
     pub fn validate(&self) -> Result<(), DomainError> {
         require(!self.title.trim().is_empty(), || DomainError::Blank {
             field: "task title",
@@ -390,6 +412,10 @@ pub struct Task {
     pub description: String,
     pub acceptance: String,
     pub verification_commands: Vec<String>,
+    /// Receipt checks validation requires to be `passed` with evidence
+    /// (ADR-0019 decision 5); a receipt without them parks the run as
+    /// `needs_session`.
+    pub required_evidence: Vec<EvidenceCheck>,
     pub status: TaskStatus,
     pub goal_id: Option<i64>,
     pub context: String,
@@ -881,7 +907,7 @@ pub enum ClaimOutcome {
 #[serde(tag = "outcome", rename_all = "snake_case")]
 pub enum IntegrationOutcome {
     Integrated {
-        task: Task,
+        task: Box<Task>,
         run: Box<TaskRun>,
         #[serde(default)]
         verification_skipped: bool,
@@ -978,6 +1004,18 @@ impl Receipt {
 
     /// Structural consistency only; Git state and verification commands are checked by the supervisor.
     pub fn check(&self, run_id: &str) -> Result<(), DomainError> {
+        self.check_requiring(run_id, &[])
+    }
+
+    /// [`Self::check`], except that a `required` check reported `failed` or
+    /// with a blank `evidence_or_reason` is left to
+    /// [`Self::missing_evidence`]: the run then waits for a session instead
+    /// of failing (ADR-0019 decision 5).
+    pub fn check_requiring(
+        &self,
+        run_id: &str,
+        required: &[EvidenceCheck],
+    ) -> Result<(), DomainError> {
         require(self.run_id == run_id, || DomainError::ReceiptRunMismatch {
             receipt_run_id: self.run_id.clone(),
             run_id: run_id.to_owned(),
@@ -988,11 +1026,16 @@ impl Receipt {
                 summary: self.summary.clone(),
             }
         })?;
-        for (name, check) in [
-            ("tests", &self.tests),
-            ("e2e", &self.e2e),
-            ("subagent_review", &self.subagent_review),
+        for evidence in [
+            EvidenceCheck::Tests,
+            EvidenceCheck::E2e,
+            EvidenceCheck::SubagentReview,
         ] {
+            let name = evidence.as_str();
+            let check = self.evidence(evidence);
+            if required.contains(&evidence) {
+                continue;
+            }
             require(check.status != CheckStatus::Failed, || {
                 DomainError::ReceiptCheckFailed {
                     check: name,
@@ -1012,6 +1055,36 @@ impl Receipt {
             || DomainError::FollowUpsNotArray,
         )
     }
+}
+
+impl Receipt {
+    fn evidence(&self, check: EvidenceCheck) -> &ReceiptCheck {
+        match check {
+            EvidenceCheck::Tests => &self.tests,
+            EvidenceCheck::E2e => &self.e2e,
+            EvidenceCheck::SubagentReview => &self.subagent_review,
+        }
+    }
+
+    /// The `required` checks this receipt does not back: a status other
+    /// than `passed`, or no evidence.
+    pub fn missing_evidence(&self, required: &[EvidenceCheck]) -> Vec<EvidenceCheck> {
+        required
+            .iter()
+            .copied()
+            .filter(|check| {
+                let claim = self.evidence(*check);
+                claim.status != CheckStatus::Passed || claim.evidence_or_reason.trim().is_empty()
+            })
+            .collect()
+    }
+}
+
+/// The `last_error` of a run parked for `missing` evidence, such as
+/// `evidence missing: e2e`.
+pub fn evidence_missing_reason(missing: &[EvidenceCheck]) -> String {
+    let names: Vec<&str> = missing.iter().map(|c| c.as_str()).collect();
+    format!("evidence missing: {}", names.join(", "))
 }
 
 pub fn validate_base_commit(commit: &str) -> Result<(), DomainError> {
@@ -1136,6 +1209,7 @@ mod tests {
             description: String::new(),
             acceptance: String::new(),
             verification_commands: vec![],
+            required_evidence: Vec::new(),
             dependencies: vec![0],
             goal_id: None,
             context: String::new(),
@@ -1161,6 +1235,71 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .starts_with("receipt is not a valid completion receipt: ")
+        );
+    }
+
+    #[test]
+    fn missing_evidence_is_a_required_check_not_passed_with_evidence() {
+        let check = |status: &str, evidence: &str| serde_json::json!({"status": status, "evidence_or_reason": evidence});
+        let receipt: Receipt = serde_json::from_value(serde_json::json!({
+            "run_id": "r",
+            "result": "succeeded",
+            "commit": "0".repeat(40),
+            "tests": check("passed", "ran"),
+            "e2e": check("not_applicable", "no surface"),
+            "subagent_review": check("passed", " "),
+        }))
+        .unwrap();
+        assert!(receipt.missing_evidence(&[]).is_empty());
+        assert!(receipt.missing_evidence(&[EvidenceCheck::Tests]).is_empty());
+        // A blank or failed check fails the receipt unless it is required;
+        // a required one is left to missing_evidence.
+        assert!(receipt.check("r").is_err());
+        assert!(
+            receipt
+                .check_requiring("r", &[EvidenceCheck::SubagentReview])
+                .is_ok()
+        );
+        let mut failed = receipt.clone();
+        failed.subagent_review.evidence_or_reason = "reviewed".into();
+        failed.e2e.status = CheckStatus::Failed;
+        assert_eq!(
+            failed.check("r").unwrap_err().to_string(),
+            "receipt reports e2e as failed: no surface"
+        );
+        assert!(
+            failed
+                .check_requiring("r", &[EvidenceCheck::Tests])
+                .is_err()
+        );
+        assert!(failed.check_requiring("r", &[EvidenceCheck::E2e]).is_ok());
+        assert_eq!(
+            failed.missing_evidence(&[EvidenceCheck::E2e]),
+            [EvidenceCheck::E2e]
+        );
+        let missing = receipt.missing_evidence(&[
+            EvidenceCheck::SubagentReview,
+            EvidenceCheck::Tests,
+            EvidenceCheck::E2e,
+        ]);
+        assert_eq!(missing, [EvidenceCheck::SubagentReview, EvidenceCheck::E2e]);
+        assert_eq!(
+            evidence_missing_reason(&missing),
+            "evidence missing: subagent_review, e2e"
+        );
+        let task = NewTask {
+            title: "t".into(),
+            description: String::new(),
+            acceptance: String::new(),
+            verification_commands: Vec::new(),
+            required_evidence: vec![EvidenceCheck::E2e, EvidenceCheck::Tests, EvidenceCheck::E2e],
+            dependencies: Vec::new(),
+            goal_id: None,
+            context: String::new(),
+        };
+        assert_eq!(
+            task.required_evidence(),
+            [EvidenceCheck::E2e, EvidenceCheck::Tests]
         );
     }
 

@@ -60,6 +60,10 @@ enum Command {
         /// Why the task exists and what to read first; shown to the worker.
         #[arg(long, default_value = "")]
         context: String,
+        /// Receipt check validation requires to be passed with evidence; repeatable.
+        /// A receipt without it parks the run as needs_session (evidence_missing).
+        #[arg(long = "evidence", value_parser = ["tests", "e2e", "subagent_review"])]
+        required_evidence: Vec<String>,
     },
     /// List one page of tasks, newest first: unfinished ones unless --status or --all says otherwise.
     /// Prints {"tasks", "next", "total"}; pass `next` to --before for the following page (null: none).
@@ -547,15 +551,22 @@ fn execute(cli: Cli) -> Result<Value> {
             dependencies,
             goal_id,
             context,
-        } => serde_json::to_value(queue.add(NewTask {
-            title,
-            description,
-            acceptance,
-            verification_commands,
-            dependencies,
-            goal_id,
-            context,
-        })?)?,
+            required_evidence,
+        } => serde_json::to_value(
+            queue.add(NewTask {
+                title,
+                description,
+                acceptance,
+                verification_commands,
+                dependencies,
+                goal_id,
+                context,
+                required_evidence: required_evidence
+                    .iter()
+                    .map(|name| name.parse())
+                    .collect::<Result<_, _>>()?,
+            })?,
+        )?,
         Command::List {
             status,
             all,

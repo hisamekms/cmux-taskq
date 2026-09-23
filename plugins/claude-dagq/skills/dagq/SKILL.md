@@ -43,12 +43,13 @@ A goal has no verification commands; a goal-level check belongs in a final task 
 
 ### Register the tasks
 
-Split the goal into tasks one session can finish in one worktree. Collect per task: title (one line), description (what to change and where), acceptance (how a reviewer decides it is done), verification commands (rerun by the supervisor in the worktree; repeat `--verify`), dependencies (tasks that must be `completed` first; repeat `--depends-on`, may cross goals), and `--context` (why it exists and what to read first, when the goal does not say it).
+Split the goal into tasks one session can finish in one worktree. Collect per task: title (one line), description (what to change and where), acceptance (how a reviewer decides it is done), verification commands (rerun by the supervisor in the worktree; repeat `--verify`), dependencies (tasks that must be `completed` first; repeat `--depends-on`, may cross goals), `--context` (why it exists and what to read first, when the goal does not say it), and `--evidence` (receipt checks the run must report as `passed` with evidence: `tests`, `e2e` or `subagent_review`; repeatable). A run whose receipt lacks a required check is not failed: validation parks it as `needs_session` (`evidence_missing`) and the supervisor resumes the session to run the check and rewrite the receipt. Follow the repository instructions on when to require it (for example `--evidence e2e` for runtime changes).
 
 ```sh
 "$DAGQ" add "TITLE" --goal 1 \
   --description "..." --acceptance "..." --context "..." \
   --verify "cargo test --locked" --verify "cargo clippy --locked --all-targets -- -D warnings" \
+  --evidence e2e \
   --depends-on 3
 "$DAGQ" ready ID
 "$DAGQ" candidates

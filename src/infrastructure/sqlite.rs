@@ -43,6 +43,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../../migrations/0012_queue_events.sql"),
     include_str!("../../migrations/0013_goal_draft.sql"),
     include_str!("../../migrations/0014_asks.sql"),
+    include_str!("../../migrations/0015_task_required_evidence.sql"),
 ];
 /// Ready tasks whose predecessors are completed, that own no unfinished run
 /// and whose goal, if any, is not a draft (ADR-0024 decision 5).
@@ -176,10 +177,10 @@ impl TaskStore for SqliteQueue {
             ensure_goal_open(&tx, goal_id)?;
         }
         tx.execute(
-            "INSERT INTO tasks(title, description, acceptance, verification_commands, goal_id, context)
-             VALUES (?1,?2,?3,?4,?5,?6)",
+            "INSERT INTO tasks(title, description, acceptance, verification_commands, goal_id, context, required_evidence)
+             VALUES (?1,?2,?3,?4,?5,?6,?7)",
             params![task.title, task.description, task.acceptance, serde_json::to_string(&task.verification_commands)?,
-                task.goal_id, task.context],
+                task.goal_id, task.context, serde_json::to_string(&task.required_evidence())?],
         )?;
         let id = tx.last_insert_rowid();
         event(
@@ -929,6 +930,7 @@ fn task_row(row: &Row<'_>) -> rusqlite::Result<Task> {
         description: row.get("description")?,
         acceptance: row.get("acceptance")?,
         verification_commands: json_col(row, "verification_commands")?,
+        required_evidence: json_col(row, "required_evidence")?,
         status: enum_col(row, "status")?,
         goal_id: row.get("goal_id")?,
         context: row.get("context")?,

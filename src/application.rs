@@ -3,9 +3,9 @@
 use anyhow::Result;
 
 use crate::domain::{
-    ClaimOutcome, Goal, GoalDetail, GoalEdit, GoalStatus, GoalSummary, GoalVerdict, NewGoal,
-    NewNote, NewTask, NotePage, NoteQuery, Predecessor, RunEvent, RunStatus, Task, TaskAction,
-    TaskDetail, TaskStatus,
+    ClaimOutcome, EvidenceCheck, Goal, GoalDetail, GoalEdit, GoalStatus, GoalSummary, GoalVerdict,
+    NewGoal, NewNote, NewTask, NotePage, NoteQuery, Predecessor, RunEvent, RunStatus, Task,
+    TaskAction, TaskDetail, TaskStatus,
 };
 
 /// Which task statuses `list` returns.
@@ -88,6 +88,7 @@ pub struct TaskListDetails {
     pub description: String,
     pub acceptance: String,
     pub verification_commands: Vec<String>,
+    pub required_evidence: Vec<EvidenceCheck>,
     pub context: String,
     pub created_at: String,
     pub updated_at: String,
@@ -104,6 +105,7 @@ impl TaskListItem {
             description: task.description,
             acceptance: task.acceptance,
             verification_commands: task.verification_commands,
+            required_evidence: task.required_evidence,
             context: task.context,
             created_at: task.created_at,
             updated_at: task.updated_at,

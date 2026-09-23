@@ -11,7 +11,7 @@ use super::{
     sqlite::{SqliteQueue, claim_task, enum_col, event, event_row, read_task, run_row},
 };
 use crate::domain::{
-    ClaimOutcome, RunEvent, RunLease, RunProcess, SessionRole, SupervisorMode,
+    ClaimOutcome, EvidenceCheck, RunEvent, RunLease, RunProcess, SessionRole, SupervisorMode,
     SupervisorRegistration, Task, TaskRun, validate_base_commit,
 };
 
@@ -35,12 +35,17 @@ pub struct LeasedRun {
 
 /// Outcome of supervisor-side receipt validation. `result_commit` is kept on
 /// rejection too when the commit itself was verified, so inspection can start there.
+/// A rejection for nothing but `evidence_missing` (the task's required checks
+/// the receipt does not back, ADR-0019 decision 5) parks the run as
+/// `needs_session` instead of failing it.
 #[derive(Debug, Serialize)]
 pub struct Validation {
     pub accepted: bool,
     pub result_commit: Option<String>,
     pub reason: Option<String>,
     pub receipt: serde_json::Value,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub evidence_missing: Vec<EvidenceCheck>,
 }
 
 /// What `integrate` put on `main`: the squash `commit` whose tree is that of
@@ -923,6 +928,8 @@ impl SqliteQueue {
         assert_lease(&tx, id, token)?;
         let status = if validation.accepted {
             "awaiting_integration"
+        } else if !validation.evidence_missing.is_empty() {
+            "needs_session"
         } else {
             "failed"
         };
@@ -943,6 +950,16 @@ impl SqliteQueue {
         let mut payload = serde_json::to_value(validation)?;
         payload["status"] = json!(status);
         run_event(&tx, id, "validation_finished", payload)?;
+        if status == "needs_session" {
+            // No `status` in the payload: `validation_finished` already
+            // reports the park, and `stats` counts it once.
+            run_event(
+                &tx,
+                id,
+                "evidence_missing",
+                json!({"checks": validation.evidence_missing, "reason": validation.reason}),
+            )?;
+        }
         // Task completion still waits for integration into main.
         let result = tx.query_row(
             "SELECT * FROM task_runs WHERE id=?1",
@@ -1490,10 +1507,11 @@ impl SqliteQueue {
         ensure!(
             tx.execute(
                 "UPDATE task_runs SET workspace_closed_at=unixepoch() WHERE id=?1 AND supervisor_token=?2
-                 AND status='awaiting_integration' AND workspace_id IS NOT NULL AND workspace_closed_at IS NULL",
+                 AND status IN ('awaiting_integration','needs_session') AND workspace_id IS NOT NULL
+                 AND workspace_closed_at IS NULL",
                 params![id, token]
             )? == 1,
-            "run is not awaiting integration with an open workspace under this supervisor"
+            "run is not awaiting integration or a session with an open workspace under this supervisor"
         );
         let result = tx.query_row(
             "SELECT * FROM task_runs WHERE id=?1",
@@ -1520,10 +1538,10 @@ impl SqliteQueue {
         ensure!(
             tx.execute(
                 "UPDATE task_runs SET last_error=?3 WHERE id=?1 AND supervisor_token=?2
-                 AND status='awaiting_integration' AND workspace_closed_at IS NULL",
+                 AND status IN ('awaiting_integration','needs_session') AND workspace_closed_at IS NULL",
                 params![id, token, message]
             )? == 1,
-            "run is not awaiting integration with an open workspace under this supervisor"
+            "run is not awaiting integration or a session with an open workspace under this supervisor"
         );
         let result = tx.query_row(
             "SELECT * FROM task_runs WHERE id=?1",

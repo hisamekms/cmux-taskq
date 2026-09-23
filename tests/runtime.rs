@@ -5,7 +5,9 @@ use dagq::{
         AgentProvider, MainRemote, SupervisorEnvironment, TaskStore, WorkspaceBackend,
         WorkspaceTags,
     },
-    domain::{GoalEdit, NewGoal, NewTask, RunStatus, Task, TaskAction, TaskRun, TaskStatus},
+    domain::{
+        EvidenceCheck, GoalEdit, NewGoal, NewTask, RunStatus, Task, TaskAction, TaskRun, TaskStatus,
+    },
     infrastructure::{
         adapters::{GitRepository, shell_join, workspace_handle},
         location::QueueLocation,
@@ -66,6 +68,7 @@ fn add_ready_task(queue: &mut SqliteQueue, title: &str, dependencies: &[i64]) ->
             description: "small change".into(),
             acceptance: "works".into(),
             verification_commands: vec!["test -f seed.txt".into()],
+            required_evidence: Vec::new(),
             dependencies: dependencies.to_vec(),
             goal_id: None,
             context: String::new(),
@@ -2098,6 +2101,7 @@ fn wrapper_registration_is_one_shot_and_rejects_stale_owners() {
         result_commit: None,
         reason: Some("receipt was not submitted".into()),
         receipt: Value::Null,
+        evidence_missing: Vec::new(),
     };
     assert!(
         queue
@@ -2169,6 +2173,7 @@ fn workspace_close_is_recorded_once_and_only_for_accepted_runs() {
                 result_commit: Some("89abcdef0123456789abcdef0123456789abcdef".into()),
                 reason: None,
                 receipt: Value::Null,
+                evidence_missing: Vec::new(),
             },
         )
         .unwrap();
@@ -2933,6 +2938,7 @@ fn add_file_task(
             description: "small change".into(),
             acceptance: "works".into(),
             verification_commands: verify.iter().map(|v| (*v).to_owned()).collect(),
+            required_evidence: Vec::new(),
             dependencies: vec![],
             goal_id: None,
             context: String::new(),
@@ -3037,6 +3043,7 @@ fn awaiting_run() -> (TempDir, PathBuf, PathBuf, TaskRun) {
             description: String::new(),
             acceptance: String::new(),
             verification_commands: vec![],
+            required_evidence: Vec::new(),
             dependencies: vec![1],
             goal_id: None,
             context: String::new(),
@@ -3517,6 +3524,7 @@ fn add_ready_task_in(
             description: "small change".into(),
             acceptance: "works".into(),
             verification_commands: vec!["test -f seed.txt".into()],
+            required_evidence: Vec::new(),
             dependencies: vec![],
             goal_id,
             context: context.into(),
@@ -4850,6 +4858,7 @@ fn verification_failure_after_rebase_needs_a_session_and_keeps_the_rebased_tree(
             description: String::new(),
             acceptance: String::new(),
             verification_commands: vec!["true".into()],
+            required_evidence: Vec::new(),
             dependencies: vec![],
             goal_id: None,
             context: String::new(),
@@ -6918,6 +6927,7 @@ fn dagq_toml_run_env_reaches_the_workspace_and_the_verification_commands() {
             verification_commands: vec![
                 r#"printf '%s %s\n' "$SHARED" "$RUN_TMP" >> "$RUN_TMP/verify-env.txt""#.into(),
             ],
+            required_evidence: Vec::new(),
             dependencies: vec![],
             goal_id: None,
             context: String::new(),
@@ -6972,4 +6982,196 @@ fn a_broken_dagq_toml_stops_provisioning_before_the_workspace() {
     let error = format!("{:#}", supervise(&db, &repo, &backend).unwrap_err());
     assert!(error.contains("unknown table [build]"), "{error}");
     assert!(backend.tags.lock().unwrap().is_empty());
+}
+
+/// A fixture whose only ready task requires `evidence` in the receipt.
+fn evidence_fixture(evidence: &[EvidenceCheck]) -> (TempDir, PathBuf, PathBuf) {
+    let (dir, repo, db) = fixture();
+    let mut queue = SqliteQueue::open(&db).unwrap();
+    queue.transition(1, TaskAction::Cancel).unwrap();
+    let task = queue
+        .add(NewTask {
+            title: "needs evidence".into(),
+            description: "small change".into(),
+            acceptance: "works".into(),
+            verification_commands: vec!["test -f seed.txt".into()],
+            required_evidence: evidence.to_vec(),
+            dependencies: Vec::new(),
+            goal_id: None,
+            context: String::new(),
+        })
+        .unwrap();
+    assert_eq!(task.id, 2);
+    assert_eq!(task.required_evidence, evidence);
+    queue.transition(task.id, TaskAction::Ready).unwrap();
+    (dir, repo, db)
+}
+
+/// A receipt function for scripts: `receipt_e2e COMMIT STATUS EVIDENCE`
+/// claims success with the given `e2e` check.
+const RECEIPT_E2E: &str = r#"receipt_e2e() {
+  printf '{"run_id":"%s","result":"succeeded","commit":"%s","tests":{"status":"passed","evidence_or_reason":"ran"},"e2e":{"status":"%s","evidence_or_reason":"%s"},"subagent_review":{"status":"passed","evidence_or_reason":"reviewed"},"summary":"done"}' "$RUN_ID" "$1" "$2" "$3" > "$RECEIPT.tmp"
+  mv "$RECEIPT.tmp" "$RECEIPT"
+}
+"#;
+
+/// A task that requires `e2e` evidence gets a receipt without it parked as
+/// `needs_session` (`evidence_missing`), not failed; the supervisor resumes
+/// the session with the evidence request, and the rewritten receipt with
+/// the evidence brings the run to `awaiting_integration`.
+#[test]
+fn missing_required_evidence_parks_the_run_for_a_resumed_session() {
+    let (_dir, repo, db) = evidence_fixture(&[EvidenceCheck::E2e]);
+    // The worker claims e2e passed but gives no evidence: without the
+    // requirement that fails the receipt, with it the run waits.
+    let backend = TestWorkspace::new(
+        &db,
+        false,
+        &format!("{RECEIPT_E2E}commit work; receipt_e2e \"$(git rev-parse HEAD)\" passed ' '"),
+    );
+    backend.resume_script_for(
+        2,
+        &format!(
+            "{RECEIPT_E2E}await_message; receipt_e2e \"$(git rev-parse HEAD)\" passed 'cargo test --test e2e: 3 passed'; idle; await_exit"
+        ),
+    );
+    let outcome = supervise(&db, &repo, &backend).unwrap();
+    backend.join();
+    assert_eq!(outcome["errors"], json!([]), "{outcome}");
+
+    let mut queue = SqliteQueue::open(&db).unwrap();
+    let detail = queue.show(2).unwrap();
+    let run = &detail.runs[0];
+    // The worker knew up front.
+    let prompt = read_prompt(run);
+    assert!(prompt.contains("Required evidence: e2e ("), "{prompt}");
+    // Validation parked it instead of failing it.
+    let validated = payloads(&detail, "validation_finished");
+    assert_eq!(validated.len(), 1);
+    assert_eq!(validated[0]["status"], "needs_session");
+    assert_eq!(validated[0]["accepted"], false);
+    assert_eq!(validated[0]["reason"], "evidence missing: e2e");
+    assert_eq!(validated[0]["evidence_missing"], json!(["e2e"]));
+    assert!(validated[0]["result_commit"].is_string());
+    assert_eq!(
+        payloads(&detail, "evidence_missing"),
+        [&json!({"checks": ["e2e"], "reason": "evidence missing: e2e"})]
+    );
+    // The worker's workspace was closed: the resume opens its own.
+    assert!(event_kinds(&detail).contains(&"workspace_closed"));
+    assert!(backend.closed().contains(&WORKSPACE_ID.to_owned()));
+    // The resume asked for the missing check, not a rebase.
+    let text = &backend.texts()[0].1;
+    assert!(
+        text.contains("found required evidence missing from the receipt"),
+        "{text}"
+    );
+    assert!(text.contains("Reason: evidence missing: e2e"), "{text}");
+    assert!(!text.contains("git rebase"), "{text}");
+    let finished = payloads(&detail, "resume_finished");
+    assert_eq!(finished.len(), 1);
+    assert_eq!(finished[0]["outcome"], "resolved");
+    assert_eq!(run.status, RunStatus::AwaitingIntegration);
+    assert!(queue.run_leases().unwrap().is_empty());
+    // It lands now that the receipt carries the evidence.
+    let landed = integrate(&db, 2, &repo).unwrap();
+    assert_eq!(landed["outcome"], "integrated", "{landed}");
+}
+
+/// A required check the receipt reports as `failed` is missing evidence
+/// too: the run waits for a session instead of failing, and a resume that
+/// reruns the check brings it to `awaiting_integration`.
+#[test]
+fn a_required_check_reported_failed_parks_the_run_instead_of_failing_it() {
+    let (_dir, repo, db) = evidence_fixture(&[EvidenceCheck::E2e]);
+    let backend = TestWorkspace::new(
+        &db,
+        false,
+        &format!(
+            "{RECEIPT_E2E}commit work; receipt_e2e \"$(git rev-parse HEAD)\" failed 'cmux was not running'"
+        ),
+    );
+    backend.resume_script_for(
+        2,
+        &format!(
+            "{RECEIPT_E2E}await_message; receipt_e2e \"$(git rev-parse HEAD)\" passed 'e2e: 5 passed'; idle; await_exit"
+        ),
+    );
+    let outcome = supervise(&db, &repo, &backend).unwrap();
+    backend.join();
+    assert_eq!(outcome["errors"], json!([]), "{outcome}");
+    let detail = SqliteQueue::open(&db).unwrap().show(2).unwrap();
+    let validated = payloads(&detail, "validation_finished");
+    assert_eq!(validated[0]["status"], "needs_session");
+    assert_eq!(validated[0]["reason"], "evidence missing: e2e");
+    assert_eq!(
+        payloads(&detail, "evidence_missing"),
+        [&json!({"checks": ["e2e"], "reason": "evidence missing: e2e"})]
+    );
+    assert_eq!(
+        payloads(&detail, "resume_finished")[0]["outcome"],
+        "resolved"
+    );
+    assert_eq!(detail.runs[0].status, RunStatus::AwaitingIntegration);
+}
+
+/// With the required evidence in the first receipt, validation accepts the
+/// run as it would without a requirement.
+#[test]
+fn required_evidence_present_in_the_receipt_awaits_integration() {
+    let (_dir, repo, db) = evidence_fixture(&[EvidenceCheck::E2e, EvidenceCheck::Tests]);
+    let backend = TestWorkspace::new(
+        &db,
+        false,
+        &format!(
+            "{RECEIPT_E2E}commit work; receipt_e2e \"$(git rev-parse HEAD)\" passed 'e2e: 3 passed'"
+        ),
+    );
+    let outcome = supervise(&db, &repo, &backend).unwrap();
+    backend.join();
+    assert_eq!(outcome["errors"], json!([]), "{outcome}");
+    let detail = SqliteQueue::open(&db).unwrap().show(2).unwrap();
+    let run = &detail.runs[0];
+    assert_eq!(run.status, RunStatus::AwaitingIntegration);
+    assert!(read_prompt(run).contains("Required evidence: e2e, tests ("));
+    assert!(!event_kinds(&detail).contains(&"evidence_missing"));
+    assert!(
+        !payloads(&detail, "validation_finished")[0]
+            .as_object()
+            .unwrap()
+            .contains_key("evidence_missing")
+    );
+}
+
+/// A resumed session that comes back without the evidence has not resolved
+/// the run: every attempt is `unresolved` and the run stays
+/// `needs_session`. An `integrate` of it does not land either: it defers
+/// the run with the missing `checks`.
+#[test]
+fn a_resume_or_integrate_without_the_required_evidence_does_not_land() {
+    let (_dir, repo, db) = evidence_fixture(&[EvidenceCheck::E2e]);
+    let backend = TestWorkspace::new(&db, false, VALID_AGENT);
+    backend.resume_script_for(
+        2,
+        "await_message; receipt \"$(git rev-parse HEAD)\"; idle; await_exit",
+    );
+    let outcome = supervise(&db, &repo, &backend).unwrap();
+    backend.join();
+    assert_eq!(outcome["errors"], json!([]), "{outcome}");
+    let mut queue = SqliteQueue::open(&db).unwrap();
+    let detail = queue.show(2).unwrap();
+    assert_eq!(detail.runs[0].status, RunStatus::NeedsSession);
+    let finished = payloads(&detail, "resume_finished");
+    assert!(!finished.is_empty());
+    assert!(finished.iter().all(|f| f["outcome"] == "unresolved"));
+    let before = git_out(&repo, &["rev-parse", "main"]);
+    let deferred = integrate(&db, 2, &repo).unwrap();
+    assert_eq!(deferred["outcome"], "needs_session", "{deferred}");
+    assert_eq!(git_out(&repo, &["rev-parse", "main"]), before);
+    let detail = queue.show(2).unwrap();
+    let run = &detail.runs[0];
+    assert_eq!(run.status, RunStatus::NeedsSession);
+    assert_eq!(run.last_error.as_deref(), Some("evidence missing: e2e"));
+    let parked = payloads(&detail, "integration_deferred");
+    assert_eq!(parked.last().unwrap()["checks"], json!(["e2e"]));
 }
