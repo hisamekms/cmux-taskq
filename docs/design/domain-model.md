@@ -103,7 +103,7 @@ domainの関数は業務上の拒否を`DomainError`（`src/domain.rs`）で返�
 - TaskRunが成功するには完了レシート、base commitの上に積まれたbranch headのコミット、clean worktree、supervisorが再実行した検証コマンドの成功が必要。receiptの自己申告だけでは成功しない。
 - Taskが`completed`になるのは、その`integrated` runを`integrate`がmainへ着地させたときだけ。着地commitのtreeは再検証したworktreeのtreeに等しく、messageは`Dagq-Task` / `Dagq-Run` trailerでrunに結び付く。`integrated` runはTaskごとに1件、`integrating` runはqueueごとに1件。
 - mainはtaskごとに1つのsquash commitの直線で、merge commitとrun branchのfast-forwardは作らない。runの詳細履歴は`refs/dagq/runs/<run-id>`に残る。
-- `needs_session`のrunはruntimeが変更しない。解消・検証コマンドの再実行・receiptの書き直しはセッションが行い、`integrate ID`が同じ手順で再検証する。
+- `needs_session`のrunはsupervisorがresumeする（[ADR-0019](../adr/0019-move-routine-maintainer-work-into-the-runtime.md)の決定1、[supervisor-lifecycle](supervisor-lifecycle.md#needs_session)）。解消・検証コマンドの再実行・receiptの書き直しはresumeしたセッションが行う。resume中もrunは`needs_session`のままで、進行は`resume_started` / `resume_finished`で表す（新しい状態は足さない）。解消したrunは、`integration_approved`があれば（`integrate`が呼ばれていれば）supervisorが`integrate`と同じ手順で着地させ、無ければ`needs_session → awaiting_integration`に戻す。`failed` receiptなら`needs_session → failed`。どちらもsupervisorのleaseの下で行う（`finish_resume`）。3回の試行で解消しなければ`needs_session`のまま人に返る（`run_attention`の`resuming (runtime)` / `resume session`）。
 - workspaceを閉じる前にTaskRunをcleanedにしない。閉じたことをcmuxの応答で確認して`workspace_closed_at`に記録するまでは開いている扱いで、close失敗はrun状態を変えない。
 - agentの異常終了だけでTaskを自動再実行しない。孤児runの復旧と再試行はどちらも明示操作。
 - 実装途中のprovider fallbackは行わず、起動不能など安全に判定できる場合だけfallbackする。

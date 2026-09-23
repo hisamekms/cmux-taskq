@@ -11,7 +11,7 @@ The `verify-N.log` files in `run_dir` (`show ID --full`) hold the supervisor's o
 ## integrate
 
 ```sh
-"$DAGQ" integrate ID        # this task's run (also resumes a needs_session run)
+"$DAGQ" integrate ID        # this task's run (also a needs_session one; the supervisor lands those itself)
 "$DAGQ" integrate --next    # the oldest run awaiting integration
 ```
 

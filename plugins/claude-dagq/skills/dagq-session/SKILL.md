@@ -1,6 +1,6 @@
 ---
 name: dagq-session
-description: Act on a dagq run's own Claude session in its cmux workspace: resume a needs_session run so it rebases and fixes its branch, answer the trust or permission prompt or question a running worker stops at, send /exit to a run whose exit request timed out, and close the workspace of a failed or interrupted run. Use when status or watch reports "resume session", "send /exit", "answer the prompt in workspace <id>" or "inspect and close workspace", or a running run makes no progress. Not for landing (dagq-land) or a dead lease (dagq-recover).
+description: Act on a dagq run's own Claude session in its cmux workspace: answer the trust or permission prompt or question a running worker (or a session the runtime resumed) stops at, send /exit to a run whose exit request timed out, close the workspace of a failed or interrupted run, and hand the user a needs_session run the runtime gave up resuming. Use when status or watch reports "resume session", "send /exit", "answer the prompt in workspace <id>" or "inspect and close workspace", or a running run makes no progress. "resuming (runtime)" needs nothing. Not for landing (dagq-land) or a dead lease (dagq-recover).
 ---
 
 # dagq: act on a run's session
@@ -39,16 +39,8 @@ cmux workspace close <workspace_id>
 
 The worktree, branch and run directory stay for the user's manual cleanup. Retrying is the user's decision: `"$DAGQ" ready ID` makes a new run.
 
-## 4. Resume a needs_session run
+## 4. needs_session runs: the runtime resumes them
 
-Attention `resume session`: `integrate` could not land the run (a rebase conflict, or a verification command failed on the rebased tree). The run's own Claude session fixes it, not this session and not by hand. Open a workspace that resumes it (the session ID is the run ID):
+The runtime resumes a `needs_session` run itself: the supervisor opens a workspace titled like the run's worker (`[<repo>]worker#<task-id> - <task title>`, description `run <run-id> resume`) with the run's own session, types the fixed resolution request (the reason, the `main` to rebase onto, the tasks landed since the run's base, the steps), sends `/exit` once the session has rewritten the receipt for the new head (or has gone idle without resolving it, or ran past the resume timeout), and closes the workspace. A run whose `integrate` was already called is then landed by the runtime; any other run goes back to `awaiting_integration` (attention `review and integrate`, the `dagq-land` skill). While this goes on, `status` shows `next: resuming (runtime)`: do nothing for that run. Never open a resume workspace or type into it; the one exception is a dialog the resumed session stops at, which you answer as in section 1 (the attention `answer the prompt in workspace <id>` does not cover resumed sessions; find the workspace with that description in `cmux workspace list`).
 
-```sh
-cmux workspace create --name "[<repo>]worker#<task-id> - <task title>" \
-  --description "run <run-id> resume" --cwd "<worktree_path>" \
-  --command "claude --resume <run-id>"
-```
-
-Send it the reason from `last_error` and this instruction: rebase the branch onto the `main` commit named in the reason (`git rebase <main commit>`), resolve the conflicts or fix what broke the verification command, rerun the task's verification commands, commit, keep the worktree clean, and rewrite `receipt.json` in `run_dir` by atomic rename with the new head as `commit`; if the change is no longer needed, write `"result": "failed"` with the reason in `summary`. It must not merge or push.
-
-When it reports done, send `/exit` in that workspace (landing removes the worktree it works in), then land the run again with the `dagq-land` skill: `review ID`, then `integrate ID` on a passing review (the user is asked only on doubt). `integrate` repeats the rebase and reruns the verification commands on the new head; it keeps the run in `needs_session` with a new reason if the receipt does not name the current head, and marks it `failed` on a failed receipt.
+The runtime tries three times. A run comes back as attention `resume session` only when the runtime cannot go on: the third resume did not resolve it (its last `resume_finished` event has `exhausted: true`), or a resume session nobody watches is still running (the supervisor died mid-resume, or the session ignored `/exit` and was let go). For the latter, read that workspace's screen and tell the user; once its session has exited (`/exit`) and the workspace is closed, the supervisor resumes the run again. Report it to the user with `last_error` and what the attempts did: `"$DAGQ" show ID --full` lists the `resume_started` / `resume_finished` events (`outcome`, `head`), and `run_dir` keeps each request as `resume-N.txt` and the final screen as `terminal-resume-N.txt`. What happens next is the user's decision: `ready ID` reruns the task, `cancel ID` drops it, and an edited task goes through `draft ID` first.

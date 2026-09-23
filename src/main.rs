@@ -313,6 +313,9 @@ enum Command {
         lease: String,
         #[arg(long)]
         claude: PathBuf,
+        /// Reopen the session of a `needs_session` run the supervisor resumes.
+        #[arg(long)]
+        resume: bool,
     },
 }
 
@@ -788,9 +791,12 @@ fn execute(cli: Cli) -> Result<Value> {
         )?,
         Command::Doctor { full } => dagq::runtime::doctor(&db, full)?,
         Command::Recover { run } => dagq::runtime::recover(&db, &run)?,
-        Command::Session { run, lease, claude } => {
-            dagq::runtime::session(&db, &run, &lease, &claude)?
-        }
+        Command::Session {
+            run,
+            lease,
+            claude,
+            resume,
+        } => dagq::runtime::session(&db, &run, &lease, &claude, resume)?,
     })
 }
 

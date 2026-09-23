@@ -277,6 +277,12 @@ impl WorkspaceBackend for FakeCmux {
     fn create(&self, _: &Task, _: &TaskRun, _: &str, _: &WorkspaceTags) -> Result<String> {
         bail!("up does not create run workspaces")
     }
+    fn create_resume(&self, _: &Task, _: &TaskRun, _: &str, _: &WorkspaceTags) -> Result<String> {
+        bail!("up does not resume runs")
+    }
+    fn send_text(&self, _: &str, _: &str) -> Result<()> {
+        bail!("up never types into a terminal")
+    }
     fn capture(&self, _: &str) -> Result<String> {
         bail!("not used")
     }
@@ -949,6 +955,89 @@ fn the_cmux_adapter_notifies_with_title_body_and_an_optional_workspace() {
     assert!(cmux.notify("fail", "body", None).is_err());
 }
 
+/// The real adapter types a resolution request as one line (line breaks
+/// and tabs, which `cmux send` would read as keys, become spaces, and
+/// backslashes slashes) and submits it with Enter, and opens a resume
+/// workspace in the run's worktree named like the run's worker workspace
+/// (`[<repo>]worker#<task-id> - <task title>`, ADR-0028).
+#[test]
+fn the_cmux_adapter_sends_one_line_and_names_the_resume_workspace() {
+    let dir = tempfile::tempdir().unwrap();
+    let dump = dir.path().join("args.txt");
+    let stub = dir.path().join("cmux-stub");
+    fs::write(
+        &stub,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" >> '{}'\ncase \"$1\" in workspace) echo 'OK workspace:7' ;; --json) echo '{{\"caller\":{{\"workspace_id\":\"01234567-89ab-4def-8123-000000000007\"}}}}' ;; esac\n",
+            dump.display()
+        ),
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).unwrap();
+    let cmux = Cmux { executable: stub };
+    cmux.send_text("WS", "line one\n\tline two\\n\n").unwrap();
+    assert_eq!(
+        fs::read_to_string(&dump).unwrap(),
+        "send\n--workspace\nWS\n--\nline one line two/n\nsend-key\n--workspace\nWS\n--\nenter\n"
+    );
+    fs::remove_file(&dump).unwrap();
+    let run = TaskRun {
+        id: "run-1".into(),
+        task_id: 3,
+        status: dagq::domain::RunStatus::NeedsSession,
+        requested_provider: dagq::domain::Provider::Claude,
+        actual_provider: dagq::domain::Provider::Claude,
+        base_commit: "0".repeat(40),
+        repo_path: Some("/src/my-repo".into()),
+        run_dir: Some(dir.path().to_string_lossy().into_owned()),
+        worktree_path: Some(dir.path().to_string_lossy().into_owned()),
+        branch: None,
+        workspace_id: None,
+        receipt_path: None,
+        log_path: None,
+        result_commit: None,
+        last_error: None,
+        workspace_closed_at: None,
+        created_at: String::new(),
+    };
+    assert_eq!(
+        cmux.create_resume(
+            &Task {
+                id: 3,
+                title: "fix it".into(),
+                description: String::new(),
+                acceptance: String::new(),
+                verification_commands: Vec::new(),
+                status: dagq::domain::TaskStatus::InProgress,
+                goal_id: None,
+                context: String::new(),
+                created_at: String::new(),
+                updated_at: String::new(),
+            },
+            &run,
+            "runner session --resume",
+            &WorkspaceTags {
+                env: vec![("DAGQ_ROLE".into(), "worker".into())],
+                description: Some(
+                    dagq::infrastructure::adapters::resume_workspace_description(&run)
+                ),
+                group: Some("group:1".into()),
+            },
+        )
+        .unwrap(),
+        "01234567-89ab-4def-8123-000000000007"
+    );
+    let args = fs::read_to_string(&dump).unwrap();
+    assert!(
+        args.starts_with(&format!(
+            "workspace\ncreate\n--name\n[my-repo]worker#3 - fix it\n--description\nrun run-1 resume\n--env\nDAGQ_ROLE=worker\n--group\ngroup:1\n--command\nrunner session --resume\n--focus\nfalse\n--cwd\n{}\n",
+            dir.path().display()
+        )),
+        "{args}"
+    );
+}
+
 /// The real adapter runs `cmux ping` in that environment and outside
 /// cmux's process tree: a stub cmux dumps what it was given and who its
 /// parent is, and this test process (which may itself run inside cmux)
@@ -1364,6 +1453,18 @@ fn up_requires_cmux_claude_and_an_initialized_queue() {
             unreachable!()
         }
         fn create(&self, _: &Task, _: &TaskRun, _: &str, _: &WorkspaceTags) -> Result<String> {
+            unreachable!()
+        }
+        fn create_resume(
+            &self,
+            _: &Task,
+            _: &TaskRun,
+            _: &str,
+            _: &WorkspaceTags,
+        ) -> Result<String> {
+            unreachable!()
+        }
+        fn send_text(&self, _: &str, _: &str) -> Result<()> {
             unreachable!()
         }
         fn capture(&self, _: &str) -> Result<String> {

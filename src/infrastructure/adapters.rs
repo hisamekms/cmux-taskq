@@ -514,6 +514,24 @@ impl GitRepository {
         ]))
     }
 
+    /// The task IDs in the `Dagq-Task` trailers of `<base>..<head>`, oldest
+    /// landing first: the tasks `integrate` put on `main` since `base`.
+    pub fn landed_task_ids(&self, base: &str, head: &str) -> Result<Vec<i64>> {
+        let text = review_output(Command::new(&self.git).arg("-C").arg(&self.root).args([
+            "log",
+            "--reverse",
+            "--format=%(trailers:key=Dagq-Task,valueonly)",
+            &format!("{base}..{head}"),
+        ]))?;
+        let mut ids: Vec<i64> = Vec::new();
+        for id in text.lines().filter_map(|line| line.trim().parse().ok()) {
+            if !ids.contains(&id) {
+                ids.push(id);
+            }
+        }
+        Ok(ids)
+    }
+
     /// `git diff <args> <base>...<head>`: the change since the merge base,
     /// without color, external diff drivers or textconv filters.
     fn diff_since(&self, base: &str, head: &str, args: &[&str]) -> Command {
@@ -825,6 +843,42 @@ impl WorkspaceBackend for Cmux {
         self.identify(workspace_handle(&raw)?)
     }
 
+    fn create_resume(
+        &self,
+        task: &Task,
+        run: &TaskRun,
+        command: &str,
+        tags: &WorkspaceTags,
+    ) -> Result<String> {
+        let raw = self.create_workspace(
+            &run_workspace_name(task, run)?,
+            Path::new(run.worktree_path.as_ref().context("missing worktree")?),
+            command,
+            tags,
+        )?;
+        self.identify(workspace_handle(&raw)?)
+    }
+
+    /// `cmux send` reads `\n`, `\r` and `\t` as keys, so the text goes as
+    /// one line with backslashes replaced; Enter submits it.
+    fn send_text(&self, workspace_id: &str, text: &str) -> Result<()> {
+        output(Command::new(&self.executable).args([
+            "send",
+            "--workspace",
+            workspace_id,
+            "--",
+            &single_line(text),
+        ]))?;
+        output(Command::new(&self.executable).args([
+            "send-key",
+            "--workspace",
+            workspace_id,
+            "--",
+            "enter",
+        ]))?;
+        Ok(())
+    }
+
     fn capture(&self, workspace_id: &str) -> Result<String> {
         output(Command::new(&self.executable).args([
             "read-screen",
@@ -1099,6 +1153,24 @@ pub fn workspace_group_name(repo_root: &Path) -> String {
     format!("[{}]", repository_name(repo_root))
 }
 
+/// `run <run-id> resume`: the description of the workspace the supervisor
+/// resumes a `needs_session` run's session in; its title is the worker's
+/// (`run_workspace_name`, ADR-0028).
+pub fn resume_workspace_description(run: &TaskRun) -> String {
+    format!("run {} resume", run.id)
+}
+
+/// `text` as one line for `cmux send`: line breaks and tabs become spaces
+/// and backslashes slashes, so nothing in it reads as a key.
+pub fn single_line(text: &str) -> String {
+    text.split(['\n', '\r', '\t'])
+        .filter(|part| !part.trim().is_empty())
+        .map(str::trim_end)
+        .collect::<Vec<_>>()
+        .join(" ")
+        .replace('\\', "/")
+}
+
 /// `[<repo>]maintainer`: the one resident Claude session of a repository's
 /// queue (ADR-0028).
 pub fn maintainer_workspace_name(repo_root: &Path) -> String {
@@ -1179,6 +1251,30 @@ impl AgentProvider for ClaudeCode {
             .arg(&settings)
             .arg("--")
             .arg(prompt)
+            .stdin(Stdio::inherit())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit());
+        Ok(command)
+    }
+
+    /// `claude --resume <run-id>` in the worktree with the run's settings
+    /// (its `Stop` hook), so the resumed session opens like the worker did.
+    fn resume_command(&self, run: &TaskRun) -> Result<Command> {
+        let run_dir = Path::new(run.run_dir.as_ref().context("missing run directory")?);
+        let settings = run_dir.join("claude-settings.json");
+        fs::write(&settings, stop_hook_settings(&run.idle_marker_path()?)?)
+            .with_context(|| format!("write {}", settings.display()))?;
+        let mut command = Command::new(&self.executable);
+        command
+            .current_dir(run.worktree_path.as_ref().context("missing worktree")?)
+            .arg("--resume")
+            .arg(&run.id)
+            .arg("--debug-file")
+            .arg(run_dir.join("claude-resume.log"))
+            .arg("--add-dir")
+            .arg(run_dir)
+            .arg("--settings")
+            .arg(&settings)
             .stdin(Stdio::inherit())
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit());

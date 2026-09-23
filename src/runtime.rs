@@ -10,20 +10,22 @@ use crate::{
         WorkspaceTags, dependency_graph,
     },
     domain::{
-        ClaimOutcome, Goal, IntegrationOutcome, NewTask, PUSH_REMOTE, Predecessor, PushReport,
-        PushResult, Receipt, ReceiptResult, RegisteredFollowUp, RunLease, RunPaths, RunProcess,
-        RunStatus, SessionRole, SupervisorMode, SupervisorRegistration, Task, TaskRun,
-        heartbeat_stale,
+        ClaimOutcome, Goal, IntegrationOutcome, MAX_RESUME_ATTEMPTS, NewTask, PUSH_REMOTE,
+        Predecessor, PushReport, PushResult, Receipt, ReceiptResult, RegisteredFollowUp, RunLease,
+        RunPaths, RunProcess, RunStatus, SessionRole, SupervisorMode, SupervisorRegistration, Task,
+        TaskRun, heartbeat_stale,
     },
     infrastructure::{
         adapters::{
-            ClaudeCode, GitRepository, load_average, path_text, process_alive, run_shell_to_log,
-            shell_join, workspace_description, workspace_group_name,
+            ClaudeCode, GitRepository, load_average, path_text, process_alive,
+            resume_workspace_description, run_shell_to_log, shell_join, workspace_description,
+            workspace_group_name,
         },
         location::{QueueLocation, runs_dir},
         run_env::load_run_env,
         runtime_store::{
-            HEARTBEAT_TIMEOUT_SECS, Landing, LeasedRun, RunPlan, Validation, lease_is_stale,
+            HEARTBEAT_TIMEOUT_SECS, Landing, LeasedRun, ResumeCandidate, RunPlan, Validation,
+            lease_is_stale,
         },
         sqlite::SqliteQueue,
     },
@@ -373,6 +375,20 @@ impl WorkspaceBackend for RecordingBackend<'_> {
         let result = self.inner.create(task, run, command, tags);
         self.recorded("create", None, Some(&run.id), result)
     }
+    fn create_resume(
+        &self,
+        task: &Task,
+        run: &TaskRun,
+        command: &str,
+        tags: &WorkspaceTags,
+    ) -> Result<String> {
+        let result = self.inner.create_resume(task, run, command, tags);
+        self.recorded("create_resume", None, Some(&run.id), result)
+    }
+    fn send_text(&self, workspace_id: &str, text: &str) -> Result<()> {
+        let result = self.inner.send_text(workspace_id, text);
+        self.recorded("send_text", Some(workspace_id), None, result)
+    }
     fn capture(&self, workspace_id: &str) -> Result<String> {
         let result = self.inner.capture(workspace_id);
         self.recorded("capture", Some(workspace_id), None, result)
@@ -419,6 +435,12 @@ impl WorkspaceBackend for RecordingBackend<'_> {
     fn prompt_wait(&self) -> Duration {
         self.inner.prompt_wait()
     }
+    fn resume_prompt_delay(&self) -> Duration {
+        self.inner.resume_prompt_delay()
+    }
+    fn resume_timeout(&self) -> Duration {
+        self.inner.resume_timeout()
+    }
 }
 
 const IDLE_POLL: Duration = Duration::from_secs(2);
@@ -457,6 +479,14 @@ enum Phase {
     /// Receipt validation runs off the loop because verification commands may
     /// take minutes; the loop only joins the result.
     Validating(Option<thread::JoinHandle<Result<Validation>>>),
+    /// A resumed session of a `needs_session` run (ADR-0019).
+    Resume(ResumeWatch),
+    /// A resolved run whose integrate was approved waits for the single
+    /// integration slot, keeping its lease.
+    AwaitingSlot,
+    /// The approved run lands off the loop, like validation; the landing
+    /// releases the lease itself.
+    Landing(Option<thread::JoinHandle<Result<IntegrationOutcome>>>),
 }
 
 enum Step {
@@ -533,6 +563,9 @@ impl Supervisor<'_> {
         if self.slots.len() < parallel {
             self.adopt_stale_runs(parallel)?;
         }
+        if self.slots.len() < parallel {
+            self.resume_parked_runs(parallel)?;
+        }
         while self.slots.len() < parallel {
             // Most-releasing candidate first, lowest ID on a tie (ADR-0023);
             // `graph` shows the same order, so it is not recorded.
@@ -596,6 +629,35 @@ impl Supervisor<'_> {
                 {
                     self.disown(&slot)
                 }
+                Err(error) if matches!(slot.phase, Phase::AwaitingSlot) => {
+                    // The resume already recorded its `resume_finished`;
+                    // only the lease it kept for the landing goes.
+                    let message = format!("landing after the resume could not start: {error:#}");
+                    self.log.note(&format!("run {}: {message}", slot.run.id));
+                    if let Err(error) = self.queue.release_lease(&slot.run.id, &self.token) {
+                        self.log.note(&format!(
+                            "run {}: could not release the lease: {error:#}",
+                            slot.run.id
+                        ));
+                    }
+                    self.errors.push(RunError {
+                        run_id: slot.run.id.clone(),
+                        task_id: slot.run.task_id,
+                        message,
+                    });
+                }
+                Err(error) if matches!(slot.phase, Phase::Resume(_)) => {
+                    let message = format!("{error:#}");
+                    self.log.note(&format!(
+                        "run {} resume stopped: {message}; its workspace is kept for inspection",
+                        slot.run.id
+                    ));
+                    let (attempt, workspace) = match &slot.phase {
+                        Phase::Resume(watch) => (watch.attempt, Some(watch.workspace.clone())),
+                        _ => unreachable!("matched a resume"),
+                    };
+                    self.give_up_resume(&slot.run, attempt, workspace.as_deref(), message);
+                }
                 Err(error) => {
                     // Creation/communication failures can be ambiguous: the
                     // session may be alive. Disown the run, delete nothing,
@@ -644,11 +706,176 @@ impl Supervisor<'_> {
         });
     }
 
+    /// A resume that failed in itself (not the session's verdict): record
+    /// `resume_finished` with outcome `error` and give the lease back; the
+    /// run stays `needs_session` with its reason, and the attempt counts.
+    /// The resume workspace is closed only when no session of this resume
+    /// can be alive: its wrapper never registered (and, the lease gone, no
+    /// longer can) or already exited. `workspace` is `None` when opening it
+    /// failed before cmux returned its ID; workspaces are never looked up
+    /// by title (ADR-0026).
+    fn give_up_resume(
+        &mut self,
+        run: &TaskRun,
+        attempt: usize,
+        workspace: Option<&str>,
+        message: String,
+    ) {
+        let workspace = workspace.map(str::to_owned);
+        // The workspace is recorded so a later pass knows it for this run's
+        // own once its session has ended (`close_left_resume_workspaces`).
+        let payload = json!({
+            "attempt": attempt,
+            "outcome": "error",
+            "error": message,
+            "workspace_id": workspace,
+            "exhausted": attempt >= MAX_RESUME_ATTEMPTS,
+        });
+        if let Err(error) =
+            self.queue
+                .finish_resume(&run.id, &self.token, None, None, false, payload)
+        {
+            self.log.note(&format!(
+                "run {}: could not record the resume error: {error:#}",
+                run.id
+            ));
+        }
+        let session_may_live = self.queue.processes(&run.id).map_or(true, |processes| {
+            processes
+                .iter()
+                .any(|p| p.role == "wrapper" && p.exited_at.is_none())
+        });
+        if let Some(workspace) = workspace {
+            if session_may_live {
+                self.log.note(&format!(
+                    "run {}: resume workspace {workspace} is kept; its session may still run",
+                    run.id
+                ));
+            } else if let Err(error) = self.cmux.close(&workspace) {
+                self.log.note(&format!(
+                    "run {}: resume workspace {workspace} could not be closed: {error:#}",
+                    run.id
+                ));
+            }
+        }
+        self.errors.push(RunError {
+            run_id: run.id.clone(),
+            task_id: run.task_id,
+            message,
+        });
+    }
+
     fn step(&mut self, slot: &mut Slot) -> Result<Step> {
+        // A landing releases the lease itself when it ends, so it is joined
+        // before the lease is checked.
+        if let Phase::Landing(handle) = &mut slot.phase {
+            if !handle.as_ref().is_some_and(|h| h.is_finished()) {
+                return Ok(Step::Continue);
+            }
+            let landed = handle
+                .take()
+                .context("landing already joined")?
+                .join()
+                .map_err(|_| anyhow!("landing thread panicked"));
+            match landed.and_then(|result| result) {
+                Ok(outcome) => {
+                    let outcome = serde_json::to_value(&outcome)?;
+                    self.log.note(&format!(
+                        "run {} landing after its resume: {}",
+                        slot.run.id, outcome["outcome"]
+                    ));
+                }
+                Err(error) => {
+                    let message = format!("landing after the resume failed: {error:#}");
+                    self.log.note(&format!("run {}: {message}", slot.run.id));
+                    self.errors.push(RunError {
+                        run_id: slot.run.id.clone(),
+                        task_id: slot.run.task_id,
+                        message,
+                    });
+                }
+            }
+            return Ok(Step::Done(Box::new(self.queue.run(&slot.run.id)?)));
+        }
         if !self.queue.holds_lease(&slot.run.id, &self.token)? {
             return Ok(Step::Disowned);
         }
         match &mut slot.phase {
+            Phase::Resume(watch) => {
+                let Some(verdict) = watch.poll(
+                    &mut self.queue,
+                    self.cmux,
+                    &self.repository,
+                    &slot.run,
+                    &self.log,
+                )?
+                else {
+                    return Ok(Step::Continue);
+                };
+                let attempt = watch.attempt;
+                let workspace = watch.workspace.clone();
+                self.finish_resumed_session(slot, attempt, &workspace, verdict)
+            }
+            Phase::AwaitingSlot => {
+                if !self
+                    .queue
+                    .runs_with_status(RunStatus::Integrating)?
+                    .is_empty()
+                {
+                    return Ok(Step::Continue);
+                }
+                let main = self.repository.main_head()?;
+                let run = match self
+                    .queue
+                    .begin_integration(&slot.run.id, &self.token, &main)
+                {
+                    Ok(run) => run,
+                    // An `integrate` took the slot since the check: try again later.
+                    Err(_)
+                        if !self
+                            .queue
+                            .runs_with_status(RunStatus::Integrating)?
+                            .is_empty() =>
+                    {
+                        return Ok(Step::Continue);
+                    }
+                    Err(error) => return Err(error),
+                };
+                self.log.note(&format!(
+                    "run {} was approved for integration; landing it onto main {main}",
+                    run.id
+                ));
+                let db = self.db.clone();
+                let repository = self.repository.clone();
+                let token = self.token.clone();
+                let common_dir = path_text(&self.repository.common_dir)?;
+                // Push as the approving `integrate` would have (`--no-push`
+                // records `push: false`).
+                let push = self
+                    .queue
+                    .run_events(&run.id)?
+                    .iter()
+                    .find(|e| e.kind == "integration_approved")
+                    .is_none_or(|e| e.payload.get("push") != Some(&json!(false)));
+                let landing = run.clone();
+                slot.run = run;
+                slot.phase = Phase::Landing(Some(thread::spawn(move || {
+                    let mut queue = SqliteQueue::open(&db)?;
+                    land_integrating(
+                        &mut queue,
+                        &db,
+                        &repository,
+                        &landing,
+                        RunStatus::NeedsSession,
+                        &main,
+                        &token,
+                        &common_dir,
+                        push.then_some(&repository as &dyn MainRemote),
+                    )
+                })));
+                Ok(Step::Continue)
+            }
+            Phase::Landing(_) => unreachable!("joined above"),
             Phase::Session(watch) => {
                 let Some(run) = watch.poll(
                     &mut self.queue,
@@ -697,6 +924,226 @@ impl Supervisor<'_> {
                 Ok(Step::Done(Box::new(run)))
             }
         }
+    }
+
+    /// Resume `needs_session` runs with attempts left (ADR-0019 decision 1),
+    /// oldest first, while slots are free: a run with a lease that is not
+    /// stale, or whose last session still runs, is someone's already.
+    fn resume_parked_runs(&mut self, parallel: usize) -> Result<()> {
+        for candidate in self.queue.runs_needing_session()? {
+            if self.slots.len() >= parallel {
+                break;
+            }
+            let ResumeCandidate {
+                run,
+                lease,
+                wrapper,
+                attempts,
+            } = candidate;
+            let now = unix_time();
+            // A previous session whose wrapper process lives on, however
+            // silent, is never joined by a second one on the same worktree.
+            if attempts >= MAX_RESUME_ATTEMPTS
+                || lease.is_some_and(|lease| !lease_is_stale(&lease, now))
+                || wrapper.is_some_and(|w| w.exited_at.is_none() && process_alive(w.pid))
+            {
+                continue;
+            }
+            self.close_left_resume_workspaces(&run)?;
+            let main = self.repository.main_head()?;
+            let (reason, evidence_missing) = resume_reason(&self.queue, &run)?;
+            let Some((run, attempt)) = self.queue.begin_resume(
+                &run.id,
+                &self.token,
+                &main,
+                reason.as_deref(),
+                MAX_RESUME_ATTEMPTS,
+            )?
+            else {
+                continue;
+            };
+            let request = ResumeRequest {
+                main,
+                reason: reason.unwrap_or_else(|| "(no reason recorded)".to_owned()),
+                evidence_missing,
+            };
+            match self.start_resume(&run, attempt, &request) {
+                Ok(watch) => {
+                    self.log.note(&format!(
+                        "run {} of task {} resumed (attempt {attempt} of {MAX_RESUME_ATTEMPTS}) in workspace {}",
+                        run.id, run.task_id, watch.workspace
+                    ));
+                    self.slots.push(Slot {
+                        run,
+                        phase: Phase::Resume(watch),
+                    });
+                }
+                Err(error) => {
+                    let message = format!("run {} could not be resumed: {error:#}", run.id);
+                    self.log.note(&message);
+                    self.give_up_resume(&run, attempt, None, message);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Close the resume workspaces earlier attempts of this run left open
+    /// (a session let go after the exit timeout, or one that might have
+    /// lived when a resume failed), found by the IDs recorded in its
+    /// `resume_finished` events (ADR-0026). The caller checked that no
+    /// session of the run is alive.
+    fn close_left_resume_workspaces(&mut self, run: &TaskRun) -> Result<()> {
+        let left: Vec<String> = self
+            .queue
+            .run_events(&run.id)?
+            .iter()
+            .filter(|e| e.kind == "resume_finished" && e.payload["workspace_closed"] != true)
+            .filter_map(|e| e.payload.get("workspace_id").and_then(Value::as_str))
+            .map(str::to_owned)
+            .collect();
+        for workspace in left {
+            if self.cmux.exists(&workspace)? {
+                self.log.note(&format!(
+                    "run {}: closing resume workspace {workspace} left by an earlier attempt; its session has ended",
+                    run.id
+                ));
+                self.cmux.close(&workspace)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Write the resolution request, refresh the runtime snapshot (the one
+    /// the worker ran may predate `session --resume`) and open the resume
+    /// workspace with the same wrapper and settings as the worker's.
+    fn start_resume(
+        &mut self,
+        run: &TaskRun,
+        attempt: usize,
+        request: &ResumeRequest,
+    ) -> Result<ResumeWatch> {
+        let run_dir = PathBuf::from(run.run_dir.as_ref().context("missing run directory")?);
+        let worktree = Path::new(run.worktree_path.as_ref().context("missing worktree")?);
+        ensure!(
+            worktree.is_dir(),
+            "worktree {} is missing",
+            worktree.display()
+        );
+        let task = self.queue.show(run.task_id)?.task;
+        let landed = landed_since(&mut self.queue, &self.repository, run, &request.main)?;
+        let message = resume_request(&task, run, request, &landed)?;
+        fs::write(run_dir.join(format!("resume-{attempt}.txt")), &message)?;
+        fs::copy(self.runner, run_dir.join("runner")).context("snapshot runtime binary")?;
+        let command = shell_join(&[
+            path_text(&run_dir.join("runner"))?,
+            "--db".into(),
+            path_text(&self.db)?,
+            "session".into(),
+            "--run".into(),
+            run.id.clone(),
+            "--lease".into(),
+            self.token.clone(),
+            "--claude".into(),
+            path_text(self.claude)?,
+            "--resume".into(),
+        ]);
+        // The worker's env and group (the same session of the run) and the
+        // description `run <run-id> resume` (ADR-0028).
+        let tags = WorkspaceTags {
+            env: session_env(SessionRole::Worker, &self.db)?,
+            description: Some(resume_workspace_description(run)),
+            group: self.workspace_group(),
+        };
+        let workspace = self.cmux.create_resume(&task, run, &command, &tags)?;
+        Ok(ResumeWatch {
+            workspace,
+            attempt,
+            run_dir,
+            receipt_path: PathBuf::from(run.receipt_path.as_ref().context("missing receipt path")?),
+            idle_marker: run.idle_marker_path()?,
+            started_at: SystemTime::now(),
+            startup: Instant::now(),
+            message,
+            agent_seen: None,
+            message_sent: None,
+            exit_requested: None,
+        })
+    }
+
+    /// The resumed session ended: close its workspace, record
+    /// `resume_finished` and move the run on. A resolved run whose
+    /// integrate was approved keeps its lease and waits for the landing
+    /// slot; an unapproved one goes back to `awaiting_integration`; a
+    /// `failed` receipt ends the run; anything else leaves it
+    /// `needs_session` for the next attempt, or for a human after the last.
+    fn finish_resumed_session(
+        &mut self,
+        slot: &mut Slot,
+        attempt: usize,
+        workspace: &str,
+        verdict: ResumeVerdict,
+    ) -> Result<Step> {
+        // A session let go after the exit timeout still runs: its
+        // workspace stays, and blocks the next attempt until it ends.
+        let closed = !verdict.exit_timed_out
+            && match self.cmux.close(workspace) {
+                Ok(()) => true,
+                Err(error) => {
+                    self.log.note(&format!(
+                        "run {}: resume workspace {workspace} could not be closed: {error:#}",
+                        slot.run.id
+                    ));
+                    false
+                }
+            };
+        let approved = self
+            .queue
+            .has_run_event(&slot.run.id, "integration_approved")?;
+        let mut payload = json!({
+            "attempt": attempt,
+            "outcome": verdict.outcome(),
+            "head": verdict.head,
+            "workspace_id": workspace,
+            "workspace_closed": closed,
+            "approved": approved,
+        });
+        if verdict.exit_timed_out {
+            payload["exit_timed_out"] = json!(true);
+        }
+        let id = slot.run.id.clone();
+        let run = match verdict.kind {
+            ResumeOutcome::Resolved if approved => {
+                let run = self
+                    .queue
+                    .finish_resume(&id, &self.token, None, None, true, payload)?;
+                slot.run = run;
+                slot.phase = Phase::AwaitingSlot;
+                return Ok(Step::Continue);
+            }
+            ResumeOutcome::Resolved => self.queue.finish_resume(
+                &id,
+                &self.token,
+                Some(RunStatus::AwaitingIntegration),
+                None,
+                false,
+                payload,
+            )?,
+            ResumeOutcome::Failed(reason) => self.queue.finish_resume(
+                &id,
+                &self.token,
+                Some(RunStatus::Failed),
+                Some(&reason),
+                false,
+                payload,
+            )?,
+            ResumeOutcome::Unresolved => {
+                payload["exhausted"] = json!(attempt >= MAX_RESUME_ATTEMPTS);
+                self.queue
+                    .finish_resume(&id, &self.token, None, None, false, payload)?
+            }
+        };
+        Ok(Step::Done(Box::new(run)))
     }
 
     /// Take over `running` / `validating` runs whose lease went stale under
@@ -1300,6 +1747,339 @@ fn screen_tail(screen: &str, count: usize) -> String {
     lines[lines.len().saturating_sub(count)..].join("\n")
 }
 
+/// How many resumes of the run were started, for a resume error recorded
+/// outside the resume watch; unreadable counts as the last attempt.
+fn resume_attempts(queue: &SqliteQueue, id: &str) -> usize {
+    queue
+        .run_events(id)
+        .map(|events| events.iter().filter(|e| e.kind == "resume_started").count())
+        .unwrap_or(MAX_RESUME_ATTEMPTS)
+}
+
+/// What the resolution request tells a resumed session.
+struct ResumeRequest {
+    /// The `main` head the session rebases onto.
+    main: String,
+    reason: String,
+    /// The run came from validation's `evidence_missing`, not a landing:
+    /// the session adds evidence instead of rebasing.
+    evidence_missing: bool,
+}
+
+/// Why the run waits for a session: the reason of its latest
+/// `integration_deferred` / `integration_error` / `evidence_missing` event
+/// (a runtime error since, such as a failed resume, may have replaced
+/// `last_error`), else `last_error`; and whether that event was
+/// `evidence_missing`.
+fn resume_reason(queue: &SqliteQueue, run: &TaskRun) -> Result<(Option<String>, bool)> {
+    let events = queue.run_events(&run.id)?;
+    let parked = events.iter().rev().find(|e| {
+        matches!(
+            e.kind.as_str(),
+            "integration_deferred" | "integration_error" | "evidence_missing"
+        )
+    });
+    let reason = parked
+        .and_then(|e| e.payload.get("reason").and_then(Value::as_str))
+        .map(str::to_owned)
+        .or_else(|| run.last_error.clone());
+    Ok((reason, parked.is_some_and(|e| e.kind == "evidence_missing")))
+}
+
+/// The tasks landed on `main` since the run's base, oldest first, from the
+/// `Dagq-Task` trailers, each with its integrated run's receipt summary.
+fn landed_since(
+    queue: &mut SqliteQueue,
+    repository: &GitRepository,
+    run: &TaskRun,
+    main: &str,
+) -> Result<Vec<PredecessorSummary>> {
+    let mut landed = Vec::new();
+    for task_id in repository.landed_task_ids(&run.base_commit, main)? {
+        let Ok(detail) = queue.show(task_id) else {
+            continue;
+        };
+        let integrated_run = detail
+            .runs
+            .iter()
+            .rev()
+            .find(|r| r.status == RunStatus::Integrated)
+            .cloned();
+        landed.push(PredecessorSummary::from_predecessor(&Predecessor {
+            task: detail.task,
+            integrated_run,
+        }));
+    }
+    Ok(landed)
+}
+
+/// The fixed resolution request the supervisor types into a resumed
+/// session (ADR-0019 decision 1), one instruction per line; the backend
+/// sends it as one line.
+fn resume_request(
+    task: &Task,
+    run: &TaskRun,
+    request: &ResumeRequest,
+    landed: &[PredecessorSummary],
+) -> Result<String> {
+    let receipt = run.receipt_path.as_ref().context("missing receipt path")?;
+    let mut lines = vec![if request.evidence_missing {
+        format!(
+            "dagq: the supervisor's validation of run {} (task {}) found required evidence missing from the receipt, so the run is needs_session.",
+            run.id, task.id
+        )
+    } else {
+        format!(
+            "dagq: integrate could not land run {} (task {}) and returned needs_session.",
+            run.id, task.id
+        )
+    }];
+    lines.push(format!("Reason: {}", request.reason));
+    lines.push(format!(
+        "main is now {} (your base commit was {}).",
+        request.main, run.base_commit
+    ));
+    if landed.is_empty() {
+        lines.push("Tasks landed on main since your base: none.".to_owned());
+    } else {
+        lines.push("Tasks landed on main since your base:".to_owned());
+        for task in landed {
+            lines.push(format!(
+                "- task {}: {}; summary: {}",
+                task.task_id, task.title, task.summary
+            ));
+        }
+    }
+    lines.push("Steps:".to_owned());
+    let verify = serde_json::to_string(&task.verification_commands)?;
+    if request.evidence_missing {
+        lines.push(
+            "1. Run the checks the reason names as missing and write their evidence into the receipt."
+                .to_owned(),
+        );
+        lines.push(format!(
+            "2. If that changes files, commit them and rerun the verification commands {verify}."
+        ));
+    } else {
+        lines.push(format!(
+            "1. In this worktree run git rebase {} and resolve the conflicts.",
+            request.main
+        ));
+        lines.push(format!(
+            "2. Rerun the verification commands {verify} and commit the result."
+        ));
+    }
+    lines.push("3. Keep the worktree clean.".to_owned());
+    lines.push(format!(
+        "4. Rewrite the receipt at {receipt} with the new head commit, writing a temporary file in the same directory and renaming it."
+    ));
+    lines.push(
+        "5. If the change is no longer needed, write the receipt with result failed and the reason in summary."
+            .to_owned(),
+    );
+    lines.push(
+        "6. Do not merge or push. When done, report briefly and stop; do not run /exit.".to_owned(),
+    );
+    Ok(lines.join("\n"))
+}
+
+/// Watches one resumed session: its wrapper registration, the single
+/// resolution request once its agent is up, the rewritten receipt and the
+/// idle marker, the single `/exit`, and the wrapper's exit.
+struct ResumeWatch {
+    workspace: String,
+    attempt: usize,
+    run_dir: PathBuf,
+    receipt_path: PathBuf,
+    idle_marker: PathBuf,
+    /// A receipt no newer than this is the one from before the resume.
+    started_at: SystemTime,
+    startup: Instant,
+    message: String,
+    agent_seen: Option<Instant>,
+    /// When the resolution request was sent (for its timeout, and for the
+    /// idle marker of the response to it).
+    message_sent: Option<(Instant, SystemTime)>,
+    exit_requested: Option<Instant>,
+}
+
+/// What a resumed session left behind when it exited.
+enum ResumeOutcome {
+    /// A rewritten `succeeded` receipt names the worktree head.
+    Resolved,
+    /// A rewritten receipt reports `failed`; the reason for `last_error`.
+    Failed(String),
+    /// Anything else: no rewritten receipt, or one for another commit.
+    Unresolved,
+}
+
+struct ResumeVerdict {
+    kind: ResumeOutcome,
+    head: Option<String>,
+    /// The session did not exit within the exit timeout of `/exit`: it is
+    /// let go (still running, its workspace kept) so the slot and the lease
+    /// are not held forever.
+    exit_timed_out: bool,
+}
+
+impl ResumeVerdict {
+    fn outcome(&self) -> &'static str {
+        match self.kind {
+            ResumeOutcome::Resolved => "resolved",
+            ResumeOutcome::Failed(_) => "failed",
+            ResumeOutcome::Unresolved => "unresolved",
+        }
+    }
+}
+
+impl ResumeWatch {
+    /// The receipt the session rewrote during this resume, if any.
+    fn rewritten_receipt(&self) -> Option<Receipt> {
+        let modified = fs::metadata(&self.receipt_path).ok()?.modified().ok()?;
+        if modified <= self.started_at {
+            return None;
+        }
+        Receipt::parse(&fs::read_to_string(&self.receipt_path).ok()?).ok()
+    }
+
+    /// `head` is the worktree's HEAD when the worktree is clean, `None`
+    /// otherwise: a resolved receipt must name a clean head.
+    fn verdict(&self, run: &TaskRun, head: Option<&str>) -> ResumeOutcome {
+        match self.rewritten_receipt() {
+            Some(receipt) if receipt.run_id != run.id => ResumeOutcome::Unresolved,
+            Some(receipt) if receipt.result == ReceiptResult::Failed => ResumeOutcome::Failed(
+                format!("session reported the run as failed: {}", receipt.summary),
+            ),
+            Some(receipt)
+                if head.is_some_and(|head| head == receipt.commit.to_ascii_lowercase()) =>
+            {
+                ResumeOutcome::Resolved
+            }
+            _ => ResumeOutcome::Unresolved,
+        }
+    }
+
+    /// One observation; `Some` once the wrapper exited.
+    fn poll(
+        &mut self,
+        queue: &mut SqliteQueue,
+        cmux: &dyn WorkspaceBackend,
+        repository: &GitRepository,
+        run: &TaskRun,
+        log: &SupervisorLog,
+    ) -> Result<Option<ResumeVerdict>> {
+        let processes = queue.processes(&run.id)?;
+        let Some(wrapper) = processes.iter().find(|p| p.role == "wrapper") else {
+            let timeout = cmux.registration_timeout();
+            ensure!(
+                self.startup.elapsed() < timeout,
+                "resumed session's wrapper did not register within {} seconds",
+                timeout.as_secs()
+            );
+            return Ok(None);
+        };
+        let worktree = Path::new(run.worktree_path.as_ref().context("missing worktree")?);
+        if wrapper.exited_at.is_some() {
+            match cmux.capture(&self.workspace) {
+                Ok(screen) => fs::write(
+                    self.run_dir
+                        .join(format!("terminal-resume-{}.txt", self.attempt)),
+                    screen,
+                )?,
+                Err(error) => queue.record_runtime_event(
+                    &run.id,
+                    "screen_capture_failed",
+                    json!({"error": format!("{error:#}")}),
+                )?,
+            }
+            let head = repository.head(worktree).ok();
+            let clean = repository
+                .status(worktree)
+                .is_ok_and(|status| status.trim().is_empty());
+            return Ok(Some(ResumeVerdict {
+                kind: self.verdict(run, head.as_deref().filter(|_| clean)),
+                head,
+                exit_timed_out: false,
+            }));
+        }
+        ensure!(
+            unix_time() - wrapper.heartbeat_at <= HEARTBEAT_TIMEOUT_SECS,
+            "resumed session's wrapper heartbeat expired; session may still be alive"
+        );
+        let Some((sent, sent_at)) = self.message_sent else {
+            if processes.iter().any(|p| p.role == "agent") {
+                let seen = *self.agent_seen.get_or_insert_with(Instant::now);
+                if seen.elapsed() >= cmux.resume_prompt_delay() {
+                    cmux.send_text(&self.workspace, &self.message)?;
+                    self.message_sent = Some((Instant::now(), SystemTime::now()));
+                    log.note(&format!(
+                        "resolution request sent to run {} in workspace {}",
+                        run.id, self.workspace
+                    ));
+                }
+            }
+            return Ok(None);
+        };
+        match self.exit_requested {
+            None => {
+                let head = repository.head(worktree)?;
+                let clean = repository.status(worktree)?.trim().is_empty();
+                // Resolved (or failed) and idle after the receipt; or idle
+                // after the request with no such receipt, which a session
+                // that could not resolve it (or stopped at a question)
+                // never ends by itself; or no idle at all within the
+                // resume timeout (a lost request, a dialog).
+                let why = match self.verdict(run, Some(head.as_str()).filter(|_| clean)) {
+                    ResumeOutcome::Unresolved if marker_newer_than(&self.idle_marker, sent_at)? => {
+                        Some("went idle without a resolving receipt")
+                    }
+                    ResumeOutcome::Unresolved => None,
+                    _ => idle_after_receipt(&self.receipt_path, &self.idle_marker)?
+                        .map(|_| "rewrote its receipt and went idle"),
+                }
+                .or_else(|| {
+                    (sent.elapsed() >= cmux.resume_timeout())
+                        .then_some("did not finish within the resume timeout")
+                });
+                if let Some(why) = why {
+                    // Ask once, the way the maintainer would; never kill the session.
+                    cmux.send_exit(&self.workspace)?;
+                    log.note(&format!(
+                        "resumed session of {} {why} (head {head}); exit requested",
+                        run.id
+                    ));
+                    self.exit_requested = Some(Instant::now());
+                }
+            }
+            Some(requested) if requested.elapsed() >= cmux.exit_timeout() => {
+                // /exit is not resent (it could pick a dialog's option).
+                log.note(&format!(
+                    "resumed session of {} did not exit within {}s of the exit request; letting it go as unresolved (its workspace {} is kept)",
+                    run.id,
+                    cmux.exit_timeout().as_secs(),
+                    self.workspace
+                ));
+                return Ok(Some(ResumeVerdict {
+                    kind: ResumeOutcome::Unresolved,
+                    head: repository.head(worktree).ok(),
+                    exit_timed_out: true,
+                }));
+            }
+            Some(_) => (),
+        }
+        Ok(None)
+    }
+}
+
+/// Whether the marker exists and was modified after `since`.
+fn marker_newer_than(marker: &Path, since: SystemTime) -> Result<bool> {
+    match fs::metadata(marker) {
+        Ok(meta) => Ok(meta.modified()? > since),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error).context("inspect idle marker"),
+    }
+}
+
 /// Evidence that the agent finished a response after publishing the receipt: an
 /// idle marker written by the provider's stop hook no older than the receipt.
 /// Markers from earlier turns (for example a question to the maintainer) do not count.
@@ -1619,34 +2399,75 @@ pub fn integrate(
             None => return Ok(serde_json::to_value(IntegrationOutcome::NoRunAwaiting)?),
         },
     };
+    // The call is the approval to land (ADR-0016 decision 5): a run it
+    // parks as `needs_session` is landed by the supervisor once a resumed
+    // session resolved it (ADR-0019 decision 1).
+    if !queue.has_run_event(&run.id, "integration_approved")? {
+        queue.record_runtime_event(
+            &run.id,
+            "integration_approved",
+            json!({"status": run.status.as_str(), "pid": std::process::id(), "push": remote.is_some()}),
+        )?;
+    }
     let previous = run.status;
     let token = Uuid::new_v4().to_string();
     let main = repository.main_head()?;
     let run = queue.begin_integration(&run.id, &token, &main)?;
     let heartbeat = Heartbeat::start(db.clone(), token.clone());
+    let outcome = land_integrating(
+        &mut queue,
+        &db,
+        &repository,
+        &run,
+        previous,
+        &main,
+        &token,
+        &common_dir,
+        remote,
+    )?;
+    drop(heartbeat); // Stops the lease heartbeat before this process reports.
+    Ok(serde_json::to_value(outcome)?)
+}
+
+/// Land a run that holds the integration slot under `token` (see
+/// [`integrate`]) and record the outcome; shared by `integrate` and by the
+/// supervisor landing an approved run it resumed. An error before `main`
+/// moved gives the slot back and returns the run to `previous`.
+#[allow(clippy::too_many_arguments)]
+fn land_integrating(
+    queue: &mut SqliteQueue,
+    db: &Path,
+    repository: &GitRepository,
+    run: &TaskRun,
+    previous: RunStatus,
+    main: &str,
+    token: &str,
+    common_dir: &str,
+    remote: Option<&dyn MainRemote>,
+) -> Result<IntegrationOutcome> {
     let task = queue.show(run.task_id)?.task;
     eprintln!(
         "run {} integrating task {} onto main {main}",
         run.id, run.task_id
     );
-    let verdict = match land(&mut queue, &db, &repository, &task, &run, &main) {
+    let verdict = match land(queue, db, repository, &task, run, main) {
         Ok(verdict) => verdict,
         Err(error) => {
             // Nothing reached main: give the slot back and keep the run where it was.
             let message = format!("integration stopped before main moved: {error:#}");
             if let Err(record) =
-                queue.abort_integration(&run.id, &token, previous.as_str(), &message)
+                queue.abort_integration(&run.id, token, previous.as_str(), &message)
             {
                 eprintln!("run {}: could not record the error: {record:#}", run.id);
             }
             return Err(error.context(format!("run {} returned to {}", run.id, previous.as_str())));
         }
     };
-    let outcome = match verdict {
+    Ok(match verdict {
         Verdict::Landed(landing, proposed) => {
             let verification_skipped = landing.verification_skipped;
             let (task, run) = queue
-                .finish_integration(&run.id, &token, &landing, &common_dir)
+                .finish_integration(&run.id, token, &landing, common_dir)
                 .with_context(|| {
                     format!(
                         "main advanced to {} but run {} could not be completed; inspect show and doctor",
@@ -1657,9 +2478,9 @@ pub fn integrate(
                 "task {} landed as {} on main; run {} integrated",
                 task.id, landing.commit, run.id
             );
-            remove_landed_worktree(&mut queue, &repository, &run);
-            let push = push_main(&queue, remote, &run.id, &landing.commit);
-            let follow_ups = register_follow_ups(&mut queue, &task, &run.id, proposed.as_ref());
+            remove_landed_worktree(queue, repository, &run);
+            let push = push_main(queue, remote, &run.id, &landing.commit);
+            let follow_ups = register_follow_ups(queue, &task, &run.id, proposed.as_ref());
             IntegrationOutcome::Integrated {
                 task,
                 run: Box::new(run),
@@ -1668,26 +2489,28 @@ pub fn integrate(
                 follow_ups,
             }
         }
-        Verdict::Deferred { reason, detail } => {
+        Verdict::Deferred { reason, mut detail } => {
             eprintln!("run {} needs a session: {reason}", run.id);
-            let run = queue.defer_integration(&run.id, &token, &reason, detail)?;
+            // How many more times the supervisor resumes it (ADR-0019); the
+            // event is the maintainer's only once none are left.
+            detail["resumes_left"] =
+                json!(MAX_RESUME_ATTEMPTS.saturating_sub(resume_attempts(queue, &run.id)));
+            let run = queue.defer_integration(&run.id, token, &reason, detail)?;
             IntegrationOutcome::NeedsSession {
                 run: Box::new(run),
-                main,
+                main: main.to_owned(),
                 reason,
             }
         }
         Verdict::ReceiptFailed { reason, receipt } => {
             eprintln!("run {} failed: {reason}", run.id);
-            let run = queue.fail_integration(&run.id, &token, &reason, receipt)?;
+            let run = queue.fail_integration(&run.id, token, &reason, receipt)?;
             IntegrationOutcome::Failed {
                 run: Box::new(run),
                 reason,
             }
         }
-    };
-    drop(heartbeat); // Stops the lease heartbeat before this process reports.
-    Ok(serde_json::to_value(outcome)?)
+    })
 }
 
 /// Push the landed `main` to [`PUSH_REMOTE`] and record the outcome as
@@ -3100,7 +3923,9 @@ fn run_health(
 }
 
 /// Run from cmux, not from a pipe; stdout must remain a terminal for Claude.
-pub fn session(db: &Path, id: &str, token: &str, claude: &Path) -> Result<Value> {
+/// `resume` reopens the session of a `needs_session` run the supervisor is
+/// resuming (ADR-0019) instead of starting the worker.
+pub fn session(db: &Path, id: &str, token: &str, claude: &Path, resume: bool) -> Result<Value> {
     ensure!(
         std::io::stdin().is_terminal() && std::io::stdout().is_terminal(),
         "interactive Claude wrapper requires a terminal"
@@ -3108,7 +3933,7 @@ pub fn session(db: &Path, id: &str, token: &str, claude: &Path) -> Result<Value>
     let provider = ClaudeCode {
         executable: claude.into(),
     };
-    session_with_provider(db, id, token, &provider)
+    run_session(db, id, token, &provider, resume)
 }
 
 pub fn session_with_provider(
@@ -3117,9 +3942,30 @@ pub fn session_with_provider(
     token: &str,
     provider: &dyn AgentProvider,
 ) -> Result<Value> {
+    run_session(db, id, token, provider, false)
+}
+
+/// The wrapper of a resumed session: `session --resume`.
+pub fn resume_session_with_provider(
+    db: &Path,
+    id: &str,
+    token: &str,
+    provider: &dyn AgentProvider,
+) -> Result<Value> {
+    run_session(db, id, token, provider, true)
+}
+
+fn run_session(
+    db: &Path,
+    id: &str,
+    token: &str,
+    provider: &dyn AgentProvider,
+    resume: bool,
+) -> Result<Value> {
     let mut queue = SqliteQueue::open(db)?;
     let started = Instant::now();
-    // cmux may start this command before its create response reaches supervisor.
+    // cmux may start this command before its create response reaches
+    // supervisor. A resumed run keeps the workspace of its first session.
     let run = loop {
         let run = queue.run(id)?;
         if run.workspace_id.is_some() {
@@ -3132,9 +3978,20 @@ pub fn session_with_provider(
         thread::sleep(Duration::from_millis(100));
     };
     let pid = std::process::id();
-    queue.register_wrapper(id, token, pid)?;
+    if resume {
+        queue.register_resume_wrapper(id, token, pid)?;
+    } else {
+        queue.register_wrapper(id, token, pid)?;
+    }
     let mut child_may_be_alive = false;
-    let result = drive_agent(&mut queue, &run, provider, pid, &mut child_may_be_alive);
+    let result = drive_agent(
+        &mut queue,
+        &run,
+        provider,
+        pid,
+        resume,
+        &mut child_may_be_alive,
+    );
     match result {
         Ok(code) => {
             queue.wrapper_exited(id, pid, code)?;
@@ -3155,17 +4012,24 @@ fn drive_agent(
     run: &TaskRun,
     provider: &dyn AgentProvider,
     pid: u32,
+    resume: bool,
     child_may_be_alive: &mut bool,
 ) -> Result<i32> {
-    let prompt_path =
-        Path::new(run.run_dir.as_ref().context("missing run directory")?).join("prompt.txt");
-    let text = fs::read_to_string(prompt_path)?;
-    let mut child = provider
-        .command(run, &text)?
-        .spawn()
-        .context("launch agent")?;
+    let mut command = if resume {
+        provider.resume_command(run)?
+    } else {
+        let prompt_path =
+            Path::new(run.run_dir.as_ref().context("missing run directory")?).join("prompt.txt");
+        provider.command(run, &fs::read_to_string(prompt_path)?)?
+    };
+    let mut child = command.spawn().context("launch agent")?;
     *child_may_be_alive = true;
-    if let Err(error) = queue.register_agent(&run.id, pid, child.id()) {
+    let registered = if resume {
+        queue.register_resume_agent(&run.id, pid, child.id())
+    } else {
+        queue.register_agent(&run.id, pid, child.id())
+    };
+    if let Err(error) = registered {
         let _ = child.kill();
         if child.wait().is_ok() {
             *child_may_be_alive = false;

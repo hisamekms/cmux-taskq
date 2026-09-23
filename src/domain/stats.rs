@@ -489,8 +489,13 @@ fn runs(events: &[RunEvent], goals: &HashMap<i64, Option<i64>>) -> Vec<Track> {
             run.status = Some(status.to_owned());
             match status {
                 // `integration_error` only puts back the status the run had
-                // before the attempt; it parks nothing new.
-                "needs_session" if event.kind != "integration_error" => run.needs_session += 1,
+                // before the attempt, and `resume_finished` reports the run
+                // still parked (ADR-0019); neither parks anything new.
+                "needs_session"
+                    if !matches!(event.kind.as_str(), "integration_error" | "resume_finished") =>
+                {
+                    run.needs_session += 1
+                }
                 "failed" => run.failed += 1,
                 _ => {}
             }

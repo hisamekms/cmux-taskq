@@ -6,10 +6,11 @@
 //! by `domain`.
 use crate::{
     domain::{
-        ATTENTION_KINDS, Attention, AttentionNext, RunEvent, SupervisorPulse,
-        SupervisorRegistration, event_attention, run_attention, supervisor_attention,
+        ATTENTION_KINDS, Attention, AttentionNext, MAX_RESUME_ATTEMPTS, RunEvent, RunStatus,
+        SupervisorPulse, SupervisorRegistration, event_attention, run_attention,
+        supervisor_attention,
     },
-    infrastructure::{adapters::process_alive, sqlite::SqliteQueue},
+    infrastructure::{adapters::process_alive, runtime_store::lease_is_stale, sqlite::SqliteQueue},
     runtime::{supervisors, unix_time},
 };
 use anyhow::Result;
@@ -78,8 +79,24 @@ pub fn attention(
                     .and_then(Value::as_str)
                     .unwrap_or("?")
             });
-        let Some(next) = run_attention(run.status, exit_pending, false, leased, prompt_waiting)
-        else {
+        let resuming = run.status == RunStatus::NeedsSession && {
+            let lease_fresh = queue
+                .run_lease(&run.id)?
+                .is_some_and(|lease| !lease_is_stale(&lease, now));
+            let session_alive = queue
+                .processes(&run.id)?
+                .iter()
+                .any(|p| p.role == "wrapper" && p.exited_at.is_none() && process_alive(p.pid));
+            resume_pending(&events, lease_fresh, session_alive)
+        };
+        let Some(next) = run_attention(
+            run.status,
+            exit_pending,
+            false,
+            leased,
+            prompt_waiting,
+            resuming,
+        ) else {
             continue;
         };
         let kind = events
@@ -102,7 +119,7 @@ pub fn attention(
         });
     }
     for run in queue.runs_with_pending_push()? {
-        let Some(next) = run_attention(run.status, false, true, false, None) else {
+        let Some(next) = run_attention(run.status, false, true, false, None, false) else {
             continue;
         };
         let error = queue
@@ -122,6 +139,25 @@ pub fn attention(
         });
     }
     Ok(attention)
+}
+
+/// Whether the supervisor is resuming the run or will: a resume in progress
+/// (a `resume_started` with no `resume_finished` after it) under a lease that
+/// is not stale, or attempts left and no session of an earlier resume still
+/// alive. A resume whose supervisor died, or one blocked by a live session,
+/// is a person's to look at.
+pub fn resume_pending(events: &[RunEvent], lease_fresh: bool, session_alive: bool) -> bool {
+    let started = events.iter().filter(|e| e.kind == "resume_started").count();
+    let in_progress = events
+        .iter()
+        .rev()
+        .find(|e| matches!(e.kind.as_str(), "resume_started" | "resume_finished"))
+        .is_some_and(|e| e.kind == "resume_started");
+    if in_progress {
+        lease_fresh
+    } else {
+        started < MAX_RESUME_ATTEMPTS && !session_alive
+    }
 }
 
 /// One event as the maintainer reads it: the row's ids and kind, and from the

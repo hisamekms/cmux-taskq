@@ -308,6 +308,10 @@ pub trait TaskStore {
 pub trait AgentProvider {
     fn preflight(&self) -> Result<()>;
     fn command(&self, run: &crate::domain::TaskRun, prompt: &str) -> Result<std::process::Command>;
+    /// The same session reopened for a `needs_session` run (ADR-0019): the
+    /// run's own settings and idle marker, without a prompt; the supervisor
+    /// sends the resolution request to the terminal once it is up.
+    fn resume_command(&self, run: &crate::domain::TaskRun) -> Result<std::process::Command>;
 }
 
 /// The Git remote `integrate` pushes the landed `main` to (ADR-0019
@@ -379,6 +383,20 @@ pub trait WorkspaceBackend {
         command: &str,
         tags: &WorkspaceTags,
     ) -> Result<String>;
+    /// Open the workspace a resumed session of a `needs_session` run works
+    /// in, in the run's worktree; the backend names it like the run's worker
+    /// workspace (ADR-0028; display only, ADR-0026) and gives it `tags`.
+    fn create_resume(
+        &self,
+        task: &crate::domain::Task,
+        run: &crate::domain::TaskRun,
+        command: &str,
+        tags: &WorkspaceTags,
+    ) -> Result<String>;
+    /// Type one line at the session's prompt and submit it: the resolution
+    /// request to a resumed session, the only text besides `/exit` the
+    /// supervisor sends (ADR-0019).
+    fn send_text(&self, workspace_id: &str, text: &str) -> Result<()>;
     fn capture(&self, workspace_id: &str) -> Result<String>;
     /// Close the workspace; the worktree and branch are not touched.
     fn close(&self, workspace_id: &str) -> Result<()>;
@@ -425,6 +443,16 @@ pub trait WorkspaceBackend {
     /// before the supervisor starts reading its screen for a dialog.
     fn prompt_wait(&self) -> std::time::Duration {
         std::time::Duration::from_secs(90)
+    }
+    /// How long a resumed session's agent may take, after it registered, to
+    /// be ready for the resolution request.
+    fn resume_prompt_delay(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(5)
+    }
+    /// How long a resumed session may work on the resolution request
+    /// without going idle before the supervisor asks it to exit.
+    fn resume_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(3600)
     }
 }
 

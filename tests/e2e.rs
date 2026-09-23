@@ -2,8 +2,9 @@
 //! real launchd, from `add` to the squash landing by `integrate`, from
 //! `up` to `down`, and from a killed supervisor to the adoption of its run.
 //! Claude is replaced by a stub script that does what the prompt asks:
-//! change, commit, write the receipt; the test itself plays the session
-//! that resolves a conflict. Requires a running cmux, so it is ignored by
+//! change, commit, write the receipt; resumed with `--resume` it reads the
+//! supervisor's resolution request from its terminal and resolves the
+//! conflict. Requires a running cmux, so it is ignored by
 //! default: `cargo test --locked --test e2e -- --ignored --nocapture`.
 use serde_json::{Value, json};
 use std::{
@@ -33,10 +34,11 @@ if [ "${1:-}" = "--version" ]; then
   printf 'claude-stub 0.0.0\n'
   exit 0
 fi
-session_id= debug_file= add_dir= settings= prompt=
+session_id= debug_file= add_dir= settings= prompt= resume=
 while [ $# -gt 0 ]; do
   case "$1" in
     --session-id) session_id=$2; shift 2 ;;
+    --resume) resume=$2; shift 2 ;;
     --debug-file) debug_file=$2; shift 2 ;;
     --add-dir) add_dir=$2; shift 2 ;;
     --settings) settings=$2; shift 2 ;;
@@ -45,6 +47,45 @@ while [ $# -gt 0 ]; do
   esac
 done
 [ $# -eq 0 ] || { printf 'stub: trailing arguments after the prompt\n' >&2; exit 64; }
+if [ -n "$resume" ]; then
+  # A resumed needs_session run: wait for the supervisor's resolution
+  # request on the terminal, rebase onto the main it names, resolve the
+  # conflict, rewrite the receipt, go idle and wait for /exit. The request
+  # is one long line, longer than a canonical-mode tty line may be.
+  [ -z "$session_id" ] && [ -z "$prompt" ] && [ -n "$debug_file" ] && [ -n "$add_dir" ] && [ -n "$settings" ] \
+    || { printf 'stub: bad resume arguments\n' >&2; exit 64; }
+  grep -q '"Stop"' "$settings" || { printf 'stub: settings lack a Stop hook\n' >&2; exit 64; }
+  printf 'argv: --resume %s --debug-file %s --add-dir %s --settings %s\n' "$resume" "$debug_file" "$add_dir" "$settings" > "$debug_file"
+  printf 'resumed %s; waiting for the resolution request\n' "$resume"
+  stty -icanon min 1
+  IFS= read -r request
+  stty icanon
+  printf '%s\n' "$request" > "$add_dir/resume-request-seen.txt"
+  main=$(printf '%s\n' "$request" | sed -n 's/.*main is now \([0-9a-f]*\) .*/\1/p')
+  [ -n "$main" ] || { printf 'stub: the request names no main\n' >&2; exit 65; }
+  if ! git rebase -q "$main" >/dev/null 2>&1; then
+    printf 'resolved by the session\n' > e2e.txt
+    git add e2e.txt
+    GIT_EDITOR=true git rebase --continue >/dev/null
+  fi
+  sh -c 'test -f seed.txt'
+  commit=$(git rev-parse HEAD)
+  receipt="$add_dir/receipt.json"
+  printf '{"run_id":"%s","result":"succeeded","commit":"%s","tests":{"status":"passed","evidence_or_reason":"test -f seed.txt exited 0 after the rebase"},"e2e":{"status":"not_applicable","evidence_or_reason":"stub agent"},"subagent_review":{"status":"not_applicable","evidence_or_reason":"stub agent"},"summary":"resolved e2e.txt"}\n' \
+    "$resume" "$commit" > "$receipt.tmp"
+  mv "$receipt.tmp" "$receipt"
+  printf 'receipt rewritten for %s\n' "$commit"
+  sleep 1
+  idle="$add_dir/idle.json"
+  printf '{"hook_event_name":"Stop","session_id":"%s","stop_hook_active":false}\n' "$resume" > "$idle.tmp"
+  mv "$idle.tmp" "$idle"
+  printf 'idle; waiting for /exit\n'
+  while read -r line; do
+    [ "$line" = "/exit" ] && break
+  done
+  printf 'bye\n'
+  exit 0
+fi
 [ -n "$session_id" ] && [ -n "$debug_file" ] && [ -n "$add_dir" ] && [ -n "$settings" ] && [ -n "$prompt" ] \
   || { printf 'stub: missing arguments\n' >&2; exit 64; }
 grep -q '"Stop"' "$settings" || { printf 'stub: settings lack a Stop hook\n' >&2; exit 64; }
@@ -912,7 +953,9 @@ fn two_independent_tasks_run_concurrently_and_a_dependent_follows_integration() 
     let third_landed = git(repo, &["rev-parse", "main"]);
     assert_eq!(git(repo, &["rev-parse", "main^"]), first_landed);
 
-    // The session resolves the parked run on top of main and rewrites its receipt.
+    // The integrate call approved it, so the next supervisor pass resumes
+    // its session (the stub plays Claude), which resolves the conflict on
+    // top of main and rewrites the receipt; the runtime then lands it.
     let run = dagq(env, &["show", &second, "--full"])["runs"][0].clone();
     assert_eq!(run["status"], "needs_session");
     let worktree = Path::new(run["worktree_path"].as_str().unwrap());
@@ -924,35 +967,58 @@ fn two_independent_tasks_run_concurrently_and_a_dependent_follows_integration() 
         dagq(env, &["integrate", "--next"])["outcome"],
         "no_run_awaiting"
     );
-    let rebase = Command::new("git")
-        .arg("-C")
-        .arg(worktree)
-        .args(["rebase", &third_landed])
-        .output()
+    let status = dagq(env, &["status"]);
+    let attention = status["attention"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["run_id"] == run["id"])
+        .cloned()
         .unwrap();
-    assert!(!rebase.status.success());
-    fs::write(worktree.join("e2e.txt"), "resolved by the session\n").unwrap();
-    git(worktree, &["add", "e2e.txt"]);
+    assert_eq!(attention["next"], "resuming (runtime)", "{status}");
+    let pass = supervise_once(&fixture, &["--parallel", "2"], &[], &mut guard);
+    let outcome = &pass.outcome;
+    assert_eq!(outcome["errors"], Value::Array(vec![]), "{outcome}");
     assert!(
-        Command::new("git")
-            .arg("-C")
-            .arg(worktree)
-            .env("GIT_EDITOR", "true")
-            .args(["rebase", "--continue"])
-            .status()
-            .unwrap()
-            .success()
+        pass.stderr.contains("resolution request sent"),
+        "{}",
+        pass.stderr
     );
-    let resolved = git(worktree, &["rev-parse", "HEAD"]);
-    let receipt_path = Path::new(run["receipt_path"].as_str().unwrap());
-    let mut receipt: Value =
-        serde_json::from_str(&fs::read_to_string(receipt_path).unwrap()).unwrap();
-    receipt["commit"] = Value::String(resolved.clone());
-    receipt["summary"] = Value::String("resolved e2e.txt".into());
-    fs::write(receipt_path.with_extension("tmp"), receipt.to_string()).unwrap();
-    fs::rename(receipt_path.with_extension("tmp"), receipt_path).unwrap();
-    let landed = dagq(env, &["integrate", &second]);
-    assert_eq!(landed["outcome"], "integrated", "{landed}");
+    let detail = dagq(env, &["show", &second, "--full"]);
+    let run = &detail["runs"][0];
+    assert_eq!(run["status"], "integrated", "{detail}");
+    let run_dir = Path::new(run["run_dir"].as_str().unwrap());
+    let seen = fs::read_to_string(run_dir.join("resume-request-seen.txt")).unwrap();
+    assert!(
+        seen.contains(&format!("main is now {third_landed} ")),
+        "{seen}"
+    );
+    assert!(seen.contains("task 1: e2e first"), "{seen}");
+    assert!(seen.contains("task 3: e2e dependent"), "{seen}");
+    let kinds: Vec<&str> = detail["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["kind"].as_str().unwrap())
+        .collect();
+    for kind in [
+        "integration_approved",
+        "resume_started",
+        "resume_finished",
+        "run_integrated",
+    ] {
+        assert!(kinds.contains(&kind), "{kind} missing: {kinds:?}");
+    }
+    let finished = detail["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["kind"] == "resume_finished")
+        .unwrap();
+    assert_eq!(finished["payload"]["outcome"], "resolved", "{finished}");
+    assert_eq!(finished["payload"]["workspace_closed"], true, "{finished}");
+    let resume_workspace = finished["payload"]["workspace_id"].as_str().unwrap();
+    wait_until_not_listed(cmux, resume_workspace);
     assert_eq!(git(repo, &["rev-parse", "main^"]), third_landed);
     assert_eq!(
         git(repo, &["rev-list", "--count", &format!("{base}..main")]),

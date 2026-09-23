@@ -851,6 +851,8 @@ mod stats {
         }
         // An `integrate` that errors puts `needs_session` back; not a new park.
         events.status(2, "b", "integration_error", 44, "needs_session");
+        // A resume that ends with the run still parked is not a new park either.
+        events.status(2, "b", "resume_finished", 44, "needs_session");
         events.run(2, "b", "run_integrated", 45);
         // Task 3 (no goal) failed twice in two runs; no receipt the second time.
         events.run(3, "c1", "run_claimed", 0);

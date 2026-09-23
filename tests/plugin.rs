@@ -171,6 +171,33 @@ fn skills_point_at_their_reference_files() {
     assert!(land.contains("Do not run `integrate` on a run with doubt until the user approves it"));
 }
 
+/// The runtime resumes `needs_session` runs (ADR-0019): no skill or
+/// reference file tells the maintainer to open a resume session itself.
+#[test]
+fn no_skill_opens_a_resume_session_for_the_maintainer() {
+    for dir in skill_dirs() {
+        let mut files = vec![dir.join("SKILL.md")];
+        if let Ok(entries) = fs::read_dir(dir.join("reference")) {
+            files.extend(entries.map(|entry| entry.unwrap().path()));
+        }
+        for file in files {
+            let text = fs::read_to_string(&file).unwrap();
+            for forbidden in ["claude --resume", "workspace create"] {
+                assert!(
+                    !text.contains(forbidden),
+                    "{} mentions {forbidden}",
+                    file.display()
+                );
+            }
+        }
+    }
+    let session = fs::read_to_string(plugin_root().join("skills/dagq-session/SKILL.md")).unwrap();
+    assert!(session.contains("The runtime resumes a `needs_session` run itself"));
+    assert!(session.contains("Never open a resume workspace"));
+    let maintain = fs::read_to_string(plugin_root().join("skills/dagq-maintain/SKILL.md")).unwrap();
+    assert!(maintain.contains("`resuming (runtime)`"));
+}
+
 fn hooks_manifest() -> Value {
     serde_json::from_str(&fs::read_to_string(plugin_root().join("hooks/hooks.json")).unwrap())
         .unwrap()

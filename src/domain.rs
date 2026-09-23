@@ -1132,8 +1132,17 @@ pub enum AttentionNext {
     RestartSupervisor,
     PushMain,
     RecoverRun,
-    AnswerPrompt { workspace_id: String },
+    AnswerPrompt {
+        workspace_id: String,
+    },
+    /// Not the maintainer's to act on: the supervisor resumes the
+    /// `needs_session` run itself (ADR-0019 decision 1).
+    Resuming,
 }
+
+/// How many times the supervisor resumes one `needs_session` run (one
+/// `resume_started` each) before it leaves the run to a human (ADR-0019).
+pub const MAX_RESUME_ATTEMPTS: usize = 3;
 
 impl fmt::Display for AttentionNext {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -1148,6 +1157,7 @@ impl fmt::Display for AttentionNext {
             Self::AnswerPrompt { workspace_id } => {
                 write!(f, "answer the prompt in workspace {workspace_id}")
             }
+            Self::Resuming => f.write_str("resuming (runtime)"),
         }
     }
 }
@@ -1171,6 +1181,7 @@ pub const ATTENTION_KINDS: &[&str] = &[
     "push_failed",
     "runtime_error",
     "prompt_waiting",
+    "resume_finished",
 ];
 
 /// Whether a run event is a transition that stops at the maintainer's or the
@@ -1184,7 +1195,12 @@ pub const ATTENTION_KINDS: &[&str] = &[
 /// abandon): nothing moves the run on until it is recovered. A
 /// `runtime_error` recorded without releasing the lease is a note.
 /// `prompt_waiting` is one: the session waits at a dialog in the payload's
-/// `workspace_id`.
+/// `workspace_id`. An `integration_deferred` with `resumes_left` above zero
+/// is not: the supervisor resumes that run. `resume_finished` is one when the
+/// resume put the run where a person decides (`awaiting_integration` for an
+/// unapproved run, `failed`), or when it was the last attempt and the run
+/// stays `needs_session` (`exhausted`); a resolved run the supervisor goes on
+/// to land is not.
 pub fn event_attention(kind: &str, payload: &serde_json::Value) -> Option<AttentionNext> {
     let status = payload
         .get("status")
@@ -1198,6 +1214,16 @@ pub fn event_attention(kind: &str, payload: &serde_json::Value) -> Option<Attent
             "validation_finished" | "supervision_finished" | "integration_failed",
             Some(RunStatus::Failed),
         ) => Some(AttentionNext::InspectAndClose),
+        // The supervisor resumes a deferred run while it has attempts left
+        // (`resumes_left`, absent before ADR-0019); only then is it a person's.
+        ("integration_deferred", Some(RunStatus::NeedsSession))
+            if payload
+                .get("resumes_left")
+                .and_then(serde_json::Value::as_u64)
+                .is_some_and(|left| left > 0) =>
+        {
+            None
+        }
         ("integration_deferred" | "integration_error", Some(RunStatus::NeedsSession)) => {
             Some(AttentionNext::ResumeSession)
         }
@@ -1213,6 +1239,15 @@ pub fn event_attention(kind: &str, payload: &serde_json::Value) -> Option<Attent
                 .get("workspace_id")
                 .and_then(serde_json::Value::as_str),
         )),
+        ("resume_finished", Some(RunStatus::AwaitingIntegration)) => {
+            Some(AttentionNext::ReviewAndIntegrate)
+        }
+        ("resume_finished", Some(RunStatus::Failed)) => Some(AttentionNext::InspectAndClose),
+        ("resume_finished", Some(RunStatus::NeedsSession))
+            if payload.get("exhausted") == Some(&serde_json::Value::Bool(true)) =>
+        {
+            Some(AttentionNext::ResumeSession)
+        }
         _ => None,
     }
 }
@@ -1234,7 +1269,9 @@ fn answer_prompt(workspace_id: Option<&str>) -> AttentionNext {
 /// supervisor's attention, not the run's. `prompt_waiting` is the workspace
 /// of a `running` run whose latest `prompt_waiting` has no `prompt_cleared`
 /// or `receipt_observed` after it (`Some("?")` when the payload named none).
-/// The caller passes only the latest run of an `in_progress` task, so a
+/// `resuming` is a `needs_session` run the supervisor is resuming or will
+/// resume (a resume in progress, or attempts left): the maintainer must not
+/// open a session of its own for it. The caller passes only the latest run of an `in_progress` task, so a
 /// failed run stops counting once the task is retried or canceled.
 pub fn run_attention(
     status: RunStatus,
@@ -1242,6 +1279,7 @@ pub fn run_attention(
     push_pending: bool,
     leased: bool,
     prompt_waiting: Option<&str>,
+    resuming: bool,
 ) -> Option<AttentionNext> {
     match status {
         RunStatus::Integrated if push_pending => Some(AttentionNext::PushMain),
@@ -1255,6 +1293,7 @@ pub fn run_attention(
             Some(AttentionNext::RecoverRun)
         }
         RunStatus::AwaitingIntegration => Some(AttentionNext::ReviewAndIntegrate),
+        RunStatus::NeedsSession if resuming => Some(AttentionNext::Resuming),
         RunStatus::NeedsSession => Some(AttentionNext::ResumeSession),
         RunStatus::Failed => Some(AttentionNext::InspectAndClose),
         RunStatus::Running if exit_pending => Some(AttentionNext::SendExit),
@@ -1420,6 +1459,43 @@ mod attention_tests {
                 }),
             ),
             ("prompt_cleared", json!({"workspace_id": "w"}), None),
+            (
+                "integration_deferred",
+                json!({"status": "needs_session", "reason": "x", "resumes_left": 2}),
+                None,
+            ),
+            (
+                "integration_deferred",
+                json!({"status": "needs_session", "reason": "x", "resumes_left": 0}),
+                Some(ResumeSession),
+            ),
+            (
+                "resume_finished",
+                json!({"status": "awaiting_integration", "outcome": "resolved"}),
+                Some(ReviewAndIntegrate),
+            ),
+            (
+                "resume_finished",
+                json!({"status": "failed", "outcome": "failed"}),
+                Some(InspectAndClose),
+            ),
+            (
+                "resume_finished",
+                json!({"status": "needs_session", "outcome": "unresolved", "exhausted": true}),
+                Some(ResumeSession),
+            ),
+            (
+                "resume_finished",
+                json!({"status": "needs_session", "outcome": "unresolved", "exhausted": false}),
+                None,
+            ),
+            (
+                "resume_finished",
+                json!({"status": "needs_session", "outcome": "resolved"}),
+                None,
+            ),
+            ("resume_started", json!({"attempt": 1}), None),
+            ("integration_approved", json!({}), None),
             ("integration_rebase_aborted", json!({"reason": "x"}), None),
             ("run_integrated", json!({"result_commit": "x"}), None),
             (
@@ -1466,38 +1542,50 @@ mod attention_tests {
     fn run_attention_follows_the_resting_status() {
         use AttentionNext::*;
         assert_eq!(
-            run_attention(RunStatus::AwaitingIntegration, false, false, false, None),
+            run_attention(
+                RunStatus::AwaitingIntegration,
+                false,
+                false,
+                false,
+                None,
+                false
+            ),
             Some(ReviewAndIntegrate)
         );
         assert_eq!(
-            run_attention(RunStatus::NeedsSession, false, false, false, None),
+            run_attention(RunStatus::NeedsSession, false, false, false, None, false),
             Some(ResumeSession)
         );
         assert_eq!(
-            run_attention(RunStatus::Failed, false, false, false, None),
+            run_attention(RunStatus::NeedsSession, false, false, true, None, true),
+            Some(Resuming)
+        );
+        assert_eq!(Resuming.to_string(), "resuming (runtime)");
+        assert_eq!(
+            run_attention(RunStatus::Failed, false, false, false, None, false),
             Some(InspectAndClose)
         );
         assert_eq!(
-            run_attention(RunStatus::Running, true, false, true, None),
+            run_attention(RunStatus::Running, true, false, true, None, false),
             Some(SendExit)
         );
         assert_eq!(
-            run_attention(RunStatus::Running, false, false, true, None),
+            run_attention(RunStatus::Running, false, false, true, None, false),
             None
         );
         assert_eq!(
-            run_attention(RunStatus::Running, false, false, true, Some("w")),
+            run_attention(RunStatus::Running, false, false, true, Some("w"), false),
             Some(AnswerPrompt {
                 workspace_id: "w".into()
             })
         );
         assert_eq!(
-            run_attention(RunStatus::Running, true, false, true, Some("w")),
+            run_attention(RunStatus::Running, true, false, true, Some("w"), false),
             Some(SendExit)
         );
         // An abandoned run is recovered before any dialog is answered.
         assert_eq!(
-            run_attention(RunStatus::Running, false, false, false, Some("w")),
+            run_attention(RunStatus::Running, false, false, false, Some("w"), false),
             Some(RecoverRun)
         );
         for status in [
@@ -1510,18 +1598,18 @@ mod attention_tests {
             RunStatus::Interrupted,
         ] {
             assert_eq!(
-                run_attention(status, true, false, true, Some("w")),
+                run_attention(status, true, false, true, Some("w"), false),
                 None,
                 "{}",
                 status.as_str()
             );
         }
         assert_eq!(
-            run_attention(RunStatus::Integrated, false, true, false, None),
+            run_attention(RunStatus::Integrated, false, true, false, None, false),
             Some(PushMain)
         );
         assert_eq!(
-            run_attention(RunStatus::Succeeded, false, true, false, None),
+            run_attention(RunStatus::Succeeded, false, true, false, None, false),
             None
         );
     }
@@ -1537,7 +1625,7 @@ mod attention_tests {
             RunStatus::Integrating,
         ] {
             assert_eq!(
-                run_attention(status, false, false, false, None),
+                run_attention(status, false, false, false, None, false),
                 Some(RecoverRun),
                 "{}",
                 status.as_str()
@@ -1545,7 +1633,7 @@ mod attention_tests {
         }
         // Nothing moves an abandoned run, so `/exit` alone would not do.
         assert_eq!(
-            run_attention(RunStatus::Running, true, false, false, None),
+            run_attention(RunStatus::Running, true, false, false, None, false),
             Some(RecoverRun)
         );
         for status in [
@@ -1554,7 +1642,7 @@ mod attention_tests {
             RunStatus::Interrupted,
         ] {
             assert_eq!(
-                run_attention(status, false, false, false, None),
+                run_attention(status, false, false, false, None, false),
                 None,
                 "{}",
                 status.as_str()

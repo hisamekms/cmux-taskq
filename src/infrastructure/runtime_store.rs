@@ -58,6 +58,17 @@ pub struct Landing {
     pub verification_skipped: bool,
 }
 
+/// A `needs_session` run as the supervisor judges it for a resume.
+#[derive(Debug, Clone)]
+pub struct ResumeCandidate {
+    pub run: TaskRun,
+    pub lease: Option<RunLease>,
+    /// The latest session's wrapper registration.
+    pub wrapper: Option<RunProcess>,
+    /// `resume_started` events so far.
+    pub attempts: usize,
+}
+
 #[derive(Debug, Serialize)]
 pub struct RunPlan {
     pub repo_path: String,
@@ -671,6 +682,56 @@ impl SqliteQueue {
         Ok(())
     }
 
+    /// Register the wrapper of a resumed session (ADR-0019): the run is
+    /// `needs_session` and leased to `token`, and `begin_resume` cleared the
+    /// previous session's process rows.
+    pub fn register_resume_wrapper(&mut self, id: &str, token: &str, pid: u32) -> Result<()> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        assert_lease(&tx, id, token)?;
+        let allowed: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM task_runs WHERE id=?1 AND supervisor_token=?2
+             AND status='needs_session')",
+            params![id, token],
+            |r| r.get(0),
+        )?;
+        ensure!(allowed, "run is not being resumed by this supervisor");
+        tx.execute(
+            "INSERT INTO run_processes(run_id,role,pid) VALUES (?1,'wrapper',?2)",
+            params![id, pid],
+        )
+        .context("wrapper is already registered; a resume may only launch once")?;
+        run_event(&tx, id, "wrapper_started", json!({"pid": pid}))?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Register the agent of a resumed session; the run stays `needs_session`.
+    pub fn register_resume_agent(
+        &mut self,
+        id: &str,
+        wrapper_pid: u32,
+        agent_pid: u32,
+    ) -> Result<()> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        assert_wrapper(&tx, id, wrapper_pid)?;
+        tx.execute(
+            "INSERT INTO run_processes(run_id,role,pid) VALUES (?1,'agent',?2)",
+            params![id, agent_pid],
+        )?;
+        run_event(
+            &tx,
+            id,
+            "agent_started",
+            json!({"pid": agent_pid, "session_id": id}),
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn register_wrapper(&mut self, id: &str, token: &str, pid: u32) -> Result<()> {
         let tx = self
             .conn
@@ -1016,7 +1077,8 @@ impl SqliteQueue {
     /// Take the single integration slot for an awaiting run or one coming
     /// back from a session: the run becomes `integrating` and this process
     /// owns it through a lease row for the duration, so `doctor` can see who
-    /// is landing what. `one_integrating_run_per_queue` backs the explicit check.
+    /// is landing what. A lease this `token` already holds (a supervisor
+    /// landing the run it resumed) is kept; one under another token refuses. `one_integrating_run_per_queue` backs the explicit check.
     pub fn begin_integration(&mut self, id: &str, token: &str, main: &str) -> Result<TaskRun> {
         let tx = self
             .conn
@@ -1049,17 +1111,192 @@ impl SqliteQueue {
             )? == 1,
             "run {id} is {previous}; only a run awaiting integration or a session can be integrated"
         );
-        tx.execute(
-            "INSERT INTO run_leases(run_id,token,pid) VALUES (?1,?2,?3)",
-            params![id, token, std::process::id()],
-        )
-        .context("run is still leased")?;
+        // A supervisor landing a run it resumed already holds its lease
+        // under the same token; any other lease means someone owns the run.
+        ensure!(
+            tx.execute(
+                "INSERT INTO run_leases(run_id,token,pid) VALUES (?1,?2,?3)
+                 ON CONFLICT(run_id) DO UPDATE SET pid=excluded.pid,heartbeat_at=unixepoch()
+                 WHERE run_leases.token=excluded.token",
+                params![id, token, std::process::id()],
+            )? == 1,
+            "run is still leased"
+        );
         run_event(
             &tx,
             id,
             "integration_started",
             json!({"main": main, "previous_status": previous, "pid": std::process::id()}),
         )?;
+        let result = tx.query_row(
+            "SELECT * FROM task_runs WHERE id=?1",
+            [id],
+            run_row(&self.runs_dir),
+        )?;
+        tx.commit()?;
+        Ok(result)
+    }
+
+    /// `needs_session` runs, oldest first, with their lease (if any), their
+    /// wrapper registration (the latest session's) and how many resumes
+    /// were started: what the supervisor judges for a resume (ADR-0019).
+    pub fn runs_needing_session(&self) -> Result<Vec<ResumeCandidate>> {
+        let runs = self.runs_with_status(crate::domain::RunStatus::NeedsSession)?;
+        runs.into_iter()
+            .map(|run| {
+                let lease = self.run_lease(&run.id)?;
+                let wrapper = self
+                    .conn
+                    .query_row(
+                        "SELECT * FROM run_processes WHERE run_id=?1 AND role='wrapper'",
+                        [&run.id],
+                        process_row,
+                    )
+                    .optional()?;
+                let attempts = resume_attempts(&self.conn, &run.id)?;
+                Ok(ResumeCandidate {
+                    run,
+                    lease,
+                    wrapper,
+                    attempts,
+                })
+            })
+            .collect()
+    }
+
+    /// Take a `needs_session` run for a resume: in one transaction, check
+    /// that it is still `needs_session` with fewer than `max_attempts`
+    /// resumes started, no lease but a stale one (which is replaced) and no
+    /// session still heartbeating, lease it to `token`, clear the previous
+    /// session's process rows, make `token` its supervisor and record
+    /// `resume_started` (`attempt`, `reason`, `main`). `Ok(None)` means
+    /// another process took it or it changed meanwhile.
+    pub fn begin_resume(
+        &mut self,
+        id: &str,
+        token: &str,
+        main: &str,
+        reason: Option<&str>,
+        max_attempts: usize,
+    ) -> Result<Option<(TaskRun, usize)>> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let now: i64 = tx.query_row("SELECT unixepoch()", [], |r| r.get(0))?;
+        let run = tx
+            .query_row(
+                "SELECT * FROM task_runs WHERE id=?1 AND status='needs_session'",
+                [id],
+                run_row(&self.runs_dir),
+            )
+            .optional()?;
+        let Some(run) = run else {
+            return Ok(None);
+        };
+        let attempts = resume_attempts(&tx, id)?;
+        if attempts >= max_attempts {
+            return Ok(None);
+        }
+        let lease = tx
+            .query_row(
+                "SELECT run_id,token,pid,heartbeat_at FROM run_leases WHERE run_id=?1",
+                [id],
+                lease_row,
+            )
+            .optional()?;
+        if let Some(lease) = &lease {
+            if !lease_is_stale(lease, now) {
+                return Ok(None);
+            }
+            tx.execute("DELETE FROM run_leases WHERE run_id=?1", [id])?;
+        }
+        // The previous session's rows give way to the resumed one's; their
+        // history stays in the run's events. A session still heartbeating
+        // is left alone.
+        let live: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM run_processes WHERE run_id=?1
+             AND exited_at IS NULL AND heartbeat_at >= ?2-?3)",
+            params![id, now, HEARTBEAT_TIMEOUT_SECS],
+            |r| r.get(0),
+        )?;
+        if live {
+            return Ok(None);
+        }
+        tx.execute("DELETE FROM run_processes WHERE run_id=?1", [id])?;
+        tx.execute(
+            "INSERT INTO run_leases(run_id,token,pid) VALUES (?1,?2,?3)",
+            params![id, token, std::process::id()],
+        )?;
+        tx.execute(
+            "UPDATE task_runs SET supervisor_token=?2 WHERE id=?1",
+            params![id, token],
+        )?;
+        let attempt = attempts + 1;
+        run_event(
+            &tx,
+            id,
+            "lease_acquired",
+            json!({"pid": std::process::id(), "reason": "resume", "previous_token": lease.map(|l| l.token)}),
+        )?;
+        run_event(
+            &tx,
+            id,
+            "resume_started",
+            json!({"attempt": attempt, "reason": reason.or(run.last_error.as_deref()), "main": main}),
+        )?;
+        let run = tx.query_row(
+            "SELECT * FROM task_runs WHERE id=?1",
+            [id],
+            run_row(&self.runs_dir),
+        )?;
+        tx.commit()?;
+        Ok(Some((run, attempt)))
+    }
+
+    /// End a resume: record `resume_finished` (with `status`, the run's
+    /// status after it) and, unless the caller goes on to land the run
+    /// under the same lease (`keep_lease`), release the lease. `status`
+    /// `awaiting_integration` or `failed` moves the run there from
+    /// `needs_session` (`reason` then becomes `last_error`); `None` keeps it
+    /// `needs_session`.
+    pub fn finish_resume(
+        &mut self,
+        id: &str,
+        token: &str,
+        status: Option<crate::domain::RunStatus>,
+        reason: Option<&str>,
+        keep_lease: bool,
+        mut payload: serde_json::Value,
+    ) -> Result<TaskRun> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        assert_lease(&tx, id, token)?;
+        if let Some(status) = status {
+            ensure!(
+                tx.execute(
+                    "UPDATE task_runs SET status=?2,last_error=COALESCE(?3,last_error)
+                     WHERE id=?1 AND status='needs_session'",
+                    params![id, status.as_str(), reason]
+                )? == 1,
+                "run {id} is not needs_session"
+            );
+        }
+        let status = status.unwrap_or(crate::domain::RunStatus::NeedsSession);
+        payload["status"] = json!(status.as_str());
+        run_event(&tx, id, "resume_finished", payload)?;
+        if !keep_lease {
+            tx.execute(
+                "DELETE FROM run_leases WHERE run_id=?1 AND token=?2",
+                params![id, token],
+            )?;
+            run_event(
+                &tx,
+                id,
+                "lease_released",
+                json!({"reason": "resume_finished"}),
+            )?;
+        }
         let result = tx.query_row(
             "SELECT * FROM task_runs WHERE id=?1",
             [id],
@@ -1348,6 +1585,15 @@ fn run_event(conn: &Connection, id: &str, kind: &str, payload: serde_json::Value
         r.get(0)
     })?;
     event(conn, task_id, Some(id), kind, payload)
+}
+
+fn resume_attempts(conn: &Connection, id: &str) -> Result<usize> {
+    let count: i64 = conn.query_row(
+        "SELECT count(*) FROM run_events WHERE run_id=?1 AND kind='resume_started'",
+        [id],
+        |r| r.get(0),
+    )?;
+    Ok(usize::try_from(count)?)
 }
 
 fn process_row(r: &Row<'_>) -> rusqlite::Result<RunProcess> {

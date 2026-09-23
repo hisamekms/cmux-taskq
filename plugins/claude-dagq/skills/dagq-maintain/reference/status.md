@@ -12,7 +12,8 @@ Read this when a field of `status`, `watch` or `show` is unclear.
 - `runs`: unfinished runs with their leases and `worktree_path`.
 - `attention`: each with `run_id`, `task_id`, `status`, `kind` (the run event that brought it there), `last_error` and a fixed `next`:
   - `review and integrate`: `awaiting_integration`.
-  - `resume session`: `needs_session`.
+  - `resuming (runtime)`: `needs_session`, being resumed by the supervisor or with resumes left; nothing to do.
+  - `resume session`: `needs_session` after the supervisor's third resume did not resolve it.
   - `inspect and close workspace`: `failed`.
   - `send /exit`: a `running` run whose exit request timed out.
   - `answer the prompt in workspace <id>`: a `running` run that stopped at a dialog before its receipt (`kind` `prompt_waiting`); it disappears after `prompt_cleared` or `receipt_observed`. Handle it with the `dagq-session` skill.
@@ -42,7 +43,7 @@ Read this when a field of `status`, `watch` or `show` is unclear.
 - `validating`: the session exited; the supervisor checks the receipt, the commit and a clean worktree, and reruns the verification commands.
 - `awaiting_integration`: accepted. `result_commit` on `branch` is what to review; the workspace was closed and the worktree and branch are kept until `integrate`.
 - `integrating`: an `integrate` process holds the queue's single integration slot. If its process died (`doctor` shows `lease_stale: true`), the `dagq-recover` skill returns the run to `awaiting_integration`.
-- `needs_session`: `integrate` could not land it (rebase conflict, or a verification command failed after the rebase); `last_error` says why.
+- `needs_session`: `integrate` could not land it (rebase conflict, or a verification command failed after the rebase); `last_error` says why. The supervisor resumes its session (up to three times, `resume_started` / `resume_finished` events), then lands it if `integrate` was called for it (`integration_approved`) or returns it to `awaiting_integration`.
 - `integrated`: landed on `main`; the task is `completed`.
 - `failed`: rejected or exited nonzero; `last_error` says why. Workspace and worktree are kept. Retry with `ready ID` after fixing the cause.
 - unfinished with `last_error` and no lease (a `runtime_error` event with `lease_released: true`): the supervisor gave the run up; use the `dagq-recover` skill. After a provisioning failure the supervisor stops claiming, drains and exits nonzero; launchd restarts it, so fix the cause (cmux, Git) and check `status`.
