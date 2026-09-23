@@ -816,6 +816,16 @@ impl WorkspaceBackend for Cmux {
         let raw = self.create_workspace(name, None, cwd, command)?;
         self.identify(workspace_handle(&raw)?)
     }
+
+    fn notify(&self, title: &str, body: &str, workspace: Option<&str>) -> Result<()> {
+        let mut command = Command::new(&self.executable);
+        command.args(["notify", "--title", title, "--body", body]);
+        if let Some(workspace) = workspace {
+            command.args(["--workspace", workspace]);
+        }
+        output(&mut command)?;
+        Ok(())
+    }
 }
 
 impl Cmux {

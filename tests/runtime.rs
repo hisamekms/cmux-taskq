@@ -155,6 +155,8 @@ struct TestWorkspace {
     exits_sent: AtomicUsize,
     sessions: Mutex<Vec<(String, TestSession)>>,
     closed: Mutex<Vec<String>>,
+    /// `notify` calls; the supervisor sends none (ADR-0022).
+    notifications: AtomicUsize,
 }
 impl TestWorkspace {
     fn new(db: &Path, fail: bool, script: &str) -> Self {
@@ -169,6 +171,7 @@ impl TestWorkspace {
             exits_sent: AtomicUsize::new(0),
             sessions: Mutex::new(Vec::new()),
             closed: Mutex::new(Vec::new()),
+            notifications: AtomicUsize::new(0),
         }
     }
     /// Agent script for one task; other tasks use the default script.
@@ -313,6 +316,10 @@ impl WorkspaceBackend for TestWorkspace {
     fn create_named(&self, _: &str, _: &Path, _: &str) -> Result<String> {
         bail!("not used by the supervisor")
     }
+    fn notify(&self, _: &str, _: &str, _: Option<&str>) -> Result<()> {
+        self.notifications.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
 }
 
 /// /bin/sh --version is not portable; a tiny standalone provider preflight stub.
@@ -404,6 +411,8 @@ fn run_agent_with(script: &str, close_fail: bool) -> (TempDir, PathBuf, dagq::do
         assert!(!kinds.contains(&"workspace_closed"));
     }
     assert_eq!(kinds.contains(&"cleanup_failed"), close_fail);
+    // A run at rest is reported through `watch`, not a notification (ADR-0022).
+    assert_eq!(backend.notifications.load(Ordering::SeqCst), 0);
     // The run came to rest: its lease is gone, and the task still owns it.
     assert!(kinds.contains(&"lease_acquired"));
     assert!(kinds.contains(&"lease_released"));
@@ -872,6 +881,7 @@ fn unanswered_exit_request_times_out_and_keeps_the_run() {
         1
     );
     assert!(!kinds.contains(&"runtime_error"));
+    assert_eq!(backend.notifications.load(Ordering::SeqCst), 0);
     // The session exited, so the attention is the landing now, not /exit.
     let status = runtime::status(&db).unwrap();
     assert_eq!(

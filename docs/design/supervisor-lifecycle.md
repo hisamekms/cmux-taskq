@@ -54,7 +54,7 @@ ready task (dependencies completed)
 
 ## Implementation status
 
-ステップ3で`claim`から`running`、セッション終了検知までを、ステップ4の[005](../journal/005-receipt-validation.md)でreceiptの検証と`awaiting_integration`への遷移を、[006](../journal/006-workspace-close.md)で受理後のworkspace終了を、[007](../journal/007-session-exit-request.md)でreceipt受領後の終了要求を、[009](../journal/009-doctor-recover.md)で`doctor`/`recover`を、[008](../journal/008-integration-confirm.md)で統合確認`integrate`と`completed`への遷移を`src/runtime.rs`に実装した。ステップ6の[017](../journal/017-parallel-runs.md)（[ADR-0007](../adr/0007-run-level-leases-parallel-execution.md)）でleaseをrun単位にし、`supervise`を上限付き並列の常駐ループにした。ステップ7の[018](../journal/018-merge-queue.md)（[ADR-0008](../adr/0008-merge-queue-squash-landing.md)）で`integrate`を手動mergeの確認からruntimeによる着地（rebase → 再検証 → squash）に置き換えた。[021](../journal/021-maintainer-up-down.md)で`up` / `down`（`src/lifecycle.rs`）、launchdによる常駐、`supervise --log-dir`、maintainer promptを足した。task 24（[ADR-0012](../adr/0012-adopt-stale-lease-of-live-wrapper.md)）で、supervisorが死んだ後もwrapperが生きているrunを次のsupervisorが引き継ぐ（adopt）ようにした。[ADR-0011](../adr/0011-cmux-socket-password-and-in-cmux-fallback.md)のtask 21で`up`にcmux外接続のpreflightを、task 22で`up --in-cmux`（launchdなしのfallback）と`supervisors.mode`を足した。task 30（[ADR-0014](../adr/0014-up-replaces-a-supervisor-of-another-binary-version.md)）で`supervisors.binary_version`を足し、`up`がversionの違うliveなsupervisorをdrainして入れ替えるようにした（`--no-wait`は走行中のrunがあれば入れ替えない）。task 57（[ADR-0016](../adr/0016-maintainer-notification-and-compact-output.md)）で`status`に`attention`と`cursor`を足し、`events --after`と`watch`（`src/watch.rs`、判定は`src/domain.rs`）を足した。
+ステップ3で`claim`から`running`、セッション終了検知までを、ステップ4の[005](../journal/005-receipt-validation.md)でreceiptの検証と`awaiting_integration`への遷移を、[006](../journal/006-workspace-close.md)で受理後のworkspace終了を、[007](../journal/007-session-exit-request.md)でreceipt受領後の終了要求を、[009](../journal/009-doctor-recover.md)で`doctor`/`recover`を、[008](../journal/008-integration-confirm.md)で統合確認`integrate`と`completed`への遷移を`src/runtime.rs`に実装した。ステップ6の[017](../journal/017-parallel-runs.md)（[ADR-0007](../adr/0007-run-level-leases-parallel-execution.md)）でleaseをrun単位にし、`supervise`を上限付き並列の常駐ループにした。ステップ7の[018](../journal/018-merge-queue.md)（[ADR-0008](../adr/0008-merge-queue-squash-landing.md)）で`integrate`を手動mergeの確認からruntimeによる着地（rebase → 再検証 → squash）に置き換えた。[021](../journal/021-maintainer-up-down.md)で`up` / `down`（`src/lifecycle.rs`）、launchdによる常駐、`supervise --log-dir`、maintainer promptを足した。task 24（[ADR-0012](../adr/0012-adopt-stale-lease-of-live-wrapper.md)）で、supervisorが死んだ後もwrapperが生きているrunを次のsupervisorが引き継ぐ（adopt）ようにした。[ADR-0011](../adr/0011-cmux-socket-password-and-in-cmux-fallback.md)のtask 21で`up`にcmux外接続のpreflightを、task 22で`up --in-cmux`（launchdなしのfallback）と`supervisors.mode`を足した。task 30（[ADR-0014](../adr/0014-up-replaces-a-supervisor-of-another-binary-version.md)）で`supervisors.binary_version`を足し、`up`がversionの違うliveなsupervisorをdrainして入れ替えるようにした（`--no-wait`は走行中のrunがあれば入れ替えない）。task 57（[ADR-0016](../adr/0016-maintainer-notification-and-compact-output.md)）で`status`に`attention`と`cursor`を足し、`events --after`と`watch`（`src/watch.rs`、判定は`src/domain.rs`）を足した。task 75（task 58の登録し直し）で`WorkspaceBackend::notify`とcmux adapterの`cmux notify`を足した。supervisorはまだ通知を送らない（[人への通知](#人への通知cmux-notify)）。
 
 ## Roles
 
@@ -108,12 +108,12 @@ cmux workspaceの名前は複数repositoryで同じcmuxを使うためrepository
 
 ### Maintainerへの通知（ADR-0016で決定、一部実装済み）
 
-[ADR-0016](../adr/0016-maintainer-notification-and-compact-output.md)で次を決めた。`status`のattentionとcursor、`events --after`、`watch`は実装済み（[`status`](#status)、[`events` / `watch`](#events--watch)）。`review`は実装済み（下記「`review`」）。`cmux notify`、圧縮出力と`--full`の残り、短い`maintainer_prompt`はgoal 6の残りのtaskで実装する。
+[ADR-0016](../adr/0016-maintainer-notification-and-compact-output.md)で次を決めた。`status`のattentionとcursor、`events --after`、`watch`は実装済み（[`status`](#status)、[`events` / `watch`](#events--watch)）。`review`は実装済み（下記「`review`」）。`cmux notify`はbackendの操作だけ実装済みで、送る条件と宛先は[ADR-0022](../adr/0022-ask-answer-inbox-planner-and-landing-on-doubt.md)で改められた（[人への通知](#人への通知cmux-notify)）。圧縮出力と`--full`の残り、短い`maintainer_prompt`はgoal 6の残りのtaskで実装する。
 
 - maintainerは状態を持たない使い捨てのsessionで、compaction・`/clear`・再起動からの起き直しは`status`の1コマンドで行う。`status`はsupervisorの健全性、未完了run、attention、次のcursorを上限のある大きさで返す。
 - `watch --after <cursor>`はcursorより後のattentionイベントかsupervisor健全性の変化までblockし、attentionと新しいcursorを返して終わる。maintainerはこれをbackgroundで走らせて終了で起きる。`doctor`は診断専用で、pollingには使わない。
 - attentionはrun_eventsのkind（公開契約。既存のkind名とpayloadは変えず追加だけ）からdomainが判定する: runの`awaiting_integration`・`needs_session`・`failed`、`exit_request_timed_out`、supervisorの停止/stale。supervisorの状態はrun_eventsに載せず`supervisors`表から導出し、schemaは変えない。
-- supervisorはattentionのたびにmaintainer workspaceへ`cmux notify`を送る（人向け）。runtimeはmaintainerのterminalに`cmux send`で打ち込まない（workerへの`/exit`は従来どおり）。`integrate`は`watch`からもイベントの副作用としても呼ばない。
+- supervisorはattentionのたびにmaintainer workspaceへ`cmux notify`を送る（人向け。のちに[ADR-0022](../adr/0022-ask-answer-inbox-planner-and-landing-on-doubt.md)の決定5で`ask_opened`のときだけinbox宛てに改まった）。runtimeはmaintainerのterminalに`cmux send`で打ち込まない（workerへの`/exit`は従来どおり）。`integrate`は`watch`からもイベントの副作用としても呼ばない。
 - maintainer経路のコマンドは既定で圧縮し（既存キー名を変えずに省く・切り詰める）、全文は`--full`。`show`・`goal show`・`doctor`は実装済み（`doctor`は上、`show`と`goal show`は[domain-model](domain-model.md)）。レビューは`review ID`が`<run_dir>/review.md`を書き、maintainerはsubagentにpathを渡す（`review`は実装済み。下記「`review`」）。
 - `maintainer_prompt`は「`status`から始め、`watch`をbackgroundで回し、attentionを報告して承認を待つ」に縮める。
 
@@ -141,6 +141,12 @@ cmux workspaceの名前は複数repositoryで同じcmuxを使うためrepository
 12. active runがなく、`--once`か停止要求（下記）か、provisioning失敗でclaimを止めていればループを抜ける。それ以外はactive runがない間2秒ごとに`candidates`を見る。ループを抜けたら（claimやGitのエラーで抜ける場合も含む）自分の登録を消す（`deregister_supervisor`）。heartbeat失敗で終わるときだけは消さない。
 
 結果は`{"outcome": "finished" | "stopped", "runs": [休止したrun], "errors": [{run_id, task_id, message}]}`。SIGINT/SIGTERMは1回目でclaimを止めてactive runの終了を待ち（graceful drain）、2回目で既定の動作（即終了）になる。即終了した（killされた）supervisorのleaseはPIDが死んだ時点で（遅くともheartbeatの30秒で）staleになり、wrapperが生きているrunは次のfill passで別のsupervisorが引き継ぐ（5）。登録はPIDが死んだ時点から`stale`として`status`/`doctor`に残る。`status` / `doctor` / `recover` / `integrate`は登録を消さず、次の`up`がPIDの死んだ登録だけを消す（[`up` / `down`](#up--down)）。
+
+### 人への通知（`cmux notify`）
+
+`WorkspaceBackend::notify(title, body, workspace)`は人への通知の操作で、cmux adapterは`cmux notify --title <title> --body <body> [--workspace <id>]`を実行する（`workspace`が`None`なら`--workspace`を付けない。失敗はcmuxの非0終了をエラーにして返す）。terminalへの打ち込みではないのでmaintainerやworkerのUI状態に干渉しない。
+
+supervisorはまだ通知を送らない。[ADR-0016](../adr/0016-maintainer-notification-and-compact-output.md)の契約(3)はattentionのたびにmaintainer workspaceへ送るとしていたが、[ADR-0022](../adr/0022-ask-answer-inbox-planner-and-landing-on-doubt.md)の決定5で、`cmux notify`は`ask_opened`のときだけinboxのworkspace宛てに送り、runの遷移（`awaiting_integration`・`needs_session`・`failed`・`exit_request_timed_out`など）は通知しないことになった。maintainerはattentionを`watch`で受ける。`ask_opened` → inboxの通知は`asks`表とinbox workspaceと合わせてgoal 10のtaskで実装する。
 
 ### Prompt
 

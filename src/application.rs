@@ -351,6 +351,11 @@ pub trait WorkspaceBackend {
     /// Open a workspace that is not tied to a run (the maintainer session)
     /// and return its stable ID.
     fn create_named(&self, name: &str, cwd: &std::path::Path, command: &str) -> Result<String>;
+    /// Tell a person that something waits for them: a notification, never
+    /// keystrokes into a terminal. `workspace` is the workspace it belongs
+    /// to; `None` sends it without one. The supervisor sends none yet:
+    /// ADR-0022 limits notifications to `ask_opened`, aimed at the inbox.
+    fn notify(&self, title: &str, body: &str, workspace: Option<&str>) -> Result<()>;
     /// How long the session may take to exit after the request before the
     /// supervisor stops waiting and leaves the run to a human.
     fn exit_timeout(&self) -> std::time::Duration {

@@ -255,6 +255,9 @@ impl WorkspaceBackend for FakeCmux {
     fn send_exit(&self, _: &str) -> Result<()> {
         bail!("not used")
     }
+    fn notify(&self, _: &str, _: &str, _: Option<&str>) -> Result<()> {
+        bail!("up does not notify")
+    }
     fn find_named(&self, name: &str) -> Result<Option<String>> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         Ok(self
@@ -735,6 +738,36 @@ fn detached_command_drops_every_inherited_cmux_variable_but_the_password() {
     );
 }
 
+/// The real adapter's `notify` is `cmux notify --title … --body …`, with
+/// `--workspace` only when a target is given; a failing cmux is an error.
+#[test]
+fn the_cmux_adapter_notifies_with_title_body_and_an_optional_workspace() {
+    let dir = tempfile::tempdir().unwrap();
+    let dump = dir.path().join("args.txt");
+    let stub = dir.path().join("cmux-stub");
+    fs::write(
+        &stub,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\n[ \"$1\" = notify ] || exit 2\n[ \"$3\" != fail ]\n",
+            dump.display()
+        ),
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).unwrap();
+    let cmux = Cmux { executable: stub };
+    let args = || fs::read_to_string(&dump).unwrap();
+    cmux.notify("dagq repo: task 1 failed", "a task\nnext: x", Some("WS"))
+        .unwrap();
+    assert_eq!(
+        args(),
+        "notify\n--title\ndagq repo: task 1 failed\n--body\na task\nnext: x\n--workspace\nWS\n"
+    );
+    cmux.notify("title", "body", None).unwrap();
+    assert_eq!(args(), "notify\n--title\ntitle\n--body\nbody\n");
+    assert!(cmux.notify("fail", "body", None).is_err());
+}
+
 /// The real adapter runs `cmux ping` in that environment and outside
 /// cmux's process tree: a stub cmux dumps what it was given and who its
 /// parent is, and this test process (which may itself run inside cmux)
@@ -1065,6 +1098,9 @@ fn up_requires_cmux_claude_and_an_initialized_queue() {
             unreachable!()
         }
         fn create_named(&self, _: &str, _: &Path, _: &str) -> Result<String> {
+            unreachable!()
+        }
+        fn notify(&self, _: &str, _: &str, _: Option<&str>) -> Result<()> {
             unreachable!()
         }
     }
