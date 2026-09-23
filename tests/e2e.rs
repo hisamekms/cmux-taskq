@@ -941,15 +941,34 @@ fn killed_supervisor_run_is_adopted_by_the_next_supervisor_and_lands() {
     assert_eq!(adopted["payload"]["wrapper"]["pid"], wrapper["pid"]);
     assert_eq!(adopted["payload"]["wrapper"]["alive"], true);
     let position = |kind: &str| kinds.iter().position(|k| *k == kind).unwrap();
-    assert!(position("agent_started") < position("run_adopted"));
-    assert!(position("run_adopted") < position("exit_requested"));
-    assert!(position("exit_requested") < position("session_exited"));
+    assert!(
+        position("agent_started") < position("run_adopted"),
+        "{kinds:?}"
+    );
+    assert!(
+        position("run_adopted") < position("exit_requested"),
+        "{kinds:?}"
+    );
+    // `exit_requested` is recorded before `/exit` is sent, so a session that
+    // exits before the send returns still lands after it.
+    assert!(
+        position("exit_requested") < position("session_exited"),
+        "{kinds:?}"
+    );
     // The adopter deregistered on exit; the killed one's row stays for `up` to prune.
     let status = dagq(env, &["status"]);
     let supervisors = status["supervisors"].as_array().unwrap();
-    assert_eq!(supervisors.len(), 1, "{status}");
-    assert_eq!(supervisors[0]["pid"], victim_pid);
-    assert_eq!(supervisors[0]["run_ids"], Value::Array(vec![]));
+    let diagnosis = format!(
+        "victim pid {victim_pid}; supervisors {supervisors:#?}; adopter stderr:\n{}",
+        pass.stderr
+    );
+    assert_eq!(supervisors.len(), 1, "{diagnosis}");
+    assert_eq!(supervisors[0]["pid"], victim_pid, "{diagnosis}");
+    assert_eq!(
+        supervisors[0]["run_ids"],
+        Value::Array(vec![]),
+        "{diagnosis}"
+    );
     assert_eq!(status["runs"], Value::Array(vec![]));
 
     let integrated = dagq(env, &["integrate", &task_id]);

@@ -763,14 +763,19 @@ impl SessionWatch {
             && let Some(evidence) = idle_after_receipt(&self.receipt_path, &self.idle_marker)?
         {
             queue.record_runtime_event(&run.id, "session_idle_observed", evidence)?;
-            // Ask once, the way the maintainer would; never kill the session.
-            cmux.send_exit(&self.workspace)?;
+            // Recorded before sending: the session may exit, and its wrapper
+            // record `session_exited`, before the send returns. A failed send
+            // abandons the run lease-less; a supervisor killed between the two
+            // leaves an adopter that never sends, and the run waits out the
+            // exit timeout for a human `/exit` (never a second `/exit`).
             let timeout = cmux.exit_timeout();
             queue.record_runtime_event(
                 &run.id,
                 "exit_requested",
                 json!({"workspace_id": self.workspace, "timeout_secs": timeout.as_secs()}),
             )?;
+            // Ask once, the way the maintainer would; never kill the session.
+            cmux.send_exit(&self.workspace)?;
             log.note(&format!(
                 "exit requested for {}; waiting for session exit",
                 run.id

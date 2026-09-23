@@ -1,4 +1,4 @@
-use anyhow::{Result, bail};
+use anyhow::{Result, bail, ensure};
 use dagq::{
     VERSION,
     application::{AgentProvider, SupervisorEnvironment, TaskStore, WorkspaceBackend},
@@ -149,6 +149,9 @@ struct TestWorkspace {
     script: String,
     scripts: Mutex<HashMap<i64, String>>,
     exit_timeout: Duration,
+    /// `send_exit` returns only after the wrapper recorded its exit, as a
+    /// slow `cmux send` does when the session exits on the first keystroke.
+    exit_returns_after_session: bool,
     exits_sent: AtomicUsize,
     sessions: Mutex<Vec<(String, TestSession)>>,
     closed: Mutex<Vec<String>>,
@@ -162,6 +165,7 @@ impl TestWorkspace {
             script: script.into(),
             scripts: Mutex::new(HashMap::new()),
             exit_timeout: Duration::from_secs(120),
+            exit_returns_after_session: false,
             exits_sent: AtomicUsize::new(0),
             sessions: Mutex::new(Vec::new()),
             closed: Mutex::new(Vec::new()),
@@ -274,6 +278,29 @@ impl WorkspaceBackend for TestWorkspace {
         self.exits_sent.fetch_add(1, Ordering::SeqCst);
         let run_dir = self.session_run_dir(workspace_id);
         fs::write(exit_request_path(&run_dir), "")?;
+        if self.exit_returns_after_session {
+            let run_id = self
+                .sessions
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|(id, _)| id == workspace_id)
+                .map(|(_, s)| s.run_id.clone())
+                .expect("workspace was created");
+            let connection = Connection::open(&self.db)?;
+            let started = Instant::now();
+            while !connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM run_processes WHERE run_id=?1 AND role='wrapper' AND exited_at IS NOT NULL)",
+                [&run_id],
+                |r| r.get::<_, bool>(0),
+            )? {
+                ensure!(
+                    started.elapsed() < Duration::from_secs(30),
+                    "session did not exit"
+                );
+                thread::sleep(Duration::from_millis(20));
+            }
+        }
         Ok(())
     }
     fn exit_timeout(&self) -> Duration {
@@ -712,6 +739,31 @@ fn idle_marker_after_receipt_triggers_exit_request_and_run_finishes() {
         .unwrap();
     assert_eq!(requested.payload["workspace_id"], WORKSPACE_ID);
     assert_eq!(requested.payload["timeout_secs"], 120);
+}
+
+/// The session exits, and its wrapper records `session_exited`, before
+/// `send_exit` returns (a slow `cmux send` under load): `exit_requested` is
+/// still recorded first, so the events read in causal order.
+#[test]
+fn exit_requested_precedes_a_session_exit_that_beats_the_send() {
+    let (_dir, repo, db) = fixture();
+    let mut backend = TestWorkspace::new(
+        &db,
+        false,
+        "commit work; receipt \"$(git rev-parse HEAD)\"; idle; await_exit",
+    );
+    backend.exit_returns_after_session = true;
+    let outcome = supervise(&db, &repo, &backend).unwrap();
+    backend.join();
+    assert_eq!(outcome["runs"][0]["status"], "awaiting_integration");
+    assert_eq!(backend.exits_sent.load(Ordering::SeqCst), 1);
+    let detail = SqliteQueue::open(&db).unwrap().show(1).unwrap();
+    let kinds = event_kinds(&detail);
+    let position = |kind: &str| kinds.iter().position(|k| *k == kind).unwrap();
+    assert!(
+        position("exit_requested") < position("session_exited"),
+        "{kinds:?}"
+    );
 }
 
 #[test]
