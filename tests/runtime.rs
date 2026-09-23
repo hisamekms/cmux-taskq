@@ -5597,3 +5597,78 @@ fn integrate_registers_the_landed_follow_ups_as_draft_tasks_of_the_goal_once() {
     // Nothing to register without follow_ups.
     assert!(runtime::register_follow_ups(&mut queue, &task, &run.id, None).is_empty());
 }
+
+#[test]
+fn dagq_toml_run_env_reaches_the_workspace_and_the_verification_commands() {
+    let (_dir, repo, db) = fixture();
+    fs::write(
+        repo.join("dagq.toml"),
+        "[run.env]\nSHARED = '${DAGQ_QUEUE_DIR}/target'\nRUN_TMP = \"${DAGQ_RUN_DIR}\"\n",
+    )
+    .unwrap();
+    git(&repo, &["add", "dagq.toml"]);
+    git(&repo, &["commit", "-m", "run env"]);
+    let mut queue = SqliteQueue::open(&db).unwrap();
+    let task = queue
+        .add(NewTask {
+            title: "env task".into(),
+            description: String::new(),
+            acceptance: String::new(),
+            verification_commands: vec![
+                r#"printf '%s %s\n' "$SHARED" "$RUN_TMP" >> "$RUN_TMP/verify-env.txt""#.into(),
+            ],
+            dependencies: vec![],
+            goal_id: None,
+            context: String::new(),
+        })
+        .unwrap();
+    queue.transition(1, TaskAction::Cancel).unwrap();
+    queue.transition(task.id, TaskAction::Ready).unwrap();
+    drop(queue);
+    let backend = TestWorkspace::new(&db, false, VALID_AGENT);
+    let outcome = supervise(&db, &repo, &backend).unwrap();
+    backend.join();
+    assert_eq!(outcome["errors"], json!([]), "{outcome}");
+    let run = SqliteQueue::open(&db).unwrap().show(task.id).unwrap().runs[0].clone();
+    assert_eq!(run.status, RunStatus::AwaitingIntegration);
+    let canonical = db.canonicalize().unwrap();
+    let queue_dir = canonical.parent().unwrap().to_str().unwrap().to_owned();
+    let run_dir = run.run_dir.clone().unwrap();
+    // The workspace gets the expanded table after the runtime's own names.
+    assert_eq!(
+        backend.tags.lock().unwrap()[0].env,
+        vec![
+            ("DAGQ_ROLE".to_owned(), "worker".to_owned()),
+            (
+                "DAGQ_QUEUE".to_owned(),
+                canonical.to_str().unwrap().to_owned()
+            ),
+            ("SHARED".to_owned(), format!("{queue_dir}/target")),
+            ("RUN_TMP".to_owned(), run_dir.clone()),
+        ]
+    );
+    let seen = Path::new(&run_dir).join("verify-env.txt");
+    let line = format!("{queue_dir}/target {run_dir}\n");
+    assert_eq!(fs::read_to_string(&seen).unwrap(), line);
+
+    // `integrate` reruns the command after a rebase that moved the head, with
+    // the same env, even when called from the run's own worktree.
+    fs::write(repo.join("other.txt"), "main moved\n").unwrap();
+    git(&repo, &["add", "other.txt"]);
+    git(&repo, &["commit", "-m", "main moved"]);
+    let worktree = PathBuf::from(run.worktree_path.as_ref().unwrap());
+    let outcome = integrate(&db, task.id, &worktree).unwrap();
+    assert_eq!(outcome["outcome"], "integrated", "{outcome}");
+    assert_eq!(fs::read_to_string(&seen).unwrap(), line.repeat(2));
+}
+
+#[test]
+fn a_broken_dagq_toml_stops_provisioning_before_the_workspace() {
+    let (_dir, repo, db) = fixture();
+    fs::write(repo.join("dagq.toml"), "[build]\n").unwrap();
+    let backend = TestWorkspace::new(&db, false, VALID_AGENT);
+    // Like any provisioning failure it stops claiming; no workspace opens.
+    let error = format!("{:#}", supervise(&db, &repo, &backend).unwrap_err());
+    assert!(error.contains("unknown table [build]"), "{error}");
+    assert!(backend.tags.lock().unwrap().is_empty());
+}

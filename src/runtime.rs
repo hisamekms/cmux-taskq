@@ -20,6 +20,7 @@ use crate::{
             workspace_description, workspace_group_name,
         },
         location::{QueueLocation, runs_dir},
+        run_env::load_run_env,
         runtime_store::{
             HEARTBEAT_TIMEOUT_SECS, Landing, LeasedRun, RunPlan, Validation, lease_is_stale,
         },
@@ -716,6 +717,7 @@ so the run workspace opens outside it: {error:#}",
         self.queue.plan_run(&claimed.id, &self.token, &plan)?;
         fs::create_dir_all(&state_dir)?;
         fs::create_dir(&run_dir).context("run directory must be new")?;
+        let run_env = run_env(&self.repository, &self.db, &run_dir)?;
         let run = self.queue.run(&claimed.id)?;
         let task = self.queue.show(run.task_id)?.task;
         let predecessors: Vec<PredecessorSummary> = self
@@ -754,8 +756,10 @@ so the run workspace opens outside it: {error:#}",
             "--claude".into(),
             path_text(self.claude)?,
         ]);
+        let mut env = session_env(SessionRole::Worker, &self.db)?;
+        env.extend(run_env);
         let tags = WorkspaceTags {
-            env: session_env(SessionRole::Worker, &self.db)?,
+            env,
             description: Some(workspace_description(
                 SessionRole::Worker,
                 &self.queue_hash,
@@ -1169,6 +1173,25 @@ fn unix_seconds(time: SystemTime) -> i64 {
         .as_secs() as i64
 }
 
+/// The expanded `[run.env]` of the repository's `dagq.toml` for the run in
+/// `run_dir` (ADR-0023 decision 3). The file is read from the main checkout,
+/// since `integrate` may be called from any worktree of the repository.
+fn run_env(repository: &GitRepository, db: &Path, run_dir: &Path) -> Result<Vec<(String, String)>> {
+    let queue_dir = db.parent().context("queue database has no directory")?;
+    load_run_env(&main_checkout(repository), queue_dir, run_dir)
+}
+
+/// The main worktree of the repository: the parent of a `.git` common
+/// directory, or the inspected root for a bare common directory.
+fn main_checkout(repository: &GitRepository) -> PathBuf {
+    match repository.common_dir.parent() {
+        Some(parent) if repository.common_dir.file_name() == Some(".git".as_ref()) => {
+            parent.to_path_buf()
+        }
+        _ => repository.root.clone(),
+    }
+}
+
 /// Cross-check the agent's receipt against Git and rerun the task's verification
 /// commands on a thread with its own connection. Rejections become a
 /// `Validation` that is not accepted; only errors in the checks themselves
@@ -1182,7 +1205,7 @@ fn spawn_validation(
     thread::spawn(move || {
         let mut queue = SqliteQueue::open(&db)?;
         let task = queue.show(run.task_id)?.task;
-        let checked = check_receipt(&queue, &repository, &task, &run)?;
+        let checked = check_receipt(&queue, &db, &repository, &task, &run)?;
         Ok(match checked {
             Ok((receipt, commit)) => Validation {
                 accepted: true,
@@ -1236,6 +1259,7 @@ struct Rejection {
 
 fn check_receipt(
     queue: &SqliteQueue,
+    db: &Path,
     repository: &GitRepository,
     task: &Task,
     run: &TaskRun,
@@ -1323,9 +1347,15 @@ fn check_receipt(
     }
     // Rerun the task's own verification commands; the receipt's claims are not enough.
     let run_dir = Path::new(run.run_dir.as_ref().context("missing run directory")?);
+    // Read only when a command runs: a task without any never needs the file.
+    let run_env = if task.verification_commands.is_empty() {
+        Vec::new()
+    } else {
+        run_env(repository, db, run_dir)?
+    };
     for (index, command) in task.verification_commands.iter().enumerate() {
         let log = run_dir.join(format!("verify-{}.log", index + 1));
-        let status = run_shell_to_log(command, worktree, &log)?;
+        let status = run_shell_to_log(command, worktree, &run_env, &log)?;
         let exit_code = status.code().unwrap_or(128);
         let output = fs::read_to_string(&log).unwrap_or_default();
         queue.record_runtime_event(
@@ -1440,7 +1470,7 @@ pub fn integrate(
         "run {} integrating task {} onto main {main}",
         run.id, run.task_id
     );
-    let verdict = match land(&mut queue, &repository, &task, &run, &main) {
+    let verdict = match land(&mut queue, &db, &repository, &task, &run, &main) {
         Ok(verdict) => verdict,
         Err(error) => {
             // Nothing reached main: give the slot back and keep the run where it was.
@@ -1692,6 +1722,7 @@ enum Verdict {
 /// landing itself (Git, files) before `main` moved.
 fn land(
     queue: &mut SqliteQueue,
+    db: &Path,
     repository: &GitRepository,
     task: &Task,
     run: &TaskRun,
@@ -1862,9 +1893,14 @@ fn land(
     } else {
         &task.verification_commands
     };
+    let run_env = if commands.is_empty() {
+        Vec::new()
+    } else {
+        run_env(repository, db, run_dir)?
+    };
     for (index, command) in commands.iter().enumerate() {
         let log = run_dir.join(format!("integrate-verify-{}.log", index + 1));
-        let status = run_shell_to_log(command, worktree, &log)?;
+        let status = run_shell_to_log(command, worktree, &run_env, &log)?;
         let exit_code = status.code().unwrap_or(128);
         let output = fs::read_to_string(&log).unwrap_or_default();
         queue.record_runtime_event(

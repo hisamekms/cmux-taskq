@@ -273,12 +273,18 @@ fn wait_with_deadline(child: &mut Child, label: &str, timeout: Duration) -> Resu
 /// in the run directory, not in the event payload.
 pub const VERIFICATION_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
-pub fn run_shell_to_log(script: &str, cwd: &Path, log: &Path) -> Result<ExitStatus> {
+pub fn run_shell_to_log(
+    script: &str,
+    cwd: &Path,
+    env: &[(String, String)],
+    log: &Path,
+) -> Result<ExitStatus> {
     let file = fs::File::create(log).with_context(|| format!("create {}", log.display()))?;
     let mut child = Command::new("/bin/sh")
         .arg("-c")
         .arg(script)
         .current_dir(cwd)
+        .envs(env.iter().map(|(key, value)| (key, value)))
         .stdin(Stdio::null())
         .stdout(Stdio::from(file.try_clone()?))
         .stderr(Stdio::from(file))

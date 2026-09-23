@@ -52,6 +52,7 @@ grep -q '"Stop"' "$settings" || { printf 'stub: settings lack a Stop hook\n' >&2
   printf 'argv: --session-id %s --debug-file %s --add-dir %s --settings %s\n' "$session_id" "$debug_file" "$add_dir" "$settings"
   printf 'cwd: %s\n' "$(pwd)"
   printf 'env: DAGQ_ROLE=%s DAGQ_QUEUE=%s\n' "${DAGQ_ROLE:-}" "${DAGQ_QUEUE:-}"
+  printf 'run env: E2E_SHARED=%s E2E_RUN_DIR=%s\n' "${E2E_SHARED:-}" "${E2E_RUN_DIR:-}"
 } > "$debug_file"
 run_id=$(printf '%s\n' "$prompt" | sed -n 's/^You are executing dagq task [0-9]*, run \(.*\)\.$/\1/p')
 [ "$run_id" = "$session_id" ] || { printf 'stub: prompt run %s != session %s\n' "$run_id" "$session_id" >&2; exit 65; }
@@ -76,6 +77,14 @@ while read -r line; do
 done
 printf 'bye\n'
 "#;
+
+const E2E_DAGQ_TOML: &str =
+    "[run.env]\nE2E_SHARED = '${DAGQ_QUEUE_DIR}/shared'\nE2E_RUN_DIR = '${DAGQ_RUN_DIR}'\n";
+
+/// A verification command that records the `[run.env]` it ran with in the
+/// run directory it names, and fails without it.
+const VERIFY_RUN_ENV: &str =
+    r#"printf 'verify env: %s\n' "$E2E_SHARED" >> "${E2E_RUN_DIR:?}/verify-env.txt""#;
 
 fn cmux_executable() -> PathBuf {
     env::var_os("DAGQ_E2E_CMUX")
@@ -326,6 +335,9 @@ fn fixture() -> Fixture {
     git(&repo, &["config", "user.name", "e2e"]);
     git(&repo, &["config", "user.email", "e2e@example.invalid"]);
     fs::write(repo.join("seed.txt"), "fixture\n").unwrap();
+    // ADR-0023 decision 3: every run gets this env in its workspace and
+    // its verification commands.
+    fs::write(repo.join("dagq.toml"), E2E_DAGQ_TOML).unwrap();
     git(&repo, &["add", "."]);
     git(&repo, &["commit", "-q", "-m", "seed"]);
     let base = git(&repo, &["rev-parse", "HEAD"]);
@@ -377,6 +389,15 @@ impl Fixture {
 
 /// Register a ready task whose acceptance the stub agent satisfies.
 fn add_ready_task(env: &Env, title: &str, dependencies: &[&str]) -> String {
+    add_ready_task_verifying(env, title, dependencies, &[])
+}
+
+fn add_ready_task_verifying(
+    env: &Env,
+    title: &str,
+    dependencies: &[&str],
+    verify: &[&str],
+) -> String {
     let mut args = vec![
         "add",
         title,
@@ -389,6 +410,9 @@ fn add_ready_task(env: &Env, title: &str, dependencies: &[&str]) -> String {
         "--verify",
         "test -f e2e.txt",
     ];
+    for command in verify {
+        args.extend(["--verify", command]);
+    }
     for dependency in dependencies {
         args.extend(["--depends-on", dependency]);
     }
@@ -510,7 +534,7 @@ fn happy_path_runs_a_stub_agent_through_cmux_and_lands_on_main() {
         env,
         ..
     } = &fixture;
-    let task_id = add_ready_task(env, "e2e stub task", &[]);
+    let task_id = add_ready_task_verifying(env, "e2e stub task", &[], &[VERIFY_RUN_ENV]);
     assert_eq!(dagq(env, &["candidates"]).as_array().unwrap().len(), 1);
 
     let mut guard = WorkspaceGuard {
@@ -628,6 +652,21 @@ fn happy_path_runs_a_stub_agent_through_cmux_and_lands_on_main() {
         )),
         "{log}"
     );
+    // dagq.toml's [run.env], expanded, reached the agent's shell and the
+    // verification commands.
+    let shared = db.canonicalize().unwrap().with_file_name("shared");
+    assert!(
+        log.contains(&format!(
+            "run env: E2E_SHARED={} E2E_RUN_DIR={}",
+            shared.display(),
+            run_dir.display()
+        )),
+        "{log}"
+    );
+    assert_eq!(
+        fs::read_to_string(run_dir.join("verify-env.txt")).unwrap(),
+        format!("verify env: {}\n", shared.display())
+    );
     // The run workspace joined the queue's group, made by its external ID.
     assert!(
         fixture.group().is_some(),
@@ -682,7 +721,7 @@ fn happy_path_runs_a_stub_agent_through_cmux_and_lands_on_main() {
         .iter()
         .filter(|e| e["kind"] == "verification_command")
         .collect();
-    assert_eq!(verifications.len(), 2);
+    assert_eq!(verifications.len(), 3);
     assert!(verifications.iter().all(|e| e["payload"]["exit_code"] == 0));
     let finished = event("validation_finished");
     assert_eq!(finished["payload"]["status"], "awaiting_integration");
