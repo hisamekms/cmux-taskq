@@ -232,8 +232,9 @@ struct TestWorkspace {
     exits_sent: AtomicUsize,
     sessions: Mutex<Vec<(String, TestSession)>>,
     closed: Mutex<Vec<String>>,
-    /// `notify` calls; the supervisor sends none (ADR-0022).
-    notifications: AtomicUsize,
+    /// `notify` calls as (title, body, workspace); the supervisor sends
+    /// none, `ask` one per new ask (ADR-0022).
+    notifications: Mutex<Vec<(String, String, Option<String>)>>,
     /// The tags each run workspace was opened with.
     tags: Mutex<Vec<WorkspaceTags>>,
     /// Every `ensure_group` call, as (external ID, name).
@@ -274,7 +275,7 @@ impl TestWorkspace {
             exits_sent: AtomicUsize::new(0),
             sessions: Mutex::new(Vec::new()),
             closed: Mutex::new(Vec::new()),
-            notifications: AtomicUsize::new(0),
+            notifications: Mutex::new(Vec::new()),
             tags: Mutex::new(Vec::new()),
             groups: Mutex::new(Vec::new()),
             group_fails: false,
@@ -575,8 +576,12 @@ impl WorkspaceBackend for TestWorkspace {
         }
         Ok(format!("group-{external_id}"))
     }
-    fn notify(&self, _: &str, _: &str, _: Option<&str>) -> Result<()> {
-        self.notifications.fetch_add(1, Ordering::SeqCst);
+    fn notify(&self, title: &str, body: &str, workspace: Option<&str>) -> Result<()> {
+        self.notifications.lock().unwrap().push((
+            title.into(),
+            body.into(),
+            workspace.map(Into::into),
+        ));
         Ok(())
     }
 }
@@ -671,7 +676,7 @@ fn run_agent_with(script: &str, close_fail: bool) -> (TempDir, PathBuf, dagq::do
     }
     assert_eq!(kinds.contains(&"cleanup_failed"), close_fail);
     // A run at rest is reported through `watch`, not a notification (ADR-0022).
-    assert_eq!(backend.notifications.load(Ordering::SeqCst), 0);
+    assert!(backend.notifications.lock().unwrap().is_empty());
     // The run workspace carries its role and queue in its environment, a
     // description naming the run and task, and the queue's group.
     let canonical = db.canonicalize().unwrap();
@@ -1275,7 +1280,7 @@ fn a_dialog_on_the_screen_is_recorded_once_and_cleared() {
 /// `$EXIT.idle` exists and then waits for the answer in `$MESSAGE` (the
 /// test backend's terminal); it commits the answer it got.
 const ASKING_AGENT: &str = r#"
-"$DAGQ" --db "$DB" ask --run "$RUN_ID" --kind worker_question --question 'Which word?' > /dev/null || exit 70
+"$DAGQ" --db "$DB" ask --run "$RUN_ID" --kind worker_question --question 'Which word?' --cmux /usr/bin/true > /dev/null || exit 70
 while [ ! -f "$EXIT.idle" ]; do sleep 0.1; done
 idle
 while [ ! -f "$MESSAGE" ]; do sleep 0.1; done
@@ -1412,7 +1417,7 @@ fn a_failed_answer_delivery_is_left_to_the_maintainer() {
         &db,
         false,
         &format!(
-            "\"$DAGQ\" --db \"$DB\" ask --run \"$RUN_ID\" --kind worker_question --question 'Which?' >/dev/null; idle; {HOLD}; commit work; receipt \"$(git rev-parse HEAD)\"; idle; await_exit"
+            "\"$DAGQ\" --db \"$DB\" ask --run \"$RUN_ID\" --kind worker_question --question 'Which?' --cmux /usr/bin/true >/dev/null; idle; {HOLD}; commit work; receipt \"$(git rev-parse HEAD)\"; idle; await_exit"
         ),
     );
     backend.text_fails = true;
@@ -1588,7 +1593,7 @@ fn unanswered_exit_request_times_out_and_keeps_the_run() {
         1
     );
     assert!(!kinds.contains(&"runtime_error"));
-    assert_eq!(backend.notifications.load(Ordering::SeqCst), 0);
+    assert!(backend.notifications.lock().unwrap().is_empty());
     // The session exited, so the attention is the landing now, not /exit.
     let status = runtime::status(&db).unwrap();
     assert_eq!(
@@ -1687,6 +1692,8 @@ fn failed_agent_retains_worktree_and_does_not_complete_task() {
         "session exited with code 7"
     );
     assert!(backend.closed().is_empty());
+    // A failed run is reported through `watch`, not a notification (ADR-0022).
+    assert!(backend.notifications.lock().unwrap().is_empty());
     let mut queue = SqliteQueue::open(&db).unwrap();
     let detail = queue.show(1).unwrap();
     assert_eq!(detail.task.status, TaskStatus::InProgress);
@@ -6099,6 +6106,106 @@ fn watch_role(
     .unwrap()
 }
 
+/// The one notification is `ask`'s (ADR-0022 decision 5): a run reaching
+/// awaiting_integration sends none, a new ask sends one to the inbox
+/// workspace `up` recorded, and a repeated ask none.
+#[test]
+fn only_a_new_ask_notifies_and_it_goes_to_the_inbox() {
+    use dagq::domain::{AskKind, NewAsk, SessionRole};
+    let (_dir, repo, db) = fixture();
+    let backend = TestWorkspace::new(&db, false, "commit work; receipt \"$(git rev-parse HEAD)\"");
+    let outcome = supervise(&db, &repo, &backend).unwrap();
+    backend.join();
+    assert_eq!(outcome["runs"][0]["status"], "awaiting_integration");
+    assert!(backend.notifications.lock().unwrap().is_empty());
+    let run_id = outcome["runs"][0]["id"].as_str().unwrap().to_owned();
+
+    let new_ask = |question: &str| NewAsk {
+        kind: AskKind::ApproveLanding,
+        task_id: None,
+        run_id: Some(run_id.clone()),
+        question: question.into(),
+        options: vec!["land".into()],
+        asked_by: "maintainer".into(),
+    };
+    // Without an inbox the notification names no workspace; the bound
+    // repository's main checkout names the queue.
+    let other = repo.parent().unwrap().join("elsewhere");
+    let asked = runtime::ask(&db, &other, new_ask(&"長".repeat(250)), &backend).unwrap();
+    assert_eq!(asked["created"], true);
+    assert_eq!(asked["notified"], true);
+    let repo_name = repo.file_name().unwrap().to_string_lossy().into_owned();
+    assert_eq!(
+        *backend.notifications.lock().unwrap(),
+        vec![(
+            format!("[{repo_name}] ask #1 approve_landing"),
+            format!("{}…\ntask 1 run {run_id}", "長".repeat(200)),
+            None
+        )]
+    );
+    // The same run and kind again: the open ask, no notification.
+    let again = runtime::ask(&db, &repo, new_ask("again"), &backend).unwrap();
+    assert_eq!(again["created"], false);
+    assert_eq!(again["notified"], false);
+    assert_eq!(backend.notifications.lock().unwrap().len(), 1);
+
+    // With the inbox recorded, a new ask goes to its workspace.
+    let queue = SqliteQueue::open(&db).unwrap();
+    queue
+        .register_session_workspace(SessionRole::Inbox, "INBOX-UUID")
+        .unwrap();
+    let asked = runtime::ask(
+        &db,
+        &other,
+        NewAsk {
+            kind: AskKind::Decide,
+            task_id: Some(1),
+            run_id: None,
+            question: "which?".into(),
+            options: Vec::new(),
+            asked_by: "maintainer".into(),
+        },
+        &backend,
+    )
+    .unwrap();
+    assert_eq!(asked["notified"], true);
+    assert_eq!(
+        backend.notifications.lock().unwrap()[1],
+        (
+            format!("[{repo_name}] ask #2 decide"),
+            "which?\ntask 1".into(),
+            Some("INBOX-UUID".into())
+        )
+    );
+    // The observer's blocked ask on no task notifies the inbox too, with
+    // the question alone as its body.
+    let blocked = runtime::ask(
+        &db,
+        &other,
+        NewAsk {
+            kind: AskKind::Blocked,
+            task_id: None,
+            run_id: None,
+            question: "slots idle".into(),
+            options: Vec::new(),
+            asked_by: "observer".into(),
+        },
+        &backend,
+    )
+    .unwrap();
+    assert_eq!(blocked["task_id"], Value::Null);
+    assert_eq!(blocked["notified"], true);
+    assert_eq!(
+        backend.notifications.lock().unwrap()[2],
+        (
+            format!("[{repo_name}] ask #3 blocked"),
+            "slots idle".into(),
+            Some("INBOX-UUID".into())
+        )
+    );
+    assert_eq!(backend.notifications.lock().unwrap().len(), 3);
+}
+
 #[test]
 fn asks_of_a_run_are_attention_for_the_inbox_then_the_maintainer() {
     use dagq::domain::{AskKind, NewAsk, SessionRole};
@@ -7146,8 +7253,8 @@ set -e
 printf '%s' "$DAGQ_ROLE" > role.txt
 q() { dagq --db "$DAGQ_QUEUE" "$@" > /dev/null; }
 q note --task 1 --kind stall --text 'task 1 waits for a slot'
-q ask --kind blocked --question 'slots idle while task 1 is ready' --option 'leave it'
-q ask --kind blocked --question 'the same alert again'
+q ask --kind blocked --question 'slots idle while task 1 is ready' --option 'leave it' --cmux /usr/bin/true
+q ask --kind blocked --question 'the same alert again' --cmux /usr/bin/true
 q goal add --draft 'claim faster' --description 'evidence: the stall note'
 if q ready 1 2> ready.err; then exit 3; fi
 if q ask --kind decide --task 1 --question 'decide?' 2> ask.err; then exit 4; fi

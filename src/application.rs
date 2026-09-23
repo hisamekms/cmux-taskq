@@ -436,8 +436,9 @@ pub trait WorkspaceBackend {
     fn ensure_group(&self, external_id: &str, name: &str) -> Result<String>;
     /// Tell a person that something waits for them: a notification, never
     /// keystrokes into a terminal. `workspace` is the workspace it belongs
-    /// to; `None` sends it without one. The supervisor sends none yet:
-    /// ADR-0022 limits notifications to `ask_opened`, aimed at the inbox.
+    /// to; `None` sends it without one. Only `ask` sends one, for a new
+    /// ask, aimed at the inbox (ADR-0022 decision 5); the supervisor sends
+    /// none.
     fn notify(&self, title: &str, body: &str, workspace: Option<&str>) -> Result<()>;
     /// How long one call may run before the backend gives it up as failed;
     /// recorded with every `backend_call_failed`.

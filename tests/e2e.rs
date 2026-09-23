@@ -110,6 +110,8 @@ case "$prompt" in
     # for the supervisor to type the answer into this terminal.
     "$add_dir/runner" --db "$DAGQ_QUEUE" ask --run "$session_id" --kind worker_question \
       --question 'Which word goes into answer.txt?' > "$add_dir/ask.json"
+    # The new ask notified a person through the real cmux.
+    grep -Eq '"notified": *true' "$add_dir/ask.json" || { printf 'stub: ask did not notify\n' >&2; exit 66; }
     idle="$add_dir/idle.json"
     printf '{"hook_event_name":"Stop","session_id":"%s","stop_hook_active":false}\n' "$session_id" > "$idle.tmp"
     mv "$idle.tmp" "$idle"

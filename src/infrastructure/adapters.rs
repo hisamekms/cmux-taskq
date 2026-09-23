@@ -3,7 +3,7 @@ use crate::{
         AgentProvider, DetachedRefusal, MainRemote, ProcessControl, SupervisorEnvironment,
         WorkspaceBackend, WorkspaceTags,
     },
-    domain::{SessionRole, Task, TaskRun},
+    domain::{Ask, SessionRole, Task, TaskRun},
 };
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::Value;
@@ -1194,6 +1194,17 @@ pub fn planner_workspace_name(repo_root: &Path) -> String {
 /// asks, which `up` opens next to the maintainer's.
 pub fn inbox_workspace_name(repo_root: &Path) -> String {
     role_workspace_name(repo_root, SessionRole::Inbox)
+}
+
+/// `[<repo>] ask #<id> <kind>`: the title of the notification `ask` sends
+/// the inbox for a new ask (ADR-0022 decision 5).
+pub fn ask_notification_title(repo_root: &Path, ask: &Ask) -> String {
+    format!(
+        "[{}] ask #{} {}",
+        repository_name(repo_root),
+        ask.id,
+        ask.kind.as_str()
+    )
 }
 
 fn role_workspace_name(repo_root: &Path, role: SessionRole) -> String {

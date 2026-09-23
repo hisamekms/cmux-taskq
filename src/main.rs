@@ -286,6 +286,7 @@ enum Command {
     },
     /// Register a question for a person about a task or one of its runs; prints the ask.
     /// An open ask of the same task, run and kind is returned instead (`created: false`).
+    /// A new ask sends one `cmux notify` to the inbox workspace (`notified`, or `notify_error`).
     #[command(args_conflicts_with_subcommands = true, subcommand_negates_reqs = true)]
     Ask {
         #[command(subcommand)]
@@ -303,6 +304,9 @@ enum Command {
         /// Run the ask is about (its task is implied).
         #[arg(long)]
         run: Option<String>,
+        /// cmux executable, used to notify the inbox; a bare name is resolved on PATH.
+        #[arg(long, default_value = "cmux")]
+        cmux: PathBuf,
     },
     /// Write the answer of an open ask; the maintainer then sees ask_answered.
     Answer {
@@ -752,15 +756,27 @@ fn execute(cli: Cli) -> Result<Value> {
             options,
             task_id,
             run,
-        } => serde_json::to_value(queue.ask(NewAsk {
-            kind: kind.unwrap_or_default().parse::<AskKind>()?,
-            task_id,
-            run_id: run,
-            question: question.unwrap_or_default(),
-            options,
-            // The session's role; a person at a plain terminal has none.
-            asked_by: role.unwrap_or_else(|| "human".into()),
-        })?)?,
+            cmux,
+        } => {
+            use dagq::infrastructure::adapters::{Cmux, executable};
+            // A missing cmux fails only the notification, not the ask.
+            dagq::runtime::ask(
+                &db,
+                &cwd,
+                NewAsk {
+                    kind: kind.unwrap_or_default().parse::<AskKind>()?,
+                    task_id,
+                    run_id: run,
+                    question: question.unwrap_or_default(),
+                    options,
+                    // The session's role; a person at a plain terminal has none.
+                    asked_by: role.unwrap_or_else(|| "human".into()),
+                },
+                &Cmux {
+                    executable: executable(&cmux).unwrap_or(cmux),
+                },
+            )?
+        }
         Command::Answer { id, text } => serde_json::to_value(queue.answer(id, &text)?)?,
         Command::Asks { open, role: r, all } => {
             json!({"asks": queue.asks(dagq::infrastructure::asks::AskQuery {

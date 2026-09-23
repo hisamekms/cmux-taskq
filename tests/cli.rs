@@ -11,14 +11,40 @@ fn invoke(db: &Path, args: &[&str]) -> Output {
 }
 
 /// Run with `DAGQ_ROLE` set to `role`, or unset: the tests do not inherit
-/// the role of the session running them.
+/// the role of the session running them. A stub `cmux` next to the queue
+/// comes first on PATH, so `ask` never notifies the person running the
+/// tests; it appends its arguments to [`notifications`] instead.
 fn invoke_as(role: Option<&str>, db: &Path, args: &[&str]) -> Output {
+    let bin = db.parent().unwrap().join("bin");
+    if !bin.join("cmux").exists() {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::create_dir_all(&bin).unwrap();
+        let stub = bin.join("cmux");
+        std::fs::write(
+            &stub,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" >> '{}'\n",
+                bin.join("notifications").display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let path = std::env::join_paths(
+        std::iter::once(bin).chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
+    )
+    .unwrap();
     let mut command = Command::new(env!("CARGO_BIN_EXE_dagq"));
-    command.env_remove("DAGQ_ROLE");
+    command.env("PATH", path).env_remove("DAGQ_ROLE");
     if let Some(role) = role {
         command.env("DAGQ_ROLE", role);
     }
     command.arg("--db").arg(db).args(args).output().unwrap()
+}
+
+/// Every argument the stub `cmux` of `db`'s directory was called with, one per line.
+fn notifications(db: &Path) -> String {
+    std::fs::read_to_string(db.parent().unwrap().join("bin/notifications")).unwrap_or_default()
 }
 
 fn ok_as(role: &str, db: &Path, args: &[&str]) -> Value {
@@ -413,6 +439,15 @@ fn ask_answer_asks_and_close_through_the_cli() {
         ],
     );
     assert_eq!(asked["created"], true);
+    assert_eq!(asked["notified"], true);
+    // A new ask sends one notification; no inbox is recorded, so it names
+    // no workspace, and a `--db` queue is named after the working directory.
+    let repo = std::env::current_dir().unwrap();
+    let repo = repo.file_name().unwrap().to_string_lossy();
+    assert_eq!(
+        notifications(&db),
+        format!("notify\n--title\n[{repo}] ask #1 decide\n--body\nWhich ADR number?\ntask 1\n")
+    );
     assert_eq!(asked["kind"], "decide");
     assert_eq!(asked["task_id"], 1);
     assert_eq!(asked["options"], serde_json::json!(["0029", "0030"]));
@@ -433,6 +468,8 @@ fn ask_answer_asks_and_close_through_the_cli() {
         ],
     );
     assert_eq!(again["created"], false);
+    assert_eq!(again["notified"], false);
+    assert_eq!(notifications(&db).matches("notify\n").count(), 1);
     assert_eq!(again["id"], id);
     assert_eq!(again["question"], "Which ADR number?");
     // Missing target, unknown kind, unknown task and a blank question fail.
@@ -550,6 +587,26 @@ fn ask_answer_asks_and_close_through_the_cli() {
         ok(&db, &["asks", "--role", "inbox"])["asks"],
         serde_json::json!([])
     );
+    // Answers and closes notify nobody: two asks, two notifications.
+    assert_eq!(notifications(&db).matches("notify\n").count(), 2);
+    // The ask stands when the notification cannot go out.
+    let unsent = ok(
+        &db,
+        &[
+            "ask",
+            "--kind",
+            "answer_prompt",
+            "--question",
+            "q",
+            "--task",
+            "1",
+            "--cmux",
+            "/nonexistent/cmux",
+        ],
+    );
+    assert_eq!(unsent["created"], true);
+    assert_eq!(unsent["notified"], false);
+    assert!(unsent["notify_error"].is_string());
 }
 
 #[test]
@@ -933,6 +990,21 @@ fn observer_may_note_and_propose_but_not_change_queue_state() {
     );
     assert_eq!(idle["task_id"], Value::Null);
     assert_eq!(idle["created"], true);
+    // The blocked ask on no task is notified with its question alone.
+    assert_eq!(idle["notified"], true);
+    assert!(
+        notifications(&db).ends_with(&format!(
+            "--title\n[{}] ask #{} blocked\n--body\nslots idle\n",
+            std::env::current_dir()
+                .unwrap()
+                .file_name()
+                .unwrap()
+                .to_string_lossy(),
+            idle["id"]
+        )),
+        "{}",
+        notifications(&db)
+    );
     let again = ok_as(
         "observer",
         &db,
@@ -942,6 +1014,7 @@ fn observer_may_note_and_propose_but_not_change_queue_state() {
         (again["id"].clone(), again["created"].clone()),
         (idle["id"].clone(), Value::Bool(false))
     );
+    assert_eq!(notifications(&db).matches("notify\n").count(), 2);
     let inbox = ok(&db, &["status", "--role", "inbox"]);
     assert!(
         inbox["attention"]

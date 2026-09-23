@@ -17,9 +17,9 @@ use crate::{
     },
     infrastructure::{
         adapters::{
-            ClaudeCode, GitRepository, load_average, path_text, process_alive,
-            resume_workspace_description, run_shell_to_log, shell_join, workspace_description,
-            workspace_group_name,
+            ClaudeCode, GitRepository, ask_notification_title, load_average, path_text,
+            process_alive, resume_workspace_description, run_shell_to_log, shell_join,
+            workspace_description, workspace_group_name,
         },
         location::{QueueLocation, runs_dir},
         run_env::load_run_env,
@@ -3777,6 +3777,60 @@ pub fn status(db: &Path) -> Result<Value> {
 
 /// Characters of an ask's question `status` keeps before `…`.
 const ASK_QUESTION_CHARS: usize = 200;
+
+/// `ask`: register an ask and, when it is new, tell a person with one
+/// `cmux notify` aimed at the inbox workspace `up` recorded (without a
+/// workspace when there is none). This is the runtime's only notification
+/// (ADR-0022 decision 5): the process that asks sends it, since asks come
+/// from the maintainer and workers, not the supervisor. A repeated ask
+/// notifies nobody. The ask stands whether or not the notification goes
+/// out; a failure is reported as `notify_error` next to `notified: false`.
+pub fn ask(
+    db: &Path,
+    checkout: &Path,
+    ask: crate::domain::NewAsk,
+    cmux: &dyn WorkspaceBackend,
+) -> Result<Value> {
+    let mut queue = SqliteQueue::open(db)?;
+    let outcome = queue.ask(ask)?;
+    let mut value = serde_json::to_value(&outcome)?;
+    if !outcome.created {
+        value["notified"] = json!(false);
+        return Ok(value);
+    }
+    // The main checkout names the repository, as the workspace group does;
+    // a queue bound to no repository falls back to the working directory.
+    let common_dir = queue.repository_binding()?.map(PathBuf::from);
+    let repo_root = match &common_dir {
+        Some(dir) if dir.file_name() == Some(".git".as_ref()) => dir.parent().unwrap_or(dir),
+        Some(dir) => dir.as_path(),
+        None => checkout,
+    };
+    let ask = &outcome.ask;
+    let question = crate::view::truncate(&ask.question, ASK_QUESTION_CHARS)
+        .unwrap_or_else(|| ask.question.clone());
+    // An observer's blocked ask may belong to no task (and then no run).
+    let mut body = question;
+    if let Some(task_id) = ask.task_id {
+        body.push_str(&format!("\ntask {task_id}"));
+        if let Some(run_id) = &ask.run_id {
+            body.push_str(&format!(" run {run_id}"));
+        }
+    }
+    let inbox = queue.session_workspace(SessionRole::Inbox)?;
+    match cmux.notify(
+        &ask_notification_title(repo_root, ask),
+        &body,
+        inbox.as_deref(),
+    ) {
+        Ok(()) => value["notified"] = json!(true),
+        Err(error) => {
+            value["notified"] = json!(false);
+            value["notify_error"] = json!(format!("{error:#}"));
+        }
+    }
+    Ok(value)
+}
 
 /// `status --role`: the attention narrowed to what `role` acts on
 /// (ADR-0022; `None` is all of it), and every open ask with its question
