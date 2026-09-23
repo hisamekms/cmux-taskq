@@ -5,7 +5,7 @@
 //! change, commit, write the receipt; the test itself plays the session
 //! that resolves a conflict. Requires a running cmux, so it is ignored by
 //! default: `cargo test --locked --test e2e -- --ignored --nocapture`.
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::{
     env, fs,
     io::Read,
@@ -116,6 +116,17 @@ fn git(repo: &Path, args: &[&str]) -> String {
     String::from_utf8(result.stdout).unwrap().trim().to_owned()
 }
 
+/// Record in `home`'s Claude Code config that the folder trust dialog was
+/// accepted at `repo`, as `up` requires before it starts anything.
+fn trust_repository(home: &Path, repo: &Path) {
+    let root = repo.canonicalize().unwrap();
+    fs::write(
+        home.join(".claude.json"),
+        json!({"projects": {root.to_str().unwrap(): {"hasTrustDialogAccepted": true}}}).to_string(),
+    )
+    .unwrap();
+}
+
 /// The queue is resolved the way a user's shell would: from the repository as
 /// the working directory, with `XDG_DATA_HOME` pointed at the disposable
 /// directory instead of the developer's real data home.
@@ -133,6 +144,7 @@ fn dagq_with(env: &Env, extra: &[(&str, &Path)], args: &[&str]) -> Value {
     command
         .current_dir(&env.repo)
         .env("XDG_DATA_HOME", &env.data_home)
+        .env_remove("CLAUDE_CONFIG_DIR")
         .args(args);
     for (key, value) in extra {
         command.env(key, value);
@@ -1186,6 +1198,7 @@ fn up_starts_a_launchd_supervisor_that_status_lists_and_down_wait_stops_it() {
     // The agent's plist goes under a disposable HOME, not the developer's.
     let home = fixture._dir.path().join("home");
     fs::create_dir(&home).unwrap();
+    trust_repository(&home, &env.repo);
     let located = dagq_with(env, &[("HOME", home.as_path())], &["locate"]);
     let label = located["label"].as_str().unwrap().to_owned();
     let plist = PathBuf::from(located["launch_agent"].as_str().unwrap());
@@ -1218,6 +1231,7 @@ fn up_starts_a_launchd_supervisor_that_status_lists_and_down_wait_stops_it() {
             .current_dir(&env.repo)
             .env("XDG_DATA_HOME", &env.data_home)
             .env("HOME", &home)
+            .env_remove("CLAUDE_CONFIG_DIR")
             .args(up_args);
         command.output().unwrap()
     };
@@ -1345,6 +1359,7 @@ fn up_in_cmux_starts_a_supervisor_in_a_workspace_that_down_wait_stops_and_closes
     // A disposable HOME, so a stray plist could only land there; none should.
     let home = fixture._dir.path().join("home");
     fs::create_dir(&home).unwrap();
+    trust_repository(&home, &env.repo);
     let located = dagq_with(env, &[("HOME", home.as_path())], &["locate"]);
     let plist = PathBuf::from(located["launch_agent"].as_str().unwrap());
     let label = located["label"].as_str().unwrap().to_owned();

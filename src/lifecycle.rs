@@ -28,8 +28,9 @@ use crate::{
     domain::{RunStatus, SessionRole, SupervisorMode, SupervisorRegistration},
     infrastructure::{
         adapters::{
-            ClaudeCode, GitRepository, maintainer_workspace_name, path_text, shell_join,
-            supervisor_workspace_name, workspace_description, workspace_group_name,
+            ClaudeCode, GitRepository, claude_trusts_repository, maintainer_workspace_name,
+            path_text, shell_join, supervisor_workspace_name, workspace_description,
+            workspace_group_name,
         },
         launchd::LaunchAgentSpec,
         location::QueueLocation,
@@ -75,6 +76,9 @@ pub struct UpEnvironment {
     pub socket_password: Option<String>,
     /// The binary launchd runs: this one, by absolute path.
     pub current_exe: PathBuf,
+    /// Claude Code's global config, which records the folder trust of each
+    /// repository (`claude_global_config`); `None` trusts nothing.
+    pub claude_config: Option<PathBuf>,
 }
 
 /// What `up` says when cmux does not admit a process from outside its
@@ -86,6 +90,20 @@ so the supervisor launchd starts could not reach it. Either save a socket passwo
 Settings (its CLI uses it on its own), or export CMUX_SOCKET_PASSWORD before `up` (it is then \
 written into the LaunchAgent); or run `up --in-cmux`, which starts the supervisor inside a cmux \
 workspace without launchd and without any automatic restart";
+
+/// What `up` says when Claude Code has not trusted the repository: every
+/// run session would stop at the folder trust dialog, since run worktrees
+/// take their trust from the repository root.
+pub fn untrusted_repository_hint(root: &Path, config: Option<&Path>) -> String {
+    format!(
+        "Claude Code has not trusted the repository {root}, so every run session would stop at \
+its folder trust dialog (run worktrees take their trust from the repository root). Start `claude` \
+once in {root} and accept \"Yes, I trust this folder\", then run `up` again; {config} must then \
+record projects[\"{root}\"].hasTrustDialogAccepted = true",
+        root = root.display(),
+        config = config.map_or_else(|| "~/.claude.json".into(), |c| c.display().to_string()),
+    )
+}
 
 #[derive(Debug, Clone)]
 pub struct UpOptions {
@@ -112,8 +130,8 @@ pub struct UpOptions {
 }
 
 /// Ensure the supervisor and the maintainer workspace exist and report the
-/// queue's open work. Preflight first (cmux, claude, an initialized queue,
-/// the repository), then prune registrations whose process is gone, start
+/// queue's open work. Preflight first (cmux, claude, Claude Code's trust of
+/// the repository root, an initialized queue, the repository), then prune registrations whose process is gone, start
 /// the agent only when no live registration of this binary's version
 /// remains (after proving that cmux admits a process with the agent's
 /// environment) — draining and replacing a live supervisor of any other
@@ -139,6 +157,21 @@ pub fn up(
         executable: options.claude.clone(),
     }
     .preflight()?;
+    // Claude Code keys trust by the main checkout even for a linked
+    // worktree, and `up` may run from any worktree of the repository.
+    let trust_root = repository
+        .common_dir
+        .parent()
+        .filter(|_| repository.common_dir.file_name() == Some(".git".as_ref()))
+        .unwrap_or(&repository.root);
+    let trusted = match environment.claude_config.as_deref() {
+        Some(config) => claude_trusts_repository(config, trust_root)?,
+        None => false,
+    };
+    ensure!(
+        trusted,
+        untrusted_repository_hint(trust_root, environment.claude_config.as_deref())
+    );
     let plugin_dir = options
         .plugin_dir
         .as_deref()

@@ -555,7 +555,7 @@ fn execute(cli: Cli) -> Result<Value> {
             cmux,
             claude,
         } => {
-            use dagq::infrastructure::adapters::SOCKET_PASSWORD_ENV;
+            use dagq::infrastructure::adapters::{SOCKET_PASSWORD_ENV, claude_global_config};
             use dagq::infrastructure::{
                 adapters::{Cmux, SystemProcesses, executable},
                 launchd::Launchctl,
@@ -569,6 +569,10 @@ fn execute(cli: Cli) -> Result<Value> {
                     .ok()
                     .filter(|password| !password.is_empty()),
                 current_exe: env::current_exe()?,
+                claude_config: claude_global_config(
+                    env::var("CLAUDE_CONFIG_DIR").ok().as_deref(),
+                    env::var("HOME").ok().as_deref(),
+                ),
             };
             let options = UpOptions {
                 parallel,

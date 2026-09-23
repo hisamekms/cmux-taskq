@@ -1140,11 +1140,48 @@ impl AgentProvider for ClaudeCode {
     }
 }
 
-/// Per-run Claude settings whose `Stop` hook publishes the hook's stdin JSON as
-/// the idle marker. Each finished response replaces the marker atomically, so
-/// its modification time tells the supervisor whether the agent went idle after
-/// writing the receipt. `SessionEnd` is not used: session exit is confirmed by
-/// the wrapper's exit code instead.
+/// Claude Code's global config, where the folder trust of each project is
+/// kept: `$CLAUDE_CONFIG_DIR/.claude.json` when that is set (non-empty),
+/// else `~/.claude.json`. `None` when neither can be named.
+pub fn claude_global_config(config_dir: Option<&str>, home: Option<&str>) -> Option<PathBuf> {
+    match (config_dir.filter(|dir| !dir.is_empty()), home) {
+        (Some(dir), _) => Some(Path::new(dir).join(".claude.json")),
+        (None, Some(home)) if !home.is_empty() => Some(Path::new(home).join(".claude.json")),
+        _ => None,
+    }
+}
+
+/// Whether Claude Code has recorded the folder trust dialog as accepted for
+/// the repository at `root` in its global config (`config`). Every run
+/// worktree resolves to its repository's root for the trust check, so this
+/// one key decides whether run sessions stop at the dialog
+/// (docs/design/provider-lifecycle.md). A missing config trusts nothing.
+pub fn claude_trusts_repository(config: &Path, root: &Path) -> Result<bool> {
+    let text = match fs::read_to_string(config) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error).with_context(|| format!("read {}", config.display())),
+    };
+    let config_json: serde_json::Value = serde_json::from_str(&text)
+        .with_context(|| format!("parse Claude Code config {}", config.display()))?;
+    let accepted = |key: &Path| {
+        key.to_str().is_some_and(|key| {
+            config_json["projects"][key]["hasTrustDialogAccepted"].as_bool() == Some(true)
+        })
+    };
+    Ok(accepted(root) || root.canonicalize().is_ok_and(|real| accepted(&real)))
+}
+
+/// Per-run Claude settings. The `Stop` hook publishes the hook's stdin JSON
+/// as the idle marker. Each finished response replaces the marker
+/// atomically, so its modification time tells the supervisor whether the
+/// agent went idle after writing the receipt. `SessionEnd` is not used:
+/// session exit is confirmed by the wrapper's exit code instead.
+///
+/// `autoMode.environment: ["$defaults"]` keeps the built-in classifier
+/// environment and, being a non-empty environment from flag settings, keeps
+/// the "Teach auto mode about your environment?" dialog from opening in a
+/// run session (docs/design/provider-lifecycle.md).
 pub fn stop_hook_settings(idle_marker: &Path) -> Result<String> {
     let marker = path_text(idle_marker)?;
     let command = format!(
@@ -1157,6 +1194,9 @@ pub fn stop_hook_settings(idle_marker: &Path) -> Result<String> {
             "Stop": [{
                 "hooks": [{"type": "command", "command": command, "timeout": 10}]
             }]
+        },
+        "autoMode": {
+            "environment": ["$defaults"]
         }
     }))?)
 }
@@ -1463,5 +1503,19 @@ esac
         .unwrap_err()
         .to_string();
         assert!(error.contains("broken"), "{error}");
+    }
+
+    #[test]
+    fn claude_global_config_prefers_the_config_dir_over_home() {
+        assert_eq!(
+            claude_global_config(Some("/cfg"), Some("/home/u")),
+            Some(PathBuf::from("/cfg/.claude.json"))
+        );
+        assert_eq!(
+            claude_global_config(Some(""), Some("/home/u")),
+            Some(PathBuf::from("/home/u/.claude.json"))
+        );
+        assert_eq!(claude_global_config(None, Some("")), None);
+        assert_eq!(claude_global_config(None, None), None);
     }
 }

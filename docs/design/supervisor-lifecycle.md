@@ -73,7 +73,7 @@ runtimeの中で人が打つ`/exit`や復旧を指す語はすべてmaintainer�
 
 `dagq up [--parallel N] [--in-cmux] [--plugin-dir PATH] [--repo PATH] [--cmux EXE] [--claude EXE]`はqueueのruntimeをcold startする1コマンドで、`src/lifecycle.rs`の`up`が行う。冪等で、続けて2回叩けば2回目は全部`reused` / `skipped`になる。外部（launchctl、cmux、PIDの生存とsignal）は`LaunchAgent`、`WorkspaceBackend`、`ProcessControl`のtrait越しに呼び、`tests/lifecycle.rs`はfakeで判定を、`tests/e2e.rs`は実launchdと実cmuxで`up → status → down --wait`を両方のmodeで確認する（in-cmux modeのe2eはsocket passwordを要らないので、`cmuxOnly`のままでも通る）。
 
-1. **preflight**: queueが`init`済み（DBが存在する。`--db`がなければcwdのrepositoryから解決）、repositoryのroot、cmux（`ping`）、Claude（`--version`）。`--plugin-dir`は絶対pathに正規化する。
+1. **preflight**: queueが`init`済み（DBが存在する。`--db`がなければcwdのrepositoryから解決）、repositoryのroot、cmux（`ping`）、Claude（`--version`）、Claude Codeがrepository rootを信頼済みであること（`$CLAUDE_CONFIG_DIR/.claude.json`、未設定なら`~/.claude.json`の`projects[<root>].hasTrustDialogAccepted`が`true`。run worktreeの信頼はrepository rootから決まるので、未信頼のまま流すと全runがtrust dialogで止まる。未信頼・configが無い・HOMEが無いときは、rootで`claude`を一度起動して承認する案内のerrorで、何も起動せずに止まる。configを書き換えて信頼を代行することはしない。[provider-lifecycle](provider-lifecycle.md#trust-prompt)）。`--plugin-dir`は絶対pathに正規化する。
 2. **stale登録の削除**: `supervisors`表のうちPIDが死んでいる行を`deregister_supervisor`で消し、消したtokenとpidを結果の`pruned_supervisors`に出す。`run_leases`は触らない（そのrunの復旧は`doctor` / `recover`の仕事）。PIDが生きていてheartbeatが30秒より古い登録（hang）は消さず、reuseもしない。
 3. **supervisor**: 生きていてheartbeatが新しい登録があり、その`binary_version`が全部`up`自身のversion（`dagq::VERSION` = `CARGO_PKG_VERSION`）と同じなら`{"outcome":"reused","mode":…,"version":…,"pid":…}`で、plistにもlaunchctlにもcmuxにも触らない（下記のcmux外接続のpreflightもしない。`mode`はその登録に記録されているものをそのまま返し、手で起動したsupervisorはnullのまま）。1つでもversionが違えば**入れ替える**（下記）。liveな登録が無ければ`--in-cmux`の有無でmodeが決まる。
    - **launchd mode（既定）**: まずcmux外接続のpreflight（下記）を通し、それからLaunchAgentを書いて起動し、登録が現れるまで（30秒）待って`{"outcome":"started","mode":"launchd","pid":…,"workspace_id":null,"plist":…}`。
@@ -172,6 +172,8 @@ supervisorはまだ通知を送らない。[ADR-0016](../adr/0016-maintainer-not
 - **Predecessor tasks**: taskの直接の依存元（`task_dependencies`のpredecessor）ごとに1行、`- task <ID>: <title>; result commit <sha>; summary: <text>`。`result commit`は依存元の`integrated` runの`result_commit`（`integrate`がmainに積んだsquash commit）、`summary`はそのrunのreceipt（`receipt_path`。なければ`<run-dir>/receipt.json`）の`summary`（空白を1つに畳む。空なら`(no summary)`）。receiptが読めない・parseできない・pathが不明なら`(receipt unavailable)`、integrated runがなければ（手で`completed`にしたなど）`result commit (not landed)`と書き、いずれもprovisionを止めない。取得はqueueの読み取り専用操作`TaskStore::predecessors(task_id)`（ID順。依存元の`Task`と`integrated` runの`Option<TaskRun>`）で、summaryの読み取りはruntime側（`PredecessorSummary::from_predecessor`）が行う。依存元がなければ`Predecessor tasks: none`。
 - **Sibling tasks in progress**: `TaskStore::tasks_in_progress()`が返す`in_progress`のtask（ID順）から自分のtaskを除き、taskにgoalがあれば同じ`goal_id`のtaskに限定したものを`- task <ID>: <title>`で並べる（`siblings_in_progress`）。goalのないtaskはgoalの有無を問わず全`in_progress` taskを見る。claimは`fill_slots`で1件ずつ順に行うので、同じpassで後にclaimされたtaskのpromptには先にclaimされたtaskが載り、その逆は載らない。`awaiting_integration`や`needs_session`のrunを持つtaskも`in_progress`なので載る。なければ`Sibling tasks in progress: none`。
 
+冒頭（worktreeだけで作業する指示の直後）に、最初に読むものを`WORKER_READING`の一文に限定する: repository instructions（AGENTS.md）のworker節、この下のtask context（とそれが名指す文書）、goal doc、依存元のsummaryだけを読み、`dagq list` / `dagq show`は打たず、docs全体は読まず、他のファイルはtaskが必要とするときだけ開く（goal 11の決定4。runに要る情報はpromptに載っていて、queueの一覧やdocs全体を読むのは最初のcommitを遅らせるだけ）。
+
 4節の後に「担当はこのtaskだけ。兄弟taskの範囲を変えず、範囲外の仕事を見つけたら受け持たずにreceiptの`follow_ups`に書く」の一文を置き、receipt JSONの例に任意の`follow_ups`（`{title, description}`の配列。`Receipt::check`は配列であることだけを見る）を含める。
 
 schemaとCLIは変えない。`tests/e2e.rs`のstubはpromptの1行目とreceipt pathの行だけを読み、`follow_ups`のないreceiptを書くので、節の追加に影響されない。
@@ -217,6 +219,10 @@ receiptの形式は`src/domain.rs`の`Receipt`で、promptとREADMEに同じ契�
  "tests": {"status": "passed | failed | not_applicable", "evidence_or_reason": "..."},
  "e2e": {...}, "subagent_review": {...}, "summary": "..."}
 ```
+
+### 最初のcommitの観測
+
+supervisorは`SessionWatch::poll`のたび（1秒ごと）に、`first_commit_observed`がまだのrunのworktreeの`HEAD`を`GitRepository::head`で読み、runの`base_commit`から動いていれば`first_commit_observed`（`commit`=そのHEAD、`base_commit`）を1回だけ記録する。時刻は観測した時点（commitからせいぜい1 tick遅れ）。引き継いだrunは既に記録があれば記録しない。HEADが読めないときはsupervisor logに書いて次のpollで読み直し、runには影響させない。`agent_started`→`first_commit_observed`が`stats`の`startup`で、workerが起動してから作業に入るまで（ダイアログ・読み込み）の長さを見る（goal 11の決定4）。
 
 ## Validation
 
@@ -309,7 +315,7 @@ attentionイベントの判定は`domain::event_attention(kind, payload)`（候�
   - `work`: `run_claimed`→最初の`receipt_observed`
   - `validate`: 最初の`receipt_observed`→最初の`validation_finished`
   - `wait_to_land`: 最初の`validation_finished`→`run_integrated`
-  - `startup`: `agent_started`→`first_commit_observed`（task E11が記録するまではnull）
+  - `startup`: `agent_started`→`first_commit_observed`（[最初のcommitの観測](#最初のcommitの観測)。記録の無いrunはnull）
   - `resumes`: `resume_started`（ADR-0019の自動resume。記録されるまでは0）の数、`review_verdict`: 最後の`review_finished`の`verdict`（goal 11のreview工程が記録するまではnull）、`needs_session` / `failed`: payloadの`status`がその値のイベントの数。`integration_error`は試行前のstatusに戻すだけなので`needs_session`に数えない
 - **`goals`と`overall`**: goalごと（goal昇順、goalの無いrunは`goal_id: null`で最後）と全体で、`runs`（件数）と区間ごとの`{count, total, median}`。区間の無いrunは数えない。中央値は偶数個なら中央2つの平均の切り捨て。
 - **`alerts`**: `[{kind, task_id, run_id, value, threshold}]`（`value`と`threshold`は秒か回数）。対象のrunに加えて、まだ終わっていないrunも見る。

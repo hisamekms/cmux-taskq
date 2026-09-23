@@ -25,7 +25,7 @@ AgentProvider
 
 Claude Code adapter（`src/infrastructure/adapters.rs`）はworktreeをcwdにし、`--session-id`にrun IDを渡し、`--debug-file`をrun管理領域に置き、`--add-dir`でrun管理領域への書き込みを許可し、promptを位置引数で渡す。stdin/stdout/stderrはwrapperのTTYを継承する。permission modeは上書きしない。
 
-加えて`command()`は`<run-dir>/claude-settings.json`を書いて`--settings`で渡す。内容は`Stop` hook 1件で、hookのstdin（イベントJSON）を`<run-dir>/idle.json`（`TaskRun::idle_marker_path`）へ一時ファイル + renameで書く。supervisorはこのmarkerをidle判定に使う（[supervisor-lifecycle](supervisor-lifecycle.md)）。`SessionEnd` hookは使わず、セッション終了はwrapperの終了コードで確認する。他のproviderは同じmarkerを自分の仕組みで書けばよく、書かなければ手動終了待ちになる。
+加えて`command()`は`<run-dir>/claude-settings.json`を書いて`--settings`で渡す。内容は`Stop` hook 1件で、hookのstdin（イベントJSON）を`<run-dir>/idle.json`（`TaskRun::idle_marker_path`）へ一時ファイル + renameで書く。supervisorはこのmarkerをidle判定に使う（[supervisor-lifecycle](supervisor-lifecycle.md)）。`SessionEnd` hookは使わず、セッション終了はwrapperの終了コードで確認する。他のproviderは同じmarkerを自分の仕組みで書けばよく、書かなければ手動終了待ちになる。同じ設定に`autoMode.environment: ["$defaults"]`も入れ、auto modeの初回案内（Teach auto mode）を抑止する（[起動時のダイアログ](#起動時のダイアログ)）。
 
 Claude providerはcmux内の通常セッションを起動し、実装、unit test、E2E、subagent review、完了レポートを実行させる。Codex providerはCodexの対応するセッション方式を使う。provider capabilityとしてinteractive、subagents、stream events、structured resultを表現する。
 
@@ -82,5 +82,19 @@ B3 / D3 で `~/.claude.json` に残った `projects` の key は repository root
 ### 推奨する後続
 
 1. maintainer 手順として文書化する（runtime 変更なし、推奨）: ある repository で初めて `supervise` を流す前に、その repository の root で `claude` を一度起動して dialog を承認する（または `~/.claude.json` の `projects[<root>].hasTrustDialogAccepted` が真であることを確認する）。使い捨て repository のスモーク（journal 010 の手順）も root を先に信頼する。task 16 で `plugins/claude-dagq/skills/dagq-maintain/SKILL.md`（当時の名前は `taskq-run`）の「every run's worktree is a directory Claude Code has never seen」という誤った本文をこの条件に書き換えた
-2. adapter の `preflight()` で `~/.claude.json` を読み、repository root が未信頼なら warning（event か stderr）を出す。dialog を抑止する CLI flag は 2.1.278 にはないので adapter flag では解決できず、runtime が `hasTrustDialogAccepted` を書き込むのはユーザーの判断を代行することになるので採らない
+2. ~~adapter の `preflight()` で `~/.claude.json` を読み、repository root が未信頼なら warning（event か stderr）を出す~~ → task 92 で `up` の preflight にした（warning ではなく error で止める。[起動時のダイアログ](#起動時のダイアログ)）。dialog を抑止する CLI flag は 2.1.278 / 2.1.280 にはないので adapter flag では解決できず、runtime が `hasTrustDialogAccepted` を書き込むのはユーザーの判断を代行することになるので採らない
 3. 未信頼の repository で `supervise` を始めてしまった場合の扱いは、task 16 で plugin の skill `dagq-maintain`（task 65 で `dagq-session` に分割、[ADR-0010](../adr/0010-maintainer-and-resident-supervisor.md) の T3）に入れた: 最初の承認より前に起動した session（最大 `--parallel` 件）はすべて dialog で止まるので、それぞれに `send-key down` + `enter` で応答する。承認後に起動した session には出ない
+
+## 起動時のダイアログ
+
+2026-09-23 に worker が起動直後に止まったダイアログは trust（5 件）、LSP plugin の推奨、auto mode の初回案内（Teach auto mode）の 3 種類。Claude Code 2.1.280 の binary（`strings ~/.local/share/claude/versions/2.1.280` の minified JS。関数名は minified のもの）から、settings.json と CLI flag で抑止できるかを調べた。結果と runtime の扱い:
+
+| ダイアログ | 表示の条件（2.1.280） | settings / flag で抑止 | runtime の扱い |
+| --- | --- | --- | --- |
+| folder trust | [Trust prompt](#trust-prompt) のとおり repository root の `projects[<root>].hasTrustDialogAccepted` | できない（flag なし。`--dangerously-skip-permissions` も効かない。`CLAUDE_CODE_SANDBOXED` は sandbox を偽ることになるので使わない） | `up` の preflight で検査して、未信頼なら案内付きの error で止まる |
+| Teach auto mode（`Teach auto mode about your environment?`） | `xP()`: auto mode の gate が有効、**settings の `autoMode.environment` が空**、`numStartups >= 5`、`autoModeEnvSetup.denials >= 5`、`dismissed` でなく `dismissedAt` から 7 日（`dnt=604800000`）経過 | できる: `autoMode.environment` が 1 件以上あれば出ない。読むのは `userSettings` / `flagSettings` / `policySettings`（`qwe`）で、`--settings` で渡す run の設定は `flagSettings` | run の `claude-settings.json` に `"autoMode": {"environment": ["$defaults"]}` を書く。`$defaults` は組み込みの environment をその位置に継承するので classifier の挙動は変わらない（`claude --settings <この設定> auto-mode config` の実効 `environment` は設定なしと同じ 21 件で、`$defaults` は展開される。2026-09-23 に確認） |
+| LSP plugin の推奨（`LSP plugin recommendation` / `Would you like to install this LSP plugin?`） | `rno()`: global config（`~/.claude.json`）の `lspRecommendationDisabled` が真か `lspRecommendationIgnoredCount >= 5`（`tno=5`）なら出ない。それ以外は session で開いたファイルの拡張子に合う LSP plugin が marketplace にあれば session に 1 回 | できない: 判定は global config だけを見て、settings.json の key も CLI flag も無い（`--bare` は LSP を切るが settings の hook も切るので Stop hook が動かない） | 何もしない。ダイアログは 30 秒（`s$e=30000`）応答が無ければ `timeout` で閉じて `lspRecommendationIgnoredCount` を 1 増やすので、止まるのは最長 30 秒で、5 回無視されると以後出ない（この machine は 2026-09-23 時点で既に 5）。runtime が `~/.claude.json` を書くのはユーザーの設定を代行するので採らない。止めたいユーザーは推奨の `Disable all LSP recommendations` を選ぶ |
+
+- trust の判定は `$CLAUDE_CONFIG_DIR/.claude.json`（未設定なら `~/.claude.json`）の `projects` を、main checkout の root（`git rev-parse --git-common-dir` の親。`up` を linked worktree から打っても同じ key になる。common dir が `.git` でない配置では `--show-toplevel`）の path で引く（`claude_trusts_repository`）。親 directory の信頼は見ない（[binary から読める判定](#binary-から読める判定)の 3 のとおり、Claude Code も git root より上は辿らない）。config が無い、HOME も `CLAUDE_CONFIG_DIR` も無い、key が無い、`hasTrustDialogAccepted` が `true` でない、のどれも未信頼として `up` を止める。parse できない config は別の error。`supervise` 自体は検査しない（`up` を経ない起動は従来どおり dialog で止まり、`prompt_waiting` になる）
+- 抑止したダイアログは task 101 の `prompt_waiting` の検知とは重ならない: 検知は画面の兆候を見るだけで、出なくなったダイアログは検知されないだけ。goal 11 の受け入れ条件「`prompt_waiting` が trust 以外で出ない」は、LSP の推奨が 30 秒で閉じる（検知は 90 秒後から）ことと Teach auto mode の抑止で満たす
+

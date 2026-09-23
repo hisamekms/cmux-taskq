@@ -84,6 +84,14 @@ fn fixture() -> Fixture {
     let cmux = dir.path().join("cmux-stub");
     fs::write(&cmux, "#!/bin/sh\nprintf 'PONG\\n'\n").unwrap();
     fs::set_permissions(&cmux, fs::Permissions::from_mode(0o755)).unwrap();
+    // Claude Code has accepted the folder trust dialog at the repository root.
+    let claude_config = dir.path().join("claude.json");
+    let root = repo.canonicalize().unwrap();
+    fs::write(
+        &claude_config,
+        json!({"projects": {root.to_str().unwrap(): {"hasTrustDialogAccepted": true}}}).to_string(),
+    )
+    .unwrap();
     Fixture {
         repo,
         location,
@@ -93,6 +101,7 @@ fn fixture() -> Fixture {
             path: "/usr/bin:/bin:/home/u/.local/bin".into(),
             socket_password: None,
             current_exe: "/opt/bin/dagq".into(),
+            claude_config: Some(claude_config),
         },
         options: UpOptions {
             parallel: 2,
@@ -638,6 +647,97 @@ fn up_fails_when_the_started_supervisor_never_registers() {
     // The agent stays loaded for inspection; no maintainer workspace was opened.
     assert!(*launchd.loaded.lock().unwrap());
     assert!(cmux.workspaces.lock().unwrap().is_empty());
+}
+
+/// `up` may run from a linked worktree: trust is still read at the main
+/// checkout's root, the key Claude Code uses for every worktree.
+#[test]
+fn up_from_a_linked_worktree_checks_the_trust_of_the_main_checkout() {
+    let mut fixture = fixture();
+    let worktree = fixture._dir.path().join("linked");
+    git(
+        &fixture.repo,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            worktree.to_str().unwrap(),
+            "-b",
+            "linked",
+        ],
+    );
+    fixture.repo = worktree;
+    let cmux = FakeCmux::default();
+    let launchd = FakeLaunchd::new(&fixture.location.db);
+    let processes = FakeProcesses::default();
+    let result = up(&fixture, &cmux, &launchd, &processes);
+    assert_eq!(result["supervisor"]["outcome"], "started", "{result}");
+}
+
+/// Run worktrees take Claude Code's folder trust from the repository root,
+/// so an untrusted root would stop every run session at the trust dialog:
+/// `up` refuses before it starts anything and says how to trust the root.
+#[test]
+fn up_fails_when_claude_code_has_not_trusted_the_repository() {
+    let mut fixture = fixture();
+    let config = fixture.environment.claude_config.clone().unwrap();
+    let root = fixture.repo.canonicalize().unwrap();
+    let cases = [
+        // No config at all, no config path, another project trusted only,
+        // and the root recorded with the dialog not accepted.
+        None,
+        Some(None),
+        Some(Some(
+            json!({"projects": {"/elsewhere": {"hasTrustDialogAccepted": true}}}),
+        )),
+        Some(Some(
+            json!({"projects": {root.to_str().unwrap(): {"hasTrustDialogAccepted": false}}}),
+        )),
+    ];
+    for case in cases {
+        match &case {
+            None => fixture.environment.claude_config = None,
+            Some(written) => {
+                fixture.environment.claude_config = Some(config.clone());
+                match written {
+                    Some(value) => fs::write(&config, value.to_string()).unwrap(),
+                    None => {
+                        let _ = fs::remove_file(&config);
+                    }
+                }
+            }
+        }
+        let cmux = FakeCmux::default();
+        let launchd = FakeLaunchd::new(&fixture.location.db);
+        let processes = FakeProcesses::default();
+        let message = format!(
+            "{:#}",
+            try_up(&fixture, &cmux, &launchd, &processes).unwrap_err()
+        );
+        assert!(
+            message.starts_with(&format!(
+                "Claude Code has not trusted the repository {}",
+                root.display()
+            )),
+            "{case:?}: {message}"
+        );
+        assert!(message.contains("Yes, I trust this folder"), "{message}");
+        assert!(launchd.installs.lock().unwrap().is_empty());
+        assert!(cmux.workspaces.lock().unwrap().is_empty());
+        assert_eq!(cmux.detached_preflights.lock().unwrap().len(), 0);
+    }
+
+    // A config that cannot be parsed is an error of its own, not a trust verdict.
+    fixture.environment.claude_config = Some(config.clone());
+    fs::write(&config, "not json").unwrap();
+    let cmux = FakeCmux::default();
+    let launchd = FakeLaunchd::new(&fixture.location.db);
+    let processes = FakeProcesses::default();
+    let message = format!(
+        "{:#}",
+        try_up(&fixture, &cmux, &launchd, &processes).unwrap_err()
+    );
+    assert!(message.contains("parse Claude Code config"), "{message}");
 }
 
 /// cmux admits only its own terminals' children unless a socket password is

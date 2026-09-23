@@ -493,6 +493,7 @@ impl Supervisor<'_> {
                 let Some(run) = watch.poll(
                     &mut self.queue,
                     self.cmux,
+                    &self.repository,
                     &self.token,
                     &slot.run,
                     &self.log,
@@ -639,6 +640,8 @@ impl Supervisor<'_> {
                 let exit_timed_out = self
                     .queue
                     .has_run_event(&run.id, "exit_request_timed_out")?;
+                let first_commit_seen =
+                    self.queue.has_run_event(&run.id, "first_commit_observed")?;
                 // A dialog recorded before adoption is not recorded again
                 // while the same screen stays up.
                 let prompt_hash = self
@@ -666,6 +669,7 @@ impl Supervisor<'_> {
                     receipt_seen,
                     exit_requested,
                     exit_timed_out,
+                    first_commit_seen,
                     agent_seen: None,
                     prompt_checked: None,
                     prompt_hash,
@@ -776,6 +780,7 @@ so the run workspace opens outside it: {error:#}",
             receipt_seen: false,
             exit_requested: None,
             exit_timed_out: false,
+            first_commit_seen: false,
             agent_seen: None,
             prompt_checked: None,
             prompt_hash: None,
@@ -795,6 +800,8 @@ struct SessionWatch {
     exit_requested: Option<Instant>,
     /// `exit_request_timed_out` is recorded once per run; the lease is kept.
     exit_timed_out: bool,
+    /// `first_commit_observed` is recorded (also by a previous supervisor).
+    first_commit_seen: bool,
     /// When this supervisor first saw the agent registered.
     agent_seen: Option<Instant>,
     /// When the screen was last read for a dialog.
@@ -811,11 +818,13 @@ impl SessionWatch {
         &mut self,
         queue: &mut SqliteQueue,
         cmux: &dyn WorkspaceBackend,
+        repository: &GitRepository,
         token: &str,
         run: &TaskRun,
         log: &SupervisorLog,
     ) -> Result<Option<TaskRun>> {
         let processes = queue.processes(&run.id)?;
+        self.watch_first_commit(queue, repository, run, log)?;
         if !self.receipt_seen && self.receipt_path.is_file() {
             self.receipt_seen = true;
             queue.record_runtime_event(
@@ -908,6 +917,45 @@ impl SessionWatch {
             }
         }
         Ok(None)
+    }
+
+    /// Record `first_commit_observed` once, the first time the worktree's
+    /// HEAD is seen away from the run's base commit: with `agent_started` it
+    /// measures how long a session takes to start working (`stats`'s
+    /// `startup`). The time is when this poll saw it, at most a tick late.
+    /// A HEAD that cannot be read is noted and checked again next poll.
+    fn watch_first_commit(
+        &mut self,
+        queue: &mut SqliteQueue,
+        repository: &GitRepository,
+        run: &TaskRun,
+        log: &SupervisorLog,
+    ) -> Result<()> {
+        if self.first_commit_seen {
+            return Ok(());
+        }
+        let Some(worktree) = run.worktree_path.as_deref() else {
+            return Ok(());
+        };
+        let head = match repository.head(Path::new(worktree)) {
+            Ok(head) => head,
+            Err(error) => {
+                log.note(&format!(
+                    "HEAD of {} could not be read for its first commit: {error:#}",
+                    run.id
+                ));
+                return Ok(());
+            }
+        };
+        if head != run.base_commit {
+            queue.record_runtime_event(
+                &run.id,
+                "first_commit_observed",
+                json!({"commit": head, "base_commit": run.base_commit}),
+            )?;
+            self.first_commit_seen = true;
+        }
+        Ok(())
     }
 
     /// Read the screen of a session that has run for `prompt_wait` with
@@ -2224,6 +2272,12 @@ pub fn siblings_in_progress(task: &Task, in_progress: Vec<Task>) -> Vec<Task> {
         .collect()
 }
 
+/// What a worker reads before it starts, and nothing more: everything else
+/// about its run is in the prompt, and reading the queue or the whole docs
+/// tree only delays the first commit (goal 11, decision 4).
+pub const WORKER_READING: &str = "Read first, and only: the worker section of the repository instructions (AGENTS.md), the task context below and the documents it names, the goal doc if there is one, and the predecessor summaries below. \
+Do not run `dagq list` or `dagq show`, and skip the rest of the docs tree; open other files only when the task needs them.\n";
+
 /// Text of `prompt.txt`. `goal` is the task's goal as it reads at claim
 /// time, `predecessors` the task's direct dependencies and `siblings` the
 /// other tasks executing at claim time (`siblings_in_progress`). The Goal,
@@ -2296,7 +2350,8 @@ pub fn prompt(
     };
     Ok(format!(
         "You are executing dagq task {task_id}, run {run_id}.\n\
-         Work only in the assigned Git worktree. Read its repository instructions.\n\
+         Work only in the assigned Git worktree.\n\
+         {reading}\
          Implement the task, run the required verification commands, and commit the result.\n\
          Do not merge, push, close the workspace, or modify the queue/runtime files.\n\
          Perform applicable unit tests, E2E, and subagent review. Record evidence or an explicit reason when not applicable.\n\
@@ -2313,6 +2368,7 @@ pub fn prompt(
          After submitting, report the outcome briefly and stop; do not run /exit yourself. Once you are idle the supervisor ends the session, and the maintainer can still send /exit. A receipt does not itself end the session.\n",
         task_id = task.id,
         run_id = run.id,
+        reading = WORKER_READING,
         title = task.title,
         description = task.description,
         acceptance = task.acceptance,

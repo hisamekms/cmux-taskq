@@ -902,6 +902,62 @@ const WORK_SCREEN: &str = "⏺ Bash(cargo test)\n  ⎿  test result: ok\n\n│ �
 /// `$EXIT.go`, then finishes like `VALID_AGENT` and waits for `/exit`.
 const PROMPTED_AGENT: &str = "while [ ! -f \"$EXIT.go\" ]; do sleep 0.2; done; commit work; receipt \"$(git rev-parse HEAD)\"; idle; await_exit";
 
+/// Commits once, waits for `$EXIT.go` before a second commit and the receipt.
+const TWO_COMMIT_AGENT: &str = "commit first; while [ ! -f \"$EXIT.go\" ]; do sleep 0.2; done; printf 'more\\n' >> change.txt; git commit -q -am second; receipt \"$(git rev-parse HEAD)\"";
+
+/// The supervisor records `first_commit_observed` once, while the session
+/// still works, when the worktree's HEAD first leaves the base commit; a
+/// later commit records nothing more. It sits between `agent_started` and
+/// `receipt_observed`, which is what `stats` reads as `startup`.
+#[test]
+fn the_first_commit_is_observed_once_while_the_session_works() {
+    let (_dir, repo, db) = fixture();
+    let backend = Arc::new(TestWorkspace::new(&db, false, TWO_COMMIT_AGENT));
+    let supervisor = {
+        let (db, repo, backend) = (db.clone(), repo.clone(), backend.clone());
+        thread::spawn(move || supervise(&db, &repo, &backend))
+    };
+    let observed = |queue: &mut SqliteQueue| {
+        event_kinds(&queue.show(1).unwrap())
+            .iter()
+            .filter(|k| **k == "first_commit_observed")
+            .count()
+    };
+    wait_until(&db, Duration::from_secs(30), |queue| observed(queue) == 1);
+    let mut queue = SqliteQueue::open(&db).unwrap();
+    let run = queue.show(1).unwrap().runs[0].clone();
+    let worktree = PathBuf::from(run.worktree_path.as_ref().unwrap());
+    let first = git_out(&worktree, &["rev-parse", "HEAD"]);
+    assert_ne!(first, run.base_commit);
+    let detail = queue.show(1).unwrap();
+    assert!(!event_kinds(&detail).contains(&"receipt_observed"));
+
+    fs::write(
+        exit_request_path(run.run_dir.as_ref().unwrap()).with_extension("go"),
+        "",
+    )
+    .unwrap();
+    let outcome = supervisor.join().unwrap().unwrap();
+    backend.join();
+    assert_eq!(outcome["errors"], json!([]), "{outcome}");
+    assert_eq!(outcome["runs"][0]["status"], "awaiting_integration");
+
+    let detail = queue.show(1).unwrap();
+    let kinds = event_kinds(&detail);
+    assert_eq!(observed(&mut queue), 1, "{kinds:?}");
+    let position = |kind: &str| kinds.iter().position(|k| *k == kind).unwrap();
+    assert!(position("agent_started") < position("first_commit_observed"));
+    assert!(position("first_commit_observed") < position("receipt_observed"));
+    let payload = events_of(&db, &run.id, "first_commit_observed").remove(0);
+    assert_eq!(payload["commit"], first.as_str());
+    assert_eq!(payload["base_commit"], run.base_commit.as_str());
+    let head = queue.show(1).unwrap().runs[0]
+        .result_commit
+        .clone()
+        .unwrap();
+    assert_ne!(head, first, "the second commit is the result");
+}
+
 /// A session that runs past `prompt_wait` has its screen read: an ordinary
 /// screen records nothing, a dialog is recorded as `prompt_waiting` once and
 /// surfaces as `answer the prompt in workspace <id>`, and the screen going
@@ -1127,6 +1183,9 @@ fn claude_stop_hook_settings_publish_the_idle_marker() {
         stop_hook_settings(&run.idle_marker_path().unwrap()).unwrap()
     );
     let parsed: Value = serde_json::from_str(&text).unwrap();
+    // A non-empty auto mode environment from flag settings keeps the
+    // "Teach auto mode" dialog away; `$defaults` keeps the built-in entries.
+    assert_eq!(parsed["autoMode"]["environment"], json!(["$defaults"]));
     let hook = &parsed["hooks"]["Stop"][0]["hooks"][0];
     assert_eq!(hook["type"], "command");
     // Run the hook exactly as Claude would: shell command, event JSON on stdin.
@@ -2962,6 +3021,17 @@ fn prompt_describes_the_goal_and_the_context_and_keeps_one_shape_without_them() 
             "{prompt}"
         );
         assert!(prompt.contains("follow_ups is optional"), "{prompt}");
+        // The worker reads only what its run needs, never the queue.
+        assert!(prompt.contains(runtime::WORKER_READING), "{prompt}");
+        assert!(
+            prompt.contains("the worker section of the repository instructions"),
+            "{prompt}"
+        );
+        assert!(prompt.contains("Do not run `dagq list`"), "{prompt}");
+        assert!(
+            !prompt.contains("Read its repository instructions"),
+            "{prompt}"
+        );
     }
 }
 
