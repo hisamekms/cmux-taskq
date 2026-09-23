@@ -891,10 +891,10 @@ fn migration_from_v6_adds_goals_and_keeps_tasks_runs_and_events() {
     // 0007 (supervisors), 0008 (goals), 0009 (supervisor mode), 0010
     // (supervisor binary version), 0011 (session workspaces), 0012
     // (queue-level backend failures), 0013 (goal draft), 0014 (asks) and
-    // 0015 (required evidence) and 0016 (observer events and task-less
-    // blocked asks) are applied together.
-    assert_eq!(SqliteQueue::SCHEMA_VERSION, 16);
-    assert_eq!(queue.schema_version().unwrap(), 16);
+    // 0015 (required evidence), 0016 (observer events and task-less
+    // blocked asks) and 0017 (the stuck_exit ask) are applied together.
+    assert_eq!(SqliteQueue::SCHEMA_VERSION, 17);
+    assert_eq!(queue.schema_version().unwrap(), 17);
     assert_eq!(
         queue
             .session_workspace(dagq::domain::SessionRole::Maintainer)
@@ -970,6 +970,13 @@ fn migration_from_v6_adds_goals_and_keeps_tasks_runs_and_events() {
         )
         .is_err()
     );
+    // 0017: the supervisor's stuck_exit ask about a run.
+    raw.execute(
+        "INSERT INTO asks(kind,task_id,run_id,question,asked_by)
+         VALUES ('stuck_exit',1,'run-landed','session did not exit','supervisor')",
+        [],
+    )
+    .unwrap();
     assert!(
         raw.execute(
             "INSERT INTO run_events(run_id,kind,payload) VALUES ('run-landed','backend_call_failed','{}')",

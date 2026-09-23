@@ -48,6 +48,7 @@ When the person wants more context before answering, read it for them with `"$DA
 - `answer_prompt`: a run's session stopped at a dialog; the answer is the choice to send to it.
 - `decide`: a choice the maintainer cannot make, often a worker's question passed on unchanged.
 - `worker_question`: a worker's own question. The maintainer may answer one about the run's own worktree first (step 3's error then); the answer reaches the worker's terminal.
+- `stuck_exit`: the supervisor's. A run's session did not exit after its `/exit`, usually because Claude Code's own dialog (such as "Background work is running") holds it; the question ends with the last lines of its screen. Show that excerpt with the question. `exit` has the maintainer answer the dialog and send `/exit` (it checks first that the work is committed), `wait` leaves the session to the person; write the person's words when they want something else. You never touch that workspace yourself. If the session exits first, the supervisor closes the ask and `answer` reports it is not open (step 3's error).
 - `blocked`: the observer saw a threshold crossed (a stall, a long wait, idle slots). When the person's answer is new work, write the answer, then tell them the planner session registers it.
 
 ## Where your authority ends

@@ -6,10 +6,12 @@ use dagq::{
         WorkspaceTags,
     },
     domain::{
-        EvidenceCheck, GoalEdit, NewGoal, NewTask, RunStatus, Task, TaskAction, TaskRun, TaskStatus,
+        AskKind, EvidenceCheck, GoalEdit, NewAsk, NewGoal, NewTask, RunStatus, SessionRole, Task,
+        TaskAction, TaskRun, TaskStatus,
     },
     infrastructure::{
         adapters::{GitRepository, shell_join, workspace_handle},
+        asks::AskQuery,
         location::QueueLocation,
         sqlite::SqliteQueue,
     },
@@ -1519,15 +1521,26 @@ fn a_failed_answer_delivery_is_left_to_the_maintainer() {
     );
 }
 
-/// An unanswered `/exit` is recorded once and surfaces as `send /exit`, but
-/// the supervisor keeps the lease and keeps watching: when the session ends
-/// later, the run is validated as usual.
+/// An unanswered `/exit` is recorded once and raised as one `stuck_exit` ask
+/// to the inbox, notified once through the ask path, but the supervisor
+/// keeps the lease and keeps watching: when the session ends later, the ask
+/// is closed by the runtime and the run is validated as usual.
 #[test]
 fn unanswered_exit_request_times_out_and_keeps_the_run() {
     let (_dir, repo, db) = fixture();
     let mut backend = TestWorkspace::new(&db, false, HELD_AGENT);
     backend.exit_timeout = Duration::from_secs(2);
+    let screen = (1..=20)
+        .map(|n| format!("line {n}"))
+        .chain(["❯ 1. Exit anyway".into(), "  2. Cancel".into()])
+        .collect::<Vec<_>>()
+        .join("\n");
+    *backend.screen.lock().unwrap() = screen;
     let backend = Arc::new(backend);
+    SqliteQueue::open(&db)
+        .unwrap()
+        .register_session_workspace(SessionRole::Inbox, "inbox-ws")
+        .unwrap();
     let supervisor = {
         let (db, repo, backend) = (db.clone(), repo.clone(), backend.clone());
         thread::spawn(move || supervise(&db, &repo, &backend))
@@ -1564,12 +1577,62 @@ fn unanswered_exit_request_times_out_and_keeps_the_run() {
         json!({"workspace_id": WORKSPACE_ID, "timeout_secs": 2})
     );
     assert_eq!(backend.exits_sent.load(Ordering::SeqCst), 1);
-    // The maintainer is told to send /exit; recovery is refused while the
-    // supervisor holds the lease.
+    // One stuck_exit ask by the supervisor, with the screen's last 15 lines.
+    let asks = queue.asks(AskQuery::default()).unwrap();
+    assert_eq!(asks.len(), 1, "{asks:?}");
+    let ask = &asks[0];
+    assert_eq!(ask.kind, AskKind::StuckExit);
+    assert_eq!(ask.run_id.as_deref(), Some(run.id.as_str()));
+    assert_eq!(ask.task_id, Some(1));
+    assert_eq!(ask.asked_by, "supervisor");
+    assert_eq!(ask.options, ["exit", "wait"]);
+    assert!(ask.is_open());
+    assert!(ask.question.contains(&run.id), "{}", ask.question);
+    assert!(ask.question.contains("task 1"), "{}", ask.question);
+    assert!(ask.question.contains(WORKSPACE_ID), "{}", ask.question);
+    assert!(ask.question.contains("line 8\n"), "{}", ask.question);
+    assert!(!ask.question.contains("line 7\n"), "{}", ask.question);
+    assert!(ask.question.ends_with("  2. Cancel"), "{}", ask.question);
+    assert_eq!(
+        kinds.iter().filter(|k| **k == "ask_opened").count(),
+        1,
+        "{kinds:?}"
+    );
+    // Notified once, to the inbox, by the ask; no run transition notifies.
+    {
+        let notifications = backend.notifications.lock().unwrap();
+        assert_eq!(notifications.len(), 1, "{notifications:?}");
+        assert!(
+            notifications[0]
+                .0
+                .ends_with(&format!("ask #{} stuck_exit", ask.id)),
+            "{notifications:?}"
+        );
+        assert!(
+            notifications[0]
+                .1
+                .ends_with(&format!("task 1 run {}", run.id))
+        );
+        assert_eq!(notifications[0].2.as_deref(), Some("inbox-ws"));
+    }
+    // The ask is the attention, for the inbox; nobody is told to send
+    // /exit, and recovery is refused while the supervisor holds the lease.
     let status = runtime::status(&db).unwrap();
-    let attention = run_attention_of(&status, &run.id).unwrap();
-    assert_eq!(attention["kind"], "exit_request_timed_out");
-    assert_eq!(attention["next"], "send /exit");
+    assert!(run_attention_of(&status, &run.id).is_none(), "{status}");
+    let attention = status["attention"].as_array().unwrap();
+    assert!(
+        attention.iter().all(|a| a["next"] != "send /exit"),
+        "{status}"
+    );
+    assert!(
+        attention
+            .iter()
+            .any(|a| a["kind"] == "ask_opened" && a["next"] == format!("answer ask {}", ask.id)),
+        "{status}"
+    );
+    let events = dagq::watch::events(&db, 0, 100, false).unwrap();
+    let events = events["events"].as_array().unwrap();
+    assert!(events.iter().all(|e| e["next"] != "send /exit"));
     assert!(runtime::recover(&db, &run.id).is_err());
 
     release_held_session(run.run_dir.as_ref().unwrap());
@@ -1593,7 +1656,27 @@ fn unanswered_exit_request_times_out_and_keeps_the_run() {
         1
     );
     assert!(!kinds.contains(&"runtime_error"));
-    assert!(backend.notifications.lock().unwrap().is_empty());
+    // The runtime closed the ask when the session exited; the closing
+    // answer is no attention, and nothing else was notified.
+    let closed = queue.read_ask(ask.id).unwrap();
+    assert!(closed.closed_at.is_some());
+    assert_eq!(
+        closed.answer.as_deref(),
+        Some("the session exited; closed by the runtime")
+    );
+    assert!(position("session_exited") < position("ask_answered"));
+    assert!(position("ask_answered") < position("validation_finished"));
+    assert!(queue.asks(AskQuery::default()).unwrap().is_empty());
+    assert_eq!(backend.notifications.lock().unwrap().len(), 1);
+    let events = dagq::watch::events(&db, 0, 100, false).unwrap();
+    assert!(
+        events["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|e| e["kind"] != "ask_answered"),
+        "{events}"
+    );
     // The session exited, so the attention is the landing now, not /exit.
     let status = runtime::status(&db).unwrap();
     assert_eq!(
@@ -5821,6 +5904,12 @@ fn adopted_run_does_not_record_an_exit_timeout_twice() {
         1
     );
     assert!(queue.run_lease(&run.id).unwrap().is_some());
+    // The timeout the dead supervisor recorded without its ask gets one
+    // stuck_exit ask from the adopter, once.
+    let asks = queue.asks(AskQuery::default()).unwrap();
+    assert_eq!(asks.len(), 1, "{asks:?}");
+    assert_eq!(asks[0].kind, AskKind::StuckExit);
+    assert_eq!(backend.notifications.lock().unwrap().len(), 1);
     fs::write(exit_request_path(run.run_dir.as_ref().unwrap()), "").unwrap();
     let outcome = supervisor.join().unwrap().unwrap();
     backend.join();
@@ -5837,6 +5926,73 @@ fn adopted_run_does_not_record_an_exit_timeout_twice() {
         1
     );
     assert!(!kinds.contains(&"runtime_error"));
+    assert!(queue.read_ask(asks[0].id).unwrap().closed_at.is_some());
+    assert_eq!(backend.notifications.lock().unwrap().len(), 1);
+}
+
+/// An adopted run whose timeout already has a stuck_exit ask (answered by
+/// the inbox here, the session still up) is not asked again; the runtime
+/// only closes the answered ask once the session exits.
+#[test]
+fn adopted_run_does_not_ask_about_its_exit_twice() {
+    let (_dir, repo, db) = fixture();
+    let mut backend = TestWorkspace::new(&db, false, IDLE_AGENT);
+    backend.exit_timeout = Duration::from_secs(1);
+    let backend = Arc::new(backend);
+    let run = start_run_under_dead_supervisor(&repo, &db, &backend, "dead-supervisor");
+    let mut queue = SqliteQueue::open(&db).unwrap();
+    for kind in ["exit_requested", "exit_request_timed_out"] {
+        queue
+            .record_runtime_event(
+                &run.id,
+                kind,
+                json!({"workspace_id": WORKSPACE_ID, "timeout_secs": 120}),
+            )
+            .unwrap();
+    }
+    let asked = queue
+        .ask(NewAsk {
+            kind: AskKind::StuckExit,
+            task_id: None,
+            run_id: Some(run.id.clone()),
+            question: "send /exit".into(),
+            options: Vec::new(),
+            asked_by: "supervisor".into(),
+        })
+        .unwrap()
+        .ask;
+    queue.answer(asked.id, "sent /exit").unwrap();
+    age_lease(&db, &run, 31);
+    let supervisor = {
+        let (db, repo, backend) = (db.clone(), repo.clone(), backend.clone());
+        thread::spawn(move || supervise(&db, &repo, &backend))
+    };
+    wait_until(&db, Duration::from_secs(30), |queue| {
+        !adoption_events(&queue.show(1).unwrap()).is_empty()
+    });
+    thread::sleep(Duration::from_millis(2500));
+    assert_eq!(
+        queue
+            .asks(AskQuery {
+                all: true,
+                ..Default::default()
+            })
+            .unwrap()
+            .len(),
+        1
+    );
+    fs::write(exit_request_path(run.run_dir.as_ref().unwrap()), "").unwrap();
+    let outcome = supervisor.join().unwrap().unwrap();
+    backend.join();
+    assert_eq!(outcome["errors"], json!([]), "{outcome}");
+    assert_eq!(outcome["runs"][0]["status"], "awaiting_integration");
+    let closed = queue.read_ask(asked.id).unwrap();
+    assert!(closed.closed_at.is_some());
+    assert_eq!(closed.answer.as_deref(), Some("sent /exit"));
+    let detail = queue.show(1).unwrap();
+    let kinds = event_kinds(&detail);
+    assert_eq!(kinds.iter().filter(|k| **k == "ask_answered").count(), 1);
+    assert!(backend.notifications.lock().unwrap().is_empty());
 }
 
 /// The supervisor died after the wrapper reported its exit but before
@@ -6355,12 +6511,13 @@ fn spawn_watch(db: &Path, after: Option<i64>) -> thread::JoinHandle<Value> {
     handle
 }
 
+/// The run's own attention; an ask about the run (with `ask_id`) is not.
 fn run_attention_of<'a>(status: &'a Value, run_id: &str) -> Option<&'a Value> {
     status["attention"]
         .as_array()
         .unwrap()
         .iter()
-        .find(|a| a["run_id"] == run_id)
+        .find(|a| a["run_id"] == run_id && a["ask_id"].is_null())
 }
 
 #[test]
@@ -6529,13 +6686,22 @@ fn status_reports_failed_runs_and_unanswered_exit_requests() {
             json!({"workspace_id": "ws-1", "timeout_secs": 120}),
         )
         .unwrap();
+    // The timeout alone is no attention: the supervisor's stuck_exit ask is.
+    queue
+        .ask(NewAsk {
+            kind: AskKind::StuckExit,
+            task_id: None,
+            run_id: Some(orphan.id.clone()),
+            question: "send /exit".into(),
+            options: Vec::new(),
+            asked_by: "supervisor".into(),
+        })
+        .unwrap();
     let woke = watcher.join().unwrap();
-    assert_eq!(woke["events"][0]["kind"], "exit_request_timed_out");
-    assert_eq!(woke["events"][0]["next"], "send /exit");
+    assert_eq!(woke["events"].as_array().unwrap().len(), 1, "{woke}");
+    assert_eq!(woke["events"][0]["kind"], "ask_opened");
     let status = runtime::status(&db).unwrap();
-    let pending = run_attention_of(&status, &orphan.id).unwrap();
-    assert_eq!(pending["status"], "running");
-    assert_eq!(pending["next"], "send /exit");
+    assert!(run_attention_of(&status, &orphan.id).is_none(), "{status}");
     queue.wrapper_exited(&orphan.id, pid, 0).unwrap();
     assert!(run_attention_of(&runtime::status(&db).unwrap(), &orphan.id).is_none());
 }

@@ -15,12 +15,11 @@ Read this when a field of `status`, `watch` or `show` is unclear.
   - `resuming (runtime)`: `needs_session`, being resumed by the supervisor or with resumes left; nothing to do.
   - `resume session`: `needs_session` after the supervisor's third resume did not resolve it.
   - `inspect and close workspace`: `failed`.
-  - `send /exit`: a `running` run whose exit request timed out.
   - `answer the prompt in workspace <id>`: a `running` run that stopped at a dialog before its receipt (`kind` `prompt_waiting`); it disappears after `prompt_cleared` or `receipt_observed`. Handle it with the `dagq-session` skill.
   - `push main`: an `integrated` run (its task `completed`) whose push of `main` to `origin` failed (`kind` `push_failed`, `last_error` the Git error) with no successful push since.
   - `recover run`: a `claimed` / `starting` / `running` / `validating` / `integrating` run without a lease, given up by its supervisor (`kind` `runtime_error` with `lease_released: true`). Nothing adopts it; handle it with the `dagq-recover` skill. It disappears once recovered. If `watch` reported it but `status` shows the run at rest, `status` wins.
   - `restart supervisor`: `kind` `supervisor_stale` (with its `pid`) or `supervisor_stopped` (nothing registered).
-  - `answer ask <id>`: an open ask (`kind` `ask_opened`, `status` `open`, with `ask_id`); the inbox's to answer.
+  - `answer ask <id>`: an open ask (`kind` `ask_opened`, `status` `open`, with `ask_id`); the inbox's to answer. A `running` run whose exit request timed out is no attention of its own: the supervisor raises it as a `stuck_exit` ask (options `exit` / `wait`) for the inbox; you act on its answer (`read the answer of ask <id> and close it`, `dagq-session`, section 3), and the supervisor closes it once the session exits (that `ask_answered` carries `runtime_closed: true` and is no `watch` event).
   - `read the answer of ask <id> and close it`: an answered ask nobody closed (`kind` `ask_answered`, `status` `answered`); the maintainer's. It disappears after `ask close <id>`.
   - `delivering the answer of ask <id> (runtime)`: an answered `worker_question` of a `running` run; the supervisor types the answer into the worker's terminal once the worker is idle after asking, closes the ask and records `ask_delivered`. Nothing to do; its `ask_answered` is not a `watch` event.
   - `send the answer of ask <id> to the worker and close it`: an answered `worker_question` the supervisor could not type (`kind` `ask_delivery_failed`, tried once), or whose run is no longer `running`. Handle it with the `dagq-session` skill.

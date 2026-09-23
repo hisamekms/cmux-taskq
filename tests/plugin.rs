@@ -253,6 +253,24 @@ fn skills_split_the_roles_of_maintainer_inbox_and_planner() {
     assert!(inbox.contains("\"$DAGQ\" answer <id> --text"));
     assert!(inbox.contains("Add no recommendation of your own"));
     assert!(inbox.contains("never `ask close`, `integrate`"));
+    // A stuck_exit ask is shown like any other; the maintainer acts on it.
+    assert!(inbox.contains("- `stuck_exit`: the supervisor's."));
+    assert!(inbox.contains("You never touch that workspace yourself"));
+    assert!(session.contains("## 3. Act on the answer of a `stuck_exit` ask"));
+    assert!(session.contains("skills/dagq-session/reference/stuck-exit.md"));
+    let stuck_exit =
+        fs::read_to_string(plugin_root().join("skills/dagq-session/reference/stuck-exit.md"))
+            .unwrap();
+    for step in [
+        "\"Background work is running\"",
+        "git -C <worktree_path> status --porcelain",
+        "`jq -r .commit <receipt_path>` equals `git -C <worktree_path> rev-parse HEAD`",
+        "select \"Exit and stop tasks\"",
+        "## Answer `wait`, or anything else",
+    ] {
+        assert!(stuck_exit.contains(step), "stuck-exit.md lacks {step}");
+    }
+    assert!(read("dagq-maintain").contains("- `stuck_exit` (a session held the supervisor's"));
 
     let planner = read("dagq-planner");
     assert!(planner.contains("skills/dagq/SKILL.md"));

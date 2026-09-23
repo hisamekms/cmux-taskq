@@ -10,8 +10,8 @@ use crate::{
         WorkspaceTags, dependency_graph,
     },
     domain::{
-        ClaimOutcome, EvidenceCheck, Goal, IntegrationOutcome, MAX_RESUME_ATTEMPTS, NewTask,
-        PUSH_REMOTE, Predecessor, PushReport, PushResult, Receipt, ReceiptResult,
+        AskKind, ClaimOutcome, EvidenceCheck, Goal, IntegrationOutcome, MAX_RESUME_ATTEMPTS,
+        NewAsk, NewTask, PUSH_REMOTE, Predecessor, PushReport, PushResult, Receipt, ReceiptResult,
         RegisteredFollowUp, RunLease, RunPaths, RunProcess, RunStatus, SessionRole, SupervisorMode,
         SupervisorRegistration, Task, TaskRun, evidence_missing_reason, heartbeat_stale,
     },
@@ -1419,6 +1419,10 @@ impl Supervisor<'_> {
                     agent_seen: None,
                     prompt_checked: None,
                     prompt_hash,
+                    // A timeout recorded without its ask (by a binary that
+                    // made none, or a supervisor that died between the two)
+                    // still gets one; one asked before is not asked again.
+                    exit_asked: !exit_timed_out || self.queue.has_stuck_exit_ask(&run.id)?,
                 })
             }
         })
@@ -1533,6 +1537,7 @@ so the run workspace opens outside it: {error:#}",
             agent_seen: None,
             prompt_checked: None,
             prompt_hash: None,
+            exit_asked: false,
         })
     }
 }
@@ -1558,6 +1563,9 @@ struct SessionWatch {
     /// `screen_hash` of the dialog last recorded as `prompt_waiting` and not
     /// cleared since.
     prompt_hash: Option<String>,
+    /// The `stuck_exit` ask of the exit timeout is registered (also by a
+    /// previous supervisor).
+    exit_asked: bool,
 }
 
 impl SessionWatch {
@@ -1625,6 +1633,13 @@ impl SessionWatch {
                         json!({"error": format!("{error:#}")}),
                     )?,
                 }
+                // Nobody needs to send /exit to a session that exited.
+                for ask in queue.close_stuck_exit_asks(&run.id, STUCK_EXIT_CLOSED)? {
+                    log.note(&format!(
+                        "session of {} exited; closed its stuck_exit ask {}",
+                        run.id, ask.id
+                    ));
+                }
                 return queue.finish_supervision(&run.id, token).map(Some);
             }
             ensure!(
@@ -1660,7 +1675,7 @@ impl SessionWatch {
                     json!({"workspace_id": self.workspace, "timeout_secs": timeout.as_secs()}),
                 )?;
                 log.note(&format!(
-                    "session for {} did not exit within {}s of the exit request; keeping the run and waiting (send /exit in workspace {})",
+                    "session for {} did not exit within {}s of the exit request; keeping the run and asking the inbox to send /exit in workspace {}",
                     run.id,
                     timeout.as_secs(),
                     self.workspace
@@ -1668,7 +1683,56 @@ impl SessionWatch {
                 self.exit_timed_out = true;
             }
         }
+        if self.exit_timed_out && !self.exit_asked {
+            self.ask_stuck_exit(queue, cmux, repository, run, log)?;
+        }
         Ok(None)
+    }
+
+    /// Raise a session that held `/exit` back as a `stuck_exit` ask to the
+    /// inbox, with the last lines of its screen, through the ask path that
+    /// notifies once when the ask is new (ADR-0022 decision 5). An open ask
+    /// of the run is not registered twice. A screen that cannot be read
+    /// leaves the ask without an excerpt. The inbox only shows it to the
+    /// person; the maintainer acts on the answer (`dagq-session`).
+    fn ask_stuck_exit(
+        &mut self,
+        queue: &mut SqliteQueue,
+        cmux: &dyn WorkspaceBackend,
+        repository: &GitRepository,
+        run: &TaskRun,
+        log: &SupervisorLog,
+    ) -> Result<()> {
+        let screen = match cmux.capture(&self.workspace) {
+            Ok(screen) => screen_tail(&screen, PROMPT_EXCERPT_LINES),
+            Err(error) => format!("(the screen could not be read: {error:#})"),
+        };
+        let question = format!(
+            "The session of run {run_id} (task {task_id}) did not exit within {timeout}s of the supervisor's /exit (exit_request_timed_out): something on its screen, usually one of Claude Code's own dialogs such as \"Background work is running\", holds the exit back. The run stays running, and goes on to validating once the session exits; this ask then closes itself. Answer `exit` to have the maintainer answer the dialog so that the session exits and send /exit in workspace {workspace}, or `wait` to leave the session as it is (or write what to do instead).\n\nLast lines of the screen:\n{screen}",
+            run_id = run.id,
+            task_id = run.task_id,
+            timeout = cmux.exit_timeout().as_secs(),
+            workspace = self.workspace,
+        );
+        let outcome = ask_in(
+            queue,
+            &repository.root,
+            NewAsk {
+                kind: AskKind::StuckExit,
+                task_id: Some(run.task_id),
+                run_id: Some(run.id.clone()),
+                question,
+                options: vec!["exit".into(), "wait".into()],
+                asked_by: SessionRole::Supervisor.as_str().into(),
+            },
+            cmux,
+        )?;
+        log.note(&format!(
+            "stuck_exit ask {} for {} (notified: {})",
+            outcome["id"], run.id, outcome["notified"]
+        ));
+        self.exit_asked = true;
+        Ok(())
     }
 
     /// Record `first_commit_observed` once, the first time the worktree's
@@ -1875,6 +1939,9 @@ impl SessionWatch {
         Ok(())
     }
 }
+
+/// The answer the runtime writes into an open `stuck_exit` ask it closes.
+const STUCK_EXIT_CLOSED: &str = "the session exited; closed by the runtime";
 
 /// A session's screen is read for a dialog at most this often.
 const PROMPT_CHECK_INTERVAL: Duration = Duration::from_secs(10);
@@ -3794,7 +3861,16 @@ pub fn ask(
     ask: crate::domain::NewAsk,
     cmux: &dyn WorkspaceBackend,
 ) -> Result<Value> {
-    let mut queue = SqliteQueue::open(db)?;
+    ask_in(&mut SqliteQueue::open(db)?, checkout, ask, cmux)
+}
+
+/// [`ask`] on a queue already open: the supervisor's own asks take this path.
+fn ask_in(
+    queue: &mut SqliteQueue,
+    checkout: &Path,
+    ask: crate::domain::NewAsk,
+    cmux: &dyn WorkspaceBackend,
+) -> Result<Value> {
     let outcome = queue.ask(ask)?;
     let mut value = serde_json::to_value(&outcome)?;
     if !outcome.created {

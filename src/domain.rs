@@ -104,6 +104,10 @@ string_enum!(AskKind {
     // A threshold crossing the observer raises (ADR-0024 decision 4); the
     // one kind that may belong to no task.
     Blocked => "blocked",
+    // A session that did not answer `/exit` within the exit timeout: the
+    // supervisor asks the inbox to clear what holds it and send `/exit`,
+    // and closes the ask itself once the session exits.
+    StuckExit => "stuck_exit",
 });
 
 string_enum!(ReceiptResult {
@@ -1369,7 +1373,6 @@ pub enum AttentionNext {
     ReviewAndIntegrate,
     ResumeSession,
     InspectAndClose,
-    SendExit,
     RestartSupervisor,
     PushMain,
     RecoverRun,
@@ -1407,7 +1410,6 @@ impl fmt::Display for AttentionNext {
             Self::ReviewAndIntegrate => f.write_str("review and integrate"),
             Self::ResumeSession => f.write_str("resume session"),
             Self::InspectAndClose => f.write_str("inspect and close workspace"),
-            Self::SendExit => f.write_str("send /exit"),
             Self::RestartSupervisor => f.write_str("restart supervisor"),
             Self::PushMain => f.write_str("push main"),
             Self::RecoverRun => f.write_str("recover run"),
@@ -1447,7 +1449,6 @@ pub const ATTENTION_KINDS: &[&str] = &[
     "integration_deferred",
     "integration_failed",
     "integration_error",
-    "exit_request_timed_out",
     "push_failed",
     "runtime_error",
     "prompt_waiting",
@@ -1471,6 +1472,10 @@ pub const ASK_EVENT_KINDS: &[&str] = &[
 /// `status` (`awaiting_integration`, `needs_session`, `failed`), or the
 /// session did not answer `/exit`. `integration_error` back to
 /// `awaiting_integration` is not one: the `integrate` caller got the error.
+/// `exit_request_timed_out` is not one: the supervisor raises it as a
+/// `stuck_exit` ask, whose `ask_opened` is the attention, and an
+/// `ask_answered` the runtime wrote when it closed such an ask itself
+/// (`runtime_closed: true`) is none either.
 /// `integration_rebase_aborted` is not one either: the landing goes on and
 /// its outcome is its own event. A `runtime_error` is one only when the
 /// supervisor released the run's lease with it (`lease_released: true`, the
@@ -1514,7 +1519,6 @@ pub fn event_attention(kind: &str, payload: &serde_json::Value) -> Option<Attent
         ("integration_deferred" | "integration_error", Some(RunStatus::NeedsSession)) => {
             Some(AttentionNext::ResumeSession)
         }
-        ("exit_request_timed_out", _) => Some(AttentionNext::SendExit),
         ("push_failed", _) => Some(AttentionNext::PushMain),
         ("runtime_error", _)
             if payload.get("lease_released") == Some(&serde_json::Value::Bool(true)) =>
@@ -1536,6 +1540,11 @@ pub fn event_attention(kind: &str, payload: &serde_json::Value) -> Option<Attent
             Some(AttentionNext::ResumeSession)
         }
         ("ask_opened", _) => ask_id(payload).map(|ask_id| AttentionNext::AnswerAsk { ask_id }),
+        ("ask_answered", _)
+            if payload.get("runtime_closed") == Some(&serde_json::Value::Bool(true)) =>
+        {
+            None
+        }
         ("ask_answered", _)
             if payload.get("kind").and_then(serde_json::Value::as_str)
                 == Some(AskKind::WorkerQuestion.as_str()) =>
@@ -1577,7 +1586,8 @@ fn answer_prompt(workspace_id: Option<&str>) -> AttentionNext {
 
 /// Whether a run in `status` waits for the maintainer now. `exit_pending` is
 /// a `running` run whose `/exit` request timed out with no session exit
-/// since. `push_pending` is the `integrated` run whose push of `main`
+/// since: it is no attention of the run's, since its `stuck_exit` ask is
+/// (and a dialog seen before the timeout is part of that ask). `push_pending` is the `integrated` run whose push of `main`
 /// failed with no successful push since, which the task being completed does
 /// not end. `leased` is whether the run has a lease row, stale or not: an
 /// unfinished run without one was given up by its owner (the supervisor's
@@ -1613,7 +1623,7 @@ pub fn run_attention(
         RunStatus::NeedsSession if resuming => Some(AttentionNext::Resuming),
         RunStatus::NeedsSession => Some(AttentionNext::ResumeSession),
         RunStatus::Failed => Some(AttentionNext::InspectAndClose),
-        RunStatus::Running if exit_pending => Some(AttentionNext::SendExit),
+        RunStatus::Running if exit_pending => None,
         RunStatus::Running if prompt_waiting.is_some() => Some(answer_prompt(prompt_waiting)),
         _ => None,
     }
@@ -1836,7 +1846,17 @@ mod attention_tests {
             (
                 "exit_request_timed_out",
                 json!({"workspace_id": "w", "timeout_secs": 120}),
-                Some(SendExit),
+                None,
+            ),
+            (
+                "ask_answered",
+                json!({"ask_id": 5, "kind": "stuck_exit", "runtime_closed": true}),
+                None,
+            ),
+            (
+                "ask_answered",
+                json!({"ask_id": 5, "kind": "stuck_exit"}),
+                Some(ReadAnswer { ask_id: 5 }),
             ),
             (
                 "push_failed",
@@ -1956,7 +1976,6 @@ mod attention_tests {
                 assert!(ATTENTION_KINDS.contains(&kind), "{kind}");
             }
         }
-        assert_eq!(SendExit.to_string(), "send /exit");
         assert_eq!(RecoverRun.to_string(), "recover run");
         assert_eq!(PushMain.to_string(), "push main");
         assert_eq!(
@@ -2013,9 +2032,10 @@ mod attention_tests {
             run_attention(RunStatus::Failed, false, false, false, None, false),
             Some(InspectAndClose)
         );
+        // The stuck_exit ask is the attention of a session holding `/exit`.
         assert_eq!(
             run_attention(RunStatus::Running, true, false, true, None, false),
-            Some(SendExit)
+            None
         );
         assert_eq!(
             run_attention(RunStatus::Running, false, false, true, None, false),
@@ -2029,7 +2049,7 @@ mod attention_tests {
         );
         assert_eq!(
             run_attention(RunStatus::Running, true, false, true, Some("w"), false),
-            Some(SendExit)
+            None
         );
         // An abandoned run is recovered before any dialog is answered.
         assert_eq!(

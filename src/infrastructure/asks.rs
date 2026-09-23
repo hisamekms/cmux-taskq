@@ -214,6 +214,57 @@ impl SqliteQueue {
         Ok(closed)
     }
 
+    /// Whether the run ever had a `stuck_exit` ask, closed or not.
+    pub fn has_stuck_exit_ask(&self, run_id: &str) -> Result<bool> {
+        Ok(self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM asks WHERE run_id=?1 AND kind='stuck_exit')",
+            [run_id],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// Close every `stuck_exit` ask of the run nobody closed: its session
+    /// exited, so nobody needs to answer it any more. An open one is
+    /// answered with `answer` first and records `ask_answered` with
+    /// `runtime_closed: true` (the one event that ends an ask, which is
+    /// no attention); an answered one is only closed, like `ask close`.
+    /// Returns the asks it closed, oldest first.
+    pub fn close_stuck_exit_asks(&mut self, run_id: &str, answer: &str) -> Result<Vec<Ask>> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let unclosed: Vec<Ask> = tx
+            .prepare(
+                "SELECT * FROM asks WHERE run_id=?1 AND kind='stuck_exit'
+                 AND closed_at IS NULL ORDER BY id",
+            )?
+            .query_map([run_id], ask_row)?
+            .collect::<rusqlite::Result<_>>()?;
+        let mut closed = Vec::with_capacity(unclosed.len());
+        for ask in unclosed {
+            if ask.is_open() {
+                tx.execute(
+                    "UPDATE asks SET answer=?2, answered_at=unixepoch() WHERE id=?1",
+                    params![ask.id, answer],
+                )?;
+                ask_event(
+                    &tx,
+                    ask.task_id,
+                    Some(run_id),
+                    "ask_answered",
+                    json!({"ask_id": ask.id, "kind": ask.kind, "runtime_closed": true}),
+                )?;
+            }
+            tx.execute(
+                "UPDATE asks SET closed_at=unixepoch() WHERE id=?1",
+                [ask.id],
+            )?;
+            closed.push(read_ask(&tx, ask.id)?);
+        }
+        tx.commit()?;
+        Ok(closed)
+    }
+
     pub fn read_ask(&self, id: i64) -> Result<Ask> {
         read_ask(&self.conn, id)
     }

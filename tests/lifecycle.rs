@@ -2480,6 +2480,9 @@ fn inbox_and_planner_prompts_name_the_queue_and_their_one_job() {
     assert!(inbox.contains("show the person its question and options"));
     assert!(inbox.contains("AskUserQuestion"));
     assert!(inbox.contains("`dagq answer ID --text '<answer>'`"));
+    // The inbox relays a stuck_exit ask like any other; it acts on nothing.
+    assert!(!inbox.contains("stuck_exit"));
+    assert!(!inbox.contains("/exit"));
     assert!(inbox.contains("Never open the queue database directly"));
 
     let planner = planner_prompt(db).unwrap();

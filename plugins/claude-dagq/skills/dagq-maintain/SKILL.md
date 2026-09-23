@@ -7,7 +7,7 @@ description: Keep a dagq queue running as its maintainer: start the runtime with
 
 Prerequisite: resolve the launcher as in the `dagq` skill (`DAGQ="${CLAUDE_PLUGIN_ROOT}/bin/dagq"`, `"$DAGQ" --resolve`); if it is not in context, read `${CLAUDE_PLUGIN_ROOT}/skills/dagq/SKILL.md` first. Never open or edit the queue database; go through the CLI only.
 
-Roles: the **supervisor** is the resident `dagq supervise` process that claims ready tasks and runs each in its own worktree and cmux workspace; the **maintainer** is this session, which starts and stops the runtime, watches, lands a run when its subagent review passes (dagq-land), and turns what it cannot decide into asks; a **worker** is the Claude session of one run. The **inbox** session shows asks to the person and writes their answers (`dagq-inbox`); the **planner** registers goals and tasks and closes goals (`dagq-planner`).
+Roles: the **supervisor** is the resident `dagq supervise` process that runs each ready task in its own worktree and workspace; the **maintainer** is this session, which starts and stops the runtime, watches, lands a run when its subagent review passes (dagq-land), and turns what it cannot decide into asks; a **worker** is the Claude session of one run. The **inbox** session shows asks to the person and writes their answers (`dagq-inbox`); the **planner** registers goals and tasks and closes goals (`dagq-planner`).
 
 This session holds no state of its own. After a restart, compaction or `/clear`, start again from step 2: `status` rebuilds everything (the plugin's SessionStart hook prints it after compaction and `/clear`).
 
@@ -18,7 +18,7 @@ This session holds no state of its own. After a restart, compaction or `/clear`,
 "$DAGQ" up --in-cmux --plugin-dir "$CLAUDE_PLUGIN_ROOT"  # only when the preflight sends you there
 ```
 
-Always start the supervisor through `up`, which is idempotent: run it again whenever unsure. Inside this session `maintainer.outcome` is `skipped`, which is normal. Report `supervisor.outcome` and the `doctor` summary. If `up` fails because cmux refuses a connection from outside its terminals, or takes long because it drains a supervisor of another version, read `${CLAUDE_PLUGIN_ROOT}/skills/dagq-maintain/reference/up-down.md` before acting.
+Always start the supervisor through `up`, which is idempotent: run it again when unsure. Inside this session `maintainer.outcome` is `skipped`, which is normal. Report `supervisor.outcome` and the `doctor` summary. If `up` fails (cmux refuses a connection from outside its terminals) or is slow (it drains a supervisor of another version), read `${CLAUDE_PLUGIN_ROOT}/skills/dagq-maintain/reference/up-down.md` before acting.
 
 ## 2. Read status
 
@@ -32,7 +32,7 @@ Read, in this order:
 2. `attention`: what waits for you now. Each entry has `run_id`, `task_id`, `status`, `kind`, `last_error` and a fixed `next`. Route it:
    - `review and integrate` (`awaiting_integration`): the `dagq-land` skill.
    - `resuming (runtime)` (`needs_session`): the supervisor is resolving it; nothing to do.
-   - `resume session` (`needs_session` the runtime gave up), `inspect and close workspace` (`failed`), `send /exit`, `answer the prompt in workspace <id>` (`prompt_waiting`: a worker stopped at a dialog), `send the answer of ask <id> to the worker and close it`: the `dagq-session` skill.
+   - `resume session` (`needs_session` the runtime gave up), `inspect and close workspace` (`failed`), `answer the prompt in workspace <id>` (`prompt_waiting`: a worker stopped at a dialog), `send the answer of ask <id> to the worker and close it`: the `dagq-session` skill.
    - `recover run` (`kind` `runtime_error`: an unfinished run left without a lease): the `dagq-recover` skill.
    - `restart supervisor` (`supervisor_stale`, `supervisor_stopped`): `up` as in step 1.
    - `push main` (`push_failed` on an `integrated` run): landed but not pushed; `dagq-land`, step 6.
@@ -42,11 +42,11 @@ Read, in this order:
 4. `asks`: the open asks (`id`, `kind`, `question` cut at 200 characters, `task_id`, `run_id`, `asked_by`, `age_secs`). They wait for the inbox. A `worker_question` does not wake your `watch`: answer one you see here when it is about the run's worktree (`dagq-session`, section 2); otherwise the inbox relays it.
 5. `cursor`: the newest event id, where the next `watch` starts.
 
-Report the attention in one short list (task, status, `next`, gist of `last_error`). `${CLAUDE_PLUGIN_ROOT}/skills/dagq-maintain/reference/status.md` lists every field and run state, for when an entry is unclear. For one task use `"$DAGQ" show ID` (`--full` only when a step asks). `doctor` diagnoses a stuck run; never poll with it.
+Report the attention in one short list (task, status, `next`, gist of `last_error`). `${CLAUDE_PLUGIN_ROOT}/skills/dagq-maintain/reference/status.md` lists every field and run state. For one task use `"$DAGQ" show ID` (`--full` only when a step asks). `doctor` diagnoses a stuck run; never poll with it.
 
 ## 3. Watch in the background
 
-Do not poll `status`, `show` or `doctor` in a loop. Wait for the next attention with `watch`:
+Never poll `status`, `show` or `doctor` in a loop; wait for the next attention with `watch`:
 
 1. Take `cursor` from the last `status` (or the last `watch`).
 2. Run `"$DAGQ" watch --after <cursor> --role maintainer` with the Bash tool's `run_in_background`. It blocks until an attention event for you (`ask_answered` included, `ask_opened` not) or a supervisor change (default `--timeout 600`).
@@ -69,6 +69,7 @@ Leave that run alone until its answer arrives as an `ask_answered` from your `wa
 - `approve_landing`: the `dagq-land` skill, step 5.
 - `decide` you forwarded from a worker's `worker_question`: pass it on unchanged (`dagq-session`, section 2).
 - Other `decide` / `answer_prompt`: do what the answer says within step 5 (a dialog's key as in `dagq-session`); report anything beyond it.
+- `stuck_exit` (a session held the supervisor's `/exit` back): `dagq-session`, section 3.
 - `blocked` (the observer's): act only on what the answer asks of you, then close it.
 
 Before your first ask, read the asks section of `${CLAUDE_PLUGIN_ROOT}/skills/dagq-maintain/reference/status.md` (kinds, `--task`, duplicates, withdrawing).
@@ -88,4 +89,4 @@ Before your first ask, read the asks section of `${CLAUDE_PLUGIN_ROOT}/skills/da
 "$DAGQ" down --force    # kill it now; only with the user's consent
 ```
 
-Use `--wait` before replacing the binary or shutting down, after sending `/exit` to any run whose exit request timed out (`dagq-session`): the drain waits for it. `down` never closes the maintainer, inbox or planner workspaces or the workers'. `${CLAUDE_PLUGIN_ROOT}/skills/dagq-maintain/reference/up-down.md` has the outcomes, the in-cmux case and where the logs are.
+Use `--wait` before replacing the binary or shutting down, after settling any `stuck_exit` ask (`dagq-session`, section 3): the drain waits for its run. `down` never closes the maintainer, inbox or planner workspaces or the workers'. `${CLAUDE_PLUGIN_ROOT}/skills/dagq-maintain/reference/up-down.md` has the outcomes, the in-cmux case and where the logs are.
