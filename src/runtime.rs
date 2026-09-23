@@ -30,6 +30,7 @@ use crate::{
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use serde::Serialize;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::{
     fs,
     io::{self, BufWriter, IsTerminal, Read, Write},
@@ -638,6 +639,21 @@ impl Supervisor<'_> {
                 let exit_timed_out = self
                     .queue
                     .has_run_event(&run.id, "exit_request_timed_out")?;
+                // A dialog recorded before adoption is not recorded again
+                // while the same screen stays up.
+                let prompt_hash = self
+                    .queue
+                    .run_events(&run.id)?
+                    .into_iter()
+                    .rev()
+                    .find(|e| {
+                        matches!(
+                            e.kind.as_str(),
+                            "prompt_waiting" | "prompt_cleared" | "receipt_observed"
+                        )
+                    })
+                    .filter(|e| e.kind == "prompt_waiting")
+                    .and_then(|e| e.payload["screen_hash"].as_str().map(str::to_owned));
                 Phase::Session(SessionWatch {
                     workspace: run
                         .workspace_id
@@ -650,6 +666,9 @@ impl Supervisor<'_> {
                     receipt_seen,
                     exit_requested,
                     exit_timed_out,
+                    agent_seen: None,
+                    prompt_checked: None,
+                    prompt_hash,
                 })
             }
         })
@@ -757,6 +776,9 @@ so the run workspace opens outside it: {error:#}",
             receipt_seen: false,
             exit_requested: None,
             exit_timed_out: false,
+            agent_seen: None,
+            prompt_checked: None,
+            prompt_hash: None,
         })
     }
 }
@@ -773,6 +795,13 @@ struct SessionWatch {
     exit_requested: Option<Instant>,
     /// `exit_request_timed_out` is recorded once per run; the lease is kept.
     exit_timed_out: bool,
+    /// When this supervisor first saw the agent registered.
+    agent_seen: Option<Instant>,
+    /// When the screen was last read for a dialog.
+    prompt_checked: Option<Instant>,
+    /// `screen_hash` of the dialog last recorded as `prompt_waiting` and not
+    /// cleared since.
+    prompt_hash: Option<String>,
 }
 
 impl SessionWatch {
@@ -844,6 +873,9 @@ impl SessionWatch {
                 unix_time() - wrapper.heartbeat_at <= HEARTBEAT_TIMEOUT_SECS,
                 "wrapper heartbeat expired; session may still be alive"
             );
+            if let Some(agent) = processes.iter().find(|p| p.role == "agent") {
+                self.watch_prompt(queue, cmux, run, agent, log)?;
+            }
         } else {
             let timeout = cmux.registration_timeout();
             ensure!(
@@ -877,6 +909,184 @@ impl SessionWatch {
         }
         Ok(None)
     }
+
+    /// Read the screen of a session that has run for `prompt_wait` with
+    /// neither a receipt nor an idle marker, its wrapper and agent alive, and
+    /// record a dialog found there as `prompt_waiting` (once per screen) and
+    /// its disappearance as `prompt_cleared`. No key is sent (ADR-0019).
+    fn watch_prompt(
+        &mut self,
+        queue: &mut SqliteQueue,
+        cmux: &dyn WorkspaceBackend,
+        run: &TaskRun,
+        agent: &RunProcess,
+        log: &SupervisorLog,
+    ) -> Result<()> {
+        let started = *self.agent_seen.get_or_insert_with(Instant::now);
+        let wait = cmux.prompt_wait();
+        if self.receipt_seen {
+            // `receipt_observed` ends the attention by itself.
+            self.prompt_hash = None;
+            return Ok(());
+        }
+        if self.idle_marker.exists() || !process_alive(agent.pid) {
+            // The agent finished a response or is gone: no dialog holds it
+            // now, and a recorded one must not stay an attention.
+            return self.clear_prompt(queue, run, log);
+        }
+        // A recorded dialog (also one adopted from the previous supervisor)
+        // is rechecked without waiting again, so an answer clears it soon.
+        if (self.prompt_hash.is_none() && started.elapsed() < wait)
+            || self
+                .prompt_checked
+                .is_some_and(|at| at.elapsed() < wait.min(PROMPT_CHECK_INTERVAL))
+        {
+            return Ok(());
+        }
+        self.prompt_checked = Some(Instant::now());
+        let screen = match cmux.capture(&self.workspace) {
+            Ok(screen) => screen,
+            Err(error) => {
+                log.note(&format!(
+                    "screen of {} could not be read for a dialog: {error:#}",
+                    run.id
+                ));
+                return Ok(());
+            }
+        };
+        match detect_prompt(&screen) {
+            Some(kind) => {
+                let excerpt = screen_tail(&screen, PROMPT_EXCERPT_LINES);
+                let hash = format!("{:x}", Sha256::digest(excerpt.as_bytes()));
+                if self.prompt_hash.as_deref() != Some(hash.as_str()) {
+                    queue.record_runtime_event(
+                        &run.id,
+                        "prompt_waiting",
+                        json!({
+                            "workspace_id": self.workspace,
+                            "excerpt": excerpt,
+                            "screen_hash": hash,
+                            "prompt": kind.as_str(),
+                        }),
+                    )?;
+                    log.note(&format!(
+                        "run {} waits at a {} dialog; answer the prompt in workspace {}",
+                        run.id,
+                        kind.as_str(),
+                        self.workspace
+                    ));
+                    self.prompt_hash = Some(hash);
+                }
+            }
+            None => self.clear_prompt(queue, run, log)?,
+        }
+        Ok(())
+    }
+
+    /// Record `prompt_cleared` if a dialog is recorded and not cleared yet.
+    fn clear_prompt(
+        &mut self,
+        queue: &mut SqliteQueue,
+        run: &TaskRun,
+        log: &SupervisorLog,
+    ) -> Result<()> {
+        if self.prompt_hash.take().is_some() {
+            queue.record_runtime_event(
+                &run.id,
+                "prompt_cleared",
+                json!({"workspace_id": self.workspace}),
+            )?;
+            log.note(&format!("dialog of {} is gone", run.id));
+        }
+        Ok(())
+    }
+}
+
+/// A session's screen is read for a dialog at most this often.
+const PROMPT_CHECK_INTERVAL: Duration = Duration::from_secs(10);
+/// `prompt_waiting` carries this many last non-empty lines of the screen.
+const PROMPT_EXCERPT_LINES: usize = 15;
+/// Only this many last non-empty lines are searched for a dialog: a dialog
+/// sits at the bottom, and text higher up is usually the work itself.
+const PROMPT_SCAN_LINES: usize = 30;
+
+/// Another numbered option counts within this many lines of the `❯` one.
+const OPTION_REACH: usize = 3;
+
+/// Which dialog of the agent's TUI holds the session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromptKind {
+    /// The folder trust question.
+    Trust,
+    /// A `❯`-marked choice among numbered options (a plugin
+    /// recommendation, the auto mode notice, ...).
+    Choice,
+    /// A footer such as `Enter to confirm · Esc to cancel` alone.
+    Confirm,
+}
+
+impl PromptKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Trust => "trust",
+            Self::Choice => "choice",
+            Self::Confirm => "confirm",
+        }
+    }
+}
+
+/// Whether the bottom of a screen shows a dialog: a line starting with `Do
+/// you trust` or an option offering to trust the folder, a line starting
+/// with `❯` and a numbered option within three lines of another numbered
+/// option, or a
+/// line starting with `Enter to confirm` or `Esc to cancel`. Box borders are
+/// ignored, and a phrase inside other text (a quote, code) does not count.
+pub fn detect_prompt(screen: &str) -> Option<PromptKind> {
+    let lines: Vec<&str> = screen
+        .lines()
+        .map(strip_frame)
+        .filter(|line| !line.is_empty())
+        .collect();
+    let tail = &lines[lines.len().saturating_sub(PROMPT_SCAN_LINES)..];
+    if tail.iter().any(|line| {
+        line.starts_with("Do you trust")
+            || option_text(line).is_some_and(|text| text.contains("trust this folder"))
+    }) {
+        return Some(PromptKind::Trust);
+    }
+    // An option's text can wrap, so another option may be a few lines away.
+    let is_option = |i: usize| tail.get(i).is_some_and(|line| option_text(line).is_some());
+    let near = |i: usize| {
+        (i.saturating_sub(OPTION_REACH)..=i + OPTION_REACH).any(|j| j != i && is_option(j))
+    };
+    if (0..tail.len()).any(|i| tail[i].starts_with('❯') && is_option(i) && near(i)) {
+        return Some(PromptKind::Choice);
+    }
+    tail.iter()
+        .any(|line| line.starts_with("Enter to confirm") || line.starts_with("Esc to cancel"))
+        .then_some(PromptKind::Confirm)
+}
+
+fn strip_frame(line: &str) -> &str {
+    line.trim_matches(|c: char| c.is_whitespace() || matches!(c, '│' | '┃' | '║' | '|'))
+}
+
+/// The text of a numbered option line (`1. Yes`, `❯ 2. No`), if it is one.
+fn option_text(line: &str) -> Option<&str> {
+    let line = line.strip_prefix('❯').unwrap_or(line).trim_start();
+    let digits = line.chars().take_while(char::is_ascii_digit).count();
+    let rest = line[digits..].strip_prefix(". ")?;
+    (digits > 0).then_some(rest)
+}
+
+/// The last `count` non-empty lines of a screen, right-trimmed.
+fn screen_tail(screen: &str, count: usize) -> String {
+    let lines: Vec<&str> = screen
+        .lines()
+        .map(str::trim_end)
+        .filter(|line| !line.is_empty())
+        .collect();
+    lines[lines.len().saturating_sub(count)..].join("\n")
 }
 
 /// Evidence that the agent finished a response after publishing the receipt: an
@@ -2712,5 +2922,115 @@ fn drive_agent(
             eprintln!("wrapper heartbeat failed: {error:#}");
         }
         thread::sleep(Duration::from_secs(1));
+    }
+}
+
+#[cfg(test)]
+mod prompt_tests {
+    use super::*;
+
+    const TRUST: &str = "\
+╭──────────────────────────────────────────────────────────────────────╮
+│ Do you trust the files in this folder?                               │
+│                                                                      │
+│ /Users/me/.local/share/dagq/0123/runs/abcd/worktree                  │
+│                                                                      │
+│ Claude Code may read, write, or execute files contained in this      │
+│ directory. This can pose security risks, so only use files from      │
+│ trusted sources.                                                     │
+│                                                                      │
+│ ❯ 1. Yes, proceed                                                    │
+│   2. No, exit                                                        │
+│                                                                      │
+╰──────────────────────────────────────────────────────────────────────╯
+   Enter to confirm · Esc to exit
+";
+
+    const LSP_PLUGIN: &str = "\
+ ✻ Welcome to Claude Code!
+
+ Plugin recommendation
+
+ This project uses Rust. The rust-analyzer LSP plugin gives Claude
+ go-to-definition and diagnostics.
+
+   1. Install rust-analyzer-lsp
+ ❯ 2. Not now
+   3. Don't suggest this again
+
+ Enter to confirm · Esc to cancel
+
+
+";
+
+    const AUTO_MODE: &str = "\
+> Implement the task
+
+⏺ Reading the repository instructions.
+
+────────────────────────────────────────────────────────────────────
+ Auto mode is available
+
+ Claude can run commands and edit files without asking each time,
+ with a classifier that stops risky actions.
+
+ ❯ 1. Yes, turn on auto mode
+   2. No, keep asking
+
+ Esc to cancel
+";
+
+    const WORK: &str = "\
+⏺ Bash(cargo test --locked)
+  ⎿  test result: ok. 42 passed; 0 failed
+     grep -n \"Esc to cancel\" src/runtime.rs
+     let text = \"Do you trust the files in this folder?\";
+
+⏺ Update(src/runtime.rs)
+  ⎿  Updated src/runtime.rs with 3 additions
+     1. Added the check
+     2. Added the test
+
+✽ Compiling… (esc to interrupt)
+
+╭──────────────────────────────────────────────────────────────────────╮
+│ ❯ run the tests again                                                │
+╰──────────────────────────────────────────────────────────────────────╯
+  ? for shortcuts
+";
+
+    #[test]
+    fn detect_prompt_finds_the_three_dialogs() {
+        assert_eq!(detect_prompt(TRUST), Some(PromptKind::Trust));
+        assert_eq!(detect_prompt(LSP_PLUGIN), Some(PromptKind::Choice));
+        assert_eq!(detect_prompt(AUTO_MODE), Some(PromptKind::Choice));
+        let newer_trust = "│ Quick safety check: Is this a project you created or one you trust?\n│ ❯ 1. Yes, I trust this folder\n│   2. No, exit\n";
+        assert_eq!(detect_prompt(newer_trust), Some(PromptKind::Trust));
+        let wrapped = "Allow this edit?\n❯ 1. Yes, and don't ask again for edits in\n     /Users/me/worktree\n  2. No\n";
+        assert_eq!(detect_prompt(wrapped), Some(PromptKind::Choice));
+        assert_eq!(
+            detect_prompt("Save changes?\n  Enter to confirm · Esc to cancel\n"),
+            Some(PromptKind::Confirm)
+        );
+    }
+
+    #[test]
+    fn detect_prompt_ignores_a_working_session() {
+        assert_eq!(detect_prompt(WORK), None);
+        assert_eq!(detect_prompt(""), None);
+        // A single marked option is not a choice among options.
+        assert_eq!(detect_prompt("❯ 1. only line\n"), None);
+        // A dialog scrolled far above the bottom no longer counts.
+        let scrolled = format!("{AUTO_MODE}{}", "output line\n".repeat(PROMPT_SCAN_LINES));
+        assert_eq!(detect_prompt(&scrolled), None);
+    }
+
+    #[test]
+    fn screen_tail_keeps_the_last_non_empty_lines() {
+        assert_eq!(screen_tail("a  \n\nb\nc\n\n\n", 2), "b\nc");
+        assert_eq!(screen_tail("a\n", 15), "a");
+        assert_eq!(option_text("❯ 12. Twelve"), Some("Twelve"));
+        assert_eq!(option_text(". none"), None);
+        assert_eq!(PromptKind::Confirm.as_str(), "confirm");
     }
 }

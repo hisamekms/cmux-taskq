@@ -61,7 +61,25 @@ pub fn attention(
             .rev()
             .find(|e| matches!(e.kind.as_str(), "exit_request_timed_out" | "session_exited"))
             .is_some_and(|e| e.kind == "exit_request_timed_out");
-        let Some(next) = run_attention(run.status, exit_pending, false, leased) else {
+        // A dialog is waiting until the screen clears or the receipt arrives.
+        let prompt_waiting = events
+            .iter()
+            .rev()
+            .find(|e| {
+                matches!(
+                    e.kind.as_str(),
+                    "prompt_waiting" | "prompt_cleared" | "receipt_observed"
+                )
+            })
+            .filter(|e| e.kind == "prompt_waiting")
+            .map(|e| {
+                e.payload
+                    .get("workspace_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("?")
+            });
+        let Some(next) = run_attention(run.status, exit_pending, false, leased, prompt_waiting)
+        else {
             continue;
         };
         let kind = events
@@ -84,7 +102,7 @@ pub fn attention(
         });
     }
     for run in queue.runs_with_pending_push()? {
-        let Some(next) = run_attention(run.status, false, true, false) else {
+        let Some(next) = run_attention(run.status, false, true, false, None) else {
             continue;
         };
         let error = queue

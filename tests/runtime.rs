@@ -160,6 +160,10 @@ struct TestWorkspace {
     /// `send_exit` returns only after the wrapper recorded its exit, as a
     /// slow `cmux send` does when the session exits on the first keystroke.
     exit_returns_after_session: bool,
+    prompt_wait: Duration,
+    /// What `capture` returns, and how often it was asked.
+    screen: Mutex<String>,
+    captures: AtomicUsize,
     exits_sent: AtomicUsize,
     sessions: Mutex<Vec<(String, TestSession)>>,
     closed: Mutex<Vec<String>>,
@@ -184,6 +188,9 @@ impl TestWorkspace {
             registration_timeout: Duration::from_secs(45),
             no_session: false,
             exit_returns_after_session: false,
+            prompt_wait: Duration::from_secs(90),
+            screen: Mutex::new("fixture terminal screen".into()),
+            captures: AtomicUsize::new(0),
             exits_sent: AtomicUsize::new(0),
             sessions: Mutex::new(Vec::new()),
             closed: Mutex::new(Vec::new()),
@@ -289,7 +296,8 @@ impl WorkspaceBackend for TestWorkspace {
         Ok(workspace)
     }
     fn capture(&self, _: &str) -> Result<String> {
-        Ok("fixture terminal screen".into())
+        self.captures.fetch_add(1, Ordering::SeqCst);
+        Ok(self.screen.lock().unwrap().clone())
     }
     fn close(&self, workspace_id: &str) -> Result<()> {
         // The session must have exited before the supervisor gives up the workspace.
@@ -348,6 +356,9 @@ impl WorkspaceBackend for TestWorkspace {
     }
     fn registration_timeout(&self) -> Duration {
         self.registration_timeout
+    }
+    fn prompt_wait(&self) -> Duration {
+        self.prompt_wait
     }
     // The maintainer workspace is `up`'s business; the supervisor never asks.
     fn exists(&self, _: &str) -> Result<bool> {
@@ -874,6 +885,120 @@ const HELD_AGENT: &str = "commit work; receipt \"$(git rev-parse HEAD)\"; idle; 
 
 fn release_held_session(run_dir: &str) {
     fs::write(Path::new(run_dir).join("exit-requested.held"), "").unwrap();
+}
+
+/// A dialog screen as Claude Code draws it, and a screen of ordinary work.
+const DIALOG_SCREEN: &str = "\
+ Auto mode is available
+
+ ❯ 1. Yes, turn on auto mode
+   2. No, keep asking
+
+ Esc to cancel
+";
+const WORK_SCREEN: &str = "⏺ Bash(cargo test)\n  ⎿  test result: ok\n\n│ ❯ \n  ? for shortcuts\n";
+
+/// Fake agent that works (no receipt, no idle marker) until the test writes
+/// `$EXIT.go`, then finishes like `VALID_AGENT` and waits for `/exit`.
+const PROMPTED_AGENT: &str = "while [ ! -f \"$EXIT.go\" ]; do sleep 0.2; done; commit work; receipt \"$(git rev-parse HEAD)\"; idle; await_exit";
+
+/// A session that runs past `prompt_wait` has its screen read: an ordinary
+/// screen records nothing, a dialog is recorded as `prompt_waiting` once and
+/// surfaces as `answer the prompt in workspace <id>`, and the screen going
+/// back to work records `prompt_cleared`. No key is sent.
+#[test]
+fn a_dialog_on_the_screen_is_recorded_once_and_cleared() {
+    let (_dir, repo, db) = fixture();
+    let mut backend = TestWorkspace::new(&db, false, PROMPTED_AGENT);
+    backend.prompt_wait = Duration::from_secs(1);
+    *backend.screen.lock().unwrap() = WORK_SCREEN.into();
+    let backend = Arc::new(backend);
+    let supervisor = {
+        let (db, repo, backend) = (db.clone(), repo.clone(), backend.clone());
+        thread::spawn(move || supervise(&db, &repo, &backend))
+    };
+    let prompts = |queue: &mut SqliteQueue, kind: &str| {
+        event_kinds(&queue.show(1).unwrap())
+            .iter()
+            .filter(|k| **k == kind)
+            .count()
+    };
+    // Ordinary work is read but not recorded.
+    let started = Instant::now();
+    while backend.captures.load(Ordering::SeqCst) < 2 {
+        assert!(started.elapsed() < Duration::from_secs(30));
+        thread::sleep(Duration::from_millis(100));
+    }
+    let mut queue = SqliteQueue::open(&db).unwrap();
+    assert_eq!(prompts(&mut queue, "prompt_waiting"), 0);
+    let run = queue.show(1).unwrap().runs[0].clone();
+    assert!(run_attention_of(&runtime::status(&db).unwrap(), &run.id).is_none());
+
+    *backend.screen.lock().unwrap() = DIALOG_SCREEN.into();
+    wait_until(&db, Duration::from_secs(30), |queue| {
+        prompts(queue, "prompt_waiting") == 1
+    });
+    // The same screen is read again but not recorded again.
+    let captured = backend.captures.load(Ordering::SeqCst);
+    while backend.captures.load(Ordering::SeqCst) < captured + 2 {
+        thread::sleep(Duration::from_millis(100));
+    }
+    assert_eq!(prompts(&mut queue, "prompt_waiting"), 1);
+    let detail = queue.show(1).unwrap();
+    let waiting = detail
+        .events
+        .iter()
+        .find(|e| e.kind == "prompt_waiting")
+        .unwrap();
+    assert_eq!(waiting.payload["workspace_id"], WORKSPACE_ID);
+    assert_eq!(waiting.payload["prompt"], "choice");
+    assert_eq!(
+        waiting.payload["excerpt"],
+        "Auto mode is available\n ❯ 1. Yes, turn on auto mode\n   2. No, keep asking\n Esc to cancel"
+    );
+    assert_eq!(waiting.payload["screen_hash"].as_str().unwrap().len(), 64);
+    let status = runtime::status(&db).unwrap();
+    let attention = run_attention_of(&status, &run.id).unwrap();
+    assert_eq!(attention["kind"], "prompt_waiting");
+    assert_eq!(attention["status"], "running");
+    assert_eq!(
+        attention["next"],
+        format!("answer the prompt in workspace {WORKSPACE_ID}")
+    );
+    let events = dagq::watch::events(&db, 0, 100, false).unwrap();
+    assert!(
+        events["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["kind"] == "prompt_waiting")
+    );
+
+    // Someone answers the dialog: the screen goes back to work.
+    *backend.screen.lock().unwrap() = WORK_SCREEN.into();
+    wait_until(&db, Duration::from_secs(30), |queue| {
+        prompts(queue, "prompt_cleared") == 1
+    });
+    assert!(run_attention_of(&runtime::status(&db).unwrap(), &run.id).is_none());
+    assert_eq!(backend.exits_sent.load(Ordering::SeqCst), 0);
+
+    fs::write(
+        exit_request_path(run.run_dir.as_ref().unwrap()).with_extension("go"),
+        "",
+    )
+    .unwrap();
+    let outcome = supervisor.join().unwrap().unwrap();
+    backend.join();
+    assert_eq!(outcome["errors"], json!([]), "{outcome}");
+    assert_eq!(outcome["runs"][0]["status"], "awaiting_integration");
+    let detail = queue.show(1).unwrap();
+    assert_eq!(
+        event_kinds(&detail)
+            .iter()
+            .filter(|k| k.starts_with("prompt_"))
+            .count(),
+        2
+    );
 }
 
 /// An unanswered `/exit` is recorded once and surfaces as `send /exit`, but

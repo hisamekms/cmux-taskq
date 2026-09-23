@@ -403,6 +403,11 @@ pub trait WorkspaceBackend {
     fn registration_timeout(&self) -> std::time::Duration {
         std::time::Duration::from_secs(45)
     }
+    /// How long a session may run with neither a receipt nor an idle marker
+    /// before the supervisor starts reading its screen for a dialog.
+    fn prompt_wait(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(90)
+    }
 }
 
 /// What the service manager had under a label when `uninstall` ran.

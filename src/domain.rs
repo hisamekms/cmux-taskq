@@ -949,18 +949,44 @@ mod tests {
 /// it, whatever its PID says: the rule for leases, wrappers and supervisors.
 pub const HEARTBEAT_TIMEOUT_SECS: i64 = 30;
 
-// What the maintainer (or the user) does about an attention (ADR-0016). The
-// values are short fixed phrases, part of the public contract of `status`,
-// `events` and `watch`.
-string_enum!(AttentionNext {
-    ReviewAndIntegrate => "review and integrate",
-    ResumeSession => "resume session",
-    InspectAndClose => "inspect and close workspace",
-    SendExit => "send /exit",
-    RestartSupervisor => "restart supervisor",
-    PushMain => "push main",
-    RecoverRun => "recover run",
-});
+/// What the maintainer (or the user) does about an attention (ADR-0016). The
+/// values are short fixed phrases, part of the public contract of `status`,
+/// `events` and `watch`; only `answer the prompt in workspace <id>` carries
+/// the workspace the dialog is open in (ADR-0019).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AttentionNext {
+    ReviewAndIntegrate,
+    ResumeSession,
+    InspectAndClose,
+    SendExit,
+    RestartSupervisor,
+    PushMain,
+    RecoverRun,
+    AnswerPrompt { workspace_id: String },
+}
+
+impl fmt::Display for AttentionNext {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ReviewAndIntegrate => f.write_str("review and integrate"),
+            Self::ResumeSession => f.write_str("resume session"),
+            Self::InspectAndClose => f.write_str("inspect and close workspace"),
+            Self::SendExit => f.write_str("send /exit"),
+            Self::RestartSupervisor => f.write_str("restart supervisor"),
+            Self::PushMain => f.write_str("push main"),
+            Self::RecoverRun => f.write_str("recover run"),
+            Self::AnswerPrompt { workspace_id } => {
+                write!(f, "answer the prompt in workspace {workspace_id}")
+            }
+        }
+    }
+}
+
+impl Serialize for AttentionNext {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
+}
 
 /// The `run_events` kinds that can mark an attention. The kind names are a
 /// public contract (ADR-0016); whether one of these events is an attention
@@ -974,6 +1000,7 @@ pub const ATTENTION_KINDS: &[&str] = &[
     "exit_request_timed_out",
     "push_failed",
     "runtime_error",
+    "prompt_waiting",
 ];
 
 /// Whether a run event is a transition that stops at the maintainer's or the
@@ -986,6 +1013,8 @@ pub const ATTENTION_KINDS: &[&str] = &[
 /// supervisor released the run's lease with it (`lease_released: true`, the
 /// abandon): nothing moves the run on until it is recovered. A
 /// `runtime_error` recorded without releasing the lease is a note.
+/// `prompt_waiting` is one: the session waits at a dialog in the payload's
+/// `workspace_id`.
 pub fn event_attention(kind: &str, payload: &serde_json::Value) -> Option<AttentionNext> {
     let status = payload
         .get("status")
@@ -1009,7 +1038,18 @@ pub fn event_attention(kind: &str, payload: &serde_json::Value) -> Option<Attent
         {
             Some(AttentionNext::RecoverRun)
         }
+        ("prompt_waiting", _) => Some(answer_prompt(
+            payload
+                .get("workspace_id")
+                .and_then(serde_json::Value::as_str),
+        )),
         _ => None,
+    }
+}
+
+fn answer_prompt(workspace_id: Option<&str>) -> AttentionNext {
+    AttentionNext::AnswerPrompt {
+        workspace_id: workspace_id.unwrap_or("?").to_owned(),
     }
 }
 
@@ -1021,14 +1061,17 @@ pub fn event_attention(kind: &str, payload: &serde_json::Value) -> Option<Attent
 /// unfinished run without one was given up by its owner (the supervisor's
 /// abandon), and neither adoption, which takes only stale leases, nor
 /// anything else moves it on until it is recovered. A stale lease is the
-/// supervisor's attention, not the run's. The caller passes only the latest
-/// run of an `in_progress` task, so a failed run stops counting once the task
-/// is retried or canceled.
+/// supervisor's attention, not the run's. `prompt_waiting` is the workspace
+/// of a `running` run whose latest `prompt_waiting` has no `prompt_cleared`
+/// or `receipt_observed` after it (`Some("?")` when the payload named none).
+/// The caller passes only the latest run of an `in_progress` task, so a
+/// failed run stops counting once the task is retried or canceled.
 pub fn run_attention(
     status: RunStatus,
     exit_pending: bool,
     push_pending: bool,
     leased: bool,
+    prompt_waiting: Option<&str>,
 ) -> Option<AttentionNext> {
     match status {
         RunStatus::Integrated if push_pending => Some(AttentionNext::PushMain),
@@ -1045,6 +1088,7 @@ pub fn run_attention(
         RunStatus::NeedsSession => Some(AttentionNext::ResumeSession),
         RunStatus::Failed => Some(AttentionNext::InspectAndClose),
         RunStatus::Running if exit_pending => Some(AttentionNext::SendExit),
+        RunStatus::Running if prompt_waiting.is_some() => Some(answer_prompt(prompt_waiting)),
         _ => None,
     }
 }
@@ -1198,6 +1242,14 @@ mod attention_tests {
                 None,
             ),
             ("runtime_error", json!({"message": "x"}), None),
+            (
+                "prompt_waiting",
+                json!({"workspace_id": "w", "excerpt": "x", "screen_hash": "h"}),
+                Some(AnswerPrompt {
+                    workspace_id: "w".into(),
+                }),
+            ),
+            ("prompt_cleared", json!({"workspace_id": "w"}), None),
             ("integration_rebase_aborted", json!({"reason": "x"}), None),
             ("run_integrated", json!({"result_commit": "x"}), None),
             (
@@ -1218,11 +1270,25 @@ mod attention_tests {
                 assert!(ATTENTION_KINDS.contains(&kind), "{kind}");
             }
         }
-        assert_eq!(SendExit.as_str(), "send /exit");
-        assert_eq!(RecoverRun.as_str(), "recover run");
+        assert_eq!(SendExit.to_string(), "send /exit");
+        assert_eq!(RecoverRun.to_string(), "recover run");
+        assert_eq!(PushMain.to_string(), "push main");
         assert_eq!(
-            "restart supervisor".parse::<AttentionNext>().unwrap(),
-            RestartSupervisor
+            serde_json::to_value(RestartSupervisor).unwrap(),
+            json!("restart supervisor")
+        );
+        assert_eq!(
+            serde_json::to_value(AnswerPrompt {
+                workspace_id: "w".into()
+            })
+            .unwrap(),
+            json!("answer the prompt in workspace w")
+        );
+        assert_eq!(
+            event_attention("prompt_waiting", &json!({})),
+            Some(AnswerPrompt {
+                workspace_id: "?".into()
+            })
         );
     }
 
@@ -1230,22 +1296,40 @@ mod attention_tests {
     fn run_attention_follows_the_resting_status() {
         use AttentionNext::*;
         assert_eq!(
-            run_attention(RunStatus::AwaitingIntegration, false, false, false),
+            run_attention(RunStatus::AwaitingIntegration, false, false, false, None),
             Some(ReviewAndIntegrate)
         );
         assert_eq!(
-            run_attention(RunStatus::NeedsSession, false, false, false),
+            run_attention(RunStatus::NeedsSession, false, false, false, None),
             Some(ResumeSession)
         );
         assert_eq!(
-            run_attention(RunStatus::Failed, false, false, false),
+            run_attention(RunStatus::Failed, false, false, false, None),
             Some(InspectAndClose)
         );
         assert_eq!(
-            run_attention(RunStatus::Running, true, false, true),
+            run_attention(RunStatus::Running, true, false, true, None),
             Some(SendExit)
         );
-        assert_eq!(run_attention(RunStatus::Running, false, false, true), None);
+        assert_eq!(
+            run_attention(RunStatus::Running, false, false, true, None),
+            None
+        );
+        assert_eq!(
+            run_attention(RunStatus::Running, false, false, true, Some("w")),
+            Some(AnswerPrompt {
+                workspace_id: "w".into()
+            })
+        );
+        assert_eq!(
+            run_attention(RunStatus::Running, true, false, true, Some("w")),
+            Some(SendExit)
+        );
+        // An abandoned run is recovered before any dialog is answered.
+        assert_eq!(
+            run_attention(RunStatus::Running, false, false, false, Some("w")),
+            Some(RecoverRun)
+        );
         for status in [
             RunStatus::Claimed,
             RunStatus::Starting,
@@ -1256,18 +1340,18 @@ mod attention_tests {
             RunStatus::Interrupted,
         ] {
             assert_eq!(
-                run_attention(status, true, false, true),
+                run_attention(status, true, false, true, Some("w")),
                 None,
                 "{}",
                 status.as_str()
             );
         }
         assert_eq!(
-            run_attention(RunStatus::Integrated, false, true, false),
+            run_attention(RunStatus::Integrated, false, true, false, None),
             Some(PushMain)
         );
         assert_eq!(
-            run_attention(RunStatus::Succeeded, false, true, false),
+            run_attention(RunStatus::Succeeded, false, true, false, None),
             None
         );
     }
@@ -1283,7 +1367,7 @@ mod attention_tests {
             RunStatus::Integrating,
         ] {
             assert_eq!(
-                run_attention(status, false, false, false),
+                run_attention(status, false, false, false, None),
                 Some(RecoverRun),
                 "{}",
                 status.as_str()
@@ -1291,7 +1375,7 @@ mod attention_tests {
         }
         // Nothing moves an abandoned run, so `/exit` alone would not do.
         assert_eq!(
-            run_attention(RunStatus::Running, true, false, false),
+            run_attention(RunStatus::Running, true, false, false, None),
             Some(RecoverRun)
         );
         for status in [
@@ -1300,7 +1384,7 @@ mod attention_tests {
             RunStatus::Interrupted,
         ] {
             assert_eq!(
-                run_attention(status, false, false, false),
+                run_attention(status, false, false, false, None),
                 None,
                 "{}",
                 status.as_str()

@@ -1,6 +1,6 @@
 ---
 name: dagq-session
-description: Act on a dagq run's own Claude session in its cmux workspace: resume a needs_session run so it rebases and fixes its branch, answer the trust or permission prompt or question a running worker stops at, send /exit to a run whose exit request timed out, and close the workspace of a failed or interrupted run. Use when status or watch reports "resume session", "send /exit" or "inspect and close workspace", or a running run makes no progress. Not for landing (dagq-land) or a dead lease (dagq-recover).
+description: Act on a dagq run's own Claude session in its cmux workspace: resume a needs_session run so it rebases and fixes its branch, answer the trust or permission prompt or question a running worker stops at, send /exit to a run whose exit request timed out, and close the workspace of a failed or interrupted run. Use when status or watch reports "resume session", "send /exit", "answer the prompt in workspace <id>" or "inspect and close workspace", or a running run makes no progress. Not for landing (dagq-land) or a dead lease (dagq-recover).
 ---
 
 # dagq: act on a run's session
@@ -17,7 +17,7 @@ A run's workspace is named `[<repo>]dagq#<task-id> <task title>` with the descri
 
 ## 1. A running run waits at a prompt or a question
 
-A run that stays `running` right after `agent_started` with nothing happening in its worktree waits at a prompt. Read the screen, then:
+Attention `answer the prompt in workspace <id>` (`kind` `prompt_waiting`): the supervisor found a dialog. When a run has been `running` for 90 seconds with no receipt and no idle marker, it reads the workspace screen and records a dialog there (trust, an LSP plugin recommendation, the auto mode notice, any `❯`-marked numbered choice or `Enter to confirm` / `Esc to cancel` footer) once as `prompt_waiting`; `"$DAGQ" show ID --full` has its `excerpt` (the last 15 lines of the screen). Work from that attention and the workspace it names; do not search the workspaces with `read-screen`. The supervisor sends no key and no notification: the answer is yours or the user's. The attention goes away when the dialog leaves the screen (`prompt_cleared`) or the receipt arrives. A question the worker writes on its terminal may not be detected. Read the screen of the named workspace, then:
 
 - Folder-trust dialog, or a permission prompt about the run's own worktree (edits inside it, `cargo`, `git`): answer it yourself with keys (`down` until the accepting choice is highlighted, then `enter`).
 - Anything else, or anything needing the user's judgement: report it to the user and send their answer.
