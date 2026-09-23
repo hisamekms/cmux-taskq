@@ -2377,7 +2377,7 @@ pub fn prompt(
 }
 
 /// The initial prompt of the maintainer session that `up` opens in the
-/// `[<repo>]dagq maintainer` workspace (ADR-0016). It names the queue and the
+/// `[<repo>]maintainer` workspace (ADR-0016). It names the queue and the
 /// supervisor's logs and points at `status`, the background `watch` and the
 /// plugin's `dagq-maintain` skill, which holds the procedure; waking up again
 /// after compaction or `/clear` is the plugin's SessionStart hook's job.

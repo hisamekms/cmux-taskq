@@ -1032,13 +1032,20 @@ pub fn created_group_id(reply: &Value) -> Result<&str> {
 }
 
 /// Workspaces are named per repository because one cmux serves several
-/// queues: `[<repo>]dagq#<task-id> <task title>` for a worker, where
-/// `<repo>` is the basename of the repository root the run was planned
-/// from and the title is the task's, unabridged (ADR-0018).
+/// queues, and every name is `[<repo>]<role>` with no space after the
+/// bracket, where `<repo>` is the basename of the repository root (the path
+/// itself when it has none). A worker is
+/// `[<repo>]worker#<task-id> - <task title>`, `<repo>` being the root the run
+/// was planned from and the title the task's, unabridged (ADR-0028, which
+/// replaces the name ADR-0018 chose).
+/// The resume workspace of a `needs_session` run (goal 8's automatic resume)
+/// takes this same name, with `run <run-id> resume` as its description.
+/// Names are for people only: the runtime identifies workspaces by UUID
+/// (ADR-0026).
 pub fn run_workspace_name(task: &Task, run: &TaskRun) -> Result<String> {
     let repo = Path::new(run.repo_path.as_ref().context("missing repository path")?);
     Ok(format!(
-        "[{}]dagq#{} {}",
+        "[{}]worker#{} - {}",
         repository_name(repo),
         run.task_id,
         task.title
@@ -1070,16 +1077,33 @@ pub fn workspace_group_name(repo_root: &Path) -> String {
     format!("[{}]", repository_name(repo_root))
 }
 
-/// `[<repo>]dagq maintainer`: the one resident Claude session of a repository's queue.
+/// `[<repo>]maintainer`: the one resident Claude session of a repository's
+/// queue (ADR-0028).
 pub fn maintainer_workspace_name(repo_root: &Path) -> String {
-    format!("[{}]dagq maintainer", repository_name(repo_root))
+    role_workspace_name(repo_root, SessionRole::Maintainer)
 }
 
-/// `[<repo>]dagq supervisor`: the workspace `up --in-cmux` runs `supervise`
+/// `[<repo>]supervisor`: the workspace `up --in-cmux` runs `supervise`
 /// in when launchd cannot reach cmux (ADR-0011). The launchd mode has no
 /// workspace at all.
 pub fn supervisor_workspace_name(repo_root: &Path) -> String {
-    format!("[{}]dagq supervisor", repository_name(repo_root))
+    role_workspace_name(repo_root, SessionRole::Supervisor)
+}
+
+/// `[<repo>]planner`: the session that talks with a person to register goals
+/// and tasks. `up` is to open it in a later goal; nothing creates it yet.
+pub fn planner_workspace_name(repo_root: &Path) -> String {
+    role_workspace_name(repo_root, SessionRole::Planner)
+}
+
+/// `[<repo>]inbox`: the session where a person answers the maintainer's
+/// asks. `up` is to open it in a later goal; nothing creates it yet.
+pub fn inbox_workspace_name(repo_root: &Path) -> String {
+    role_workspace_name(repo_root, SessionRole::Inbox)
+}
+
+fn role_workspace_name(repo_root: &Path, role: SessionRole) -> String {
+    format!("[{}]{}", repository_name(repo_root), role.as_str())
 }
 
 fn repository_name(root: &Path) -> String {
@@ -1246,19 +1270,19 @@ mod tests {
     /// One cmux serves several repositories, so every workspace name
     /// carries the repository (the basename of its root). A worker's name
     /// carries the task and its title as is; the run ID goes to the
-    /// description instead (ADR-0018).
+    /// description instead (ADR-0018, ADR-0028).
     #[test]
     fn workspace_names_carry_the_repository_and_the_task() {
         let title = "Set last_error when a run fails";
         assert_eq!(
             run_workspace_name(&task(title), &run(Some("/home/u/ghq/dagq"))).unwrap(),
-            "[dagq]dagq#15 Set last_error when a run fails"
+            "[dagq]worker#15 - Set last_error when a run fails"
         );
         // The title is neither trimmed nor shortened.
         let long = format!("  {}  ", "x".repeat(200));
         assert_eq!(
             run_workspace_name(&task(&long), &run(Some("/tmp/my repo/"))).unwrap(),
-            format!("[my repo]dagq#15 {long}")
+            format!("[my repo]worker#15 - {long}")
         );
         assert!(
             !run_workspace_name(&task(title), &run(Some("/home/u/ghq/dagq")))
@@ -1273,16 +1297,21 @@ mod tests {
         );
         assert_eq!(
             maintainer_workspace_name(Path::new("/home/u/ghq/dagq")),
-            "[dagq]dagq maintainer"
+            "[dagq]maintainer"
         );
         // A root with no basename falls back to the path itself.
-        assert_eq!(
-            maintainer_workspace_name(Path::new("/")),
-            "[/]dagq maintainer"
-        );
+        assert_eq!(maintainer_workspace_name(Path::new("/")), "[/]maintainer");
         assert_eq!(
             supervisor_workspace_name(Path::new("/home/u/ghq/dagq")),
-            "[dagq]dagq supervisor"
+            "[dagq]supervisor"
+        );
+        assert_eq!(
+            planner_workspace_name(Path::new("/home/u/ghq/dagq")),
+            "[dagq]planner"
+        );
+        assert_eq!(
+            inbox_workspace_name(Path::new("/tmp/my repo/")),
+            "[my repo]inbox"
         );
     }
 
@@ -1321,7 +1350,7 @@ mod tests {
         let listing = serde_json::json!({
             "window_id": "W",
             "workspaces": [
-                {"id": "4AC63CB7-3BE1-40A1-BCC4-CA0461685F01", "title": "[dagq]dagq maintainer"},
+                {"id": "4AC63CB7-3BE1-40A1-BCC4-CA0461685F01", "title": "[dagq]maintainer"},
                 {"title": "no id"}
             ]
         });
@@ -1333,7 +1362,7 @@ mod tests {
             &listing,
             "4ac63cb7-3be1-40a1-bcc4-ca0461685f01"
         ));
-        assert!(!workspace_listed(&listing, "[dagq]dagq maintainer"));
+        assert!(!workspace_listed(&listing, "[dagq]maintainer"));
         assert!(!workspace_listed(&serde_json::json!({}), "x"));
     }
 
@@ -1449,7 +1478,7 @@ esac
                 "workspace",
                 "create",
                 "--name",
-                "[dagq]dagq#15 Set last_error when a run fails",
+                "[dagq]worker#15 - Set last_error when a run fails",
                 "--description",
                 "dagq role=worker queue=abc",
                 "--env",

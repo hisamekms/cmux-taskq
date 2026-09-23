@@ -11,7 +11,7 @@
 //! outside cmux's process tree) before it writes the agent, or launchd would
 //! keep restarting a supervisor that fails its own preflight forever. Where
 //! that password is not configured, `up --in-cmux` starts the supervisor
-//! inside the cmux workspace `[<repo>]dagq supervisor` instead, with no
+//! inside the cmux workspace `[<repo>]supervisor` instead, with no
 //! launchd involved and so nothing to restart it (ADR-0011).
 //!
 //! A supervisor is only reused while it runs this binary's own version.
@@ -58,6 +58,14 @@ pub const ROLE_ENV: &str = "DAGQ_ROLE";
 /// The queue database the workspace belongs to.
 pub const QUEUE_ENV: &str = "DAGQ_QUEUE";
 pub const MAINTAINER_ROLE: &str = SessionRole::Maintainer.as_str();
+/// `DAGQ_ROLE` of a run's workspace (and of the resume workspace of its run).
+pub const WORKER_ROLE: &str = SessionRole::Worker.as_str();
+/// `DAGQ_ROLE` of the session that talks with a person to register goals and
+/// tasks. `up` is to open it in a later goal; no workspace of it exists yet.
+pub const PLANNER_ROLE: &str = SessionRole::Planner.as_str();
+/// `DAGQ_ROLE` of the session where a person answers the maintainer's asks.
+/// `up` is to open it in a later goal; no workspace of it exists yet.
+pub const INBOX_ROLE: &str = SessionRole::Inbox.as_str();
 /// File under the queue's log directory that launchd appends the
 /// supervisor's stdout and stderr to.
 pub const LAUNCHD_LOG_NAME: &str = "launchd.log";
@@ -108,9 +116,9 @@ record projects[\"{root}\"].hasTrustDialogAccepted = true",
 #[derive(Debug, Clone)]
 pub struct UpOptions {
     pub parallel: u16,
-    /// Start the supervisor inside the cmux workspace `[<repo>]dagq
-    /// supervisor` instead of as a LaunchAgent: no launchd, no automatic
-    /// restart, and no out-of-cmux preflight to pass.
+    /// Start the supervisor inside the cmux workspace `[<repo>]supervisor`
+    /// instead of as a LaunchAgent: no launchd, no automatic restart, and no
+    /// out-of-cmux preflight to pass.
     pub in_cmux: bool,
     /// Refuse to wait for a supervisor of another version to drain. Only a
     /// replacement reads it (ADR-0014): with runs in flight `up` stops
@@ -688,7 +696,7 @@ fn start_under_launchd(
 /// no socket password is needed. Nothing restarts it either.
 ///
 /// cmux keeps a workspace open after its command exits, so a leftover
-/// `[<repo>]dagq supervisor` may belong to a supervisor that crashed, or to
+/// `[<repo>]supervisor` may belong to a supervisor that crashed, or to
 /// one that is alive but no longer heartbeating (which `up` never reuses
 /// and never kills). Either way it is the maintainer's to close, and `up`
 /// stops rather than open a second one or interfere with the first.

@@ -13,7 +13,7 @@ Take `workspace_id`, `worktree_path`, the run `id` and `last_error` from `"$DAGQ
 cmux read-screen --workspace <workspace_id> --lines 40
 ```
 
-A run's workspace is named `[<repo>]dagq#<task-id> <task title>` with the description `run <run-id>`. `${CLAUDE_PLUGIN_ROOT}/skills/dagq-session/reference/cmux.md` has the key and text commands.
+A run's workspace is named `[<repo>]worker#<task-id> - <task title>` with the description `dagq role=worker queue=<queue hash> run=<run-id> task=<id>`; names are for people, and the runtime finds workspaces by `workspace_id`. `${CLAUDE_PLUGIN_ROOT}/skills/dagq-session/reference/cmux.md` has the key and text commands.
 
 ## 1. A running run waits at a prompt or a question
 
@@ -44,7 +44,8 @@ The worktree, branch and run directory stay for the user's manual cleanup. Retry
 Attention `resume session`: `integrate` could not land the run (a rebase conflict, or a verification command failed on the rebased tree). The run's own Claude session fixes it, not this session and not by hand. Open a workspace that resumes it (the session ID is the run ID):
 
 ```sh
-cmux workspace create --name "[<repo>]dagq resume <run-id>" --cwd "<worktree_path>" \
+cmux workspace create --name "[<repo>]worker#<task-id> - <task title>" \
+  --description "run <run-id> resume" --cwd "<worktree_path>" \
   --command "claude --resume <run-id>"
 ```
 

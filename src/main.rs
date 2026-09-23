@@ -157,7 +157,7 @@ enum Command {
         /// Maximum number of runs the supervisor executes at once.
         #[arg(long, default_value_t = 4, value_parser = clap::value_parser!(u16).range(1..))]
         parallel: u16,
-        /// Run the supervisor in the cmux workspace `[<repo>]dagq supervisor`
+        /// Run the supervisor in the cmux workspace `[<repo>]supervisor`
         /// instead of under launchd: no socket password needed, and nothing
         /// restarts it if it stops.
         #[arg(long)]

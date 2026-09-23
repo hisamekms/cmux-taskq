@@ -551,7 +551,7 @@ fn happy_path_runs_a_stub_agent_through_cmux_and_lands_on_main() {
     assert_eq!(
         listing["custom_title"],
         format!(
-            "[{}]dagq#{task_id} e2e stub task",
+            "[{}]worker#{task_id} - e2e stub task",
             repo.file_name().unwrap().to_string_lossy()
         ),
         "{listing}"
@@ -1262,7 +1262,7 @@ fn up_starts_a_launchd_supervisor_that_status_lists_and_down_wait_stops_it() {
     let repo_name = repo.file_name().unwrap().to_str().unwrap();
     assert_eq!(
         first["maintainer"]["name"],
-        format!("[{repo_name}]dagq maintainer")
+        format!("[{repo_name}]maintainer")
     );
     // launchd knows the agent, and the plist is what `up` described.
     assert!(
@@ -1388,7 +1388,7 @@ fn up_in_cmux_starts_a_supervisor_in_a_workspace_that_down_wait_stops_and_closes
     let repo_name = repo.file_name().unwrap().to_str().unwrap();
     assert_eq!(
         first["supervisor"]["name"],
-        format!("[{repo_name}]dagq supervisor")
+        format!("[{repo_name}]supervisor")
     );
     let supervisor_workspace = first["supervisor"]["workspace_id"]
         .as_str()
