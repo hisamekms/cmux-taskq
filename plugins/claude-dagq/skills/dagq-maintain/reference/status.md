@@ -57,7 +57,7 @@ Registering one (`"$DAGQ" ask --kind <kind> --question <text> [--option <text>].
 ## Run states
 
 - `claimed` / `starting` / `running`: in progress. Events: `lease_acquired`, `workspace_created`, `agent_started`, `receipt_observed`, `session_idle_observed`, `exit_requested`.
-- `validating`: the session exited; the supervisor checks the receipt, the commit and a clean worktree, and reruns the verification commands.
+- `validating`: the session exited; the supervisor checks the receipt, the commit, a clean worktree and required evidence. It does not run the verification commands; `integrate` runs them once after its rebase.
 - `awaiting_integration`: accepted. `result_commit` on `branch` is what to review; the workspace was closed and the worktree and branch are kept until `integrate`.
 - `integrating`: an `integrate` process holds the queue's single integration slot. If its process died (`doctor` shows `lease_stale: true`), the `dagq-recover` skill returns the run to `awaiting_integration`.
 - `needs_session`: `integrate` could not land it (rebase conflict, or a verification command failed after the rebase); `last_error` says why. The supervisor resumes its session (up to three times, `resume_started` / `resume_finished` events), then lands it if `integrate` was called for it (`integration_approved`) or returns it to `awaiting_integration`.

@@ -39,7 +39,7 @@ If the user wants changes, the run goes back to a session: see the `dagq-session
 "$DAGQ" integrate ID
 ```
 
-`integrate` rebases the run onto the current `main`, re-validates it (rerunning the verification commands unless the rebase was a no-op on the head the supervisor already verified), squashes it into one commit on `main` and removes the worktree and branch. Read `outcome`:
+`integrate` rebases the run onto the current `main`, re-validates it and runs the verification commands (their only run for the commit; validation does not run them), squashes it into one commit on `main` and removes the worktree and branch. Read `outcome`:
 
 - `integrated`: `run.result_commit` is the new `main` head and the task is `completed`; dependents become candidates. `push` says what became of pushing `main` to `origin`: `pushed`, `skipped` (`reason`: `--no-push`, or the repository has no `origin`) or `failed` (`error`). The landing stands in every case. `follow_ups` lists the draft tasks registered from the landed receipt's `follow_ups` (`[{task_id, title}]`, empty when there were none).
 - `needs_session`: nothing reached `main`; `reason` names the conflicting files or the failed verification. The supervisor now resumes the run's session to resolve it and, because this `integrate` approved the run, lands it itself: do not run `integrate` for it again, and do not open a session for it. Report it; `status` shows `resuming (runtime)` until the run lands, and only after three failed resumes does it come back as `resume session` (the `dagq-session` skill).

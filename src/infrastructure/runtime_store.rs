@@ -50,9 +50,9 @@ pub struct Validation {
 
 /// What `integrate` put on `main`: the squash `commit` whose tree is that of
 /// `source_commit` (the rebased run head kept under `history_ref`), on top of
-/// `main_before`. `verification_skipped` is true when the rebase was a no-op
-/// on the validated head and the landing reused validation's verification of
-/// that same commit.
+/// `main_before`. `verification_skipped` is always false: every landing
+/// runs the verification commands (ADR-0023 decision 1); the field keeps the
+/// `run_integrated` payload's shape.
 #[derive(Debug, Serialize)]
 pub struct Landing {
     pub commit: String,

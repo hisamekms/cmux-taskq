@@ -87,7 +87,7 @@ plugins/claude-dagq/
     reference/up-down.md            up / down の出力、別 version の入替、cmux の接続拒否と --in-cmux、in_cmux の down、log
     reference/status.md             status / watch / events / show のフィールド、run の状態一覧
   skills/dagq-land/               review ID → subagent に review.md の path を渡して結論だけ受け取る → pass なら integrate（疑義のときだけユーザーに聞く。着地後に origin へ push し、follow_ups を draft task として登録する）、draft を ready にするかをユーザーに聞く
-    reference/integrate.md          review.md の中身、integrate の再検証と skip、outcome、--next
+    reference/integrate.md          review.md の中身、integrate の再検証と検証コマンド、outcome、--next
   skills/dagq-session/            run の session への操作: trust / permission prompt への応答、worker_question の ask への回答か人への転送、exit_request_timed_out の /exit、failed / interrupted の workspace close、runtime が resume を諦めた needs_session の報告（resume workspace は作らない）
     reference/cmux.md               read-screen / send-key / send / workspace close の使い方
     reference/worker-question.md    worker_question の ask への回答・人への転送・送信失敗の扱い

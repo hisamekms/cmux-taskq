@@ -894,9 +894,9 @@ pub enum ClaimOutcome {
 
 /// Result of one `integrate` invocation. `Integrated` landed the run on
 /// `main` (`run.result_commit` is the landed commit); its
-/// `verification_skipped` is true when the rebase was a no-op on the
-/// validated head and the landing reused the validation's run of the
-/// verification commands.
+/// `verification_skipped` is always false since the verification commands
+/// run on every landing (ADR-0023 decision 1), and is kept for the output's
+/// shape.
 /// `NeedsSession` parked the run for a session to resolve; `Failed` ended it
 /// because its rewritten receipt reported `failed`. `NoRunAwaiting` is
 /// `--next` on an empty queue. `Integrated` also reports the push of the

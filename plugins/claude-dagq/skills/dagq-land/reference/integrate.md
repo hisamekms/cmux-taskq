@@ -4,9 +4,9 @@ Read this when the `dagq-land` skill's short form is not enough.
 
 ## What review.md holds
 
-`review ID` writes `<run_dir>/review.md` through a temporary file and a rename. It has a header (run, base, head, branch, worktree, verify logs), the task (description, acceptance, verification commands), the goal's acceptance and constraints when the task has a goal, the receipt (summary, tests, e2e, subagent_review, follow_ups), `git log --oneline <base>..<head>`, `git diff --stat <base>...<head>`, and the full `git diff <base>...<head>`. `base` is the run's base commit, or the current `main` once a session rebased `head` onto it; `head` is the receipt's commit.
+`review ID` writes `<run_dir>/review.md` through a temporary file and a rename. It has a header (run, base, head, branch, worktree, where `integrate-verify-N.log` goes), the task (description, acceptance, verification commands), the goal's acceptance and constraints when the task has a goal, the receipt (summary, tests, e2e, subagent_review, follow_ups), `git log --oneline <base>..<head>`, `git diff --stat <base>...<head>`, and the full `git diff <base>...<head>`. `base` is the run's base commit, or the current `main` once a session rebased `head` onto it; `head` is the receipt's commit.
 
-The `verify-N.log` files in `run_dir` (`show ID --full`) hold the supervisor's own verification output.
+Validation checks only the receipt, the commit, a clean worktree and required evidence; it runs no verification command and writes no `verify-N.log`. The task's verification commands run once per commit, in `integrate` after its rebase (ADR-0023 decision 1), and write `integrate-verify-N.log` in `run_dir` (`show ID --full`). Before the first `integrate` there is no verification output to read; the receipt's `tests` evidence is the worker's own claim.
 
 ## integrate
 
@@ -15,9 +15,9 @@ The `verify-N.log` files in `run_dir` (`show ID --full`) hold the supervisor's o
 "$DAGQ" integrate --next    # the oldest run awaiting integration
 ```
 
-`integrate` takes the single integration slot, rebases the run's worktree onto the current `main` and re-validates it: the receipt must name the worktree head, the rebased head must sit on `main` with a clean tree, and the task's verification commands are rerun. It then squashes the rebased tree into one commit on `main` (title, receipt summary, trailers `Dagq-Task: ID` and `Dagq-Run: RUN_ID`) and removes the worktree and branch; the run's history stays under `refs/dagq/runs/<run-id>`.
+`integrate` takes the single integration slot, rebases the run's worktree onto the current `main` and re-validates it: the receipt must name the worktree head, the rebased head must sit on `main` with a clean tree, and the task's verification commands run, their only run for this commit. It then squashes the rebased tree into one commit on `main` (title, receipt summary, trailers `Dagq-Task: ID` and `Dagq-Run: RUN_ID`) and removes the worktree and branch; the run's history stays under `refs/dagq/runs/<run-id>`.
 
-When the rebase is a no-op and the worktree head is still the run's `result_commit` (the commit the supervisor's validation ran the commands on), `integrate` skips the rerun and writes no `integrate-verify-N.log`; this shows as an `integration_verification_skipped` event (`main`, `head`, `reason`) and `verification_skipped: true` in the output and the `run_integrated` payload. A head a session rewrote after `needs_session` is always rerun, which shows as `verification_command` events with `phase: "integration"` and writes `integrate-verify-N.log` in `run_dir`. Files left by an earlier attempt can remain, so judge by the events after the last `integration_rebased` (`show ID --full`), not by the files.
+The commands run on every landing, also when the rebase is a no-op: they show as `verification_command` events with `phase: "integration"` and write `integrate-verify-N.log` in `run_dir`. A failing command parks the run as `needs_session` and the supervisor resumes its session. `verification_skipped` stays in the output and the `run_integrated` payload and is always `false`; older runs may still carry an `integration_verification_skipped` event from before ADR-0023. Files left by an earlier attempt can remain, so judge by the events after the last `integration_rebased` (`show ID --full`), not by the files.
 
 After landing, `integrate` pushes `main` to `origin` (`git push origin main`) and reports it as `push: {outcome, remote, error, reason}` on `integrated`, with the event `push_finished`, `push_skipped` (`--no-push`, or no `origin` remote) or `push_failed` (attention `push main`) on the run. A failed push never undoes the landing or fails `integrate`.
 

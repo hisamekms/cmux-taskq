@@ -717,8 +717,8 @@ fn happy_path_runs_a_stub_agent_through_cmux_and_lands_on_main() {
         )),
         "{log}"
     );
-    // dagq.toml's [run.env], expanded, reached the agent's shell and the
-    // verification commands.
+    // dagq.toml's [run.env], expanded, reached the agent's shell; the
+    // verification commands get it at integrate, the only place they run.
     let shared = db.canonicalize().unwrap().with_file_name("shared");
     assert!(
         log.contains(&format!(
@@ -728,10 +728,7 @@ fn happy_path_runs_a_stub_agent_through_cmux_and_lands_on_main() {
         )),
         "{log}"
     );
-    assert_eq!(
-        fs::read_to_string(run_dir.join("verify-env.txt")).unwrap(),
-        format!("verify env: {}\n", shared.display())
-    );
+    assert!(!run_dir.join("verify-env.txt").exists());
     // The run workspace joined the queue's group, made by its external ID.
     assert!(
         fixture.group().is_some(),
@@ -755,7 +752,6 @@ fn happy_path_runs_a_stub_agent_through_cmux_and_lands_on_main() {
         "exit_requested",
         "session_exited",
         "supervision_finished",
-        "verification_command",
         "validation_finished",
         "workspace_closed",
         "lease_released",
@@ -782,12 +778,8 @@ fn happy_path_runs_a_stub_agent_through_cmux_and_lands_on_main() {
         event("supervision_finished")["payload"]["status"],
         "validating"
     );
-    let verifications: Vec<&Value> = events
-        .iter()
-        .filter(|e| e["kind"] == "verification_command")
-        .collect();
-    assert_eq!(verifications.len(), 3);
-    assert!(verifications.iter().all(|e| e["payload"]["exit_code"] == 0));
+    // Validation checks the receipt only (ADR-0023 decision 1).
+    assert!(!kinds.contains(&"verification_command"), "{kinds:?}");
     let finished = event("validation_finished");
     assert_eq!(finished["payload"]["status"], "awaiting_integration");
     assert_eq!(finished["payload"]["result_commit"], head.as_str());
@@ -869,6 +861,25 @@ fn happy_path_runs_a_stub_agent_through_cmux_and_lands_on_main() {
     ] {
         assert!(kinds.contains(&expected), "missing {expected} in {kinds:?}");
     }
+    // The verification commands ran once, after the rebase, with the run env.
+    let verifications: Vec<&Value> = detail["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["kind"] == "verification_command")
+        .collect();
+    assert_eq!(verifications.len(), 3);
+    assert!(
+        verifications
+            .iter()
+            .all(|e| e["payload"]["exit_code"] == 0 && e["payload"]["phase"] == "integration")
+    );
+    assert!(!kinds.contains(&"integration_verification_skipped"));
+    assert_eq!(integrated["verification_skipped"], false);
+    assert_eq!(
+        fs::read_to_string(run_dir.join("verify-env.txt")).unwrap(),
+        format!("verify env: {}\n", shared.display())
+    );
     assert!(!kinds.contains(&"cleanup_failed"), "{kinds:?}");
     assert_eq!(
         dagq(env, &["integrate", "--next"])["outcome"],

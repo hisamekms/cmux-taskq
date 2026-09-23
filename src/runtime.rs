@@ -2222,8 +2222,9 @@ fn main_checkout(repository: &GitRepository) -> PathBuf {
     }
 }
 
-/// Cross-check the agent's receipt against Git and rerun the task's verification
-/// commands on a thread with its own connection. Rejections become a
+/// Cross-check the agent's receipt against Git on a thread with its own
+/// connection. The task's verification commands do not run here: `integrate`
+/// runs them once, after its rebase (ADR-0023 decision 1). Rejections become a
 /// `Validation` that is not accepted; only errors in the checks themselves
 /// propagate, leaving the run in `validating`.
 fn spawn_validation(
@@ -2235,7 +2236,7 @@ fn spawn_validation(
     thread::spawn(move || {
         let mut queue = SqliteQueue::open(&db)?;
         let task = queue.show(run.task_id)?.task;
-        let checked = check_receipt(&queue, &db, &repository, &task, &run)?;
+        let checked = check_receipt(&repository, &task, &run)?;
         Ok(match checked {
             Ok((receipt, commit)) => Validation {
                 accepted: true,
@@ -2293,8 +2294,6 @@ struct Rejection {
 }
 
 fn check_receipt(
-    queue: &SqliteQueue,
-    db: &Path,
     repository: &GitRepository,
     task: &Task,
     run: &TaskRun,
@@ -2381,41 +2380,6 @@ fn check_receipt(
             Some(receipt),
         );
     }
-    // Rerun the task's own verification commands; the receipt's claims are not enough.
-    let run_dir = Path::new(run.run_dir.as_ref().context("missing run directory")?);
-    // Read only when a command runs: a task without any never needs the file.
-    let run_env = if task.verification_commands.is_empty() {
-        Vec::new()
-    } else {
-        run_env(repository, db, run_dir)?
-    };
-    for (index, command) in task.verification_commands.iter().enumerate() {
-        let log = run_dir.join(format!("verify-{}.log", index + 1));
-        let status = run_shell_to_log(command, worktree, &run_env, &log)?;
-        let exit_code = status.code().unwrap_or(128);
-        let output = fs::read_to_string(&log).unwrap_or_default();
-        queue.record_runtime_event(
-            &run.id,
-            "verification_command",
-            json!({
-                "index": index + 1,
-                "command": command,
-                "exit_code": exit_code,
-                "log_path": path_text(&log)?,
-                "output_tail": tail(&output, 2000),
-            }),
-        )?;
-        if exit_code != 0 {
-            return reject(
-                format!(
-                    "verification command {command:?} exited with {exit_code}; see {}",
-                    log.display()
-                ),
-                Some(commit),
-                Some(receipt),
-            );
-        }
-    }
     // Checked last: only a run that is otherwise sound waits for a session
     // to add the evidence (ADR-0019 decision 5).
     let missing = receipt.missing_evidence(&task.required_evidence);
@@ -2441,7 +2405,8 @@ pub enum IntegrateTarget {
 
 /// Land one validated run on `main`: take the single integration slot,
 /// rebase the run worktree onto the current `refs/heads/main`, re-validate
-/// (receipt, descent from main, clean tree, verification commands), squash
+/// (receipt, descent from main, clean tree) and run the verification
+/// commands, the only run of them for the commit (ADR-0023), squash
 /// the tree into one commit with `Dagq-Task` / `Dagq-Run` trailers and
 /// fast-forward `main` to it. Never a merge commit, never a fast-forward of
 /// the run branch itself. A conflict or a failed re-validation parks the run
@@ -2970,29 +2935,9 @@ fn land(
             json!({"main": main, "head": rebased}),
         );
     }
-    // The task's verification commands run again on the rebased tree, unless
-    // the rebase was a no-op on the head validation itself verified: the
-    // supervisor ran these very commands on this commit and tree, so a second
-    // run can only repeat its result. A head a session wrote after
-    // `needs_session` is not that head, even when the session rebased it onto
-    // main itself, so it is verified here.
-    let verification_skipped = rebased == head && run.result_commit.as_deref() == Some(&*head);
-    if verification_skipped {
-        queue.record_runtime_event(
-            &run.id,
-            "integration_verification_skipped",
-            json!({
-                "main": main,
-                "head": rebased,
-                "reason": "rebase was a no-op; validation already verified this head",
-            }),
-        )?;
-    }
-    let commands: &[String] = if verification_skipped {
-        &[]
-    } else {
-        &task.verification_commands
-    };
+    // The task's verification commands run here, once per commit, on the
+    // rebased tree: validation only checks the receipt (ADR-0023 decision 1).
+    let commands = &task.verification_commands;
     let run_env = if commands.is_empty() {
         Vec::new()
     } else {
@@ -3040,7 +2985,7 @@ fn land(
             main_before: main.to_owned(),
             history_ref,
             message: paragraphs.join("\n\n"),
-            verification_skipped,
+            verification_skipped: false,
         },
         receipt.follow_ups,
     ))
@@ -3263,7 +3208,7 @@ fn review_markdown(
          - head: {head}\n\
          - branch: {branch}\n\
          - worktree: {worktree}\n\
-         - verification logs: {run_dir}/verify-N.log\n\n\
+         - verification logs: {run_dir}/integrate-verify-N.log (written when integrate runs the verification commands after its rebase)\n\n\
          ## Task\n\n\
          ### Description\n\n{description}\n\n\
          ### Acceptance\n\n{acceptance}\n\n\
@@ -3516,7 +3461,7 @@ pub fn prompt(
          Each of tests, e2e and subagent_review needs evidence when passed and a reason when not_applicable.\n\
          follow_ups is optional: an array of work you found outside this task, each with a title and a description, for the maintainer to register; omit it when there is none.\n\
          You may write this receipt outside the worktree. Keep the worktree clean after committing.\n\
-         The supervisor rejects the run unless the commit is the clean head of your branch on top of the base commit, and it reruns the verification commands itself.\n\
+         The supervisor rejects the run unless the commit is the clean head of your branch on top of the base commit, and integrate reruns the verification commands itself after rebasing onto main.\n\
          When you need a decision you cannot make from the task and the repository, do not write the question to the terminal and wait: run `dagq ask --run {run_id} --kind worker_question --question '...'` in the worktree (one ask at a time, with everything you need decided in its question), report briefly that you asked, and stop. The answer arrives in this terminal as `answer to ask <id>: ...`; continue from it.\n\
          {stop_background}\n\
          After submitting, report the outcome briefly and stop; do not run /exit yourself. Once you are idle the supervisor ends the session, and the maintainer can still send /exit. A receipt does not itself end the session.\n",
