@@ -10,8 +10,10 @@ Prerequisite: resolve the launcher as in the `dagq` skill (`DAGQ="${CLAUDE_PLUGI
 ## 1. Diagnose without changing state
 
 ```sh
-"$DAGQ" doctor
+"$DAGQ" doctor --full
 ```
+
+Plain `doctor` is the compact form, one line's worth per supervisor and per run (`run_id`, `task_id`, `status`, `lease_stale`, `recoverable`, `blocker_count`, `workspace_id`, `worktree_path`); diagnosing needs `--full`, which prints the lease, processes, paths and the `blockers` described below.
 
 - `supervisors`: one entry per registered `supervise` process (`registered: true`, with `pid`, `alive` (`kill -0`), `parallel`, `started_at`, `heartbeat_at`, `heartbeat_age_secs`, `run_ids`, and `stale` when the PID is dead or the heartbeat is older than 30 seconds), plus one per process that holds leases without a registration, such as a running `integrate` (`registered: false`). A resident supervisor is listed even with an empty `run_ids`; empty `supervisors` means no supervisor is registered and no run is owned by anyone. A stale registration is left by a killed or hung supervisor; the runtime never deletes it, so report it to the user rather than trying to remove it, and `recover` works on runs regardless of it.
 - `runs`: every run in `claimed`, `starting`, `running`, `validating`, or `integrating` with `task_id`, `workspace_id`, `worktree_exists`, `run_dir_exists`, `receipt_exists`, `last_error`, its own `lease` (`pid`, `alive`, heartbeat age, `stale`; `null` when no supervisor owns it), and each registered `wrapper` / `agent` process with `pid`, `alive`, heartbeat age, and `exit_code` (`alive` is null once an exit is recorded).

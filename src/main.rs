@@ -80,8 +80,17 @@ enum Command {
         #[arg(long)]
         full: bool,
     },
-    /// Show a task, its dependencies, run history, and events.
-    Show { id: i64 },
+    /// Show a task, its latest run and its latest events; long texts are cut
+    /// to 300 characters (ending in `…`, with `truncated: true`).
+    Show {
+        id: i64,
+        /// Print every run, event payload and process, and the texts in full.
+        #[arg(long)]
+        full: bool,
+        /// How many of the latest events to show without --full.
+        #[arg(long, default_value_t = dagq::view::DEFAULT_EVENTS, conflicts_with = "full")]
+        events: usize,
+    },
     /// Make a draft task ready (dependencies may still block execution).
     Ready { id: i64 },
     /// Return a ready task to draft.
@@ -213,8 +222,12 @@ enum Command {
         #[arg(long, default_value_t = 2, value_parser = clap::value_parser!(u64).range(1..))]
         interval: u64,
     },
-    /// Report every unfinished run with its lease, processes, heartbeats and paths without changing state.
-    Doctor,
+    /// Report every unfinished run and supervisor, one line's worth each, without changing state.
+    Doctor {
+        /// Include each run's lease, processes, heartbeats and paths, and every supervisor field.
+        #[arg(long)]
+        full: bool,
+    },
     /// Mark one unfinished run interrupted once its processes and supervisor are gone; keeps its worktree and workspace and leaves other runs alone.
     Recover {
         /// Run ID from `show` or `doctor`.
@@ -255,8 +268,14 @@ enum GoalCommand {
     },
     /// List goals with their task counts by status.
     List,
-    /// Show a goal, its tasks, and its events.
-    Show { id: i64 },
+    /// Show a goal, its tasks, and the kinds of its latest 10 events; long
+    /// texts are cut to 300 characters (ending in `…`, with `truncated: true`).
+    Show {
+        id: i64,
+        /// Print the texts and every event with its payload in full.
+        #[arg(long)]
+        full: bool,
+    },
     /// Replace fields of a goal; runs already started keep their prompt.
     #[command(group = clap::ArgGroup::new("field").multiple(true).required(true))]
     Edit {
@@ -364,7 +383,14 @@ fn execute(cli: Cli) -> Result<Value> {
                 full,
             })?)?
         }
-        Command::Show { id } => serde_json::to_value(queue.show(id)?)?,
+        Command::Show { id, full, events } => {
+            let detail = queue.show(id)?;
+            if full {
+                serde_json::to_value(detail)?
+            } else {
+                dagq::view::task_detail(&detail, events)
+            }
+        }
         Command::Ready { id } => serde_json::to_value(queue.transition(id, TaskAction::Ready)?)?,
         Command::Draft { id } => serde_json::to_value(queue.transition(id, TaskAction::Draft)?)?,
         Command::Cancel { id } => serde_json::to_value(queue.transition(id, TaskAction::Cancel)?)?,
@@ -396,7 +422,14 @@ fn execute(cli: Cli) -> Result<Value> {
                 doc,
             })?)?,
             GoalCommand::List => serde_json::to_value(queue.list_goals()?)?,
-            GoalCommand::Show { id } => serde_json::to_value(queue.show_goal(id)?)?,
+            GoalCommand::Show { id, full } => {
+                let detail = queue.show_goal(id)?;
+                if full {
+                    serde_json::to_value(detail)?
+                } else {
+                    dagq::view::goal_detail(&detail)
+                }
+            }
             GoalCommand::Edit {
                 id,
                 title,
@@ -544,7 +577,7 @@ fn execute(cli: Cli) -> Result<Value> {
             };
             dagq::runtime::integrate(&db, target, &checkout(repo))?
         }
-        Command::Doctor => dagq::runtime::doctor(&db)?,
+        Command::Doctor { full } => dagq::runtime::doctor(&db, full)?,
         Command::Recover { run } => dagq::runtime::recover(&db, &run)?,
         Command::Session { run, lease, claude } => {
             dagq::runtime::session(&db, &run, &lease, &claude)?

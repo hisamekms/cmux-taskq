@@ -353,7 +353,7 @@ fn supervise_once(
             if workspaces.iter().any(|(t, _)| t == task) {
                 continue;
             }
-            let detail = dagq(&fixture.env, &["show", task]);
+            let detail = dagq(&fixture.env, &["show", task, "--full"]);
             if let Some(id) = detail["runs"]
                 .as_array()
                 .unwrap()
@@ -428,7 +428,7 @@ fn happy_path_runs_a_stub_agent_through_cmux_and_lands_on_main() {
     let repo = repo.as_path();
     let db = db.as_path();
 
-    let detail = dagq(env, &["show", &task_id]);
+    let detail = dagq(env, &["show", &task_id, "--full"]);
     assert_eq!(detail["task"]["status"], "in_progress");
     let runs = detail["runs"].as_array().unwrap();
     assert_eq!(runs.len(), 1);
@@ -589,7 +589,7 @@ fn happy_path_runs_a_stub_agent_through_cmux_and_lands_on_main() {
         git(repo, &["branch", "--list", &format!("dagq/{run_id}")]),
         ""
     );
-    let detail = dagq(env, &["show", &task_id]);
+    let detail = dagq(env, &["show", &task_id, "--full"]);
     assert_eq!(detail["task"]["status"], "completed");
     assert_eq!(detail["runs"][0]["status"], "integrated");
     let kinds: Vec<&str> = detail["events"]
@@ -658,7 +658,7 @@ fn two_independent_tasks_run_concurrently_and_a_dependent_follows_integration() 
         "{outcome}"
     );
     for task in [&first, &second] {
-        let detail = dagq(env, &["show", task]);
+        let detail = dagq(env, &["show", task, "--full"]);
         assert_eq!(detail["task"]["status"], "in_progress");
         let run = &detail["runs"][0];
         assert_eq!(run["status"], "awaiting_integration");
@@ -669,14 +669,17 @@ fn two_independent_tasks_run_concurrently_and_a_dependent_follows_integration() 
         assert_eq!(git(worktree, &["status", "--porcelain"]), "");
     }
     // The dependent never started: awaiting integration is not completion.
-    let detail = dagq(env, &["show", &third]);
+    let detail = dagq(env, &["show", &third, "--full"]);
     assert_eq!(detail["task"]["status"], "ready");
     assert_eq!(detail["runs"], Value::Array(vec![]));
     assert_eq!(dagq(env, &["candidates"]).as_array().unwrap().len(), 0);
-    assert_eq!(dagq(env, &["doctor"])["runs"], Value::Array(vec![]));
+    assert_eq!(
+        dagq(env, &["doctor", "--full"])["runs"],
+        Value::Array(vec![])
+    );
 
     // Land the first task; the dependent becomes claimable from the landed main.
-    let first_run = dagq(env, &["show", &first])["runs"][0].clone();
+    let first_run = dagq(env, &["show", &first, "--full"])["runs"][0].clone();
     let first_commit = first_run["result_commit"].as_str().unwrap().to_owned();
     assert_eq!(dagq(env, &["integrate", &first])["outcome"], "integrated");
     let first_landed = git(repo, &["rev-parse", "main"]);
@@ -685,7 +688,7 @@ fn two_independent_tasks_run_concurrently_and_a_dependent_follows_integration() 
     assert_eq!(dagq(env, &["candidates"])[0]["id"].to_string(), third);
     let pass = supervise_once(&fixture, &["--parallel", "2"], &[&third], &mut guard);
     assert_eq!(pass.outcome["runs"].as_array().unwrap().len(), 1);
-    let run = dagq(env, &["show", &third])["runs"][0].clone();
+    let run = dagq(env, &["show", &third, "--full"])["runs"][0].clone();
     assert_eq!(run["status"], "awaiting_integration", "{run}");
     assert_eq!(run["base_commit"], first_landed.as_str());
     assert_eq!(git(repo, &["rev-parse", "main"]), first_landed);
@@ -712,7 +715,7 @@ fn two_independent_tasks_run_concurrently_and_a_dependent_follows_integration() 
     assert_eq!(git(repo, &["rev-parse", "main^"]), first_landed);
 
     // The session resolves the parked run on top of main and rewrites its receipt.
-    let run = dagq(env, &["show", &second])["runs"][0].clone();
+    let run = dagq(env, &["show", &second, "--full"])["runs"][0].clone();
     assert_eq!(run["status"], "needs_session");
     let worktree = Path::new(run["worktree_path"].as_str().unwrap());
     assert_eq!(
@@ -762,7 +765,7 @@ fn two_independent_tasks_run_concurrently_and_a_dependent_follows_integration() 
         "resolved by the session\n"
     );
     for task in [&first, &second, &third] {
-        let detail = dagq(env, &["show", task]);
+        let detail = dagq(env, &["show", task, "--full"]);
         assert_eq!(detail["task"]["status"], "completed", "{task}");
         assert!(
             !Path::new(detail["runs"][0]["worktree_path"].as_str().unwrap()).exists(),
@@ -824,7 +827,7 @@ fn killed_supervisor_run_is_adopted_by_the_next_supervisor_and_lands() {
             started.elapsed() < SUPERVISE_TIMEOUT,
             "the worker did not start within {SUPERVISE_TIMEOUT:?}"
         );
-        let detail = dagq(env, &["show", &task_id]);
+        let detail = dagq(env, &["show", &task_id, "--full"]);
         if let Some(run) = detail["runs"].as_array().unwrap().last()
             && run["status"] == "running"
         {
@@ -862,7 +865,7 @@ fn killed_supervisor_run_is_adopted_by_the_next_supervisor_and_lands() {
     assert_eq!(status["runs"][0]["run_id"], run_id.as_str());
     assert_eq!(status["runs"][0]["lease"]["pid"], victim_pid);
     assert_eq!(status["runs"][0]["lease"]["alive"], false);
-    let doctor = dagq(env, &["doctor"]);
+    let doctor = dagq(env, &["doctor", "--full"]);
     assert_eq!(doctor["runs"][0]["recoverable"], false, "{doctor}");
     let wrapper = doctor["runs"][0]["processes"]
         .as_array()
@@ -889,7 +892,7 @@ fn killed_supervisor_run_is_adopted_by_the_next_supervisor_and_lands() {
     );
     assert_eq!(pass.workspaces, vec![(task_id.clone(), workspace.clone())]);
 
-    let detail = dagq(env, &["show", &task_id]);
+    let detail = dagq(env, &["show", &task_id, "--full"]);
     assert_eq!(detail["runs"].as_array().unwrap().len(), 1); // Not rerun.
     let run = &detail["runs"][0];
     assert_eq!(run["status"], "awaiting_integration");
@@ -1255,7 +1258,7 @@ fn up_in_cmux_starts_a_supervisor_in_a_workspace_that_down_wait_stops_and_closes
         supervisor_workspace.as_str()
     );
     assert_eq!(supervisors[0]["stale"], false);
-    let doctor = dagq(env, &["doctor"]);
+    let doctor = dagq(env, &["doctor", "--full"]);
     assert_eq!(doctor["supervisors"][0]["mode"], "in_cmux", "{doctor}");
     assert_eq!(
         doctor["supervisors"][0]["binary_version"], VERSION,

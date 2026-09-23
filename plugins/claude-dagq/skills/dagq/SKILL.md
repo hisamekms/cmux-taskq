@@ -89,7 +89,7 @@ A one-shot task omits `--goal`. The task is registered as `draft` and the JSON i
 
 ```sh
 "$DAGQ" goal list                         # every goal with its task counts by status
-"$DAGQ" goal show ID                      # the goal, its tasks (id, title, status), its events
+"$DAGQ" goal show ID                      # the goal, its tasks (id, title, status), its latest events (--full: everything)
 "$DAGQ" set-goal TASK GOAL                # move a draft or ready task into an open goal
 "$DAGQ" set-goal TASK --none              # take a draft or ready task out of its goal
 "$DAGQ" goal edit ID --constraints "..."  # replace one or more fields (--title, --description, --acceptance, --constraints, --doc; --doc "" clears it)
@@ -103,13 +103,13 @@ A one-shot task omits `--goal`. The task is registered as `draft` and the JSON i
 | Command | Use |
 | --- | --- |
 | `"$DAGQ" goal list` | All goals with `id`, `title`, `closed`, `verdict`, and `tasks` counts (`total`, `draft`, `ready`, `in_progress`, `completed`, `canceled`) |
-| `"$DAGQ" goal show ID` | `goal` (all fields), `tasks` (`id`, `title`, `status`), `closed`, `events` (`goal_created`, `goal_updated`, `goal_closed`) |
+| `"$DAGQ" goal show ID` | `goal` (all fields), `tasks` (`id`, `title`, `status`), `closed`, `events` (`goal_created`, `goal_updated`, `goal_closed`; only `kind` and `created_at` of the latest 10, `events_total` counts them all) |
 | `"$DAGQ" list` | One page of unfinished tasks, newest first: `{"tasks", "next", "total"}` (see below) |
-| `"$DAGQ" show ID` | `task` (with `goal_id` and `context`), `dependencies`, `runs`, `events`, `processes` |
+| `"$DAGQ" show ID` | `task` (with `goal_id` and `context`), `dependencies`, `runs` (only the latest: `id`, `status`, `branch`, `result_commit`, `last_error`, `worktree_path`, `workspace_id`; `runs_total` counts them all), `events` (the latest 10, `--events N` for more, with `id`, `kind`, `created_at` and only `status` / `reason` / `last_error` / `from` / `to` of the payload; `events_total` counts them all), `processes` (the latest run's) |
 | `"$DAGQ" candidates` | What the next `supervise` would pick |
 | `"$DAGQ" locate` | The queue this directory resolves to (`db`, `runs_dir`, `git_common_dir`, `db_exists`) without opening it |
 | `"$DAGQ" status` | `supervisors`: every registered `supervise` process (`pid`, `alive`, `parallel`, `heartbeat_age_secs`, `stale`, `run_ids`; listed even while it holds no run) plus any `integrate` process holding a lease (`registered: false`); `runs`: unfinished runs with their leases |
-| `"$DAGQ" doctor` | The same `supervisors`; per run: lease liveness, processes, worktree/receipt existence, `blockers`, `recoverable` |
+| `"$DAGQ" doctor` | The same `supervisors`, one line each (`pid`, `alive`, `registered`, `mode`, `workspace_id`, `binary_version`, `heartbeat_age_secs`, `stale`, `run_ids`); per run: `run_id`, `task_id`, `status`, `lease_stale`, `recoverable`, `blocker_count`, `workspace_id`, `worktree_path`. `doctor --full` adds lease liveness, processes, worktree/receipt existence and the `blockers` themselves |
 
 `list` answers "which tasks are moving or can move" and "how far is this goal". It prints `{"tasks": [...], "next": ID | null, "total": N}`:
 
@@ -118,21 +118,23 @@ A one-shot task omits `--goal`. The task is registered as `draft` and the JSON i
 - `next`: null means this page is the last one. Otherwise pass it as `--before NEXT` (with the same filters) for the following page; it is the ID of the first task of that page. Decide whether more pages exist from `next` alone — never by counting `tasks`.
 - `total`: how many tasks match the filters across all pages.
 
+`show`, `goal show` and `doctor` are compact by default so their size stays bounded by the number of runs or tasks: a long `description`, `acceptance`, `context` or `constraints` (and a run's `last_error`) is cut to 300 characters ending in `…`, and the object that holds it carries `truncated: true`. Add `--full` for the untruncated text, every run with all its fields, every event with its whole payload, and every process; the key names are the same in both forms.
+
 Task `status`: `draft` → `ready` → `in_progress` → `completed`, or `canceled`. A task stays `in_progress` while any run is unfinished or awaiting integration.
 
 Run `status` in `runs` (latest last): `claimed`, `starting`, `running`, `validating` are unfinished; `awaiting_integration` means the receipt and verification passed and the run waits for `integrate` to land it on `main`; `integrating` means an `integrate` process is landing it right now; `needs_session` means the landing hit a rebase conflict or a failed verification and a resumed session must fix it (`last_error` says what); `integrated` means the run was squashed onto `main` (`result_commit` is the landed commit) and the task is `completed`; `failed` and `interrupted` keep their worktree and workspace for inspection, with the reason in `last_error`. Dependency-free tasks run in parallel (up to the supervisor's `--parallel`), each in its own workspace and worktree; a dependent task waits until every predecessor is `completed`.
 
-Useful run fields: `branch` (`dagq/<run-id>`), `worktree_path`, `workspace_id` (cmux), `run_dir` (prompt, logs, `receipt.json`, `verify-N.log`), `receipt_path`, `result_commit`, `last_error`, `workspace_closed_at`.
+Useful run fields: `branch` (`dagq/<run-id>`), `worktree_path`, `workspace_id` (cmux), `result_commit`, `last_error`, and with `show ID --full` also `run_dir` (prompt, logs, `receipt.json`, `verify-N.log`), `receipt_path`, `workspace_closed_at`.
 
 ## 4. Report results
 
-Judge completion only from `show`: the run's `status`, `result_commit`, `last_error`, and the `validation_finished` event. Neither a Stop hook firing, an idle session, nor the receipt file's existence means success; the supervisor validates the receipt against Git and the verification commands before a run becomes `awaiting_integration`. Summarize for the user: task status, latest run status, branch and commit to review, and the next step (`dagq-maintain` to start the runtime or integrate, `dagq-recover` if the run is stuck).
+Judge completion only from `show`: the run's `status`, `result_commit`, `last_error`, and the `validation_finished` event (its receipt payload is in `show ID --full`). Neither a Stop hook firing, an idle session, nor the receipt file's existence means success; the supervisor validates the receipt against Git and the verification commands before a run becomes `awaiting_integration`. Summarize for the user: task status, latest run status, branch and commit to review, and the next step (`dagq-maintain` to start the runtime or integrate, `dagq-recover` if the run is stuck).
 
 ### Close a goal
 
 A goal is closed once, by the maintainer, after reviewing it; the runtime never closes it. When `goal show ID` lists every task as `completed` (or `canceled`):
 
-1. For each completed task, read the receipt of its integrated run in `show TASK`: the `receipt` in the run's last `integration_receipt` event (`validation_finished` holds the receipt seen before landing; `receipt_path` is the file). Collect its `summary` and its `follow_ups`, an optional array of `{title, description}` the worker proposed for work it found outside its task.
+1. For each completed task, read the receipt of its integrated run in `show TASK --full`: the `receipt` in the run's last `integration_receipt` event (`validation_finished` holds the receipt seen before landing; `receipt_path` is the file). Collect its `summary` and its `follow_ups`, an optional array of `{title, description}` the worker proposed for work it found outside its task.
 2. Compare what landed against the goal's `acceptance` (`goal show ID`). A follow-up, or anything the acceptance asks for that no task delivered, is a gap in the decomposition.
 3. Register each gap as a task on the same goal with `add --goal ID`, then `ready` it, and report to the user that the goal stays open; close it after those tasks are completed. Do not close first: a closed goal refuses new tasks.
 4. When nothing is missing, record the verdict:

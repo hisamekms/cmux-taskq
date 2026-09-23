@@ -781,10 +781,26 @@ fn unanswered_exit_request_times_out_and_retains_run() {
         .unwrap();
     assert_eq!(runtime_error.payload["lease_released"], true);
     // Still alive: doctor sees the wrapper and refuses recovery.
-    let report = runtime::doctor(&db).unwrap();
+    let report = runtime::doctor(&db, true).unwrap();
     assert_eq!(report["supervisors"], json!([]));
     assert_eq!(report["runs"][0]["lease"], Value::Null);
     assert_eq!(report["runs"][0]["recoverable"], false);
+    // The default report keeps one line's worth per run: no lease, processes or run_dir.
+    let blockers = report["runs"][0]["blockers"].as_array().unwrap().len();
+    assert!(blockers > 0);
+    assert_eq!(
+        runtime::doctor(&db, false).unwrap()["runs"],
+        json!([{
+            "run_id": run.id,
+            "task_id": 1,
+            "status": "running",
+            "lease_stale": null,
+            "recoverable": false,
+            "blocker_count": blockers,
+            "workspace_id": run.workspace_id,
+            "worktree_path": run.worktree_path,
+        }])
+    );
     assert!(runtime::recover(&db, &run.id).is_err());
     // A later manual exit is still recorded by the wrapper; nothing restarts the run.
     backend.join();
@@ -899,7 +915,7 @@ fn failed_agent_retains_worktree_and_does_not_complete_task() {
     assert!(queue.run_leases().unwrap().is_empty());
     assert!(queue.candidates().unwrap().is_empty());
     // A failed run does not free the task automatically, but the maintainer may give up on it.
-    assert_eq!(runtime::doctor(&db).unwrap()["runs"], json!([]));
+    assert_eq!(runtime::doctor(&db, true).unwrap()["runs"], json!([]));
     queue.transition(1, TaskAction::Cancel).unwrap();
     assert_eq!(queue.show(1).unwrap().task.status, TaskStatus::Canceled);
 }
@@ -930,7 +946,7 @@ fn provisioning_failure_retains_the_run_and_stops_claiming_other_tasks() {
     // the drained loop took its registration with it.
     assert!(queue.run_leases().unwrap().is_empty());
     assert!(queue.supervisors().unwrap().is_empty());
-    let report = runtime::doctor(&db).unwrap();
+    let report = runtime::doctor(&db, true).unwrap();
     assert_eq!(report["supervisors"], json!([]));
     assert_eq!(report["runs"][0]["recoverable"], true);
     assert_eq!(
@@ -1215,7 +1231,10 @@ fn resident_supervisor_without_runs_is_listed_until_it_stops() {
     let registered = queue.supervisors().unwrap().remove(0);
     assert_eq!(registered.pid, std::process::id());
     assert_eq!(registered.parallel, 3);
-    for report in [runtime::status(&db).unwrap(), runtime::doctor(&db).unwrap()] {
+    for report in [
+        runtime::status(&db).unwrap(),
+        runtime::doctor(&db, true).unwrap(),
+    ] {
         assert_eq!(report["runs"], json!([]));
         assert_eq!(report["supervisors"].as_array().unwrap().len(), 1);
         let entry = &report["supervisors"][0];
@@ -1244,7 +1263,10 @@ fn resident_supervisor_without_runs_is_listed_until_it_stops() {
     assert_eq!(outcome["runs"], json!([]));
     assert!(queue.supervisors().unwrap().is_empty());
     assert_eq!(runtime::status(&db).unwrap()["supervisors"], json!([]));
-    assert_eq!(runtime::doctor(&db).unwrap()["supervisors"], json!([]));
+    assert_eq!(
+        runtime::doctor(&db, true).unwrap()["supervisors"],
+        json!([])
+    );
 
     // An error out of the loop itself (here: main vanished before a claim)
     // ends the process with nothing active, so it deregisters too.
@@ -1388,13 +1410,34 @@ fn killed_supervisor_registration_is_reported_stale_and_never_deleted() {
     )
     .unwrap();
     drop(raw);
-    let doctor = runtime::doctor(&db).unwrap();
+    let doctor = runtime::doctor(&db, true).unwrap();
     assert_eq!(doctor["supervisors"].as_array().unwrap().len(), 2);
     let hung = &doctor["supervisors"][1];
     assert_eq!(hung["alive"], true);
     assert_eq!(hung["stale"], true);
     assert!(hung["heartbeat_age_secs"].as_i64().unwrap() > 30);
     assert_eq!(hung["run_ids"], json!([]));
+    let compact = runtime::doctor(&db, false).unwrap();
+    let keys: Vec<&String> = compact["supervisors"][1]
+        .as_object()
+        .unwrap()
+        .keys()
+        .collect();
+    assert_eq!(
+        keys,
+        [
+            "alive",
+            "binary_version",
+            "heartbeat_age_secs",
+            "mode",
+            "pid",
+            "registered",
+            "run_ids",
+            "stale",
+            "workspace_id"
+        ]
+    );
+    assert_eq!(compact["supervisors"][1]["stale"], true);
 
     // A run owned without a registration (an `integrate` process, or a
     // supervisor from before the registry) is still attributed to its lease.
@@ -1449,7 +1492,7 @@ fn killed_supervisor_registration_is_reported_stale_and_never_deleted() {
         .collect();
     assert_eq!(tokens, ["killed", "hung", "owner"]);
     assert_eq!(
-        runtime::doctor(&db).unwrap()["supervisors"]
+        runtime::doctor(&db, true).unwrap()["supervisors"]
             .as_array()
             .unwrap()
             .len(),
@@ -1524,7 +1567,7 @@ fn recover_requires_dead_processes_and_stale_lease_then_allows_a_new_run() {
     let mut queue = SqliteQueue::open(&db).unwrap();
 
     // Everything is alive: doctor says so and recover refuses.
-    let report = runtime::doctor(&db).unwrap();
+    let report = runtime::doctor(&db, true).unwrap();
     assert_eq!(report["supervisors"][0]["pid"], json!(std::process::id()));
     assert_eq!(report["supervisors"][0]["stale"], false);
     assert_eq!(report["supervisors"][0]["alive"], true);
@@ -1555,7 +1598,7 @@ fn recover_requires_dead_processes_and_stale_lease_then_allows_a_new_run() {
         .unwrap();
     raw.execute("UPDATE run_processes SET heartbeat_at=0", [])
         .unwrap();
-    let report = runtime::doctor(&db).unwrap();
+    let report = runtime::doctor(&db, true).unwrap();
     assert_eq!(report["supervisors"][0]["stale"], true);
     assert_eq!(report["supervisors"][0]["alive"], false);
     assert_eq!(report["runs"][0]["lease"]["stale"], true);
@@ -1573,7 +1616,7 @@ fn recover_requires_dead_processes_and_stale_lease_then_allows_a_new_run() {
     agent.wait().unwrap();
     wrapper.kill().unwrap();
     wrapper.wait().unwrap();
-    let report = runtime::doctor(&db).unwrap();
+    let report = runtime::doctor(&db, true).unwrap();
     assert_eq!(report["runs"][0]["recoverable"], true);
     assert_eq!(report["runs"][0]["blockers"], json!([]));
     let outcome = runtime::recover(&db, &run.id).unwrap();
@@ -1596,7 +1639,7 @@ fn recover_requires_dead_processes_and_stale_lease_then_allows_a_new_run() {
     assert!(detail.processes.iter().all(|p| p.exited_at.is_none()));
     assert!(Path::new(run.worktree_path.as_ref().unwrap()).exists());
     assert!(runtime::recover(&db, &run.id).is_err()); // No longer unfinished.
-    assert_eq!(runtime::doctor(&db).unwrap()["runs"], json!([]));
+    assert_eq!(runtime::doctor(&db, true).unwrap()["runs"], json!([]));
     assert!(queue.candidates().unwrap().is_empty());
 
     // Retry is a separate decision: ready again, then a second run with new paths.
@@ -1629,7 +1672,7 @@ fn recover_ignores_exited_processes_and_tolerates_a_missing_lease() {
         error.contains("supervisor pid") && !error.contains("wrapper pid"),
         "{error}"
     );
-    let report = runtime::doctor(&db).unwrap();
+    let report = runtime::doctor(&db, true).unwrap();
     assert!(
         report["runs"][0]["processes"]
             .as_array()
@@ -1641,7 +1684,10 @@ fn recover_ignores_exited_processes_and_tolerates_a_missing_lease() {
         .unwrap()
         .execute("DELETE FROM run_leases", [])
         .unwrap();
-    assert_eq!(runtime::doctor(&db).unwrap()["supervisors"], json!([]));
+    assert_eq!(
+        runtime::doctor(&db, true).unwrap()["supervisors"],
+        json!([])
+    );
     let outcome = runtime::recover(&db, &run.id).unwrap();
     assert_eq!(outcome["run"]["status"], "interrupted");
     let detail = queue.show(1).unwrap();
@@ -2026,7 +2072,7 @@ fn moved_queue_directory_resolves_run_paths_and_lands_awaiting_runs() {
         json!(text(expected(&unfinished.id).worktree)),
         "{status}"
     );
-    let doctor = runtime::doctor(&db).unwrap();
+    let doctor = runtime::doctor(&db, true).unwrap();
     let health = &doctor["runs"].as_array().unwrap()[0];
     assert_eq!(health["run_id"], json!(unfinished.id), "{doctor}");
     assert_eq!(
@@ -2714,7 +2760,7 @@ fn conflicting_run_needs_a_session_and_lands_after_the_session_resolves_it() {
     assert!(queue.transition(2, TaskAction::Ready).is_err());
     assert_eq!(integrate_next(&db, &repo)["outcome"], "no_run_awaiting");
     assert!(queue.candidates().unwrap().is_empty());
-    assert_eq!(runtime::doctor(&db).unwrap()["runs"], json!([]));
+    assert_eq!(runtime::doctor(&db, true).unwrap()["runs"], json!([]));
 
     // Nothing changed in the worktree: the runtime tries again and parks it again.
     let outcome = integrate(&db, 2, &repo).unwrap();
@@ -3073,7 +3119,7 @@ fn integration_slot_is_exclusive_and_an_abandoned_landing_is_recoverable() {
         RunStatus::AwaitingIntegration
     );
     // It is visible while alive, and recoverable once its process is gone.
-    let report = runtime::doctor(&db).unwrap();
+    let report = runtime::doctor(&db, true).unwrap();
     assert_eq!(report["runs"][0]["run_id"], json!(run.id));
     assert_eq!(report["runs"][0]["status"], "integrating");
     assert_eq!(report["runs"][0]["recoverable"], false);
@@ -3083,7 +3129,7 @@ fn integration_slot_is_exclusive_and_an_abandoned_landing_is_recoverable() {
         .execute("UPDATE run_leases SET heartbeat_at=0, pid=?1", [dead_pid()])
         .unwrap();
     assert_eq!(
-        runtime::doctor(&db).unwrap()["runs"][0]["recoverable"],
+        runtime::doctor(&db, true).unwrap()["runs"][0]["recoverable"],
         true
     );
     let recovered = runtime::recover(&db, &run.id).unwrap();
@@ -3178,7 +3224,7 @@ fn independent_tasks_run_concurrently_and_a_dependent_starts_after_integration()
     );
     assert_eq!(status["runs"].as_array().unwrap().len(), 2);
     assert!(status["runs"][0]["lease"]["pid"].is_number());
-    let doctor = runtime::doctor(&db).unwrap();
+    let doctor = runtime::doctor(&db, true).unwrap();
     assert_eq!(doctor["runs"].as_array().unwrap().len(), 2);
     assert!(
         doctor["runs"]
@@ -3234,7 +3280,7 @@ fn independent_tasks_run_concurrently_and_a_dependent_starts_after_integration()
     let mut closed = backend.closed();
     closed.sort();
     assert_eq!(closed, [workspace_id(0), workspace_id(1), workspace_id(2)]);
-    assert_eq!(runtime::doctor(&db).unwrap()["runs"], json!([]));
+    assert_eq!(runtime::doctor(&db, true).unwrap()["runs"], json!([]));
     // The independent second run conflicts with the first (same file) and
     // waits for a session; the dependent, built on the landing, lands cleanly.
     assert_eq!(
@@ -3278,7 +3324,7 @@ fn a_timed_out_run_is_abandoned_while_the_other_run_is_accepted() {
     assert!(stuck.last_error.as_ref().unwrap().contains("did not exit"));
     assert!(queue.run_leases().unwrap().is_empty());
     // Only the stuck run is unfinished; its live wrapper still blocks recovery.
-    let report = runtime::doctor(&db).unwrap();
+    let report = runtime::doctor(&db, true).unwrap();
     assert_eq!(report["runs"].as_array().unwrap().len(), 1);
     assert_eq!(report["runs"][0]["run_id"], json!(stuck.id));
     assert_eq!(report["runs"][0]["recoverable"], false);
@@ -3336,7 +3382,7 @@ fn failed_runs_in_the_same_pass_do_not_affect_the_accepted_run() {
     );
     assert_eq!(backend.closed(), [workspace_id(0)]);
     assert!(queue.run_leases().unwrap().is_empty());
-    assert_eq!(runtime::doctor(&db).unwrap()["runs"], json!([]));
+    assert_eq!(runtime::doctor(&db, true).unwrap()["runs"], json!([]));
     // Failed tasks can be retried independently; the accepted one still owns its slot.
     queue.transition(2, TaskAction::Ready).unwrap();
     assert!(queue.transition(1, TaskAction::Ready).is_err());
@@ -3360,7 +3406,7 @@ fn recovering_one_orphaned_run_leaves_the_other_running() {
     let raw = Connection::open(&db).unwrap();
     raw.execute("UPDATE run_leases SET heartbeat_at=0, pid=?1", [dead_pid()])
         .unwrap();
-    let report = runtime::doctor(&db).unwrap();
+    let report = runtime::doctor(&db, true).unwrap();
     assert_eq!(report["supervisors"].as_array().unwrap().len(), 1);
     assert_eq!(
         report["supervisors"][0]["run_ids"],
@@ -3379,7 +3425,7 @@ fn recovering_one_orphaned_run_leaves_the_other_running() {
         child.kill().unwrap();
         child.wait().unwrap();
     }
-    let report = runtime::doctor(&db).unwrap();
+    let report = runtime::doctor(&db, true).unwrap();
     assert_eq!(report["runs"][0]["recoverable"], true);
     assert_eq!(report["runs"][1]["recoverable"], false);
     assert_eq!(
@@ -3701,7 +3747,7 @@ fn fresh_leases_dead_wrappers_early_runs_leaseless_and_integrating_runs_are_not_
     )
     .unwrap();
     assert!(queue.candidates().unwrap().is_empty());
-    let before = runtime::doctor(&db).unwrap();
+    let before = runtime::doctor(&db, true).unwrap();
     let health = |report: &Value, run: &TaskRun| -> Value {
         report["runs"]
             .as_array()
@@ -3761,7 +3807,7 @@ fn fresh_leases_dead_wrappers_early_runs_leaseless_and_integrating_runs_are_not_
         "gone-early"
     );
     assert!(queue.run_lease(&leaseless.id).unwrap().is_none());
-    let after = runtime::doctor(&db).unwrap();
+    let after = runtime::doctor(&db, true).unwrap();
     for run in [&fresh, &dead_wrapper, &silent_wrapper, &starting, &claimed] {
         assert_eq!(
             health(&after, run)["recoverable"],

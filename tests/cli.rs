@@ -371,3 +371,105 @@ fn events_and_watch_read_past_a_cursor() {
     assert_eq!(quiet["cursor"], cursor);
     assert!(!invoke(&db, &["watch", "--interval", "0"]).status.success());
 }
+
+#[test]
+fn show_goal_show_and_doctor_are_compact_unless_full() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("queue.db");
+    ok(&db, &["init"]);
+    let long = "長".repeat(400);
+    ok(
+        &db,
+        &[
+            "goal",
+            "add",
+            "compact",
+            "--description",
+            &long,
+            "--acceptance",
+            "short",
+        ],
+    );
+    ok(
+        &db,
+        &[
+            "add",
+            "task",
+            "--goal",
+            "1",
+            "--context",
+            &long,
+            "--verify",
+            "true",
+        ],
+    );
+    // Draft and ready back and forth: one event each, twelve in all with `task_created`.
+    for _ in 0..6 {
+        ok(&db, &["ready", "1"]);
+        ok(&db, &["draft", "1"]);
+    }
+    ok(&db, &["goal", "edit", "1", "--constraints", &long]);
+
+    let full = ok(&db, &["show", "1", "--full"]);
+    assert_eq!(full["task"]["context"], long.as_str());
+    assert!(full["task"].get("truncated").is_none());
+    let all_events = full["events"].as_array().unwrap().len();
+    assert!(all_events > 10);
+    assert!(full["events"][0]["payload"].is_object());
+    assert!(full.get("events_total").is_none());
+
+    let shown = ok(&db, &["show", "1"]);
+    let context = shown["task"]["context"].as_str().unwrap();
+    assert!(context.ends_with('…'), "{context}");
+    assert_eq!(context.chars().count(), 301);
+    assert_eq!(shown["task"]["truncated"], true);
+    assert_eq!(
+        shown["task"]["verification_commands"],
+        serde_json::json!(["true"])
+    );
+    assert_eq!(shown["runs"], serde_json::json!([]));
+    assert_eq!(shown["events_total"], all_events);
+    let events = shown["events"].as_array().unwrap();
+    assert_eq!(events.len(), 10);
+    assert_eq!(events[9]["id"], full["events"][all_events - 1]["id"]);
+    assert_eq!(
+        events[9]["payload"],
+        serde_json::json!({"from": "ready", "to": "draft"})
+    );
+    let three = ok(&db, &["show", "1", "--events", "3"]);
+    assert_eq!(three["events"].as_array().unwrap().len(), 3);
+    assert!(
+        !invoke(&db, &["show", "1", "--full", "--events", "3"])
+            .status
+            .success()
+    );
+
+    let full = ok(&db, &["goal", "show", "1", "--full"]);
+    assert_eq!(full["goal"]["description"], long.as_str());
+    assert!(full["events"][0]["payload"].is_object());
+    let goal = ok(&db, &["goal", "show", "1"]);
+    assert_eq!(goal["goal"]["truncated"], true);
+    assert_eq!(goal["goal"]["acceptance"], "short");
+    assert!(goal["goal"]["description"].as_str().unwrap().ends_with('…'));
+    assert!(goal["goal"]["constraints"].as_str().unwrap().ends_with('…'));
+    assert_eq!(
+        goal["tasks"],
+        serde_json::json!([{"id": 1, "title": "task", "status": "draft"}])
+    );
+    assert_eq!(
+        goal["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["kind"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["goal_created", "goal_updated"]
+    );
+    assert!(goal["events"][0].get("payload").is_none());
+
+    for args in [&["doctor"][..], &["doctor", "--full"]] {
+        let report = ok(&db, args);
+        assert_eq!(report["runs"], serde_json::json!([]), "{args:?}");
+        assert_eq!(report["supervisors"], serde_json::json!([]), "{args:?}");
+    }
+}

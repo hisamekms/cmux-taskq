@@ -111,7 +111,7 @@ cmux workspaceの名前は複数repositoryで同じcmuxを使うためrepository
 - `watch --after <cursor>`はcursorより後のattentionイベントかsupervisor健全性の変化までblockし、attentionと新しいcursorを返して終わる。maintainerはこれをbackgroundで走らせて終了で起きる。`doctor`は診断専用で、pollingには使わない。
 - attentionはrun_eventsのkind（公開契約。既存のkind名とpayloadは変えず追加だけ）からdomainが判定する: runの`awaiting_integration`・`needs_session`・`failed`、`exit_request_timed_out`、supervisorの停止/stale。supervisorの状態はrun_eventsに載せず`supervisors`表から導出し、schemaは変えない。
 - supervisorはattentionのたびにmaintainer workspaceへ`cmux notify`を送る（人向け）。runtimeはmaintainerのterminalに`cmux send`で打ち込まない（workerへの`/exit`は従来どおり）。`integrate`は`watch`からもイベントの副作用としても呼ばない。
-- maintainer経路のコマンドは既定で圧縮し（既存キー名を変えずに省く・切り詰める）、全文は`--full`。レビューは`review ID`が`<run_dir>/review.md`を書き、maintainerはsubagentにpathを渡す。
+- maintainer経路のコマンドは既定で圧縮し（既存キー名を変えずに省く・切り詰める）、全文は`--full`。`show`・`goal show`・`doctor`は実装済み（`doctor`は上、`show`と`goal show`は[domain-model](domain-model.md)）。レビューは`review ID`が`<run_dir>/review.md`を書き、maintainerはsubagentにpathを渡す。
 - `maintainer_prompt`は「`status`から始め、`watch`をbackgroundで回し、attentionを報告して承認を待つ」に縮める。
 
 ## `supervise`
@@ -256,7 +256,7 @@ attentionイベントの判定は`domain::event_attention(kind, payload)`（候�
 
 ### `doctor`
 
-`dagq doctor`は状態を変えずにJSONで報告する。
+`dagq doctor`は状態を変えずにJSONで報告する。以下は`doctor --full`の内容で、既定の出力はsupervisor 1件・run 1件につき1行相当に圧縮する（ADR-0016の決定4。キー名は変えず省くだけ）: supervisorは`pid`、`alive`、`registered`、`mode`、`workspace_id`、`binary_version`、`heartbeat_age_secs`、`stale`、`run_ids`、runは`run_id`、`task_id`、`status`、`lease_stale`（leaseがなければnull）、`recoverable`、`blocker_count`（`blockers`の件数）、`workspace_id`、`worktree_path`（`RunHealth::summary` / `SupervisorHealth::summary`）。
 
 - `supervisors`: `status`と同じ。staleな登録は報告するだけで、`doctor`も`recover`も`integrate`も消さない。
 - `runs`: `claimed`/`starting`/`running`/`validating`/`integrating`のrunごとに、`workspace_id`、worktreeとrun directoryとreceiptの存在、`last_error`、そのrunの`lease`（PID、`kill -0`による生存、heartbeatの経過秒数、30秒を超えた`stale`。なければnull）、登録済みwrapper/agentプロセスのPID・生存・heartbeat経過秒数・終了コード。`exited_at`が記録済みのプロセスはPIDが再利用されうるため生存確認せず`alive: null`にする。

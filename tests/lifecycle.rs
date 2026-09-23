@@ -1188,7 +1188,7 @@ fn up_in_cmux_starts_the_supervisor_in_a_workspace_and_leaves_launchd_alone() {
         status["supervisors"][0]["workspace_id"],
         first["supervisor"]["workspace_id"]
     );
-    let doctor = dagq::runtime::doctor(&fixture.location.db).unwrap();
+    let doctor = dagq::runtime::doctor(&fixture.location.db, true).unwrap();
     assert_eq!(doctor["supervisors"][0]["mode"], "in_cmux", "{doctor}");
 
     // Idempotent: the live registration is reused with the mode it was

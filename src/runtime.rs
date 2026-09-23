@@ -1697,6 +1697,41 @@ pub struct RunHealth {
     pub recoverable: bool,
 }
 
+impl RunHealth {
+    /// The run in `doctor`'s default output: whether it can be recovered and
+    /// where it is, with `blockers` counted (`blocker_count`) and the lease
+    /// reduced to `lease_stale` (null without a lease).
+    pub fn summary(&self) -> Value {
+        json!({
+            "run_id": self.run_id,
+            "task_id": self.task_id,
+            "status": self.status,
+            "lease_stale": self.lease.as_ref().map(|lease| lease.stale),
+            "recoverable": self.recoverable,
+            "blocker_count": self.blockers.len(),
+            "workspace_id": self.workspace_id,
+            "worktree_path": self.worktree_path,
+        })
+    }
+}
+
+impl SupervisorHealth {
+    /// The supervisor in `doctor`'s default output, one line's worth.
+    pub fn summary(&self) -> Value {
+        json!({
+            "pid": self.pid,
+            "alive": self.alive,
+            "registered": self.registered,
+            "mode": self.mode,
+            "workspace_id": self.workspace_id,
+            "binary_version": self.binary_version,
+            "heartbeat_age_secs": self.heartbeat_age_secs,
+            "stale": self.stale,
+            "run_ids": self.run_ids,
+        })
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct DoctorReport {
     pub checked_at: i64,
@@ -1745,7 +1780,10 @@ pub fn status(db: &Path) -> Result<Value> {
 
 /// Inspect every registered supervisor and every unfinished run with its
 /// lease, processes and paths. Reads only.
-pub fn doctor(db: &Path) -> Result<Value> {
+/// `doctor`: with `full`, every unfinished run with its lease, processes
+/// and paths; without it, one line's worth per run and per supervisor
+/// ([`RunHealth::summary`], [`SupervisorHealth::summary`]).
+pub fn doctor(db: &Path, full: bool) -> Result<Value> {
     let queue = SqliteQueue::open(db)?;
     let now = unix_time();
     let registrations = queue.supervisors()?;
@@ -1762,9 +1800,17 @@ pub fn doctor(db: &Path) -> Result<Value> {
             Ok(run_health(&run, &processes, lease, now))
         })
         .collect::<Result<Vec<_>>>()?;
+    let supervisors = supervisors(&registrations, &leases, now);
+    if !full {
+        return Ok(json!({
+            "checked_at": now,
+            "supervisors": supervisors.iter().map(SupervisorHealth::summary).collect::<Vec<_>>(),
+            "runs": runs.iter().map(RunHealth::summary).collect::<Vec<_>>(),
+        }));
+    }
     Ok(serde_json::to_value(DoctorReport {
         checked_at: now,
-        supervisors: supervisors(&registrations, &leases, now),
+        supervisors,
         runs,
     })?)
 }

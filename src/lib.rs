@@ -3,6 +3,7 @@ pub mod domain;
 pub mod infrastructure;
 pub mod lifecycle;
 pub mod runtime;
+pub mod view;
 pub mod watch;
 
 /// The version of this binary, recorded on every supervisor registration so
