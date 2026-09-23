@@ -23,13 +23,12 @@ CLI の使い方（登録・起動・監視・レビューと着地・復旧）�
 cargo fmt --all --check
 cargo test --locked
 cargo clippy --locked --all-targets -- -D warnings
-cargo llvm-cov --locked --fail-under-lines 80
 ```
 
 ## テストの制約
 
-- unit test: 行カバレッジの合計を 80% 以上に保つ（`cargo-llvm-cov`、行基準、全体）。下回る変更は着地しない
-- e2e test: ハッピーパスを `tests/e2e.rs` に置く。実バイナリ・実 Git・実 cmux を使い、Claude の代わりに受け入れ条件どおり commit と receipt を書く stub スクリプトを provider にする。cmux が必要なので `#[ignore]` とし、runtime を変えた run では maintainer が `integrate` の前に run の worktree で `cargo test --locked --test e2e -- --ignored` を実行する
+- unit test: 行カバレッジの合計を 80% 以上に保つ（`cargo-llvm-cov`、行基準、全体）。下回る変更は着地しない。門番は task の `verification_commands`（supervisor の validating が worker の receipt を信用せず再実行する）と CI で、worker が手元で `cargo llvm-cov` を回す必要はない。runtime（`src/`）を触る task を `dagq add` するときは verification に `cargo llvm-cov --locked --fail-under-lines 80` を含める
+- e2e test: ハッピーパスを `tests/e2e.rs` に置く。実バイナリ・実 Git・実 cmux を使い、Claude の代わりに受け入れ条件どおり commit と receipt を書く stub スクリプトを provider にする。cmux が必要なので `#[ignore]` とし、runtime（`src/`）を変えた run では worker が worktree で `cargo test --locked --test e2e -- --ignored` を実行し、receipt の `e2e` に evidence を書く。maintainer は自分では再実行しない
 - 実 Claude を含む経路は自動化せず、手動スモーク（journal 010, 012）で確認する
 
 ## 文書のルール
@@ -53,6 +52,8 @@ cargo llvm-cov --locked --fail-under-lines 80
 
 runtime の `supervise` プロセスが **supervisor**、登録・監視・レビュー・着地を行う常駐の Claude Code session が **maintainer**、run ごとに worktree で作業する Claude session が **worker**（[ADR-0010](docs/adr/0010-maintainer-and-resident-supervisor.md)、[docs/design/overview.md](docs/design/overview.md) の用語）。
 
+同じ commit に対する verification は supervisor の validating の結果が正で、`integrate` は rebase が head を動かしたときだけ `verification_commands` を再実行する（rebase が no-op なら再検証しない）。
+
 ### maintainer
 
 cold start は repository の中で1行。当面は in-cmux mode で運用する（cmux の socket password を設定していないので launchd mode は preflight で止まる。[ADR-0011](docs/adr/0011-cmux-socket-password-and-in-cmux-fallback.md)）。
@@ -66,14 +67,14 @@ dagq up --in-cmux --claude ~/.local/bin/claude --plugin-dir <この repository>/
 - maintainer workspace は `dagq dagq maintainer`。maintainer session の中から `up` を打つと maintainer は `skipped`、生きている supervisor は `reused` になる
 - 操作は plugin の `dagq` / `dagq-maintain` / `dagq-recover` skill に従う。CLI の外で状態を持たず、DB は手で直さない。`cmux read-screen` は当面の一次情報として認める
 - バイナリは「作業中」のとおり固定した `~/.local/bin/dagq` だけを使う（`~/.local/bin` が PATH にあるので supervisor の起動でも同じものが動く）。キューは cwd から解決されるので、コマンドは repository の中（どの worktree でもよい）で実行する
-- runtime（`src/`）を変えた run は、`integrate` の前に run の worktree で `cargo test --locked --test e2e -- --ignored` を通す
+- runtime（`src/`）を変えた run は、`integrate` の前に receipt の `e2e` の evidence と run_dir の log を確認する。e2e は自分では再実行せず、evidence が無い・不十分なときだけ worker の session に差し戻す
 - push は maintainer だけが行う。着手と着地はユーザーに報告するが承認は待たない。ユーザーの判断が要るとき（受け入れ条件の変更、固定バイナリの更新、DB に触らずに解消できない詰まり）だけ報告して待つ
 - 権限確認は worktree 内の編集・cargo・git など安全なものは maintainer が応答し、それ以外とユーザーの判断が要るものはユーザーに確認する
 
 ### worker
 
 - runtime の prompt に従う。割り当てられた worktree（branch `dagq/<run-id>`）の中だけで作業し、main、queue DB、`runs/` 配下の runtime ファイル、他の run の worktree は触らない。merge も push も workspace の close もしない
-- 変更後は「変更後に必ず通す」のコマンドとタスクの verify コマンドを worktree で実行する。e2e と subagent review は該当するときに実行し、しないときは理由を receipt に書く
+- 変更後は「変更後に必ず通す」の 3 本（fmt / test / clippy）とタスクの verify コマンドを worktree で実行する。e2e と subagent review は該当するときに実行し、しないときは理由を receipt に書く。runtime（`src/`）を変えた run では e2e（`cargo test --locked --test e2e -- --ignored`）は必須で、結果を receipt の `e2e` に evidence として書く
 - コミットしてから receipt を書く。receipt の commit は run branch の clean head で、base commit の上に乗っている
 - 判断が要るときは terminal に質問を書いて待つ。maintainer が `read-screen` で拾い、同じ terminal に返答する
 - receipt を書いたら結果を短く報告して止まる。`/exit` は自分で打たない。supervisor が idle を見て送る
