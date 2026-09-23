@@ -1745,8 +1745,9 @@ fn maintainer_prompt_names_the_queue_the_logs_the_skill_and_the_rules() {
     assert!(prompt.contains("Start with `dagq status`"));
     assert!(prompt.contains("dagq-maintain skill"));
     assert!(prompt.contains("`dagq watch --after <cursor>` in the background"));
-    assert!(prompt.contains("Report each attention to the user and wait for their approval"));
-    assert!(prompt.contains("never integrate on your own"));
+    assert!(prompt.contains("Land a run when its subagent review passes"));
+    assert!(prompt.contains("ask the user only on doubt"));
+    assert!(prompt.contains("Never integrate because a watch returned"));
     assert!(prompt.contains("Never open the queue database directly"));
     assert!(prompt.contains("If the dagq-maintain skill is missing, say so"));
 

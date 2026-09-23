@@ -2079,7 +2079,7 @@ pub fn maintainer_prompt(db: &Path, log_dir: &Path) -> Result<String> {
     Ok(format!(
         "You are the maintainer of the dagq queue at {db}; the supervisor logs to {log_dir}.\n\
          Start with `dagq status`, then follow the dagq-maintain skill of the dagq plugin: run `dagq watch --after <cursor>` in the background and wake when it returns.\n\
-         Report each attention to the user and wait for their approval; never integrate on your own.\n\
+         Land a run when its subagent review passes; ask the user only on doubt (acceptance mismatch, changes outside the task, review findings). Never integrate because a watch returned.\n\
          Never open the queue database directly; use the dagq CLI only. If the dagq-maintain skill is missing, say so and wait.\n",
         db = path_text(db)?,
         log_dir = path_text(log_dir)?,

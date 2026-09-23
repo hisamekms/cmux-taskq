@@ -108,7 +108,7 @@ cmux workspaceの名前は複数repositoryで同じcmuxを使うためrepository
 
 ### Maintainer prompt
 
-`src/runtime.rs`の`maintainer_prompt(db, log_dir)`がworker promptの隣で生成する（[ADR-0016](../adr/0016-maintainer-notification-and-compact-output.md)の決定8で5行以内に縮めた）。内容: この queue（db path）のmaintainerであることとsupervisorのlog dir、`dagq status`から始めてdagq pluginの`dagq-maintain` skillに従い`dagq watch --after <cursor>`をbackgroundで走らせ終了で起きること、attentionをユーザーに報告して承認を待ち自分では`integrate`しないこと、queue DBを直接開かずCLIだけを使うこと、skillが無ければそう報告して待つこと。CLIの手順はpromptに書かずskillに置くので、skillを変えてもpromptは変わらない。compactionと`/clear`からの起き直しはpromptではなくpluginの`SessionStart` hookが`status`を出して担う（[plugin-integration](plugin-integration.md#起き直しhookadr-0016)）。
+`src/runtime.rs`の`maintainer_prompt(db, log_dir)`がworker promptの隣で生成する（[ADR-0016](../adr/0016-maintainer-notification-and-compact-output.md)の決定8で5行以内に縮めた）。内容: この queue（db path）のmaintainerであることとsupervisorのlog dir、`dagq status`から始めてdagq pluginの`dagq-maintain` skillに従い`dagq watch --after <cursor>`をbackgroundで走らせ終了で起きること、subagentレビューが通ったrunは着地し、疑義（受け入れ条件との食い違い・指示外の変更・レビューの指摘）のときだけユーザーに聞き、`watch`が返っただけでは`integrate`しないこと（[ADR-0022](../adr/0022-ask-answer-inbox-planner-and-landing-on-doubt.md)決定3）、queue DBを直接開かずCLIだけを使うこと、skillが無ければそう報告して待つこと。CLIの手順はpromptに書かずskillに置くので、skillを変えてもpromptは変わらない。compactionと`/clear`からの起き直しはpromptではなくpluginの`SessionStart` hookが`status`を出して担う（[plugin-integration](plugin-integration.md#起き直しhookadr-0016)）。
 
 ### Maintainerへの通知（ADR-0016で決定、一部実装済み）
 
@@ -119,7 +119,7 @@ cmux workspaceの名前は複数repositoryで同じcmuxを使うためrepository
 - attentionはrun_eventsのkind（公開契約。既存のkind名とpayloadは変えず追加だけ）からdomainが判定する: runの`awaiting_integration`・`needs_session`・`failed`、`exit_request_timed_out`、supervisorの停止/stale（のちに[ADR-0025](../adr/0025-leaseless-unfinished-run-is-a-recover-run-attention.md)でsupervisorが手放した未完了runの`recover run`が加わった）。supervisorの状態はrun_eventsに載せず`supervisors`表から導出し、schemaは変えない。
 - supervisorはattentionのたびにmaintainer workspaceへ`cmux notify`を送る（人向け。のちに[ADR-0022](../adr/0022-ask-answer-inbox-planner-and-landing-on-doubt.md)の決定5で`ask_opened`のときだけinbox宛てに改まった）。runtimeはmaintainerのterminalに`cmux send`で打ち込まない（workerへの`/exit`は従来どおり）。`integrate`は`watch`からもイベントの副作用としても呼ばない。
 - maintainer経路のコマンドは既定で圧縮し（既存キー名を変えずに省く・切り詰める）、全文は`--full`。`show`・`goal show`・`doctor`は実装済み（`doctor`は上、`show`と`goal show`は[domain-model](domain-model.md)）。レビューは`review ID`が`<run_dir>/review.md`を書き、maintainerはsubagentにpathを渡す（`review`は実装済み。下記「`review`」）。
-- `maintainer_prompt`は「`status`から始め、`watch`をbackgroundで回し、attentionを報告して承認を待つ」に縮める。
+- `maintainer_prompt`は「`status`から始め、`watch`をbackgroundで回し、attentionを報告して承認を待つ」に縮める（着地の承認は[ADR-0022](../adr/0022-ask-answer-inbox-planner-and-landing-on-doubt.md)の決定3で「疑義のあるときだけ聞く」に改まった）。
 
 ## `supervise`
 

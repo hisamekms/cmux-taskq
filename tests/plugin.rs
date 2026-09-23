@@ -167,7 +167,8 @@ fn skills_point_at_their_reference_files() {
     assert!(maintain.contains("Never call `integrate` because a watch returned"));
     let land = fs::read_to_string(plugin_root().join("skills/dagq-land/SKILL.md")).unwrap();
     assert!(land.contains("\"$DAGQ\" review ID"));
-    assert!(land.contains("Do not run `integrate` until the user approves this run"));
+    assert!(land.contains("Land on a pass, ask only on doubt"));
+    assert!(land.contains("Do not run `integrate` on a run with doubt until the user approves it"));
 }
 
 fn hooks_manifest() -> Value {

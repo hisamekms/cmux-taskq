@@ -1,13 +1,13 @@
 ---
 name: dagq-maintain
-description: Keep a dagq queue running as its maintainer: start the runtime with up, stop it with down, read status (supervisor health, unfinished runs, attention, cursor), and wait for attention with watch in the background, then report it and wait for the user's approval. Use when the session starts or wakes up as a dagq maintainer, when the user asks to start, stop, or check the supervisor, or asks what in the queue needs attention now. Landing a run is dagq-land; answering, resuming, or closing a run's session is dagq-session; a stuck lease is dagq-recover.
+description: Keep a dagq queue running as its maintainer: start the runtime with up, stop it with down, read status (supervisor health, unfinished runs, attention, cursor), and wait for attention with watch in the background, then report it and route it. Use when the session starts or wakes up as a dagq maintainer, when the user asks to start, stop, or check the supervisor, or asks what in the queue needs attention now. Landing a run is dagq-land; answering, resuming, or closing a run's session is dagq-session; a stuck lease is dagq-recover.
 ---
 
 # dagq: keep the queue running and watch it
 
 Prerequisite: resolve the launcher as in the `dagq` skill (`DAGQ="${CLAUDE_PLUGIN_ROOT}/bin/dagq"`, `"$DAGQ" --resolve`); if it is not in context, read `${CLAUDE_PLUGIN_ROOT}/skills/dagq/SKILL.md` first. Never open or edit the queue database; go through the CLI only.
 
-Roles: the **supervisor** is the resident `dagq supervise` process that claims ready tasks and runs each in its own worktree and cmux workspace; the **maintainer** is this session, which starts and stops the runtime, watches, reports, and lands with the user's approval; a **worker** is the Claude session of one run.
+Roles: the **supervisor** is the resident `dagq supervise` process that claims ready tasks and runs each in its own worktree and cmux workspace; the **maintainer** is this session, which starts and stops the runtime, watches, reports, and lands a run when its subagent review passes, asking the user only on doubt (dagq-land); a **worker** is the Claude session of one run.
 
 This session holds no state of its own. After a restart, compaction or `/clear`, start again from step 2: `status` rebuilds everything needed (a maintainer session gets it from the plugin's SessionStart hook after compaction and `/clear`).
 
@@ -49,12 +49,13 @@ Do not poll `status`, `show` or `doctor` in a loop. Wait for the next attention 
 3. When it finishes, read its `events`, `supervisors_changed`, `supervisors` and `cursor`. Report each attention event to the user as in step 2; for a supervisor change, run `status` and act on step 2.1. On a timeout `events` is empty and the cursor is unchanged.
 4. Go back to 2 with the returned `cursor`. Keep exactly one watch running at a time.
 
-`watch` and `events --after <cursor>` (the same events without waiting) only read the queue. **Never call `integrate` because a watch returned**; landing waits for the user's approval (step 4).
+`watch` and `events --after <cursor>` (the same events without waiting) only read the queue. **Never call `integrate` because a watch returned**; landing goes through the `dagq-land` review, which lands on a pass and asks the user only on doubt (step 4).
 
 ## 4. Where your authority ends
 
-- Report and wait: landing (`integrate`), pushing `main` by hand after a `push_failed`, `down --force`, `recover`, changing a task's acceptance, and anything outside a run's own worktree need the user's go-ahead.
-- Do yourself, without asking: `up`, `status`, `watch`, `show`, `review`, answering a run's trust or permission prompt about its own worktree (`dagq-session`), and reporting.
+- Land without asking when the `dagq-land` review passes (`integrate` also pushes `main`); report and wait when it finds doubt (an acceptance mismatch, changes outside the task, review findings).
+- Report and wait: pushing `main` by hand after a `push_failed`, `down --force`, `recover`, changing a task's acceptance, and anything outside a run's own worktree need the user's go-ahead.
+- Do yourself, without asking: `up`, `status`, `watch`, `show`, `review`, `integrate` after a passing review, answering a run's trust or permission prompt about its own worktree (`dagq-session`), and reporting.
 - A receipt's `follow_ups` are registered by `integrate` as `draft` tasks; making one `ready` waits for the user (`dagq-land`). Registering other new work (a new goal, a gap in a goal) follows the `dagq` skill once the user agrees.
 
 ## 5. Stop the runtime

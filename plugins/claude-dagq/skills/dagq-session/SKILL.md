@@ -23,7 +23,7 @@ A run that stays `running` right after `agent_started` with nothing happening in
 - Anything else, or anything needing the user's judgement: report it to the user and send their answer.
 - A question the worker wrote on its terminal: answer it the same way, as text followed by `enter`.
 
-A stuck prompt is not a runtime failure: answer it, do not recover the run. The trust dialog appears only when the repository root was never trusted; every session started before the first approval (up to `--parallel`) shows it, so answer each.
+A stuck prompt is not a runtime failure: answer it, do not recover the run. The trust dialog appears only when the repository root was never trusted; every session started before the root is first trusted (up to `--parallel`) shows it, so answer each.
 
 ## 2. Send /exit after the exit request timed out
 
@@ -50,4 +50,4 @@ cmux workspace create --name "[<repo>]dagq resume <run-id>" --cwd "<worktree_pat
 
 Send it the reason from `last_error` and this instruction: rebase the branch onto the `main` commit named in the reason (`git rebase <main commit>`), resolve the conflicts or fix what broke the verification command, rerun the task's verification commands, commit, keep the worktree clean, and rewrite `receipt.json` in `run_dir` by atomic rename with the new head as `commit`; if the change is no longer needed, write `"result": "failed"` with the reason in `summary`. It must not merge or push.
 
-When it reports done, send `/exit` in that workspace (landing removes the worktree it works in), then land the run again with the `dagq-land` skill: `review ID` and the user's approval, then `integrate ID`. `integrate` repeats the rebase and reruns the verification commands on the new head; it keeps the run in `needs_session` with a new reason if the receipt does not name the current head, and marks it `failed` on a failed receipt.
+When it reports done, send `/exit` in that workspace (landing removes the worktree it works in), then land the run again with the `dagq-land` skill: `review ID`, then `integrate ID` on a passing review (the user is asked only on doubt). `integrate` repeats the rebase and reruns the verification commands on the new head; it keeps the run in `needs_session` with a new reason if the receipt does not name the current head, and marks it `failed` on a failed receipt.

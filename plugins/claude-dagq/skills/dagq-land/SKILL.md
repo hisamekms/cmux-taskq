@@ -1,6 +1,6 @@
 ---
 name: dagq-land
-description: Review a dagq run that is awaiting_integration and, once the user approves it, land it on main with integrate, which also pushes main to origin. The review runs in a subagent from the review.md file that review ID writes, so the diff never enters this session. Use when status or watch reports "review and integrate", or when the user asks to review, approve, integrate, land, or push a finished dagq task. Not for fixing a needs_session run (dagq-session) or a stuck integrating lease (dagq-recover).
+description: Review a dagq run that is awaiting_integration and, when the subagent review passes, land it on main with integrate, which also pushes main to origin; the user is asked only on doubt. The review runs in a subagent from the review.md file that review ID writes, so the diff never enters this session. Use when status or watch reports "review and integrate", or when the user asks to review, integrate, land, or push a finished dagq task. Not for fixing a needs_session run (dagq-session) or a stuck integrating lease (dagq-recover).
 ---
 
 # dagq: review a run and land it on main
@@ -17,13 +17,19 @@ It takes the task's run in `awaiting_integration` (or `needs_session` after a se
 
 ## 2. Review in a subagent
 
-Start a subagent (the Agent tool) with `path` and this request: read the file; check the diff against the task's acceptance, the goal's constraints and the receipt's claims (tests, e2e, subagent review); answer with a verdict (`approve` or `changes needed`) and at most a few findings with file and line, never the diff itself. Take only that answer back.
+Start a subagent (the Agent tool) with `path` and this request: read the file; check the diff against the task's acceptance, the goal's constraints and the receipt's claims (tests, e2e, subagent review), and flag changes the task did not ask for; list the titles of the receipt's `follow_ups`; answer with a verdict (`approve` or `changes needed`) and at most a few findings with file and line, never the diff itself. Take only that answer back.
 
 When the repository asks the maintainer to check something beyond the file (for example the receipt's `e2e` evidence and the run's logs for a run that changed the runtime), add it to the same request with the paths from `"$DAGQ" show ID --full` (`run_dir`).
 
-## 3. Report and wait for approval
+## 3. Land on a pass, ask only on doubt
 
-Tell the user, in a few lines: the task and its title, `branch` and `head`, the diffstat numbers, the subagent's verdict and findings, and the titles of the receipt's `follow_ups` if any (they are in review.md; ask the subagent to list them; `integrate` registers them as draft tasks when the run lands). Then wait. **Do not run `integrate` until the user approves this run.** A watch returning, a passing review, or an earlier approval of another run is not approval.
+If the verdict is `approve` and none of these holds, go on to step 4 without waiting:
+
+- the receipt or the diff disagrees with the task's acceptance;
+- the diff has changes the task did not ask for;
+- the subagent returned findings.
+
+If any holds, do not land: tell the user, in a few lines, the task and its title, `branch` and `head`, the diffstat numbers, the verdict and findings, which condition holds, and the titles of the receipt's `follow_ups` if any (`integrate` registers them as draft tasks when the run lands), then wait for their answer. **Do not run `integrate` on a run with doubt until the user approves it.** A watch returning is never a reason to land, and approving one run says nothing about another.
 
 If the user wants changes, the run goes back to a session: see the `dagq-session` skill, or have the user `ready` the task again after editing it.
 
