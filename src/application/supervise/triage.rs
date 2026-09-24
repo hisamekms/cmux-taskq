@@ -352,7 +352,9 @@ impl Supervisor<'_> {
                     self.queue.record_runtime_event(
                         run.id(),
                         "cleanup_failed",
-                        json!({"workspace_id": workspace, "message": message}),
+                        reason_of_error(&error, ReasonCode::Other).on(
+                            json!({"workspace_id": workspace, "message": message, "by": "triage"}),
+                        ),
                     )?;
                 }
             }
@@ -381,6 +383,7 @@ impl Supervisor<'_> {
             run.id(),
             "triage_failed",
             json!({
+                "code": ReasonCode::JobFailed,
                 "attempt": attempt,
                 "error": error,
                 "duration_secs": duration_secs,

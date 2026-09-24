@@ -6,7 +6,7 @@
 
 use serde_json::{Map, Value, json};
 
-use crate::domain::{GoalDetail, OBSERVATION_KIND, RunEvent, TaskDetail};
+use crate::domain::{GoalDetail, OBSERVATION_KIND, RunEvent, TaskDetail, reason};
 
 /// Characters a long text field keeps before `…`.
 pub const TEXT_LIMIT: usize = 300;
@@ -14,8 +14,9 @@ pub const TEXT_LIMIT: usize = 300;
 pub const DEFAULT_EVENTS: usize = 10;
 /// Latest notes (`observation` events) a compact view lists in full.
 pub const DEFAULT_OBSERVATIONS: usize = 5;
-/// Payload keys a compact event keeps: what happened, not where.
-const EVENT_GIST: [&str; 5] = ["status", "reason", "last_error", "from", "to"];
+/// Payload keys a compact event keeps: what happened, not where. `code`
+/// is the reason code (ADR-0034).
+const EVENT_GIST: [&str; 6] = ["status", "reason", "last_error", "from", "to", "code"];
 
 pub use crate::application::health::truncate;
 
@@ -61,9 +62,9 @@ pub fn task_detail(detail: &TaskDetail, events: usize) -> Value {
     truncate_fields(&mut task, &["description", "acceptance", "context"]);
     let latest_run = detail.runs.last();
     let runs: Vec<Value> = latest_run
-        .map(|run| {
+        .map(|latest| {
             let mut run = pick(
-                &object(run),
+                &object(latest),
                 &[
                     "id",
                     "status",
@@ -75,6 +76,9 @@ pub fn task_detail(detail: &TaskDetail, events: usize) -> Value {
                 ],
             );
             truncate_fields(&mut run, &["last_error"]);
+            if let Some(code) = reason::run_error_code(latest, &run_events(detail, latest)) {
+                run.insert("last_error_code".into(), json!(code));
+            }
             Value::Object(run)
         })
         .into_iter()
@@ -98,6 +102,16 @@ pub fn task_detail(detail: &TaskDetail, events: usize) -> Value {
         "observations": observations(&detail.events),
         "processes": processes,
     })
+}
+
+/// The events of `run` among the task's.
+fn run_events(detail: &TaskDetail, run: &crate::domain::TaskRun) -> Vec<RunEvent> {
+    detail
+        .events
+        .iter()
+        .filter(|event| event.run_id.as_ref() == Some(run.id()))
+        .cloned()
+        .collect()
 }
 
 /// The latest [`DEFAULT_OBSERVATIONS`] notes among `events`, oldest first,

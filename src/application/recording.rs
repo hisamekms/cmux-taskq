@@ -7,7 +7,7 @@ use serde_json::{Value, json};
 use std::{path::Path, sync::Arc, time::Duration};
 
 use super::{QueueOpener, SupervisorEnvironment, WorkspaceBackend, WorkspaceTags};
-use crate::domain::{RunId, Task, TaskRun};
+use crate::domain::{Reason, ReasonCode, RunId, Task, TaskRun};
 
 /// `backend_call_failed` keeps this many leading characters of the error.
 pub const BACKEND_ERROR_CHARS: usize = 300;
@@ -16,7 +16,8 @@ pub const BACKEND_ERROR_CHARS: usize = 300;
 /// was for, the backend's per-call timeout), its error cut to
 /// [`BACKEND_ERROR_CHARS`] characters, and the load it failed under — the
 /// 1-minute load average (null when unavailable), the slots held and the
-/// `parallel` offered (null without a supervisor).
+/// `parallel` offered (null without a supervisor). `code` is
+/// `backend_timeout` or `backend_failed` (ADR-0034).
 pub fn backend_failure_payload(
     op: &str,
     workspace_id: Option<&str>,
@@ -27,6 +28,7 @@ pub fn backend_failure_payload(
     parallel: Option<i64>,
 ) -> Value {
     json!({
+        "code": ReasonCode::of_backend_error(error),
         "op": op,
         "workspace_id": workspace_id,
         "timeout_secs": timeout.as_secs(),
@@ -35,6 +37,52 @@ pub fn backend_failure_payload(
         "slots": slots,
         "parallel": parallel,
     })
+}
+
+/// A failed backend call, handed back by [`RecordingBackend`] so that
+/// whoever records the error later can tell a cmux failure from others
+/// ([`reason_of_error`]). It prints exactly as the error it wraps, with or
+/// without `{:#}`, and its sources are that error's.
+#[derive(Debug)]
+pub struct BackendFailure {
+    pub op: String,
+    error: anyhow::Error,
+}
+
+impl BackendFailure {
+    fn wrap(op: &str, error: anyhow::Error) -> anyhow::Error {
+        anyhow::Error::new(Self {
+            op: op.to_owned(),
+            error,
+        })
+    }
+
+    /// `backend_timeout` or `backend_failed`, with the call's `op`.
+    pub fn reason(&self) -> Reason {
+        Reason::new(ReasonCode::of_backend_error(&format!("{:#}", self.error)))
+            .with("op", self.op.as_str())
+    }
+}
+
+impl std::fmt::Display for BackendFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.error, f)
+    }
+}
+
+impl std::error::Error for BackendFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.error.source()
+    }
+}
+
+/// The reason code of an error a run step failed with: that of a failed
+/// cmux call anywhere in its chain, else `fallback`.
+pub fn reason_of_error(error: &anyhow::Error, fallback: ReasonCode) -> Reason {
+    error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<BackendFailure>())
+        .map_or_else(|| Reason::new(fallback), BackendFailure::reason)
 }
 
 /// A [`WorkspaceBackend`] that records every failed or timed-out call as
@@ -80,10 +128,10 @@ impl<'a> RecordingBackend<'a> {
         run_id: Option<&RunId>,
         result: Result<T>,
     ) -> Result<T> {
-        if let Err(error) = &result {
+        result.map_err(|error| {
             let _ = self.record(op, workspace_id, run_id, &format!("{error:#}"));
-        }
-        result
+            BackendFailure::wrap(op, error)
+        })
     }
 
     fn record(
@@ -209,5 +257,53 @@ impl WorkspaceBackend for RecordingBackend<'_> {
     }
     fn resume_timeout(&self) -> Duration {
         self.inner.resume_timeout()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use anyhow::{Context, anyhow};
+
+    #[test]
+    fn a_backend_failure_prints_as_the_error_it_wraps_and_classifies_it() {
+        let inner = || anyhow!("Command timed out").context("cmux capture-pane failed");
+        let wrapped = BackendFailure::wrap("capture", inner());
+        assert_eq!(format!("{wrapped:#}"), format!("{:#}", inner()));
+        assert_eq!(format!("{wrapped}"), format!("{}", inner()));
+        let outer = Err::<(), _>(wrapped)
+            .context("run could not be watched")
+            .unwrap_err();
+        assert_eq!(
+            format!("{outer:#}"),
+            "run could not be watched: cmux capture-pane failed: Command timed out"
+        );
+        let reason = reason_of_error(&outer, ReasonCode::Other);
+        assert_eq!(reason.code, ReasonCode::BackendTimeout);
+        assert_eq!(reason.detail["op"], "capture");
+        let failed = BackendFailure::wrap("close", anyhow!("workspace not found"));
+        assert_eq!(
+            reason_of_error(&failed, ReasonCode::Other).code,
+            ReasonCode::BackendFailed
+        );
+        assert_eq!(
+            reason_of_error(&anyhow!("git failed"), ReasonCode::Other),
+            Reason::new(ReasonCode::Other)
+        );
+    }
+
+    #[test]
+    fn a_backend_failure_payload_carries_its_code() {
+        let payload = backend_failure_payload(
+            "send_exit",
+            Some("ws"),
+            Duration::from_secs(30),
+            "\"cmux\" send did not finish within 30s",
+            None,
+            1,
+            Some(4),
+        );
+        assert_eq!(payload["code"], "backend_timeout");
+        assert_eq!(payload["op"], "send_exit");
     }
 }

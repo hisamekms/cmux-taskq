@@ -230,7 +230,8 @@ impl SessionWatch {
                     Err(error) => sv.queue.record_runtime_event(
                         run.id(),
                         "screen_capture_failed",
-                        json!({"error": format!("{error:#}")}),
+                        reason_of_error(&error, ReasonCode::BackendFailed)
+                            .on(json!({"error": format!("{error:#}")})),
                     )?,
                 }
                 // Nobody needs to send /exit to a session that exited, nor
@@ -298,7 +299,7 @@ impl SessionWatch {
                 sv.queue.record_runtime_event(
                     run.id(),
                     "exit_request_timed_out",
-                    json!({"workspace_id": self.workspace, "timeout_secs": timeout.as_secs()}),
+                    json!({"code": ReasonCode::ExitTimeout, "workspace_id": self.workspace, "timeout_secs": timeout.as_secs()}),
                 )?;
                 warn!(run_id = %run.id(), "session for {} did not exit within {}s of the exit request; keeping the run and asking the inbox to send /exit in workspace {}", run.id(), timeout.as_secs(), self.workspace);
                 self.exit_timed_out = true;
@@ -478,11 +479,11 @@ impl SessionWatch {
                     sv.queue.record_runtime_event(
                         run.id(),
                         "ask_delivery_failed",
-                        json!({
+                        reason_of_error(&error, ReasonCode::BackendFailed).on(json!({
                             "ask_id": ask.id,
                             "workspace_id": self.workspace,
                             "error": format!("{error:#}"),
-                        }),
+                        })),
                     )?;
                     warn!(ask_id = %ask.id, run_id = %run.id(), error = %format_args!("{error:#}"), "answer of ask {} could not be sent to run {} in workspace {}: {error:#}; it is left to the inbox", ask.id, run.id(), self.workspace);
                 }

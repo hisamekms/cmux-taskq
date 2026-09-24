@@ -12,12 +12,12 @@ use tracing::{info, warn};
 
 use super::{
     Clock, IdGenerator, Landing, MainRemote, ProcessControl, Queue, Repository, RunFiles, RunStore,
-    Verifier, path_text, tail,
+    Verifier, path_text, reason_of_error, tail,
 };
 use crate::domain::{
     CommitSha, EvidenceCheck, IntegrationOutcome, MAX_RESUME_ATTEMPTS, NewTask, PUSH_REMOTE,
-    PushReport, PushResult, Receipt, ReceiptResult, RegisteredFollowUp, RunId, RunStatus, Task,
-    TaskId, TaskRun, evidence_missing_reason, heartbeat_stale,
+    PushReport, PushResult, Reason, ReasonCode, Receipt, ReceiptResult, RegisteredFollowUp, RunId,
+    RunStatus, Task, TaskId, TaskRun, evidence_missing_reason, heartbeat_stale,
     scope::{out_of_scope, scope_violation_reason},
 };
 
@@ -25,6 +25,8 @@ use crate::domain::{
 /// verify on the way.
 pub struct Rejection {
     pub reason: String,
+    /// The code of `reason` (ADR-0034).
+    pub code: ReasonCode,
     pub commit: Option<CommitSha>,
     pub receipt: Option<Receipt>,
     /// The task's required checks the receipt does not back, when that is
@@ -45,20 +47,23 @@ pub fn check_receipt(
     task: &Task,
     run: &TaskRun,
 ) -> Result<std::result::Result<(Receipt, CommitSha), Rejection>> {
-    let reject = |reason: String, commit: Option<CommitSha>, receipt: Option<Receipt>| {
-        Ok(Err(Rejection {
-            reason,
-            commit,
-            receipt,
-            evidence_missing: Vec::new(),
-            scope_violation: Vec::new(),
-        }))
-    };
+    let reject =
+        |code: ReasonCode, reason: String, commit: Option<CommitSha>, receipt: Option<Receipt>| {
+            Ok(Err(Rejection {
+                reason,
+                code,
+                commit,
+                receipt,
+                evidence_missing: Vec::new(),
+                scope_violation: Vec::new(),
+            }))
+        };
     let receipt_path = Path::new(run.receipt_path().context("missing receipt path")?);
     let text = match files.read_to_string(receipt_path) {
         Ok(text) => text,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return reject(
+                ReasonCode::ReceiptMissing,
                 format!("receipt was not submitted at {}", receipt_path.display()),
                 None,
                 None,
@@ -68,10 +73,22 @@ pub fn check_receipt(
     };
     let receipt = match Receipt::parse(&text) {
         Ok(receipt) => receipt,
-        Err(error) => return reject(format!("{error:#}"), None, None),
+        Err(error) => {
+            return reject(
+                ReasonCode::of_receipt_error(&error),
+                format!("{error:#}"),
+                None,
+                None,
+            );
+        }
     };
     if let Err(error) = receipt.check_requiring(run.id(), task.required_evidence()) {
-        return reject(format!("{error:#}"), None, Some(receipt));
+        return reject(
+            ReasonCode::of_receipt_error(&error),
+            format!("{error:#}"),
+            None,
+            Some(receipt),
+        );
     }
     // The commit must be the head of the run branch, checked out in the worktree,
     // and new work on top of the base commit.
@@ -82,6 +99,7 @@ pub fn check_receipt(
         Some(current) if current == expected_ref => (),
         current => {
             return reject(
+                ReasonCode::CommitMismatch,
                 format!(
                     "worktree is on {} instead of {expected_ref}",
                     current.as_deref().unwrap_or("a detached HEAD")
@@ -94,6 +112,7 @@ pub fn check_receipt(
     let head = repository.head(worktree)?;
     if head.as_str() != receipt.commit.to_ascii_lowercase() {
         return reject(
+            ReasonCode::CommitMismatch,
             format!(
                 "receipt commit {} is not the head of {branch} ({head})",
                 receipt.commit
@@ -105,6 +124,7 @@ pub fn check_receipt(
     let commit = head;
     if commit == *run.base_commit() {
         return reject(
+            ReasonCode::CommitMismatch,
             format!("no commit was made on top of base {}", run.base_commit()),
             Some(commit),
             Some(receipt),
@@ -112,6 +132,7 @@ pub fn check_receipt(
     }
     if !repository.is_ancestor(run.base_commit().as_str(), commit.as_str())? {
         return reject(
+            ReasonCode::CommitMismatch,
             format!(
                 "commit {commit} does not descend from base {}",
                 run.base_commit()
@@ -123,6 +144,7 @@ pub fn check_receipt(
     let status = repository.status(worktree)?;
     if !status.trim().is_empty() {
         return reject(
+            ReasonCode::WorktreeDirty,
             format!("worktree is not clean:\n{}", status.trim_end()),
             Some(commit),
             Some(receipt),
@@ -147,6 +169,7 @@ pub fn check_receipt(
     if !outside.is_empty() {
         return Ok(Err(Rejection {
             reason: scope_violation_reason(&outside),
+            code: ReasonCode::ScopeViolation,
             commit: Some(commit),
             receipt: Some(receipt),
             evidence_missing: Vec::new(),
@@ -159,6 +182,7 @@ pub fn check_receipt(
     if !missing.is_empty() {
         return Ok(Err(Rejection {
             reason: evidence_missing_reason(&missing),
+            code: ReasonCode::EvidenceMissing,
             commit: Some(commit),
             receipt: Some(receipt),
             evidence_missing: missing,
@@ -327,9 +351,13 @@ pub fn land_integrating(
         Err(error) => {
             // Nothing reached main: give the slot back and keep the run where it was.
             let message = format!("integration stopped before main moved: {error:#}");
-            if let Err(record) =
-                queue.abort_integration(run.id(), token, previous.as_str(), &message)
-            {
+            if let Err(record) = queue.abort_integration(
+                run.id(),
+                token,
+                previous.as_str(),
+                &message,
+                &reason_of_error(&error, ReasonCode::Other),
+            ) {
                 warn!(
                     op = "integrate",
                     error = %format_args!("{record:#}"),
@@ -450,7 +478,7 @@ fn push_main(
         ),
         PushResult::Failed => (
             "push_failed",
-            json!({"remote": report.remote, "commit": commit, "error": report.error}),
+            json!({"code": ReasonCode::PushFailed, "remote": report.remote, "commit": commit, "error": report.error}),
         ),
     };
     match &report.error {
@@ -661,7 +689,12 @@ fn land(
     run: &TaskRun,
     main: &CommitSha,
 ) -> Result<Verdict> {
-    let defer = |reason: String, detail: Value| Ok(Verdict::Deferred { reason, detail });
+    let defer = |code: Reason, reason: String, detail: Value| {
+        Ok(Verdict::Deferred {
+            reason,
+            detail: code.on(detail),
+        })
+    };
     let worktree = Path::new(run.worktree_path().context("missing worktree")?);
     ensure!(
         files.is_dir(worktree),
@@ -680,7 +713,7 @@ fn land(
         queue.record_runtime_event(
             run.id(),
             "integration_rebase_aborted",
-            json!({"reason": "a rebase was left in progress"}),
+            json!({"code": ReasonCode::RebaseInProgress, "reason": "a rebase was left in progress"}),
         )?;
     }
     let expected_ref = format!("refs/heads/{branch}");
@@ -688,6 +721,7 @@ fn land(
         Some(current) if current == expected_ref => (),
         current => {
             return defer(
+                ReasonCode::CommitMismatch.into(),
                 format!(
                     "worktree is on {} instead of {expected_ref}",
                     current.as_deref().unwrap_or("a detached HEAD")
@@ -704,10 +738,17 @@ fn land(
     let receipt = match files.read_to_string(receipt_path) {
         Ok(text) => match Receipt::parse(&text) {
             Ok(receipt) => receipt,
-            Err(error) => return defer(format!("{error:#}"), json!({})),
+            Err(error) => {
+                return defer(
+                    ReasonCode::of_receipt_error(&error).into(),
+                    format!("{error:#}"),
+                    json!({}),
+                );
+            }
         },
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return defer(
+                ReasonCode::ReceiptMissing.into(),
                 format!("receipt is missing at {}", receipt_path.display()),
                 json!({}),
             );
@@ -721,13 +762,18 @@ fn land(
         });
     }
     if let Err(error) = receipt.check_requiring(run.id(), task.required_evidence()) {
-        return defer(format!("{error:#}"), json!({}));
+        return defer(
+            ReasonCode::of_receipt_error(&error).into(),
+            format!("{error:#}"),
+            json!({}),
+        );
     }
     // A resumed session may have come back without the evidence it was
     // asked for; `checks` tells the next resume to ask for it again.
     let missing = receipt.missing_evidence(task.required_evidence());
     if !missing.is_empty() {
         return defer(
+            ReasonCode::EvidenceMissing.into(),
             evidence_missing_reason(&missing),
             json!({"checks": missing}),
         );
@@ -746,6 +792,7 @@ fn land(
     )?;
     if head.as_str() != receipt.commit.to_ascii_lowercase() {
         return defer(
+            ReasonCode::CommitMismatch.into(),
             format!(
                 "receipt commit {} is not the head of {branch} ({head}); rerun the verification commands and rewrite the receipt for the current head",
                 receipt.commit
@@ -756,6 +803,7 @@ fn land(
     let status = repository.status(worktree)?;
     if !status.trim().is_empty() {
         return defer(
+            ReasonCode::WorktreeDirty.into(),
             format!("worktree is not clean:\n{}", status.trim_end()),
             json!({"head": head}),
         );
@@ -767,6 +815,7 @@ fn land(
             repository.rebase_abort(worktree)?;
         }
         return defer(
+            ReasonCode::RebaseConflict.into(),
             format!(
                 "rebase onto main {main} conflicted in {}; resolve it in the worktree (git rebase {main}), rerun the verification commands, and rewrite the receipt with the new head",
                 if conflicts.is_empty() {
@@ -792,6 +841,7 @@ fn land(
     )?;
     if rebased == *main {
         return defer(
+            ReasonCode::RebaseEmpty.into(),
             format!(
                 "no commit remains on top of main {main} after the rebase; if the change is no longer needed, write a failed receipt with the reason"
             ),
@@ -805,6 +855,7 @@ fn land(
     let status = repository.status(worktree)?;
     if !status.trim().is_empty() {
         return defer(
+            ReasonCode::WorktreeDirty.into(),
             format!(
                 "worktree is not clean after the rebase:\n{}",
                 status.trim_end()
@@ -821,6 +872,7 @@ fn land(
     );
     if !outside.is_empty() {
         return defer(
+            ReasonCode::ScopeViolation.into(),
             format!(
                 "{} after the rebase onto main {main}; take them out of the run branch (or ask for the task's --paths to be widened), commit, and rewrite the receipt with the new head",
                 scope_violation_reason(&outside)
@@ -859,6 +911,7 @@ fn land(
         )?;
         if exit_code != 0 {
             return defer(
+                Reason::new(ReasonCode::VerificationFailed).with("index", index + 1),
                 format!(
                     "verification command {command:?} exited with {exit_code} after the rebase onto {main}; see {}",
                     log.display()
@@ -981,7 +1034,7 @@ fn remove_landed_worktree(queue: &mut dyn Queue, repository: &dyn Repository, ru
         Err(error) => {
             let message = format!("landed worktree {worktree} could not be removed: {error:#}");
             warn!(op = "cleanup", run_id = %run.id(), "run {}: {message}", run.id());
-            queue.record_cleanup_failure(run.id(), &message)
+            queue.record_cleanup_failure(run.id(), &message, &ReasonCode::GitFailed.into())
         }
     };
     if let Err(error) = recorded {

@@ -266,6 +266,7 @@ impl Supervisor<'_> {
         let resumes = events.iter().filter(|e| e.kind == "resume_started").count();
         let attempt = requested + 1;
         let mut payload = json!({
+            "code": ReasonCode::RebaseConflict,
             "main": main,
             "head": head,
             // Recorded for the reader; a failure to find it does not stop the request.
@@ -365,7 +366,11 @@ impl Supervisor<'_> {
                             session.workspace
                         );
                         warn!(run_id = %run.id(), "run {}: {message}", run.id());
-                        self.queue.record_cleanup_failure(run.id(), &message)?;
+                        self.queue.record_cleanup_failure(
+                            run.id(),
+                            &message,
+                            &reason_of_error(&error, ReasonCode::BackendFailed),
+                        )?;
                     }
                 }
                 self.queue.run(run.id())
@@ -486,15 +491,23 @@ impl Supervisor<'_> {
                         reasons.join("; ")
                     }
                 );
-                self.queue
-                    .decide_landing(run.id(), RunStatus::NeedsSession, &reason, payload)?;
+                self.queue.decide_landing(
+                    run.id(),
+                    RunStatus::NeedsSession,
+                    &reason,
+                    Reason::new(ReasonCode::SentBack).on(payload),
+                )?;
                 self.queue.close_ask(ask_id)?;
                 info!(run_id = %run.id(), "run {} was sent back by ask {ask_id}; it waits for a resume", run.id());
             }
             _ => {
                 let reason = format!("canceled by ask {ask_id}");
-                self.queue
-                    .decide_landing(run.id(), RunStatus::Failed, &reason, payload)?;
+                self.queue.decide_landing(
+                    run.id(),
+                    RunStatus::Failed,
+                    &reason,
+                    Reason::new(ReasonCode::Cancelled).on(payload),
+                )?;
                 self.queue.transition(run.task_id(), TaskAction::Cancel)?;
                 self.queue.close_ask(ask_id)?;
                 info!(run_id = %run.id(), task_id = %run.task_id(), "run {} failed and task {} was canceled by ask {ask_id}", run.id(), run.task_id());

@@ -23,6 +23,7 @@ pub mod stats;
 pub mod supervise;
 
 pub use ports::*;
+pub use recording::reason_of_error;
 
 use std::time::{SystemTime, UNIX_EPOCH};
 

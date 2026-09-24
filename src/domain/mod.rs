@@ -253,6 +253,7 @@ mod error;
 pub mod goal;
 pub mod ids;
 mod input;
+pub mod reason;
 pub mod run;
 pub mod scope;
 pub mod stats;
@@ -264,6 +265,7 @@ use error::require;
 pub use goal::Goal;
 pub use ids::{CommitSha, GoalId, RunId, TaskId};
 pub use input::{GoalEdit, GoalRecord, NewGoal, NewTask, RunPlan, RunRecord, TaskRecord};
+pub use reason::{Reason, ReasonCode};
 pub use run::TaskRun;
 pub use task::{Task, TaskAction};
 pub use views::{
@@ -925,6 +927,9 @@ pub struct Attention {
     pub status: String,
     pub kind: String,
     pub last_error: Option<String>,
+    /// The code of `last_error` (ADR-0034), when the event that set it has one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error_code: Option<ReasonCode>,
     pub next: AttentionNext,
 }
 
@@ -966,6 +971,7 @@ pub fn supervisor_attention(pulses: &[SupervisorPulse]) -> Vec<Attention> {
         status: status.into(),
         kind: kind.into(),
         last_error: None,
+        last_error_code: None,
         next: AttentionNext::RestartSupervisor,
     };
     if pulses.is_empty() {

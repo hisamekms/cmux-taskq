@@ -56,15 +56,16 @@ use super::{
         review_prompt, revise_mismatch_request, revise_request, siblings_in_progress,
         triage_prompt,
     },
-    recording::RecordingBackend,
+    recording::{RecordingBackend, reason_of_error},
     tail, unix_seconds,
 };
 use crate::domain::{
     AskKind, ClaimOutcome, CommitSha, EvidenceCheck, HEARTBEAT_TIMEOUT_SECS, IntegrationOutcome,
-    LANDING_OPTIONS, MAX_RESUME_ATTEMPTS, MAX_REVISE_ATTEMPTS, NewAsk, Predecessor, Receipt,
-    ReceiptResult, ReviewDecision, ReviewVerdict, RunId, RunLease, RunPaths, RunPlan, RunProcess,
-    RunStatus, SessionRole, TRIAGE_OPTIONS, TRIAGE_RETRY_FAILURES, TaskAction, TaskId, TaskRun,
-    TaskStatus, TriageDecision, TriageState, TriageVerdict, heartbeat_stale, triage_state,
+    LANDING_OPTIONS, MAX_RESUME_ATTEMPTS, MAX_REVISE_ATTEMPTS, NewAsk, Predecessor, Reason,
+    ReasonCode, Receipt, ReceiptResult, ReviewDecision, ReviewVerdict, RunId, RunLease, RunPaths,
+    RunPlan, RunProcess, RunStatus, SessionRole, TRIAGE_OPTIONS, TRIAGE_RETRY_FAILURES, TaskAction,
+    TaskId, TaskRun, TaskStatus, TriageDecision, TriageState, TriageVerdict, heartbeat_stale,
+    triage_state,
 };
 
 mod adopt;
@@ -465,9 +466,11 @@ impl Supervisor<'_> {
                 // leases and the registration; they go stale once this
                 // process is gone.
                 for slot in &self.slots {
-                    let _ = self
-                        .queue
-                        .record_runtime_error(slot.run.id(), &format!("{error:#}"));
+                    let _ = self.queue.record_runtime_error(
+                        slot.run.id(),
+                        &format!("{error:#}"),
+                        &ReasonCode::LeaseLost.into(),
+                    );
                 }
                 return Err(error);
             }
@@ -560,7 +563,11 @@ impl Supervisor<'_> {
                 Err(error) => {
                     let message = format!("run {} provisioning failed: {error:#}", run.id());
                     warn!(run_id = %run.id(), error = %format_args!("{error:#}"), "{message}; no further tasks will be claimed");
-                    self.abandon(&run, message.clone());
+                    self.abandon(
+                        &run,
+                        message.clone(),
+                        &reason_of_error(&error, ReasonCode::Other),
+                    );
                     self.claiming = false;
                     self.provisioning_error = Some(message);
                     break;
@@ -629,7 +636,13 @@ impl Supervisor<'_> {
                         Phase::Resume(watch) => (watch.attempt, Some(watch.workspace.clone())),
                         _ => unreachable!("matched a resume"),
                     };
-                    self.give_up_resume(&slot.run, attempt, workspace.as_deref(), message);
+                    self.give_up_resume(
+                        &slot.run,
+                        attempt,
+                        workspace.as_deref(),
+                        message,
+                        &reason_of_error(&error, ReasonCode::Other),
+                    );
                 }
                 Err(error) => {
                     // Creation/communication failures can be ambiguous: the
@@ -639,7 +652,11 @@ impl Supervisor<'_> {
                     stop_job(&mut slot);
                     let message = format!("{error:#}");
                     warn!(run_id = %slot.run.id(), "run {} retained for inspection: {message}; see show {} and doctor", slot.run.id(), slot.run.task_id());
-                    self.abandon(&slot.run, message);
+                    self.abandon(
+                        &slot.run,
+                        message,
+                        &reason_of_error(&error, ReasonCode::Other),
+                    );
                 }
             }
         }
@@ -753,8 +770,11 @@ impl Supervisor<'_> {
             message,
         });
     }
-    fn abandon(&mut self, run: &TaskRun, message: String) {
-        if let Err(error) = self.queue.abandon_run(run.id(), &self.token, &message) {
+    fn abandon(&mut self, run: &TaskRun, message: String, reason: &Reason) {
+        if let Err(error) = self
+            .queue
+            .abandon_run(run.id(), &self.token, &message, reason)
+        {
             warn!(run_id = %run.id(), error = %format_args!("{error:#}"), "run {}: could not record the error: {error:#}", run.id());
         }
         self.errors.push(RunError {
@@ -777,17 +797,18 @@ impl Supervisor<'_> {
         attempt: usize,
         workspace: Option<&str>,
         message: String,
+        reason: &Reason,
     ) {
         let workspace = workspace.map(str::to_owned);
         // The workspace is recorded so a later pass knows it for this run's
         // own once its session has ended (`close_left_resume_workspaces`).
-        let payload = json!({
+        let payload = reason.on(json!({
             "attempt": attempt,
             "outcome": "error",
             "error": message,
             "workspace_id": workspace,
             "exhausted": attempt >= MAX_RESUME_ATTEMPTS,
-        });
+        }));
         if let Err(error) =
             self.queue
                 .finish_resume(run.id(), &self.token, None, None, false, payload)
@@ -1018,7 +1039,7 @@ impl Supervisor<'_> {
                         slot.run = run;
                         slot.phase = Phase::Validating(Some(handle), Some(session));
                     }
-                    ReviseOutcome::Mismatch(why) => {
+                    ReviseOutcome::Mismatch(code, why) => {
                         let message = revise_mismatch_request(&slot.run, &label, &why)?;
                         // Only what the session writes after this counts.
                         let sent_at = self.files.now();
@@ -1032,7 +1053,7 @@ impl Supervisor<'_> {
                                 self.queue.record_runtime_event(
                                     slot.run.id(),
                                     kind,
-                                    json!({"attempt": watch.attempt, "reason": why}),
+                                    json!({"code": code, "attempt": watch.attempt, "reason": why}),
                                 )?;
                                 info!(run_id = %slot.run.id(), "run {}: {why}; asked the session to fix it ({label})", slot.run.id());
                             }
@@ -1100,6 +1121,7 @@ impl Supervisor<'_> {
                             run.id(),
                             "review_failed",
                             json!({
+                                "code": ReasonCode::JobFailed,
                                 "attempt": attempt,
                                 "error": error,
                                 "duration_secs": duration_secs,
@@ -1168,6 +1190,7 @@ fn spawn_validation(
                 accepted: true,
                 result_commit: Some(commit),
                 reason: None,
+                code: None,
                 receipt: serde_json::to_value(receipt)?,
                 evidence_missing: Vec::new(),
                 scope_violation: Vec::new(),
@@ -1179,6 +1202,7 @@ fn spawn_validation(
                     accepted: false,
                     result_commit: rejection.commit,
                     reason: Some(rejection.reason),
+                    code: Some(rejection.code),
                     receipt: rejection
                         .receipt
                         .map(serde_json::to_value)
@@ -1212,7 +1236,12 @@ fn close_workspace(
         Err(error) => {
             let message = format!("workspace {workspace} could not be closed: {error:#}");
             warn!(run_id = %run.id(), "run {}: {message}", run.id());
-            queue.cleanup_failed(run.id(), token, &message)
+            queue.cleanup_failed(
+                run.id(),
+                token,
+                &message,
+                &reason_of_error(&error, ReasonCode::BackendFailed),
+            )
         }
     }
 }

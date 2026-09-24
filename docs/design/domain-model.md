@@ -18,6 +18,7 @@ related:
   - adr-0023
   - adr-0024
   - adr-0029
+  - adr-0034
   - design-persistence
 ---
 
@@ -25,7 +26,7 @@ related:
 
 ## Implementation status
 
-ステップ2で`Task`、`TaskDependency`、`TaskRun`、`RunEvent`、ステップ3で`RunProcess`と`SupervisorLease`、ステップ4で`Receipt`を実装した。ステップ6（[ADR-0007](../adr/0007-run-level-leases-parallel-execution.md)）で`SupervisorLease`を`RunLease`に置き換え、ステップ7（[ADR-0008](../adr/0008-merge-queue-squash-landing.md)）でrunの`integrating`と`needs_session`、`IntegrationOutcome`の`needs_session` / `failed` / `no_run_awaiting`を加えた。[plan](../plans/current.md#after-first-dogfooding)のステップ9の後に`Goal`と`Task.goal_id` / `Task.context`、receiptの`follow_ups`を加えた（[ADR-0009](../adr/0009-goal-groups-tasks.md)）。goal 12でgoalのdraft状態（`GoalStatus`）と、run_eventsのkind `observation`で表すnote（`NewNote`）を加えた（ADR-0024の決定4、5）。goal 8のtask 73で`Task.required_evidence`（`EvidenceCheck`）と`Receipt::missing_evidence`を加えた（ADR-0019の決定5）。Rustの型と手動遷移規則は`src/domain/`（構成は[集約: TaskとGoal](#集約-taskとgoal)）、ストレージとprovider/workspaceの契約は`src/application.rs`、永続化は`src/infrastructure/sqlite.rs`と`src/infrastructure/runtime_store.rs`にある。`AgentSession`と`Workspace`は独立エンティティにせず、TaskRunの`id`（Claude session ID）と`workspace_id`で表す。
+ステップ2で`Task`、`TaskDependency`、`TaskRun`、`RunEvent`、ステップ3で`RunProcess`と`SupervisorLease`、ステップ4で`Receipt`を実装した。ステップ6（[ADR-0007](../adr/0007-run-level-leases-parallel-execution.md)）で`SupervisorLease`を`RunLease`に置き換え、ステップ7（[ADR-0008](../adr/0008-merge-queue-squash-landing.md)）でrunの`integrating`と`needs_session`、`IntegrationOutcome`の`needs_session` / `failed` / `no_run_awaiting`を加えた。[plan](../plans/current.md#after-first-dogfooding)のステップ9の後に`Goal`と`Task.goal_id` / `Task.context`、receiptの`follow_ups`を加えた（[ADR-0009](../adr/0009-goal-groups-tasks.md)）。goal 12でgoalのdraft状態（`GoalStatus`）と、run_eventsのkind `observation`で表すnote（`NewNote`）を加えた（ADR-0024の決定4、5）。goal 8のtask 73で`Task.required_evidence`（`EvidenceCheck`）と`Receipt::missing_evidence`を加えた（ADR-0019の決定5）。goal 21のtask 195で失敗・保留・中断の理由の分類コード`ReasonCode`（`src/domain/reason.rs`）を加えた（[ADR-0034](../adr/0034-domain-events-carry-reason-codes-actor-and-configuration-changes.md)の決定1。[理由の分類コード](#理由の分類コードcode)）。Rustの型と手動遷移規則は`src/domain/`（構成は[集約: TaskとGoal](#集約-taskとgoal)）、ストレージとprovider/workspaceの契約は`src/application.rs`、永続化は`src/infrastructure/sqlite.rs`と`src/infrastructure/runtime_store.rs`にある。`AgentSession`と`Workspace`は独立エンティティにせず、TaskRunの`id`（Claude session ID）と`workspace_id`で表す。
 
 ## Entities
 
@@ -66,7 +67,7 @@ related:
 - `goal add --draft`はdraftのgoalを作り、`goal ready ID`がdraftを`open`にして`goal_status_changed`（`from: draft`、`to: open`）を記録する。`goal ready`は閉じていないdraftにだけ許す（`domain::goal::ready`）。draftのgoalにも`add --goal`と`set-goal`でtaskを所属させられ、`goal close`もできる（採らない提案は`abandoned`で閉じる）。draftのgoalのtaskは`ready`にしても`candidates`・`graph`の`candidates`・supervisorのclaimに出ない（`READY_QUERY`がgoalの`status = 'draft'`を除く）。`graph`は所属goalのあるtaskに`goal_status`を添える。
 - `note --task ID | --run RUN_ID | --goal ID --text TEXT [--kind SLUG]`はkind `observation`のrun_eventを1件書いて返す。`--task`はtaskのイベント、`--run`はそのrunのtaskとrunのイベント、`--goal`はgoal単位のイベントになる。`notes [--goal ID] [--task ID] [--since CURSOR] [--limit N]`はobservationだけを古い順に返し（`{"notes", "cursor"}`）、`--since`なしは直近`--limit`件（既定20）、`--since`ありはcursorより後の最初の`--limit`件。`--goal`はgoalのnoteに加えて所属taskとそのrunのnoteを、`--task`はtaskとそのrunのnoteを含む。`cursor`は最後のnoteのイベントID（空なら`--since`の値、それも無ければ0）。
 - `DAGQ_ROLE=observer`の環境からは、CLIの入口（`main.rs`の`observer_access`）が許可の一覧にないコマンドを`{"error": "observer may not change queue state"}`で拒否する（ADR-0024の決定4）。許すのは読み取り（`locate` / `list` / `show` / `candidates` / `graph` / `status` / `events` / `watch` / `stats` / `doctor` / `goal list` / `goal show` / `notes`）、`note`、`goal add --draft`、そしてdraftで閉じていないgoalへの`add --goal`（taskはdraftで登録される）だけ。`ready` / `draft` / `cancel` / `integrate` / `recover` / `goal ready` / `goal close` / `goal edit` / 通常の`goal add` / goalなしかopenなgoalへの`add` / `dependency` / `set-goal` / `review` / `init` / `up` / `down`などは拒否する。一覧に載せない限り後から足したコマンドも拒否される。task 99で`ask --kind blocked`（observerが閾値超えをinboxに上げるask。taskにもrunにも紐づかなくてよい唯一のkind）を一覧に足した。ほかのkindの`ask`、`answer`、`ask close`、`observe`、`supervise`は拒否する。判定は`DAGQ_ROLE`の申告に依存する柵で、悪意ある実行は防がない。
-- `show`と`goal show`の既定出力は`src/view.rs`が`TaskDetail` / `GoalDetail`から作る圧縮形で、全文は`--full`（ADR-0016の決定4）。キー名は全文と同じで、省くか切り詰めるだけ。長い文字列（taskの`description`/`acceptance`/`context`、goalの`title`/`description`/`acceptance`/`constraints`、runの`last_error`、eventの要点の値）は300文字で切って`…`を付け、それを持つobjectに`truncated: true`を足す。`show`は最新runの`id`/`status`/`branch`/`result_commit`/`last_error`/`worktree_path`/`workspace_id`だけを`runs`に1件、そのrunの`processes`、直近10件（`--events N`で変更）のイベントを`id`/`kind`/`created_at`、runに属するイベントなら`run_id`、payloadの`status`/`reason`/`last_error`/`from`/`to`だけで返し、pathは出さない。`goal show`はイベントを直近10件の`kind`/`created_at`だけにする。どちらも全件数を`runs_total` / `events_total`で添える。どちらも`observations`に、自分に紐づくnote（`show`はtaskとそのrun、`goal show`はgoal自身）の直近5件を`id`/`created_at`/`run_id`（あれば）/`text`（300文字で切る）/`kind`/`by`で古い順に添える。
+- `show`と`goal show`の既定出力は`src/view.rs`が`TaskDetail` / `GoalDetail`から作る圧縮形で、全文は`--full`（ADR-0016の決定4）。キー名は全文と同じで、省くか切り詰めるだけ。長い文字列（taskの`description`/`acceptance`/`context`、goalの`title`/`description`/`acceptance`/`constraints`、runの`last_error`、eventの要点の値）は300文字で切って`…`を付け、それを持つobjectに`truncated: true`を足す。`show`は最新runの`id`/`status`/`branch`/`result_commit`/`last_error`/`worktree_path`/`workspace_id`と、あれば`last_error_code`（[理由の分類コード](#理由の分類コードcode)）だけを`runs`に1件、そのrunの`processes`、直近10件（`--events N`で変更）のイベントを`id`/`kind`/`created_at`、runに属するイベントなら`run_id`、payloadの`status`/`reason`/`last_error`/`from`/`to`/`code`だけで返し、pathは出さない。`goal show`はイベントを直近10件の`kind`/`created_at`だけにする。どちらも全件数を`runs_total` / `events_total`で添える。どちらも`observations`に、自分に紐づくnote（`show`はtaskとそのrun、`goal show`はgoal自身）の直近5件を`id`/`created_at`/`run_id`（あれば）/`text`（300文字で切る）/`kind`/`by`で古い順に添える。
 - scheduling（`candidates`、`claim`）が見るgoalの性質は、draftのgoalのtaskを除くことだけ。supervisorのclaim順は解放数とIDだけで決まり、goalをまたぐ依存も許す。
 
 ## IDとcommitのnewtype
@@ -234,3 +235,76 @@ domainの関数は業務上の拒否を`DomainError`（`src/domain/error.rs`）�
 | 着地の保留・中断・失敗 | `integrating` → `needs_session` / 元のstatus / `failed` | rebaseの衝突や再検証の失敗の理由（検証コマンドの失敗は`verification command "<cmd>" exited with <code> after the rebase onto <main>; see <run-dir>/integrate-<attempt>-verify-N.log`）、mainを進める前のGit/DB errorは`integration stopped before main moved: <error>`、セッションが書き直した`failed` receiptの理由（[supervisor-lifecycle](supervisor-lifecycle.md#integrate)） | `integration_deferred` / `integration_error` / `integration_failed` |
 
 `last_error`はstatusと最後のイベントに合わせて読む。`failed`なら非0終了・検証拒否・着地時の`failed` receipt、`claimed`/`starting`/`running`/`validating`で`last_error`があればsupervisorが手放したrun（`doctor`にleaseなしで出る）、`awaiting_integration`で`last_error`があればclose失敗（`cleanup_failed`、`workspace_closed_at`はnull）かmainを進める前に止まった着地（`integration_error`）、`needs_session`なら着地の衝突である。`show`・`doctor`・superviseの結果の`errors`に出て、`list`には出ない。`recover`は`last_error`を上書きしない。
+
+### 理由の分類コード（`code`）
+
+[ADR-0034](../adr/0034-domain-events-carry-reason-codes-actor-and-configuration-changes.md)の決定1（task 195）。失敗・保留・中断を記録するイベントは、payloadに`code`（`domain::ReasonCode`、snake_caseの閉じた集合）と、コードごとの構造化した値を持つ。今の`reason` / `message` / `error` / `last_error`の自由文は項目も文言も変えずに残す。コードは「なぜ」で、「どの工程で」はイベントのkindが持つ（同じ`backend_timeout`が`runtime_error`にも`screen_capture_failed`にも付く）。足す値にpath・workspace ID・pidなどマシン依存の値は入れない（[ADR-0032](../adr/0032-classify-records-into-domain-events-diagnostics-coordination-and-bodies.md)。既存の項目の`workspace_id`などはそのまま）。schemaは変えず、`task_runs`に列は足さない。コードが入る前のイベントには`code`が無く、読む側はそれを許す。コードの一覧は`ReasonCode::ALL`と`meaning()`が正で、名前を変えるにはADRが要る。
+
+| code | 意味 | 一緒に入る値 |
+| --- | --- | --- |
+| `session_exit_code` | sessionが自分の非0の終了コード（1–127）で終わった | `exit_code` |
+| `session_killed` | sessionがsignalで終わった（wrapperがsignalのときに報告する128、またはshellの128+N。143はSIGTERM） | `exit_code`、128+Nなら`signal`（N） |
+| `exit_timeout` | `/exit`の後、exit timeout内にsessionが終わらなかった | （`timeout_secs`は既存） |
+| `heartbeat_lost` | wrapperのheartbeatが途絶え、processは生きている | （`heartbeat_age_secs`は既存） |
+| `wrapper_failed` | session wrapperがagentを動かせなかった | |
+| `lease_lost` | supervisorのheartbeatが失敗し、leaseを保てなかった | |
+| `receipt_missing` | receiptが書かれていない | |
+| `receipt_invalid` | receiptが読めない・別のrunのもの・checkの説明が無い・commitの形式やfollow_upsが不正 | |
+| `worker_failed` | receiptがrunを`failed`と報告した | |
+| `evidence_failed` | taskが要求していないcheckをreceiptが`failed`と報告した | |
+| `evidence_missing` | taskが要求するcheckをreceiptが裏付けていない | （`checks` / `evidence_missing`は既存） |
+| `commit_mismatch` | receiptのcommitがrun branchのbaseの上の新しいheadでない（別のbranch、headでない、commitが無い、baseから辿れない） | |
+| `worktree_dirty` | worktreeにcommitされていない変更がある | |
+| `scope_violation` | 差分がtaskの`--paths`の外を変えた | （`paths` / `scope_violation`は既存） |
+| `rebase_conflict` | runがmainと衝突した（着地のrebase、passの後の`git merge-tree`の事前判定） | （`conflicts`は既存） |
+| `rebase_empty` | rebaseの後にmainの上にcommitが残らない | |
+| `rebase_in_progress` | worktreeに途中のrebaseが残っていたので中止した | |
+| `verification_failed` | rebaseの後の検証コマンドが非0で終わった | `index`（1始まり）、（`command` / `exit_code`は既存） |
+| `backend_timeout` | cmuxの呼び出しがtimeoutした（adapterの`did not finish within`、cmuxの`Command timed out`） | `op`（`backend_call_failed`は既存の`op`） |
+| `backend_failed` | cmuxの呼び出しが失敗した | `op` |
+| `job_failed` | headlessのreviewかtriageのjobが失敗した | |
+| `sent_back` | 人がreviewのconcernをsessionに差し戻した | |
+| `cancelled` | 人が着地をcancelした | |
+| `triage_resume` | triage（かその`decide`のaskへの人の回答）がrunをsessionに戻した | |
+| `resume_exhausted` | 最後のresumeの後もsessionが要る | |
+| `orphaned` | runの登録processが死んでいて`recover`された | |
+| `push_failed` | 着地したmainのpushが失敗した | |
+| `git_failed` | runtimeのGitコマンドが失敗した（着地したworktreeの削除） | |
+| `other` | どれにも当たらない。自由文が理由を持つ。増えたらコードを足す | |
+
+経路とコードの対応（`backend_*`は`application::reason_of_error`がerrorの連鎖から`RecordingBackend`の包んだcmuxの失敗（`BackendFailure`）を見つけたときで、`op`を持つ。見つからなければ表のfallback）:
+
+| イベント | 経路 | code |
+| --- | --- | --- |
+| `supervision_finished` | sessionの非0終了（`last_error`は`session exited with code N`） | `session_exit_code` / `session_killed`。0終了とliveの受け渡しは持たない |
+| `validation_finished` | receiptの照合の拒否（`last_error`） | `receipt_missing` / `receipt_invalid` / `worker_failed` / `evidence_failed` / `commit_mismatch` / `worktree_dirty` / `scope_violation` / `evidence_missing`。受理は持たない |
+| `scope_violation` / `evidence_missing` | validationの保留に添えるイベント | `scope_violation` / `evidence_missing`（`validation_finished`と同じコードなので`stats`の`reason_codes`は数えない。`backend_call_failed`も失敗した工程のイベントと重なるので数えない） |
+| `integration_deferred` | 着地の保留（`needs_session`） | `commit_mismatch` / `receipt_missing` / `receipt_invalid` / `worker_failed` / `evidence_failed` / `evidence_missing` / `worktree_dirty` / `rebase_conflict` / `rebase_empty` / `scope_violation` / `verification_failed` |
+| `integration_failed` | 書き直したreceiptが`failed` | `worker_failed` |
+| `integration_error` | mainを進める前のerror（元のstatusに戻す） | `backend_*`、なければ`other` |
+| `integration_rebase_aborted` | 残っていたrebaseの中止 | `rebase_in_progress` |
+| `runtime_error` | supervisorのabandon（provisioning、監視、adoptやresumeの開始の失敗） | `backend_*`、なければ`other` |
+| `runtime_error` | wrapper自身のerror（leaseは残す） | `wrapper_failed` |
+| `runtime_error` | supervisorのheartbeatの失敗（各runに書き、leaseは残す） | `lease_lost` |
+| `run_recovered` | 孤児runの`recover`（supervisorの自動も手動も） | `orphaned` |
+| `resume_finished` | resumeそのもののerror（`outcome: error`、`last_error`は変えない） | `backend_*`、なければ`other` |
+| `resume_finished` | 書き直したreceiptが`failed`（`status: failed`） | `worker_failed`。解消・未解消は持たない |
+| `triage_finished` | triageのverdictが`resume` | `triage_resume` |
+| `triage_finished` | resumeを使い切った（`by: runtime`） | `resume_exhausted` |
+| `triage_decided` | triageの`decide`のaskに`resume`と答えた | `triage_resume`。`retry` / `cancel`は持たない |
+| `landing_decided` | `approve_landing`のaskの`send_back` / `cancel` | `sent_back` / `cancelled` |
+| `cleanup_failed` | workspaceのclose（受理後、resume workspace、triage）の失敗 | `backend_*`（triageは、なければ`other`。triageのものは`by: triage`を持ち`last_error`を変えない） |
+| `cleanup_failed` | 着地したworktreeとbranchの削除の失敗 | `git_failed` |
+| `exit_request_timed_out` | `/exit`の応答なし | `exit_timeout` |
+| `wrapper_heartbeat_expired` | wrapperの沈黙 | `heartbeat_lost` |
+| `screen_capture_failed` | 終了後の画面の取得の失敗 | `backend_*` |
+| `ask_delivery_failed` | workerの質問への回答の送信の失敗 | `backend_*` |
+| `backend_call_failed` | cmuxの呼び出しの失敗 | `backend_timeout` / `backend_failed` |
+| `review_failed` / `triage_failed` | headlessのjobの失敗 | `job_failed` |
+| `conflict_precheck` | passの後の事前判定がmainとの衝突を見つけた | `rebase_conflict` |
+| `revise_receipt_rejected` / `conflict_receipt_rejected` | 生きているsessionが書き直したreceiptが合わない | `commit_mismatch` / `worktree_dirty` / `receipt_invalid` |
+| `push_failed` | pushの失敗 | `push_failed` |
+
+コードを持たないもの: `resume_finished`の`resolved` / `unresolved`（runは`needs_session`のまま前の理由を保つ）、`triage_finished`の`retry` / `ask`、`prompt_waiting`（`answer_prompt`のaskが扱う）、`verification_command`（着地の結果は`integration_deferred`が持つ）。
+
+runの`last_error`のコードは列を持たず、`domain::reason::last_error_code`がrunのイベントから導く: `last_error`を書いたか中断したイベント（`supervision_finished`、`validation_finished`、`integration_deferred` / `integration_failed` / `integration_error`、`runtime_error`、`interrupted`にした`run_recovered`、`landing_decided`、triageのもの（`by: triage`、`last_error`を変えない）を除く`cleanup_failed`、コードを持つ`triage_finished` / `triage_decided`、`status: failed`の`resume_finished`）のうち最新のもののコード。そのイベントがコード以前のものならnull。`domain::reason::run_error_code`は`last_error`のあるrunと`interrupted`のrunにだけそれを返す。`status`（attentionと`runs`）と`show`の`last_error_code`、`stats`の`reason_codes`がこれを読む（[supervisor-lifecycle](supervisor-lifecycle.md#status)）。

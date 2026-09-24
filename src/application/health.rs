@@ -13,9 +13,9 @@ use std::path::Path;
 use super::{AskQuery, Clock, ProcessControl, Queue, RunFiles, TRIAGE_ASKER};
 use crate::domain::{
     ASK_EVENT_KINDS, AskKind, Attention, AttentionNext, HEARTBEAT_TIMEOUT_SECS, LANDING_OPTIONS,
-    RunEvent, RunId, RunLease, RunProcess, RunStatus, SessionRole, SupervisorMode, SupervisorPulse,
-    SupervisorRegistration, TRIAGE_OPTIONS, TaskId, TaskRun, TriageState, event_attention,
-    heartbeat_stale, run_attention, supervisor_attention, triage_state,
+    ReasonCode, RunEvent, RunId, RunLease, RunProcess, RunStatus, SessionRole, SupervisorMode,
+    SupervisorPulse, SupervisorRegistration, TRIAGE_OPTIONS, TaskId, TaskRun, TriageState,
+    event_attention, heartbeat_stale, reason, run_attention, supervisor_attention, triage_state,
 };
 
 /// Health of one run's lease as `status` and `doctor` report it.
@@ -230,16 +230,21 @@ pub fn status(
                 .iter()
                 .find(|l| l.run_id == *run.id())
                 .map(|l| lease_health(l, now, control));
-            json!({
+            let mut entry = json!({
                 "run_id": run.id(),
                 "task_id": run.task_id(),
                 "status": run.status(),
                 "workspace_id": run.workspace_id(),
                 "worktree_path": run.worktree_path(),
                 "lease": lease,
-            })
+            });
+            // Why it waits or failed (ADR-0034), for a run that has an error.
+            if let Some(code) = reason::run_error_code(&run, &queue.run_events(run.id())?) {
+                entry["last_error_code"] = json!(code);
+            }
+            Ok(entry)
         })
-        .collect::<Vec<_>>();
+        .collect::<Result<Vec<_>>>()?;
     let asks = queue
         .asks(AskQuery {
             open: true,
@@ -460,7 +465,7 @@ pub fn truncate_reason(text: &str) -> String {
 }
 
 /// One event as the inbox reads it: the row's ids and kind, and from the
-/// payload only `status`, `exit_code` and a truncated `reason` (from
+/// payload only `status`, `exit_code`, the reason `code` and a truncated `reason` (from
 /// `reason`, `message` or `error`). Paths and receipts are left out.
 /// An attention event also carries its `next`.
 pub fn compact_event(event: &RunEvent) -> Value {
@@ -484,6 +489,9 @@ pub fn compact_event(event: &RunEvent) -> Value {
     }
     if let Some(ask_id) = payload.get("ask_id") {
         object.insert("ask_id".into(), ask_id.clone());
+    }
+    if let Some(code) = payload.get(reason::CODE_KEY) {
+        object.insert(reason::CODE_KEY.into(), code.clone());
     }
     if let Some(reason) = ["reason", "message", "error"]
         .iter()
@@ -580,6 +588,7 @@ pub fn attention(
             status: run.status().as_str().into(),
             kind,
             last_error: run.last_error().map(truncate_reason),
+            last_error_code: reason::run_error_code(&run, &events),
             next,
         });
     }
@@ -605,6 +614,7 @@ pub fn attention(
             ask_id: None,
             status: run.status().as_str().into(),
             kind: "push_failed".into(),
+            last_error_code: error.as_ref().map(|_| ReasonCode::PushFailed),
             last_error: error,
             next,
         });
@@ -696,6 +706,7 @@ pub fn attention(
             status: status.into(),
             kind: kind.into(),
             last_error: None,
+            last_error_code: None,
             next,
         });
     }

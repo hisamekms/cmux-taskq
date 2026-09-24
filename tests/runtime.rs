@@ -6,8 +6,8 @@ use dagq::{
         SupervisorEnvironment, TaskStore, WorkspaceBackend, WorkspaceTags,
     },
     domain::{
-        AskKind, CommitSha, EvidenceCheck, GoalEdit, GoalId, NewAsk, NewGoal, NewTask, RunId,
-        RunStatus, SessionRole, Task, TaskAction, TaskId, TaskRun, TaskStatus,
+        AskKind, CommitSha, EvidenceCheck, GoalEdit, GoalId, NewAsk, NewGoal, NewTask, ReasonCode,
+        RunId, RunStatus, SessionRole, Task, TaskAction, TaskId, TaskRun, TaskStatus,
     },
     infrastructure::{
         adapters::{GitRepository, shell_join, workspace_handle},
@@ -1012,6 +1012,11 @@ fn failing_verification_command_passes_validation_and_needs_a_session_at_integra
         .show(TaskId::new(1))
         .unwrap();
     assert_eq!(detail.runs[0].status(), RunStatus::NeedsSession);
+    // The failure is classified, with the command's index and exit code (ADR-0034).
+    let deferred = payloads(&detail, "integration_deferred");
+    assert_eq!(deferred[0]["code"], "verification_failed");
+    assert_eq!(deferred[0]["index"], 1);
+    assert_eq!(deferred[0]["exit_code"], 1);
     let verifications = integration_verifications(&detail);
     assert_eq!(verifications.len(), 1, "{verifications:?}");
     assert_eq!(verifications[0]["exit_code"], 1);
@@ -1875,7 +1880,7 @@ fn unanswered_exit_request_times_out_and_keeps_the_run() {
         .unwrap();
     assert_eq!(
         timed_out.payload,
-        json!({"workspace_id": WORKSPACE_ID, "timeout_secs": 1})
+        json!({"code": "exit_timeout", "workspace_id": WORKSPACE_ID, "timeout_secs": 1})
     );
     assert_eq!(backend.exits_sent.load(Ordering::SeqCst), 1);
     // One stuck_exit ask by the supervisor, with the screen's last 15 lines.
@@ -2205,6 +2210,10 @@ fn failed_backend_calls_are_recorded_with_the_load_and_counted_by_stats() {
         .find(|e| e.kind == "runtime_error")
         .unwrap();
     assert!(failures[0].id < abandoned.id);
+    // The abandon carries the backend call's code and op (ADR-0034).
+    assert_eq!(failures[0].payload["code"], "backend_failed");
+    assert_eq!(abandoned.payload["code"], "backend_failed");
+    assert_eq!(abandoned.payload["op"], "create");
 
     // close: `cleanup_failed` stays as it was, and the failure is recorded too.
     let (_dir, db, detail) = run_agent_with(VALID_AGENT, true);
@@ -2230,8 +2239,10 @@ fn failed_backend_calls_are_recorded_with_the_load_and_counted_by_stats() {
             .unwrap()
             .keys()
             .collect::<Vec<_>>(),
-        ["message", "workspace_id"]
+        ["code", "message", "op", "workspace_id"]
     );
+    assert_eq!(cleanup.payload["code"], "backend_failed");
+    assert_eq!(cleanup.payload["op"], "close");
     assert!(failures[0].id < cleanup.id);
     let stats = runtime::stats(&db, &Default::default()).unwrap();
     assert_eq!(stats["backend_failures"]["count"], 1, "{stats}");
@@ -2279,6 +2290,24 @@ fn failed_backend_calls_are_recorded_with_the_load_and_counted_by_stats() {
         .find(|e| e.kind == "runtime_error")
         .unwrap();
     assert!(failures[0].id < abandoned.id);
+    // cmux's timeout is told apart from its other failures.
+    assert_eq!(failures[0].payload["code"], "backend_timeout");
+    assert_eq!(abandoned.payload["code"], "backend_timeout");
+    assert_eq!(abandoned.payload["op"], "send_exit");
+    assert!(
+        abandoned.payload["message"]
+            .as_str()
+            .unwrap()
+            .contains("did not finish within 30s"),
+        "{:?}",
+        abandoned.payload
+    );
+    let status = runtime::status(&db).unwrap();
+    assert_eq!(
+        run_attention_of(&status, run.id()).unwrap()["last_error_code"],
+        "backend_timeout",
+        "{status}"
+    );
 
     // A second failure in the same window is an alert.
     backend.exists_fails = true;
@@ -2295,6 +2324,12 @@ fn failed_backend_calls_are_recorded_with_the_load_and_counted_by_stats() {
     let failures = &stats["backend_failures"];
     assert_eq!(failures["count"], 2, "{stats}");
     assert_eq!(failures["by_op"], json!({"exists": 1, "send_exit": 1}));
+    // The codes of the window, per code and per kind.
+    let codes = &stats["reason_codes"];
+    // `backend_call_failed` is `backend_failures`' to count, not again here.
+    assert_eq!(codes["by_code"]["backend_timeout"], 1, "{stats}");
+    assert_eq!(codes["by_kind"]["runtime_error"]["backend_timeout"], 1);
+    assert_eq!(codes["by_kind"].get("backend_call_failed"), None);
     assert_eq!(failures["max_slots"], 1);
     assert!(failures["max_load_avg"].is_f64() || failures["max_load_avg"].is_null());
     assert!(stats["alerts"].as_array().unwrap().contains(&json!({
@@ -2619,6 +2654,7 @@ fn wrapper_registration_is_one_shot_and_rejects_stale_owners() {
         accepted: false,
         result_commit: None,
         reason: Some("receipt was not submitted".into()),
+        code: Some(ReasonCode::ReceiptMissing),
         receipt: Value::Null,
         evidence_missing: Vec::new(),
         scope_violation: Vec::new(),
@@ -2641,7 +2677,11 @@ fn wrapper_registration_is_one_shot_and_rejects_stale_owners() {
     ); // Terminal.
     // A failed run never records a workspace close or cleanup failure.
     assert!(queue.workspace_closed(run.id(), "owner").is_err());
-    assert!(queue.cleanup_failed(run.id(), "owner", "late").is_err());
+    assert!(
+        queue
+            .cleanup_failed(run.id(), "owner", "late", &ReasonCode::BackendFailed.into())
+            .is_err()
+    );
 }
 
 #[test]
@@ -2679,7 +2719,16 @@ fn workspace_close_is_recorded_once_and_only_for_accepted_runs() {
     queue.register_agent(run.id(), 10, 12).unwrap();
     // Still running: neither close nor cleanup failure may be recorded.
     assert!(queue.workspace_closed(run.id(), "owner").is_err());
-    assert!(queue.cleanup_failed(run.id(), "owner", "early").is_err());
+    assert!(
+        queue
+            .cleanup_failed(
+                run.id(),
+                "owner",
+                "early",
+                &ReasonCode::BackendFailed.into()
+            )
+            .is_err()
+    );
     queue.wrapper_exited(run.id(), 10, 0).unwrap();
     queue.finish_supervision(run.id(), "owner").unwrap();
     let accepted = queue
@@ -2690,6 +2739,7 @@ fn workspace_close_is_recorded_once_and_only_for_accepted_runs() {
                 accepted: true,
                 result_commit: Some(sha("89abcdef0123456789abcdef0123456789abcdef")),
                 reason: None,
+                code: None,
                 receipt: Value::Null,
                 evidence_missing: Vec::new(),
                 scope_violation: Vec::new(),
@@ -2701,7 +2751,12 @@ fn workspace_close_is_recorded_once_and_only_for_accepted_runs() {
     assert!(accepted.workspace_closed_at().is_none());
     assert!(queue.workspace_closed(run.id(), "other-owner").is_err());
     let failed = queue
-        .cleanup_failed(run.id(), "owner", "cmux down")
+        .cleanup_failed(
+            run.id(),
+            "owner",
+            "cmux down",
+            &ReasonCode::BackendFailed.into(),
+        )
         .unwrap();
     assert_eq!(failed.status(), RunStatus::AwaitingIntegration);
     assert_eq!(failed.last_error(), Some("cmux down"));
@@ -2711,7 +2766,11 @@ fn workspace_close_is_recorded_once_and_only_for_accepted_runs() {
     assert!(closed.workspace_closed_at().is_some());
     assert_eq!(closed.status(), RunStatus::AwaitingIntegration);
     assert!(queue.workspace_closed(run.id(), "owner").is_err());
-    assert!(queue.cleanup_failed(run.id(), "owner", "late").is_err());
+    assert!(
+        queue
+            .cleanup_failed(run.id(), "owner", "late", &ReasonCode::BackendFailed.into())
+            .is_err()
+    );
     let kinds: Vec<String> = queue
         .show(TaskId::new(1))
         .unwrap()
@@ -3336,7 +3395,9 @@ fn a_failed_push_keeps_the_landing_and_waits_as_attention() {
     let landed = git_out(&repo, &["rev-parse", "main"]);
     assert_eq!(
         events_of(&db, run.id(), "push_failed"),
-        [json!({"remote": "origin", "commit": landed, "error": "rejected: fetch first"})]
+        [
+            json!({"code": "push_failed", "remote": "origin", "commit": landed, "error": "rejected: fetch first"})
+        ]
     );
     let mut queue = SqliteQueue::open(&db).unwrap();
     assert_eq!(
@@ -3352,7 +3413,8 @@ fn a_failed_push_keeps_the_landing_and_waits_as_attention() {
         run_attention_of(&status, run.id()).unwrap(),
         &json!({
             "run_id": run.id(), "task_id": 1, "status": "integrated",
-            "kind": "push_failed", "last_error": "rejected: fetch first", "next": "push main",
+            "kind": "push_failed", "last_error": "rejected: fetch first",
+            "last_error_code": "push_failed", "next": "push main",
         })
     );
     let events = dagq::watch::events(&db, 0, 100, false).unwrap();
@@ -4546,6 +4608,7 @@ fn conflicting_run_needs_a_session_and_lands_after_the_session_resolves_it() {
         .find(|e| e.kind == "integration_deferred")
         .unwrap();
     assert_eq!(deferred.payload["status"], "needs_session");
+    assert_eq!(deferred.payload["code"], "rebase_conflict");
     assert_eq!(deferred.payload["conflicts"], json!(["change.txt"]));
     assert_eq!(deferred.payload["aborted"], true);
     assert!(
@@ -6642,7 +6705,12 @@ fn fresh_leases_dead_wrappers_early_runs_leaseless_and_integrating_runs_are_not_
     // `running` without a lease: abandoned by a runtime error or recovered.
     let leaseless = orphan_run(&repo, &db, "abandoned", spawn(), spawn());
     queue
-        .abandon_run(leaseless.id(), "abandoned", "exit request timed out")
+        .abandon_run(
+            leaseless.id(),
+            "abandoned",
+            "exit request timed out",
+            &ReasonCode::Other.into(),
+        )
         .unwrap();
     assert!(queue.run_lease(leaseless.id()).unwrap().is_none());
     // `claimed` with a stale lease.
@@ -7711,6 +7779,57 @@ fn attention_events_are_read_past_a_cursor_and_wake_watch() {
     assert!(run_attention_of(&runtime::status(&db).unwrap(), run.id()).is_none());
 }
 
+/// A session ended by a signal (exit 143, SIGTERM) is classified as
+/// `session_killed` with its exit code and signal (ADR-0034), and `status`,
+/// `show` and `stats` report the code next to the unchanged free text.
+#[test]
+fn a_session_killed_by_a_signal_is_classified_in_status_show_and_stats() {
+    let (_dir, db, detail) = run_agent("commit work; receipt \"$(git rev-parse HEAD)\"; exit 143");
+    let run = &detail.runs[0];
+    assert_eq!(run.last_error(), Some("session exited with code 143"));
+    let finished = payloads(&detail, "supervision_finished");
+    assert_eq!(
+        finished[0],
+        &json!({"status": "failed", "exit_code": 143, "code": "session_killed", "signal": 15})
+    );
+    let status = runtime::status(&db).unwrap();
+    let failed = run_attention_of(&status, run.id()).unwrap();
+    assert_eq!(failed["last_error"], "session exited with code 143");
+    assert_eq!(failed["last_error_code"], "session_killed");
+    let view = dagq::view::task_detail(&detail, 10);
+    assert_eq!(
+        view["runs"][0]["last_error_code"], "session_killed",
+        "{view}"
+    );
+    assert!(
+        view["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["payload"]["code"] == "session_killed"),
+        "{view}"
+    );
+    let stats = runtime::stats(&db, &Default::default()).unwrap();
+    assert_eq!(
+        stats["reason_codes"]["by_code"]["session_killed"], 1,
+        "{stats}"
+    );
+    assert_eq!(
+        stats["reason_codes"]["by_kind"]["supervision_finished"],
+        json!({"session_killed": 1})
+    );
+    // `watch` / `events` keep the code in their compact form.
+    let events = dagq::watch::events(&db, 0, 1000, true).unwrap();
+    assert!(
+        events["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["kind"] == "supervision_finished" && e["code"] == "session_killed"),
+        "{events}"
+    );
+}
+
 #[test]
 fn status_reports_failed_runs_and_unanswered_exit_requests() {
     let (_dir, db, detail) = run_agent("commit work; receipt \"$(git rev-parse HEAD)\"; exit 7");
@@ -7722,6 +7841,7 @@ fn status_reports_failed_runs_and_unanswered_exit_requests() {
     // (the stub `claude` prints no verdict), which is a person's.
     assert_eq!(failed["kind"], "triage_failed");
     assert_eq!(failed["last_error"], "session exited with code 7");
+    assert_eq!(failed["last_error_code"], "session_exit_code");
     assert_eq!(failed["next"], "triage by hand");
     let events = dagq::watch::events(&db, 0, 100, false).unwrap();
     assert_eq!(events["events"].as_array().unwrap().len(), 1, "{events}");
@@ -7862,7 +7982,7 @@ fn an_abandoned_run_is_recovered_and_triaged_by_the_supervisor() {
     let noted = orphan_run(&repo, &db, "owner", pid, pid);
     let cursor = queue.latest_event_id().unwrap();
     queue
-        .record_runtime_error(noted.id(), "a passing error")
+        .record_runtime_error(noted.id(), "a passing error", &ReasonCode::Other.into())
         .unwrap();
     assert!(run_attention_of(&runtime::status(&db).unwrap(), noted.id()).is_none());
     assert_eq!(
@@ -8346,10 +8466,14 @@ fn missing_required_evidence_parks_the_run_for_a_resumed_session() {
     assert_eq!(validated[0]["accepted"], false);
     assert_eq!(validated[0]["reason"], "evidence missing: e2e");
     assert_eq!(validated[0]["evidence_missing"], json!(["e2e"]));
+    assert_eq!(validated[0]["code"], "evidence_missing");
+    assert_eq!(validated[1].get("code"), None);
     assert!(validated[0]["result_commit"].is_string());
     assert_eq!(
         payloads(&detail, "evidence_missing"),
-        [&json!({"checks": ["e2e"], "reason": "evidence missing: e2e"})]
+        [
+            &json!({"code": "evidence_missing", "checks": ["e2e"], "reason": "evidence missing: e2e"})
+        ]
     );
     // The worker's workspace was closed: the resume opens its own.
     assert!(event_kinds(&detail).contains(&"workspace_closed"));
@@ -8403,7 +8527,9 @@ fn a_required_check_reported_failed_parks_the_run_instead_of_failing_it() {
     assert_eq!(validated[0]["reason"], "evidence missing: e2e");
     assert_eq!(
         payloads(&detail, "evidence_missing"),
-        [&json!({"checks": ["e2e"], "reason": "evidence missing: e2e"})]
+        [
+            &json!({"code": "evidence_missing", "checks": ["e2e"], "reason": "evidence missing: e2e"})
+        ]
     );
     assert_eq!(
         payloads(&detail, "resume_finished")[0]["outcome"],
@@ -8549,7 +8675,9 @@ fn a_change_outside_the_declared_paths_parks_the_run_for_a_resumed_session() {
     assert!(validated[0]["result_commit"].is_string());
     assert_eq!(
         payloads(&detail, "scope_violation"),
-        [&json!({"paths": ["change.txt"], "allowed": ["docs/**", "*.md"], "reason": reason})]
+        [
+            &json!({"code": "scope_violation", "paths": ["change.txt"], "allowed": ["docs/**", "*.md"], "reason": reason})
+        ]
     );
     assert!(!event_kinds(&detail).contains(&"evidence_missing"));
     // The resume asked to take the path out, not for a rebase or evidence.

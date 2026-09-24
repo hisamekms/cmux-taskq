@@ -85,7 +85,13 @@ impl Supervisor<'_> {
                 Err(error) => {
                     let message = format!("run {} could not be resumed: {error:#}", run.id());
                     warn!(run_id = %run.id(), error = %format_args!("{error:#}"), "{}", message);
-                    self.give_up_resume(&run, attempt, None, message);
+                    self.give_up_resume(
+                        &run,
+                        attempt,
+                        None,
+                        message,
+                        &reason_of_error(&error, ReasonCode::Other),
+                    );
                 }
             }
         }
@@ -444,7 +450,7 @@ impl Supervisor<'_> {
                 Some(RunStatus::Failed),
                 Some(&reason),
                 false,
-                payload,
+                Reason::new(ReasonCode::WorkerFailed).on(payload),
             )?,
             ResumeOutcome::Unresolved => {
                 payload["exhausted"] = json!(attempt >= MAX_RESUME_ATTEMPTS);
@@ -669,7 +675,8 @@ impl ResumeWatch {
                 Err(error) => sv.queue.record_runtime_event(
                     run.id(),
                     "screen_capture_failed",
-                    json!({"error": format!("{error:#}")}),
+                    reason_of_error(&error, ReasonCode::BackendFailed)
+                        .on(json!({"error": format!("{error:#}")})),
                 )?,
             }
             let head = sv.repository.head(worktree).ok();

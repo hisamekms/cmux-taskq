@@ -17,8 +17,9 @@ use super::{GraphInput, TaskPage, TaskQuery, timestamp, unix_seconds};
 use crate::domain::{
     Ask, AskKind, AskOutcome, ClaimOutcome, CommitSha, EvidenceCheck, Goal, GoalDetail, GoalEdit,
     GoalId, GoalSummary, GoalVerdict, NewAsk, NewGoal, NewNote, NewTask, NotePage, NoteQuery,
-    Predecessor, RunEvent, RunId, RunLease, RunPlan, RunProcess, RunStatus, SessionRole,
-    SupervisorMode, SupervisorRegistration, Task, TaskAction, TaskDetail, TaskId, TaskRun,
+    Predecessor, Reason, ReasonCode, RunEvent, RunId, RunLease, RunPlan, RunProcess, RunStatus,
+    SessionRole, SupervisorMode, SupervisorRegistration, Task, TaskAction, TaskDetail, TaskId,
+    TaskRun,
 };
 
 pub trait TaskStore {
@@ -573,6 +574,9 @@ pub struct Validation {
     pub accepted: bool,
     pub result_commit: Option<CommitSha>,
     pub reason: Option<String>,
+    /// The code of `reason` (ADR-0034); `None` for an accepted run.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub code: Option<ReasonCode>,
     pub receipt: serde_json::Value,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub evidence_missing: Vec<EvidenceCheck>,
@@ -660,7 +664,13 @@ pub trait RunStore {
     ) -> Result<Option<TaskRun>>;
     fn holds_lease(&self, id: &RunId, token: &str) -> Result<bool>;
     /// Record a runtime error and give the lease up, leaving the status.
-    fn abandon_run(&mut self, id: &RunId, token: &str, message: &str) -> Result<TaskRun>;
+    fn abandon_run(
+        &mut self,
+        id: &RunId,
+        token: &str,
+        message: &str,
+        reason: &Reason,
+    ) -> Result<TaskRun>;
     fn run_leases(&self) -> Result<Vec<RunLease>>;
     fn run_lease(&self, id: &RunId) -> Result<Option<RunLease>>;
     fn active_runs(&self) -> Result<Vec<TaskRun>>;
@@ -718,6 +728,7 @@ pub trait RunStore {
         token: &str,
         revert_to: &str,
         message: &str,
+        reason: &Reason,
     ) -> Result<TaskRun>;
     /// Record the landing: the run is integrated and its task completed.
     fn finish_integration(
@@ -727,9 +738,15 @@ pub trait RunStore {
         landing: &Landing,
         common_dir: &str,
     ) -> Result<(Task, TaskRun)>;
-    fn record_cleanup_failure(&mut self, id: &RunId, message: &str) -> Result<()>;
+    fn record_cleanup_failure(&mut self, id: &RunId, message: &str, reason: &Reason) -> Result<()>;
     fn workspace_closed(&mut self, id: &RunId, token: &str) -> Result<TaskRun>;
-    fn cleanup_failed(&mut self, id: &RunId, token: &str, message: &str) -> Result<TaskRun>;
+    fn cleanup_failed(
+        &mut self,
+        id: &RunId,
+        token: &str,
+        message: &str,
+        reason: &Reason,
+    ) -> Result<TaskRun>;
     /// Git common directory the queue is bound to, if any.
     fn repository_binding(&self) -> Result<Option<String>>;
     fn bind_repository(&mut self, common_dir: &str) -> Result<()>;
@@ -748,7 +765,7 @@ pub trait RunStore {
     /// The processes registered for the run (its wrapper and agent).
     fn processes(&self, id: &RunId) -> Result<Vec<RunProcess>>;
     /// Record a runtime error on the run without changing its status.
-    fn record_runtime_error(&mut self, id: &RunId, message: &str) -> Result<()>;
+    fn record_runtime_error(&mut self, id: &RunId, message: &str, reason: &Reason) -> Result<()>;
     /// Save the paths a claimed run is provisioned at.
     fn plan_run(&mut self, id: &RunId, token: &str, plan: &RunPlan) -> Result<()>;
     fn workspace_created(&mut self, id: &RunId, token: &str, workspace: &str) -> Result<()>;

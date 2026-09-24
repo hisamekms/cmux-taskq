@@ -83,7 +83,8 @@ impl ExitWatch {
                     Err(error) => sv.queue.record_runtime_event(
                         run.id(),
                         "screen_capture_failed",
-                        json!({"error": format!("{error:#}")}),
+                        reason_of_error(&error, ReasonCode::BackendFailed)
+                            .on(json!({"error": format!("{error:#}")})),
                     )?,
                 }
             }
@@ -140,7 +141,7 @@ impl ExitWatch {
                 sv.queue.record_runtime_event(
                     run.id(),
                     "exit_request_timed_out",
-                    json!({"workspace_id": session.workspace, "timeout_secs": timeout.as_secs()}),
+                    json!({"code": ReasonCode::ExitTimeout, "workspace_id": session.workspace, "timeout_secs": timeout.as_secs()}),
                 )?;
                 warn!(run_id = %run.id(), "session for {} did not exit within {}s of the exit request; keeping the run and asking the inbox to send /exit in workspace {}", run.id(), timeout.as_secs(), session.workspace);
                 self.timed_out = true;
@@ -256,7 +257,7 @@ pub(super) fn wrapper_pulse(
         sv.queue.record_runtime_event(
             run.id(),
             "wrapper_heartbeat_expired",
-            json!({"pid": wrapper.pid, "heartbeat_age_secs": age, "workspace_id": workspace}),
+            json!({"code": ReasonCode::HeartbeatLost, "pid": wrapper.pid, "heartbeat_age_secs": age, "workspace_id": workspace}),
         )?;
         info!(run_id = %run.id(), "wrapper of {} (pid {}) stopped heartbeating {age}s ago but its process is alive; asking its session in workspace {workspace} to exit", run.id(), wrapper.pid);
         *noted = true;

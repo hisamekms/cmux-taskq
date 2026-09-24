@@ -14,7 +14,7 @@ use std::{
 };
 
 use super::{AgentProvider, Queue, RunFiles, Spawner, Streams};
-use crate::domain::{RunId, TaskRun};
+use crate::domain::{ReasonCode, RunId, TaskRun};
 
 /// How long the wrapper waits for the supervisor to record the workspace
 /// cmux started it in.
@@ -77,7 +77,11 @@ pub fn run_session(ctx: Session<'_>, id: &RunId, token: &str, resume: bool) -> R
             Ok(json!({"run_id": id, "exit_code": code}))
         }
         Err(error) => {
-            let _ = queue.record_runtime_error(id, &format!("{error:#}"));
+            let _ = queue.record_runtime_error(
+                id,
+                &format!("{error:#}"),
+                &ReasonCode::WrapperFailed.into(),
+            );
             if !child_may_be_alive {
                 let _ = queue.wrapper_exited(id, pid, 127);
             }

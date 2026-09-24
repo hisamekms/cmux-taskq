@@ -16,9 +16,9 @@ use super::{
 };
 use crate::application::{AskStore, Generators, RunStore, timestamp, unix_seconds};
 use crate::domain::{
-    ClaimOutcome, CommitSha, DomainError, GoalId, RunEvent, RunId, RunLease, RunPaths, RunProcess,
-    RunStatus, SessionRole, SupervisorMode, SupervisorRegistration, Task, TaskAction, TaskId,
-    TaskRun, run,
+    ClaimOutcome, CommitSha, DomainError, GoalId, Reason, ReasonCode, RunEvent, RunId, RunLease,
+    RunPaths, RunProcess, RunStatus, SessionRole, SupervisorMode, SupervisorRegistration, Task,
+    TaskAction, TaskId, TaskRun, run,
 };
 
 pub use crate::application::{
@@ -400,7 +400,13 @@ impl SqliteQueue {
     /// `recover` judge the run by its registered processes alone while this
     /// supervisor keeps serving other runs; a wrapper that has not registered
     /// yet can no longer do so.
-    pub fn abandon_run(&mut self, id: &RunId, token: &str, message: &str) -> Result<TaskRun> {
+    pub fn abandon_run(
+        &mut self,
+        id: &RunId,
+        token: &str,
+        message: &str,
+        reason: &Reason,
+    ) -> Result<TaskRun> {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -420,7 +426,7 @@ impl SqliteQueue {
             &tx,
             id,
             "runtime_error",
-            json!({"message": message, "lease_released": released == 1}),
+            reason.on(json!({"message": message, "lease_released": released == 1})),
         )?;
         tx.commit()?;
         Ok(run.relocated(&self.runs_dir))
@@ -701,7 +707,12 @@ impl SqliteQueue {
         Ok((slots, parallel))
     }
 
-    pub fn record_runtime_error(&mut self, id: &RunId, message: &str) -> Result<()> {
+    pub fn record_runtime_error(
+        &mut self,
+        id: &RunId,
+        message: &str,
+        reason: &Reason,
+    ) -> Result<()> {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -713,7 +724,12 @@ impl SqliteQueue {
             || "run does not exist".to_owned(),
             |run| run::abandon(run, message.to_owned()),
         )?;
-        run_event(&tx, id, "runtime_error", json!({"message": message}))?;
+        run_event(
+            &tx,
+            id,
+            "runtime_error",
+            reason.on(json!({"message": message})),
+        )?;
         tx.commit()?;
         Ok(())
     }
@@ -895,6 +911,7 @@ impl SqliteQueue {
         report["previous_status"] = json!(previous);
         report["status"] = json!(run.status());
         report["lease_deleted"] = json!(leases_deleted == 1);
+        Reason::new(ReasonCode::Orphaned).apply_to(&mut report);
         run_event(&tx, id, "run_recovered", report)?;
         // The task stays in_progress; a retry is an explicit `ready` and a new run.
         tx.commit()?;
@@ -926,12 +943,11 @@ impl SqliteQueue {
             || "run is not owned by this supervisor".to_owned(),
             |run| run::finish_session(run, Some(code)),
         )?;
-        run_event(
-            &tx,
-            id,
-            "supervision_finished",
-            json!({"status": run.status(), "exit_code": code}),
-        )?;
+        let mut payload = json!({"status": run.status(), "exit_code": code});
+        if code != 0 {
+            Reason::of_exit_code(code).apply_to(&mut payload);
+        }
+        run_event(&tx, id, "supervision_finished", payload)?;
         // Completion and dependency release belong to the next validation stage.
         tx.commit()?;
         Ok(run.relocated(&self.runs_dir))
@@ -1063,6 +1079,7 @@ impl SqliteQueue {
                 id,
                 "scope_violation",
                 json!({
+                    "code": ReasonCode::ScopeViolation,
                     "paths": validation.scope_violation,
                     "allowed": validation.allowed_paths,
                     "reason": validation.reason,
@@ -1073,7 +1090,11 @@ impl SqliteQueue {
                 &tx,
                 id,
                 "evidence_missing",
-                json!({"checks": validation.evidence_missing, "reason": validation.reason}),
+                json!({
+                    "code": ReasonCode::EvidenceMissing,
+                    "checks": validation.evidence_missing,
+                    "reason": validation.reason,
+                }),
             )?;
         }
         // Task completion still waits for integration into main.
@@ -1481,7 +1502,7 @@ impl SqliteQueue {
             |run| run::fail_integration(run, reason.to_owned()),
             reason,
             "integration_failed",
-            json!({"receipt": receipt}),
+            json!({"code": ReasonCode::WorkerFailed, "receipt": receipt}),
         )
     }
 
@@ -1493,6 +1514,7 @@ impl SqliteQueue {
         token: &str,
         revert_to: &str,
         message: &str,
+        reason: &Reason,
     ) -> Result<TaskRun> {
         let revert_to: RunStatus = revert_to.parse()?;
         self.leave_integration(
@@ -1501,7 +1523,7 @@ impl SqliteQueue {
             |run| run::abort_integration(run, revert_to, message.to_owned()),
             message,
             "integration_error",
-            json!({}),
+            reason.on(json!({})),
         )
     }
 
@@ -1595,7 +1617,12 @@ impl SqliteQueue {
 
     /// Note a post-landing cleanup failure (worktree or branch removal) on a
     /// run whose status no longer changes.
-    pub fn record_cleanup_failure(&mut self, id: &RunId, message: &str) -> Result<()> {
+    pub fn record_cleanup_failure(
+        &mut self,
+        id: &RunId,
+        message: &str,
+        reason: &Reason,
+    ) -> Result<()> {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -1607,7 +1634,12 @@ impl SqliteQueue {
             || "run does not exist".to_owned(),
             |run| run::record_cleanup_failure(run, message.to_owned()),
         )?;
-        run_event(&tx, id, "cleanup_failed", json!({"message": message}))?;
+        run_event(
+            &tx,
+            id,
+            "cleanup_failed",
+            reason.on(json!({"message": message})),
+        )?;
         tx.commit()?;
         Ok(())
     }
@@ -1643,7 +1675,13 @@ impl SqliteQueue {
 
     /// A failed close leaves `workspace_closed_at` null so the workspace is never
     /// treated as cleaned; the run status does not change.
-    pub fn cleanup_failed(&mut self, id: &RunId, token: &str, message: &str) -> Result<TaskRun> {
+    pub fn cleanup_failed(
+        &mut self,
+        id: &RunId,
+        token: &str,
+        message: &str,
+        reason: &Reason,
+    ) -> Result<TaskRun> {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -1661,7 +1699,7 @@ impl SqliteQueue {
             &tx,
             id,
             "cleanup_failed",
-            json!({"workspace_id": result.workspace_id(), "message": message}),
+            reason.on(json!({"workspace_id": result.workspace_id(), "message": message})),
         )?;
         tx.commit()?;
         Ok(result)
@@ -1790,6 +1828,7 @@ impl SqliteQueue {
                     |run| run::resume_after_triage(run, instruction.clone()),
                 )?;
                 payload["instruction"] = json!(instruction);
+                payload["code"] = json!(ReasonCode::TriageResume);
             }
             TriageAction::Ask { ask_id } => payload["ask_id"] = json!(ask_id),
         }
@@ -1862,6 +1901,7 @@ impl SqliteQueue {
             id,
             "triage_finished",
             json!({
+                "code": ReasonCode::ResumeExhausted,
                 "by": "runtime",
                 "verdict": "ask",
                 "action": "ask",
@@ -1995,12 +2035,11 @@ impl SqliteQueue {
             [id],
             run_row(&self.runs_dir),
         )?;
-        run_event(
-            &tx,
-            id,
-            "triage_decided",
-            json!({"ask_id": ask_id, "answer": answer, "reason": reason, "status": result.status().as_str()}),
-        )?;
+        let mut payload = json!({"ask_id": ask_id, "answer": answer, "reason": reason, "status": result.status().as_str()});
+        if answer == "resume" {
+            payload["code"] = json!(ReasonCode::TriageResume);
+        }
+        run_event(&tx, id, "triage_decided", payload)?;
         tx.commit()?;
         Ok(result)
     }
@@ -2333,8 +2372,14 @@ impl RunStore for SqliteQueue {
     fn holds_lease(&self, id: &RunId, token: &str) -> Result<bool> {
         SqliteQueue::holds_lease(self, id, token)
     }
-    fn abandon_run(&mut self, id: &RunId, token: &str, message: &str) -> Result<TaskRun> {
-        SqliteQueue::abandon_run(self, id, token, message)
+    fn abandon_run(
+        &mut self,
+        id: &RunId,
+        token: &str,
+        message: &str,
+        reason: &Reason,
+    ) -> Result<TaskRun> {
+        SqliteQueue::abandon_run(self, id, token, message, reason)
     }
     fn run_leases(&self) -> Result<Vec<RunLease>> {
         SqliteQueue::run_leases(self)
@@ -2415,8 +2460,9 @@ impl RunStore for SqliteQueue {
         token: &str,
         revert_to: &str,
         message: &str,
+        reason: &Reason,
     ) -> Result<TaskRun> {
-        SqliteQueue::abort_integration(self, id, token, revert_to, message)
+        SqliteQueue::abort_integration(self, id, token, revert_to, message, reason)
     }
     fn finish_integration(
         &mut self,
@@ -2427,14 +2473,20 @@ impl RunStore for SqliteQueue {
     ) -> Result<(Task, TaskRun)> {
         SqliteQueue::finish_integration(self, id, token, landing, common_dir)
     }
-    fn record_cleanup_failure(&mut self, id: &RunId, message: &str) -> Result<()> {
-        SqliteQueue::record_cleanup_failure(self, id, message)
+    fn record_cleanup_failure(&mut self, id: &RunId, message: &str, reason: &Reason) -> Result<()> {
+        SqliteQueue::record_cleanup_failure(self, id, message, reason)
     }
     fn workspace_closed(&mut self, id: &RunId, token: &str) -> Result<TaskRun> {
         SqliteQueue::workspace_closed(self, id, token)
     }
-    fn cleanup_failed(&mut self, id: &RunId, token: &str, message: &str) -> Result<TaskRun> {
-        SqliteQueue::cleanup_failed(self, id, token, message)
+    fn cleanup_failed(
+        &mut self,
+        id: &RunId,
+        token: &str,
+        message: &str,
+        reason: &Reason,
+    ) -> Result<TaskRun> {
+        SqliteQueue::cleanup_failed(self, id, token, message, reason)
     }
     fn repository_binding(&self) -> Result<Option<String>> {
         SqliteQueue::repository_binding(self)
@@ -2459,8 +2511,8 @@ impl RunStore for SqliteQueue {
     fn processes(&self, id: &RunId) -> Result<Vec<RunProcess>> {
         SqliteQueue::processes(self, id)
     }
-    fn record_runtime_error(&mut self, id: &RunId, message: &str) -> Result<()> {
-        SqliteQueue::record_runtime_error(self, id, message)
+    fn record_runtime_error(&mut self, id: &RunId, message: &str, reason: &Reason) -> Result<()> {
+        SqliteQueue::record_runtime_error(self, id, message, reason)
     }
     fn plan_run(&mut self, id: &RunId, token: &str, plan: &crate::domain::RunPlan) -> Result<()> {
         SqliteQueue::plan_run(self, id, token, plan)

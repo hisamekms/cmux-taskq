@@ -8,7 +8,10 @@ use std::collections::{BTreeMap, HashMap};
 use serde::Serialize;
 use serde_json::Value;
 
-use super::{GoalId, RunEvent, RunId, TaskId};
+use super::{
+    GoalId, RunEvent, RunId, TaskId,
+    reason::{REPEATED_CODE_KINDS, event_code},
+};
 
 /// Runs returned without `--full`.
 pub const DEFAULT_RUNS: usize = 50;
@@ -120,6 +123,19 @@ pub struct BackendFailures {
     pub max_slots: Option<i64>,
 }
 
+/// The events in the window that carry a reason code (ADR-0034): how often
+/// each code was recorded, and in which kinds of event. An event whose code
+/// repeats that of the `validation_finished` recorded with it
+/// (`evidence_missing`, `scope_violation`) is not counted again.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct ReasonCodes {
+    pub count: i64,
+    /// Events per code.
+    pub by_code: BTreeMap<String, i64>,
+    /// Events per kind, then per code.
+    pub by_kind: BTreeMap<String, BTreeMap<String, i64>>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Stats {
     /// Finished runs, oldest finish first.
@@ -133,6 +149,8 @@ pub struct Stats {
     /// them with `--full` or when no run is returned. With `--goal`, only
     /// the failures of that goal's runs.
     pub backend_failures: BackendFailures,
+    /// The reason codes recorded in the same window as `backend_failures`.
+    pub reason_codes: ReasonCodes,
     /// Pass it to `--since` to read only runs that finish later.
     pub next_cursor: i64,
 }
@@ -297,9 +315,9 @@ pub fn stats(
             .min()
             .map_or(0, |id| id - 1),
     };
-    let backend_failures = backend_failures(events, window_start, next_cursor, |task_id| {
-        query.goal_id.is_none() || task_id.is_some_and(in_goal)
-    });
+    let counts = |task_id: Option<TaskId>| query.goal_id.is_none() || task_id.is_some_and(in_goal);
+    let backend_failures = backend_failures(events, window_start, next_cursor, counts);
+    let reason_codes = reason_codes(events, window_start, next_cursor, counts);
     if backend_failures.count >= BACKEND_FAILURES {
         alerts.push(Alert {
             kind: "backend_failures",
@@ -325,8 +343,39 @@ pub fn stats(
         overall,
         alerts,
         backend_failures,
+        reason_codes,
         next_cursor,
     }
+}
+
+/// Count the reason codes of the events with `after < id <= upto` whose
+/// task `counts` accepts.
+fn reason_codes(
+    events: &[RunEvent],
+    after: i64,
+    upto: i64,
+    counts: impl Fn(Option<TaskId>) -> bool,
+) -> ReasonCodes {
+    let mut codes = ReasonCodes::default();
+    for event in events.iter().filter(|event| {
+        event.id > after
+            && event.id <= upto
+            && !REPEATED_CODE_KINDS.contains(&event.kind.as_str())
+            && counts(event.task_id)
+    }) {
+        let Some(code) = event_code(event) else {
+            continue;
+        };
+        codes.count += 1;
+        *codes.by_code.entry(code.as_str().to_owned()).or_default() += 1;
+        *codes
+            .by_kind
+            .entry(event.kind.clone())
+            .or_default()
+            .entry(code.as_str().to_owned())
+            .or_default() += 1;
+    }
+    codes
 }
 
 /// Aggregate the `backend_call_failed` events with `after < id <= upto`
@@ -584,4 +633,87 @@ pub fn timestamp_millis(text: &str) -> Option<i64> {
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
     let days = era * 146_097 + doe - 719_468;
     Some(((days * 24 + hour) * 60 + minute) * 60_000 + second * 1000 + millis)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn event(id: i64, task_id: i64, kind: &str, payload: Value) -> RunEvent {
+        RunEvent {
+            id,
+            task_id: Some(TaskId::new(task_id)),
+            goal_id: None,
+            run_id: None,
+            kind: kind.to_owned(),
+            payload,
+            created_at: String::new(),
+        }
+    }
+
+    #[test]
+    fn reason_codes_are_counted_once_per_park_within_the_window() {
+        let events = [
+            event(
+                1,
+                1,
+                "supervision_finished",
+                json!({"code": "session_killed"}),
+            ),
+            event(
+                2,
+                1,
+                "validation_finished",
+                json!({"code": "evidence_missing"}),
+            ),
+            event(
+                3,
+                1,
+                "evidence_missing",
+                json!({"code": "evidence_missing"}),
+            ),
+            event(
+                4,
+                2,
+                "integration_deferred",
+                json!({"code": "rebase_conflict"}),
+            ),
+            event(
+                5,
+                1,
+                "runtime_error",
+                json!({"message": "before the codes"}),
+            ),
+            event(
+                6,
+                1,
+                "supervision_finished",
+                json!({"code": "session_killed"}),
+            ),
+            event(
+                7,
+                1,
+                "backend_call_failed",
+                json!({"code": "backend_failed"}),
+            ),
+        ];
+        let codes = reason_codes(&events, 0, 5, |_| true);
+        assert_eq!(codes.count, 3);
+        assert_eq!(
+            codes.by_code,
+            BTreeMap::from([
+                ("evidence_missing".to_owned(), 1),
+                ("rebase_conflict".to_owned(), 1),
+                ("session_killed".to_owned(), 1),
+            ])
+        );
+        assert_eq!(
+            codes.by_kind["integration_deferred"],
+            BTreeMap::from([("rebase_conflict".to_owned(), 1)])
+        );
+        assert_eq!(reason_codes(&events, 5, 7, |_| true).count, 1);
+        let task_two = reason_codes(&events, 0, 6, |task| task == Some(TaskId::new(2)));
+        assert_eq!(task_two.count, 1);
+    }
 }

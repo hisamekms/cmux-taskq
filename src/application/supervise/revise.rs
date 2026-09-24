@@ -63,7 +63,7 @@ pub(super) enum ReviseOutcome {
     /// not name the clean worktree HEAD (an old commit, a commit after the
     /// receipt, uncommitted changes) or cannot be read: validation would
     /// fail the run and its work, so the session is asked to fix it.
-    Mismatch(String),
+    Mismatch(ReasonCode, String),
     /// The session will not rewrite it: why.
     Ended(String),
 }
@@ -126,17 +126,22 @@ impl ReviseWatch {
                     ReviseOutcome::Rewritten(head)
                 }
                 Ok(receipt) if receipt.commit.to_ascii_lowercase() != head.as_str() => {
-                    ReviseOutcome::Mismatch(format!(
-                        "the rewritten receipt names commit {} but the worktree HEAD is {head}",
-                        receipt.commit
-                    ))
+                    ReviseOutcome::Mismatch(
+                        ReasonCode::CommitMismatch,
+                        format!(
+                            "the rewritten receipt names commit {} but the worktree HEAD is {head}",
+                            receipt.commit
+                        ),
+                    )
                 }
-                Ok(_) => ReviseOutcome::Mismatch(format!(
-                    "the worktree has uncommitted changes on top of HEAD {head}"
-                )),
-                Err(error) => {
-                    ReviseOutcome::Mismatch(format!("the rewritten receipt is invalid: {error:#}"))
-                }
+                Ok(_) => ReviseOutcome::Mismatch(
+                    ReasonCode::WorktreeDirty,
+                    format!("the worktree has uncommitted changes on top of HEAD {head}"),
+                ),
+                Err(error) => ReviseOutcome::Mismatch(
+                    ReasonCode::ReceiptInvalid,
+                    format!("the rewritten receipt is invalid: {error:#}"),
+                ),
             }));
         }
         if !rewritten && idle.is_some_and(|idle| idle.idle_since(self.sent_at)) {

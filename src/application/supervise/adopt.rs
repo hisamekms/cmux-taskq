@@ -72,7 +72,7 @@ impl Supervisor<'_> {
                     // other runtime error so `recover` can judge the run.
                     let message = format!("run {} could not be resumed: {error:#}", run.id());
                     warn!(run_id = %run.id(), error = %format_args!("{error:#}"), "{}", message);
-                    self.abandon(&run, message);
+                    self.abandon(&run, message, &reason_of_error(&error, ReasonCode::Other));
                 }
             }
         }
