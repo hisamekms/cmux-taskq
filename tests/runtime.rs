@@ -12,7 +12,7 @@ use dagq::{
     infrastructure::{
         adapters::{GitRepository, shell_join, workspace_handle},
         asks::AskQuery,
-        clock::SystemClock,
+        clock::{self, SystemClock},
         location::QueueLocation,
         run_files::LocalRunFiles,
         sqlite::SqliteQueue,
@@ -665,12 +665,33 @@ fn claude_stub(db: &Path) -> PathBuf {
 /// second's pause.
 const TEST_TICK: Duration = Duration::from_millis(50);
 
-/// Supervisor options with the test tick.
+/// Supervisor options with the test tick and the [`SteadyClock`].
 fn supervise_options(parallel: usize, once: bool) -> SuperviseOptions {
     SuperviseOptions {
         tick: TEST_TICK,
         idle_poll: TEST_TICK,
+        generators: Generators {
+            clock: Arc::new(SteadyClock(SystemTime::now(), Instant::now())),
+            ..clock::system()
+        },
         ..SuperviseOptions::new(parallel, once)
+    }
+}
+
+/// The clock of one supervisor in these tests: the wall clock when its
+/// options were made, advanced by the monotonic clock. The supervisor's
+/// heartbeat thread waits its 2 seconds on the monotonic clock, which stops
+/// while the host sleeps (`CLOCK_UPTIME_RAW` on macOS), while the wall
+/// clock jumps by the time asleep; a jump past `HEARTBEAT_TIMEOUT_SECS`
+/// made the loop's next lease-checked write fail with "run lease is missing
+/// or stale" before the heartbeat caught up. This clock does not jump, and
+/// agrees with the wall clock again for the next supervisor, so the times
+/// a test writes with `unixepoch()` before it supervises still hold.
+struct SteadyClock(SystemTime, Instant);
+
+impl Clock for SteadyClock {
+    fn system_time(&self) -> SystemTime {
+        self.0 + self.1.elapsed()
     }
 }
 
