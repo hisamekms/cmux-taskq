@@ -3,7 +3,7 @@
 
 use std::{
     fs,
-    io::{self, Read, Write},
+    io::{self, BufWriter, Read, Write},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::SystemTime,
@@ -58,8 +58,62 @@ impl RunFiles for LocalRunFiles {
     fn exists(&self, path: &Path) -> bool {
         path.exists()
     }
+    fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
+        fs::rename(from, to)
+    }
+    fn remove_file(&self, path: &Path) -> io::Result<()> {
+        fs::remove_file(path)
+    }
+    fn append_line(&self, path: &Path, line: &str) -> io::Result<()> {
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)?;
+        writeln!(file, "{line}")
+    }
+    fn canonicalize(&self, path: &Path) -> io::Result<PathBuf> {
+        path.canonicalize()
+    }
+    fn write_fenced(&self, path: &Path, text: &str, info: &str, body: &Path) -> Result<()> {
+        let (longest, last) = backtick_run_and_last_byte(body)?;
+        let fence = "`".repeat(longest.max(2) + 1);
+        let mut out = BufWriter::new(
+            fs::File::create(path).with_context(|| format!("create {}", path.display()))?,
+        );
+        writeln!(out, "{text}{fence}{info}")?;
+        io::copy(
+            &mut fs::File::open(body).with_context(|| format!("open {}", body.display()))?,
+            &mut out,
+        )?;
+        if last.is_some_and(|byte| byte != b'\n') {
+            out.write_all(b"\n")?;
+        }
+        writeln!(out, "{fence}")?;
+        out.into_inner()
+            .map_err(|error| error.into_error())?
+            .sync_all()
+            .with_context(|| format!("write {}", path.display()))
+    }
     fn now(&self) -> SystemTime {
         SystemTime::now()
+    }
+}
+
+/// The longest run of backticks in the file and its last byte, read in chunks.
+fn backtick_run_and_last_byte(path: &Path) -> Result<(usize, Option<u8>)> {
+    let mut file = fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
+    let mut buffer = [0u8; 64 * 1024];
+    let (mut longest, mut run, mut last) = (0, 0, None);
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            return Ok((longest, last));
+        }
+        for &byte in &buffer[..read] {
+            run = if byte == b'`' { run + 1 } else { 0 };
+            longest = longest.max(run);
+        }
+        last = Some(buffer[read - 1]);
     }
 }
 

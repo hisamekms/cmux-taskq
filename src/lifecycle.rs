@@ -24,6 +24,7 @@ use crate::{
     application::{
         AgentProvider, DetachedRefusal, LaunchAgent, ProcessControl, SupervisorEnvironment,
         WorkspaceBackend, WorkspaceTags,
+        prompt::{inbox_prompt, planner_prompt},
     },
     domain::{RunStatus, SessionRole, SupervisorMode, SupervisorRegistration},
     infrastructure::{
@@ -37,7 +38,7 @@ use crate::{
         runtime_store::HEARTBEAT_TIMEOUT_SECS,
         sqlite::SqliteQueue,
     },
-    runtime::{RecordingBackend, inbox_prompt, planner_prompt},
+    runtime::RecordingBackend,
 };
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Value, json};

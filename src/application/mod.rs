@@ -1,7 +1,10 @@
 //! Use cases and the ports they reach the outside through (ADR-0013):
 //! `ports` holds the traits the infrastructure implements, `integrate` the
-//! landing of a validated run and `prompt` the worker's prompt. The query
-//! types and the dependency view of `list` and `graph` stay here.
+//! landing of a validated run, `prompt` the worker's prompt and the
+//! initial prompts of the inbox and the planner, `review` the review
+//! material of a run, `rebind` the binding to a moved repository and
+//! `stats` the reads behind the run and goal times. The query types and
+//! the dependency view of `list` and `graph` stay here.
 
 pub mod ask;
 pub mod health;
@@ -9,8 +12,11 @@ pub mod integrate;
 pub mod naming;
 mod ports;
 pub mod prompt;
+pub mod rebind;
 pub mod recording;
+pub mod review;
 pub mod session;
+pub mod stats;
 pub mod supervise;
 
 pub use ports::*;

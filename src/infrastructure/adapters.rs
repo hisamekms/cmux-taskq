@@ -329,13 +329,7 @@ fn object_id(text: &str, field: &'static str) -> Result<CommitSha> {
     Ok(CommitSha::parse(text.trim(), field)?)
 }
 
-/// The size of a diff, as `git diff --numstat` counts it.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
-pub struct DiffNumbers {
-    pub files_changed: u64,
-    pub insertions: u64,
-    pub deletions: u64,
-}
+pub use crate::application::DiffNumbers;
 
 #[derive(Clone)]
 pub struct GitRepository {
@@ -865,6 +859,19 @@ impl Repository for GitRepository {
     }
     fn main_checkout(&self) -> Result<Option<PathBuf>> {
         GitRepository::main_checkout(self)
+    }
+    fn log_oneline(&self, base: &str, head: &str) -> Result<String> {
+        GitRepository::log_oneline(self, base, head)
+    }
+    fn diff_stat(&self, base: &str, head: &str) -> Result<String> {
+        GitRepository::diff_stat(self, base, head)
+    }
+    fn diff_numbers(&self, base: &str, head: &str) -> Result<DiffNumbers> {
+        GitRepository::diff_numbers(self, base, head)
+    }
+    fn diff_to_file(&self, base: &str, head: &str, path: &Path) -> Result<()> {
+        let file = fs::File::create(path).with_context(|| format!("create {}", path.display()))?;
+        GitRepository::diff_to(self, base, head, &file)
     }
     fn create_worktree(&self, run: &TaskRun) -> Result<String> {
         GitRepository::create_worktree(self, run)

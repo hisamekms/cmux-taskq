@@ -2255,6 +2255,18 @@ impl RunStore for SqliteQueue {
     fn active_runs(&self) -> Result<Vec<TaskRun>> {
         SqliteQueue::active_runs(self)
     }
+    fn all_runs(&self) -> Result<Vec<TaskRun>> {
+        SqliteQueue::all_runs(self)
+    }
+    fn all_events(&self) -> Result<Vec<RunEvent>> {
+        SqliteQueue::all_events(self)
+    }
+    fn task_goals(&self) -> Result<HashMap<TaskId, Option<GoalId>>> {
+        SqliteQueue::task_goals(self)
+    }
+    fn rebind_repository(&mut self, common_dir: &str) -> Result<Option<String>> {
+        SqliteQueue::rebind_repository(self, common_dir)
+    }
     fn recover_run(
         &mut self,
         id: &RunId,

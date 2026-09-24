@@ -5,6 +5,7 @@
 use anyhow::Result;
 use serde::Serialize;
 use std::{
+    collections::HashMap,
     ffi::{OsStr, OsString},
     fmt, io,
     path::{Path, PathBuf},
@@ -187,9 +188,10 @@ pub trait Spawner: Send + Sync {
     fn spawn(&self, command: &CommandSpec, streams: Streams<'_>) -> Result<Box<dyn Spawned>>;
 }
 
-/// The files of the runs (the run directory, its prompt, the receipt and
-/// the idle marker) as the supervisor and the session wrapper read and
-/// write them. Errors are the operating system's, unchanged.
+/// The files of the runs (the run directory, its prompt, the receipt, the
+/// idle marker and `review.md`) and of the queue directory (`rebind`'s log
+/// and `repository` file) as the use cases read and write them. Errors are
+/// the operating system's, unchanged.
 pub trait RunFiles: Send + Sync {
     /// Create `dir` and every missing parent.
     fn create_dir_all(&self, dir: &Path) -> io::Result<()>;
@@ -207,6 +209,18 @@ pub trait RunFiles: Send + Sync {
     fn is_file(&self, path: &Path) -> bool;
     fn is_dir(&self, path: &Path) -> bool;
     fn exists(&self, path: &Path) -> bool;
+    fn rename(&self, from: &Path, to: &Path) -> io::Result<()>;
+    fn remove_file(&self, path: &Path) -> io::Result<()>;
+    /// Append `line` and a newline to `path`, creating it if missing.
+    fn append_line(&self, path: &Path, line: &str) -> io::Result<()>;
+    /// The absolute path with every link resolved; an error when it does
+    /// not exist.
+    fn canonicalize(&self, path: &Path) -> io::Result<PathBuf>;
+    /// Write `text`, then the bytes of the file `body` as a block fenced
+    /// with one backtick more than its longest backtick run (three at
+    /// least) and labelled `info`, to a new file at `path`, and sync it.
+    /// `body` is read in chunks, never whole.
+    fn write_fenced(&self, path: &Path, text: &str, info: &str, body: &Path) -> Result<()>;
     /// The wall clock that stamps the files: a time compared with a
     /// file's modification time is read here, not from the [`Clock`].
     fn now(&self) -> SystemTime;
@@ -621,6 +635,15 @@ pub trait RunStore {
     fn run_leases(&self) -> Result<Vec<RunLease>>;
     fn run_lease(&self, id: &RunId) -> Result<Option<RunLease>>;
     fn active_runs(&self) -> Result<Vec<TaskRun>>;
+    /// Every run of the queue, oldest first.
+    fn all_runs(&self) -> Result<Vec<TaskRun>>;
+    /// Every run event, oldest first, for `stats`.
+    fn all_events(&self) -> Result<Vec<RunEvent>>;
+    /// The goal of every task, for `stats`.
+    fn task_goals(&self) -> Result<HashMap<TaskId, Option<GoalId>>>;
+    /// Point the queue at `common_dir` whatever it was bound to, and return
+    /// the previous binding (`rebind`, ADR-0020).
+    fn rebind_repository(&mut self, common_dir: &str) -> Result<Option<String>>;
     /// Recover an orphaned run whose `checked_processes` registered
     /// processes the caller found dead.
     fn recover_run(
@@ -865,6 +888,23 @@ pub trait Repository {
     /// The tasks landed between two commits, oldest first, from their
     /// `Dagq-Task` trailers.
     fn landed_task_ids(&self, base: &str, head: &str) -> Result<Vec<TaskId>>;
+    /// `git log --oneline <base>..<head>`.
+    fn log_oneline(&self, base: &str, head: &str) -> Result<String>;
+    /// `git diff --stat <base>...<head>`.
+    fn diff_stat(&self, base: &str, head: &str) -> Result<String>;
+    /// The size of the diff `<base>...<head>`.
+    fn diff_numbers(&self, base: &str, head: &str) -> Result<DiffNumbers>;
+    /// Write the full diff `<base>...<head>` to a new file at `path`, as
+    /// Git's raw bytes and never through memory.
+    fn diff_to_file(&self, base: &str, head: &str, path: &Path) -> Result<()>;
+}
+
+/// The size of a diff, as `git diff --numstat` counts it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct DiffNumbers {
+    pub files_changed: u64,
+    pub insertions: u64,
+    pub deletions: u64,
 }
 
 /// Runs a task's verification commands for `integrate` (ADR-0023

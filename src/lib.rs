@@ -1,4 +1,5 @@
 pub mod application;
+pub mod compose;
 pub mod domain;
 pub mod infrastructure;
 pub mod lifecycle;

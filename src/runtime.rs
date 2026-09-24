@@ -2,9 +2,10 @@
 //! the repository, builds the adapters of the ports and calls the use case
 //! in `application` (ADR-0013). `supervise` and `session` are
 //! [`crate::application::supervise`] and [`crate::application::session`];
-//! `integrate` is [`crate::application::integrate`]. `review`, `status`,
-//! `doctor`, `recover`, `rebind`, `ask` and `stats` still work on the
-//! queue here.
+//! `integrate` is [`crate::application::integrate`]; `review`, `rebind`
+//! and `stats` are built in [`crate::compose`] and re-exported here, and
+//! the inbox and planner prompts are [`crate::application::prompt`].
+//! `status`, `doctor`, `recover` and `ask` still work on the queue here.
 pub use crate::application::recording::{
     BACKEND_ERROR_CHARS, RecordingBackend, backend_failure_payload,
 };
@@ -14,22 +15,27 @@ pub use crate::application::{
         IntegrateTarget, integrate_logs, integrate_verify_log, next_integrate_attempt,
         register_follow_ups,
     },
-    prompt::{PredecessorSummary, STOP_BACKGROUND, WORKER_READING, prompt, siblings_in_progress},
+    prompt::{
+        PredecessorSummary, STOP_BACKGROUND, WORKER_READING, inbox_prompt, planner_prompt, prompt,
+        siblings_in_progress,
+    },
+    rebind::REBIND_LOG,
+    review::review_logs_hint,
     supervise::{PromptKind, RunError, TRIAGE_TOOLS, detect_prompt, review_prompt},
 };
+pub use crate::compose::{rebind, review, stats};
 pub use crate::infrastructure::run_files::SupervisorLog;
 use crate::{
     application::{
-        AgentProvider, Generators, MainRemote, NoteLog, TaskStore, WorkspaceBackend, fenced,
+        AgentProvider, Generators, MainRemote, NoteLog, WorkspaceBackend,
         health::run_health,
         integrate::{self as integration, Integration},
-        or_none,
         session::{self as wrapper, Session},
         supervise::{self as supervisor, Heartbeat, Layout, LoopSettings, Ports},
     },
     domain::{
-        Goal, IntegrationOutcome, Receipt, RunId, RunLease, RunStatus, SessionRole, SupervisorMode,
-        SupervisorRegistration, Task, TaskDetail, TaskId, TaskRun, heartbeat_stale,
+        IntegrationOutcome, RunId, RunLease, RunStatus, SessionRole, SupervisorMode,
+        SupervisorRegistration, TaskDetail, TaskId, TaskRun, heartbeat_stale,
     },
     infrastructure::{
         adapters::{
@@ -45,12 +51,11 @@ use crate::{
     },
     lifecycle::{QUEUE_ENV, REVIEWER_ROLE, ROLE_ENV, session_env},
 };
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, ensure};
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::{
-    fs,
-    io::{self, BufWriter, IsTerminal, Read, Write},
+    io::IsTerminal,
     path::{Path, PathBuf},
     sync::{Arc, atomic::AtomicBool},
     time::Duration,
@@ -289,281 +294,6 @@ pub fn integrate(
     Ok(serde_json::to_value(outcome)?)
 }
 
-/// Write the review material of the task's run that awaits integration or a
-/// session to `<run_dir>/review.md` (temporary file, then rename) and report
-/// where it is with the size of the diff (ADR-0016, decision 7). The file holds the
-/// task, its goal, the receipt, the commits, the diffstat and the full diff
-/// `<base>...<head>`, `base` being the run's base commit and `head` the
-/// receipt's commit. When a session already rebased `head` onto the current
-/// `main`, `base` is that `main` instead, so the review does not repeat
-/// what other tasks landed meanwhile. The diff itself is never returned, so the caller
-/// hands the path to a subagent instead of reading it.
-pub fn review(db: &Path, task_id: TaskId) -> Result<Value> {
-    let mut queue = SqliteQueue::open(db)?;
-    let detail = queue.show(task_id)?;
-    let run = detail
-        .runs
-        .iter()
-        .find(|r| {
-            matches!(
-                r.status(),
-                RunStatus::AwaitingIntegration | RunStatus::NeedsSession
-            )
-        })
-        .cloned()
-        .with_context(|| {
-            format!(
-                "task {task_id} ({}) has no run awaiting integration or a session",
-                detail.task.status().as_str()
-            )
-        })?;
-    let task = detail.task;
-    let goal = match task.goal_id() {
-        Some(goal_id) => Some(queue.show_goal(goal_id)?.goal),
-        None => None,
-    };
-    let run_dir = Path::new(run.run_dir().context("missing run directory")?);
-    let receipt_path = Path::new(run.receipt_path().context("missing receipt path")?);
-    let receipt = Receipt::parse(
-        &fs::read_to_string(receipt_path)
-            .with_context(|| format!("read receipt {}", receipt_path.display()))?,
-    )?;
-    let checkout = run
-        .repo_path()
-        .or(run.worktree_path())
-        .context("run has no repository path")?;
-    let repository = GitRepository::inspect(Path::new(checkout))?;
-    let head = receipt.commit.to_ascii_lowercase();
-    let main = repository.main_head()?;
-    let base = if main != *run.base_commit() && repository.is_ancestor(main.as_str(), &head)? {
-        main.into_string()
-    } else {
-        run.base_commit().to_string()
-    };
-    let log = repository.log_oneline(&base, &head)?;
-    let stat = repository.diff_stat(&base, &head)?;
-    let numbers = repository.diff_numbers(&base, &head)?;
-    let text = review_markdown(
-        &task,
-        &run,
-        goal.as_ref(),
-        &receipt,
-        &base,
-        &head,
-        &log,
-        &stat,
-    );
-    let path = run_dir.join("review.md");
-    let temporary = run_dir.join(format!(".review.md.{}.tmp", std::process::id()));
-    let diff = run_dir.join(format!(".review.md.{}.diff.tmp", std::process::id()));
-    let written =
-        write_review(&repository, &base, &head, &text, &diff, &temporary).and_then(|()| {
-            fs::rename(&temporary, &path).with_context(|| format!("write {}", path.display()))
-        });
-    let _ = fs::remove_file(&diff);
-    if let Err(error) = written {
-        let _ = fs::remove_file(&temporary);
-        return Err(error);
-    }
-    Ok(json!({
-        "run_id": run.id(),
-        "task_id": task.id(),
-        "path": path_text(&path)?,
-        "base": base,
-        "head": head,
-        "files_changed": numbers.files_changed,
-        "insertions": numbers.insertions,
-        "deletions": numbers.deletions,
-    }))
-}
-
-/// Write `text` and then the full diff `<base>...<head>` as a fenced block to
-/// `temporary`. Git streams the diff to the file `diff` first, as raw bytes
-/// and never through memory, because the fence must be longer than any
-/// backtick run in it; the file is then copied under the fence.
-fn write_review(
-    repository: &GitRepository,
-    base: &str,
-    head: &str,
-    text: &str,
-    diff: &Path,
-    temporary: &Path,
-) -> Result<()> {
-    let file = fs::File::create(diff).with_context(|| format!("create {}", diff.display()))?;
-    repository.diff_to(base, head, &file)?;
-    drop(file);
-    let (longest, last) = backtick_run_and_last_byte(diff)?;
-    let fence = "`".repeat(longest.max(2) + 1);
-    let mut out = BufWriter::new(
-        fs::File::create(temporary).with_context(|| format!("create {}", temporary.display()))?,
-    );
-    writeln!(out, "{text}{fence}diff")?;
-    io::copy(
-        &mut fs::File::open(diff).with_context(|| format!("open {}", diff.display()))?,
-        &mut out,
-    )?;
-    if last.is_some_and(|byte| byte != b'\n') {
-        out.write_all(b"\n")?;
-    }
-    writeln!(out, "{fence}")?;
-    out.into_inner()
-        .map_err(|error| error.into_error())?
-        .sync_all()
-        .with_context(|| format!("write {}", temporary.display()))
-}
-
-/// The longest run of backticks in the file and its last byte, read in chunks.
-fn backtick_run_and_last_byte(path: &Path) -> Result<(usize, Option<u8>)> {
-    let mut file = fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
-    let mut buffer = [0u8; 64 * 1024];
-    let (mut longest, mut run, mut last) = (0, 0, None);
-    loop {
-        let read = file.read(&mut buffer)?;
-        if read == 0 {
-            return Ok((longest, last));
-        }
-        for &byte in &buffer[..read] {
-            run = if byte == b'`' { run + 1 } else { 0 };
-            longest = longest.max(run);
-        }
-        last = Some(buffer[read - 1]);
-    }
-}
-
-/// A fenced block whose fence is longer than any backtick run in `text`,
-/// so a diff of Markdown cannot close it early.
-/// Where review.md says the verification logs are: integrate writes
-/// `integrate-<attempt>-verify-N.log` per attempt, and the latest attempt's
-/// logs are named when one ran.
-pub fn review_logs_hint(run_dir: Option<&str>) -> String {
-    let Some(run_dir) = run_dir else {
-        return "(no run directory)".to_owned();
-    };
-    let pattern = format!(
-        "{run_dir}/integrate-<attempt>-verify-N.log (one set per integrate attempt, written when integrate runs the verification commands after its rebase)"
-    );
-    let (latest, _) = integrate_logs(Path::new(run_dir));
-    if latest.is_empty() {
-        return format!("{pattern}; none yet");
-    }
-    let latest: Vec<String> = latest.iter().map(|p| p.display().to_string()).collect();
-    format!("{pattern}; latest attempt: {}", latest.join(", "))
-}
-
-#[allow(clippy::too_many_arguments)]
-fn review_markdown(
-    task: &Task,
-    run: &TaskRun,
-    goal: Option<&Goal>,
-    receipt: &Receipt,
-    base: &str,
-    head: &str,
-    log: &str,
-    stat: &str,
-) -> String {
-    let mut out = format!(
-        "# Review of task {id}: {title}\n\n\
-         - run: {run_id} ({status})\n\
-         - base: {base} (run base {run_base})\n\
-         - head: {head}\n\
-         - branch: {branch}\n\
-         - worktree: {worktree}\n\
-         - verification logs: {logs}\n\n\
-         ## Task\n\n\
-         ### Description\n\n{description}\n\n\
-         ### Acceptance\n\n{acceptance}\n\n\
-         ### Verification commands\n\n{verify}\n",
-        id = task.id(),
-        title = task.title(),
-        run_id = run.id(),
-        status = run.status().as_str(),
-        run_base = run.base_commit(),
-        branch = run.branch().unwrap_or("(none)"),
-        worktree = run.worktree_path().unwrap_or("(none)"),
-        logs = review_logs_hint(run.run_dir()),
-        description = or_none(task.description()),
-        acceptance = or_none(task.acceptance()),
-        verify = fenced("sh", &task.verification_commands().join("\n")),
-    );
-    if let Some(goal) = goal {
-        out.push_str(&format!(
-            "\n## Goal {id}: {title}\n\n\
-             ### Goal acceptance\n\n{acceptance}\n\n\
-             ### Goal constraints\n\n{constraints}\n",
-            id = goal.id(),
-            title = goal.title(),
-            acceptance = or_none(goal.acceptance()),
-            constraints = or_none(goal.constraints()),
-        ));
-    }
-    out.push_str(&format!(
-        "\n## Receipt\n\n### Summary\n\n{summary}\n",
-        summary = or_none(&receipt.summary)
-    ));
-    for (name, check) in [
-        ("Tests", &receipt.tests),
-        ("E2E", &receipt.e2e),
-        ("Subagent review", &receipt.subagent_review),
-    ] {
-        out.push_str(&format!(
-            "\n### {name}: {status}\n\n{evidence}\n",
-            status = check.status.as_str(),
-            evidence = or_none(&check.evidence_or_reason),
-        ));
-    }
-    let follow_ups = match &receipt.follow_ups {
-        Some(Value::Array(items)) if !items.is_empty() => items
-            .iter()
-            .map(|item| {
-                format!(
-                    "- {}: {}",
-                    item["title"].as_str().unwrap_or("(untitled)"),
-                    item["description"].as_str().unwrap_or("")
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("\n"),
-        _ => "(none)".to_owned(),
-    };
-    out.push_str(&format!("\n### Follow-ups\n\n{follow_ups}\n"));
-    out.push_str(&format!(
-        "\n## Commits\n\n`git log --oneline {base}..{head}`\n\n{log}\n\
-         ## Diffstat\n\n`git diff --stat {base}...{head}`\n\n{stat}\n\
-         ## Diff\n\n`git diff {base}...{head}`\n\n",
-        log = fenced("", log),
-        stat = fenced("", stat),
-    ));
-    out
-}
-
-/// The initial prompt of the inbox session that `up` opens in the
-/// `[<repo>]inbox` workspace (ADR-0022): it relays each open ask to a person
-/// and writes the person's answer back, deciding nothing itself. Every
-/// other attention is the inbox's too (ADR-0024 decision 6): it reports it
-/// and does only what the person says.
-pub fn inbox_prompt(db: &Path) -> Result<String> {
-    Ok(format!(
-        "You are the inbox of the dagq queue at {db}: you relay its asks and attention to a person and never decide anything yourself.\n\
-         Start with `dagq status --role inbox` and follow the dagq-inbox skill of the dagq plugin: run `dagq watch --role inbox --after <cursor>` in the background, wake when it returns and watch again from the cursor it returns.\n\
-         On ask_opened, read the ask with `dagq asks --open --role inbox`, show the person its question and options (use AskUserQuestion when it is available), then write the person's answer with `dagq answer ID --text '<answer>'`. Report any other attention (an answered ask, a stopped supervisor, a failed review or triage) to the person and do only what they say, as the skill describes.\n\
-         Never open the queue database directly; use the dagq CLI only.\n",
-        db = path_text(db)?,
-    ))
-}
-
-/// The initial prompt of the planner session that `up` opens in the
-/// `[<repo>]planner` workspace (ADR-0022): it turns a person's problems into
-/// goals and tasks and closes a goal once its tasks meet the acceptance.
-pub fn planner_prompt(db: &Path) -> Result<String> {
-    Ok(format!(
-        "You are the planner of the dagq queue at {db}: listen to the person's problems and turn them into goals and tasks.\n\
-         Follow the dagq-planner skill of the dagq plugin: register them as its dagq skill describes and make the tasks ready. You do not land runs or answer asks.\n\
-         When every task of a goal is completed, check their receipts against the goal's acceptance and close the goal (`dagq goal close ID --verdict achieved`).\n\
-         Never open the queue database directly; use the dagq CLI only.\n",
-        db = path_text(db)?,
-    ))
-}
-
 /// A process that owns runs, as `status` and `doctor` report it: a resident
 /// `supervise` through its registration (`registered`, with `parallel` and
 /// `started_at`), or an `integrate` process through the lease it holds
@@ -705,54 +435,6 @@ pub fn status_for(db: &Path, role: Option<crate::domain::SessionRole>) -> Result
     }))
 }
 
-/// `stats` (ADR-0023 decision 5): per-run and per-goal times and the
-/// thresholds crossed, derived from `run_events` by
-/// [`crate::domain::stats::stats`]. The idle alert looks at the live
-/// supervisors' slots now. Reads only.
-pub fn stats(db: &Path, query: &crate::domain::stats::StatsQuery) -> Result<Value> {
-    use crate::domain::stats::{SlotSnapshot, stats};
-    let queue = SqliteQueue::open(db)?;
-    let now = queue.generators().clock.now();
-    let events = queue.all_events()?;
-    let goals = queue.task_goals()?;
-    let registrations = queue.supervisors()?;
-    let slots: i64 = crate::watch::pulses(&registrations, now)
-        .iter()
-        .zip(&registrations)
-        .filter(|(pulse, _)| !pulse.stale)
-        .map(|(_, registration)| i64::from(registration.parallel))
-        .sum();
-    let executing = queue
-        .active_runs()?
-        .iter()
-        .filter(|run| run.status() != RunStatus::Integrating)
-        .count();
-    let ready = queue
-        .list(&crate::application::TaskQuery {
-            status: crate::application::StatusFilter::Only(vec![crate::domain::TaskStatus::Ready]),
-            limit: 1,
-            ..Default::default()
-        })?
-        .total;
-    // A draft goal's ready tasks wait for `goal ready`, not for a
-    // predecessor, so they do not make free slots an alert.
-    let ready_in_draft_goals: usize = queue
-        .list_goals()?
-        .iter()
-        .filter(|goal| goal.status == crate::domain::GoalStatus::Draft)
-        .map(|goal| goal.tasks.ready)
-        .sum();
-    let ready = ready.saturating_sub(ready_in_draft_goals);
-    let snapshot = SlotSnapshot {
-        free_slots: slots - i64::try_from(executing)?,
-        candidates: queue.candidates()?.len(),
-        ready,
-    };
-    Ok(serde_json::to_value(stats(
-        &events, &goals, now, snapshot, query,
-    ))?)
-}
-
 /// Inspect every registered supervisor and every unfinished run with its
 /// lease, processes and paths. Reads only.
 /// `doctor`: with `full`, every unfinished run with its lease, processes
@@ -837,120 +519,6 @@ pub fn recover(db: &Path, id: &RunId) -> Result<Value> {
     let run = queue.recover_run(run.id(), processes.len(), report)?;
     Ok(json!({"outcome": "recovered", "run": run}))
 }
-
-/// `rebind`: bind the queue at `db` to the repository containing `repo`
-/// after the repository moved, the only way the binding changes (ADR-0020).
-/// Refused while a registered supervisor or an `integrate` still lives,
-/// since both hold paths of the old repository. The change is appended to
-/// `logs/rebind.jsonl`, the queue directory's `repository` file (if any)
-/// is rewritten, and every run worktree still on disk gets its Git link
-/// repaired from the new repository. Reports where a repository-resolved
-/// queue now lives, which differs from the queue's own directory until it
-/// is moved there.
-pub fn rebind(db: &Path, repo: &Path) -> Result<Value> {
-    let db = db
-        .canonicalize()
-        .context("queue must already be initialized")?;
-    let mut queue = SqliteQueue::open(&db)?;
-    let repository = GitRepository::inspect(repo)?;
-    let common_dir = path_text(&repository.common_dir)?;
-    let live = queue
-        .supervisors()?
-        .into_iter()
-        .filter(|registration| process_alive(registration.pid))
-        .map(|registration| registration.pid)
-        .collect::<Vec<_>>();
-    ensure!(
-        live.is_empty(),
-        "refusing to rebind while a supervisor is running (pid {live:?}); stop it with `down --wait` first"
-    );
-    let leases = queue.run_leases()?;
-    if let Some(run) = queue
-        .runs_with_status(RunStatus::Integrating)?
-        .into_iter()
-        .find(|run| {
-            leases
-                .iter()
-                .any(|lease| lease.run_id == *run.id() && process_alive(lease.pid))
-        })
-    {
-        bail!(
-            "refusing to rebind while run {} of task {} is integrating",
-            run.id(),
-            run.task_id()
-        );
-    }
-    let previous = queue.rebind_repository(&common_dir)?;
-    let changed = previous.as_deref() != Some(common_dir.as_str());
-    let location = crate::infrastructure::location::QueueLocation::explicit(&db);
-    if changed {
-        fs::create_dir_all(&location.log_dir)?;
-        let mut log = fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(location.log_dir.join(REBIND_LOG))?;
-        writeln!(
-            log,
-            "{}",
-            json!({
-                "at": queue.generators().clock.now(),
-                "previous_git_common_dir": previous,
-                "git_common_dir": common_dir,
-                "binary_version": crate::VERSION,
-            })
-        )?;
-        let pointer = location
-            .queue_dir
-            .join(crate::infrastructure::location::REPOSITORY_FILE_NAME);
-        if pointer.is_file() {
-            fs::write(&pointer, format!("{common_dir}\n"))?;
-        }
-    }
-    let worktrees = queue
-        .all_runs()?
-        .into_iter()
-        .filter_map(|run| {
-            let path = PathBuf::from(run.worktree_path()?);
-            Some((run.id().clone(), path))
-        })
-        .filter(|(_, path)| path.is_dir())
-        .map(|(run_id, path)| {
-            let error = repository.repair_worktree(&path).err();
-            json!({
-                "run_id": run_id,
-                "worktree_path": path,
-                "repaired": error.is_none(),
-                "error": error.map(|e| format!("{e:#}")),
-            })
-        })
-        .collect::<Vec<_>>();
-    let resolved = crate::infrastructure::location::data_home()
-        .ok()
-        .map(|home| {
-            crate::infrastructure::location::QueueLocation::for_repository(
-                &repository.common_dir,
-                &home,
-            )
-            .queue_dir
-        });
-    let move_to = resolved
-        .clone()
-        .filter(|dir| dir.canonicalize().ok().as_deref() != Some(location.queue_dir.as_path()));
-    Ok(json!({
-        "outcome": if changed { "rebound" } else { "unchanged" },
-        "db": db,
-        "previous_git_common_dir": previous,
-        "git_common_dir": common_dir,
-        "queue_dir": location.queue_dir,
-        "repository_queue_dir": resolved,
-        "move_to": move_to,
-        "worktrees": worktrees,
-    }))
-}
-
-/// Append-only record of `rebind` under the queue's `logs/`, one JSON
-/// object per changed binding; the schema has no queue-level event.
-pub const REBIND_LOG: &str = "rebind.jsonl";
 
 fn lease_health(lease: &RunLease, now: i64) -> LeaseHealth {
     let age = now - lease.heartbeat_at;

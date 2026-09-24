@@ -1019,6 +1019,18 @@ mod tests {
         fn landed_task_ids(&self, _: &str, _: &str) -> Result<Vec<crate::domain::TaskId>> {
             unimplemented!()
         }
+        fn log_oneline(&self, _: &str, _: &str) -> Result<String> {
+            unimplemented!()
+        }
+        fn diff_stat(&self, _: &str, _: &str) -> Result<String> {
+            unimplemented!()
+        }
+        fn diff_numbers(&self, _: &str, _: &str) -> Result<crate::application::DiffNumbers> {
+            unimplemented!()
+        }
+        fn diff_to_file(&self, _: &str, _: &str, _: &Path) -> Result<()> {
+            unimplemented!()
+        }
     }
 
     fn sha(text: &str) -> CommitSha {

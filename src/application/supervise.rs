@@ -5320,6 +5320,21 @@ mod idle_tests {
         fn exists(&self, path: &Path) -> bool {
             self.files.lock().unwrap().contains_key(path)
         }
+        fn rename(&self, _: &Path, _: &Path) -> io::Result<()> {
+            unimplemented!("the supervisor renames no run file")
+        }
+        fn remove_file(&self, _: &Path) -> io::Result<()> {
+            unimplemented!("the supervisor removes no run file")
+        }
+        fn append_line(&self, _: &Path, _: &str) -> io::Result<()> {
+            unimplemented!("the supervisor appends to no run file")
+        }
+        fn canonicalize(&self, _: &Path) -> io::Result<PathBuf> {
+            unimplemented!("the supervisor resolves no run file")
+        }
+        fn write_fenced(&self, _: &Path, _: &str, _: &str, _: &Path) -> Result<()> {
+            unimplemented!("the supervisor writes no review")
+        }
         fn now(&self) -> SystemTime {
             UNIX_EPOCH + Duration::from_secs(1_000_000)
         }
