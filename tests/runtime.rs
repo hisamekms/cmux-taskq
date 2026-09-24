@@ -4668,6 +4668,379 @@ fn unapproved_resumed_run_is_validated_and_reviewed_with_its_session_open() {
     );
 }
 
+/// Stand in for an earlier resume the supervisor judged `unresolved`
+/// (task 122): one `resume_started` / `resume_finished` pair under another
+/// token after the run was parked.
+fn unresolved_attempt(db: &Path, run: &TaskRun, main: &str) {
+    let mut queue = SqliteQueue::open(db).unwrap();
+    let (_, attempt) = queue
+        .begin_resume(&run.id, "earlier", main, None, 3)
+        .unwrap()
+        .unwrap();
+    assert_eq!(attempt, 1);
+    queue
+        .finish_resume(
+            &run.id,
+            "earlier",
+            None,
+            None,
+            false,
+            json!({"attempt": 1, "outcome": "unresolved", "exhausted": false}),
+        )
+        .unwrap();
+}
+
+/// Resolve the parked conflict in the run's worktree on top of `main` as
+/// that session did, and return the new head.
+fn resolve_in_worktree(run: &TaskRun, main: &str) -> String {
+    let worktree = Path::new(run.worktree_path.as_ref().unwrap());
+    let rebase = Command::new("git")
+        .arg("-C")
+        .arg(worktree)
+        .args(["rebase", main])
+        .output()
+        .unwrap();
+    assert!(!rebase.status.success());
+    fs::write(worktree.join("change.txt"), "resolved by the session\n").unwrap();
+    git(worktree, &["add", "change.txt"]);
+    let status = Command::new("git")
+        .arg("-C")
+        .arg(worktree)
+        .env("GIT_EDITOR", "true")
+        .args(["rebase", "--continue"])
+        .status()
+        .unwrap();
+    assert!(status.success());
+    git_out(worktree, &["rev-parse", "HEAD"])
+}
+
+/// A parked run whose earlier resume already rebased it onto main and
+/// rewrote the receipt for its clean head (judged `unresolved` all the
+/// same): the supervisor opens no session and uses no attempt, records
+/// `resume_skipped` and, its integrate approved, lands it. The backend has
+/// no resume script, so a resume would have failed.
+#[test]
+fn an_approved_run_resolved_by_an_earlier_resume_lands_without_a_session() {
+    let (_dir, repo, db) = fixture();
+    let backend = TestWorkspace::new(&db, false, VALID_AGENT);
+    let (run, first_landed) = parked_conflict(&repo, &db, &backend);
+    unresolved_attempt(&db, &run, &first_landed);
+    let resolved = resolve_in_worktree(&run, &first_landed);
+    write_receipt(&run, &resolved, "succeeded", "resolved");
+
+    let mut queue = SqliteQueue::open(&db).unwrap();
+    let cursor = queue.latest_event_id().unwrap();
+    let outcome = supervise(&db, &repo, &backend).unwrap();
+    assert_eq!(outcome["errors"], json!([]), "{outcome}");
+
+    let detail = queue.show(2).unwrap();
+    assert_landed(&repo, &detail.runs[0], "second", &first_landed);
+    assert_eq!(detail.task.status, TaskStatus::Completed);
+    assert!(backend.resumes.lock().unwrap().is_empty());
+    assert!(backend.texts().is_empty());
+    assert_eq!(payloads(&detail, "resume_started").len(), 1);
+    assert_eq!(
+        payloads(&detail, "resume_skipped"),
+        [
+            &json!({"head": resolved, "main": first_landed, "approved": true, "status": "needs_session"})
+        ]
+    );
+    let kinds = event_kinds(&detail);
+    let after: Vec<&str> = kinds
+        .iter()
+        .skip_while(|k| **k != "resume_finished")
+        .filter(|k| {
+            matches!(
+                **k,
+                "resume_finished"
+                    | "resume_skipped"
+                    | "resume_started"
+                    | "integration_started"
+                    | "run_integrated"
+            )
+        })
+        .copied()
+        .collect();
+    assert_eq!(
+        after,
+        [
+            "resume_finished",
+            "resume_skipped",
+            "integration_started",
+            "run_integrated"
+        ]
+    );
+    assert!(queue.run_leases().unwrap().is_empty());
+    assert_eq!(
+        dagq::watch::events(&db, cursor, 100, false).unwrap()["events"],
+        json!([])
+    );
+}
+
+/// The same run without an approving `integrate` is validated and reviewed
+/// without a session: the stand-in `claude` prints no verdict, so it waits
+/// for a review by hand in `awaiting_integration`.
+#[test]
+fn an_unapproved_run_resolved_by_an_earlier_resume_is_validated_without_a_session() {
+    let (_dir, repo, db) = fixture();
+    let backend = TestWorkspace::new(&db, false, VALID_AGENT);
+    let (run, first_landed) = parked_conflict(&repo, &db, &backend);
+    Connection::open(&db)
+        .unwrap()
+        .execute(
+            "DELETE FROM run_events WHERE run_id=?1 AND kind='integration_approved'",
+            [&run.id],
+        )
+        .unwrap();
+    unresolved_attempt(&db, &run, &first_landed);
+    let resolved = resolve_in_worktree(&run, &first_landed);
+    write_receipt(&run, &resolved, "succeeded", "resolved");
+
+    let mut queue = SqliteQueue::open(&db).unwrap();
+    let outcome = supervise(&db, &repo, &backend).unwrap();
+    assert_eq!(outcome["errors"], json!([]), "{outcome}");
+
+    let detail = queue.show(2).unwrap();
+    let back = &detail.runs[0];
+    assert_eq!(back.status, RunStatus::AwaitingIntegration);
+    assert_eq!(back.result_commit.as_deref(), Some(resolved.as_str()));
+    assert_eq!(git_out(&repo, &["rev-parse", "main"]), first_landed);
+    assert!(backend.resumes.lock().unwrap().is_empty());
+    assert_eq!(payloads(&detail, "resume_started").len(), 1);
+    assert_eq!(
+        payloads(&detail, "resume_skipped"),
+        [
+            &json!({"head": resolved, "main": first_landed, "approved": false, "status": "validating"})
+        ]
+    );
+    let kinds = event_kinds(&detail);
+    let after: Vec<&str> = kinds
+        .iter()
+        .skip_while(|k| **k != "resume_skipped")
+        .filter(|k| {
+            matches!(
+                **k,
+                "resume_skipped" | "validation_finished" | "review_started" | "review_failed"
+            )
+        })
+        .copied()
+        .collect();
+    assert_eq!(
+        after,
+        [
+            "resume_skipped",
+            "validation_finished",
+            "review_started",
+            "review_failed"
+        ]
+    );
+    assert_eq!(
+        payloads(&detail, "review_started").last().unwrap()["workspace_id"],
+        Value::Null
+    );
+    assert!(queue.run_leases().unwrap().is_empty());
+}
+
+/// A skipped run the landing parks again (its verification fails on the
+/// resolved head) is resumed with a session next, not skipped again.
+#[test]
+fn a_run_parked_again_after_a_skip_is_resumed_not_skipped() {
+    let (_dir, repo, db) = fixture();
+    let backend = TestWorkspace::new(&db, false, VALID_AGENT);
+    let (run, first_landed) = parked_conflict(&repo, &db, &backend);
+    unresolved_attempt(&db, &run, &first_landed);
+    let resolved = resolve_in_worktree(&run, &first_landed);
+    write_receipt(&run, &resolved, "succeeded", "resolved");
+    Connection::open(&db)
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET verification_commands='[\"false\"]' WHERE id=2",
+            [],
+        )
+        .unwrap();
+
+    let outcome = supervise(&db, &repo, &backend).unwrap();
+    // The resumes after the second park fail (the backend has no script)
+    // until the attempts are used up; none is skipped.
+    assert_eq!(outcome["errors"].as_array().unwrap().len(), 2, "{outcome}");
+    let mut queue = SqliteQueue::open(&db).unwrap();
+    let detail = queue.show(2).unwrap();
+    assert_eq!(detail.runs[0].status, RunStatus::NeedsSession);
+    assert_eq!(git_out(&repo, &["rev-parse", "main"]), first_landed);
+    assert_eq!(payloads(&detail, "resume_skipped").len(), 1);
+    let kinds = event_kinds(&detail);
+    let after: Vec<&str> = kinds
+        .iter()
+        .skip_while(|k| **k != "resume_skipped")
+        .filter(|k| {
+            matches!(
+                **k,
+                "resume_skipped" | "integration_deferred" | "resume_started" | "resume_finished"
+            )
+        })
+        .copied()
+        .collect();
+    assert_eq!(
+        after,
+        [
+            "resume_skipped",
+            "integration_deferred",
+            "resume_started",
+            "resume_finished",
+            "resume_started",
+            "resume_finished"
+        ]
+    );
+    assert_eq!(
+        payloads(&detail, "resume_started").last().unwrap()["attempt"],
+        3
+    );
+}
+
+/// An unapproved run a supervisor moved on by `resume_skipped` and then
+/// died holding (no session, no wrapper registration since) is adopted by
+/// the next supervisor and validated and reviewed with no session.
+#[test]
+fn a_skipped_run_whose_supervisor_died_is_adopted() {
+    let (_dir, repo, db) = fixture();
+    let backend = TestWorkspace::new(&db, false, VALID_AGENT);
+    let (run, first_landed) = parked_conflict(&repo, &db, &backend);
+    Connection::open(&db)
+        .unwrap()
+        .execute(
+            "DELETE FROM run_events WHERE run_id=?1 AND kind='integration_approved'",
+            [&run.id],
+        )
+        .unwrap();
+    // The attempt clears the worker's process rows: no wrapper is left.
+    unresolved_attempt(&db, &run, &first_landed);
+    let resolved = resolve_in_worktree(&run, &first_landed);
+    write_receipt(&run, &resolved, "succeeded", "resolved");
+    let mut queue = SqliteQueue::open(&db).unwrap();
+    assert!(queue.processes(&run.id).unwrap().is_empty());
+    let skipped = queue
+        .skip_resume(&run.id, "dead", &resolved, &first_landed, false)
+        .unwrap()
+        .unwrap();
+    assert_eq!(skipped.status, RunStatus::Validating);
+    // Taken already: a second skip or resume finds it leased.
+    assert!(
+        queue
+            .skip_resume(&run.id, "other", &resolved, &first_landed, false)
+            .unwrap()
+            .is_none()
+    );
+    Connection::open(&db)
+        .unwrap()
+        .execute(
+            "UPDATE run_leases SET pid=?2 WHERE run_id=?1",
+            rusqlite::params![run.id, dead_pid()],
+        )
+        .unwrap();
+
+    let outcome = supervise(&db, &repo, &backend).unwrap();
+    assert_eq!(outcome["errors"], json!([]), "{outcome}");
+    let detail = queue.show(2).unwrap();
+    assert_eq!(detail.runs[0].status, RunStatus::AwaitingIntegration);
+    assert!(backend.resumes.lock().unwrap().is_empty());
+    let adopted = payloads(&detail, "run_adopted");
+    assert_eq!(adopted.len(), 1, "{:?}", event_kinds(&detail));
+    assert_eq!(adopted[0]["wrapper"], Value::Null);
+    assert_eq!(
+        payloads(&detail, "review_started").last().unwrap()["workspace_id"],
+        Value::Null
+    );
+    assert!(queue.run_leases().unwrap().is_empty());
+}
+
+/// Takes one condition of the skip away from a resolved run (the repo, the
+/// queue, the run and its resolved head).
+type Spoil = fn(&Path, &Path, &TaskRun, &str);
+
+/// A parked run lacking any one condition of the skip is resumed as
+/// before: the resume uses an attempt (and fails here, the backend having
+/// no resume script) and no `resume_skipped` is recorded.
+#[test]
+fn a_run_missing_any_condition_of_the_skip_is_resumed() {
+    let cases: [(&str, Spoil); 8] = [
+        ("no resume since it was parked", |_, _, _, _| {}),
+        // Recorded before the unresolved attempt below.
+        ("a person sent it back", |_, _, _, _| {}),
+        ("the receipt names the old head", |_, _, run, _| {
+            write_receipt(
+                run,
+                run.result_commit.as_ref().unwrap(),
+                "succeeded",
+                "stale",
+            );
+        }),
+        ("the worktree is dirty", |_, _, run, _| {
+            let worktree = Path::new(run.worktree_path.as_ref().unwrap());
+            fs::write(worktree.join("stray.txt"), "left over\n").unwrap();
+        }),
+        ("main moved past the head", |repo, _, _, _| {
+            git(repo, &["commit", "-q", "--allow-empty", "-m", "moved on"]);
+        }),
+        ("the receipt is another run's", |_, _, run, resolved| {
+            let mut receipt = session_receipt(run, resolved, "succeeded", "resolved");
+            receipt["run_id"] = json!("another-run");
+            write_receipt_json(run, receipt);
+        }),
+        ("the receipt reports failed", |_, _, run, resolved| {
+            write_receipt(run, resolved, "failed", "gave up");
+        }),
+        ("the required evidence is missing", |_, db, run, _| {
+            Connection::open(db)
+                .unwrap()
+                .execute(
+                    "UPDATE tasks SET required_evidence='[\"e2e\"]' WHERE id=?1",
+                    [run.task_id],
+                )
+                .unwrap();
+        }),
+    ];
+    for (index, (case, spoil)) in cases.into_iter().enumerate() {
+        let (_dir, repo, db) = fixture();
+        let backend = TestWorkspace::new(&db, false, VALID_AGENT);
+        let (run, first_landed) = parked_conflict(&repo, &db, &backend);
+        if case == "a person sent it back" {
+            SqliteQueue::open(&db)
+                .unwrap()
+                .record_runtime_event(
+                    &run.id,
+                    "landing_decided",
+                    json!({"status": "needs_session", "reason": "findings sent back"}),
+                )
+                .unwrap();
+        }
+        if index != 0 {
+            unresolved_attempt(&db, &run, &first_landed);
+        }
+        let resolved = resolve_in_worktree(&run, &first_landed);
+        write_receipt(&run, &resolved, "succeeded", "resolved");
+        spoil(&repo, &db, &run, &resolved);
+
+        let outcome = supervise(&db, &repo, &backend).unwrap();
+        assert_eq!(
+            outcome["errors"].as_array().unwrap().len(),
+            1,
+            "{case}: {outcome}"
+        );
+        let mut queue = SqliteQueue::open(&db).unwrap();
+        let detail = queue.show(2).unwrap();
+        assert!(
+            payloads(&detail, "resume_skipped").is_empty(),
+            "{case}: {:?}",
+            event_kinds(&detail)
+        );
+        let started = payloads(&detail, "resume_started");
+        assert_eq!(started.len(), usize::from(index != 0) + 1, "{case}");
+        let finished = payloads(&detail, "resume_finished");
+        assert_eq!(finished.last().unwrap()["outcome"], "error", "{case}");
+        assert_eq!(detail.runs[0].status, RunStatus::NeedsSession, "{case}");
+    }
+}
+
 /// A resume that cannot start, or a session that cannot resolve the run,
 /// uses up an attempt; after the third the run stays `needs_session` and is
 /// the maintainer's (`resume session`). The sessions behave like Claude: they

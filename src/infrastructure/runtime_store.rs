@@ -1396,46 +1396,15 @@ impl SqliteQueue {
         if attempts >= max_attempts {
             return Ok(None);
         }
-        let lease = tx
-            .query_row(
-                "SELECT run_id,token,pid,heartbeat_at FROM run_leases WHERE run_id=?1",
-                [id],
-                lease_row,
-            )
-            .optional()?;
-        if let Some(lease) = &lease {
-            if !lease_is_stale(lease, now) {
-                return Ok(None);
-            }
-            tx.execute("DELETE FROM run_leases WHERE run_id=?1", [id])?;
-        }
-        // The previous session's rows give way to the resumed one's; their
-        // history stays in the run's events. A session still heartbeating
-        // is left alone.
-        let live: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM run_processes WHERE run_id=?1
-             AND exited_at IS NULL AND heartbeat_at >= ?2-?3)",
-            params![id, now, HEARTBEAT_TIMEOUT_SECS],
-            |r| r.get(0),
-        )?;
-        if live {
+        let Some(previous) = lease_parked_run(&tx, id, token, now, true)? else {
             return Ok(None);
-        }
-        tx.execute("DELETE FROM run_processes WHERE run_id=?1", [id])?;
-        tx.execute(
-            "INSERT INTO run_leases(run_id,token,pid) VALUES (?1,?2,?3)",
-            params![id, token, std::process::id()],
-        )?;
-        tx.execute(
-            "UPDATE task_runs SET supervisor_token=?2 WHERE id=?1",
-            params![id, token],
-        )?;
+        };
         let attempt = attempts + 1;
         run_event(
             &tx,
             id,
             "lease_acquired",
-            json!({"pid": std::process::id(), "reason": "resume", "previous_token": lease.map(|l| l.token)}),
+            json!({"pid": std::process::id(), "reason": "resume", "previous_token": previous}),
         )?;
         run_event(
             &tx,
@@ -1450,6 +1419,59 @@ impl SqliteQueue {
         )?;
         tx.commit()?;
         Ok(Some((run, attempt)))
+    }
+
+    /// Move a `needs_session` run on without a session because an earlier
+    /// attempt already resolved it (its receipt names the clean worktree
+    /// `head`, which sits on `main`): under the same checks as
+    /// [`Self::begin_resume`] but whatever the attempts so far, lease it to
+    /// `token` (`lease_acquired` with `reason: resume_skipped`), make
+    /// `token` its supervisor and record `resume_skipped` (`head`, `main`,
+    /// `approved`, `status`). An approved run stays `needs_session` for the
+    /// caller to land under the lease; an unapproved one becomes
+    /// `validating`. No `resume_started` is recorded, so no attempt is used.
+    /// `Ok(None)` means another process took it or it changed meanwhile.
+    pub fn skip_resume(
+        &mut self,
+        id: &str,
+        token: &str,
+        head: &str,
+        main: &str,
+        approved: bool,
+    ) -> Result<Option<TaskRun>> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let now: i64 = tx.query_row("SELECT unixepoch()", [], |r| r.get(0))?;
+        // No session starts: the earlier session's rows stay as they are.
+        let Some(previous) = lease_parked_run(&tx, id, token, now, false)? else {
+            return Ok(None);
+        };
+        let status = if approved {
+            crate::domain::RunStatus::NeedsSession
+        } else {
+            tx.execute("UPDATE task_runs SET status='validating' WHERE id=?1", [id])?;
+            crate::domain::RunStatus::Validating
+        };
+        run_event(
+            &tx,
+            id,
+            "lease_acquired",
+            json!({"pid": std::process::id(), "reason": "resume_skipped", "previous_token": previous}),
+        )?;
+        run_event(
+            &tx,
+            id,
+            "resume_skipped",
+            json!({"head": head, "main": main, "approved": approved, "status": status.as_str()}),
+        )?;
+        let run = tx.query_row(
+            "SELECT * FROM task_runs WHERE id=?1",
+            [id],
+            run_row(&self.runs_dir),
+        )?;
+        tx.commit()?;
+        Ok(Some(run))
     }
 
     /// End a resume: record `resume_finished` (with `status`, the run's
@@ -2082,6 +2104,65 @@ fn run_event(conn: &Connection, id: &str, kind: &str, payload: serde_json::Value
         r.get(0)
     })?;
     event(conn, task_id, Some(id), kind, payload)
+}
+
+/// Lease a `needs_session` run to `token` for a resume or its skip, inside
+/// the caller's transaction: no lease but a stale one (which is replaced)
+/// and no session still heartbeating; with `clear_processes` (a resumed
+/// session registers in their place) the previous session's process rows
+/// are cleared (their history stays in the run's events), and `token`
+/// becomes its supervisor. `Ok(Some(previous lease token))` once leased,
+/// `Ok(None)` when the run is not free to take.
+fn lease_parked_run(
+    tx: &Connection,
+    id: &str,
+    token: &str,
+    now: i64,
+    clear_processes: bool,
+) -> Result<Option<Option<String>>> {
+    let parked: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM task_runs WHERE id=?1 AND status='needs_session')",
+        [id],
+        |r| r.get(0),
+    )?;
+    if !parked {
+        return Ok(None);
+    }
+    let lease = tx
+        .query_row(
+            "SELECT run_id,token,pid,heartbeat_at FROM run_leases WHERE run_id=?1",
+            [id],
+            lease_row,
+        )
+        .optional()?;
+    if let Some(lease) = &lease {
+        if !lease_is_stale(lease, now) {
+            return Ok(None);
+        }
+        tx.execute("DELETE FROM run_leases WHERE run_id=?1", [id])?;
+    }
+    // A session still heartbeating is left alone.
+    let live: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM run_processes WHERE run_id=?1
+         AND exited_at IS NULL AND heartbeat_at >= ?2-?3)",
+        params![id, now, HEARTBEAT_TIMEOUT_SECS],
+        |r| r.get(0),
+    )?;
+    if live {
+        return Ok(None);
+    }
+    if clear_processes {
+        tx.execute("DELETE FROM run_processes WHERE run_id=?1", [id])?;
+    }
+    tx.execute(
+        "INSERT INTO run_leases(run_id,token,pid) VALUES (?1,?2,?3)",
+        params![id, token, std::process::id()],
+    )?;
+    tx.execute(
+        "UPDATE task_runs SET supervisor_token=?2 WHERE id=?1",
+        params![id, token],
+    )?;
+    Ok(Some(lease.map(|l| l.token)))
 }
 
 fn resume_attempts(conn: &Connection, id: &str) -> Result<usize> {

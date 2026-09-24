@@ -2358,6 +2358,10 @@ impl Supervisor<'_> {
             }
             self.close_left_resume_workspaces(&run)?;
             let main = self.repository.main_head()?;
+            if let Some(head) = self.resolved_head(&run, &main)? {
+                self.skip_resume(&run, &head, &main)?;
+                continue;
+            }
             let (reason, kind) = resume_reason(&self.queue, &run)?;
             let Some((run, attempt)) = self.queue.begin_resume(
                 &run.id,
@@ -2392,6 +2396,112 @@ impl Supervisor<'_> {
                 }
             }
         }
+        Ok(())
+    }
+
+    /// The worktree head of a `needs_session` run an earlier resume already
+    /// resolved although it was not judged so (its session rewrote the
+    /// receipt before the attempt that saw it, or went idle without
+    /// rewriting it again): the run was last parked by the landing or
+    /// validation (not a person's `send_back`, `landing_decided`), the last
+    /// of the parking events, `resume_finished` and `resume_skipped` is a
+    /// `resume_finished` with `outcome: unresolved` (a session ran; a resume
+    /// that could not start changed nothing), the receipt parses with
+    /// this run's `run_id`, `succeeded` and the task's required evidence,
+    /// its `commit` is the head of a clean worktree, and that head has
+    /// `main` as a proper ancestor. `None` whenever one of these fails or
+    /// cannot be read, and the run is resumed as before. Back in
+    /// `needs_session` after a skip, however it got there, the run needs a
+    /// resume first, so a skip never repeats without one.
+    fn resolved_head(&mut self, run: &TaskRun, main: &str) -> Result<Option<String>> {
+        const PARKING: [&str; 5] = [
+            "integration_deferred",
+            "integration_error",
+            "evidence_missing",
+            "scope_violation",
+            "landing_decided",
+        ];
+        let events = self.queue.run_events(&run.id)?;
+        let parked = events
+            .iter()
+            .rev()
+            .find(|e| PARKING.contains(&e.kind.as_str()));
+        let last = events.iter().rev().find(|e| {
+            PARKING.contains(&e.kind.as_str())
+                || matches!(e.kind.as_str(), "resume_finished" | "resume_skipped")
+        });
+        if parked.is_none_or(|e| e.kind == "landing_decided")
+            || last
+                .is_none_or(|e| e.kind != "resume_finished" || e.payload["outcome"] != "unresolved")
+        {
+            return Ok(None);
+        }
+        let (Some(worktree), Some(receipt_path)) = (&run.worktree_path, &run.receipt_path) else {
+            return Ok(None);
+        };
+        let Some(receipt) = fs::read_to_string(receipt_path)
+            .ok()
+            .and_then(|text| Receipt::parse(&text).ok())
+        else {
+            return Ok(None);
+        };
+        let task = self.queue.show(run.task_id)?.task;
+        if receipt.run_id != run.id
+            || receipt.result != ReceiptResult::Succeeded
+            || !receipt.missing_evidence(&task.required_evidence).is_empty()
+        {
+            return Ok(None);
+        }
+        let worktree = Path::new(worktree);
+        let Ok(head) = self.repository.head(worktree) else {
+            return Ok(None);
+        };
+        let resolved = head == receipt.commit.to_ascii_lowercase()
+            && head != main
+            && self
+                .repository
+                .status(worktree)
+                .is_ok_and(|status| status.trim().is_empty())
+            && self.repository.is_ancestor(main, &head).unwrap_or(false);
+        Ok(resolved.then_some(head))
+    }
+
+    /// Move a run [`Self::resolved_head`] found resolved on without opening
+    /// a session or using an attempt: record `resume_skipped` and, under
+    /// its lease, land it when its integrate was approved, or validate and
+    /// review it (with no session to keep) otherwise.
+    fn skip_resume(&mut self, run: &TaskRun, head: &str, main: &str) -> Result<()> {
+        let approved = self.queue.has_run_event(&run.id, "integration_approved")?;
+        let Some(run) = self
+            .queue
+            .skip_resume(&run.id, &self.token, head, main, approved)?
+        else {
+            return Ok(());
+        };
+        self.log.note(&format!(
+            "run {} of task {} was already resolved at {head} on main {main}; {} without a resume",
+            run.id,
+            run.task_id,
+            if approved {
+                "landing it"
+            } else {
+                "validating it"
+            }
+        ));
+        let phase = if approved {
+            Phase::AwaitingSlot
+        } else {
+            Phase::Validating(
+                Some(spawn_validation(
+                    self.db.clone(),
+                    self.repository.clone(),
+                    run.clone(),
+                    self.log.clone(),
+                )),
+                None,
+            )
+        };
+        self.slots.push(Slot { run, phase });
         Ok(())
     }
 
@@ -2601,20 +2711,27 @@ impl Supervisor<'_> {
             if !lease_is_stale(&lease, now) {
                 continue;
             }
-            let Some(wrapper) = wrapper else {
-                continue;
-            };
-            let alive = wrapper.exited_at.is_none().then(|| {
-                process_alive(wrapper.pid) && now - wrapper.heartbeat_at <= HEARTBEAT_TIMEOUT_SECS
+            // A run moved on by `resume_skipped` has no session of its own
+            // since: its supervisor alone owned it, whatever the wrapper of
+            // an earlier session left behind.
+            let skipped = self.skipped_resume(&run.id)?;
+            let alive = wrapper.as_ref().and_then(|wrapper| {
+                wrapper.exited_at.is_none().then(|| {
+                    process_alive(wrapper.pid)
+                        && now - wrapper.heartbeat_at <= HEARTBEAT_TIMEOUT_SECS
+                })
             });
-            if alive == Some(false) {
+            if !skipped && (wrapper.is_none() || alive == Some(false)) {
                 continue;
             }
-            let observed = json!({
-                "pid": wrapper.pid,
-                "alive": alive,
-                "exited_at": wrapper.exited_at,
-            });
+            let observed = match &wrapper {
+                Some(wrapper) => json!({
+                    "pid": wrapper.pid,
+                    "alive": alive,
+                    "exited_at": wrapper.exited_at,
+                }),
+                None => Value::Null,
+            };
             let pid = std::process::id();
             let Some(run) =
                 self.queue
@@ -2632,10 +2749,12 @@ impl Supervisor<'_> {
                 lease.token,
                 lease.pid,
                 now - lease.heartbeat_at,
-                wrapper.pid,
-                match wrapper.exited_at {
-                    Some(at) => format!("exited at {at}"),
-                    None => "alive".to_owned(),
+                wrapper.as_ref().map_or(0, |w| w.pid),
+                match wrapper.as_ref().map(|w| w.exited_at) {
+                    Some(Some(at)) => format!("exited at {at}"),
+                    Some(None) if alive == Some(true) => "alive".to_owned(),
+                    Some(None) => "gone".to_owned(),
+                    None => "none since resume_skipped".to_owned(),
                 },
                 run.task_id,
                 run.workspace_id.as_deref().unwrap_or("?")
@@ -2732,6 +2851,23 @@ impl Supervisor<'_> {
         })
     }
 
+    /// Whether the run's last resume event is `resume_skipped`: it was moved
+    /// on without a session, and no resume opened one since.
+    fn skipped_resume(&self, id: &str) -> Result<bool> {
+        Ok(self
+            .queue
+            .run_events(id)?
+            .iter()
+            .rev()
+            .find(|e| {
+                matches!(
+                    e.kind.as_str(),
+                    "resume_started" | "resume_finished" | "resume_skipped"
+                )
+            })
+            .is_some_and(|e| e.kind == "resume_skipped"))
+    }
+
     /// The session an accepted run keeps open (ADR-0027): the workspace of
     /// the resume that handed its live session to validation
     /// (`resume_finished` with status `validating`) unless a
@@ -2739,10 +2875,13 @@ impl Supervisor<'_> {
     /// workspace while it is not closed.
     fn session_of(&self, run: &TaskRun) -> Result<Option<SessionRef>> {
         let events = self.queue.run_events(&run.id)?;
-        let resumed = events
-            .iter()
-            .rev()
-            .find(|e| matches!(e.kind.as_str(), "resume_started" | "resume_finished"));
+        let resumed = events.iter().rev().find(|e| {
+            matches!(
+                e.kind.as_str(),
+                "resume_started" | "resume_finished" | "resume_skipped"
+            )
+        });
+        // A run moved on by `resume_skipped` has no session open.
         if let Some(event) = resumed {
             if event.kind == "resume_finished"
                 && event.payload["status"] == RunStatus::Validating.as_str()
