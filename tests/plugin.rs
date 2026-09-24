@@ -332,6 +332,31 @@ fn session_start(env: &[(&str, &str)], data_home: &Path, cwd: &Path) -> Output {
     command.output().unwrap()
 }
 
+/// Splits the hook's stdout for `role` into its leading line of text, which
+/// keeps Claude Code from reading the output as the hook's control JSON, and
+/// the status JSON after it.
+fn hook_status(output: &Output, role: &str) -> Value {
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stderr, b"");
+    let text = String::from_utf8(output.stdout.clone()).unwrap();
+    let (header, status) = text.split_once('\n').expect("a header line");
+    assert!(
+        serde_json::from_str::<Value>(&text).is_err(),
+        "the whole stdout must not parse as JSON: {text}"
+    );
+    assert_eq!(
+        header,
+        format!(
+            "This session is the dagq {role} (DAGQ_ROLE={role}); follow the dagq-{role} skill of the dagq plugin. The queue status for this role (dagq status --role {role}):"
+        )
+    );
+    serde_json::from_str(status).unwrap()
+}
+
 #[test]
 fn session_start_hook_prints_status_only_in_the_sessions_up_opens() {
     let dir = tempfile::tempdir().unwrap();
@@ -371,7 +396,7 @@ fn session_start_hook_prints_status_only_in_the_sessions_up_opens() {
 
     // The inbox gets status, with all the attention and the cursor.
     let inbox_env = [("DAGQ_BIN", binary), ("DAGQ_ROLE", "inbox")];
-    let status = stdout_json(&session_start(&inbox_env, &data_home, &repo));
+    let status = hook_status(&session_start(&inbox_env, &data_home, &repo), "inbox");
     assert!(status["supervisors"].is_array());
     assert!(status["attention"].is_array());
     assert_eq!(status["attention"][0]["kind"], "supervisor_stopped");
@@ -393,11 +418,14 @@ fn session_start_hook_prints_status_only_in_the_sessions_up_opens() {
             "/usr/bin/true",
         ],
     ));
-    let inbox = stdout_json(&session_start(
-        &[("DAGQ_BIN", binary), ("DAGQ_ROLE", "inbox")],
-        &data_home,
-        &repo,
-    ));
+    let inbox = hook_status(
+        &session_start(
+            &[("DAGQ_BIN", binary), ("DAGQ_ROLE", "inbox")],
+            &data_home,
+            &repo,
+        ),
+        "inbox",
+    );
     let kinds = |status: &Value| -> Vec<String> {
         status["attention"]
             .as_array()
@@ -409,11 +437,14 @@ fn session_start_hook_prints_status_only_in_the_sessions_up_opens() {
     assert_eq!(kinds(&inbox), ["supervisor_stopped", "ask_opened"]);
     assert_eq!(inbox["asks"][0]["question"], "stuck?");
     assert!(inbox["cursor"].is_number());
-    let planner = stdout_json(&session_start(
-        &[("DAGQ_BIN", binary), ("DAGQ_ROLE", "planner")],
-        &data_home,
-        &repo,
-    ));
+    let planner = hook_status(
+        &session_start(
+            &[("DAGQ_BIN", binary), ("DAGQ_ROLE", "planner")],
+            &data_home,
+            &repo,
+        ),
+        "planner",
+    );
     assert!(kinds(&planner).is_empty(), "{planner}");
     assert!(planner["cursor"].is_number());
 
@@ -432,7 +463,10 @@ fn session_start_hook_prints_status_only_in_the_sessions_up_opens() {
         ("DAGQ_ROLE", "planner"),
         ("DAGQ_QUEUE", db.as_str()),
     ];
-    let status = stdout_json(&session_start(&with_queue, &data_home, dir.path()));
+    let status = hook_status(
+        &session_start(&with_queue, &data_home, dir.path()),
+        "planner",
+    );
     assert!(status["cursor"].is_number());
 
     // A failure is one line of explanation, never a failed session start.

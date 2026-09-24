@@ -6,7 +6,10 @@
 # --env) selects `dagq status --role <role>` (supervisors, unfinished runs,
 # the attention and asks addressed to that role, and the next cursor) on
 # stdout, which Claude Code adds to the context, so the session re-orients
-# itself after compaction or /clear. Every other session, workers included,
+# itself after compaction or /clear. The status comes after one line of text
+# naming the role and its skill: Claude Code reads a stdout that is JSON as
+# the hook's control output and drops its unknown keys, so the bare status
+# would never reach the context. Every other session, workers included,
 # gets no output. The hook never fails the session start: when status cannot
 # be read it prints one line saying why and exits 0. startup is left to each
 # session's initial prompt.
@@ -34,6 +37,7 @@ if [ -z "${DAGQ_DB:-}" ] && [ -n "${DAGQ_QUEUE:-}" ]; then
 fi
 
 if output=$("$launcher" status --role "$role" 2>/dev/null); then
+  printf 'This session is the dagq %s (DAGQ_ROLE=%s); follow the dagq-%s skill of the dagq plugin. The queue status for this role (dagq status --role %s):\n' "$role" "$role" "$role" "$role"
   printf '%s\n' "$output"
 else
   # Ask again for the error alone and keep it on one line; printf, because
