@@ -973,7 +973,7 @@ fn failing_verification_command_passes_validation_and_needs_a_session_at_integra
         reason.contains("verification command \"test -f seed.txt\" exited with 1"),
         "{reason}"
     );
-    assert!(reason.contains("integrate-verify-1.log"), "{reason}");
+    assert!(reason.contains("integrate-1-verify-1.log"), "{reason}");
     let detail = SqliteQueue::open(&db)
         .unwrap()
         .show(TaskId::new(1))
@@ -982,8 +982,148 @@ fn failing_verification_command_passes_validation_and_needs_a_session_at_integra
     let verifications = integration_verifications(&detail);
     assert_eq!(verifications.len(), 1, "{verifications:?}");
     assert_eq!(verifications[0]["exit_code"], 1);
+    assert_eq!(verifications[0]["attempt"], 1);
     // Nothing landed.
     assert_eq!(git_out(&repo, &["rev-parse", "main"]), main);
+
+    // A second integrate of the same run keeps the first attempt's log: each
+    // attempt writes its own `integrate-<attempt>-verify-N.log`.
+    let run = &detail.runs[0];
+    let run_dir = Path::new(run.run_dir().unwrap());
+    let first = run_dir.join("integrate-1-verify-1.log");
+    fs::write(&first, "the first attempt's output\n").unwrap();
+    let outcome = integrate(&db, 1, &repo).unwrap();
+    assert_eq!(outcome["outcome"], "needs_session", "{outcome}");
+    assert!(
+        outcome["reason"]
+            .as_str()
+            .unwrap()
+            .contains("integrate-2-verify-1.log"),
+        "{outcome}"
+    );
+    let second = run_dir.join("integrate-2-verify-1.log");
+    assert!(second.exists());
+    assert_eq!(
+        fs::read_to_string(&first).unwrap(),
+        "the first attempt's output\n"
+    );
+    let detail = SqliteQueue::open(&db)
+        .unwrap()
+        .show(TaskId::new(1))
+        .unwrap();
+    let verifications = integration_verifications(&detail);
+    assert_eq!(verifications.len(), 2, "{verifications:?}");
+    assert_eq!(verifications[1]["attempt"], 2);
+    assert_eq!(
+        verifications[1]["log_path"],
+        json!(second.to_str().unwrap())
+    );
+
+    // The triage reads the latest attempt's log and names the earlier one.
+    let run = &detail.runs[0];
+    let prompt = runtime::triage_prompt(&detail, run, 0, run_dir).unwrap();
+    assert!(
+        prompt.contains(&format!("Verification log {} (end)", second.display())),
+        "{prompt}"
+    );
+    assert!(
+        !prompt.contains(&format!("Verification log {} (end)", first.display())),
+        "{prompt}"
+    );
+    assert!(
+        prompt.contains(&format!(
+            "Logs of earlier integrate attempts (not shown): {}",
+            first.display()
+        )),
+        "{prompt}"
+    );
+    // review.md names the latest attempt's logs.
+    let head = run.result_commit().cloned().unwrap();
+    write_receipt_json(run, session_receipt(run, head.as_str(), "succeeded", "s"));
+    runtime::review(&db, TaskId::new(1)).unwrap();
+    let review = fs::read_to_string(run_dir.join("review.md")).unwrap();
+    assert!(
+        review.contains(&format!("latest attempt: {}", second.display())),
+        "{review}"
+    );
+}
+
+/// Integrate's verification logs are numbered per attempt; a run directory
+/// with the name used before (`integrate-verify-N.log`) is still read, as
+/// the attempt before the numbered ones.
+#[test]
+fn integrate_logs_are_kept_per_attempt_and_old_names_are_read() {
+    let dir = TempDir::new().unwrap();
+    let run_dir = dir.path();
+    assert_eq!(runtime::next_integrate_attempt(run_dir), 1);
+    assert_eq!(runtime::integrate_logs(run_dir), (vec![], vec![]));
+    assert_eq!(
+        runtime::review_logs_hint(Some(run_dir.to_str().unwrap())),
+        format!(
+            "{}/integrate-<attempt>-verify-N.log (one set per integrate attempt, written when integrate runs the verification commands after its rebase); none yet",
+            run_dir.display()
+        )
+    );
+    assert_eq!(runtime::review_logs_hint(None), "(no run directory)");
+    for name in [
+        "integrate-verify-1.log",
+        "integrate-verify-2.log",
+        "verify-1.log",
+        "integrate-x-verify-1.log",
+        "integrate-verify-y.log",
+        "notes.txt",
+    ] {
+        fs::write(run_dir.join(name), name).unwrap();
+    }
+    assert_eq!(
+        runtime::integrate_logs(run_dir),
+        (
+            vec![
+                run_dir.join("integrate-verify-1.log"),
+                run_dir.join("integrate-verify-2.log")
+            ],
+            vec![]
+        )
+    );
+    assert_eq!(runtime::next_integrate_attempt(run_dir), 1);
+    assert_eq!(
+        runtime::integrate_verify_log(run_dir, 1, 2),
+        run_dir.join("integrate-1-verify-2.log")
+    );
+    for name in [
+        "integrate-1-verify-1.log",
+        "integrate-10-verify-2.log",
+        "integrate-10-verify-10.log",
+        "integrate-2-verify-1.log",
+    ] {
+        fs::write(run_dir.join(name), name).unwrap();
+    }
+    let (latest, earlier) = runtime::integrate_logs(run_dir);
+    assert_eq!(
+        latest,
+        vec![
+            run_dir.join("integrate-10-verify-2.log"),
+            run_dir.join("integrate-10-verify-10.log")
+        ]
+    );
+    assert_eq!(
+        earlier,
+        vec![
+            run_dir.join("integrate-verify-1.log"),
+            run_dir.join("integrate-verify-2.log"),
+            run_dir.join("integrate-1-verify-1.log"),
+            run_dir.join("integrate-2-verify-1.log")
+        ]
+    );
+    assert_eq!(runtime::next_integrate_attempt(run_dir), 11);
+    assert!(
+        runtime::review_logs_hint(Some(run_dir.to_str().unwrap())).ends_with(&format!(
+            "latest attempt: {}, {}",
+            run_dir.join("integrate-10-verify-2.log").display(),
+            run_dir.join("integrate-10-verify-10.log").display()
+        ))
+    );
+    assert_eq!(runtime::next_integrate_attempt(&run_dir.join("missing")), 1);
 }
 
 #[test]
@@ -3577,7 +3717,7 @@ fn conflict_free_run_lands_as_one_squash_commit_and_releases_dependents() {
         event_kinds(&detail)
     );
     let run_dir = Path::new(run.run_dir().unwrap());
-    assert!(run_dir.join("integrate-verify-1.log").exists());
+    assert!(run_dir.join("integrate-1-verify-1.log").exists());
     assert!(!run_dir.join("verify-1.log").exists());
     let changed = detail
         .events
@@ -5656,7 +5796,7 @@ fn verification_failure_after_rebase_needs_a_session_and_keeps_the_rebased_tree(
     assert_eq!(git_out(&worktree, &["status", "--porcelain"]), "");
     assert!(
         Path::new(run.run_dir().unwrap())
-            .join("integrate-verify-1.log")
+            .join("integrate-1-verify-1.log")
             .exists()
     );
     let parked = queue.show(victim).unwrap().runs[0].clone();

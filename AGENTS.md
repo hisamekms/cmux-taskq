@@ -58,7 +58,7 @@ cargo clippy --locked --all-targets -- -D warnings
 
 役割はこの 5 つ（ADR-0024 の決定 1、[docs/design/overview.md](docs/design/overview.md) の用語集）。runtime の `supervise` プロセスが **supervisor**（claim・worker の起動・validating・run ごとの headless の review / triage の job・resume・着地・後始末）、run ごとに worktree で作業する Claude session が **worker**、人と対話して goal / task を登録する常駐 session が **planner**、人に届くもの（ask と attention）の窓口になる常駐 session が **inbox**、supervisor が timer で起動する headless の job が **observer**。以前の常駐 session（ADR-0010〜0023 に出てくる英字の役割名）は ADR-0024 で退役し、既存 ADR のその記述は overview の用語集で読み替える。
 
-同じ commit に対する verification は `integrate` の 1 回が正で、validating は receipt・commit・clean・要求 evidence だけを見て `verification_commands` を実行しない。`integrate` は rebase の有無に関わらず rebase 後に必ず `verification_commands` を実行し（`integrate-verify-N.log`）、失敗すれば run は `needs_session` になって supervisor が resume する（[ADR-0023](docs/adr/0023-verify-once-review-in-supervisor-run-env-graph-and-stats.md) 決定 1）。
+同じ commit に対する verification は `integrate` の 1 回が正で、validating は receipt・commit・clean・要求 evidence だけを見て `verification_commands` を実行しない。`integrate` は rebase の有無に関わらず rebase 後に必ず `verification_commands` を実行し（試行ごとの `integrate-<attempt>-verify-N.log`）、失敗すれば run は `needs_session` になって supervisor が resume する（[ADR-0023](docs/adr/0023-verify-once-review-in-supervisor-run-env-graph-and-stats.md) 決定 1）。
 
 ### 起動と停止（`up` / `down`）
 

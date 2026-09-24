@@ -29,7 +29,7 @@ Task `status`: `draft` → `ready` → `in_progress` → `completed`, or `cancel
 
 Run `status` in `runs` (latest last): `claimed`, `starting`, `running`, `validating` are unfinished; `awaiting_integration` means the receipt passed validation (the verification commands have not run yet; `integrate` runs them after its rebase) and the run waits for `integrate` to land it on `main`; `integrating` means an `integrate` process is landing it right now; `needs_session` means the landing hit a rebase conflict or a failed verification and the supervisor resumes the run's session to fix it, up to three times (`last_error` says what); `integrated` means the run was squashed onto `main` (`result_commit` is the landed commit) and the task is `completed`; `failed` and `interrupted` keep their worktree and workspace for inspection, with the reason in `last_error`. Dependency-free tasks run in parallel (up to the supervisor's `--parallel`), each in its own workspace and worktree; a dependent task waits until every predecessor is `completed`.
 
-Useful run fields: `branch` (`dagq/<run-id>`), `worktree_path`, `workspace_id` (cmux), `result_commit`, `last_error`, and with `show ID --full` also `run_dir` (prompt, logs, `receipt.json`, `integrate-verify-N.log`), `receipt_path`, `workspace_closed_at`.
+Useful run fields: `branch` (`dagq/<run-id>`), `worktree_path`, `workspace_id` (cmux), `result_commit`, `last_error`, and with `show ID --full` also `run_dir` (prompt, logs, `receipt.json`, `integrate-<attempt>-verify-N.log`, one set per integrate attempt), `receipt_path`, `workspace_closed_at`.
 
 ## Decide what to run first with `graph`
 

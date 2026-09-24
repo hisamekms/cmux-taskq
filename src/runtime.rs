@@ -4843,8 +4843,9 @@ pub const TRIAGE_TOOLS: &[&str] = &["Read", "Grep", "Glob"];
 /// ends).
 const TRIAGE_TAIL_BYTES: usize = 3000;
 
-/// Logs of a run directory the triage reads: `integrate-verify-N.log` and
-/// `verify-N.log`, in name order, at most this many.
+/// Logs of a run directory the triage reads: the latest integrate
+/// attempt's `integrate-<attempt>-verify-N.log` (see [`integrate_logs`]) and
+/// `verify-N.log`, at most this many.
 const TRIAGE_LOGS: usize = 8;
 
 /// What the headless triage is asked (ADR-0024 decision 3): the task, the
@@ -4882,23 +4883,27 @@ pub fn triage_prompt(
             ))
         )
     ));
-    let mut logs: Vec<PathBuf> = fs::read_dir(dir)
-        .map(|entries| {
-            entries
-                .filter_map(|entry| entry.ok().map(|e| e.path()))
-                .filter(|path| {
-                    path.file_name()
-                        .and_then(|n| n.to_str())
-                        .is_some_and(|name| {
-                            (name.starts_with("integrate-verify-") || name.starts_with("verify-"))
-                                && name.ends_with(".log")
-                        })
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-    logs.sort();
+    let (latest, earlier) = integrate_logs(dir);
+    let mut logs = latest;
+    // `verify-N.log` is what validation wrote before ADR-0023.
+    let mut validation: Vec<PathBuf> = log_names(dir)
+        .into_iter()
+        .filter(|(name, _)| name.starts_with("verify-") && name.ends_with(".log"))
+        .map(|(_, path)| path)
+        .collect();
+    validation.sort();
+    logs.extend(validation);
     logs.truncate(TRIAGE_LOGS);
+    if !earlier.is_empty() {
+        material.push_str(&format!(
+            "Logs of earlier integrate attempts (not shown): {}\n",
+            earlier
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
     if logs.is_empty() {
         material.push_str("Verification logs: none\n");
     }
@@ -5951,8 +5956,11 @@ fn land(
     } else {
         run_env(repository, db, run_dir)?
     };
+    // Each attempt keeps its own logs, so a second integrate of the run does
+    // not overwrite why the first one failed.
+    let attempt = next_integrate_attempt(run_dir);
     for (index, command) in commands.iter().enumerate() {
-        let log = run_dir.join(format!("integrate-verify-{}.log", index + 1));
+        let log = integrate_verify_log(run_dir, attempt, index + 1);
         let status = run_shell_to_log(command, worktree, &run_env, &log)?;
         let exit_code = status.code().unwrap_or(128);
         let output = fs::read_to_string(&log).unwrap_or_default();
@@ -5961,6 +5969,7 @@ fn land(
             "verification_command",
             json!({
                 "phase": "integration",
+                "attempt": attempt,
                 "index": index + 1,
                 "command": command,
                 "exit_code": exit_code,
@@ -5997,6 +6006,71 @@ fn land(
         },
         receipt.follow_ups,
     ))
+}
+
+/// Where integrate's attempt `attempt` writes the log of its `index`th
+/// verification command (both from 1): `integrate-<attempt>-verify-<index>.log`.
+pub fn integrate_verify_log(run_dir: &Path, attempt: u32, index: usize) -> PathBuf {
+    run_dir.join(format!("integrate-{attempt}-verify-{index}.log"))
+}
+
+/// The attempt and command index of an integrate verification log's file
+/// name. The name used before attempts were counted,
+/// `integrate-verify-<index>.log`, is attempt 0: it came before any
+/// numbered one.
+fn integrate_log_key(name: &str) -> Option<(u32, usize)> {
+    let stem = name.strip_prefix("integrate-")?.strip_suffix(".log")?;
+    if let Some(index) = stem.strip_prefix("verify-") {
+        return Some((0, index.parse().ok()?));
+    }
+    let (attempt, index) = stem.split_once("-verify-")?;
+    Some((attempt.parse().ok()?, index.parse().ok()?))
+}
+
+/// The files of `dir` with their names.
+fn log_names(dir: &Path) -> Vec<(String, PathBuf)> {
+    fs::read_dir(dir)
+        .map(|entries| {
+            entries
+                .filter_map(|entry| entry.ok().map(|e| e.path()))
+                .filter_map(|path| {
+                    let name = path.file_name()?.to_str()?.to_owned();
+                    Some((name, path))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The attempt integrate's next run of the verification commands writes
+/// its logs under: one past the highest attempt in `run_dir` (1 when none).
+pub fn next_integrate_attempt(run_dir: &Path) -> u32 {
+    log_names(run_dir)
+        .iter()
+        .filter_map(|(name, _)| integrate_log_key(name))
+        .map(|(attempt, _)| attempt)
+        .max()
+        .map_or(1, |attempt| attempt + 1)
+}
+
+/// Integrate's verification logs in `run_dir`: those of the latest attempt
+/// in command order, and those of the earlier attempts, oldest first.
+pub fn integrate_logs(run_dir: &Path) -> (Vec<PathBuf>, Vec<PathBuf>) {
+    let mut keyed: Vec<((u32, usize), PathBuf)> = log_names(run_dir)
+        .into_iter()
+        .filter_map(|(name, path)| Some((integrate_log_key(&name)?, path)))
+        .collect();
+    keyed.sort();
+    let Some(&((latest, _), _)) = keyed.last() else {
+        return (Vec::new(), Vec::new());
+    };
+    let (current, earlier): (Vec<_>, Vec<_>) = keyed
+        .into_iter()
+        .partition(|((attempt, _), _)| *attempt == latest);
+    (
+        current.into_iter().map(|(_, path)| path).collect(),
+        earlier.into_iter().map(|(_, path)| path).collect(),
+    )
 }
 
 /// Title, the receipt's summary, and the trailers that tie the commit to
@@ -6197,6 +6271,24 @@ fn or_none(text: &str) -> &str {
     }
 }
 
+/// Where review.md says the verification logs are: integrate writes
+/// `integrate-<attempt>-verify-N.log` per attempt, and the latest attempt's
+/// logs are named when one ran.
+pub fn review_logs_hint(run_dir: Option<&str>) -> String {
+    let Some(run_dir) = run_dir else {
+        return "(no run directory)".to_owned();
+    };
+    let pattern = format!(
+        "{run_dir}/integrate-<attempt>-verify-N.log (one set per integrate attempt, written when integrate runs the verification commands after its rebase)"
+    );
+    let (latest, _) = integrate_logs(Path::new(run_dir));
+    if latest.is_empty() {
+        return format!("{pattern}; none yet");
+    }
+    let latest: Vec<String> = latest.iter().map(|p| p.display().to_string()).collect();
+    format!("{pattern}; latest attempt: {}", latest.join(", "))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn review_markdown(
     task: &Task,
@@ -6215,7 +6307,7 @@ fn review_markdown(
          - head: {head}\n\
          - branch: {branch}\n\
          - worktree: {worktree}\n\
-         - verification logs: {run_dir}/integrate-verify-N.log (written when integrate runs the verification commands after its rebase)\n\n\
+         - verification logs: {logs}\n\n\
          ## Task\n\n\
          ### Description\n\n{description}\n\n\
          ### Acceptance\n\n{acceptance}\n\n\
@@ -6227,7 +6319,7 @@ fn review_markdown(
         run_base = run.base_commit(),
         branch = run.branch().unwrap_or("(none)"),
         worktree = run.worktree_path().unwrap_or("(none)"),
-        run_dir = run.run_dir().unwrap_or("(none)"),
+        logs = review_logs_hint(run.run_dir()),
         description = or_none(task.description()),
         acceptance = or_none(task.acceptance()),
         verify = fenced("sh", &task.verification_commands().join("\n")),
