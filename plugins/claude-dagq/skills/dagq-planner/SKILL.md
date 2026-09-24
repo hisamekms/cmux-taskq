@@ -13,6 +13,8 @@ This session talks with the person directly (ask them in the terminal or with `A
 
 Hear the problem, then follow the `dagq` skill's section 2: a goal (`goal add`, with acceptance and constraints) unless it is a one-shot task, tasks with `add --goal` (acceptance, verification commands, dependencies, context, `--evidence` per the repository's instructions), and `ready` for each once the person agrees with the decomposition. Check with `"$DAGQ" graph --goal ID` that the order and the critical chain look right. The supervisor claims ready tasks by itself; nothing else needs to be told.
 
+Give a task a priority only when the person says it should go first or can wait (`add --priority LEVEL`, or `set-priority TASK LEVEL` while it is `draft` or `ready`): `urgent` for a defect stopping operation, `high` for work others build on, `low` for what can wait, `normal` otherwise. Keep `interrupt` for an exceptional cut-in the person asks for, never as a habit. A ready task's priority carries over to the unfinished tasks it waits on, so raise the one that matters, not its chain. To hurry a task, raise its priority; never move other tasks back to `draft` or bend dependencies for it. The meaning of each level and the claim order are in "Priority and claim order" of `${CLAUDE_PLUGIN_ROOT}/skills/dagq/reference/inspect.md`.
+
 ## 2. Follow a goal
 
 `"$DAGQ" goal list` gives each goal's task counts; `"$DAGQ" goal show ID` its tasks and latest events; `graph --goal ID` what waits on what. Report to the person: which tasks are completed, in progress or blocked, and what is waiting on them. A run waiting on the person shows as an ask in `status` (the inbox shows it); do not answer it here.
@@ -32,4 +34,4 @@ When the person asks to start or stop the queue, or to replace the fixed `dagq` 
 
 ## Where your authority ends
 
-Do with the person's agreement: `goal add`, `add`, `dependency`, `set-goal`, `ready`, `draft`, `cancel` of a draft or ready task, `goal ready`, `goal edit`, `goal close`, `note`, and `up` / `down` (section 5). Never: `integrate`, `review`, `answer`, `ask close`, `recover`, or anything in a run's worktree or workspace; those are the inbox's, on the person's word (`dagq-recover`).
+Do with the person's agreement: `goal add`, `add`, `dependency`, `set-goal`, `set-priority`, `ready`, `draft`, `cancel` of a draft or ready task, `goal ready`, `goal edit`, `goal close`, `note`, and `up` / `down` (section 5). Never: `integrate`, `review`, `answer`, `ask close`, `recover`, or anything in a run's worktree or workspace; those are the inbox's, on the person's word (`dagq-recover`).

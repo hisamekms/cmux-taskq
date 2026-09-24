@@ -1,6 +1,6 @@
 # Inspect commands and their fields
 
-Read this when you need a field of `list`, `show`, `goal show`, `graph`, `status`, `stats` or `doctor`, or the meaning of a task or run status.
+Read this when you need a field of `list`, `show`, `goal show`, `graph`, `status`, `stats` or `doctor`, the meaning of a task or run status, or how priority orders claiming.
 
 | Command | Use |
 | --- | --- |
@@ -9,8 +9,8 @@ Read this when you need a field of `list`, `show`, `goal show`, `graph`, `status
 | `"$DAGQ" list` | One page of unfinished tasks, newest first: `{"tasks", "next", "total"}` (see below) |
 | `"$DAGQ" show ID` | `task` (with `goal_id` and `context`), `dependencies`, `runs` (only the latest: `id`, `status`, `branch`, `result_commit`, `last_error`, `last_error_code` when known, `worktree_path`, `workspace_id`; `runs_total` counts them all), `events` (the latest 10, `--events N` for more, with `id`, `kind`, `created_at`, `run_id` when the event belongs to a run, and only `status` / `reason` / `last_error` / `from` / `to` / `code` (the reason code) of the payload; `events_total` counts them all), `processes` (the latest run's), `observations` (the latest 5 notes on the task or its runs: `id`, `created_at`, `run_id`, `text`, `kind`, `by`) |
 | `"$DAGQ" notes` | Notes as `{"notes", "cursor"}`, oldest first: the latest `--limit` (default 20), or with `--since CURSOR` the first `--limit` after it. `--goal ID` keeps the goal's notes and its tasks' and runs'; `--task ID` the task's and its runs'. Each note is a run event of kind `observation` with payload `text`, `kind` (a slug, default `note`) and `by` (`DAGQ_ROLE` of the writer, or `human`) |
-| `"$DAGQ" candidates` | Which tasks the next `supervise` can pick, in ID order: ready, every predecessor completed, no unfinished run, and not in a draft goal |
-| `"$DAGQ" graph [--goal ID]` | Unfinished (`draft`, `ready`, `in_progress`) tasks as `{"tasks", "candidates", "critical"}`: per task `id`, `status`, `title`, `goal_id`, `goal_status` (only for a task in a goal; a `draft` goal's tasks are never candidates), `depends_on` (every direct predecessor), `ready_after` (the unfinished ones it still waits for), `blocks` (unfinished tasks depending on it directly) and `unblocks` (how many unfinished tasks depend on it directly or transitively); `candidates` in the order the supervisor claims them (most `unblocks` first, ties by ID); `critical` the chain from the task with the most `unblocks` down its most-releasing dependents (empty when nothing blocks anything). `--goal` narrows the tasks, candidates and the chain's start to one goal; the counts still span every goal |
+| `"$DAGQ" candidates` | Which tasks the next `supervise` can pick, in claim order (see "Priority and claim order"): ready, every predecessor completed, every goal it depends on closed as achieved, no unfinished run, and not in a draft goal. Each is the task (with its `priority`) plus the `effective_priority` it is claimed by |
+| `"$DAGQ" graph [--goal ID]` | Unfinished (`draft`, `ready`, `in_progress`) tasks as `{"tasks", "candidates", "critical"}`: per task `id`, `status`, `title`, `goal_id`, `goal_status` (only for a task in a goal; a `draft` goal's tasks are never candidates), `depends_on` (every direct predecessor), `ready_after` (the unfinished ones it still waits for), `blocks` (unfinished tasks depending on it directly), `unblocks` (how many unfinished tasks depend on it directly or transitively), `priority` (its own) and `effective_priority` (what it is claimed by); `candidates` in the order the supervisor claims them (highest `effective_priority`, then most `unblocks`, then lowest ID); `critical` the chain from the task with the most `unblocks` down its most-releasing dependents (empty when nothing blocks anything). `--goal` narrows the tasks, candidates and the chain's start to one goal; the counts still span every goal |
 | `"$DAGQ" locate` | The queue this directory resolves to (`db`, `runs_dir`, `git_common_dir`, `db_exists`) without opening it |
 | `"$DAGQ" status` | `supervisors`: every registered `supervise` process (`pid`, `alive`, `parallel`, `heartbeat_age_secs`, `stale`, `run_ids`; listed even while it holds no run) plus any `integrate` process holding a lease (`registered: false`); `runs`: unfinished runs with their leases |
 | `"$DAGQ" stats` | Where time goes, from run events: `runs` (latest 50 finished; `--full` all) with seconds of `work` (claim→receipt), `validate` (receipt→validation), `wait_to_land` (validation→integrated), `startup`, and counts `resumes`, `needs_session`, `failed`, `review_verdict`; `goals` and `overall` with `{count, total, median}` per interval; `alerts` (`{kind, task_id, run_id, value, threshold}`: `awaiting_integration` > 15 min, 3rd `needs_session`, `ask_unanswered` > 60 min, `task_failed` twice, `work_over_median` > 2× the goal median, `idle_slots` with ready tasks all blocked, `backend_failures` 2 or more failed cmux calls in the window); `backend_failures` (`{count, by_op, max_load_avg, max_slots}`: `backend_call_failed` events in the window, per op, the highest 1-minute load and slots held); `next_cursor` — pass it to `--since` for only runs finished later. `--goal ID` narrows to one goal |
@@ -19,7 +19,7 @@ Read this when you need a field of `list`, `show`, `goal show`, `graph`, `status
 `list` answers "which tasks are moving or can move" and "how far is this goal". It prints `{"tasks": [...], "next": ID | null, "total": N}`:
 
 - `tasks`: at most `--limit` (default 20) tasks in ID descending order (newest first). By default only unfinished ones (`draft`, `ready`, `in_progress`); `--status ready,in_progress` picks statuses (any of them; an unknown status exits 1 with an error), `--all` adds `completed` and `canceled`, `--goal ID` keeps one goal's tasks. `--status` / `--all` and `--goal` combine with AND.
-- Each task has only `id`, `status`, `title`, `goal_id`, `dependencies` (predecessor IDs) and `latest_run` (`{"id", "status"}` of the newest run, or null). `--full` adds `description`, `acceptance`, `context`, `verification_commands`, `created_at`, `updated_at`; prefer `show ID` for one task.
+- Each task has only `id`, `status`, `title`, `priority`, `goal_id`, `dependencies` (predecessor IDs), `goal_dependencies` and `latest_run` (`{"id", "status"}` of the newest run, or null). `--full` adds `description`, `acceptance`, `context`, `verification_commands`, `created_at`, `updated_at`; prefer `show ID` for one task.
 - `next`: null means this page is the last one. Otherwise pass it as `--before NEXT` (with the same filters) for the following page; it is the ID of the first task of that page. Decide whether more pages exist from `next` alone — never by counting `tasks`.
 - `total`: how many tasks match the filters across all pages.
 
@@ -38,7 +38,30 @@ When planning a goal or deciding what to make `ready` next, read `"$DAGQ" graph 
 1. `critical` is the chain that holds back the most work. Its first task should be `ready` and running; if it is `draft`, make it `ready` before tasks with small `unblocks`.
 2. A task with a large `unblocks` that is not in `candidates` waits on its `ready_after`; those predecessors are what to finish (or to review and land) first.
 3. When one task blocks many (goal 8 had five tasks waiting on one), consider splitting it or removing a dependency that is not real (`dependency remove`) so more tasks run in parallel.
-4. `candidates` is the order the supervisor will claim in, so there is no need to register or `ready` tasks in a particular order to get the releasing ones first.
+4. `candidates` is the order the supervisor will claim in, so there is no need to register or `ready` tasks in a particular order to get the releasing ones first. To put a task ahead of the others, give it a priority (below).
+
+## Priority and claim order
+
+Every task has one of five priorities. Pick it by what waiting costs, not by how much the task matters in general:
+
+| Level | Use for | Example |
+| --- | --- | --- |
+| `interrupt` | An exceptional cut-in that must run before every other ready task. Not for routine use: when many tasks are `interrupt`, it orders nothing | A goal the person decided to put ahead of the whole queue (goal 28, which added priorities) |
+| `urgent` | A defect that is stopping operation now | The supervisor or landing is broken |
+| `high` | Work to do early, because other work builds on it | A cleanup or refactor several planned tasks assume |
+| `normal` | Everything else (the default) | |
+| `low` | Work that can wait | A conditional proposal, an observer's idea not yet needed |
+
+```sh
+"$DAGQ" add "TITLE" --goal 1 --priority high ...   # default normal; names only (no numbers)
+"$DAGQ" set-priority TASK urgent                    # a draft or ready task
+```
+
+- **Claim order.** The supervisor, `candidates` and `graph`'s `candidates` all use one order: highest effective priority → most `unblocks` → lowest ID. (A goal rank will sit between priority and `unblocks` once goals get one.)
+- **Effective priority.** A task's own priority, raised to the highest priority of the `ready` tasks that wait on it directly or transitively. So a `high` ready task pulls its unfinished predecessors ahead with it; there is no need to raise them one by one. Only `ready` tasks outside a draft goal pass their priority on: an `in_progress`, `draft`, `canceled` or `completed` task, or a task in a draft goal, raises nothing (a draft set aside does not push its predecessors forward). A task in between does not stop it: a ready task's priority still reaches the predecessors beyond a draft one. `graph` shows both `priority` and `effective_priority`.
+- **When it can change.** Only while the task is `draft` or `ready`; `set-priority` on a claimed (`in_progress`) or finished task is refused. It takes effect at the next claim and never stops a run already running. A change is recorded as a `task_priority_changed` event (`from`, `to`).
+- **Express urgency with priority only.** Do not move other tasks back to `draft`, and do not add or remove dependencies that are not real, to get one task claimed first; give it a higher priority instead.
+- **No aging.** A `low` task waits as long as higher ones keep arriving; nothing raises it over time. Check `graph` for ready tasks that never reach the front and raise them by hand.
 
 ## Change a goal or a task's goal
 
