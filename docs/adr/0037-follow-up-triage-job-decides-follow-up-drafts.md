@@ -1,5 +1,5 @@
 ---
-id: adr-0035
+id: adr-0037
 type: adr
 title: follow_upのdraft taskの採否をsupervisorが起動するheadlessのfollow-up triage jobが決め、判断がつかないものだけinboxで人に聞く
 status: accepted
@@ -27,7 +27,7 @@ related:
   - design-plugin-integration
 ---
 
-# ADR-0035: follow_upのdraft taskの採否をsupervisorが起動するheadlessのfollow-up triage jobが決め、判断がつかないものだけinboxで人に聞く
+# ADR-0037: follow_upのdraft taskの採否をsupervisorが起動するheadlessのfollow-up triage jobが決め、判断がつかないものだけinboxで人に聞く
 
 ## Context
 
