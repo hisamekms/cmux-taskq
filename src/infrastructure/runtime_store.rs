@@ -277,15 +277,16 @@ impl SqliteQueue {
         Ok(())
     }
 
-    /// `running` and `validating` runs whose lease carries a token other
-    /// than `token`, oldest run first, each with its wrapper registration.
-    /// Runs in other statuses and runs without a lease are not adoptable,
-    /// so they are not listed.
+    /// `running`, `validating` and `awaiting_integration` runs whose lease
+    /// carries a token other than `token`, oldest run first, each with its
+    /// wrapper registration. An `awaiting_integration` run is leased only
+    /// while its supervisor reviews it (ADR-0027). Runs in other statuses
+    /// and runs without a lease are not adoptable, so they are not listed.
     pub fn runs_leased_by_others(&self, token: &str) -> Result<Vec<LeasedRun>> {
         let mut statement = self.conn.prepare(
             "SELECT r.*, l.token, l.pid, l.heartbeat_at FROM task_runs r
              JOIN run_leases l ON l.run_id=r.id
-             WHERE r.status IN ('running','validating') AND l.token<>?1
+             WHERE r.status IN ('running','validating','awaiting_integration') AND l.token<>?1
              ORDER BY r.rowid",
         )?;
         let rows = statement
@@ -346,7 +347,8 @@ impl SqliteQueue {
             .query_row(
                 "SELECT l.run_id,l.token,l.pid,l.heartbeat_at FROM run_leases l
                  JOIN task_runs r ON r.id=l.run_id
-                 WHERE l.run_id=?1 AND l.token=?2 AND r.status IN ('running','validating')",
+                 WHERE l.run_id=?1 AND l.token=?2
+                 AND r.status IN ('running','validating','awaiting_integration')",
                 params![id, previous_token],
                 lease_row,
             )
@@ -979,6 +981,104 @@ impl SqliteQueue {
         Ok(result)
     }
 
+    /// Hand a run whose session went idle after its receipt to validation
+    /// with the session still alive (ADR-0027 decision 1): `running` becomes
+    /// `validating` under the same lease, and `supervision_finished` records
+    /// `session_live: true` with no exit code.
+    pub fn finish_supervision_live(&mut self, id: &str, token: &str) -> Result<TaskRun> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        assert_lease(&tx, id, token)?;
+        ensure!(
+            tx.execute(
+                "UPDATE task_runs SET status='validating' WHERE id=?1 AND supervisor_token=?2
+                 AND status IN ('starting','running')",
+                params![id, token]
+            )? == 1,
+            "run is not owned by this supervisor"
+        );
+        run_event(
+            &tx,
+            id,
+            "supervision_finished",
+            json!({"status": "validating", "exit_code": null, "session_live": true}),
+        )?;
+        let result = tx.query_row(
+            "SELECT * FROM task_runs WHERE id=?1",
+            [id],
+            run_row(&self.runs_dir),
+        )?;
+        tx.commit()?;
+        Ok(result)
+    }
+
+    /// Validate an `awaiting_integration` run again under the lease that
+    /// reviews it, after its live session rewrote the receipt for a
+    /// `revise` verdict (ADR-0027 decision 2); `revise_finished` is the
+    /// record of why.
+    pub fn restart_validation(&mut self, id: &str, token: &str) -> Result<TaskRun> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        assert_lease(&tx, id, token)?;
+        ensure!(
+            tx.execute(
+                "UPDATE task_runs SET status='validating' WHERE id=?1 AND supervisor_token=?2
+                 AND status='awaiting_integration'",
+                params![id, token]
+            )? == 1,
+            "run is not awaiting integration under this supervisor"
+        );
+        let result = tx.query_row(
+            "SELECT * FROM task_runs WHERE id=?1",
+            [id],
+            run_row(&self.runs_dir),
+        )?;
+        tx.commit()?;
+        Ok(result)
+    }
+
+    /// Apply the `send_back` or `cancel` answer of an `approve_landing` ask
+    /// to a run awaiting integration that nobody leases: it becomes
+    /// `status` (`needs_session` or `failed`) with `reason` as `last_error`,
+    /// recorded as `landing_decided` with `payload`.
+    pub fn decide_landing(
+        &mut self,
+        id: &str,
+        status: crate::domain::RunStatus,
+        reason: &str,
+        mut payload: serde_json::Value,
+    ) -> Result<TaskRun> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let leased: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM run_leases WHERE run_id=?1)",
+            [id],
+            |r| r.get(0),
+        )?;
+        ensure!(!leased, "run {id} is leased");
+        ensure!(
+            tx.execute(
+                "UPDATE task_runs SET status=?2,last_error=?3 WHERE id=?1
+                 AND status='awaiting_integration'",
+                params![id, status.as_str(), reason]
+            )? == 1,
+            "run {id} is not awaiting integration"
+        );
+        payload["status"] = json!(status.as_str());
+        payload["reason"] = json!(reason);
+        run_event(&tx, id, "landing_decided", payload)?;
+        let result = tx.query_row(
+            "SELECT * FROM task_runs WHERE id=?1",
+            [id],
+            run_row(&self.runs_dir),
+        )?;
+        tx.commit()?;
+        Ok(result)
+    }
+
     pub fn finish_validation(
         &mut self,
         id: &str,
@@ -1191,8 +1291,9 @@ impl SqliteQueue {
             )? == 1,
             "run {id} is {previous}; only a run awaiting integration or a session can be integrated"
         );
-        // A supervisor landing a run it resumed already holds its lease
-        // under the same token; any other lease means someone owns the run.
+        // A supervisor landing a run it resumed or reviewed already holds
+        // its lease under the same token; any other lease means someone
+        // owns the run.
         ensure!(
             tx.execute(
                 "INSERT INTO run_leases(run_id,token,pid) VALUES (?1,?2,?3)

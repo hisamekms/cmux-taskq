@@ -478,6 +478,29 @@ enum GoalCommand {
 
 /// The error of a command the observer may not run.
 const OBSERVER_DENIED: &str = "observer may not change queue state";
+/// The error of a command the headless reviewer may not run.
+const REVIEWER_DENIED: &str = "reviewer may not change queue state";
+
+/// What the supervisor's headless review may run (ADR-0027): reads only.
+fn reviewer_access(command: &Command) -> ObserverAccess {
+    match command {
+        Command::Locate
+        | Command::List { .. }
+        | Command::Show { .. }
+        | Command::Candidates
+        | Command::Graph { .. }
+        | Command::Status { .. }
+        | Command::Asks { .. }
+        | Command::Events { .. }
+        | Command::Stats { .. }
+        | Command::Doctor { .. }
+        | Command::Notes { .. }
+        | Command::Goal {
+            command: GoalCommand::List | GoalCommand::Show { .. },
+        } => ObserverAccess::Allowed,
+        _ => ObserverAccess::Denied,
+    }
+}
 
 /// What the observer's environment may run (ADR-0024 decision 4).
 #[derive(Debug, PartialEq, Eq)]
@@ -535,6 +558,11 @@ fn execute(cli: Cli) -> Result<Value> {
     };
     if access == ObserverAccess::Denied {
         bail!(OBSERVER_DENIED);
+    }
+    if role.as_deref() == Some(dagq::lifecycle::REVIEWER_ROLE)
+        && reviewer_access(&cli.command) == ObserverAccess::Denied
+    {
+        bail!(REVIEWER_DENIED);
     }
     let cwd = env::current_dir().context("working directory is unavailable")?;
     let location = QueueLocation::resolve(cli.db.as_deref(), &cwd)?;

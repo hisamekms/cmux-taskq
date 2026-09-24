@@ -30,7 +30,7 @@ Read, in this order:
 
 1. `supervisors`: healthy is `registered: true`, `alive: true`, `stale: false`. Empty, or `stale: true`, means nothing serves the queue: run `up` again, and report a stale row whose process is still alive to the user (it is stopped with `down --force`, never by you).
 2. `attention`: what waits for you now. Each entry has `run_id`, `task_id`, `status`, `kind`, `last_error` and a fixed `next`. Route it:
-   - `review and integrate` (`awaiting_integration`): the `dagq-land` skill.
+   - `review by hand` / `review and integrate`: `dagq-land`; `reviewing (runtime)`: nothing.
    - `resuming (runtime)` (`needs_session`): the supervisor is resolving it; nothing to do.
    - `resume session` (`needs_session` the runtime gave up), `inspect and close workspace` (`failed`), `answer the prompt in workspace <id>` (`prompt_waiting`: a worker stopped at a dialog), `send the answer of ask <id> to the worker and close it`: the `dagq-session` skill.
    - `recover run` (`kind` `runtime_error`: an unfinished run left without a lease): the `dagq-recover` skill.
@@ -66,7 +66,7 @@ When a run needs a decision you cannot make yourself (landing on doubt, a choice
 
 Leave that run alone until its answer arrives as an `ask_answered` from your `watch`; read it with `"$DAGQ" asks --role maintainer`, act on it, then `"$DAGQ" ask close <id>`:
 
-- `approve_landing`: the `dagq-land` skill, step 5.
+- `approve_landing`: `dagq-land`, step 5.
 - `decide` you forwarded from a worker's `worker_question`: pass it on unchanged (`dagq-session`, section 2).
 - Other `decide` / `answer_prompt`: do what the answer says within step 5 (a dialog's key as in `dagq-session`); report anything beyond it.
 - `stuck_exit` (a session held the supervisor's `/exit` back): `dagq-session`, section 3.
@@ -76,7 +76,7 @@ Before your first ask, read the asks section of `${CLAUDE_PLUGIN_ROOT}/skills/da
 
 ## 5. Where your authority ends
 
-- Land without asking when the `dagq-land` review passes (`integrate` also pushes `main`); on doubt register an `approve_landing` ask (step 4) and land only once it is answered `land`.
+- Land without asking when the `dagq-land` review passes (`integrate` also pushes `main`); on doubt register an `approve_landing` ask (step 4); the supervisor applies its answer.
 - Ask first (an ask): `down --force`, `recover`, changing a task's acceptance, anything outside a run's own worktree, and a `push_failed` whose cause needs the person (`dagq-land`, step 6).
 - Do yourself: `up`, `status`, `watch`, `show`, `review`, `integrate` after a passing review, answering a trust or permission prompt about a run's own worktree or a worker's question about it (`dagq-session`), and reporting.
 - Not yours: `add`, `goal add`, `goal close`, and the `draft` tasks from `follow_ups` are the planner's (`dagq-planner`); `ready` / `cancel` only as an answer says. Record new work with `"$DAGQ" note --task ID --text "..."`.

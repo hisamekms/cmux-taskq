@@ -1603,3 +1603,41 @@ fn add_evidence_is_stored_and_shown() {
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("coverage"));
 }
+
+/// The supervisor's headless review runs under `DAGQ_ROLE=reviewer`
+/// (ADR-0027): it may read the queue and nothing else.
+#[test]
+fn reviewer_may_only_read_the_queue() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("queue.db");
+    ok(&db, &["init"]);
+    ok(&db, &["goal", "add", "open goal"]);
+    ok(&db, &["add", "existing", "--goal", "1"]);
+    for args in [
+        &["ready", "1"][..],
+        &["note", "--task", "1", "--text", "x"],
+        &["ask", "--kind", "decide", "--question", "q", "--task", "1"],
+        &["integrate", "1"],
+        &["review", "1"],
+        &["goal", "add", "draft", "--draft"],
+    ] {
+        let output = invoke_as(Some("reviewer"), &db, args);
+        assert!(!output.status.success(), "{args:?} was allowed");
+        let error: Value = serde_json::from_slice(&output.stderr).unwrap();
+        assert_eq!(
+            error,
+            serde_json::json!({"error": "reviewer may not change queue state"}),
+            "{args:?}"
+        );
+    }
+    for args in [
+        &["list"][..],
+        &["show", "1"],
+        &["status"],
+        &["asks"],
+        &["notes"],
+        &["goal", "show", "1"],
+    ] {
+        ok_as("reviewer", &db, args);
+    }
+}

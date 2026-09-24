@@ -332,6 +332,28 @@ pub trait AgentProvider {
     fn wait_interval(&self) -> std::time::Duration {
         std::time::Duration::from_secs(1)
     }
+    /// The headless review of an accepted run (ADR-0023 decision 2,
+    /// ADR-0027). Kept apart from [`AgentProvider::headless_command`]: a
+    /// review belongs to a run, and needs that run's directory (settings
+    /// without the worker's `Stop` hook, so the live session's idle marker
+    /// is not written, a debug file, `--add-dir`) and tools denied as well
+    /// as allowed, since the live worker session owns the worktree; the
+    /// observer's job has no run.
+    ///
+    /// A non-interactive agent in the run's worktree with settings of the
+    /// run directory and `prompt` as its only input, whose
+    /// stdout is the verdict JSON. It must not touch the worker session's
+    /// idle marker. The runtime wires stdin, stdout and stderr, waits at
+    /// most [`AgentProvider::review_timeout`] and reads stdout.
+    fn review_command(
+        &self,
+        run: &crate::domain::TaskRun,
+        prompt: &str,
+    ) -> Result<std::process::Command>;
+    /// How long the headless review may take before it counts as failed.
+    fn review_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(600)
+    }
 }
 
 /// The Git remote `integrate` pushes the landed `main` to (ADR-0019

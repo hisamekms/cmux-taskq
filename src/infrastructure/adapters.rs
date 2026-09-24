@@ -1308,6 +1308,46 @@ impl AgentProvider for ClaudeCode {
         command.arg("--").arg(prompt).stdin(Stdio::null());
         Ok(command)
     }
+    /// `claude -p` in the worktree with `claude-review-settings.json` of
+    /// the run directory: the worker's settings without its `Stop` hook, so
+    /// the review never writes the live session's idle marker. It may only
+    /// read (`Read`, `Grep`, `Glob` allowed; `Bash`, `Edit`, `Write`,
+    /// `NotebookEdit` disallowed); `review.md` is in the run directory.
+    fn review_command(&self, run: &TaskRun, prompt: &str) -> Result<Command> {
+        let run_dir = Path::new(run.run_dir.as_ref().context("missing run directory")?);
+        let settings = run_dir.join("claude-review-settings.json");
+        fs::write(&settings, review_settings()?)
+            .with_context(|| format!("write {}", settings.display()))?;
+        let mut command = Command::new(&self.executable);
+        command
+            .current_dir(run.worktree_path.as_ref().context("missing worktree")?)
+            .arg("-p")
+            .arg("--debug-file")
+            .arg(run_dir.join("claude-review.log"))
+            .arg("--add-dir")
+            .arg(run_dir)
+            .arg("--settings")
+            .arg(&settings)
+            .arg("--allowedTools")
+            .arg("Read,Grep,Glob")
+            // The live worker session owns the worktree: the review never
+            // edits it or runs commands in it.
+            .arg("--disallowedTools")
+            .arg("Bash,Edit,Write,NotebookEdit")
+            .arg("--")
+            .arg(prompt);
+        Ok(command)
+    }
+}
+
+/// Settings of the headless review: no hooks, and the same `autoMode`
+/// environment as a run session (see [`stop_hook_settings`]).
+pub fn review_settings() -> Result<String> {
+    Ok(serde_json::to_string_pretty(&serde_json::json!({
+        "autoMode": {
+            "environment": ["$defaults"]
+        }
+    }))?)
 }
 
 /// Claude Code's global config, where the folder trust of each project is

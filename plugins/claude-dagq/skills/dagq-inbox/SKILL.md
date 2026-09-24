@@ -7,7 +7,7 @@ description: Be a dagq queue's inbox: start from status --role inbox, wait for a
 
 Prerequisite: `DAGQ="${CLAUDE_PLUGIN_ROOT}/bin/dagq"` resolved as in the `dagq` skill (`"$DAGQ" --resolve`). Never open or edit the queue database; go through the CLI only.
 
-An **ask** is a question the maintainer, a worker or the observer registered in the queue for the person, and then stopped or moved on from. This session is how it reaches the person: it shows the ask, and writes the person's answer back with `answer`; the maintainer (or, for a worker's question, the supervisor) acts on it. `dagq ask` also sends one `cmux notify` to this workspace, so the person knows to look here.
+An **ask** is a question the maintainer, a worker or the observer registered in the queue for the person, and then stopped or moved on from. This session is how it reaches the person: it shows the ask, and writes the person's answer back with `answer`; the maintainer acts on it, or the supervisor for a worker's question and for an `approve_landing` answered with one of its options. `dagq ask` also sends one `cmux notify` to this workspace, so the person knows to look here.
 
 This session holds no state of its own. After a restart, compaction or `/clear`, start again from step 1 (the plugin's SessionStart hook prints `status --role inbox` after compaction and `/clear`).
 
@@ -44,7 +44,7 @@ When the person wants more context before answering, read it for them with `"$DA
 
 ## What the kinds mean to the person
 
-- `approve_landing`: the maintainer's review found a doubt about landing the run. `land` lands it as it is, `send_back` returns it for changes (ask the person what should change and include it in the answer, e.g. `send_back: <what to change>`), `cancel` drops the task.
+- `approve_landing`: the supervisor's review (or the maintainer's) found a doubt about landing the run; the question carries the reasons and where `review.md` is. Answer with exactly one of the options: `land` lands it as it is, `send_back` resumes the run's session to fix the review's reasons, `cancel` fails the run and drops the task. The supervisor applies the answer itself; any other text goes to the maintainer instead.
 - `answer_prompt`: a run's session stopped at a dialog; the answer is the choice to send to it.
 - `decide`: a choice the maintainer cannot make, often a worker's question passed on unchanged.
 - `worker_question`: a worker's own question. The maintainer may answer one about the run's own worktree first (step 3's error then); the answer reaches the worker's terminal.
@@ -53,4 +53,4 @@ When the person wants more context before answering, read it for them with `"$DA
 
 ## Where your authority ends
 
-Only `status`, `watch`, `asks`, `show` and `answer`. Never answer on the person's behalf, never pick a default, and never `ask close`, `integrate`, `review`, `ready`, `cancel`, `add` or type into another workspace: acting on an answer is the maintainer's, and registering work is the planner's.
+Only `status`, `watch`, `asks`, `show` and `answer`. Never answer on the person's behalf, never pick a default, and never `ask close`, `integrate`, `review`, `ready`, `cancel`, `add` or type into another workspace: acting on an answer is the supervisor's or the maintainer's, and registering work is the planner's.

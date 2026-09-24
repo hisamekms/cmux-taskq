@@ -75,6 +75,7 @@ string_enum!(SessionRole {
     Planner => "planner",
     Inbox => "inbox",
     Observer => "observer",
+    Reviewer => "reviewer",
 });
 
 // Whether a goal's tasks may run (ADR-0024 decision 5). A `draft` goal is a
@@ -109,6 +110,51 @@ string_enum!(AskKind {
     // and closes the ask itself once the session exits.
     StuckExit => "stuck_exit",
 });
+
+// The verdict of the supervisor's headless review (ADR-0023 decision 2,
+// ADR-0027 decision 2): `pass` lands the run, `revise` goes back to the live
+// worker session, `concern` waits for a person in an `approve_landing` ask.
+string_enum!(ReviewDecision {
+    Pass => "pass",
+    Revise => "revise",
+    Concern => "concern",
+});
+
+/// What the headless review prints on stdout: one JSON object.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewVerdict {
+    pub verdict: ReviewDecision,
+    pub reasons: Vec<String>,
+    pub summary: String,
+}
+
+impl ReviewVerdict {
+    /// The verdict in the review's stdout: the whole text, or else the
+    /// outermost `{...}` in it (a model may wrap the object in a fence or
+    /// a sentence).
+    pub fn parse(stdout: &str) -> Result<Self, String> {
+        let text = stdout.trim();
+        let parsed = serde_json::from_str::<Self>(text).or_else(|error| {
+            match (text.find('{'), text.rfind('}')) {
+                (Some(start), Some(end)) if start < end => {
+                    serde_json::from_str::<Self>(&text[start..=end])
+                }
+                _ => Err(error),
+            }
+        });
+        parsed.map_err(|error| format!("the review printed no verdict JSON: {error}"))
+    }
+}
+
+/// How many times the supervisor sends a `revise` verdict back to the live
+/// session of one run; a later review that does not pass is a `concern`
+/// (ADR-0027 decision 2).
+pub const MAX_REVISE_ATTEMPTS: usize = 2;
+
+/// The options of the `approve_landing` ask a `concern` opens, which the
+/// supervisor acts on once answered (ADR-0027, ADR-0022 decision 3).
+pub const LANDING_OPTIONS: &[&str] = &["land", "send_back", "cancel"];
 
 string_enum!(ReceiptResult {
     Succeeded => "succeeded",
@@ -1398,6 +1444,17 @@ pub enum AttentionNext {
     DeliverAnswer {
         ask_id: i64,
     },
+    /// Not the maintainer's to act on: the supervisor holds the accepted run
+    /// for its headless review and what follows from the verdict (ADR-0027).
+    Reviewing,
+    /// The headless review failed (`review_failed`): a person or the
+    /// maintainer reviews the run and calls `integrate` by hand.
+    ReviewByHand,
+    /// Not the maintainer's to act on: the supervisor lands, sends back or
+    /// cancels the run as the answer of its `approve_landing` ask says.
+    ApplyingAnswer {
+        ask_id: i64,
+    },
 }
 
 /// How many times the supervisor resumes one `needs_session` run (one
@@ -1430,6 +1487,11 @@ impl fmt::Display for AttentionNext {
                     "send the answer of ask {ask_id} to the worker and close it"
                 )
             }
+            Self::Reviewing => f.write_str("reviewing (runtime)"),
+            Self::ReviewByHand => f.write_str("review by hand"),
+            Self::ApplyingAnswer { ask_id } => {
+                write!(f, "applying the answer of ask {ask_id} (runtime)")
+            }
         }
     }
 }
@@ -1453,6 +1515,7 @@ pub const ATTENTION_KINDS: &[&str] = &[
     "runtime_error",
     "prompt_waiting",
     "resume_finished",
+    "review_failed",
     "ask_opened",
     "ask_answered",
     "ask_delivery_failed",
@@ -1488,20 +1551,27 @@ pub const ASK_EVENT_KINDS: &[&str] = &[
 /// unapproved run, `failed`), or when it was the last attempt and the run
 /// stays `needs_session` (`exhausted`); a resolved run the supervisor goes on
 /// to land is not.
+/// `validation_finished` into `awaiting_integration` is not one: the
+/// supervisor reviews the run (ADR-0027); `review_failed` is, since the
+/// run then waits for a review by hand.
 /// `ask_opened` waits for the inbox's answer and
 /// `ask_answered` for the maintainer to read it, see [`attention_role`],
 /// except the answer of a `worker_question`, which the supervisor types into
 /// the worker's terminal itself (`runtime_delivers: true`); its answer to a
 /// run no longer running and its `ask_delivery_failed` are the maintainer's.
+/// The answer of an `approve_landing` ask the supervisor applies
+/// (`runtime_delivers: true`: one of [`LANDING_OPTIONS`] for a run awaiting
+/// integration) is not one either.
 pub fn event_attention(kind: &str, payload: &serde_json::Value) -> Option<AttentionNext> {
     let status = payload
         .get("status")
         .and_then(serde_json::Value::as_str)
         .and_then(|status| status.parse::<RunStatus>().ok());
     match (kind, status) {
-        ("validation_finished", Some(RunStatus::AwaitingIntegration)) => {
-            Some(AttentionNext::ReviewAndIntegrate)
-        }
+        // The supervisor that validated the run reviews it and acts on the
+        // verdict itself (ADR-0023 decision 2, ADR-0027).
+        ("validation_finished", Some(RunStatus::AwaitingIntegration)) => None,
+        ("review_failed", _) => Some(AttentionNext::ReviewByHand),
         (
             "validation_finished" | "supervision_finished" | "integration_failed",
             Some(RunStatus::Failed),
@@ -1556,6 +1626,14 @@ pub fn event_attention(kind: &str, payload: &serde_json::Value) -> Option<Attent
                 _ => None,
             }
         }
+        // An answer the supervisor applies to the run itself.
+        ("ask_answered", _)
+            if payload.get("kind").and_then(serde_json::Value::as_str)
+                == Some(AskKind::ApproveLanding.as_str())
+                && payload.get("runtime_delivers") == Some(&serde_json::Value::Bool(true)) =>
+        {
+            None
+        }
         ("ask_answered", _) => ask_id(payload).map(|ask_id| AttentionNext::ReadAnswer { ask_id }),
         ("ask_delivery_failed", _) => {
             ask_id(payload).map(|ask_id| AttentionNext::DeliverAnswer { ask_id })
@@ -1585,9 +1663,11 @@ fn answer_prompt(workspace_id: Option<&str>) -> AttentionNext {
 }
 
 /// Whether a run in `status` waits for the maintainer now. `exit_pending` is
-/// a `running` run whose `/exit` request timed out with no session exit
-/// since: it is no attention of the run's, since its `stuck_exit` ask is
-/// (and a dialog seen before the timeout is part of that ask). `push_pending` is the `integrated` run whose push of `main`
+/// a run whose `/exit` request timed out with no session exit since: a
+/// `running` one, or one the supervisor still holds after its validation
+/// or review (ADR-0027). It is no attention of the run's, since its
+/// `stuck_exit` ask is (and a dialog seen before the timeout is part of
+/// that ask). `push_pending` is the `integrated` run whose push of `main`
 /// failed with no successful push since, which the task being completed does
 /// not end. `leased` is whether the run has a lease row, stale or not: an
 /// unfinished run without one was given up by its owner (the supervisor's
@@ -1598,7 +1678,9 @@ fn answer_prompt(workspace_id: Option<&str>) -> AttentionNext {
 /// or `receipt_observed` after it (`Some("?")` when the payload named none).
 /// `resuming` is a `needs_session` run the supervisor is resuming or will
 /// resume (a resume in progress, or attempts left): the maintainer must not
-/// open a session of its own for it. The caller passes only the latest run of an `in_progress` task, so a
+/// open a session of its own for it. An `awaiting_integration` run with a
+/// lease is the supervisor's review (ADR-0027); without one it waits for a
+/// person (a failed review, or a run validated before the review existed). The caller passes only the latest run of an `in_progress` task, so a
 /// failed run stops counting once the task is retried or canceled.
 pub fn run_attention(
     status: RunStatus,
@@ -1619,6 +1701,15 @@ pub fn run_attention(
         {
             Some(AttentionNext::RecoverRun)
         }
+        // The supervisor asked the session to exit after the review's
+        // verdict (or a failed validation) and waits for it (ADR-0027); its
+        // `stuck_exit` ask is the attention, as for a running run.
+        RunStatus::AwaitingIntegration | RunStatus::NeedsSession | RunStatus::Failed
+            if exit_pending && leased =>
+        {
+            None
+        }
+        RunStatus::AwaitingIntegration if leased => Some(AttentionNext::Reviewing),
         RunStatus::AwaitingIntegration => Some(AttentionNext::ReviewAndIntegrate),
         RunStatus::NeedsSession if resuming => Some(AttentionNext::Resuming),
         RunStatus::NeedsSession => Some(AttentionNext::ResumeSession),
@@ -1806,7 +1897,39 @@ mod attention_tests {
             (
                 "validation_finished",
                 json!({"status": "awaiting_integration"}),
-                Some(ReviewAndIntegrate),
+                None,
+            ),
+            (
+                "review_failed",
+                json!({"status": "awaiting_integration", "error": "x", "attempt": 1}),
+                Some(ReviewByHand),
+            ),
+            ("review_started", json!({"attempt": 1}), None),
+            (
+                "review_finished",
+                json!({"verdict": "concern", "reasons": ["x"], "summary": "s"}),
+                None,
+            ),
+            (
+                "revise_requested",
+                json!({"attempt": 1, "reasons": ["x"]}),
+                None,
+            ),
+            ("revise_finished", json!({"attempt": 1, "head": "h"}), None),
+            (
+                "landing_decided",
+                json!({"ask_id": 3, "answer": "cancel", "status": "failed"}),
+                None,
+            ),
+            (
+                "ask_answered",
+                json!({"ask_id": 5, "kind": "approve_landing", "runtime_delivers": true}),
+                None,
+            ),
+            (
+                "ask_answered",
+                json!({"ask_id": 5, "kind": "approve_landing", "runtime_delivers": false}),
+                Some(ReadAnswer { ask_id: 5 }),
             ),
             (
                 "validation_finished",
@@ -1976,6 +2099,12 @@ mod attention_tests {
                 assert!(ATTENTION_KINDS.contains(&kind), "{kind}");
             }
         }
+        assert_eq!(Reviewing.to_string(), "reviewing (runtime)");
+        assert_eq!(ReviewByHand.to_string(), "review by hand");
+        assert_eq!(
+            ApplyingAnswer { ask_id: 7 }.to_string(),
+            "applying the answer of ask 7 (runtime)"
+        );
         assert_eq!(RecoverRun.to_string(), "recover run");
         assert_eq!(PushMain.to_string(), "push main");
         assert_eq!(
@@ -2006,6 +2135,32 @@ mod attention_tests {
     }
 
     #[test]
+    fn review_verdict_is_read_from_the_whole_stdout_or_its_outermost_object() {
+        let verdict = ReviewVerdict::parse(
+            r#"{"verdict":"revise","reasons":["add a test"],"summary":"almost"}"#,
+        )
+        .unwrap();
+        assert_eq!(verdict.verdict, ReviewDecision::Revise);
+        assert_eq!(verdict.reasons, vec!["add a test".to_owned()]);
+        let fenced =
+            "Here it is:\n```json\n{\"verdict\":\"pass\",\"reasons\":[],\"summary\":\"ok\"}\n```\n";
+        assert_eq!(
+            ReviewVerdict::parse(fenced).unwrap().verdict,
+            ReviewDecision::Pass
+        );
+        for bad in [
+            "",
+            "no json here",
+            r#"{"verdict":"maybe","reasons":[],"summary":"x"}"#,
+            r#"{"verdict":"pass","summary":"x"}"#,
+            r#"{"verdict":"pass","reasons":[],"summary":"x","extra":1}"#,
+        ] {
+            let error = ReviewVerdict::parse(bad).unwrap_err();
+            assert!(error.contains("no verdict JSON"), "{bad}: {error}");
+        }
+    }
+
+    #[test]
     fn run_attention_follows_the_resting_status() {
         use AttentionNext::*;
         assert_eq!(
@@ -2018,6 +2173,34 @@ mod attention_tests {
                 false
             ),
             Some(ReviewAndIntegrate)
+        );
+        // Leased, it is the supervisor's review (ADR-0027); a session that
+        // held back the /exit after the verdict is its stuck_exit ask's.
+        assert_eq!(
+            run_attention(
+                RunStatus::AwaitingIntegration,
+                true,
+                false,
+                true,
+                None,
+                false
+            ),
+            None
+        );
+        assert_eq!(
+            run_attention(RunStatus::Failed, true, false, true, None, false),
+            None
+        );
+        assert_eq!(
+            run_attention(
+                RunStatus::AwaitingIntegration,
+                false,
+                false,
+                true,
+                None,
+                false
+            ),
+            Some(Reviewing)
         );
         assert_eq!(
             run_attention(RunStatus::NeedsSession, false, false, false, None, false),

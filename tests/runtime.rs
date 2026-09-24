@@ -183,6 +183,11 @@ impl AgentProvider for TestProvider {
     fn wait_interval(&self) -> Duration {
         TEST_TICK
     }
+    fn review_command(&self, _: &TaskRun, _: &str) -> Result<Command> {
+        unreachable!("sessions do not review")
+    }
+    // `headless_command` keeps the default refusal: a run's provider has no
+    // headless job, which the observer test relies on.
     fn command(&self, run: &TaskRun, prompt: &str) -> Result<Command> {
         assert!(prompt.contains("Acceptance criteria:"));
         assert!(prompt.contains("Verification commands (run in the worktree):"));
@@ -1568,7 +1573,10 @@ fn a_failed_answer_delivery_is_left_to_the_maintainer() {
 /// An unanswered `/exit` is recorded once and raised as one `stuck_exit` ask
 /// to the inbox, notified once through the ask path, but the supervisor
 /// keeps the lease and keeps watching: when the session ends later, the ask
-/// is closed by the runtime and the run is validated as usual.
+/// is closed by the runtime and the run moves on as the verdict said. The
+/// `/exit` comes after the validation and the review (ADR-0027; here a
+/// failed review, the stand-in `claude` printing no verdict), so the run is
+/// already `awaiting_integration` and the question says what follows.
 #[test]
 fn unanswered_exit_request_times_out_and_keeps_the_run() {
     let (_dir, repo, db) = fixture();
@@ -1598,7 +1606,7 @@ fn unanswered_exit_request_times_out_and_keeps_the_run() {
     let mut queue = SqliteQueue::open(&db).unwrap();
     let detail = queue.show(1).unwrap();
     let run = detail.runs[0].clone();
-    assert_eq!(run.status, RunStatus::Running);
+    assert_eq!(run.status, RunStatus::AwaitingIntegration);
     assert!(run.last_error.is_none());
     assert!(queue.run_lease(&run.id).unwrap().is_some());
     let kinds = event_kinds(&detail);
@@ -1611,6 +1619,8 @@ fn unanswered_exit_request_times_out_and_keeps_the_run() {
     );
     assert!(!kinds.contains(&"runtime_error"));
     assert!(!kinds.contains(&"session_exited"));
+    // Nothing after the verdict happens until the session exits.
+    assert!(!kinds.contains(&"review_failed"));
     let timed_out = detail
         .events
         .iter()
@@ -1637,6 +1647,14 @@ fn unanswered_exit_request_times_out_and_keeps_the_run() {
     assert!(ask.question.contains("line 8\n"), "{}", ask.question);
     assert!(!ask.question.contains("line 7\n"), "{}", ask.question);
     assert!(ask.question.ends_with("  2. Cancel"), "{}", ask.question);
+    assert!(
+        ask.question.contains(
+            "The run stays awaiting_integration under the supervisor after its validation and review, and waits for a review by hand once the session exits"
+        ),
+        "{}",
+        ask.question
+    );
+    assert!(!ask.question.contains("stays running"), "{}", ask.question);
     assert_eq!(
         kinds.iter().filter(|k| **k == "ask_opened").count(),
         1,
@@ -1690,8 +1708,10 @@ fn unanswered_exit_request_times_out_and_keeps_the_run() {
     assert!(queue.run_leases().unwrap().is_empty());
     let kinds = event_kinds(&detail);
     let position = |kind: &str| kinds.iter().position(|k| *k == kind).unwrap();
+    assert!(position("validation_finished") < position("exit_requested"));
     assert!(position("exit_request_timed_out") < position("session_exited"));
-    assert!(position("session_exited") < position("validation_finished"));
+    assert!(position("session_exited") < position("workspace_closed"));
+    assert!(position("workspace_closed") < position("review_failed"));
     assert_eq!(
         kinds
             .iter()
@@ -1709,7 +1729,8 @@ fn unanswered_exit_request_times_out_and_keeps_the_run() {
         Some("the session exited; closed by the runtime")
     );
     assert!(position("session_exited") < position("ask_answered"));
-    assert!(position("ask_answered") < position("validation_finished"));
+    assert!(position("ask_answered") < position("workspace_closed"));
+    assert!(position("ask_answered") < position("review_failed"));
     assert!(queue.asks(AskQuery::default()).unwrap().is_empty());
     assert_eq!(backend.notifications.lock().unwrap().len(), 1);
     let events = dagq::watch::events(&db, 0, 100, false).unwrap();
@@ -1721,11 +1742,11 @@ fn unanswered_exit_request_times_out_and_keeps_the_run() {
             .all(|e| e["kind"] != "ask_answered"),
         "{events}"
     );
-    // The session exited, so the attention is the landing now, not /exit.
+    // The session exited, so the attention is the failed review now.
     let status = runtime::status(&db).unwrap();
     assert_eq!(
         run_attention_of(&status, &run.id).unwrap()["next"],
-        "review and integrate"
+        "review by hand"
     );
 }
 
@@ -3331,13 +3352,15 @@ fn review_writes_a_non_utf8_diff_as_raw_bytes() {
         "{text}"
     );
     assert!(diff.ends_with(b"\n`````\n"), "{text}");
-    // Only review.md is left in the run directory, no temporary file.
+    // No temporary file is left beside review.md (the others are the
+    // supervisor's headless review's).
     let leftovers: Vec<_> = fs::read_dir(run_dir)
         .unwrap()
         .map(|entry| entry.unwrap().file_name().into_string().unwrap())
-        .filter(|name| name.contains("review"))
+        .filter(|name| name.starts_with(".review.md"))
         .collect();
-    assert_eq!(leftovers, ["review.md"]);
+    assert!(leftovers.is_empty(), "{leftovers:?}");
+    assert!(run_dir.join("review.md").is_file());
 }
 
 #[test]
@@ -4503,9 +4526,12 @@ fn approved_needs_session_run_is_resumed_until_the_runtime_lands_it() {
 
 /// A `needs_session` run that no `integrate` approved (here standing in for
 /// validation's `evidence_missing`) is resumed with the evidence request
-/// and, resolved, goes back to `awaiting_integration` for the maintainer.
+/// and, resolved, keeps its resumed session open through validation and the
+/// supervisor's review like the worker's (ADR-0027 decision 3). The
+/// stand-in `claude` prints no verdict, so the review fails and the run
+/// waits for a review by hand.
 #[test]
-fn unapproved_resumed_run_returns_to_awaiting_integration() {
+fn unapproved_resumed_run_is_validated_and_reviewed_with_its_session_open() {
     let (_dir, repo, db) = fixture();
     let backend = TestWorkspace::new(&db, false, VALID_AGENT);
     let (run, first_landed) = parked_conflict(&repo, &db, &backend);
@@ -4543,8 +4569,44 @@ fn unapproved_resumed_run_returns_to_awaiting_integration() {
     let finished = payloads(&detail, "resume_finished");
     assert_eq!(finished.len(), 1);
     assert_eq!(finished[0]["outcome"], "resolved");
-    assert_eq!(finished[0]["status"], "awaiting_integration");
+    assert_eq!(finished[0]["status"], "validating");
     assert_eq!(finished[0]["approved"], false);
+    assert_eq!(finished[0]["workspace_closed"], false);
+    assert_eq!(finished[0]["session_live"], true);
+    let resume_workspace = finished[0]["workspace_id"].as_str().unwrap().to_owned();
+    let kinds = event_kinds(&detail);
+    let after: Vec<&str> = kinds
+        .iter()
+        .skip_while(|k| **k != "resume_finished")
+        .filter(|k| {
+            matches!(
+                **k,
+                "validation_finished"
+                    | "review_started"
+                    | "exit_requested"
+                    | "session_exited"
+                    | "workspace_closed"
+                    | "review_failed"
+            )
+        })
+        .copied()
+        .collect();
+    assert_eq!(
+        after,
+        [
+            "validation_finished",
+            "review_started",
+            "exit_requested",
+            "session_exited",
+            "workspace_closed",
+            "review_failed",
+        ]
+    );
+    assert!(backend.closed().contains(&resume_workspace));
+    assert_eq!(
+        payloads(&detail, "review_started").last().unwrap()["workspace_id"],
+        json!(resume_workspace)
+    );
     assert!(
         !event_kinds(&detail).contains(&"integration_started") || {
             // Only the maintainer's two landings before the resume.
@@ -4563,14 +4625,15 @@ fn unapproved_resumed_run_returns_to_awaiting_integration() {
     );
     assert!(!text.contains("git rebase"), "{text}");
     assert!(text.contains(runtime::STOP_BACKGROUND), "{text}");
-    // The maintainer is woken to review it again.
+    // The maintainer is woken only by the failed review.
     let events = dagq::watch::events(&db, cursor, 100, false).unwrap();
-    assert_eq!(events["events"][0]["kind"], "resume_finished", "{events}");
-    assert_eq!(events["events"][0]["next"], "review and integrate");
+    assert_eq!(events["events"].as_array().unwrap().len(), 1, "{events}");
+    assert_eq!(events["events"][0]["kind"], "review_failed", "{events}");
+    assert_eq!(events["events"][0]["next"], "review by hand");
     let status = runtime::status(&db).unwrap();
     let attention = run_attention_of(&status, &run.id).unwrap();
-    assert_eq!(attention["kind"], "resume_finished");
-    assert_eq!(attention["next"], "review and integrate");
+    assert_eq!(attention["kind"], "review_failed");
+    assert_eq!(attention["next"], "review by hand");
     // Integrating it now is the approval.
     assert_eq!(
         integrate(&db, 2, &repo).unwrap()["outcome"],
@@ -5172,10 +5235,13 @@ fn independent_tasks_run_concurrently_and_a_dependent_starts_after_integration()
             .all(|r| r["recoverable"] == false)
     );
 
+    // Accepted and past the supervisor's review (the stand-in `claude`
+    // prints no verdict, so each waits for a review by hand).
     wait_until(&db, Duration::from_secs(30), |queue| {
         [1, 2]
             .iter()
             .all(|task| queue.show(*task).unwrap().runs[0].status == RunStatus::AwaitingIntegration)
+            && queue.run_leases().unwrap().is_empty()
     });
     // Awaiting integration does not satisfy the dependency; the loop idles.
     thread::sleep(Duration::from_millis(500));
@@ -5250,26 +5316,31 @@ fn a_timed_out_run_is_kept_while_the_other_run_is_accepted() {
     };
     wait_until(&db, Duration::from_secs(30), |queue| {
         event_kinds(&queue.show(1).unwrap()).contains(&"exit_request_timed_out")
-            && queue
-                .show(2)
-                .unwrap()
-                .runs
-                .first()
-                .is_some_and(|r| r.status == RunStatus::AwaitingIntegration)
+            && queue.show(2).unwrap().runs.first().is_some_and(|r| {
+                r.status == RunStatus::AwaitingIntegration
+                    && queue.run_lease(&r.id).unwrap().is_none()
+            })
     });
     let stuck = queue.show(1).unwrap().runs[0].clone();
     let healthy = queue.show(2).unwrap().runs[0].clone();
     assert!(healthy.last_error.is_none());
     assert!(healthy.workspace_closed_at.is_some());
-    assert_eq!(stuck.status, RunStatus::Running);
+    // The stuck session held back the /exit that followed its review, so
+    // its run is already accepted and its supervisor still holds it.
+    assert_eq!(stuck.status, RunStatus::AwaitingIntegration);
     assert!(stuck.last_error.is_none());
     assert!(queue.run_lease(&stuck.id).unwrap().is_some());
-    assert!(queue.run_lease(&healthy.id).unwrap().is_none());
-    // Only the stuck run is unfinished, and its supervisor still holds it.
-    let report = runtime::doctor(&db, true).unwrap();
-    assert_eq!(report["runs"].as_array().unwrap().len(), 1);
-    assert_eq!(report["runs"][0]["run_id"], json!(stuck.id));
-    assert_eq!(report["runs"][0]["recoverable"], false);
+    // Its stuck_exit ask is the attention, not the run (task 104).
+    wait_until(&db, Duration::from_secs(10), |queue| {
+        queue
+            .asks(AskQuery::default())
+            .unwrap()
+            .iter()
+            .any(|a| a.kind == AskKind::StuckExit && a.run_id.as_deref() == Some(stuck.id.as_str()))
+    });
+    let status = runtime::status(&db).unwrap();
+    assert!(run_attention_of(&status, &stuck.id).is_none(), "{status}");
+    assert!(runtime::recover(&db, &stuck.id).is_err());
 
     release_held_session(stuck.run_dir.as_ref().unwrap());
     let outcome = supervisor.join().unwrap().unwrap();
@@ -5557,13 +5628,18 @@ fn stale_lease_of_a_live_wrapper_is_adopted_and_driven_to_awaiting_integration()
     let position = |kind: &str| kinds.iter().position(|k| *k == kind).unwrap();
     assert!(position("lease_acquired") < position("run_adopted"));
     assert!(position("run_adopted") < position("receipt_observed"));
+    // The session stays open through validation and the review (the
+    // stand-in `claude` prints no verdict, so the review fails); /exit
+    // follows (ADR-0027).
     assert!(position("receipt_observed") < position("session_idle_observed"));
-    assert!(position("session_idle_observed") < position("exit_requested"));
-    assert!(position("exit_requested") < position("session_exited"));
-    assert!(position("session_exited") < position("supervision_finished"));
+    assert!(position("session_idle_observed") < position("supervision_finished"));
     assert!(position("supervision_finished") < position("validation_finished"));
-    assert!(position("validation_finished") < position("workspace_closed"));
-    assert!(position("workspace_closed") < position("lease_released"));
+    assert!(position("validation_finished") < position("review_started"));
+    assert!(position("review_started") < position("exit_requested"));
+    assert!(position("exit_requested") < position("session_exited"));
+    assert!(position("session_exited") < position("workspace_closed"));
+    assert!(position("workspace_closed") < position("review_failed"));
+    assert!(position("review_failed") < position("lease_released"));
     assert_eq!(kinds.iter().filter(|k| **k == "exit_requested").count(), 1);
     assert!(!kinds.contains(&"runtime_error"));
     assert!(!kinds.contains(&"run_recovered"));
@@ -6433,8 +6509,10 @@ fn asks_of_a_run_are_attention_for_the_inbox_then_the_maintainer() {
     let (_dir, _repo, db, run) = awaiting_run();
     let mut queue = SqliteQueue::open(&db).unwrap();
     let before = queue.latest_event_id().unwrap();
+    // A `decide` ask: the supervisor applies an `approve_landing` answer
+    // itself (see a_third_review_that_does_not_pass_asks_a_person_and_land_lands_it).
     let new_ask = |question: &str| NewAsk {
-        kind: AskKind::ApproveLanding,
+        kind: AskKind::Decide,
         task_id: None,
         run_id: Some(run.id.clone()),
         question: question.into(),
@@ -6481,7 +6559,7 @@ fn asks_of_a_run_are_attention_for_the_inbox_then_the_maintainer() {
     );
     let asks = status["asks"].as_array().unwrap();
     assert_eq!(asks.len(), 1);
-    assert_eq!(asks[0]["kind"], "approve_landing");
+    assert_eq!(asks[0]["kind"], "decide");
     assert_eq!(asks[0]["asked_by"], "maintainer");
     assert_eq!(asks[0]["run_id"], json!(run.id));
     assert!(asks[0]["age_secs"].as_i64().unwrap() >= 0);
@@ -6498,10 +6576,11 @@ fn asks_of_a_run_are_attention_for_the_inbox_then_the_maintainer() {
             .iter()
             .all(|a| a["kind"] != "ask_opened")
     );
-    // The run's own attention keeps the event that brought it there.
+    // The run's own attention keeps the event that brought it there (the
+    // stand-in `claude` printed no verdict, so its review failed).
     assert_eq!(
         run_attention_of(&maintainer, &run.id).unwrap()["kind"],
-        "validation_finished"
+        "review_failed"
     );
     assert!(
         runtime::status_for(&db, Some(SessionRole::Planner)).unwrap()["attention"]
@@ -6591,14 +6670,16 @@ fn attention_events_are_read_past_a_cursor_and_wake_watch() {
     let queue = SqliteQueue::open(&db).unwrap();
     let latest = queue.latest_event_id().unwrap();
 
-    // `status` derives the attention from the queue as it is now.
+    // `status` derives the attention from the queue as it is now. The
+    // accepted run is the supervisor's to review; the stand-in `claude`
+    // printed no verdict, so the review failed and it waits for a person.
     let status = runtime::status(&db).unwrap();
     assert_eq!(status["cursor"], json!(latest));
     assert_eq!(
         run_attention_of(&status, &run.id).unwrap(),
         &json!({
             "run_id": run.id, "task_id": 1, "status": "awaiting_integration",
-            "kind": "validation_finished", "last_error": null, "next": "review and integrate",
+            "kind": "review_failed", "last_error": null, "next": "review by hand",
         })
     );
     // `supervise --once` exited, so nothing supervises the queue.
@@ -6610,9 +6691,9 @@ fn attention_events_are_read_past_a_cursor_and_wake_watch() {
     assert_eq!(events["cursor"], json!(latest));
     let listed = events["events"].as_array().unwrap();
     assert_eq!(listed.len(), 1, "{events}");
-    assert_eq!(listed[0]["kind"], "validation_finished");
+    assert_eq!(listed[0]["kind"], "review_failed");
     assert_eq!(listed[0]["status"], "awaiting_integration");
-    assert_eq!(listed[0]["next"], "review and integrate");
+    assert_eq!(listed[0]["next"], "review by hand");
     assert_eq!(listed[0]["run_id"], json!(run.id));
     let all = dagq::watch::events(&db, 0, 1000, true).unwrap();
     let all_events = all["events"].as_array().unwrap();
@@ -7296,9 +7377,11 @@ fn missing_required_evidence_parks_the_run_for_a_resumed_session() {
     // The worker knew up front.
     let prompt = read_prompt(run);
     assert!(prompt.contains("Required evidence: e2e ("), "{prompt}");
-    // Validation parked it instead of failing it.
+    // Validation parked it instead of failing it; the resolved resume is
+    // validated again with its session open (ADR-0027 decision 3).
     let validated = payloads(&detail, "validation_finished");
-    assert_eq!(validated.len(), 1);
+    assert_eq!(validated.len(), 2);
+    assert_eq!(validated[1]["status"], "awaiting_integration");
     assert_eq!(validated[0]["status"], "needs_session");
     assert_eq!(validated[0]["accepted"], false);
     assert_eq!(validated[0]["reason"], "evidence missing: e2e");
@@ -7448,6 +7531,9 @@ impl AgentProvider for ObserverProvider {
         let mut command = Command::new("/bin/sh");
         command.current_dir(cwd).arg("-c").arg(&self.script);
         Ok(command)
+    }
+    fn review_command(&self, _: &TaskRun, _: &str) -> Result<Command> {
+        bail!("the observer reviews no run")
     }
 }
 
@@ -7760,4 +7846,717 @@ fn supervisor_starts_the_observer_on_its_interval_without_a_run_slot() {
     // Once the interval passed, the next pass observes again.
     supervise_observed();
     assert_eq!(queue_events(&db, "observe_started").len(), 4);
+}
+
+/// Stands in for the headless reviewer (ADR-0027): each review runs the
+/// next script with `/bin/sh -c` in the worktree (the last one repeats) and
+/// records its prompt; `timeout` is the review timeout.
+struct TestReviewer {
+    scripts: Mutex<Vec<String>>,
+    prompts: Mutex<Vec<String>>,
+    timeout: Duration,
+}
+
+impl TestReviewer {
+    fn new(scripts: &[String]) -> Self {
+        Self {
+            scripts: Mutex::new(scripts.to_vec()),
+            prompts: Mutex::new(Vec::new()),
+            timeout: Duration::from_secs(60),
+        }
+    }
+    fn prompts(&self) -> Vec<String> {
+        self.prompts.lock().unwrap().clone()
+    }
+}
+
+impl AgentProvider for TestReviewer {
+    fn preflight(&self) -> Result<()> {
+        Ok(())
+    }
+    fn command(&self, _: &TaskRun, _: &str) -> Result<Command> {
+        unreachable!("the reviewer starts no session")
+    }
+    fn resume_command(&self, _: &TaskRun) -> Result<Command> {
+        unreachable!("the reviewer starts no session")
+    }
+    fn headless_command(&self, _: &Path, _: &str, _: &[&str]) -> Result<Command> {
+        unreachable!("the reviewer runs only reviews")
+    }
+    fn review_command(&self, run: &TaskRun, prompt: &str) -> Result<Command> {
+        self.prompts.lock().unwrap().push(prompt.into());
+        let mut scripts = self.scripts.lock().unwrap();
+        let script = if scripts.len() > 1 {
+            scripts.remove(0)
+        } else {
+            scripts[0].clone()
+        };
+        let mut command = Command::new("/bin/sh");
+        command
+            .current_dir(run.worktree_path.as_ref().unwrap())
+            .arg("-c")
+            .arg(script);
+        Ok(command)
+    }
+    fn review_timeout(&self) -> Duration {
+        self.timeout
+    }
+}
+
+/// A reviewer script that prints the verdict JSON.
+fn verdict(decision: &str, reasons: &[&str], summary: &str) -> String {
+    let json = json!({"verdict": decision, "reasons": reasons, "summary": summary});
+    format!("printf '%s\\n' '{json}'")
+}
+
+fn supervise_reviewed(
+    db: &Path,
+    repo: &Path,
+    backend: &TestWorkspace,
+    reviewer: &TestReviewer,
+) -> Value {
+    let outcome = runtime::supervise_with_reviewer(
+        db,
+        repo,
+        backend,
+        &claude_stub(db),
+        reviewer,
+        Path::new(env!("CARGO_BIN_EXE_dagq")),
+        &supervise_options(4, true),
+    )
+    .unwrap();
+    backend.join();
+    outcome
+}
+
+/// The position of the first event of `kind`, which must exist.
+fn position(kinds: &[&str], kind: &str) -> usize {
+    kinds
+        .iter()
+        .position(|k| *k == kind)
+        .unwrap_or_else(|| panic!("no {kind} in {kinds:?}"))
+}
+
+/// The worker goes idle after its receipt and never exits by itself; each
+/// time a text arrives in its terminal it appends a line, commits, rewrites
+/// the receipt and goes idle again, `revises` times.
+fn revising_agent(revises: usize) -> String {
+    format!(
+        "commit work; receipt \"$(git rev-parse HEAD)\"; idle; \
+         for n in $(seq 1 {revises}); do \
+           while [ ! -f \"$MESSAGE\" ]; do sleep 0.1; done; rm \"$MESSAGE\"; \
+           printf 'fix %s\\n' \"$n\" >> change.txt; git commit -q -am \"fix $n\"; \
+           receipt \"$(git rev-parse HEAD)\"; idle; \
+         done; await_exit"
+    )
+}
+
+/// A receipt accepted with the session still open is reviewed before the
+/// session is asked to exit (ADR-0027 decision 1); on `pass` the supervisor
+/// sends `/exit`, closes the workspace and lands the run without anyone
+/// calling `integrate`.
+#[test]
+fn a_passing_review_exits_the_live_session_and_lands_it() {
+    let (_dir, repo, db) = fixture();
+    let base = git_out(&repo, &["rev-parse", "main"]);
+    let backend = TestWorkspace::new(&db, false, IDLE_AGENT);
+    let reviewer = TestReviewer::new(&[verdict("pass", &[], "meets the acceptance")]);
+    let outcome = supervise_reviewed(&db, &repo, &backend, &reviewer);
+    assert_eq!(outcome["errors"], json!([]), "{outcome}");
+    assert_eq!(outcome["runs"][0]["status"], "integrated", "{outcome}");
+    let mut queue = SqliteQueue::open(&db).unwrap();
+    let detail = queue.show(1).unwrap();
+    assert_eq!(detail.task.status, TaskStatus::Completed);
+    let run = detail.runs[0].clone();
+    assert_landed(&repo, &run, "test task", &base);
+    assert!(queue.run_leases().unwrap().is_empty());
+    let kinds = event_kinds(&detail);
+    // The session lives through validation and review; /exit comes after
+    // the verdict, the landing after the close.
+    for (earlier, later) in [
+        ("session_idle_observed", "supervision_finished"),
+        ("supervision_finished", "validation_finished"),
+        ("validation_finished", "review_started"),
+        ("review_started", "review_finished"),
+        ("review_finished", "exit_requested"),
+        ("exit_requested", "session_exited"),
+        ("session_exited", "workspace_closed"),
+        ("workspace_closed", "integration_started"),
+        ("integration_started", "run_integrated"),
+    ] {
+        assert!(
+            position(&kinds, earlier) < position(&kinds, later),
+            "{earlier} before {later}: {kinds:?}"
+        );
+    }
+    assert!(!kinds.contains(&"integration_approved"), "{kinds:?}");
+    assert_eq!(backend.exits_sent.load(Ordering::SeqCst), 1);
+    assert_eq!(backend.closed(), vec![WORKSPACE_ID.to_owned()]);
+    let supervised = payloads(&detail, "supervision_finished");
+    assert_eq!(
+        supervised[0],
+        &json!({"status": "validating", "exit_code": null, "session_live": true})
+    );
+    let started = payloads(&detail, "review_started");
+    assert_eq!(
+        started,
+        [&json!({"attempt": 1, "workspace_id": WORKSPACE_ID, "session_live": true})]
+    );
+    let finished = payloads(&detail, "review_finished");
+    assert_eq!(finished.len(), 1);
+    assert_eq!(finished[0]["verdict"], "pass");
+    assert_eq!(finished[0]["reasons"], json!([]));
+    assert_eq!(finished[0]["summary"], "meets the acceptance");
+    assert_eq!(finished[0]["attempt"], 1);
+    assert!(finished[0]["duration_secs"].is_u64());
+    // The reviewer reads review.md and is told the acceptance, the schema
+    // and the verdicts.
+    let prompts = reviewer.prompts();
+    assert_eq!(prompts.len(), 1);
+    let run_dir = Path::new(run.run_dir.as_ref().unwrap());
+    let review_md = run_dir.join("review.md");
+    assert!(review_md.is_file());
+    for expected in [
+        format!("Read the review material at {}", review_md.display()),
+        "Acceptance criteria of the task:\nworks".to_owned(),
+        r#"{"verdict": "pass" | "revise" | "concern", "reasons": [string], "summary": string}"#
+            .to_owned(),
+        "- revise: findings the worker can fix without a person's judgment".to_owned(),
+        "- concern: findings that need a person's judgment".to_owned(),
+    ] {
+        assert!(
+            prompts[0].contains(&expected),
+            "{expected:?} not in {}",
+            prompts[0]
+        );
+    }
+    assert_eq!(
+        fs::read_to_string(run_dir.join("review-prompt-1.txt")).unwrap(),
+        prompts[0]
+    );
+    assert!(run_dir.join("terminal-final.txt").is_file());
+    // Nothing waits for anyone.
+    assert!(run_attention_of(&runtime::status(&db).unwrap(), &run.id).is_none());
+}
+
+/// A `revise` verdict goes to the live session as a fixed request; once
+/// the session rewrote its receipt for a new head and went idle, the run is
+/// validated and reviewed again, and lands on `pass` (ADR-0027 decision 2).
+#[test]
+fn a_revise_verdict_is_fixed_by_the_live_session_and_reviewed_again() {
+    let (_dir, repo, db) = fixture();
+    let base = git_out(&repo, &["rev-parse", "main"]);
+    let backend = TestWorkspace::new(&db, false, &revising_agent(1));
+    let reviewer = TestReviewer::new(&[
+        verdict("revise", &["add a line to change.txt"], "one gap"),
+        verdict("pass", &[], "fixed"),
+    ]);
+    let outcome = supervise_reviewed(&db, &repo, &backend, &reviewer);
+    assert_eq!(outcome["errors"], json!([]), "{outcome}");
+    let mut queue = SqliteQueue::open(&db).unwrap();
+    let detail = queue.show(1).unwrap();
+    let run = detail.runs[0].clone();
+    assert_landed(&repo, &run, "test task", &base);
+    assert_eq!(
+        fs::read_to_string(repo.join("change.txt")).unwrap(),
+        format!("change by {}\nfix 1\n", run.id)
+    );
+    let requested = payloads(&detail, "revise_requested");
+    assert_eq!(requested.len(), 1);
+    assert_eq!(requested[0]["attempt"], 1);
+    assert_eq!(requested[0]["reasons"], json!(["add a line to change.txt"]));
+    let revised = payloads(&detail, "revise_finished");
+    assert_eq!(revised.len(), 1);
+    let head = git_out(&repo, &["rev-parse", &format!("refs/dagq/runs/{}", run.id)]);
+    assert_eq!(revised[0], &json!({"attempt": 1, "head": head}));
+    let verdicts: Vec<&Value> = payloads(&detail, "review_finished")
+        .iter()
+        .map(|p| &p["verdict"])
+        .collect();
+    assert_eq!(verdicts, [&json!("revise"), &json!("pass")]);
+    assert_eq!(payloads(&detail, "validation_finished").len(), 2);
+    let kinds = event_kinds(&detail);
+    assert!(position(&kinds, "revise_requested") < position(&kinds, "revise_finished"));
+    assert!(position(&kinds, "revise_finished") < position(&kinds, "exit_requested"));
+    // One /exit, after the second review; the request named the findings.
+    assert_eq!(backend.exits_sent.load(Ordering::SeqCst), 1);
+    let texts = backend.texts();
+    assert_eq!(texts.len(), 1);
+    assert_eq!(texts[0].0, WORKSPACE_ID);
+    let text = &texts[0].1;
+    for expected in [
+        format!(
+            "dagq: the supervisor's review of run {} (task 1) asks for changes (revise 1 of 2).",
+            run.id
+        ),
+        "Findings:\n- add a line to change.txt".to_owned(),
+        "[\"test -f seed.txt\"]".to_owned(),
+        format!(
+            "Rewrite the receipt at {} with the new head commit",
+            run.receipt_path.as_ref().unwrap()
+        ),
+        runtime::STOP_BACKGROUND.to_owned(),
+        "Do not merge or push. When done, report briefly and stop; do not run /exit.".to_owned(),
+    ] {
+        assert!(text.contains(&expected), "{expected:?} not in {text}");
+    }
+    let run_dir = Path::new(run.run_dir.as_ref().unwrap());
+    assert_eq!(
+        &fs::read_to_string(run_dir.join("revise-1.txt")).unwrap(),
+        text
+    );
+}
+
+/// Revise is sent at most twice; a third review that does not pass becomes
+/// an `approve_landing` ask after `/exit` and the close. `land` then lands
+/// the run as an approved one.
+#[test]
+fn a_third_review_that_does_not_pass_asks_a_person_and_land_lands_it() {
+    let (_dir, repo, db) = fixture();
+    let base = git_out(&repo, &["rev-parse", "main"]);
+    let backend = TestWorkspace::new(&db, false, &revising_agent(2));
+    let reviewer = TestReviewer::new(&[verdict("revise", &["still short"], "not yet")]);
+    let outcome = supervise_reviewed(&db, &repo, &backend, &reviewer);
+    assert_eq!(outcome["errors"], json!([]), "{outcome}");
+    assert_eq!(outcome["runs"][0]["status"], "awaiting_integration");
+    let mut queue = SqliteQueue::open(&db).unwrap();
+    let detail = queue.show(1).unwrap();
+    let run = detail.runs[0].clone();
+    assert_eq!(payloads(&detail, "revise_requested").len(), 2);
+    assert_eq!(payloads(&detail, "revise_finished").len(), 2);
+    assert_eq!(payloads(&detail, "review_finished").len(), 3);
+    assert_eq!(backend.texts().len(), 2);
+    assert_eq!(backend.closed(), vec![WORKSPACE_ID.to_owned()]);
+    assert!(queue.run_leases().unwrap().is_empty());
+    let kinds = event_kinds(&detail);
+    assert!(position(&kinds, "workspace_closed") < position(&kinds, "ask_opened"));
+    let asks = queue.asks(Default::default()).unwrap();
+    assert_eq!(asks.len(), 1);
+    let ask = &asks[0];
+    assert_eq!(ask.kind, dagq::domain::AskKind::ApproveLanding);
+    assert_eq!(ask.run_id.as_deref(), Some(run.id.as_str()));
+    assert_eq!(ask.options, ["land", "send_back", "cancel"]);
+    assert_eq!(ask.asked_by, "supervisor");
+    assert!(
+        ask.question.contains(
+            "returned revise (the review still asks for changes after 2 revises): not yet"
+        ),
+        "{}",
+        ask.question
+    );
+    assert!(ask.question.contains("\n- still short"), "{}", ask.question);
+    // The ask is the attention, for the inbox; the run itself is not one.
+    let status = runtime::status(&db).unwrap();
+    assert!(
+        run_attention_of(&status, &run.id).is_none() || {
+            let entries: Vec<&Value> = status["attention"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|a| a["run_id"] == json!(run.id))
+                .collect();
+            entries.iter().all(|a| a["ask_id"] == json!(ask.id))
+        }
+    );
+    let entry = status["attention"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["ask_id"] == json!(ask.id))
+        .unwrap();
+    assert_eq!(entry["next"], format!("answer ask {}", ask.id));
+
+    queue.answer(ask.id, "land").unwrap();
+    let status = runtime::status(&db).unwrap();
+    let entry = status["attention"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["ask_id"] == json!(ask.id))
+        .unwrap();
+    assert_eq!(
+        entry["next"],
+        format!("applying the answer of ask {} (runtime)", ask.id)
+    );
+    let outcome = supervise_reviewed(&db, &repo, &backend, &reviewer);
+    assert_eq!(outcome["errors"], json!([]), "{outcome}");
+    let detail = queue.show(1).unwrap();
+    assert_landed_run(&detail.runs[0], &repo, &base);
+    assert_eq!(detail.task.status, TaskStatus::Completed);
+    assert!(queue.read_ask(ask.id).unwrap().closed_at.is_some());
+    let approved = payloads(&detail, "integration_approved");
+    assert_eq!(approved.len(), 1);
+    assert_eq!(approved[0]["ask_id"], ask.id);
+    // No fourth review.
+    assert_eq!(reviewer.prompts().len(), 3);
+}
+
+fn assert_landed_run(run: &TaskRun, repo: &Path, base: &str) {
+    assert_landed(repo, run, "test task", base);
+}
+
+/// A `concern` exits and closes the session and asks a person; `send_back`
+/// parks the run for a resume whose request names the findings, and the
+/// resumed session goes through validation and review like the worker's
+/// (ADR-0027 decision 3): the review passes and the supervisor lands it.
+#[test]
+fn a_concern_sent_back_is_resumed_reviewed_again_and_landed() {
+    let (_dir, repo, db) = fixture();
+    let base = git_out(&repo, &["rev-parse", "main"]);
+    let backend = TestWorkspace::new(&db, false, IDLE_AGENT);
+    let reviewer = TestReviewer::new(&[
+        verdict(
+            "concern",
+            &["changes a file the task did not name"],
+            "scope",
+        ),
+        verdict("pass", &[], "fixed"),
+    ]);
+    let outcome = supervise_reviewed(&db, &repo, &backend, &reviewer);
+    assert_eq!(outcome["errors"], json!([]), "{outcome}");
+    let mut queue = SqliteQueue::open(&db).unwrap();
+    let detail = queue.show(1).unwrap();
+    let run = detail.runs[0].clone();
+    assert_eq!(run.status, RunStatus::AwaitingIntegration);
+    assert!(backend.texts().is_empty());
+    assert_eq!(backend.exits_sent.load(Ordering::SeqCst), 1);
+    let kinds = event_kinds(&detail);
+    assert!(position(&kinds, "review_finished") < position(&kinds, "exit_requested"));
+    assert!(position(&kinds, "workspace_closed") < position(&kinds, "ask_opened"));
+    let ask = queue.asks(Default::default()).unwrap()[0].clone();
+    assert!(
+        ask.question.contains("returned concern: scope"),
+        "{}",
+        ask.question
+    );
+    // The ask was opened through `runtime::ask`, which notifies the inbox.
+    let notified = backend.notifications.lock().unwrap().clone();
+    assert_eq!(notified.len(), 1, "{notified:?}");
+    assert!(
+        notified[0].1.contains(&format!("run {}", run.id)),
+        "{notified:?}"
+    );
+
+    queue.answer(ask.id, "send_back").unwrap();
+    backend.resume_script_for(
+        1,
+        "await_message; printf 'narrowed\\n' > change.txt; git commit -q -am narrowed; receipt \"$(git rev-parse HEAD)\"; idle; await_exit",
+    );
+    let outcome = supervise_reviewed(&db, &repo, &backend, &reviewer);
+    assert_eq!(outcome["errors"], json!([]), "{outcome}");
+    let detail = queue.show(1).unwrap();
+    let landed = detail.runs[0].clone();
+    assert_landed_run(&landed, &repo, &base);
+    assert_eq!(
+        fs::read_to_string(repo.join("change.txt")).unwrap(),
+        "narrowed\n"
+    );
+    assert!(queue.read_ask(ask.id).unwrap().closed_at.is_some());
+    let decided = payloads(&detail, "landing_decided");
+    assert_eq!(decided.len(), 1);
+    assert_eq!(decided[0]["answer"], "send_back");
+    assert_eq!(decided[0]["status"], "needs_session");
+    let text = &backend.texts()[0].1;
+    assert!(
+        text.contains("raised findings a person sent back to you"),
+        "{text}"
+    );
+    assert!(
+        text.contains("changes a file the task did not name"),
+        "{text}"
+    );
+    assert!(text.contains("Fix the findings in the reason"), "{text}");
+    // The resumed session stayed open through the review: validation,
+    // review, then /exit and the close of its workspace, then the landing.
+    let finished = payloads(&detail, "resume_finished");
+    assert_eq!(finished.len(), 1);
+    assert_eq!(finished[0]["outcome"], "resolved");
+    assert_eq!(finished[0]["status"], "validating");
+    assert_eq!(finished[0]["workspace_closed"], false);
+    assert_eq!(finished[0]["session_live"], true);
+    let resume_workspace = finished[0]["workspace_id"].as_str().unwrap().to_owned();
+    let kinds = event_kinds(&detail);
+    let after_resume: Vec<&str> = kinds
+        .iter()
+        .skip_while(|k| **k != "resume_finished")
+        .filter(|k| {
+            matches!(
+                **k,
+                "validation_finished"
+                    | "review_started"
+                    | "review_finished"
+                    | "exit_requested"
+                    | "workspace_closed"
+                    | "integration_started"
+                    | "run_integrated"
+            )
+        })
+        .copied()
+        .collect();
+    assert_eq!(
+        after_resume,
+        [
+            "validation_finished",
+            "review_started",
+            "review_finished",
+            "exit_requested",
+            "workspace_closed",
+            "integration_started",
+            "run_integrated",
+        ]
+    );
+    let closed = payloads(&detail, "workspace_closed");
+    assert_eq!(
+        closed.last().unwrap(),
+        &&json!({"workspace_id": resume_workspace, "resume_attempt": 1})
+    );
+    assert!(backend.closed().contains(&resume_workspace));
+    assert_eq!(payloads(&detail, "review_started")[1]["session_live"], true);
+    assert_eq!(reviewer.prompts().len(), 2);
+}
+
+/// `cancel` fails the run and cancels its task.
+#[test]
+fn a_concern_canceled_fails_the_run_and_cancels_the_task() {
+    let (_dir, repo, db) = fixture();
+    let backend = TestWorkspace::new(&db, false, IDLE_AGENT);
+    let reviewer = TestReviewer::new(&[verdict("concern", &["not wanted"], "drop it")]);
+    supervise_reviewed(&db, &repo, &backend, &reviewer);
+    let mut queue = SqliteQueue::open(&db).unwrap();
+    let ask = queue.asks(Default::default()).unwrap()[0].clone();
+    queue.answer(ask.id, "cancel").unwrap();
+    supervise_reviewed(&db, &repo, &backend, &reviewer);
+    let detail = queue.show(1).unwrap();
+    assert_eq!(detail.task.status, TaskStatus::Canceled);
+    assert_eq!(detail.runs[0].status, RunStatus::Failed);
+    assert_eq!(
+        detail.runs[0].last_error.as_deref(),
+        Some(format!("canceled by ask {}", ask.id).as_str())
+    );
+    assert!(queue.read_ask(ask.id).unwrap().closed_at.is_some());
+    assert_eq!(reviewer.prompts().len(), 1);
+}
+
+/// A headless review that fails (a non-zero exit, stdout without a verdict,
+/// or the timeout) exits and closes the session, records `review_failed`
+/// and leaves the run `awaiting_integration` for a review by hand.
+#[test]
+fn a_failed_review_closes_the_session_and_waits_for_a_review_by_hand() {
+    for (script, timeout, expected) in [
+        (
+            "echo broken >&2; exit 3",
+            60,
+            "exited with exit status: 3: broken",
+        ),
+        (
+            "echo 'no verdict here'",
+            60,
+            "the review printed no verdict JSON",
+        ),
+        ("sleep 30", 1, "did not finish within 1 seconds"),
+    ] {
+        let (_dir, repo, db) = fixture();
+        let backend = TestWorkspace::new(&db, false, IDLE_AGENT);
+        let mut reviewer = TestReviewer::new(&[script.to_owned()]);
+        reviewer.timeout = Duration::from_secs(timeout);
+        let cursor = SqliteQueue::open(&db).unwrap().latest_event_id().unwrap();
+        let outcome = supervise_reviewed(&db, &repo, &backend, &reviewer);
+        assert_eq!(outcome["errors"], json!([]), "{outcome}");
+        assert_eq!(outcome["runs"][0]["status"], "awaiting_integration");
+        let mut queue = SqliteQueue::open(&db).unwrap();
+        let detail = queue.show(1).unwrap();
+        let run = detail.runs[0].clone();
+        assert!(queue.run_leases().unwrap().is_empty());
+        assert_eq!(backend.closed(), vec![WORKSPACE_ID.to_owned()]);
+        let kinds = event_kinds(&detail);
+        assert!(!kinds.contains(&"review_finished"), "{kinds:?}");
+        assert!(position(&kinds, "workspace_closed") < position(&kinds, "review_failed"));
+        let failed = payloads(&detail, "review_failed");
+        assert_eq!(failed[0]["attempt"], 1);
+        assert_eq!(failed[0]["status"], "awaiting_integration");
+        let error = failed[0]["error"].as_str().unwrap();
+        assert!(error.contains(expected), "{error}");
+        let status = runtime::status(&db).unwrap();
+        let attention = run_attention_of(&status, &run.id).unwrap();
+        assert_eq!(attention["kind"], "review_failed");
+        assert_eq!(attention["next"], "review by hand");
+        let events = dagq::watch::events(&db, cursor, 100, false).unwrap();
+        let events = events["events"].as_array().unwrap();
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_eq!(events[0]["kind"], "review_failed");
+        assert_eq!(events[0]["next"], "review by hand");
+        // By hand it lands as before.
+        assert_eq!(integrate(&db, 1, &repo).unwrap()["outcome"], "integrated");
+    }
+}
+
+/// A revise whose rewritten receipt does not name the clean worktree HEAD
+/// (here the commit before the fix) is not handed to validation, which
+/// would fail the run and its work: the live session is asked to rewrite
+/// it for HEAD, and once it does the run is reviewed again and lands
+/// (task 107, description (d)).
+#[test]
+fn a_revise_receipt_for_another_commit_is_sent_back_to_the_session_until_it_names_head() {
+    let (_dir, repo, db) = fixture();
+    let base = git_out(&repo, &["rev-parse", "main"]);
+    let script = "commit work; receipt \"$(git rev-parse HEAD)\"; idle; \
+        while [ ! -f \"$MESSAGE\" ]; do sleep 0.1; done; rm \"$MESSAGE\"; \
+        before=$(git rev-parse HEAD); printf 'fix\\n' >> change.txt; git commit -q -am fix; \
+        receipt \"$before\"; idle; \
+        while [ ! -f \"$MESSAGE\" ]; do sleep 0.1; done; rm \"$MESSAGE\"; \
+        receipt \"$(git rev-parse HEAD)\"; idle; await_exit";
+    let backend = TestWorkspace::new(&db, false, script);
+    let reviewer = TestReviewer::new(&[
+        verdict("revise", &["add a line"], "one gap"),
+        verdict("pass", &[], "fixed"),
+    ]);
+    let outcome = supervise_reviewed(&db, &repo, &backend, &reviewer);
+    assert_eq!(outcome["errors"], json!([]), "{outcome}");
+    let detail = SqliteQueue::open(&db).unwrap().show(1).unwrap();
+    let run = detail.runs[0].clone();
+    assert_landed(&repo, &run, "test task", &base);
+    assert_eq!(
+        fs::read_to_string(repo.join("change.txt")).unwrap(),
+        format!("change by {}\nfix\n", run.id)
+    );
+    let rejected = payloads(&detail, "revise_receipt_rejected");
+    assert_eq!(rejected.len(), 1, "{:?}", event_kinds(&detail));
+    assert_eq!(rejected[0]["attempt"], 1);
+    assert!(
+        rejected[0]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("but the worktree HEAD is"),
+        "{}",
+        rejected[0]
+    );
+    // Validation saw only the receipt for HEAD: nothing failed.
+    let validated = payloads(&detail, "validation_finished");
+    assert_eq!(validated.len(), 2);
+    assert!(validated.iter().all(|v| v["accepted"] == true));
+    assert_eq!(payloads(&detail, "revise_finished").len(), 1);
+    let kinds = event_kinds(&detail);
+    assert!(position(&kinds, "revise_receipt_rejected") < position(&kinds, "revise_finished"));
+    let texts = backend.texts();
+    assert_eq!(texts.len(), 2);
+    assert!(
+        texts[1].1.contains(&format!(
+            "dagq: the receipt you rewrote for revise 1 of run {} cannot be accepted",
+            run.id
+        )),
+        "{}",
+        texts[1].1
+    );
+    assert!(texts[1].1.contains("git rev-parse HEAD"), "{}", texts[1].1);
+    assert_eq!(backend.exits_sent.load(Ordering::SeqCst), 1);
+}
+
+/// A supervisor died while it waited for the session to exit after a
+/// passing review, with the exit timeout recorded and no `stuck_exit` ask
+/// made yet. The adopter reviews nothing again and sends no second `/exit`
+/// (ADR-0027), asks about the stuck exit once with what follows (the
+/// landing), closes that ask once the session exits, and lands the run.
+#[test]
+fn adopted_run_waiting_for_its_exit_after_a_pass_asks_once_and_lands() {
+    let (_dir, repo, db) = fixture();
+    let base = git_out(&repo, &["rev-parse", "main"]);
+    let backend = Arc::new(TestWorkspace::new(&db, false, IDLE_AGENT));
+    let run = start_run_under_dead_supervisor(&repo, &db, &backend, "dead-supervisor");
+    let idle = run.idle_marker_path().unwrap();
+    wait_until(&db, Duration::from_secs(20), |_| idle.is_file());
+    let head = git_out(
+        Path::new(run.worktree_path.as_ref().unwrap()),
+        &["rev-parse", "HEAD"],
+    );
+    // What the dead supervisor got through: validation, a passing review,
+    // the /exit and its timeout.
+    Connection::open(&db)
+        .unwrap()
+        .execute(
+            "UPDATE task_runs SET status='awaiting_integration', result_commit=?2 WHERE id=?1",
+            rusqlite::params![run.id, head],
+        )
+        .unwrap();
+    let mut queue = SqliteQueue::open(&db).unwrap();
+    for (kind, payload) in [
+        (
+            "validation_finished",
+            json!({"status": "awaiting_integration"}),
+        ),
+        ("review_started", json!({"attempt": 1})),
+        (
+            "review_finished",
+            json!({"verdict": "pass", "reasons": [], "summary": "ok", "attempt": 1}),
+        ),
+        (
+            "exit_requested",
+            json!({"workspace_id": WORKSPACE_ID, "timeout_secs": 120}),
+        ),
+        (
+            "exit_request_timed_out",
+            json!({"workspace_id": WORKSPACE_ID, "timeout_secs": 120}),
+        ),
+    ] {
+        queue.record_runtime_event(&run.id, kind, payload).unwrap();
+    }
+    age_lease(&db, &run, 31);
+    let reviewer = Arc::new(TestReviewer::new(&[verdict("concern", &["x"], "never")]));
+    let supervisor = {
+        let (db, repo, backend, reviewer) =
+            (db.clone(), repo.clone(), backend.clone(), reviewer.clone());
+        thread::spawn(move || {
+            runtime::supervise_with_reviewer(
+                &db,
+                &repo,
+                &*backend,
+                &claude_stub(&db),
+                &*reviewer,
+                Path::new(env!("CARGO_BIN_EXE_dagq")),
+                &supervise_options(4, true),
+            )
+        })
+    };
+    wait_until(&db, Duration::from_secs(30), |queue| {
+        !queue.asks(AskQuery::default()).unwrap().is_empty()
+    });
+    thread::sleep(Duration::from_millis(1500));
+    let asks = queue.asks(AskQuery::default()).unwrap();
+    assert_eq!(asks.len(), 1, "{asks:?}");
+    let ask = asks[0].clone();
+    assert_eq!(ask.kind, AskKind::StuckExit);
+    assert!(
+        ask.question
+            .contains("The run stays awaiting_integration under the supervisor after its validation and review, and lands on main once the session exits"),
+        "{}",
+        ask.question
+    );
+    assert_eq!(backend.exits_sent.load(Ordering::SeqCst), 0);
+    // The person's /exit reaches the session.
+    fs::write(exit_request_path(run.run_dir.as_ref().unwrap()), "").unwrap();
+    let outcome = supervisor.join().unwrap().unwrap();
+    backend.join();
+    assert_eq!(outcome["errors"], json!([]), "{outcome}");
+    let detail = queue.show(1).unwrap();
+    assert_landed(&repo, &detail.runs[0], "test task", &base);
+    assert!(reviewer.prompts().is_empty(), "reviewed again");
+    assert_eq!(backend.exits_sent.load(Ordering::SeqCst), 0);
+    let kinds = event_kinds(&detail);
+    assert_eq!(kinds.iter().filter(|k| **k == "exit_requested").count(), 1);
+    assert_eq!(kinds.iter().filter(|k| **k == "review_started").count(), 1);
+    let closed = queue.read_ask(ask.id).unwrap();
+    assert!(closed.closed_at.is_some());
+    assert_eq!(
+        closed.answer.as_deref(),
+        Some("the session exited; closed by the runtime")
+    );
+    assert_eq!(
+        queue
+            .asks(AskQuery {
+                all: true,
+                ..Default::default()
+            })
+            .unwrap()
+            .len(),
+        1
+    );
 }

@@ -71,6 +71,9 @@ pub const INBOX_ROLE: &str = SessionRole::Inbox.as_str();
 /// refuses every command that changes queue state from this environment,
 /// except notes, draft goals and the draft tasks of a draft goal.
 pub const OBSERVER_ROLE: &str = SessionRole::Observer.as_str();
+/// `DAGQ_ROLE` of the supervisor's headless review of a run (ADR-0027). The
+/// CLI allows it only commands that read the queue.
+pub const REVIEWER_ROLE: &str = SessionRole::Reviewer.as_str();
 /// File under the queue's log directory that launchd appends the
 /// supervisor's stdout and stderr to.
 pub const LAUNCHD_LOG_NAME: &str = "launchd.log";

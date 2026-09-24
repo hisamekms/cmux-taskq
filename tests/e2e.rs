@@ -39,9 +39,12 @@ if [ "${1:-}" = "--version" ]; then
   printf 'claude-stub 0.0.0\n'
   exit 0
 fi
-session_id= debug_file= add_dir= settings= prompt= resume=
+session_id= debug_file= add_dir= settings= prompt= resume= headless= tools= denied=
 while [ $# -gt 0 ]; do
   case "$1" in
+    -p) headless=1; shift ;;
+    --allowedTools) tools=$2; shift 2 ;;
+    --disallowedTools) denied=$2; shift 2 ;;
     --session-id) session_id=$2; shift 2 ;;
     --resume) resume=$2; shift 2 ;;
     --debug-file) debug_file=$2; shift 2 ;;
@@ -52,6 +55,23 @@ while [ $# -gt 0 ]; do
   esac
 done
 [ $# -eq 0 ] || { printf 'stub: trailing arguments after the prompt\n' >&2; exit 64; }
+if [ -n "$headless" ]; then
+  # The supervisor's headless review (ADR-0027): read review.md, print the
+  # verdict JSON on stdout. Only a task that says E2E-REVIEW-PASS passes;
+  # any other review fails, and its run waits for a review by hand.
+  [ -z "$session_id" ] && [ -n "$debug_file" ] && [ -n "$add_dir" ] && [ -n "$settings" ] && [ -n "$prompt" ] \
+    && [ "$tools" = "Read,Grep,Glob" ] && [ "$denied" = "Bash,Edit,Write,NotebookEdit" ] || { printf 'stub: bad review arguments\n' >&2; exit 64; }
+  ! grep -q '"Stop"' "$settings" || { printf 'stub: review settings would write the idle marker\n' >&2; exit 64; }
+  review=$(printf '%s\n' "$prompt" | sed -n 's/^Read the review material at \(.*\): the task.*/\1/p')
+  [ -f "$review" ] || { printf 'stub: no review material at %s\n' "$review" >&2; exit 65; }
+  printf 'argv: -p --debug-file %s --add-dir %s --settings %s\nreview: %s\n' "$debug_file" "$add_dir" "$settings" "$review" > "$debug_file"
+  if grep -q 'E2E-REVIEW-PASS' "$review"; then
+    printf '{"verdict":"pass","reasons":[],"summary":"the stub reviewer found e2e.txt committed"}\n'
+    exit 0
+  fi
+  printf 'stub: no verdict for this task\n' >&2
+  exit 3
+fi
 if [ -n "$resume" ]; then
   # A resumed needs_session run: wait for the supervisor's resolution
   # request on the terminal, rebase onto the main it names, resolve the
@@ -465,11 +485,27 @@ fn add_ready_task_verifying(
     dependencies: &[&str],
     verify: &[&str],
 ) -> String {
+    add_ready_task_described(
+        env,
+        title,
+        "Add e2e.txt to the worktree",
+        dependencies,
+        verify,
+    )
+}
+
+fn add_ready_task_described(
+    env: &Env,
+    title: &str,
+    description: &str,
+    dependencies: &[&str],
+    verify: &[&str],
+) -> String {
     let mut args = vec![
         "add",
         title,
         "--description",
-        "Add e2e.txt to the worktree",
+        description,
         "--acceptance",
         "e2e.txt is committed and seed.txt still exists",
         "--verify",
@@ -601,8 +637,29 @@ fn happy_path_runs_a_stub_agent_through_cmux_and_lands_on_main() {
         env,
         ..
     } = &fixture;
-    let task_id = add_ready_task_verifying(env, "e2e stub task", &[], &[VERIFY_RUN_ENV]);
+    // The stub reviewer passes a task that says E2E-REVIEW-PASS.
+    let task_id = add_ready_task_described(
+        env,
+        "e2e stub task",
+        "Add e2e.txt to the worktree. E2E-REVIEW-PASS",
+        &[],
+        &[VERIFY_RUN_ENV],
+    );
     assert_eq!(dagq(env, &["candidates"]).as_array().unwrap().len(), 1);
+    // The supervisor pushes what it lands to the repository's bare origin.
+    let origin = repo.parent().unwrap().join("origin.git");
+    git(
+        repo.parent().unwrap(),
+        &[
+            "init",
+            "-q",
+            "--bare",
+            "-b",
+            "main",
+            origin.to_str().unwrap(),
+        ],
+    );
+    git(repo, &["remote", "add", "origin", origin.to_str().unwrap()]);
 
     let mut guard = WorkspaceGuard {
         cmux: cmux.clone(),
@@ -617,22 +674,20 @@ fn happy_path_runs_a_stub_agent_through_cmux_and_lands_on_main() {
     let outcome = &pass.outcome;
     assert_eq!(outcome["runs"].as_array().unwrap().len(), 1, "{outcome}");
     assert_eq!(outcome["errors"], Value::Array(vec![]), "{outcome}");
-    assert_eq!(
-        outcome["runs"][0]["status"], "awaiting_integration",
-        "{outcome}"
-    );
+    // Accepted, reviewed and landed by the supervisor alone (ADR-0027).
+    assert_eq!(outcome["runs"][0]["status"], "integrated", "{outcome}");
     let stderr = &pass.stderr;
     let base = base.as_str();
     let repo = repo.as_path();
     let db = db.as_path();
 
     let detail = dagq(env, &["show", &task_id, "--full"]);
-    assert_eq!(detail["task"]["status"], "in_progress");
+    assert_eq!(detail["task"]["status"], "completed");
     let runs = detail["runs"].as_array().unwrap();
     assert_eq!(runs.len(), 1);
     let run = &runs[0];
     let run_id = run["id"].as_str().unwrap();
-    assert_eq!(run["status"], "awaiting_integration");
+    assert_eq!(run["status"], "integrated");
     assert_eq!(run["workspace_id"], workspace.as_str());
     assert_eq!(run["base_commit"], base);
     assert!(run["last_error"].is_null());
@@ -659,11 +714,12 @@ fn happy_path_runs_a_stub_agent_through_cmux_and_lands_on_main() {
     assert!(run["workspace_closed_at"].is_number(), "{run}");
     assert!(
         !workspace_listed(cmux, &workspace),
-        "workspace {workspace} is still open after the run was accepted"
+        "workspace {workspace} is still open after the run landed"
     );
-    assert!(stderr.contains("awaiting_integration"), "{stderr}");
+    assert!(stderr.contains("review 1: pass"), "{stderr}");
+    assert!(stderr.contains("integrated"), "{stderr}");
 
-    // The run lives next to the queue, and its worktree resolves the same queue.
+    // The run lives next to the queue.
     let run_dir = Path::new(run["run_dir"].as_str().unwrap());
     assert_eq!(
         run_dir,
@@ -674,28 +730,33 @@ fn happy_path_runs_a_stub_agent_through_cmux_and_lands_on_main() {
     );
     let worktree = Path::new(run["worktree_path"].as_str().unwrap());
     assert_eq!(worktree, run_dir.join("worktree"));
-    let from_worktree = Env {
-        repo: worktree.to_path_buf(),
-        data_home: env.data_home.clone(),
-    };
-    assert_eq!(
-        dagq(&from_worktree, &["locate"])["db"],
-        db.to_str().unwrap()
-    );
-    let head = git(worktree, &["rev-parse", "HEAD"]);
-    assert_eq!(git(repo, &["rev-parse", "main"]), base); // Not merged by the supervisor.
+    // The run's own history is kept under its ref; the landing is one
+    // squash commit on main with its tree, pushed to origin.
+    let head = git(repo, &["rev-parse", &format!("refs/dagq/runs/{run_id}")]);
     assert_ne!(head, base);
-    assert_eq!(run["result_commit"], head.as_str());
+    let main = git(repo, &["rev-parse", "main"]);
+    assert_ne!(main, head);
+    assert_eq!(run["result_commit"], main.as_str());
+    assert_eq!(git(&origin, &["rev-parse", "main"]), main);
+    assert_eq!(git(repo, &["rev-parse", "main^"]), base);
     assert_eq!(
-        git(worktree, &["symbolic-ref", "HEAD"]),
-        format!("refs/heads/dagq/{run_id}")
+        git(repo, &["rev-parse", "main^{tree}"]),
+        git(repo, &["rev-parse", &format!("{head}^{{tree}}")])
     );
-    assert_eq!(git(worktree, &["status", "--porcelain"]), "");
     assert_eq!(
-        fs::read_to_string(worktree.join("e2e.txt")).unwrap(),
+        git(repo, &["log", "-1", "--format=%B", "main"]),
+        format!("e2e stub task\n\nadded e2e.txt\n\nDagq-Task: {task_id}\nDagq-Run: {run_id}")
+    );
+    assert_eq!(git(repo, &["status", "--porcelain"]), ""); // The checkout moved with main.
+    assert_eq!(
+        fs::read_to_string(repo.join("e2e.txt")).unwrap(),
         format!("written by the stub agent for {run_id}\n")
     );
-    assert!(!repo.join("e2e.txt").exists()); // main is untouched.
+    assert!(!worktree.exists(), "landed worktree was not removed");
+    assert_eq!(
+        git(repo, &["branch", "--list", &format!("dagq/{run_id}")]),
+        ""
+    );
 
     let receipt: Value =
         serde_json::from_str(&fs::read_to_string(run["receipt_path"].as_str().unwrap()).unwrap())
@@ -720,7 +781,7 @@ fn happy_path_runs_a_stub_agent_through_cmux_and_lands_on_main() {
         "{log}"
     );
     // dagq.toml's [run.env], expanded, reached the agent's shell; the
-    // verification commands get it at integrate, the only place they run.
+    // verification commands get it at the landing, the only place they run.
     let shared = db.canonicalize().unwrap().with_file_name("shared");
     assert!(
         log.contains(&format!(
@@ -730,20 +791,41 @@ fn happy_path_runs_a_stub_agent_through_cmux_and_lands_on_main() {
         )),
         "{log}"
     );
-    assert!(!run_dir.join("verify-env.txt").exists());
+    assert_eq!(
+        fs::read_to_string(run_dir.join("verify-env.txt")).unwrap(),
+        format!("verify env: {}\n", shared.display())
+    );
+    // The headless review ran `claude -p` with the run directory's hook-less
+    // settings and read review.md there.
+    let review_log = fs::read_to_string(run_dir.join("claude-review.log")).unwrap();
+    assert!(
+        review_log.contains(&format!(
+            "argv: -p --debug-file {run_dir}/claude-review.log --add-dir {run_dir} --settings {run_dir}/claude-review-settings.json",
+            run_dir = run_dir.display()
+        )),
+        "{review_log}"
+    );
+    assert!(
+        review_log.contains(&format!("review: {}/review.md", run_dir.display())),
+        "{review_log}"
+    );
     // The run workspace joined the queue's group, made by its external ID.
     assert!(
         fixture.group().is_some(),
         "no workspace group for the queue"
     );
 
-    let kinds: Vec<&str> = detail["events"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|e| e["kind"].as_str().unwrap())
-        .collect();
-    for expected in [
+    let events = detail["events"].as_array().unwrap();
+    let kinds: Vec<&str> = events.iter().map(|e| e["kind"].as_str().unwrap()).collect();
+    let position = |kind: &str| {
+        kinds
+            .iter()
+            .position(|k| *k == kind)
+            .unwrap_or_else(|| panic!("missing {kind} in {kinds:?}"))
+    };
+    // The session stays open through validation and the review; /exit is
+    // sent on the passing verdict, and the landing follows the close.
+    let order = [
         "lease_acquired",
         "worktree_created",
         "workspace_created",
@@ -751,16 +833,27 @@ fn happy_path_runs_a_stub_agent_through_cmux_and_lands_on_main() {
         "agent_started",
         "receipt_observed",
         "session_idle_observed",
-        "exit_requested",
-        "session_exited",
         "supervision_finished",
         "validation_finished",
+        "review_started",
+        "review_finished",
+        "exit_requested",
+        "session_exited",
         "workspace_closed",
-        "lease_released",
-    ] {
-        assert!(kinds.contains(&expected), "missing {expected} in {kinds:?}");
+        "integration_started",
+        "integration_rebased",
+        "run_integrated",
+        "worktree_removed",
+        "push_finished",
+    ];
+    for pair in order.windows(2) {
+        assert!(
+            position(pair[0]) < position(pair[1]),
+            "{} before {}: {kinds:?}",
+            pair[0],
+            pair[1]
+        );
     }
-    let events = detail["events"].as_array().unwrap();
     let event = |kind: &str| events.iter().find(|e| e["kind"] == kind).unwrap();
     assert_eq!(
         event("workspace_created")["payload"]["workspace_id"],
@@ -771,102 +864,34 @@ fn happy_path_runs_a_stub_agent_through_cmux_and_lands_on_main() {
         run_id
     );
     assert_eq!(
+        event("supervision_finished")["payload"],
+        serde_json::json!({"status": "validating", "exit_code": null, "session_live": true})
+    );
+    assert_eq!(
+        event("review_started")["payload"]["session_live"],
+        true,
+        "the session must be alive during the review"
+    );
+    let review = &event("review_finished")["payload"];
+    assert_eq!(review["verdict"], "pass");
+    assert_eq!(review["attempt"], 1);
+    assert_eq!(
+        review["summary"],
+        "the stub reviewer found e2e.txt committed"
+    );
+    assert_eq!(
         event("exit_requested")["payload"]["workspace_id"],
         workspace.as_str()
     );
     assert!(!kinds.contains(&"exit_request_timed_out"), "{kinds:?}");
+    assert!(!kinds.contains(&"integration_approved"), "{kinds:?}");
     assert_eq!(event("session_exited")["payload"]["exit_code"], 0);
-    assert_eq!(
-        event("supervision_finished")["payload"]["status"],
-        "validating"
-    );
-    // Validation checks the receipt only (ADR-0023 decision 1).
-    assert!(!kinds.contains(&"verification_command"), "{kinds:?}");
     let finished = event("validation_finished");
     assert_eq!(finished["payload"]["status"], "awaiting_integration");
     assert_eq!(finished["payload"]["result_commit"], head.as_str());
     assert_eq!(finished["payload"]["receipt"]["summary"], "added e2e.txt");
-    assert!(!kinds.contains(&"cleanup_failed"), "{kinds:?}");
-
-    let processes = detail["processes"].as_array().unwrap();
-    assert_eq!(processes.len(), 2);
-    assert!(processes.iter().all(|p| p["exit_code"] == 0));
-
-    // The task stays taken until integration; the lease is gone.
-    assert_eq!(dagq(env, &["candidates"]).as_array().unwrap().len(), 0);
-    let status = dagq(env, &["status"]);
-    assert_eq!(status["supervisors"], Value::Array(vec![]), "{status}");
-    assert_eq!(status["runs"], Value::Array(vec![]), "{status}");
-
-    // Landing is the runtime's job: one squash commit on main with the run's
-    // tree, pushed to the repository's bare origin.
-    let origin = repo.parent().unwrap().join("origin.git");
-    git(
-        repo.parent().unwrap(),
-        &[
-            "init",
-            "-q",
-            "--bare",
-            "-b",
-            "main",
-            origin.to_str().unwrap(),
-        ],
-    );
-    git(repo, &["remote", "add", "origin", origin.to_str().unwrap()]);
-    let integrated = dagq(env, &["integrate", &task_id]);
-    assert_eq!(integrated["outcome"], "integrated", "{integrated}");
-    assert_eq!(integrated["task"]["status"], "completed");
-    assert_eq!(integrated["run"]["status"], "integrated");
-    let main = git(repo, &["rev-parse", "main"]);
-    assert_ne!(main, head);
-    assert_eq!(
-        integrated["push"],
-        serde_json::json!({"outcome": "pushed", "remote": "origin", "error": null})
-    );
-    assert_eq!(git(&origin, &["rev-parse", "main"]), main);
-    assert_eq!(integrated["run"]["result_commit"], main.as_str());
-    assert_eq!(git(repo, &["rev-parse", "main^"]), base);
-    assert_eq!(
-        git(repo, &["rev-parse", "main^{tree}"]),
-        git(repo, &["rev-parse", &format!("{head}^{{tree}}")])
-    );
-    assert_eq!(
-        git(repo, &["log", "-1", "--format=%B", "main"]),
-        format!("e2e stub task\n\nadded e2e.txt\n\nDagq-Task: {task_id}\nDagq-Run: {run_id}")
-    );
-    assert_eq!(git(repo, &["status", "--porcelain"]), ""); // The checkout moved with main.
-    assert!(repo.join("e2e.txt").exists());
-    assert_eq!(
-        git(repo, &["rev-parse", &format!("refs/dagq/runs/{run_id}")]),
-        head
-    );
-    assert!(!worktree.exists(), "landed worktree was not removed");
-    assert_eq!(
-        git(repo, &["branch", "--list", &format!("dagq/{run_id}")]),
-        ""
-    );
-    let detail = dagq(env, &["show", &task_id, "--full"]);
-    assert_eq!(detail["task"]["status"], "completed");
-    assert_eq!(detail["runs"][0]["status"], "integrated");
-    let kinds: Vec<&str> = detail["events"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|e| e["kind"].as_str().unwrap())
-        .collect();
-    for expected in [
-        "integration_started",
-        "integration_rebased",
-        "run_integrated",
-        "worktree_removed",
-        "push_finished",
-    ] {
-        assert!(kinds.contains(&expected), "missing {expected} in {kinds:?}");
-    }
     // The verification commands ran once, after the rebase, with the run env.
-    let verifications: Vec<&Value> = detail["events"]
-        .as_array()
-        .unwrap()
+    let verifications: Vec<&Value> = events
         .iter()
         .filter(|e| e["kind"] == "verification_command")
         .collect();
@@ -876,18 +901,29 @@ fn happy_path_runs_a_stub_agent_through_cmux_and_lands_on_main() {
             .iter()
             .all(|e| e["payload"]["exit_code"] == 0 && e["payload"]["phase"] == "integration")
     );
-    assert!(!kinds.contains(&"integration_verification_skipped"));
-    assert_eq!(integrated["verification_skipped"], false);
-    assert_eq!(
-        fs::read_to_string(run_dir.join("verify-env.txt")).unwrap(),
-        format!("verify env: {}\n", shared.display())
-    );
     assert!(!kinds.contains(&"cleanup_failed"), "{kinds:?}");
+
+    let processes = detail["processes"].as_array().unwrap();
+    assert_eq!(processes.len(), 2);
+    assert!(processes.iter().all(|p| p["exit_code"] == 0));
+
+    assert_eq!(dagq(env, &["candidates"]).as_array().unwrap().len(), 0);
+    let status = dagq(env, &["status"]);
+    assert_eq!(status["supervisors"], Value::Array(vec![]), "{status}");
+    assert_eq!(status["runs"], Value::Array(vec![]), "{status}");
+    // Only the stopped `--once` supervisor is left; no run waits for anyone.
+    assert!(
+        status["attention"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|a| a["run_id"].is_null()),
+        "{status}"
+    );
     assert_eq!(
         dagq(env, &["integrate", "--next"])["outcome"],
         "no_run_awaiting"
     );
-    assert_eq!(dagq(env, &["status"])["runs"], Value::Array(vec![]));
 }
 
 /// The stub worker asks a `worker_question` (its task says `E2E-ASK`) and
@@ -1287,7 +1323,8 @@ fn killed_supervisor_run_is_adopted_by_the_next_supervisor_and_lands() {
     assert_eq!(run["workspace_id"], workspace.as_str());
     assert!(run["last_error"].is_null(), "{run}");
     assert!(run["workspace_closed_at"].is_number(), "{run}");
-    assert!(!workspace_listed(cmux, &workspace));
+    // cmux accepted the close; its list can lag behind it for a moment.
+    wait_until_not_listed(cmux, &workspace);
     let events = detail["events"].as_array().unwrap();
     let kinds: Vec<&str> = events.iter().map(|e| e["kind"].as_str().unwrap()).collect();
     let count = |kind: &str| kinds.iter().filter(|k| **k == kind).count();

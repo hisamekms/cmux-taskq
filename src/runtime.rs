@@ -10,10 +10,12 @@ use crate::{
         WorkspaceTags, dependency_graph,
     },
     domain::{
-        AskKind, ClaimOutcome, EvidenceCheck, Goal, IntegrationOutcome, MAX_RESUME_ATTEMPTS,
-        NewAsk, NewTask, PUSH_REMOTE, Predecessor, PushReport, PushResult, Receipt, ReceiptResult,
-        RegisteredFollowUp, RunLease, RunPaths, RunProcess, RunStatus, SessionRole, SupervisorMode,
-        SupervisorRegistration, Task, TaskRun, evidence_missing_reason, heartbeat_stale,
+        AskKind, ClaimOutcome, EvidenceCheck, Goal, IntegrationOutcome, LANDING_OPTIONS,
+        MAX_RESUME_ATTEMPTS, MAX_REVISE_ATTEMPTS, NewAsk, NewTask, PUSH_REMOTE, Predecessor,
+        PushReport, PushResult, Receipt, ReceiptResult, RegisteredFollowUp, ReviewDecision,
+        ReviewVerdict, RunLease, RunPaths, RunProcess, RunStatus, SessionRole, SupervisorMode,
+        SupervisorRegistration, Task, TaskAction, TaskRun, evidence_missing_reason,
+        heartbeat_stale,
     },
     infrastructure::{
         adapters::{
@@ -203,11 +205,29 @@ pub struct RunError {
 /// active or claimable; otherwise on `stop`, or after a provisioning failure
 /// has drained the active runs (an error). Every task unblocked by `integrate`
 /// is picked up on a later pass with the then-current `main` as its base.
+/// Accepted runs are reviewed headless by `claude` itself (ADR-0027).
 pub fn supervise(
     db: &Path,
     repo: &Path,
     cmux: &dyn WorkspaceBackend,
     claude: &Path,
+    runner: &Path,
+    options: &SuperviseOptions,
+) -> Result<Value> {
+    let reviewer = ClaudeCode {
+        executable: claude.into(),
+    };
+    supervise_with_reviewer(db, repo, cmux, claude, &reviewer, runner, options)
+}
+
+/// [`supervise`] with the provider of the headless review given apart
+/// from the `claude` the run sessions start (a test double in tests).
+pub fn supervise_with_reviewer(
+    db: &Path,
+    repo: &Path,
+    cmux: &dyn WorkspaceBackend,
+    claude: &Path,
+    reviewer: &dyn AgentProvider,
     runner: &Path,
     options: &SuperviseOptions,
 ) -> Result<Value> {
@@ -260,6 +280,7 @@ pub fn supervise(
         repository,
         cmux: &cmux,
         claude,
+        reviewer,
         runner,
         token,
         heartbeat,
@@ -470,6 +491,8 @@ struct Supervisor<'a> {
     repository: GitRepository,
     cmux: &'a dyn WorkspaceBackend,
     claude: &'a Path,
+    /// Starts the headless review of accepted runs (ADR-0027).
+    reviewer: &'a dyn AgentProvider,
     runner: &'a Path,
     token: String,
     heartbeat: Heartbeat,
@@ -499,17 +522,66 @@ struct Slot {
 
 enum Phase {
     Session(SessionWatch),
-    /// Receipt validation runs off the loop because verification commands may
-    /// take minutes; the loop only joins the result.
-    Validating(Option<thread::JoinHandle<Result<Validation>>>),
+    /// Receipt validation runs off the loop; the loop only joins the result.
+    /// The run's session (if it still has a workspace) stays open through
+    /// validation and review (ADR-0027 decision 1).
+    Validating(
+        Option<thread::JoinHandle<Result<Validation>>>,
+        Option<SessionRef>,
+    ),
+    /// The headless review of an accepted run (ADR-0023 decision 2).
+    Review(ReviewWatch),
+    /// The live session fixes what a `revise` verdict named (ADR-0027
+    /// decision 2).
+    Revise(ReviseWatch),
+    /// The session is asked to `/exit` and its workspace closed before the
+    /// run moves on (a landing, an ask, a failed review, or rest).
+    Exiting(ExitWatch),
     /// A resumed session of a `needs_session` run (ADR-0019).
     Resume(ResumeWatch),
-    /// A resolved run whose integrate was approved waits for the single
-    /// integration slot, keeping its lease.
+    /// A run to land (a passed review, or an approved resolved resume)
+    /// waits for the single integration slot, keeping its lease.
     AwaitingSlot,
-    /// The approved run lands off the loop, like validation; the landing
-    /// releases the lease itself.
+    /// The run lands off the loop, like validation; the landing releases
+    /// the lease itself.
     Landing(Option<thread::JoinHandle<Result<IntegrationOutcome>>>),
+}
+
+/// The session of a run the supervisor keeps open through validation,
+/// review and revise (ADR-0027): the worker's own workspace, or the one of
+/// the resume that reopened the session (ADR-0019).
+#[derive(Debug, Clone)]
+struct SessionRef {
+    workspace: String,
+    /// The resume attempt that opened the workspace; `None` for the
+    /// worker's workspace (`task_runs.workspace_id`).
+    resume: Option<usize>,
+}
+
+/// What the supervisor does once the session exited and its workspace
+/// closed.
+enum AfterExit {
+    /// Wait for the integration slot and land (a passed review, or an
+    /// approved resolved resume).
+    Land,
+    /// Open the `approve_landing` ask (a `concern`, or a `revise` past its
+    /// limit) and give the lease back.
+    Ask {
+        decision: ReviewDecision,
+        reasons: Vec<String>,
+        summary: String,
+        /// Why a `revise` verdict became a question for a person.
+        why: Option<String>,
+    },
+    /// Record `review_failed` and give the lease back.
+    ReviewFailed {
+        attempt: usize,
+        error: String,
+        duration_secs: u64,
+    },
+    /// Give the lease back: a run parked for evidence (its workspace is
+    /// closed) or a failed one (its workspace is kept for inspection).
+    Rest { close: bool },
 }
 
 enum Step {
@@ -598,6 +670,9 @@ impl Supervisor<'_> {
             self.adopt_stale_runs(parallel)?;
         }
         if self.slots.len() < parallel {
+            self.apply_landing_answers(parallel)?;
+        }
+        if self.slots.len() < parallel {
             self.resume_parked_runs(parallel)?;
         }
         while self.slots.len() < parallel {
@@ -651,7 +726,10 @@ impl Supervisor<'_> {
                         .note(&format!("run {} is {}", run.id, run.status.as_str()));
                     self.finished.push(*run);
                 }
-                Ok(Step::Disowned) => self.disown(&slot),
+                Ok(Step::Disowned) => {
+                    stop_reviewer(&mut slot);
+                    self.disown(&slot)
+                }
                 // A lease-guarded write that failed because the lease
                 // changed hands mid-step (this process was stalled and
                 // adopted from) is the other owner's run to describe.
@@ -666,7 +744,7 @@ impl Supervisor<'_> {
                 Err(error) if matches!(slot.phase, Phase::AwaitingSlot) => {
                     // The resume already recorded its `resume_finished`;
                     // only the lease it kept for the landing goes.
-                    let message = format!("landing after the resume could not start: {error:#}");
+                    let message = format!("landing could not start: {error:#}");
                     self.log.note(&format!("run {}: {message}", slot.run.id));
                     if let Err(error) = self.queue.release_lease(&slot.run.id, &self.token) {
                         self.log.note(&format!(
@@ -695,7 +773,9 @@ impl Supervisor<'_> {
                 Err(error) => {
                     // Creation/communication failures can be ambiguous: the
                     // session may be alive. Disown the run, delete nothing,
-                    // and keep serving the other slots.
+                    // and keep serving the other slots. A headless review in
+                    // progress is stopped: nobody would read its verdict.
+                    stop_reviewer(&mut slot);
                     let message = format!("{error:#}");
                     self.log.note(&format!(
                         "run {} retained for inspection: {message}; see show {} and doctor",
@@ -819,7 +899,7 @@ impl Supervisor<'_> {
             "lease of run {} is held by another process; this supervisor stopped watching it",
             slot.run.id
         );
-        if matches!(slot.phase, Phase::Validating(Some(_))) {
+        if matches!(slot.phase, Phase::Validating(Some(_), _)) {
             // Its checks finish on their own; the new owner runs its own.
             message.push_str("; a validation already in progress runs to completion unrecorded");
         }
@@ -920,12 +1000,12 @@ impl Supervisor<'_> {
                 Ok(outcome) => {
                     let outcome = serde_json::to_value(&outcome)?;
                     self.log.note(&format!(
-                        "run {} landing after its resume: {}",
+                        "run {} landing: {}",
                         slot.run.id, outcome["outcome"]
                     ));
                 }
                 Err(error) => {
-                    let message = format!("landing after the resume failed: {error:#}");
+                    let message = format!("landing failed: {error:#}");
                     self.log.note(&format!("run {}: {message}", slot.run.id));
                     self.errors.push(RunError {
                         run_id: slot.run.id.clone(),
@@ -963,6 +1043,7 @@ impl Supervisor<'_> {
                 {
                     return Ok(Step::Continue);
                 }
+                let previous = self.queue.run(&slot.run.id)?.status;
                 let main = self.repository.main_head()?;
                 let run = match self
                     .queue
@@ -981,37 +1062,13 @@ impl Supervisor<'_> {
                     Err(error) => return Err(error),
                 };
                 self.log.note(&format!(
-                    "run {} was approved for integration; landing it onto main {main}",
-                    run.id
+                    "run {} lands onto main {main} ({})",
+                    run.id,
+                    previous.as_str()
                 ));
-                let db = self.db.clone();
-                let repository = self.repository.clone();
-                let token = self.token.clone();
-                let common_dir = path_text(&self.repository.common_dir)?;
-                // Push as the approving `integrate` would have (`--no-push`
-                // records `push: false`).
-                let push = self
-                    .queue
-                    .run_events(&run.id)?
-                    .iter()
-                    .find(|e| e.kind == "integration_approved")
-                    .is_none_or(|e| e.payload.get("push") != Some(&json!(false)));
-                let landing = run.clone();
+                slot.phase =
+                    Phase::Landing(Some(self.spawn_landing(run.clone(), previous, main)?));
                 slot.run = run;
-                slot.phase = Phase::Landing(Some(thread::spawn(move || {
-                    let mut queue = SqliteQueue::open(&db)?;
-                    land_integrating(
-                        &mut queue,
-                        &db,
-                        &repository,
-                        &landing,
-                        RunStatus::NeedsSession,
-                        &main,
-                        &token,
-                        &common_dir,
-                        push.then_some(&repository as &dyn MainRemote),
-                    )
-                })));
                 Ok(Step::Continue)
             }
             Phase::Landing(_) => unreachable!("joined above"),
@@ -1031,6 +1088,10 @@ impl Supervisor<'_> {
                     self.queue.release_lease(&run.id, &self.token)?;
                     return Ok(Step::Done(Box::new(run)));
                 }
+                let session = SessionRef {
+                    workspace: watch.workspace.clone(),
+                    resume: None,
+                };
                 let handle = spawn_validation(
                     self.db.clone(),
                     self.repository.clone(),
@@ -1038,10 +1099,10 @@ impl Supervisor<'_> {
                     self.log.clone(),
                 );
                 slot.run = run;
-                slot.phase = Phase::Validating(Some(handle));
+                slot.phase = Phase::Validating(Some(handle), Some(session));
                 Ok(Step::Continue)
             }
-            Phase::Validating(handle) => {
+            Phase::Validating(handle, session) => {
                 if !handle.as_ref().is_some_and(|h| h.is_finished()) {
                     return Ok(Step::Continue);
                 }
@@ -1053,21 +1114,596 @@ impl Supervisor<'_> {
                 let run = self
                     .queue
                     .finish_validation(&slot.run.id, &self.token, &validation)?;
-                // An accepted run gives up its workspace, and so does one
-                // parked for evidence: its session ended, and a resume opens
-                // a workspace of its own. Failures keep it for inspection.
-                let run = if matches!(
-                    run.status,
-                    RunStatus::AwaitingIntegration | RunStatus::NeedsSession
-                ) {
-                    close_workspace(&mut self.queue, self.cmux, &self.token, &run, &self.log)?
-                } else {
-                    run
+                let session = session.take();
+                slot.phase = match run.status {
+                    // An approved run (its integrate was called) lands without
+                    // a review, as before (ADR-0027 decision 3).
+                    RunStatus::AwaitingIntegration
+                        if self.queue.has_run_event(&run.id, "integration_approved")? =>
+                    {
+                        Phase::Exiting(ExitWatch::new(session, AfterExit::Land))
+                    }
+                    RunStatus::AwaitingIntegration => self.start_review(&run, session)?,
+                    // A run parked for evidence gives up its workspace, since a
+                    // resume opens one of its own; a failed one keeps it for
+                    // inspection.
+                    RunStatus::NeedsSession => {
+                        Phase::Exiting(ExitWatch::new(session, AfterExit::Rest { close: true }))
+                    }
+                    _ => Phase::Exiting(ExitWatch::new(session, AfterExit::Rest { close: false })),
                 };
-                self.queue.release_lease(&run.id, &self.token)?;
-                Ok(Step::Done(Box::new(run)))
+                slot.run = run;
+                Ok(Step::Continue)
+            }
+            Phase::Review(watch) => {
+                let Some(outcome) = watch.poll()? else {
+                    return Ok(Step::Continue);
+                };
+                let attempt = watch.attempt;
+                let duration_secs = watch.started.elapsed().as_secs();
+                let session = watch.session.take();
+                let run = self.queue.run(&slot.run.id)?;
+                slot.phase = match outcome {
+                    Ok(verdict) => {
+                        self.queue.record_runtime_event(
+                            &run.id,
+                            "review_finished",
+                            json!({
+                                "verdict": verdict.verdict,
+                                "reasons": verdict.reasons,
+                                "summary": verdict.summary,
+                                "duration_secs": duration_secs,
+                                "attempt": attempt,
+                            }),
+                        )?;
+                        self.log.note(&format!(
+                            "run {} review {attempt}: {} ({})",
+                            run.id,
+                            verdict.verdict.as_str(),
+                            verdict.summary
+                        ));
+                        self.act_on_verdict(&run, session, verdict)?
+                    }
+                    Err(error) => {
+                        self.log.note(&format!(
+                            "run {} review {attempt} failed: {error}; the run waits for a review by hand",
+                            run.id
+                        ));
+                        Phase::Exiting(ExitWatch::new(
+                            session,
+                            AfterExit::ReviewFailed {
+                                attempt,
+                                error,
+                                duration_secs,
+                            },
+                        ))
+                    }
+                };
+                slot.run = run;
+                Ok(Step::Continue)
+            }
+            Phase::Revise(watch) => {
+                let Some(outcome) =
+                    watch.poll(&mut self.queue, self.cmux, &self.repository, &slot.run)?
+                else {
+                    return Ok(Step::Continue);
+                };
+                let session = watch.session.clone();
+                match outcome {
+                    ReviseOutcome::Rewritten(head) => {
+                        self.queue.record_runtime_event(
+                            &slot.run.id,
+                            "revise_finished",
+                            json!({"attempt": watch.attempt, "head": head}),
+                        )?;
+                        self.log.note(&format!(
+                            "run {} rewrote its receipt for revise {} (head {head}); validating again",
+                            slot.run.id, watch.attempt
+                        ));
+                        let run = self.queue.restart_validation(&slot.run.id, &self.token)?;
+                        let handle = spawn_validation(
+                            self.db.clone(),
+                            self.repository.clone(),
+                            run.clone(),
+                            self.log.clone(),
+                        );
+                        slot.run = run;
+                        slot.phase = Phase::Validating(Some(handle), Some(session));
+                    }
+                    ReviseOutcome::Mismatch(why) => {
+                        let message = revise_mismatch_request(&slot.run, watch.attempt, &why)?;
+                        // Only what the session writes after this counts.
+                        let sent_at = SystemTime::now();
+                        match self.cmux.send_text(&session.workspace, &message) {
+                            Ok(()) => {
+                                watch.sent_at = sent_at;
+                                self.queue.record_runtime_event(
+                                    &slot.run.id,
+                                    "revise_receipt_rejected",
+                                    json!({"attempt": watch.attempt, "reason": why}),
+                                )?;
+                                self.log.note(&format!(
+                                    "run {}: {why}; asked the session to fix it (revise {})",
+                                    slot.run.id, watch.attempt
+                                ));
+                            }
+                            Err(error) => {
+                                let why = format!(
+                                    "{why}, and the request to fix it could not be sent: {error:#}"
+                                );
+                                self.log.note(&format!("run {}: {why}", slot.run.id));
+                                let reasons = watch.reasons.clone();
+                                slot.phase = Phase::Exiting(ExitWatch::new(
+                                    Some(session),
+                                    AfterExit::Ask {
+                                        decision: ReviewDecision::Revise,
+                                        summary: why.clone(),
+                                        reasons,
+                                        why: Some(why),
+                                    },
+                                ));
+                            }
+                        }
+                    }
+                    ReviseOutcome::Ended(why) => {
+                        self.log.note(&format!(
+                            "run {}: the session {why} after revise {}; asking a person",
+                            slot.run.id, watch.attempt
+                        ));
+                        let reasons = watch.reasons.clone();
+                        slot.phase = Phase::Exiting(ExitWatch::new(
+                            Some(session),
+                            AfterExit::Ask {
+                                decision: ReviewDecision::Revise,
+                                summary: format!("the session {why}"),
+                                reasons,
+                                why: Some(format!(
+                                    "the session {why} after revise {}",
+                                    watch.attempt
+                                )),
+                            },
+                        ));
+                    }
+                }
+                Ok(Step::Continue)
+            }
+            Phase::Exiting(watch) => {
+                if !watch.poll(
+                    &mut self.queue,
+                    self.cmux,
+                    &self.repository,
+                    &slot.run,
+                    &self.log,
+                )? {
+                    return Ok(Step::Continue);
+                }
+                let session = watch.session.take();
+                let then = std::mem::replace(&mut watch.then, AfterExit::Rest { close: false });
+                let mut run = self.queue.run(&slot.run.id)?;
+                let close = !matches!(then, AfterExit::Rest { close: false });
+                if close && let Some(session) = &session {
+                    run = self.close_session(&run, session)?;
+                }
+                match then {
+                    AfterExit::Land => {
+                        slot.run = run;
+                        slot.phase = Phase::AwaitingSlot;
+                        Ok(Step::Continue)
+                    }
+                    AfterExit::Ask {
+                        decision,
+                        reasons,
+                        summary,
+                        why,
+                    } => {
+                        let ask = self.open_landing_ask(
+                            &run,
+                            decision,
+                            &reasons,
+                            &summary,
+                            why.as_deref(),
+                        )?;
+                        self.log
+                            .note(&format!("run {} waits for a person in ask {ask}", run.id));
+                        self.queue.release_lease(&run.id, &self.token)?;
+                        Ok(Step::Done(Box::new(self.queue.run(&run.id)?)))
+                    }
+                    AfterExit::ReviewFailed {
+                        attempt,
+                        error,
+                        duration_secs,
+                    } => {
+                        self.queue.record_runtime_event(
+                            &run.id,
+                            "review_failed",
+                            json!({
+                                "attempt": attempt,
+                                "error": error,
+                                "duration_secs": duration_secs,
+                                "status": run.status.as_str(),
+                            }),
+                        )?;
+                        self.queue.release_lease(&run.id, &self.token)?;
+                        Ok(Step::Done(Box::new(self.queue.run(&run.id)?)))
+                    }
+                    AfterExit::Rest { .. } => {
+                        self.queue.release_lease(&run.id, &self.token)?;
+                        Ok(Step::Done(Box::new(run)))
+                    }
+                }
             }
         }
+    }
+
+    /// Land `run`, which holds the integration slot under this token, on a
+    /// thread (`previous` is where an error before `main` moved returns it).
+    /// It pushes unless an approving `integrate --no-push` recorded
+    /// `push: false`; a run landed on a passed review always pushes.
+    fn spawn_landing(
+        &self,
+        run: TaskRun,
+        previous: RunStatus,
+        main: String,
+    ) -> Result<thread::JoinHandle<Result<IntegrationOutcome>>> {
+        let db = self.db.clone();
+        let repository = self.repository.clone();
+        let token = self.token.clone();
+        let common_dir = path_text(&self.repository.common_dir)?;
+        let push = self
+            .queue
+            .run_events(&run.id)?
+            .iter()
+            .find(|e| e.kind == "integration_approved")
+            .is_none_or(|e| e.payload.get("push") != Some(&json!(false)));
+        Ok(thread::spawn(move || {
+            let mut queue = SqliteQueue::open(&db)?;
+            land_integrating(
+                &mut queue,
+                &db,
+                &repository,
+                &run,
+                previous,
+                &main,
+                &token,
+                &common_dir,
+                push.then_some(&repository as &dyn MainRemote),
+            )
+        }))
+    }
+
+    /// Record `review_started` and start the headless review of an accepted
+    /// run whose session stays open (ADR-0027 decision 1): write
+    /// `review.md`, then run the reviewer's command with the task's
+    /// acceptance and the verdict schema. A review that cannot even start
+    /// is a failed one.
+    fn start_review(&mut self, run: &TaskRun, session: Option<SessionRef>) -> Result<Phase> {
+        let attempt = self
+            .queue
+            .run_events(&run.id)?
+            .iter()
+            .filter(|e| e.kind == "review_started")
+            .count()
+            + 1;
+        let live = match &session {
+            Some(_) => session_alive(&self.queue, &run.id)?,
+            None => false,
+        };
+        self.queue.record_runtime_event(
+            &run.id,
+            "review_started",
+            json!({
+                "attempt": attempt,
+                "workspace_id": session.as_ref().map(|s| s.workspace.clone()),
+                "session_live": live,
+            }),
+        )?;
+        Ok(match self.spawn_review(run, attempt) {
+            Ok((child, stdout, stderr)) => {
+                self.log.note(&format!(
+                    "run {} review {attempt} started (session {})",
+                    run.id,
+                    if live { "kept open" } else { "ended" }
+                ));
+                Phase::Review(ReviewWatch {
+                    session,
+                    child,
+                    attempt,
+                    started: Instant::now(),
+                    timeout: self.reviewer.review_timeout(),
+                    stdout,
+                    stderr,
+                })
+            }
+            Err(error) => {
+                let error = format!("the headless review could not start: {error:#}");
+                self.log.note(&format!("run {}: {error}", run.id));
+                Phase::Exiting(ExitWatch::new(
+                    session,
+                    AfterExit::ReviewFailed {
+                        attempt,
+                        error,
+                        duration_secs: 0,
+                    },
+                ))
+            }
+        })
+    }
+
+    fn spawn_review(
+        &mut self,
+        run: &TaskRun,
+        attempt: usize,
+    ) -> Result<(std::process::Child, PathBuf, PathBuf)> {
+        let run_dir = PathBuf::from(run.run_dir.as_ref().context("missing run directory")?);
+        let material = review(&self.db, run.task_id)?;
+        let path = material["path"]
+            .as_str()
+            .context("review wrote no path")?
+            .to_owned();
+        let task = self.queue.show(run.task_id)?.task;
+        let prompt = review_prompt(&task, run, &path);
+        fs::write(
+            run_dir.join(format!("review-prompt-{attempt}.txt")),
+            &prompt,
+        )?;
+        let stdout = run_dir.join(format!("review-{attempt}.out"));
+        let stderr = run_dir.join(format!("review-{attempt}.err"));
+        let mut command = self.reviewer.review_command(run, &prompt)?;
+        // The repository's [run.env] reaches the review too (ADR-0023
+        // decision 3).
+        command
+            .envs(run_env(&self.repository, &self.db, &run_dir)?)
+            // Like the observer's job: the CLI knows the review by its role
+            // and allows it only reads of this queue.
+            .env(crate::lifecycle::ROLE_ENV, crate::lifecycle::REVIEWER_ROLE)
+            .env(crate::lifecycle::QUEUE_ENV, &self.db)
+            .stdin(std::process::Stdio::null())
+            .stdout(fs::File::create(&stdout)?)
+            .stderr(fs::File::create(&stderr)?);
+        let child = command.spawn().context("start the review")?;
+        Ok((child, stdout, stderr))
+    }
+
+    /// Move on from a verdict: `pass` exits the session and lands; `revise`
+    /// goes to the live session while revises are left (ADR-0027 decision
+    /// 2); anything else exits the session and asks a person.
+    fn act_on_verdict(
+        &mut self,
+        run: &TaskRun,
+        session: Option<SessionRef>,
+        verdict: ReviewVerdict,
+    ) -> Result<Phase> {
+        let ask = |why: Option<String>, verdict: ReviewVerdict, session| {
+            Phase::Exiting(ExitWatch::new(
+                session,
+                AfterExit::Ask {
+                    decision: verdict.verdict,
+                    reasons: verdict.reasons,
+                    summary: verdict.summary,
+                    why,
+                },
+            ))
+        };
+        match verdict.verdict {
+            ReviewDecision::Pass => Ok(Phase::Exiting(ExitWatch::new(session, AfterExit::Land))),
+            ReviewDecision::Concern => Ok(ask(None, verdict, session)),
+            ReviewDecision::Revise => {
+                let revises = self
+                    .queue
+                    .run_events(&run.id)?
+                    .iter()
+                    .filter(|e| e.kind == "revise_requested")
+                    .count();
+                if revises >= MAX_REVISE_ATTEMPTS {
+                    let why = format!("the review still asks for changes after {revises} revises");
+                    return Ok(ask(Some(why), verdict, session));
+                }
+                let Some(live) = session
+                    .clone()
+                    .filter(|_| session_alive(&self.queue, &run.id).unwrap_or(false))
+                else {
+                    let why = "the session had ended, so nobody could revise the run".to_owned();
+                    return Ok(ask(Some(why), verdict, session));
+                };
+                let attempt = revises + 1;
+                let task = self.queue.show(run.task_id)?.task;
+                let message = revise_request(&task, run, attempt, &verdict.reasons)?;
+                let run_dir = Path::new(run.run_dir.as_ref().context("missing run directory")?);
+                fs::write(run_dir.join(format!("revise-{attempt}.txt")), &message)?;
+                let sent_at = SystemTime::now();
+                if let Err(error) = self.cmux.send_text(&live.workspace, &message) {
+                    let why = format!("the revise request could not be sent: {error:#}");
+                    self.log.note(&format!("run {}: {why}", run.id));
+                    return Ok(ask(Some(why), verdict, session));
+                }
+                self.queue.record_runtime_event(
+                    &run.id,
+                    "revise_requested",
+                    json!({"attempt": attempt, "reasons": verdict.reasons, "sent_at": unix_seconds(sent_at)}),
+                )?;
+                self.log.note(&format!(
+                    "revise {attempt} of {MAX_REVISE_ATTEMPTS} sent to run {} in workspace {}",
+                    run.id, live.workspace
+                ));
+                Ok(Phase::Revise(ReviseWatch {
+                    session: live,
+                    attempt,
+                    reasons: verdict.reasons,
+                    sent_at,
+                    sent: Instant::now(),
+                }))
+            }
+        }
+    }
+
+    /// Close the session's workspace after it exited: the worker's own
+    /// through [`close_workspace`], a resume's by recording
+    /// `workspace_closed` with its attempt.
+    fn close_session(&mut self, run: &TaskRun, session: &SessionRef) -> Result<TaskRun> {
+        match session.resume {
+            None if run.workspace_closed_at.is_none() && run.workspace_id.is_some() => {
+                close_workspace(&mut self.queue, self.cmux, &self.token, run, &self.log)
+            }
+            None => Ok(run.clone()),
+            Some(attempt) => {
+                match self.cmux.close(&session.workspace) {
+                    Ok(()) => self.queue.record_runtime_event(
+                        &run.id,
+                        "workspace_closed",
+                        json!({"workspace_id": session.workspace, "resume_attempt": attempt}),
+                    )?,
+                    Err(error) => {
+                        let message = format!(
+                            "resume workspace {} could not be closed: {error:#}",
+                            session.workspace
+                        );
+                        self.log.note(&format!("run {}: {message}", run.id));
+                        self.queue.record_cleanup_failure(&run.id, &message)?;
+                    }
+                }
+                self.queue.run(&run.id)
+            }
+        }
+    }
+
+    /// Open the `approve_landing` ask of a run whose review did not pass
+    /// (ADR-0027, ADR-0022 decision 3) and notify the inbox; returns its ID.
+    fn open_landing_ask(
+        &mut self,
+        run: &TaskRun,
+        decision: ReviewDecision,
+        reasons: &[String],
+        summary: &str,
+        why: Option<&str>,
+    ) -> Result<i64> {
+        let mut question = format!(
+            "The supervisor's review of run {} (task {}) returned {}{}: {summary}",
+            run.id,
+            run.task_id,
+            decision.as_str(),
+            why.map(|why| format!(" ({why})")).unwrap_or_default()
+        );
+        for reason in reasons {
+            question.push_str(&format!("\n- {reason}"));
+        }
+        if let Some(run_dir) = &run.run_dir {
+            question.push_str(&format!("\nReview material: {run_dir}/review.md"));
+        }
+        question.push_str(
+            "\nland: land it as it is. send_back: resume the session with these reasons. cancel: fail the run and cancel the task.",
+        );
+        // Through `ask`, like the CLI: a new ask notifies the inbox.
+        let outcome = ask_in(
+            &mut self.queue,
+            &self.repository.root,
+            NewAsk {
+                kind: AskKind::ApproveLanding,
+                task_id: None,
+                run_id: Some(run.id.clone()),
+                question,
+                options: LANDING_OPTIONS.iter().map(|o| (*o).to_owned()).collect(),
+                asked_by: "supervisor".to_owned(),
+            },
+            self.cmux,
+        )?;
+        outcome["id"].as_i64().context("ask returned no id")
+    }
+
+    /// Apply the answered `approve_landing` asks of runs awaiting
+    /// integration that nobody leases (ADR-0027): `land` lands the run in
+    /// the single slot (as an approved one), `send_back` makes it
+    /// `needs_session` for a resume that names the review's reasons, and
+    /// `cancel` fails the run and cancels its task. The ask is closed once
+    /// applied; any other answer is left to the maintainer. An error is
+    /// noted and the ask is tried again on a later pass.
+    fn apply_landing_answers(&mut self, parallel: usize) -> Result<()> {
+        for ask in self.queue.landing_answers()? {
+            let Some(run_id) = ask.run_id.clone() else {
+                continue;
+            };
+            let answer = ask.answer.as_deref().unwrap_or_default().trim().to_owned();
+            let run = self.queue.run(&run_id)?;
+            if run.status != RunStatus::AwaitingIntegration
+                || !LANDING_OPTIONS.contains(&answer.as_str())
+                || self.queue.run_lease(&run_id)?.is_some()
+            {
+                continue;
+            }
+            if answer == "land"
+                && (self.slots.len() >= parallel
+                    || !self
+                        .queue
+                        .runs_with_status(RunStatus::Integrating)?
+                        .is_empty())
+            {
+                continue;
+            }
+            if let Err(error) = self.apply_landing_answer(&run, ask.id, &answer) {
+                self.log.note(&format!(
+                    "run {}: the answer {answer:?} of ask {} could not be applied: {error:#}",
+                    run.id, ask.id
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn apply_landing_answer(&mut self, run: &TaskRun, ask_id: i64, answer: &str) -> Result<()> {
+        let payload = json!({"ask_id": ask_id, "answer": answer});
+        match answer {
+            "land" => {
+                if !self.queue.has_run_event(&run.id, "integration_approved")? {
+                    self.queue.record_runtime_event(
+                        &run.id,
+                        "integration_approved",
+                        json!({"status": run.status.as_str(), "pid": std::process::id(), "push": true, "ask_id": ask_id}),
+                    )?;
+                }
+                let main = self.repository.main_head()?;
+                let landing = self.queue.begin_integration(&run.id, &self.token, &main)?;
+                self.queue.close_ask(ask_id)?;
+                self.log.note(&format!(
+                    "run {} lands onto main {main} as ask {ask_id} answered",
+                    run.id
+                ));
+                let handle =
+                    self.spawn_landing(landing.clone(), RunStatus::AwaitingIntegration, main)?;
+                self.slots.push(Slot {
+                    run: landing,
+                    phase: Phase::Landing(Some(handle)),
+                });
+            }
+            "send_back" => {
+                let reasons = latest_review_reasons(&self.queue, &run.id)?;
+                let reason = format!(
+                    "the review's findings were sent back by ask {ask_id}: {}",
+                    if reasons.is_empty() {
+                        "(no reasons recorded)".to_owned()
+                    } else {
+                        reasons.join("; ")
+                    }
+                );
+                self.queue
+                    .decide_landing(&run.id, RunStatus::NeedsSession, &reason, payload)?;
+                self.queue.close_ask(ask_id)?;
+                self.log.note(&format!(
+                    "run {} was sent back by ask {ask_id}; it waits for a resume",
+                    run.id
+                ));
+            }
+            _ => {
+                let reason = format!("canceled by ask {ask_id}");
+                self.queue
+                    .decide_landing(&run.id, RunStatus::Failed, &reason, payload)?;
+                self.queue.transition(run.task_id, TaskAction::Cancel)?;
+                self.queue.close_ask(ask_id)?;
+                self.log.note(&format!(
+                    "run {} failed and task {} was canceled by ask {ask_id}",
+                    run.id, run.task_id
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// Resume `needs_session` runs with attempts left (ADR-0019 decision 1),
@@ -1095,7 +1731,7 @@ impl Supervisor<'_> {
             }
             self.close_left_resume_workspaces(&run)?;
             let main = self.repository.main_head()?;
-            let (reason, evidence_missing) = resume_reason(&self.queue, &run)?;
+            let (reason, kind) = resume_reason(&self.queue, &run)?;
             let Some((run, attempt)) = self.queue.begin_resume(
                 &run.id,
                 &self.token,
@@ -1109,7 +1745,7 @@ impl Supervisor<'_> {
             let request = ResumeRequest {
                 main,
                 reason: reason.unwrap_or_else(|| "(no reason recorded)".to_owned()),
-                evidence_missing,
+                kind,
             };
             match self.start_resume(&run, attempt, &request) {
                 Ok(watch) => {
@@ -1213,13 +1849,16 @@ impl Supervisor<'_> {
             message_sent: None,
             exit_requested: None,
             required_evidence: task.required_evidence.clone(),
+            approved: self.queue.has_run_event(&run.id, "integration_approved")?,
         })
     }
 
-    /// The resumed session ended: close its workspace, record
+    /// The resumed session ended, or resolved the run: record
     /// `resume_finished` and move the run on. A resolved run whose
-    /// integrate was approved keeps its lease and waits for the landing
-    /// slot; an unapproved one goes back to `awaiting_integration`; a
+    /// integrate was approved has exited; its workspace is closed and it
+    /// keeps its lease and waits for the landing slot. An unapproved
+    /// resolved run keeps its session and lease and goes through
+    /// validation and review like the worker's (ADR-0027 decision 3); a
     /// `failed` receipt ends the run; anything else leaves it
     /// `needs_session` for the next attempt, or for a human after the last.
     fn finish_resumed_session(
@@ -1229,9 +1868,15 @@ impl Supervisor<'_> {
         workspace: &str,
         verdict: ResumeVerdict,
     ) -> Result<Step> {
+        let approved = self
+            .queue
+            .has_run_event(&slot.run.id, "integration_approved")?;
+        let reviewed = matches!(verdict.kind, ResumeOutcome::Resolved) && !approved;
         // A session let go after the exit timeout still runs: its
-        // workspace stays, and blocks the next attempt until it ends.
+        // workspace stays, and blocks the next attempt until it ends. A
+        // session going on to review keeps it until the verdict.
         let closed = !verdict.exit_timed_out
+            && !reviewed
             && match self.cmux.close(workspace) {
                 Ok(()) => true,
                 Err(error) => {
@@ -1242,9 +1887,6 @@ impl Supervisor<'_> {
                     false
                 }
             };
-        let approved = self
-            .queue
-            .has_run_event(&slot.run.id, "integration_approved")?;
         let mut payload = json!({
             "attempt": attempt,
             "outcome": verdict.outcome(),
@@ -1256,6 +1898,9 @@ impl Supervisor<'_> {
         if verdict.exit_timed_out {
             payload["exit_timed_out"] = json!(true);
         }
+        if reviewed {
+            payload["session_live"] = json!(verdict.live);
+        }
         let id = slot.run.id.clone();
         let run = match verdict.kind {
             ResumeOutcome::Resolved if approved => {
@@ -1266,14 +1911,31 @@ impl Supervisor<'_> {
                 slot.phase = Phase::AwaitingSlot;
                 return Ok(Step::Continue);
             }
-            ResumeOutcome::Resolved => self.queue.finish_resume(
-                &id,
-                &self.token,
-                Some(RunStatus::AwaitingIntegration),
-                None,
-                false,
-                payload,
-            )?,
+            ResumeOutcome::Resolved => {
+                let run = self.queue.finish_resume(
+                    &id,
+                    &self.token,
+                    Some(RunStatus::Validating),
+                    None,
+                    true,
+                    payload,
+                )?;
+                let handle = spawn_validation(
+                    self.db.clone(),
+                    self.repository.clone(),
+                    run.clone(),
+                    self.log.clone(),
+                );
+                slot.run = run;
+                slot.phase = Phase::Validating(
+                    Some(handle),
+                    Some(SessionRef {
+                        workspace: workspace.to_owned(),
+                        resume: Some(attempt),
+                    }),
+                );
+                return Ok(Step::Continue);
+            }
             ResumeOutcome::Failed(reason) => self.queue.finish_resume(
                 &id,
                 &self.token,
@@ -1351,7 +2013,12 @@ impl Supervisor<'_> {
                 run.task_id,
                 run.workspace_id.as_deref().unwrap_or("?")
             ));
-            match self.resume(&run) {
+            let phase = if run.status == RunStatus::AwaitingIntegration {
+                self.adopt_review(&run)
+            } else {
+                self.resume(&run)
+            };
+            match phase {
                 Ok(phase) => self.slots.push(Slot { run, phase }),
                 Err(error) => {
                     // The lease is this process's now; give it up like any
@@ -1374,12 +2041,15 @@ impl Supervisor<'_> {
     /// beginning: it is a function of the receipt and the worktree alone.
     fn resume(&self, run: &TaskRun) -> Result<Phase> {
         Ok(match run.status {
-            RunStatus::Validating => Phase::Validating(Some(spawn_validation(
-                self.db.clone(),
-                self.repository.clone(),
-                run.clone(),
-                self.log.clone(),
-            ))),
+            RunStatus::Validating => Phase::Validating(
+                Some(spawn_validation(
+                    self.db.clone(),
+                    self.repository.clone(),
+                    run.clone(),
+                    self.log.clone(),
+                )),
+                self.session_of(run)?,
+            ),
             _ => {
                 let receipt_path =
                     PathBuf::from(run.receipt_path.as_ref().context("missing receipt path")?);
@@ -1432,6 +2102,128 @@ impl Supervisor<'_> {
                 })
             }
         })
+    }
+
+    /// The session an accepted run keeps open (ADR-0027): the workspace of
+    /// the resume that handed its live session to validation
+    /// (`resume_finished` with status `validating`) unless a
+    /// `workspace_closed` of that resume followed, else the worker's own
+    /// workspace while it is not closed.
+    fn session_of(&self, run: &TaskRun) -> Result<Option<SessionRef>> {
+        let events = self.queue.run_events(&run.id)?;
+        let resumed = events
+            .iter()
+            .rev()
+            .find(|e| matches!(e.kind.as_str(), "resume_started" | "resume_finished"));
+        if let Some(event) = resumed {
+            if event.kind == "resume_finished"
+                && event.payload["status"] == RunStatus::Validating.as_str()
+                && let (Some(workspace), Some(attempt)) = (
+                    event.payload["workspace_id"].as_str(),
+                    event.payload["attempt"].as_u64(),
+                )
+            {
+                let closed = events.iter().any(|e| {
+                    e.id > event.id
+                        && e.kind == "workspace_closed"
+                        && e.payload["workspace_id"] == workspace
+                });
+                return Ok((!closed).then(|| SessionRef {
+                    workspace: workspace.to_owned(),
+                    resume: Some(attempt as usize),
+                }));
+            }
+            return Ok(None);
+        }
+        Ok(run
+            .workspace_id
+            .clone()
+            .filter(|_| run.workspace_closed_at.is_none())
+            .map(|workspace| SessionRef {
+                workspace,
+                resume: None,
+            }))
+    }
+
+    /// Rebuild an adopted `awaiting_integration` run under review from its
+    /// events: a `revise_requested` with nothing after it waits for the live
+    /// session again; a verdict already recorded (`review_finished` with
+    /// nothing after it), or an approved run not reviewed since its
+    /// validation, goes on to its `/exit` without a second review and
+    /// without a second `/exit` if one was already requested; anything else
+    /// is reviewed from the start, the review being a function of the
+    /// receipt and the commit.
+    fn adopt_review(&mut self, run: &TaskRun) -> Result<Phase> {
+        let session = self.session_of(run)?;
+        let events = self.queue.run_events(&run.id)?;
+        let Some(anchor) = events.iter().rev().find(|e| {
+            matches!(
+                e.kind.as_str(),
+                "validation_finished"
+                    | "review_started"
+                    | "review_finished"
+                    | "revise_requested"
+                    | "revise_finished"
+            )
+        }) else {
+            return self.start_review(run, session);
+        };
+        let then = match anchor.kind.as_str() {
+            "revise_requested" => {
+                if let Some(live) = session.clone()
+                    && session_alive(&self.queue, &run.id)?
+                {
+                    return Ok(Phase::Revise(ReviseWatch {
+                        session: live,
+                        attempt: anchor.payload["attempt"].as_u64().unwrap_or(1) as usize,
+                        reasons: serde_json::from_value(anchor.payload["reasons"].clone())
+                            .unwrap_or_default(),
+                        sent_at: UNIX_EPOCH
+                            + Duration::from_secs(
+                                anchor.payload["sent_at"].as_u64().unwrap_or_default(),
+                            ),
+                        sent: Instant::now(),
+                    }));
+                }
+                None
+            }
+            "review_finished" => {
+                match serde_json::from_value::<ReviewVerdict>(json!({
+                    "verdict": anchor.payload["verdict"],
+                    "reasons": anchor.payload["reasons"],
+                    "summary": anchor.payload["summary"],
+                })) {
+                    Ok(verdict) if verdict.verdict == ReviewDecision::Pass => Some(AfterExit::Land),
+                    Ok(verdict) => Some(AfterExit::Ask {
+                        why: (verdict.verdict == ReviewDecision::Revise).then(|| {
+                            "the revise could not go on when the supervisor was replaced".to_owned()
+                        }),
+                        decision: verdict.verdict,
+                        reasons: verdict.reasons,
+                        summary: verdict.summary,
+                    }),
+                    Err(_) => None,
+                }
+            }
+            "validation_finished" if events.iter().any(|e| e.kind == "integration_approved") => {
+                Some(AfterExit::Land)
+            }
+            _ => None,
+        };
+        let Some(then) = then else {
+            return self.start_review(run, session);
+        };
+        let after = |kind: &str| events.iter().any(|e| e.id > anchor.id && e.kind == kind);
+        let mut watch = ExitWatch::new(session, then);
+        // Never a second /exit; its timeout restarts now.
+        if after("exit_requested") {
+            watch.requested = Some(Instant::now());
+        }
+        watch.timed_out = after("exit_request_timed_out");
+        // A timeout recorded without its ask still gets one; one asked
+        // before is not asked again (as for a running run, task 104).
+        watch.exit_asked = !watch.timed_out || self.queue.has_stuck_exit_ask(&run.id)?;
+        Ok(Phase::Exiting(watch))
     }
 
     /// Plan paths, create the run directory, worktree and workspace. Any
@@ -1575,8 +2367,11 @@ struct SessionWatch {
 }
 
 impl SessionWatch {
-    /// One observation. `Some` once the wrapper exited and supervision finished
-    /// (`validating` or `failed`); an error means the run must be retained.
+    /// One observation. `Some` once supervision finished (`validating` or
+    /// `failed`): the wrapper exited, or the session went idle after its
+    /// receipt and stays open for the review; an error means the run must
+    /// be retained. An `/exit` an earlier supervisor already requested is
+    /// waited out as before.
     fn poll(
         &mut self,
         queue: &mut SqliteQueue,
@@ -1610,24 +2405,14 @@ impl SessionWatch {
             && let Some(evidence) = idle_after_receipt(&self.receipt_path, &self.idle_marker)?
         {
             queue.record_runtime_event(&run.id, "session_idle_observed", evidence)?;
-            // Recorded before sending: the session may exit, and its wrapper
-            // record `session_exited`, before the send returns. A failed send
-            // abandons the run lease-less; a supervisor killed between the two
-            // leaves an adopter that never sends, and the run waits out the
-            // exit timeout for a human `/exit` (never a second `/exit`).
-            let timeout = cmux.exit_timeout();
-            queue.record_runtime_event(
-                &run.id,
-                "exit_requested",
-                json!({"workspace_id": self.workspace, "timeout_secs": timeout.as_secs()}),
-            )?;
-            // Ask once, the way the maintainer would; never kill the session.
-            cmux.send_exit(&self.workspace)?;
+            // The session stays open through validation and review, and
+            // is asked to exit only once the verdict is known (ADR-0027
+            // decision 1).
             log.note(&format!(
-                "exit requested for {}; waiting for session exit",
+                "session of {} is idle after its receipt; validating with the session open",
                 run.id
             ));
-            self.exit_requested = Some(Instant::now());
+            return queue.finish_supervision_live(&run.id, token).map(Some);
         }
         if let Some(wrapper) = wrapper {
             if wrapper.exited_at.is_some() {
@@ -1690,55 +2475,18 @@ impl SessionWatch {
             }
         }
         if self.exit_timed_out && !self.exit_asked {
-            self.ask_stuck_exit(queue, cmux, repository, run, log)?;
+            ask_stuck_exit(
+                queue,
+                cmux,
+                repository,
+                run,
+                &self.workspace,
+                "The run stays running, and goes on to validating once the session exits",
+                log,
+            )?;
+            self.exit_asked = true;
         }
         Ok(None)
-    }
-
-    /// Raise a session that held `/exit` back as a `stuck_exit` ask to the
-    /// inbox, with the last lines of its screen, through the ask path that
-    /// notifies once when the ask is new (ADR-0022 decision 5). An open ask
-    /// of the run is not registered twice. A screen that cannot be read
-    /// leaves the ask without an excerpt. The inbox only shows it to the
-    /// person; the maintainer acts on the answer (`dagq-session`).
-    fn ask_stuck_exit(
-        &mut self,
-        queue: &mut SqliteQueue,
-        cmux: &dyn WorkspaceBackend,
-        repository: &GitRepository,
-        run: &TaskRun,
-        log: &SupervisorLog,
-    ) -> Result<()> {
-        let screen = match cmux.capture(&self.workspace) {
-            Ok(screen) => screen_tail(&screen, PROMPT_EXCERPT_LINES),
-            Err(error) => format!("(the screen could not be read: {error:#})"),
-        };
-        let question = format!(
-            "The session of run {run_id} (task {task_id}) did not exit within {timeout}s of the supervisor's /exit (exit_request_timed_out): something on its screen, usually one of Claude Code's own dialogs such as \"Background work is running\", holds the exit back. The run stays running, and goes on to validating once the session exits; this ask then closes itself. Answer `exit` to have the maintainer answer the dialog so that the session exits and send /exit in workspace {workspace}, or `wait` to leave the session as it is (or write what to do instead).\n\nLast lines of the screen:\n{screen}",
-            run_id = run.id,
-            task_id = run.task_id,
-            timeout = cmux.exit_timeout().as_secs(),
-            workspace = self.workspace,
-        );
-        let outcome = ask_in(
-            queue,
-            &repository.root,
-            NewAsk {
-                kind: AskKind::StuckExit,
-                task_id: Some(run.task_id),
-                run_id: Some(run.id.clone()),
-                question,
-                options: vec!["exit".into(), "wait".into()],
-                asked_by: SessionRole::Supervisor.as_str().into(),
-            },
-            cmux,
-        )?;
-        log.note(&format!(
-            "stuck_exit ask {} for {} (notified: {})",
-            outcome["id"], run.id, outcome["notified"]
-        ));
-        self.exit_asked = true;
-        Ok(())
     }
 
     /// Record `first_commit_observed` once, the first time the worktree's
@@ -1946,6 +2694,54 @@ impl SessionWatch {
     }
 }
 
+/// Raise a session that held `/exit` back as a `stuck_exit` ask to the
+/// inbox, with the last lines of its screen, through the ask path that
+/// notifies once when the ask is new (ADR-0022 decision 5). An open ask of
+/// the run is not registered twice. A screen that cannot be read leaves the
+/// ask without an excerpt. `after` says where the run stands and what
+/// follows once the session exits: a `running` run goes on to validating,
+/// one the supervisor holds after its review (ADR-0027) to its landing, its
+/// ask or its rest. The inbox only shows the ask to the person; the
+/// maintainer acts on the answer (`dagq-session`).
+fn ask_stuck_exit(
+    queue: &mut SqliteQueue,
+    cmux: &dyn WorkspaceBackend,
+    repository: &GitRepository,
+    run: &TaskRun,
+    workspace: &str,
+    after: &str,
+    log: &SupervisorLog,
+) -> Result<()> {
+    let screen = match cmux.capture(workspace) {
+        Ok(screen) => screen_tail(&screen, PROMPT_EXCERPT_LINES),
+        Err(error) => format!("(the screen could not be read: {error:#})"),
+    };
+    let question = format!(
+        "The session of run {run_id} (task {task_id}) did not exit within {timeout}s of the supervisor's /exit (exit_request_timed_out): something on its screen, usually one of Claude Code's own dialogs such as \"Background work is running\", holds the exit back. {after}; this ask then closes itself. Answer `exit` to have the maintainer answer the dialog so that the session exits and send /exit in workspace {workspace}, or `wait` to leave the session as it is (or write what to do instead).\n\nLast lines of the screen:\n{screen}",
+        run_id = run.id,
+        task_id = run.task_id,
+        timeout = cmux.exit_timeout().as_secs(),
+    );
+    let outcome = ask_in(
+        queue,
+        &repository.root,
+        NewAsk {
+            kind: AskKind::StuckExit,
+            task_id: Some(run.task_id),
+            run_id: Some(run.id.clone()),
+            question,
+            options: vec!["exit".into(), "wait".into()],
+            asked_by: SessionRole::Supervisor.as_str().into(),
+        },
+        cmux,
+    )?;
+    log.note(&format!(
+        "stuck_exit ask {} for {} (notified: {})",
+        outcome["id"], run.id, outcome["notified"]
+    ));
+    Ok(())
+}
+
 /// The answer the runtime writes into an open `stuck_exit` ask it closes.
 const STUCK_EXIT_CLOSED: &str = "the session exited; closed by the runtime";
 
@@ -2050,32 +2846,48 @@ struct ResumeRequest {
     /// The `main` head the session rebases onto.
     main: String,
     reason: String,
-    /// The run came from validation's `evidence_missing`, not a landing:
-    /// the session adds evidence instead of rebasing.
-    evidence_missing: bool,
+    kind: ResumeKind,
+}
+
+/// Why the run waits for a session, which decides the request's steps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResumeKind {
+    /// A landing was deferred (a conflict, failed verification): rebase.
+    Landing,
+    /// Validation's `evidence_missing`: add the evidence instead.
+    EvidenceMissing,
+    /// A person sent a review's concern back (`landing_decided`): fix
+    /// the findings.
+    SentBack,
 }
 
 /// Why the run waits for a session: the reason of its latest
-/// `integration_deferred` / `integration_error` / `evidence_missing` event
-/// (a runtime error since, such as a failed resume, may have replaced
-/// `last_error`), else `last_error`; and whether that event was
-/// `evidence_missing` (or a landing deferred for missing evidence, whose
-/// payload names the `checks`).
-fn resume_reason(queue: &SqliteQueue, run: &TaskRun) -> Result<(Option<String>, bool)> {
+/// `integration_deferred` / `integration_error` / `evidence_missing` /
+/// `landing_decided` event (a runtime error since, such as a failed resume,
+/// may have replaced `last_error`), else `last_error`; and what kind of
+/// request that makes: `evidence_missing` (or a landing deferred for missing
+/// evidence, whose payload names the `checks`), a review sent back, or a
+/// landing.
+fn resume_reason(queue: &SqliteQueue, run: &TaskRun) -> Result<(Option<String>, ResumeKind)> {
     let events = queue.run_events(&run.id)?;
     let parked = events.iter().rev().find(|e| {
         matches!(
             e.kind.as_str(),
-            "integration_deferred" | "integration_error" | "evidence_missing"
+            "integration_deferred" | "integration_error" | "evidence_missing" | "landing_decided"
         )
     });
     let reason = parked
         .and_then(|e| e.payload.get("reason").and_then(Value::as_str))
         .map(str::to_owned)
         .or_else(|| run.last_error.clone());
-    let evidence =
-        parked.is_some_and(|e| e.kind == "evidence_missing" || e.payload.get("checks").is_some());
-    Ok((reason, evidence))
+    let kind = match parked {
+        Some(e) if e.kind == "evidence_missing" || e.payload.get("checks").is_some() => {
+            ResumeKind::EvidenceMissing
+        }
+        Some(e) if e.kind == "landing_decided" => ResumeKind::SentBack,
+        _ => ResumeKind::Landing,
+    };
+    Ok((reason, kind))
 }
 
 /// The tasks landed on `main` since the run's base, oldest first, from the
@@ -2115,16 +2927,19 @@ fn resume_request(
     landed: &[PredecessorSummary],
 ) -> Result<String> {
     let receipt = run.receipt_path.as_ref().context("missing receipt path")?;
-    let mut lines = vec![if request.evidence_missing {
-        format!(
+    let mut lines = vec![match request.kind {
+        ResumeKind::EvidenceMissing => format!(
             "dagq: the supervisor's validation of run {} (task {}) found required evidence missing from the receipt, so the run is needs_session.",
             run.id, task.id
-        )
-    } else {
-        format!(
+        ),
+        ResumeKind::SentBack => format!(
+            "dagq: the supervisor's review of run {} (task {}) raised findings a person sent back to you, so the run is needs_session.",
+            run.id, task.id
+        ),
+        ResumeKind::Landing => format!(
             "dagq: integrate could not land run {} (task {}) and returned needs_session.",
             run.id, task.id
-        )
+        ),
     }];
     lines.push(format!("Reason: {}", request.reason));
     lines.push(format!(
@@ -2144,7 +2959,7 @@ fn resume_request(
     }
     lines.push("Steps:".to_owned());
     let verify = serde_json::to_string(&task.verification_commands)?;
-    if request.evidence_missing {
+    if request.kind == ResumeKind::EvidenceMissing {
         lines.push(
             "1. Run the checks the reason names as missing and write their evidence into the receipt."
                 .to_owned(),
@@ -2152,6 +2967,12 @@ fn resume_request(
         lines.push(format!(
             "2. If that changes files, commit them and rerun the verification commands {verify}."
         ));
+    } else if request.kind == ResumeKind::SentBack {
+        lines.push(format!(
+            "1. Fix the findings in the reason and commit; if main moved, git rebase {} first.",
+            request.main
+        ));
+        lines.push(format!("2. Rerun the verification commands {verify}."));
     } else {
         lines.push(format!(
             "1. In this worktree run git rebase {} and resolve the conflicts.",
@@ -2197,6 +3018,9 @@ struct ResumeWatch {
     /// The task's required checks: a rewritten receipt still without them
     /// has not resolved the run.
     required_evidence: Vec<EvidenceCheck>,
+    /// Its integrate was called: resolved, it exits and lands without a
+    /// review; otherwise it stays open for validation and review.
+    approved: bool,
 }
 
 /// What a resumed session left behind when it exited.
@@ -2216,6 +3040,9 @@ struct ResumeVerdict {
     /// let go (still running, its workspace kept) so the slot and the lease
     /// are not held forever.
     exit_timed_out: bool,
+    /// The session resolved the run and is still running, never asked to
+    /// exit: it goes on to validation and review (ADR-0027 decision 3).
+    live: bool,
 }
 
 impl ResumeVerdict {
@@ -2297,6 +3124,7 @@ impl ResumeWatch {
                 kind: self.verdict(run, head.as_deref().filter(|_| clean)),
                 head,
                 exit_timed_out: false,
+                live: false,
             }));
         }
         ensure!(
@@ -2326,7 +3154,25 @@ impl ResumeWatch {
                 // that could not resolve it (or stopped at a question)
                 // never ends by itself; or no idle at all within the
                 // resume timeout (a lost request, a dialog).
-                let why = match self.verdict(run, Some(head.as_str()).filter(|_| clean)) {
+                let verdict = self.verdict(run, Some(head.as_str()).filter(|_| clean));
+                // An unapproved resolved run keeps its session for
+                // validation and review (ADR-0027 decision 3).
+                if matches!(verdict, ResumeOutcome::Resolved)
+                    && !self.approved
+                    && idle_after_receipt(&self.receipt_path, &self.idle_marker)?.is_some()
+                {
+                    log.note(&format!(
+                        "resumed session of {} rewrote its receipt and went idle (head {head}); validating with the session open",
+                        run.id
+                    ));
+                    return Ok(Some(ResumeVerdict {
+                        kind: ResumeOutcome::Resolved,
+                        head: Some(head),
+                        exit_timed_out: false,
+                        live: true,
+                    }));
+                }
+                let why = match verdict {
                     ResumeOutcome::Unresolved if marker_newer_than(&self.idle_marker, sent_at)? => {
                         Some("went idle without a resolving receipt")
                     }
@@ -2360,12 +3206,390 @@ impl ResumeWatch {
                     kind: ResumeOutcome::Unresolved,
                     head: repository.head(worktree).ok(),
                     exit_timed_out: true,
+                    live: false,
                 }));
             }
             Some(_) => (),
         }
         Ok(None)
     }
+}
+
+/// Kill the headless reviewer of a slot the supervisor stops watching.
+fn stop_reviewer(slot: &mut Slot) {
+    if let Phase::Review(watch) = &mut slot.phase {
+        let _ = watch.child.kill();
+        let _ = watch.child.wait();
+    }
+}
+
+/// Whether the run's session wrapper is registered and has not exited.
+fn session_alive(queue: &SqliteQueue, run_id: &str) -> Result<bool> {
+    Ok(queue
+        .processes(run_id)?
+        .iter()
+        .any(|p| p.role == "wrapper" && p.exited_at.is_none()))
+}
+
+/// The `reasons` of the run's latest `review_finished`.
+fn latest_review_reasons(queue: &SqliteQueue, run_id: &str) -> Result<Vec<String>> {
+    Ok(queue
+        .run_events(run_id)?
+        .into_iter()
+        .rev()
+        .find(|e| e.kind == "review_finished")
+        .and_then(|e| serde_json::from_value(e.payload["reasons"].clone()).ok())
+        .unwrap_or_default())
+}
+
+/// The headless review in progress: the reviewer's process, whose stdout
+/// and stderr go to `review-N.out` / `review-N.err` in the run directory.
+struct ReviewWatch {
+    session: Option<SessionRef>,
+    child: std::process::Child,
+    attempt: usize,
+    started: Instant,
+    timeout: Duration,
+    stdout: PathBuf,
+    stderr: PathBuf,
+}
+
+impl ReviewWatch {
+    /// `Some` once the review ended: its verdict, or why it failed (a
+    /// non-zero exit, stdout without a verdict, or the timeout, after which
+    /// the process is killed).
+    fn poll(&mut self) -> Result<Option<std::result::Result<ReviewVerdict, String>>> {
+        let status = match self.child.try_wait()? {
+            Some(status) => status,
+            None if self.started.elapsed() < self.timeout => return Ok(None),
+            None => {
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+                return Ok(Some(Err(format!(
+                    "the headless review did not finish within {} seconds",
+                    self.timeout.as_secs()
+                ))));
+            }
+        };
+        if !status.success() {
+            let stderr = fs::read_to_string(&self.stderr).unwrap_or_default();
+            return Ok(Some(Err(format!(
+                "the headless review exited with {status}: {}",
+                or_none(tail(stderr.trim(), 500))
+            ))));
+        }
+        let stdout = fs::read_to_string(&self.stdout).unwrap_or_default();
+        Ok(Some(ReviewVerdict::parse(&stdout)))
+    }
+}
+
+/// A `revise` verdict sent to the live session: it is waited for until the
+/// session rewrites its receipt and goes idle.
+struct ReviseWatch {
+    session: SessionRef,
+    attempt: usize,
+    reasons: Vec<String>,
+    /// A receipt or idle marker no newer than this predates the request.
+    sent_at: SystemTime,
+    sent: Instant,
+}
+
+enum ReviseOutcome {
+    /// The receipt was rewritten after the request, names the clean
+    /// worktree HEAD (or reports `failed`), and the session went idle after
+    /// it; the worktree HEAD at that time. Validation judges the receipt.
+    Rewritten(String),
+    /// The session rewrote the receipt and went idle, but the receipt does
+    /// not name the clean worktree HEAD (an old commit, a commit after the
+    /// receipt, uncommitted changes) or cannot be read: validation would
+    /// fail the run and its work, so the session is asked to fix it.
+    Mismatch(String),
+    /// The session will not rewrite it: why.
+    Ended(String),
+}
+
+impl ReviseWatch {
+    fn poll(
+        &mut self,
+        queue: &mut SqliteQueue,
+        cmux: &dyn WorkspaceBackend,
+        repository: &GitRepository,
+        run: &TaskRun,
+    ) -> Result<Option<ReviseOutcome>> {
+        let processes = queue.processes(&run.id)?;
+        let Some(wrapper) = processes
+            .iter()
+            .find(|p| p.role == "wrapper" && p.exited_at.is_none())
+        else {
+            return Ok(Some(ReviseOutcome::Ended(
+                "ended before it rewrote the receipt".to_owned(),
+            )));
+        };
+        ensure!(
+            unix_time() - wrapper.heartbeat_at <= HEARTBEAT_TIMEOUT_SECS,
+            "wrapper heartbeat expired; session may still be alive"
+        );
+        let receipt = Path::new(run.receipt_path.as_ref().context("missing receipt path")?);
+        let idle_marker = run.idle_marker_path()?;
+        let rewritten = fs::metadata(receipt)
+            .and_then(|meta| meta.modified())
+            .is_ok_and(|modified| modified > self.sent_at);
+        if rewritten && idle_after_receipt(receipt, &idle_marker)?.is_some() {
+            let worktree = Path::new(run.worktree_path.as_ref().context("missing worktree")?);
+            let head = repository.head(worktree)?;
+            let clean = repository.status(worktree)?.trim().is_empty();
+            let parsed = fs::read_to_string(receipt)
+                .map_err(anyhow::Error::from)
+                .and_then(|text| Ok(Receipt::parse(&text)?));
+            return Ok(Some(match parsed {
+                // A session that gives the change up is validation's to fail.
+                Ok(receipt) if receipt.result == ReceiptResult::Failed => {
+                    ReviseOutcome::Rewritten(head)
+                }
+                Ok(receipt) if receipt.commit.to_ascii_lowercase() == head && clean => {
+                    ReviseOutcome::Rewritten(head)
+                }
+                Ok(receipt) if receipt.commit.to_ascii_lowercase() != head => {
+                    ReviseOutcome::Mismatch(format!(
+                        "the rewritten receipt names commit {} but the worktree HEAD is {head}",
+                        receipt.commit
+                    ))
+                }
+                Ok(_) => ReviseOutcome::Mismatch(format!(
+                    "the worktree has uncommitted changes on top of HEAD {head}"
+                )),
+                Err(error) => {
+                    ReviseOutcome::Mismatch(format!("the rewritten receipt is invalid: {error:#}"))
+                }
+            }));
+        }
+        if !rewritten && marker_newer_than(&idle_marker, self.sent_at)? {
+            return Ok(Some(ReviseOutcome::Ended(
+                "went idle without rewriting the receipt".to_owned(),
+            )));
+        }
+        if self.sent.elapsed() >= cmux.resume_timeout() {
+            return Ok(Some(ReviseOutcome::Ended(format!(
+                "did not rewrite the receipt within {} seconds",
+                cmux.resume_timeout().as_secs()
+            ))));
+        }
+        Ok(None)
+    }
+}
+
+/// Asks the run's session to `/exit` once (unless it ended already) and
+/// waits for its wrapper to exit; then the supervisor closes the workspace
+/// and does `then`. A session that holds the `/exit` back past the exit
+/// timeout is recorded as `exit_request_timed_out` and waited for, keeping
+/// the lease, as before (ADR-0027 leaves it unchanged).
+struct ExitWatch {
+    session: Option<SessionRef>,
+    requested: Option<Instant>,
+    timed_out: bool,
+    /// The `stuck_exit` ask of the exit timeout is registered (also by a
+    /// previous supervisor), as for a running run's session (task 104).
+    exit_asked: bool,
+    then: AfterExit,
+}
+
+impl ExitWatch {
+    fn new(session: Option<SessionRef>, then: AfterExit) -> Self {
+        Self {
+            session,
+            requested: None,
+            timed_out: false,
+            exit_asked: false,
+            then,
+        }
+    }
+
+    /// Where the run stands while its session holds the `/exit` back, and
+    /// what follows once it exits: the `stuck_exit` question's sentence.
+    fn after(&self, run: &TaskRun) -> String {
+        let next = match &self.then {
+            AfterExit::Land => "lands on main",
+            AfterExit::Ask { .. } => "opens an approve_landing ask for the person",
+            AfterExit::ReviewFailed { .. } => "waits for a review by hand",
+            AfterExit::Rest { close: true } => "is resumed in a session of its own",
+            AfterExit::Rest { close: false } => "is left to the person",
+        };
+        format!(
+            "The run stays {} under the supervisor after its validation and review, and {next} once the session exits",
+            run.status.as_str()
+        )
+    }
+
+    /// Whether the session is gone (or there was none). A session that
+    /// exited has its `stuck_exit` asks closed.
+    fn poll(
+        &mut self,
+        queue: &mut SqliteQueue,
+        cmux: &dyn WorkspaceBackend,
+        repository: &GitRepository,
+        run: &TaskRun,
+        log: &SupervisorLog,
+    ) -> Result<bool> {
+        let Some(session) = &self.session else {
+            return Ok(true);
+        };
+        let processes = queue.processes(&run.id)?;
+        let wrapper = processes.iter().find(|p| p.role == "wrapper");
+        let Some(wrapper) = wrapper.filter(|w| w.exited_at.is_none()) else {
+            if self.requested.is_some() {
+                let name = match session.resume {
+                    Some(attempt) => format!("terminal-resume-{attempt}.txt"),
+                    None => "terminal-final.txt".to_owned(),
+                };
+                let run_dir = Path::new(run.run_dir.as_ref().context("missing run directory")?);
+                match cmux.capture(&session.workspace) {
+                    Ok(screen) => fs::write(run_dir.join(name), screen)?,
+                    Err(error) => queue.record_runtime_event(
+                        &run.id,
+                        "screen_capture_failed",
+                        json!({"error": format!("{error:#}")}),
+                    )?,
+                }
+            }
+            // Nobody needs to send /exit to a session that exited.
+            for ask in queue.close_stuck_exit_asks(&run.id, STUCK_EXIT_CLOSED)? {
+                log.note(&format!(
+                    "session of {} exited; closed its stuck_exit ask {}",
+                    run.id, ask.id
+                ));
+            }
+            return Ok(true);
+        };
+        ensure!(
+            unix_time() - wrapper.heartbeat_at <= HEARTBEAT_TIMEOUT_SECS,
+            "wrapper heartbeat expired; session may still be alive"
+        );
+        match self.requested {
+            None => {
+                // Recorded before sending: the session may exit, and its
+                // wrapper record `session_exited`, before the send returns.
+                let timeout = cmux.exit_timeout();
+                queue.record_runtime_event(
+                    &run.id,
+                    "exit_requested",
+                    json!({"workspace_id": session.workspace, "timeout_secs": timeout.as_secs()}),
+                )?;
+                // Ask once, the way the maintainer would; never kill the session.
+                cmux.send_exit(&session.workspace)?;
+                log.note(&format!(
+                    "exit requested for {}; waiting for session exit",
+                    run.id
+                ));
+                self.requested = Some(Instant::now());
+            }
+            Some(requested) if !self.timed_out && requested.elapsed() >= cmux.exit_timeout() => {
+                let timeout = cmux.exit_timeout();
+                queue.record_runtime_event(
+                    &run.id,
+                    "exit_request_timed_out",
+                    json!({"workspace_id": session.workspace, "timeout_secs": timeout.as_secs()}),
+                )?;
+                log.note(&format!(
+                    "session for {} did not exit within {}s of the exit request; keeping the run and asking the inbox to send /exit in workspace {}",
+                    run.id,
+                    timeout.as_secs(),
+                    session.workspace
+                ));
+                self.timed_out = true;
+            }
+            Some(_) => (),
+        }
+        if self.timed_out && !self.exit_asked {
+            let workspace = session.workspace.clone();
+            ask_stuck_exit(
+                queue,
+                cmux,
+                repository,
+                run,
+                &workspace,
+                &self.after(run),
+                log,
+            )?;
+            self.exit_asked = true;
+        }
+        Ok(false)
+    }
+}
+
+/// The fixed request the supervisor types into the live session when the
+/// receipt it rewrote for a revise does not name its clean worktree HEAD.
+fn revise_mismatch_request(run: &TaskRun, attempt: usize, why: &str) -> Result<String> {
+    let receipt = run.receipt_path.as_ref().context("missing receipt path")?;
+    Ok([
+        format!(
+            "dagq: the receipt you rewrote for revise {attempt} of run {} cannot be accepted: {why}.",
+            run.id
+        ),
+        "Steps:".to_owned(),
+        "1. Commit every change you meant to make, so the worktree is clean.".to_owned(),
+        format!(
+            "2. Rewrite the receipt at {receipt} with the current HEAD commit (git rev-parse HEAD), writing a temporary file in the same directory and renaming it."
+        ),
+        format!("3. {STOP_BACKGROUND}"),
+        "4. Do not merge or push. When done, report briefly and stop; do not run /exit."
+            .to_owned(),
+    ]
+    .join("\n"))
+}
+
+/// What the headless reviewer is asked (ADR-0023 decision 2, ADR-0027
+/// decision 2): where the material is, the task's acceptance, the verdict
+/// schema and where `revise` ends and `concern` begins.
+pub fn review_prompt(task: &Task, run: &TaskRun, review_path: &str) -> String {
+    format!(
+        "You review run {run_id} of dagq task {task_id} ({title}) before it lands on main.\n\
+         Read the review material at {review_path}: the task, its goal, the receipt, the commits and the full diff. Read the worktree if you need more. Do not change any file.\n\n\
+         Acceptance criteria of the task:\n{acceptance}\n\n\
+         Decide one verdict:\n\
+         - pass: the diff meets the acceptance criteria and the task's instructions and nothing needs fixing.\n\
+         - revise: findings the worker can fix without a person's judgment: missing tests or evidence, lint, fmt or clippy findings, a receipt that disagrees with the diff where fixing the diff settles it, or an obvious gap inside the instructed scope.\n\
+         - concern: findings that need a person's judgment: a mismatch with the acceptance criteria, changes the task did not ask for, or a finding that involves a judgment call.\n\n\
+         Answer with one JSON object and nothing else, matching this schema:\n\
+         {{\"verdict\": \"pass\" | \"revise\" | \"concern\", \"reasons\": [string], \"summary\": string}}\n\
+         reasons lists each finding (empty for pass); summary is one or two sentences.\n",
+        run_id = run.id,
+        task_id = task.id,
+        title = task.title,
+        acceptance = or_none(&task.acceptance),
+    )
+}
+
+/// The fixed request the supervisor types into the live session for a
+/// `revise` verdict (ADR-0027 decision 2), one instruction per line; the
+/// backend sends it as one line.
+fn revise_request(
+    task: &Task,
+    run: &TaskRun,
+    attempt: usize,
+    reasons: &[String],
+) -> Result<String> {
+    let receipt = run.receipt_path.as_ref().context("missing receipt path")?;
+    let verify = serde_json::to_string(&task.verification_commands)?;
+    let mut lines = vec![format!(
+        "dagq: the supervisor's review of run {} (task {}) asks for changes (revise {attempt} of {MAX_REVISE_ATTEMPTS}).",
+        run.id, task.id
+    )];
+    lines.push("Findings:".to_owned());
+    for reason in reasons {
+        lines.push(format!("- {reason}"));
+    }
+    lines.push("Steps:".to_owned());
+    lines.push("1. Fix the findings in this worktree and commit.".to_owned());
+    lines.push(format!("2. Run the verification commands {verify}."));
+    lines.push("3. Keep the worktree clean.".to_owned());
+    lines.push(format!("4. {STOP_BACKGROUND}"));
+    lines.push(format!(
+        "5. Rewrite the receipt at {receipt} with the new head commit, writing a temporary file in the same directory and renaming it."
+    ));
+    lines.push(
+        "6. Do not merge or push. When done, report briefly and stop; do not run /exit.".to_owned(),
+    );
+    Ok(lines.join("\n"))
 }
 
 /// Whether the marker exists and was modified after `since`.
@@ -2678,6 +3902,16 @@ pub fn integrate(
             None => return Ok(serde_json::to_value(IntegrationOutcome::NoRunAwaiting)?),
         },
     };
+    // A run the supervisor holds (its review, ADR-0027, or its resume) is
+    // not approved by a call that cannot land it.
+    if let Some(lease) = queue.run_lease(&run.id)?
+        && !lease_is_stale(&lease, unix_time())
+    {
+        bail!(
+            "run {} is held by the supervisor (its review or resume is in progress); see show for its review_finished / resume_finished events",
+            run.id
+        );
+    }
     // The call is the approval to land (ADR-0016 decision 5): a run it
     // parks as `needs_session` is landed by the supervisor once a resumed
     // session resolved it (ADR-0019 decision 1).

@@ -6,9 +6,10 @@
 //! by `domain`.
 use crate::{
     domain::{
-        ASK_EVENT_KINDS, ATTENTION_KINDS, AskKind, Attention, AttentionNext, MAX_RESUME_ATTEMPTS,
-        RunEvent, RunStatus, SessionRole, SupervisorPulse, SupervisorRegistration, attention_role,
-        event_attention, run_attention, supervisor_attention,
+        ASK_EVENT_KINDS, ATTENTION_KINDS, AskKind, Attention, AttentionNext, LANDING_OPTIONS,
+        MAX_RESUME_ATTEMPTS, RunEvent, RunStatus, SessionRole, SupervisorPulse,
+        SupervisorRegistration, attention_role, event_attention, run_attention,
+        supervisor_attention,
     },
     infrastructure::{
         adapters::process_alive, asks::AskQuery, runtime_store::lease_is_stale, sqlite::SqliteQueue,
@@ -59,6 +60,14 @@ pub fn attention(
             // the lease, so a run read before a release and its lease read
             // after it would look abandoned: judge it by its status now.
             run = queue.run(&run.id)?;
+        }
+        // A run whose review raised a concern waits in its
+        // `approve_landing` ask, which is the attention (ADR-0027).
+        if run.status == RunStatus::AwaitingIntegration
+            && !leased
+            && queue.has_unclosed_ask(&run.id, AskKind::ApproveLanding)?
+        {
+            continue;
         }
         let events = queue.run_events(&run.id)?;
         let exit_pending = events
@@ -118,6 +127,13 @@ pub fn attention(
                 }
             })
             .map_or_else(|| run.status.as_str().to_owned(), |e| e.kind.clone());
+        // After a failed headless review the run is a person's to review.
+        let next = match next {
+            AttentionNext::ReviewAndIntegrate if kind == "review_failed" => {
+                AttentionNext::ReviewByHand
+            }
+            next => next,
+        };
         attention.push(Attention {
             run_id: Some(run.id),
             task_id: Some(run.task_id),
@@ -190,6 +206,20 @@ pub fn attention(
                     AttentionNext::DeliverAnswer { ask_id: ask.id },
                 )
             }
+        } else if ask.kind == AskKind::ApproveLanding
+            && let Some(run_id) = ask.run_id.as_deref()
+            && queue.run(run_id)?.status == RunStatus::AwaitingIntegration
+            && ask
+                .answer
+                .as_deref()
+                .is_some_and(|answer| LANDING_OPTIONS.contains(&answer.trim()))
+        {
+            // The supervisor lands, sends back or cancels the run itself.
+            (
+                "answered",
+                "ask_answered",
+                AttentionNext::ApplyingAnswer { ask_id: ask.id },
+            )
         } else {
             (
                 "answered",

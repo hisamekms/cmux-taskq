@@ -1,0 +1,12 @@
+# needs_session runs: what the runtime's resume does
+
+A run becomes `needs_session` only when its landing conflicted or its verification failed after the rebase, when validation found required evidence missing, or when a person answered `send_back` to the `approve_landing` ask of a review concern. A `revise` verdict goes to the still-open worker session without any resume (ADR-0027).
+
+The supervisor opens a workspace titled like the run's worker (`[<repo>]worker#<task-id> - <task title>`, description `run <run-id> resume`) with the run's own session and types the fixed resolution request: the reason, the `main` to rebase onto, the tasks landed since the run's base, and the steps. `run_dir` keeps it as `resume-N.txt`.
+
+Once the session has rewritten the receipt for the new head and gone idle:
+
+- a run whose `integrate` was already called (`integration_approved`) gets `/exit` and is landed by the runtime;
+- any other run keeps the session open and goes through validation and the supervisor's review like the worker's (the `dagq-land` skill, section 0).
+
+A session that goes idle without resolving it, or runs past the resume timeout, gets `/exit` and its workspace is closed (the final screen is `terminal-resume-N.txt`). The attention `answer the prompt in workspace <id>` does not cover resumed sessions.

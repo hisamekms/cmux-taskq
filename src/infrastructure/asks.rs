@@ -6,7 +6,7 @@ use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
 use serde_json::json;
 
 use super::sqlite::{SqliteQueue, enum_col, json_col};
-use crate::domain::{Ask, AskKind, AskOutcome, NewAsk, RunStatus, SessionRole};
+use crate::domain::{Ask, AskKind, AskOutcome, LANDING_OPTIONS, NewAsk, RunStatus, SessionRole};
 
 /// Which asks `asks` lists. By default the ones nobody closed; `all` adds
 /// the closed ones, `open` keeps only the unanswered ones, and `role` keeps
@@ -116,6 +116,21 @@ impl SqliteQueue {
                 })?;
             payload["runtime_delivers"] = json!(status == RunStatus::Running.as_str());
         }
+        if ask.kind == AskKind::ApproveLanding
+            && let Some(run_id) = ask.run_id.as_deref()
+        {
+            // The supervisor lands, sends back or cancels a run awaiting
+            // integration as answered (ADR-0027); any other answer, or one
+            // for a run that moved on, is the maintainer's to read.
+            let status: String =
+                tx.query_row("SELECT status FROM task_runs WHERE id=?1", [run_id], |r| {
+                    r.get(0)
+                })?;
+            payload["runtime_delivers"] = json!(
+                status == RunStatus::AwaitingIntegration.as_str()
+                    && LANDING_OPTIONS.contains(&text.trim())
+            );
+        }
         ask_event(
             &tx,
             ask.task_id,
@@ -181,12 +196,30 @@ impl SqliteQueue {
     /// Whether the run has a `worker_question` nobody closed, answered or
     /// not: its worker stopped at the ask and waits for the answer.
     pub fn has_unclosed_worker_question(&self, run_id: &str) -> Result<bool> {
+        self.has_unclosed_ask(run_id, AskKind::WorkerQuestion)
+    }
+
+    /// Whether the run has an ask of `kind` nobody closed, answered or not.
+    pub fn has_unclosed_ask(&self, run_id: &str, kind: AskKind) -> Result<bool> {
         Ok(self.conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM asks WHERE run_id=?1 AND kind='worker_question'
+            "SELECT EXISTS(SELECT 1 FROM asks WHERE run_id=?1 AND kind=?2
              AND closed_at IS NULL)",
-            [run_id],
+            params![run_id, kind.as_str()],
             |r| r.get(0),
         )?)
+    }
+
+    /// The answered `approve_landing` asks about a run that nobody closed,
+    /// oldest first: the answers the supervisor applies (ADR-0027).
+    pub fn landing_answers(&self) -> Result<Vec<Ask>> {
+        Ok(self
+            .conn
+            .prepare(
+                "SELECT * FROM asks WHERE kind='approve_landing' AND run_id IS NOT NULL
+                 AND answered_at IS NOT NULL AND closed_at IS NULL ORDER BY id",
+            )?
+            .query_map([], ask_row)?
+            .collect::<rusqlite::Result<_>>()?)
     }
 
     /// Close an answered `worker_question` whose answer was typed into the

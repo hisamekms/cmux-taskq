@@ -9,6 +9,8 @@ last_verified: 2026-09-23
 scope: provider
 related:
   - adr-0004
+  - adr-0023
+  - adr-0027
   - design-supervisor-lifecycle
 ---
 
@@ -20,12 +22,18 @@ application層はagent providerの共通契約を使い、CLI引数や出力形�
 AgentProvider
   preflight()              -- 実装済み: 実行可能性の確認
   command(run, prompt)     -- 実装済み: wrapperが起動するコマンド
+  resume_command(run)      -- 実装済み: needs_sessionのrunを同じ会話で開き直すコマンド
+  headless_command(cwd, prompt, allowed_tools) -- 実装済み: observerのheadless job（runを持たない）
+  review_command(run, prompt) -- 実装済み: supervisorのheadless review（stdoutがverdict JSON）
+  review_timeout()         -- 実装済み: headless reviewの上限（既定600秒）
   inspect / interrupt / collect_result  -- 後続
 ```
 
 Claude Code adapter（`src/infrastructure/adapters.rs`）はworktreeをcwdにし、`--session-id`にrun IDを渡し、`--debug-file`をrun管理領域に置き、`--add-dir`でrun管理領域への書き込みを許可し、promptを位置引数で渡す。stdin/stdout/stderrはwrapperのTTYを継承する。permission modeは上書きしない。
 
 加えて`command()`は`<run-dir>/claude-settings.json`を書いて`--settings`で渡す。内容は`Stop` hook 1件で、hookのstdin（イベントJSON）を`<run-dir>/idle.json`（`TaskRun::idle_marker_path`）へ一時ファイル + renameで書く。supervisorはこのmarkerをidle判定に使う（[supervisor-lifecycle](supervisor-lifecycle.md)）。`SessionEnd` hookは使わず、セッション終了はwrapperの終了コードで確認する。他のproviderは同じmarkerを自分の仕組みで書けばよく、書かなければ手動終了待ちになる。同じ設定に`autoMode.environment: ["$defaults"]`も入れ、auto modeの初回案内（Teach auto mode）を抑止する（[起動時のダイアログ](#起動時のダイアログ)）。
+
+`review_command()`（[ADR-0023](../adr/0023-verify-once-review-in-supervisor-run-env-graph-and-stats.md)の決定2、[ADR-0027](../adr/0027-keep-worker-session-through-review-revise-verdict-and-merge-tree-precheck.md)）はsupervisorが受理したrunをreviewさせる非対話のコマンドを返す。Claude Code adapterは`claude -p --debug-file <run-dir>/claude-review.log --add-dir <run-dir> --settings <run-dir>/claude-review-settings.json --allowedTools Read,Grep,Glob --disallowedTools Bash,Edit,Write,NotebookEdit -- <prompt>`をworktreeで起動する（worktreeは生きているworkerのsessionのものなので、reviewは読むだけ）。`claude-review-settings.json`は`autoMode.environment`だけで`Stop` hookを持たない: reviewの間もworkerのsessionは開いたままなので、reviewがidle markerを書くとsupervisorのidle判定（reviseの往復）を誤らせる。cmux workspaceは作らず、stdin / stdout / stderrはruntimeが繋ぐ（stdinはnull、stdoutとstderrは`<run-dir>/review-<attempt>.out` / `.err`）。runtimeは`review_timeout()`を過ぎたらkillし、stdoutの`{"verdict": "pass" | "revise" | "concern", "reasons": [..], "summary": ".."}`を読む（[supervisor-lifecycle](supervisor-lifecycle.md#review-supervisor)）。`headless_command()`と1つのportにしないのは、reviewがrunに属し、そのrun directoryの設定・debug file・`--add-dir`と禁止するtoolを要るのに対し、observerのjobにはrunが無いため。reviewの子プロセスにはruntimeが`DAGQ_ROLE=reviewer`と`DAGQ_QUEUE`を渡し、CLIはreviewerに読むコマンドだけを許す。print mode（`-p`）はfolder trustの判定を飛ばす（[binary から読める判定](#binary-から読める判定)の1）ので、reviewはtrust dialogで止まらない。
 
 Claude providerはcmux内の通常セッションを起動し、実装、unit test、E2E、subagent review、完了レポートを実行させる。Codex providerはCodexの対応するセッション方式を使う。provider capabilityとしてinteractive、subagents、stream events、structured resultを表現する。
 
