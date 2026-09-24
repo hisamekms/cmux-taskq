@@ -2,9 +2,10 @@
 id: adr-0035
 type: adr
 title: ADRは丸ごと置き換え、置き換え・廃止の日付とstatusをfrontmatterと本文冒頭の注記に残す
-status: proposed
+status: accepted
 created: 2026-09-24
 updated: 2026-09-24
+accepted_on: 2026-09-24
 owners:
   - hisamekms
 tags:

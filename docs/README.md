@@ -4,8 +4,8 @@ type: design
 title: Documentation guide
 status: current
 created: 2026-09-21
-updated: 2026-09-23
-last_verified: 2026-09-23
+updated: 2026-09-24
+last_verified: 2026-09-24
 tags:
   - documentation
 ---
@@ -16,7 +16,7 @@ dagqの文書は、決定、現在の設計、実装計画、作業記録を分�
 
 ## 文書の種類
 
-- `adr/`: なぜその決定をしたか。重要な決定は必ず追加し、既存のADRを書き換えない。
+- `adr/`: なぜその決定をしたか。重要な決定は必ず追加し、既存のADRを書き換えない。`accepted`のADRだけが現在の決定で、`superseded`なら`superseded_by`を辿る。決定を変えるときは古いADRを丸ごと置き換える統合ADRを書く（[ADR-0035](adr/0035-adr-is-superseded-whole-with-dates-and-banner.md)、索引は[adr/README.md](adr/README.md)）。
 - `design/`: 現在の実装がどうなっているか。コードを読む前のショートカットとして保守する。
 - `plans/`: これから何を作るか。ステップの順序と完了条件を持つ。完了した計画は`status: completed`にして残す。
 - `journal/`: 凍結済み。過去の作業記録。新しいジャーナルは作らず、人の判断はADR、Goalの記述、`Task.context`、receiptの`summary`に残す。
