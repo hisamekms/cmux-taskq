@@ -4,8 +4,8 @@ type: design
 title: Domain model
 status: current
 created: 2026-09-21
-updated: 2026-09-24
-last_verified: 2026-09-24
+updated: 2026-09-25
+last_verified: 2026-09-25
 scope: domain
 related:
   - adr-0003
@@ -25,7 +25,7 @@ related:
 
 ## Implementation status
 
-ステップ2で`Task`、`TaskDependency`、`TaskRun`、`RunEvent`、ステップ3で`RunProcess`と`SupervisorLease`、ステップ4で`Receipt`を実装した。ステップ6（[017](../journal/017-parallel-runs.md)）で`SupervisorLease`を`RunLease`に置き換え、ステップ7（[018](../journal/018-merge-queue.md)）でrunの`integrating`と`needs_session`、`IntegrationOutcome`の`needs_session` / `failed` / `no_run_awaiting`を加えた。[020](../journal/020-goal-groups-task-definitions.md)のT2で`Goal`と`Task.goal_id` / `Task.context`、receiptの`follow_ups`を加えた（[ADR-0009](../adr/0009-goal-groups-tasks.md)）。goal 12でgoalのdraft状態（`GoalStatus`）と、run_eventsのkind `observation`で表すnote（`NewNote`）を加えた（ADR-0024の決定4、5）。goal 8のtask 73で`Task.required_evidence`（`EvidenceCheck`）と`Receipt::missing_evidence`を加えた（ADR-0019の決定5）。Rustの型と手動遷移規則は`src/domain/`（構成は[集約: TaskとGoal](#集約-taskとgoal)）、ストレージとprovider/workspaceの契約は`src/application.rs`、永続化は`src/infrastructure/sqlite.rs`と`src/infrastructure/runtime_store.rs`にある。`AgentSession`と`Workspace`は独立エンティティにせず、TaskRunの`id`（Claude session ID）と`workspace_id`で表す。
+ステップ2で`Task`、`TaskDependency`、`TaskRun`、`RunEvent`、ステップ3で`RunProcess`と`SupervisorLease`、ステップ4で`Receipt`を実装した。ステップ6（[ADR-0007](../adr/0007-run-level-leases-parallel-execution.md)）で`SupervisorLease`を`RunLease`に置き換え、ステップ7（[ADR-0008](../adr/0008-merge-queue-squash-landing.md)）でrunの`integrating`と`needs_session`、`IntegrationOutcome`の`needs_session` / `failed` / `no_run_awaiting`を加えた。[plan](../plans/current.md#after-first-dogfooding)のステップ9の後に`Goal`と`Task.goal_id` / `Task.context`、receiptの`follow_ups`を加えた（[ADR-0009](../adr/0009-goal-groups-tasks.md)）。goal 12でgoalのdraft状態（`GoalStatus`）と、run_eventsのkind `observation`で表すnote（`NewNote`）を加えた（ADR-0024の決定4、5）。goal 8のtask 73で`Task.required_evidence`（`EvidenceCheck`）と`Receipt::missing_evidence`を加えた（ADR-0019の決定5）。Rustの型と手動遷移規則は`src/domain/`（構成は[集約: TaskとGoal](#集約-taskとgoal)）、ストレージとprovider/workspaceの契約は`src/application.rs`、永続化は`src/infrastructure/sqlite.rs`と`src/infrastructure/runtime_store.rs`にある。`AgentSession`と`Workspace`は独立エンティティにせず、TaskRunの`id`（Claude session ID）と`workspace_id`で表す。
 
 ## Entities
 

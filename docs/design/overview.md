@@ -51,9 +51,9 @@ dagqは、依存関係を持つ開発タスクをSQLiteで管理し、着手可�
 | **inbox** | 人に届くものすべての窓口になる常駐session（[ADR-0022](../adr/0022-ask-answer-inbox-planner-and-landing-on-doubt.md)、ADR-0024の決定6）。openなaskを人に見せてanswerを書き戻し、それ以外のattention（回答済みのask、止まったsupervisor、失敗したreview / triage、pushの失敗）を人に知らせ、人の指示があるときだけ`dagq-recover`の手順（`up` / `down`、手でのreviewと`integrate`、`recover`、run workspaceへのキー送信）を実行する。自分では判断しない。`up`が`[<repo>]inbox`のworkspaceに`inbox_prompt`付きで開く。 | （新設） |
 | **observer** | supervisorのtimerで定期起動するheadlessのjob（ADR-0024の決定4）。`stats`と直近のnoteを読み、note・`blocked`のask・draftのgoalだけを書く。状態は変えない。 | （新設） |
 
-**退役した役割。** ADR-0010からADR-0023までの記述とjournalに出てくる常駐のClaude Code session「メンテナー」（英字表記の役割名。`up`が`[<repo>]`＋その名のworkspaceを開き、`DAGQ_ROLE`にその名を持っていた）は、ADR-0024で退役した。既存のADRとjournalは書き換えないので、そこでのメンテナーの仕事は次のとおり読み替える: レビューと着地はsupervisorのreview job、失敗runの扱い（recoverしてready / cancel）はsupervisorのtriage job、3回resumeして解消しない`needs_session`と作業中のdialog（`prompt_waiting`）はinbox宛てのask、継続的な監視と改善提案はobserver、人への相談とanswerに従う操作・`up` / `down` / 固定バイナリの更新はinbox（またはplanner）のsessionから人の指示で行う。`up`はそのworkspaceを開かず、queueに記録されたそのworkspaceの行を忘れる（workspace自体は人が閉じる）。
+**退役した役割。** ADR-0010からADR-0023までの記述に出てくる常駐のClaude Code session「メンテナー」（英字表記の役割名。`up`が`[<repo>]`＋その名のworkspaceを開き、`DAGQ_ROLE`にその名を持っていた）は、ADR-0024で退役した。既存のADRは書き換えないので、そこでのメンテナーの仕事は次のとおり読み替える: レビューと着地はsupervisorのreview job、失敗runの扱い（recoverしてready / cancel）はsupervisorのtriage job、3回resumeして解消しない`needs_session`と作業中のdialog（`prompt_waiting`）はinbox宛てのask、継続的な監視と改善提案はobserver、人への相談とanswerに従う操作・`up` / `down` / 固定バイナリの更新はinbox（またはplanner）のsessionから人の指示で行う。`up`はそのworkspaceを開かず、queueに記録されたそのworkspaceの行を忘れる（workspace自体は人が閉じる）。
 
-既存のADR（0001〜0009）とjournalに残る旧称もこの表で読み替える。runtimeのCLI名（`supervise`）と`supervisors`表は変えない。
+既存のADR（0001〜0009）に残る旧称もこの表で読み替える。runtimeのCLI名（`supervise`）と`supervisors`表は変えない。
 
 ```text
 CLI / Claude plugin / Codex plugin

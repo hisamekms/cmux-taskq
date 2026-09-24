@@ -4,8 +4,8 @@ type: design
 title: SQLite persistence
 status: current
 created: 2026-09-21
-updated: 2026-09-24
-last_verified: 2026-09-24
+updated: 2026-09-25
+last_verified: 2026-09-25
 scope: persistence
 related:
   - adr-0003
@@ -27,7 +27,7 @@ related:
 
 # SQLite persistence
 
-SQLiteはキューの正本であり、プロセス間共有と再起動後の復旧に使う。stdoutは正本にしない。ステップ2で4テーブル、ステップ3で3テーブル、ステップ4で`task_runs.workspace_closed_at`列を実装し、[008](../journal/008-integration-confirm.md)で`task_runs`を作り直して`integrated`を加え（schema version 4）、[017](../journal/017-parallel-runs.md)でleaseをrun単位の`run_leases`に移してqueue全体の実行枠を外し（schema version 5、[ADR-0007](../adr/0007-run-level-leases-parallel-execution.md)）、[018](../journal/018-merge-queue.md)で`task_runs`を再び作り直して`integrating`と`needs_session`を加え、統合スロットの部分UNIQUE indexを足した（schema version 6、[ADR-0008](../adr/0008-merge-queue-squash-landing.md)）。`0007_supervisors.sql`は常駐supervisorの登録表`supervisors`を足した（schema version 7）。`0008_goals.sql`は`goals`、`tasks.goal_id` / `tasks.context`を足し、`run_events`を作り直してgoal単位のイベントを持てるようにした（schema version 8、[ADR-0009](../adr/0009-goal-groups-tasks.md)。ADRの「schema v6」は7がsupervisorsに使われたためv8と読み替える）。`0009_supervisor_mode.sql`は`supervisors`に`mode`と`workspace_id`を足した（schema version 9、[ADR-0011](../adr/0011-cmux-socket-password-and-in-cmux-fallback.md)）。`0012_queue_events.sql`は`run_events`を作り直し、`backend_call_failed`だけはtaskにもgoalにも紐づかない行を持てるようにした（schema version 12、task 109）。`0016_observer.sql`は`asks`と`run_events`を作り直し、observerの`blocked`のaskとその事象、observer自身の`observe_started` / `observe_finished`をtaskの無い行として持てるようにした（schema version 16、task 99）。`0017_stuck_exit_ask.sql`は`asks`を0016と同じ手順で作り直し、kindのCHECKに`stuck_exit`（supervisorが`/exit`のtimeoutで作るask。task 104）を足した（schema version 17）。`0018_task_paths.sql`は`tasks.paths`を足した（schema version 18、[ADR-0029](../adr/0029-task-declares-paths-and-verification-follows-the-kind-of-change.md)）。
+SQLiteはキューの正本であり、プロセス間共有と再起動後の復旧に使う。stdoutは正本にしない。ステップ2で4テーブル、ステップ3で3テーブル、ステップ4で`task_runs.workspace_closed_at`列を実装し、ステップ4の統合確認で`task_runs`を作り直して`integrated`を加え（schema version 4）、ステップ6でleaseをrun単位の`run_leases`に移してqueue全体の実行枠を外し（schema version 5、[ADR-0007](../adr/0007-run-level-leases-parallel-execution.md)）、ステップ7で`task_runs`を再び作り直して`integrating`と`needs_session`を加え、統合スロットの部分UNIQUE indexを足した（schema version 6、[ADR-0008](../adr/0008-merge-queue-squash-landing.md)）。`0007_supervisors.sql`は常駐supervisorの登録表`supervisors`を足した（schema version 7）。`0008_goals.sql`は`goals`、`tasks.goal_id` / `tasks.context`を足し、`run_events`を作り直してgoal単位のイベントを持てるようにした（schema version 8、[ADR-0009](../adr/0009-goal-groups-tasks.md)。ADRの「schema v6」は7がsupervisorsに使われたためv8と読み替える）。`0009_supervisor_mode.sql`は`supervisors`に`mode`と`workspace_id`を足した（schema version 9、[ADR-0011](../adr/0011-cmux-socket-password-and-in-cmux-fallback.md)）。`0012_queue_events.sql`は`run_events`を作り直し、`backend_call_failed`だけはtaskにもgoalにも紐づかない行を持てるようにした（schema version 12、task 109）。`0016_observer.sql`は`asks`と`run_events`を作り直し、observerの`blocked`のaskとその事象、observer自身の`observe_started` / `observe_finished`をtaskの無い行として持てるようにした（schema version 16、task 99）。`0017_stuck_exit_ask.sql`は`asks`を0016と同じ手順で作り直し、kindのCHECKに`stuck_exit`（supervisorが`/exit`のtimeoutで作るask。task 104）を足した（schema version 17）。`0018_task_paths.sql`は`tasks.paths`を足した（schema version 18、[ADR-0029](../adr/0029-task-declares-paths-and-verification-follows-the-kind-of-change.md)）。
 
 ```text
 tasks

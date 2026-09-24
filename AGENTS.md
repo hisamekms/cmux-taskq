@@ -35,11 +35,11 @@ cargo clippy --locked --all-targets -- -D warnings
   - runtime（`src/`・`tests/`・`migrations/`）: `--paths` なしで fmt / clippy / `cargo llvm-cov --locked --fail-under-lines 80` と `--evidence e2e`（上の llvm-cov の規則どおり `cargo test --locked` は重ねない）
   - 種類が混ざる task は重い方の検証にする。task が宣言外のパスを本当に必要とするなら、worker は `failed` の receipt に必要なパスを書き、planner が `--paths` を広げて登録し直す（draft / ready のうちは `set-paths TASK --paths ...` / `--none` で変えられる）
 - e2e test: ハッピーパスを `tests/e2e.rs` に置く。実バイナリ・実 Git・実 cmux を使い、Claude の代わりに受け入れ条件どおり commit と receipt を書く stub スクリプトを provider にする。cmux が必要なので `#[ignore]` とし、runtime（`src/`）を変えた run では worker が worktree で `cargo test --locked --test e2e -- --ignored` を実行し、receipt の `e2e` に evidence を書く。inbox も planner も自分では再実行しない
-- 実 Claude を含む経路は自動化せず、手動スモーク（journal 010, 012）で確認する
+- 実 Claude を含む経路は自動化せず、手動スモーク（[docs/design/manual-smoke.md](docs/design/manual-smoke.md)）で確認する
 
 ## 文書のルール
 
-- 人の判断は ADR・Goal の記述・`Task.context`・receipt の `summary` に残す（`docs/journal/` は凍結済みで、新しいジャーナルは作らない）
+- 人の判断は ADR・Goal の記述・`Task.context`・receipt の `summary` に残す（作業記録のジャーナルは [ADR-0036](docs/adr/0036-delete-frozen-work-records.md) で削除した）
 - 決定は `docs/adr/` に追加する。既存 ADR は書き換えない
 - ADR は `accepted` だけが現在の決定で、`superseded` なら `superseded_by` を辿る。決定を変えるときは古い ADR を丸ごと置き換える統合 ADR を書く（[ADR-0035](docs/adr/0035-adr-is-superseded-whole-with-dates-and-banner.md)、索引は [docs/adr/README.md](docs/adr/README.md)）
 - 実装を変えたら `docs/design/` の該当文書と `updated` / `last_verified` を更新する

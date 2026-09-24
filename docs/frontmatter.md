@@ -4,8 +4,8 @@ type: design
 title: Documentation frontmatter specification
 status: current
 created: 2026-09-21
-updated: 2026-09-24
-last_verified: 2026-09-24
+updated: 2026-09-25
+last_verified: 2026-09-25
 tags:
   - documentation
   - conventions
@@ -43,9 +43,8 @@ related:
 | `adr` | `proposed`, `accepted`, `rejected`, `superseded`, `deprecated` | `accepted_on`, `superseded_by`, `superseded_on`, `supersedes` (see [ADR fields](#adr-fields)) |
 | `design` | `draft`, `current`, `deprecated`, `superseded` | `last_verified`, optional `scope` |
 | `plan` | `proposed`, `active`, `blocked`, `completed`, `archived` | optional `milestone`, `target`, `depends_on` |
-| `journal` | `draft`, `planned`, `open`, `done`, `abandoned` | optional `plan_step`, `queue_task`, `depends_on_journal`, `verify`. Frozen on 2026-09-22: no new journals are created, and existing files keep their values as written |
 
-Design documents describe the current state and may be edited. Plans describe intended work and may be edited while active. Journals recorded one task each; their `Log` section was append-only, `queue_task` links to the dagq task ID after migration, and `verify` listed commands to pass to `dagq add --verify`. Journal IDs use `journal-NNN`. The `journal/` directory is frozen ([journal/README.md](journal/README.md)); the row above is kept so existing files still validate.
+Design documents describe the current state and may be edited. Plans describe intended work and may be edited while active. The progress and state of individual tasks live in the dagq queue, not in documents.
 
 ## ADR fields
 
@@ -98,5 +97,4 @@ Future documentation validation should check unique IDs, allowed status values, 
 docs/adr/0001-rust-runtime.md
 docs/design/supervisor-lifecycle.md
 docs/plans/rust-runtime-mvp.md
-docs/journal/003-supervisor.md
 ```

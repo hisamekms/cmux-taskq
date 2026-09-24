@@ -105,7 +105,7 @@ The two are versioned together. When a session resolves the binary (`dagq --reso
 
 ## Current status
 
-The Rust/SQLite queue and a parallel supervisor are implemented. Tasks, dependencies, state transitions, candidate selection, run reservation, per-run supervisor leases, process heartbeats, and events are persisted locally. `supervise` is a resident loop: it claims dependency-ready tasks up to `--parallel N` (default 4), creates a Git worktree and a cmux workspace for each, starts an interactive Claude Code session through a wrapper, records each session's exit, validates each completion receipt against Git, and closes the workspace of an accepted run. `integrate` is the merge queue: it lands one validated run at a time on `main` by rebasing its worktree onto the current `main`, re-validating it, and squashing it into a single commit, and the supervisor picks up the tasks that unblocks. Claude Code's interactive lifecycle was [verified first](docs/journal/001-claude-lifecycle-spike.md).
+The Rust/SQLite queue and a parallel supervisor are implemented. Tasks, dependencies, state transitions, candidate selection, run reservation, per-run supervisor leases, process heartbeats, and events are persisted locally. `supervise` is a resident loop: it claims dependency-ready tasks up to `--parallel N` (default 4), creates a Git worktree and a cmux workspace for each, starts an interactive Claude Code session through a wrapper, records each session's exit, validates each completion receipt against Git, and closes the workspace of an accepted run. `integrate` is the merge queue: it lands one validated run at a time on `main` by rebasing its worktree onto the current `main`, re-validating it, and squashing it into a single commit, and the supervisor picks up the tasks that unblocks.
 
 A validated run is `awaiting_integration`, and the supervisor reviews it with a headless `claude -p` while the run's session stays open: on `pass` it sends `/exit`, closes the workspace and lands the run itself (the same landing as `integrate`, push included); on `revise` it types the findings into the live session, which fixes them and rewrites its receipt for another review (at most twice); on `concern`, or a third review that does not pass, it closes the session and opens an `approve_landing` ask whose `land`, `send_back` or `cancel` answer it applies; a review that fails leaves the run to `integrate` by hand (attention `review by hand`). A run whose rebase conflicts, or whose verification fails after the rebase, waits as `needs_session` while the supervisor resumes its Claude session to fix it, and lands it once `integrate` was called for it. One run's failure never touches another: each run has its own lease, and `doctor` / `recover` judge and release one run at a time. A supervisor that dies while a run's session is still alive does not lose the run: the next supervisor with a free slot adopts the stale lease and finishes the run; every other stale lease waits for `recover`.
 
@@ -376,7 +376,6 @@ The step-by-step procedure for a release, including how to confirm the first aut
 - [Documentation guide](docs/README.md)
 - [Current design](docs/design/overview.md)
 - [Active plan](docs/plans/current.md)
-- [Task journals](docs/journal/README.md)
 - [Architecture decisions](docs/adr/README.md)
 - [Agent instructions](AGENTS.md)
 

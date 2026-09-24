@@ -4,8 +4,8 @@ type: design
 title: Current design documents
 status: current
 created: 2026-09-21
-updated: 2026-09-21
-last_verified: 2026-09-21
+updated: 2026-09-25
+last_verified: 2026-09-25
 tags:
   - architecture
 ---
@@ -20,3 +20,4 @@ tags:
 - [Supervisor lifecycle](supervisor-lifecycle.md)
 - [Provider lifecycle](provider-lifecycle.md)
 - [Plugin integration](plugin-integration.md)
+- [Manual smoke](manual-smoke.md)

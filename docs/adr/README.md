@@ -4,8 +4,8 @@ type: design
 title: Architecture decision records
 status: current
 created: 2026-09-21
-updated: 2026-09-24
-last_verified: 2026-09-24
+updated: 2026-09-25
+last_verified: 2026-09-25
 tags:
   - architecture
   - documentation
@@ -69,6 +69,7 @@ ADRは、将来の実装や運用に大きな影響を与える決定の理由�
 | [ADR-0031](0031-color-pill-and-pin-for-inbox-and-planner-and-unpin-before-close.md) | upがinbox / plannerのworkspaceに役割の色・status pill・ピンを当て、dagqのworkspace closeはピンを外してから閉じる |  |
 | [ADR-0035](0035-follow-up-triage-job-decides-follow-up-drafts.md) | follow_upのdraft taskの採否をsupervisorが起動するheadlessのfollow-up triage jobが決め、判断がつかないものだけinboxで人に聞く |  |
 | [ADR-0035](0035-adr-is-superseded-whole-with-dates-and-banner.md) | ADRは丸ごと置き換え、置き換え・廃止の日付とstatusをfrontmatterと本文冒頭の注記に残す | 2026-09-24 |
+| [ADR-0036](0036-delete-frozen-work-records.md) | 凍結済みのdocs/journal/を削除し、今も効く手順と観測事実だけをdesign文書へ移す | 2026-09-25 |
 
 番号0035は2本のADR（follow-up triage jobと、ADRの丸ごと置き換え）が使っている。どちらを改番するかは別途決める。
 
