@@ -399,6 +399,267 @@ fn reader(mut source: impl Read + Send + 'static) -> thread::JoinHandle<String> 
     })
 }
 
+/// The file in a fixture's temporary directory that its test process holds an
+/// exclusive `flock` on for as long as the fixture lives. The lock goes away
+/// with the process however it ends, SIGKILL included, so a directory whose
+/// owner file can be locked by someone else belongs to a dead test.
+const OWNER_FILE: &str = "e2e-owner";
+/// A fixture directory without an owner file, left by an e2e from before the
+/// owner file existed, is swept only once it is this old.
+const UNMARKED_SWEEP_AGE: Duration = Duration::from_secs(60 * 60);
+
+/// Take ownership of a fresh fixture directory: lock the owner file under a
+/// temporary name and rename it into place, so a concurrent sweep never sees
+/// an owner file that is not yet locked.
+fn claim_fixture_dir(dir: &Path) -> fs::File {
+    let staging = dir.join(format!("{OWNER_FILE}.tmp"));
+    let mut file = fs::File::create(&staging).unwrap();
+    file.lock().unwrap();
+    use std::io::Write;
+    writeln!(file, "{}", std::process::id()).unwrap();
+    fs::rename(&staging, dir.join(OWNER_FILE)).unwrap();
+    file
+}
+
+/// Clean up what earlier e2e tests left behind when their process died before
+/// its guards and `TempDir` could drop (SIGTERM, SIGKILL): the processes
+/// running from or on their temporary directory, the cmux workspaces whose
+/// `DAGQ_QUEUE` or `E2E_SHARED` points into it, the workspace groups named
+/// after its queue hashes, and the directory itself. A directory counts as
+/// left behind only when its owner lock is free (the owner process is gone),
+/// or, without an owner file, when it has the fixture's shape and is older
+/// than [`UNMARKED_SWEEP_AGE`]. The sweep holds that lock while it works, so
+/// concurrent sweeps never take the same directory. Nothing outside those
+/// directories is touched: the production queue's workspaces carry no such
+/// env and its group has another external ID.
+fn sweep_abandoned_fixtures(cmux: &Path) {
+    let Ok(entries) = fs::read_dir(env::temp_dir()) else {
+        return;
+    };
+    let mut abandoned = Vec::new();
+    for entry in entries.flatten() {
+        let dir = entry.path();
+        if !entry.file_name().to_string_lossy().starts_with(".tmp") {
+            continue;
+        }
+        if let Some(lock) = claim_abandoned(&dir) {
+            abandoned.push((dir, lock));
+        }
+    }
+    if abandoned.is_empty() {
+        return;
+    }
+    let prefixes: Vec<(PathBuf, Vec<PathBuf>)> = abandoned
+        .iter()
+        .map(|(dir, _)| {
+            let mut forms = vec![dir.clone()];
+            if let Ok(real) = dir.canonicalize()
+                && real != *dir
+            {
+                forms.push(real);
+            }
+            (dir.clone(), forms)
+        })
+        .collect();
+    let inside = |value: &str| {
+        prefixes
+            .iter()
+            .flat_map(|(_, forms)| forms)
+            .any(|form| Path::new(value).starts_with(form))
+    };
+    for (dir, _) in &abandoned {
+        eprintln!("e2e sweep: {} was left by a dead e2e", dir.display());
+    }
+    kill_processes_inside(&inside);
+    for (dir, _) in &abandoned {
+        for hash in queue_hashes(dir) {
+            delete_group(cmux, &hash);
+        }
+    }
+    close_workspaces_inside(cmux, &inside);
+    for (dir, lock) in abandoned {
+        match fs::remove_dir_all(&dir) {
+            Ok(()) => eprintln!("e2e sweep: removed {}", dir.display()),
+            Err(error) => eprintln!("e2e sweep: removing {} failed: {error}", dir.display()),
+        }
+        drop(lock);
+    }
+}
+
+/// The locked owner file of `dir` when `dir` is a fixture directory whose
+/// owner is gone, `None` when it is live, not a fixture, or taken by another
+/// sweep.
+fn claim_abandoned(dir: &Path) -> Option<fs::File> {
+    let owner = dir.join(OWNER_FILE);
+    let file = if owner.exists() {
+        fs::File::open(&owner).ok()?
+    } else {
+        // An e2e from before the owner file: recognize the fixture by its
+        // stub agent and queue data home, and wait until it is old.
+        if !dir.join("claude-stub").is_file() || !dir.join("data").is_dir() {
+            return None;
+        }
+        let age = fs::metadata(dir).ok()?.modified().ok()?.elapsed().ok()?;
+        if age < UNMARKED_SWEEP_AGE {
+            return None;
+        }
+        fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&owner)
+            .ok()?
+    };
+    file.try_lock().ok()?;
+    Some(file)
+}
+
+/// The queue hashes under the fixture's data home, which are the external
+/// IDs of the queues' workspace groups.
+fn queue_hashes(dir: &Path) -> Vec<String> {
+    let Ok(entries) = fs::read_dir(dir.join("data").join("dagq")) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter(|entry| entry.path().is_dir())
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect()
+}
+
+/// Terminate the processes an abandoned directory started: those whose
+/// program is in it (the runner copy), the stub agent (`/bin/sh
+/// <dir>/claude-stub`), and a `dagq` binary given its queue or stub
+/// (`--db`, `--claude`), like the temporary queue's supervisor. `ps` joins
+/// argv with spaces, so only these shapes are matched: a word of some other
+/// process's arguments, like a Claude prompt that quotes such a path, never
+/// makes it a target.
+fn kill_processes_inside(inside: &dyn Fn(&str) -> bool) {
+    let Ok(output) = Command::new("ps")
+        .args(["-axww", "-o", "pid=,command="])
+        .output()
+    else {
+        eprintln!("e2e sweep: ps failed; left processes alone");
+        return;
+    };
+    let me = std::process::id();
+    let mut victims = Vec::new();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let mut words = line.split_whitespace();
+        let Some(pid) = words.next().and_then(|pid| pid.parse::<u32>().ok()) else {
+            continue;
+        };
+        let argv: Vec<&str> = words.collect();
+        let program = argv.first().is_some_and(|word| inside(word));
+        let stub = argv.first() == Some(&"/bin/sh")
+            && argv
+                .get(1)
+                .is_some_and(|word| word.ends_with("/claude-stub") && inside(word));
+        let dagq = argv
+            .first()
+            .is_some_and(|word| Path::new(word).file_name() == Some("dagq".as_ref()))
+            && argv
+                .windows(2)
+                .any(|pair| matches!(pair[0], "--db" | "--claude") && inside(pair[1]));
+        if pid != me && (program || stub || dagq) {
+            eprintln!("e2e sweep: terminating process {pid}: {}", argv.join(" "));
+            victims.push(pid);
+        }
+    }
+    for pid in &victims {
+        // SAFETY: kill has no memory preconditions.
+        unsafe { libc::kill(*pid as libc::pid_t, libc::SIGTERM) };
+    }
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while victims.iter().any(|pid| pid_alive(*pid)) && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(100));
+    }
+    for pid in victims.iter().filter(|pid| pid_alive(**pid)) {
+        eprintln!("e2e sweep: killing process {pid}, still alive after SIGTERM");
+        // SAFETY: as above.
+        unsafe { libc::kill(*pid as libc::pid_t, libc::SIGKILL) };
+    }
+}
+
+fn delete_group(cmux: &Path, external_id: &str) {
+    let Some(group) = try_listed_group(cmux, external_id) else {
+        return;
+    };
+    let id = group["id"].as_str().unwrap_or_default().to_owned();
+    let name = group["name"].as_str().unwrap_or_default().to_owned();
+    match Command::new(cmux)
+        .args(["workspace-group", "delete", &id, "--close-workspaces"])
+        .output()
+    {
+        Ok(output) if output.status.success() => {
+            eprintln!("e2e sweep: deleted workspace group {id} {name} (queue {external_id})")
+        }
+        Ok(output) => eprintln!(
+            "e2e sweep: deleting workspace group {id} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ),
+        Err(error) => eprintln!("e2e sweep: deleting workspace group {id} failed: {error}"),
+    }
+}
+
+/// Close each listed workspace whose `DAGQ_QUEUE` or `E2E_SHARED` points
+/// into an abandoned directory. A workspace without those variables, like
+/// every workspace of the production queue other than its runs, is skipped.
+fn close_workspaces_inside(cmux: &Path, inside: &dyn Fn(&str) -> bool) {
+    let Some(list) = cmux_json(
+        cmux,
+        &["--json", "--id-format", "uuids", "workspace", "list"],
+    ) else {
+        eprintln!("e2e sweep: cmux workspace list failed; left workspaces alone");
+        return;
+    };
+    for workspace in list["workspaces"].as_array().into_iter().flatten() {
+        let Some(id) = workspace["id"].as_str() else {
+            continue;
+        };
+        let Some(env) = cmux_json(cmux, &["workspace", "env", id, "--json"]) else {
+            continue;
+        };
+        let points_inside = ["DAGQ_QUEUE", "E2E_SHARED"]
+            .iter()
+            .any(|key| env["env"][key].as_str().is_some_and(inside));
+        if !points_inside {
+            continue;
+        }
+        let title = workspace["title"].as_str().unwrap_or_default();
+        match Command::new(cmux).args(["workspace", "close", id]).output() {
+            Ok(output) if output.status.success() => {
+                eprintln!("e2e sweep: closed workspace {id} {title}")
+            }
+            Ok(output) => eprintln!(
+                "e2e sweep: closing workspace {id} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            ),
+            Err(error) => eprintln!("e2e sweep: closing workspace {id} failed: {error}"),
+        }
+    }
+}
+
+fn try_listed_group(cmux: &Path, external_id: &str) -> Option<Value> {
+    let list = cmux_json(
+        cmux,
+        &["--json", "--id-format", "uuids", "workspace-group", "list"],
+    )?;
+    list["groups"]
+        .as_array()?
+        .iter()
+        .find(|group| group["external_id"] == external_id)
+        .cloned()
+}
+
+fn cmux_json(cmux: &Path, args: &[&str]) -> Option<Value> {
+    let output = Command::new(cmux).args(args).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    serde_json::from_slice(&output.stdout).ok()
+}
+
 /// Disposable repository, queue and stub agent, all outside this repository.
 struct Fixture {
     group: GroupGuard,
@@ -409,13 +670,18 @@ struct Fixture {
     base: String,
     db: PathBuf,
     env: Env,
+    /// Held for the fixture's lifetime, and dropped after `_dir` is gone;
+    /// see [`OWNER_FILE`].
+    _owner: fs::File,
 }
 
 fn fixture() -> Fixture {
     let cmux = cmux_executable();
     let cmux_version = preflight(&cmux);
     eprintln!("cmux: {cmux_version}");
+    sweep_abandoned_fixtures(&cmux);
     let dir = tempfile::tempdir().unwrap();
+    let owner = claim_fixture_dir(dir.path());
     let repo = dir.path().join("repo");
     fs::create_dir(&repo).unwrap();
     git(&repo, &["init", "-b", "main"]);
@@ -465,6 +731,7 @@ fn fixture() -> Fixture {
         base,
         db,
         env,
+        _owner: owner,
     }
 }
 
@@ -1440,9 +1707,7 @@ fn pid_alive(pid: u32) -> bool {
     Command::new("kill")
         .args(["-0", &pid.to_string()])
         .output()
-        .unwrap()
-        .status
-        .success()
+        .is_ok_and(|output| output.status.success())
 }
 
 /// Whether the launchd `up` / `down` e2e runs. It is temporarily off unless
