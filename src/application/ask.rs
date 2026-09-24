@@ -38,7 +38,7 @@ pub fn ask(
         None => checkout,
     };
     let ask = &outcome.ask;
-    let question = crate::view::truncate(&ask.question, NOTIFY_QUESTION_CHARS)
+    let question = super::health::truncate(&ask.question, NOTIFY_QUESTION_CHARS)
         .unwrap_or_else(|| ask.question.clone());
     // An observer's blocked ask may belong to no task (and then no run).
     let mut body = question;

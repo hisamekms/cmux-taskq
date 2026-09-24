@@ -5,9 +5,10 @@
 //! [`crate::application::health::attention`]. Everything here reads the
 //! queue and writes nothing; which transition is an attention is decided
 //! by `domain`.
+pub use crate::application::health::compact_event;
 use crate::{
-    application::health::{for_role, pulses, supervisors, truncate_reason as truncate},
-    domain::{ATTENTION_KINDS, RunEvent, SessionRole, event_attention},
+    application::health::{for_role, pulses, supervisors},
+    domain::{ATTENTION_KINDS, SessionRole, event_attention},
     infrastructure::{adapters::SystemProcesses, sqlite::SqliteQueue},
 };
 use anyhow::Result;
@@ -21,45 +22,6 @@ use std::{
 /// At most this many attention events come back from one `watch`; the
 /// cursor then points at the last one returned.
 const WATCH_LIMIT: usize = 100;
-
-/// One event as the inbox reads it: the row's ids and kind, and from the
-/// payload only `status`, `exit_code` and a truncated `reason` (from
-/// `reason`, `message` or `error`). Paths and receipts are left out.
-/// An attention event also carries its `next`.
-pub fn compact_event(event: &RunEvent) -> Value {
-    let mut value = json!({"id": event.id, "kind": event.kind});
-    let object = value.as_object_mut().expect("object literal");
-    if let Some(task_id) = event.task_id {
-        object.insert("task_id".into(), json!(task_id));
-    }
-    if let Some(goal_id) = event.goal_id {
-        object.insert("goal_id".into(), json!(goal_id));
-    }
-    if let Some(run_id) = &event.run_id {
-        object.insert("run_id".into(), json!(run_id));
-    }
-    let payload = &event.payload;
-    if let Some(status) = payload.get("status").or_else(|| payload.get("to")) {
-        object.insert("status".into(), status.clone());
-    }
-    if let Some(code) = payload.get("exit_code") {
-        object.insert("exit_code".into(), code.clone());
-    }
-    if let Some(ask_id) = payload.get("ask_id") {
-        object.insert("ask_id".into(), ask_id.clone());
-    }
-    if let Some(reason) = ["reason", "message", "error"]
-        .iter()
-        .find_map(|key| payload.get(*key).and_then(Value::as_str))
-    {
-        object.insert("reason".into(), json!(truncate(reason)));
-    }
-    if let Some(next) = event_attention(&event.kind, payload) {
-        object.insert("next".into(), json!(next));
-    }
-    object.insert("created_at".into(), json!(event.created_at));
-    value
-}
 
 /// Up to `limit` events with `after < id <= upto` in compact form, attention
 /// for `role` only unless `all`, and the cursor to continue from: the last

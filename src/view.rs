@@ -17,12 +17,7 @@ pub const DEFAULT_OBSERVATIONS: usize = 5;
 /// Payload keys a compact event keeps: what happened, not where.
 const EVENT_GIST: [&str; 5] = ["status", "reason", "last_error", "from", "to"];
 
-/// `text` cut to `limit` characters with `…` appended, or `None` when it fits.
-pub fn truncate(text: &str, limit: usize) -> Option<String> {
-    let mut chars = text.char_indices();
-    let (end, _) = chars.nth(limit)?;
-    Some(format!("{}…", &text[..end]))
-}
+pub use crate::application::health::truncate;
 
 /// Truncate the string fields `keys` of `object` in place and mark it
 /// `truncated` when any of them was cut.

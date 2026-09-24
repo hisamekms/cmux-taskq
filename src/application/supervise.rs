@@ -4895,7 +4895,7 @@ pub fn triage_prompt(
         .events
         .iter()
         .filter(|e| e.run_id.as_ref() == Some(run.id()))
-        .map(crate::watch::compact_event)
+        .map(super::health::compact_event)
         .collect();
     let events = &events[events.len().saturating_sub(40)..];
     material.push_str(&format!(
