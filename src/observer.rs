@@ -20,7 +20,6 @@ use crate::{
     domain::{NoteQuery, stats::StatsQuery},
     infrastructure::{adapters::shell_join, asks::AskQuery, sqlite::SqliteQueue},
     lifecycle::{OBSERVER_ROLE, QUEUE_ENV, ROLE_ENV},
-    runtime::unix_time,
 };
 
 /// Notes the prompt carries.
@@ -96,7 +95,7 @@ pub fn observe(db: &Path, provider: &dyn AgentProvider, options: &ObserveOptions
         .canonicalize()
         .context("queue must already be initialized")?;
     let queue = SqliteQueue::open(&db)?;
-    let started = unix_time();
+    let started = queue.generators().clock.now();
     let since = match (options.since, options.mode) {
         (Some(since), _) => Some(since),
         (None, ObserveMode::Hourly) => read_cursor(&db)?,

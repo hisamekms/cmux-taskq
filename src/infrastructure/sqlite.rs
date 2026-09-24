@@ -1,7 +1,7 @@
 use std::{
     path::{Path, PathBuf},
     str::FromStr,
-    time::Duration,
+    time::{Duration, SystemTime},
 };
 
 use anyhow::{Context, Result, ensure};
@@ -11,12 +11,11 @@ use rusqlite::{
 };
 use serde::de::DeserializeOwned;
 use serde_json::json;
-use uuid::Uuid;
 
 use crate::{
     application::{
-        GraphInput, GraphTask, LatestRun, StatusFilter, TaskListItem, TaskPage, TaskQuery,
-        TaskStore,
+        Generators, GraphInput, GraphTask, IdGenerator, LatestRun, StatusFilter, TaskListItem,
+        TaskPage, TaskQuery, TaskStore, timestamp,
     },
     domain::{
         ClaimOutcome, CommitSha, DomainError, Goal, GoalDetail, GoalEdit, GoalId, GoalRecord,
@@ -25,7 +24,7 @@ use crate::{
         TaskAction, TaskDetail, TaskId, TaskRecord, TaskRun, TaskStatus, TaskStatusCounts, goal,
         scope::validate_path_globs, task,
     },
-    infrastructure::location::runs_dir,
+    infrastructure::{clock, location::runs_dir},
 };
 
 const APPLICATION_ID: i64 = 0x43545131;
@@ -74,6 +73,9 @@ pub struct SqliteQueue {
     /// receipt and log are resolved under it by run ID, never read from the
     /// absolute paths stored at claim time, so a moved queue keeps its runs.
     pub(super) runs_dir: PathBuf,
+    /// Where every time the queue writes and every run ID it creates come
+    /// from; the system clock and random UUIDs unless a test fixes them.
+    pub(super) generators: Generators,
 }
 
 impl SqliteQueue {
@@ -92,6 +94,17 @@ impl SqliteQueue {
         let mut queue = Self::connect(path.as_ref(), false)?;
         queue.migrate(false)?;
         Ok(queue)
+    }
+
+    /// The queue reading the time and creating IDs through `generators`
+    /// instead of the system clock and random UUIDs.
+    pub fn with_generators(mut self, generators: Generators) -> Self {
+        self.generators = generators;
+        self
+    }
+
+    pub fn generators(&self) -> &Generators {
+        &self.generators
     }
 
     pub fn schema_version(&self) -> Result<i64> {
@@ -115,6 +128,7 @@ impl SqliteQueue {
         Ok(Self {
             conn,
             runs_dir: runs_dir(&db),
+            generators: clock::system(),
         })
     }
 
@@ -178,8 +192,9 @@ impl TaskStore for SqliteQueue {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let now = self.generators.clock.timestamp();
         let dependencies = new.dependencies.clone();
-        let task = Task::new(TaskId::new(next_id(&tx, "tasks")?), new, now(&tx)?)?;
+        let task = Task::new(TaskId::new(next_id(&tx, "tasks")?), new, now.clone())?;
         if let Some(goal_id) = task.goal_id() {
             goal::check_accepts_tasks(&read_goal(&tx, goal_id)?)?;
         }
@@ -201,7 +216,7 @@ impl TaskStore for SqliteQueue {
             json!({"goal_id": task.goal_id()}),
         )?;
         for predecessor in dependencies {
-            insert_dependency(&tx, id, predecessor)?;
+            insert_dependency(&tx, id, predecessor, &now)?;
         }
         let result = read_task(&tx, id)?;
         tx.commit()?;
@@ -336,7 +351,7 @@ impl TaskStore for SqliteQueue {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let result = transition_task(&tx, task_id, action)?;
+        let result = transition_task(&tx, task_id, action, &self.generators.clock.timestamp())?;
         tx.commit()?;
         Ok(result)
     }
@@ -345,7 +360,12 @@ impl TaskStore for SqliteQueue {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        insert_dependency(&tx, task_id, predecessor_id)?;
+        insert_dependency(
+            &tx,
+            task_id,
+            predecessor_id,
+            &self.generators.clock.timestamp(),
+        )?;
         tx.commit()?;
         Ok(())
     }
@@ -363,7 +383,7 @@ impl TaskStore for SqliteQueue {
             changed == 1,
             "dependency {task_id} -> {predecessor_id} does not exist"
         );
-        touch(&tx, task_id)?;
+        touch(&tx, task_id, &self.generators.clock.timestamp())?;
         event(
             &tx,
             task_id,
@@ -424,7 +444,14 @@ impl TaskStore for SqliteQueue {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let outcome = claim_task(&tx, &self.runs_dir, base_commit, &[])?;
+        let outcome = claim_task(
+            &tx,
+            &self.runs_dir,
+            self.generators.ids.as_ref(),
+            self.generators.clock.system_time(),
+            base_commit,
+            &[],
+        )?;
         tx.commit()?;
         Ok(outcome)
     }
@@ -472,7 +499,11 @@ impl TaskStore for SqliteQueue {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let goal = Goal::new(GoalId::new(next_id(&tx, "goals")?), new, now(&tx)?)?;
+        let goal = Goal::new(
+            GoalId::new(next_id(&tx, "goals")?),
+            new,
+            self.generators.clock.timestamp(),
+        )?;
         let id = goal.id();
         tx.execute(
             "INSERT INTO goals(id, title, description, acceptance, constraints, doc, status,
@@ -554,13 +585,14 @@ impl TaskStore for SqliteQueue {
         let new = goal::edit(old, edit)?;
         tx.execute(
             "UPDATE goals SET title=?1, description=?2, acceptance=?3, constraints=?4, doc=?5,
-             updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?6",
+             updated_at=?6 WHERE id=?7",
             params![
                 new.title(),
                 new.description(),
                 new.acceptance(),
                 new.constraints(),
                 new.doc(),
+                self.generators.clock.timestamp(),
                 goal_id
             ],
         )?;
@@ -581,7 +613,7 @@ impl TaskStore for SqliteQueue {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let goal = read_goal(&tx, goal_id)?;
         let counts = task_counts(&tx, goal_id)?;
-        let closed = goal::close(goal, verdict, &counts, now(&tx)?)?;
+        let closed = goal::close(goal, verdict, &counts, self.generators.clock.timestamp())?;
         // `closed_at IS NULL` only detects a concurrent close; the domain
         // decided whether this one may happen.
         let changed = tx.execute(
@@ -614,9 +646,12 @@ impl TaskStore for SqliteQueue {
         let from = draft.status();
         let opened = goal::ready(draft)?;
         tx.execute(
-            "UPDATE goals SET status=?1, updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
-             WHERE id=?2",
-            params![opened.status().as_str(), goal_id],
+            "UPDATE goals SET status=?1, updated_at=?2 WHERE id=?3",
+            params![
+                opened.status().as_str(),
+                self.generators.clock.timestamp(),
+                goal_id
+            ],
         )?;
         goal_event(
             &tx,
@@ -716,8 +751,8 @@ impl TaskStore for SqliteQueue {
         }
         if from != task.goal_id() {
             tx.execute(
-                "UPDATE tasks SET goal_id=?1, updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?2",
-                params![task.goal_id(), task_id],
+                "UPDATE tasks SET goal_id=?1, updated_at=?2 WHERE id=?3",
+                params![task.goal_id(), self.generators.clock.timestamp(), task_id],
             )?;
             event(
                 &tx,
@@ -743,8 +778,12 @@ impl TaskStore for SqliteQueue {
         let task = task::set_paths(task, paths)?;
         if from != task.paths() {
             tx.execute(
-                "UPDATE tasks SET paths=?1, updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?2",
-                params![serde_json::to_string(task.paths())?, task_id],
+                "UPDATE tasks SET paths=?1, updated_at=?2 WHERE id=?3",
+                params![
+                    serde_json::to_string(task.paths())?,
+                    self.generators.clock.timestamp(),
+                    task_id
+                ],
             )?;
             event(
                 &tx,
@@ -781,15 +820,6 @@ fn next_id(conn: &Connection, table: &str) -> Result<i64> {
     )?)
 }
 
-/// The database's current time in the format of its timestamp columns.
-fn now(conn: &Connection) -> Result<String> {
-    Ok(
-        conn.query_row("SELECT strftime('%Y-%m-%dT%H:%M:%fZ','now')", [], |r| {
-            r.get(0)
-        })?,
-    )
-}
-
 fn task_counts(conn: &Connection, goal_id: GoalId) -> Result<TaskStatusCounts> {
     let mut counts = TaskStatusCounts::default();
     let mut rows =
@@ -823,10 +853,13 @@ fn goal_event(
 /// the first task of `order` that is still a candidate, or the lowest-ID
 /// candidate when none of them is (an empty `order` means ID order). There
 /// is no queue-wide execution slot; `one_unfinished_run_per_task` is the
-/// only limit, so concurrent claims take different tasks.
+/// only limit, so concurrent claims take different tasks. The run is
+/// created at `at` with an ID from `ids`.
 pub(super) fn claim_task(
     tx: &Connection,
     runs_dir: &Path,
+    ids: &dyn IdGenerator,
+    at: SystemTime,
     base_commit: &CommitSha,
     order: &[TaskId],
 ) -> Result<ClaimOutcome> {
@@ -842,14 +875,14 @@ pub(super) fn claim_task(
         return Ok(ClaimOutcome::NoReadyTask);
     }
     let task = task::claim(ready.swap_remove(preferred))?;
-    let run_id = RunId::new(Uuid::new_v4().to_string())?;
-    let run = TaskRun::new(run_id, &task, base_commit, Provider::Claude, now(tx)?)?;
+    let now = timestamp(at);
+    let run_id = RunId::new(ids.uuid())?;
+    let run = TaskRun::new(run_id, &task, base_commit, Provider::Claude, now.clone())?;
     // `status='ready'` only detects a concurrent change; the domain decided the claim.
     ensure!(
         tx.execute(
-            "UPDATE tasks SET status=?1, updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
-             WHERE id=?2 AND status='ready'",
-            params![task.status().as_str(), task.id()],
+            "UPDATE tasks SET status=?1, updated_at=?2 WHERE id=?3 AND status='ready'",
+            params![task.status().as_str(), now, task.id()],
         )? == 1,
         "task {} changed concurrently",
         task.id()
@@ -887,15 +920,15 @@ pub(super) fn transition_task(
     conn: &Connection,
     task_id: TaskId,
     action: TaskAction,
+    now: &str,
 ) -> Result<Task> {
     let task = read_task(conn, task_id)?;
     let from = task.status();
     let task = task::transition(task, action, has_unfinished_run(conn, task_id)?)?;
     // `status=?3` only detects a concurrent change; the domain decided the move.
     let changed = conn.execute(
-        "UPDATE tasks SET status=?1, updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
-         WHERE id=?2 AND status=?3",
-        params![task.status().as_str(), task_id, from.as_str()],
+        "UPDATE tasks SET status=?1, updated_at=?2 WHERE id=?3 AND status=?4",
+        params![task.status().as_str(), now, task_id, from.as_str()],
     )?;
     ensure!(changed == 1, "task {task_id} changed concurrently");
     event(
@@ -924,7 +957,12 @@ pub(super) fn read_task(conn: &Connection, task_id: TaskId) -> Result<Task> {
         .with_context(|| format!("task {task_id} does not exist"))
 }
 
-fn insert_dependency(conn: &Connection, task_id: TaskId, predecessor_id: TaskId) -> Result<()> {
+fn insert_dependency(
+    conn: &Connection,
+    task_id: TaskId,
+    predecessor_id: TaskId,
+    now: &str,
+) -> Result<()> {
     task::check_not_self(task_id, predecessor_id)?;
     task::check_dependencies_editable(&read_task(conn, task_id)?)?;
     read_task(conn, predecessor_id)?;
@@ -945,7 +983,7 @@ fn insert_dependency(conn: &Connection, task_id: TaskId, predecessor_id: TaskId)
         params![task_id, predecessor_id],
     )?;
     if inserted != 0 {
-        touch(conn, task_id)?;
+        touch(conn, task_id, now)?;
         event(
             conn,
             task_id,
@@ -957,10 +995,10 @@ fn insert_dependency(conn: &Connection, task_id: TaskId, predecessor_id: TaskId)
     Ok(())
 }
 
-fn touch(conn: &Connection, task_id: TaskId) -> Result<()> {
+fn touch(conn: &Connection, task_id: TaskId, now: &str) -> Result<()> {
     conn.execute(
-        "UPDATE tasks SET updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?1",
-        [task_id],
+        "UPDATE tasks SET updated_at=?1 WHERE id=?2",
+        params![now, task_id],
     )?;
     Ok(())
 }

@@ -2,8 +2,8 @@ use anyhow::{Result, bail, ensure};
 use dagq::{
     VERSION,
     application::{
-        AgentProvider, MainRemote, SupervisorEnvironment, TaskStore, WorkspaceBackend,
-        WorkspaceTags,
+        AgentProvider, Clock, Generators, IdGenerator, MainRemote, SupervisorEnvironment,
+        TaskStore, WorkspaceBackend, WorkspaceTags,
     },
     domain::{
         AskKind, CommitSha, EvidenceCheck, GoalEdit, GoalId, NewAsk, NewGoal, NewTask, RunId,
@@ -12,6 +12,7 @@ use dagq::{
     infrastructure::{
         adapters::{GitRepository, shell_join, workspace_handle},
         asks::AskQuery,
+        clock::SystemClock,
         location::QueueLocation,
         sqlite::SqliteQueue,
     },
@@ -26,10 +27,10 @@ use std::{
     process::Command,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicI64, AtomicUsize, Ordering},
     },
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tempfile::TempDir;
 
@@ -2412,6 +2413,90 @@ fn claim_creates_a_lease_that_only_its_owner_can_use_or_release() {
     assert_eq!(raw_token, "first");
 }
 
+/// A clock the test moves by hand, in whole seconds.
+#[derive(Clone)]
+struct ManualClock(Arc<AtomicI64>);
+
+impl ManualClock {
+    fn at(secs: i64) -> Self {
+        Self(Arc::new(AtomicI64::new(secs)))
+    }
+
+    fn set(&self, secs: i64) {
+        self.0.store(secs, Ordering::SeqCst);
+    }
+}
+
+impl Clock for ManualClock {
+    fn system_time(&self) -> SystemTime {
+        UNIX_EPOCH + Duration::from_secs(self.0.load(Ordering::SeqCst) as u64)
+    }
+}
+
+/// IDs handed out in order.
+struct FixedIds(Mutex<Vec<&'static str>>);
+
+impl IdGenerator for FixedIds {
+    fn uuid(&self) -> String {
+        self.0.lock().unwrap().remove(0).to_owned()
+    }
+}
+
+#[test]
+fn an_injected_clock_decides_lease_staleness_and_injected_ids_name_the_run() {
+    use dagq::{
+        domain::{ClaimOutcome, HEARTBEAT_TIMEOUT_SECS},
+        infrastructure::runtime_store::{RunPlan, lease_is_stale},
+    };
+    const T: i64 = 1_900_000_000;
+    const RUN: &str = "11111111-1111-4111-8111-111111111111";
+    let (_dir, _repo, db) = fixture();
+    let clock = ManualClock::at(T);
+    let mut queue = SqliteQueue::open(&db).unwrap().with_generators(Generators {
+        clock: Arc::new(clock.clone()),
+        ids: Arc::new(FixedIds(Mutex::new(vec![RUN]))),
+    });
+    let registration = queue.register_supervisor("first", 1, 1, VERSION).unwrap();
+    assert_eq!((registration.started_at, registration.heartbeat_at), (T, T));
+    let ClaimOutcome::Claimed { run } = queue
+        .claim_for_supervisor(&sha("0123456789abcdef0123456789abcdef01234567"), "first")
+        .unwrap()
+    else {
+        panic!()
+    };
+    // The run ID, the claim time and the first heartbeat come from the
+    // generators, the times in the form the columns always had.
+    assert_eq!(run.id().as_str(), RUN);
+    assert_eq!(run.created_at(), "2030-03-17T17:46:40.000Z");
+    let task = queue.show(run.task_id()).unwrap().task;
+    assert_eq!(task.updated_at(), "2030-03-17T17:46:40.000Z");
+    let lease = queue.run_lease(run.id()).unwrap().unwrap();
+    assert_eq!(lease.heartbeat_at, T);
+    assert!(!lease_is_stale(&lease, T + HEARTBEAT_TIMEOUT_SECS));
+    assert!(lease_is_stale(&lease, T + HEARTBEAT_TIMEOUT_SECS + 1));
+    let plan = RunPlan {
+        repo_path: "/test".into(),
+        run_dir: "/run".into(),
+        branch: "dagq/test".into(),
+        worktree_path: "/run/worktree".into(),
+        receipt_path: "/run/receipt.json".into(),
+        log_path: "/run/log".into(),
+    };
+    // The store judges the lease by the same clock: stale one second past
+    // the timeout, fresh again after a heartbeat at that time.
+    clock.set(T + HEARTBEAT_TIMEOUT_SECS + 1);
+    let error = queue.plan_run(run.id(), "first", &plan).unwrap_err();
+    assert_eq!(error.to_string(), "run lease is missing or stale");
+    assert_eq!(queue.heartbeat("first").unwrap(), 1);
+    let lease = queue.run_lease(run.id()).unwrap().unwrap();
+    assert_eq!(lease.heartbeat_at, T + HEARTBEAT_TIMEOUT_SECS + 1);
+    assert_eq!(
+        queue.supervisors().unwrap()[0].heartbeat_at,
+        T + HEARTBEAT_TIMEOUT_SECS + 1
+    );
+    queue.plan_run(run.id(), "first", &plan).unwrap();
+}
+
 #[test]
 fn shell_arguments_round_trip_without_expansion_and_cmux_handles_are_strict() {
     let value = "a'b $HOME $(echo injected) `echo injected`\nmore";
@@ -2712,7 +2797,7 @@ fn supervise_log_dir_records_each_start_in_its_own_file() {
     let mut options = supervise_options(2, true);
     options.log_dir = Some(log_dir.clone());
     let backend = TestWorkspace::new(&db, false, VALID_AGENT);
-    let before = runtime::unix_time();
+    let before = SystemClock.now();
     let outcome = supervise_with(&db, &repo, &backend, &options).unwrap();
     backend.join();
     assert_eq!(outcome["outcome"], "finished");
@@ -2739,7 +2824,7 @@ fn supervise_log_dir_records_each_start_in_its_own_file() {
         .unwrap()
         .parse()
         .unwrap();
-    assert!(started_at >= before && started_at <= runtime::unix_time());
+    assert!(started_at >= before && started_at <= SystemClock.now());
     let text = fs::read_to_string(&first[0]).unwrap();
     let mut queue = SqliteQueue::open(&db).unwrap();
     let run = queue.show(TaskId::new(1)).unwrap().runs.remove(0);
@@ -2770,7 +2855,7 @@ fn supervise_log_dir_records_each_start_in_its_own_file() {
     )));
 
     // A second start in a later second gets its own file.
-    while runtime::unix_time() <= started_at {
+    while SystemClock.now() <= started_at {
         thread::sleep(Duration::from_millis(20));
     }
     let outcome = supervise_with(&db, &repo, &backend, &options).unwrap();
@@ -7077,7 +7162,7 @@ fn two_supervisors_racing_for_one_stale_lease_adopt_it_once() {
     );
     let lease = queue.run_lease(second.id()).unwrap().unwrap();
     assert_eq!((lease.token.as_str(), lease.pid), ("first", 1));
-    assert!(runtime::unix_time() - lease.heartbeat_at <= 5);
+    assert!(SystemClock.now() - lease.heartbeat_at <= 5);
     assert_eq!(supervisor_token_of(&db, &second), "first");
     assert!(queue.holds_lease(second.id(), "first").unwrap());
     assert!(!queue.holds_lease(second.id(), "fresh").unwrap());

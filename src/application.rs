@@ -1,6 +1,11 @@
 //! Application-facing storage contract. Provider/process adapters come next.
 
 use anyhow::Result;
+use std::{
+    fmt,
+    sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use crate::domain::{
     ClaimOutcome, CommitSha, EvidenceCheck, Goal, GoalDetail, GoalEdit, GoalId, GoalStatus,
@@ -622,6 +627,108 @@ mod tests {
             dependency_graph(GraphInput::default(), None)
                 .tasks
                 .is_empty()
+        );
+    }
+}
+
+/// The current time, injected so a use case reads it through this port and
+/// a test can fix it (ADR-0013 policy 7). One operation reads it once and
+/// passes the value on, so its steps share one reference time.
+pub trait Clock: Send + Sync {
+    fn system_time(&self) -> SystemTime;
+
+    /// Unix seconds, the form of `heartbeat_at`, `closed_at` and the other
+    /// INTEGER times.
+    fn now(&self) -> i64 {
+        unix_seconds(self.system_time())
+    }
+
+    /// `%Y-%m-%dT%H:%M:%fZ` in UTC (RFC 3339 with milliseconds), the form
+    /// SQLite's `strftime` gives `created_at` / `updated_at`.
+    fn timestamp(&self) -> String {
+        timestamp(self.system_time())
+    }
+}
+
+/// New identifiers: run IDs, supervisor tokens and integrate tokens, each
+/// a UUID string.
+pub trait IdGenerator: Send + Sync {
+    fn uuid(&self) -> String;
+}
+
+/// The clock and the ID generator a use case is given.
+#[derive(Clone)]
+pub struct Generators {
+    pub clock: Arc<dyn Clock>,
+    pub ids: Arc<dyn IdGenerator>,
+}
+
+impl fmt::Debug for Generators {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Generators").finish_non_exhaustive()
+    }
+}
+
+/// Seconds since the Unix epoch; zero before it.
+pub fn unix_seconds(time: SystemTime) -> i64 {
+    time.duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or_default()
+}
+
+/// `time` as `YYYY-MM-DDTHH:MM:SS.mmmZ` in UTC; the epoch for a time before it.
+pub fn timestamp(time: SystemTime) -> String {
+    let elapsed = time.duration_since(UNIX_EPOCH).unwrap_or_default();
+    let secs = elapsed.as_secs() as i64;
+    let (days, rest) = (secs.div_euclid(86_400), secs.rem_euclid(86_400));
+    // Civil date from days since 1970-01-01 (Howard Hinnant's algorithm).
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}.{:03}Z",
+        rest / 3_600,
+        rest % 3_600 / 60,
+        rest % 60,
+        elapsed.subsec_millis()
+    )
+}
+
+#[cfg(test)]
+mod clock_tests {
+    use super::*;
+    use std::time::Duration;
+
+    struct At(SystemTime);
+
+    impl Clock for At {
+        fn system_time(&self) -> SystemTime {
+            self.0
+        }
+    }
+
+    #[test]
+    fn a_clock_gives_unix_seconds_and_the_timestamp_column_form() {
+        let clock = At(UNIX_EPOCH + Duration::from_millis(1_000_000_000_123));
+        assert_eq!(clock.now(), 1_000_000_000);
+        assert_eq!(clock.timestamp(), "2001-09-09T01:46:40.123Z");
+        let before_epoch = At(UNIX_EPOCH - Duration::from_secs(1));
+        assert_eq!(before_epoch.now(), 0);
+        assert_eq!(before_epoch.timestamp(), "1970-01-01T00:00:00.000Z");
+        // Leap days and the last millisecond of a year.
+        assert_eq!(
+            timestamp(UNIX_EPOCH + Duration::from_secs(951_782_400)),
+            "2000-02-29T00:00:00.000Z"
+        );
+        assert_eq!(
+            timestamp(UNIX_EPOCH + Duration::from_millis(1_735_689_599_999)),
+            "2024-12-31T23:59:59.999Z"
         );
     }
 }

@@ -17,7 +17,7 @@ use crate::{
         runtime_store::{TRIAGE_ASKER, lease_is_stale},
         sqlite::SqliteQueue,
     },
-    runtime::{supervisors, unix_time},
+    runtime::supervisors,
 };
 use anyhow::Result;
 use serde_json::{Value, json};
@@ -357,13 +357,13 @@ pub fn watch(db: &Path, options: &WatchOptions) -> Result<Value> {
         Some(after) => after,
         None => queue.latest_event_id()?,
     };
-    let baseline = pulses(&queue.supervisors()?, unix_time());
+    let baseline = pulses(&queue.supervisors()?, queue.generators().clock.now());
     let deadline = Instant::now() + options.timeout;
     loop {
         let upto = queue.latest_event_id()?;
         let (events, cursor) = read_events(&queue, after, upto, WATCH_LIMIT, false, options.role)?;
         let registrations = queue.supervisors()?;
-        let now = unix_time();
+        let now = queue.generators().clock.now();
         let changed = for_role(options.role) && pulses(&registrations, now) != baseline;
         let remaining = deadline.saturating_duration_since(Instant::now());
         if !events.is_empty() || changed || remaining.is_zero() {

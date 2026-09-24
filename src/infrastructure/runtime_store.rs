@@ -12,6 +12,7 @@ use super::{
         SqliteQueue, claim_task, enum_col, event, event_row, read_task, run_row, stored_run_row,
     },
 };
+use crate::application::{timestamp, unix_seconds};
 use crate::domain::{
     ClaimOutcome, CommitSha, DomainError, EvidenceCheck, GoalId, RunEvent, RunId, RunLease,
     RunProcess, RunStatus, SessionRole, SupervisorMode, SupervisorRegistration, Task, TaskAction,
@@ -107,15 +108,24 @@ impl SqliteQueue {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let outcome = claim_task(&tx, &self.runs_dir, base_commit, order)?;
+        // The claim, its run and its first heartbeat share one time.
+        let at = self.generators.clock.system_time();
+        let outcome = claim_task(
+            &tx,
+            &self.runs_dir,
+            self.generators.ids.as_ref(),
+            at,
+            base_commit,
+            order,
+        )?;
         if let ClaimOutcome::Claimed { run } = &outcome {
             tx.execute(
                 "UPDATE task_runs SET supervisor_token=?2 WHERE id=?1",
                 params![run.id(), token],
             )?;
             tx.execute(
-                "INSERT INTO run_leases(run_id,token,pid) VALUES (?1,?2,?3)",
-                params![run.id(), token, std::process::id()],
+                "INSERT INTO run_leases(run_id,token,pid,heartbeat_at) VALUES (?1,?2,?3,?4)",
+                params![run.id(), token, std::process::id(), unix_seconds(at)],
             )?;
             run_event(
                 &tx,
@@ -132,8 +142,8 @@ impl SqliteQueue {
     /// an idle supervisor owns nothing.
     pub fn heartbeat_leases(&self, token: &str) -> Result<usize> {
         Ok(self.conn.execute(
-            "UPDATE run_leases SET heartbeat_at=unixepoch() WHERE token=?1",
-            [token],
+            "UPDATE run_leases SET heartbeat_at=?2 WHERE token=?1",
+            params![token, self.generators.clock.now()],
         )?)
     }
 
@@ -145,13 +155,14 @@ impl SqliteQueue {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let now = self.generators.clock.now();
         tx.execute(
-            "UPDATE supervisors SET heartbeat_at=unixepoch() WHERE token=?1",
-            [token],
+            "UPDATE supervisors SET heartbeat_at=?2 WHERE token=?1",
+            params![token, now],
         )?;
         let leases = tx.execute(
-            "UPDATE run_leases SET heartbeat_at=unixepoch() WHERE token=?1",
-            [token],
+            "UPDATE run_leases SET heartbeat_at=?2 WHERE token=?1",
+            params![token, now],
         )?;
         tx.commit()?;
         Ok(leases)
@@ -173,9 +184,11 @@ impl SqliteQueue {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let now = self.generators.clock.now();
         tx.execute(
-            "INSERT INTO supervisors(token,pid,parallel,binary_version) VALUES (?1,?2,?3,?4)",
-            params![token, pid, parallel, binary_version],
+            "INSERT INTO supervisors(token,pid,parallel,binary_version,started_at,heartbeat_at)
+             VALUES (?1,?2,?3,?4,?5,?5)",
+            params![token, pid, parallel, binary_version, now],
         )
         .context("supervisor token is already registered")?;
         let result = tx.query_row(
@@ -233,10 +246,10 @@ impl SqliteQueue {
     /// (ADR-0026).
     pub fn register_session_workspace(&self, role: SessionRole, workspace_id: &str) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO session_workspaces(role,workspace_id) VALUES (?1,?2)
+            "INSERT INTO session_workspaces(role,workspace_id,created_at) VALUES (?1,?2,?3)
              ON CONFLICT(role) DO UPDATE SET workspace_id=excluded.workspace_id,
-                                              created_at=unixepoch()",
-            params![role.as_str(), workspace_id],
+                                              created_at=excluded.created_at",
+            params![role.as_str(), workspace_id, self.generators.clock.now()],
         )?;
         Ok(())
     }
@@ -359,7 +372,7 @@ impl SqliteQueue {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let now: i64 = tx.query_row("SELECT unixepoch()", [], |r| r.get(0))?;
+        let now = self.generators.clock.now();
         let lease = tx
             .query_row(
                 "SELECT l.run_id,l.token,l.pid,l.heartbeat_at FROM run_leases l
@@ -377,9 +390,9 @@ impl SqliteQueue {
             return Ok(None);
         }
         let updated = tx.execute(
-            "UPDATE run_leases SET token=?3,pid=?4,heartbeat_at=unixepoch()
+            "UPDATE run_leases SET token=?3,pid=?4,heartbeat_at=?5
              WHERE run_id=?1 AND token=?2",
-            params![id, previous_token, token, pid],
+            params![id, previous_token, token, pid, now],
         )?;
         if updated == 0 {
             return Ok(None);
@@ -579,7 +592,7 @@ impl SqliteQueue {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        assert_lease(&tx, id, token)?;
+        assert_lease(&tx, id, token, self.generators.clock.now())?;
         apply(
             &tx,
             id,
@@ -596,7 +609,7 @@ impl SqliteQueue {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        assert_lease(&tx, id, token)?;
+        assert_lease(&tx, id, token, self.generators.clock.now())?;
         apply(
             &tx,
             id,
@@ -759,7 +772,7 @@ impl SqliteQueue {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        assert_lease(&tx, id, token)?;
+        assert_lease(&tx, id, token, self.generators.clock.now())?;
         let allowed =
             supervised_run(&tx, id, token)?.is_some_and(|run| run::check_resumable(&run).is_ok());
         ensure!(allowed, "run is not being resumed by this supervisor");
@@ -802,7 +815,7 @@ impl SqliteQueue {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        assert_lease(&tx, id, token)?;
+        assert_lease(&tx, id, token, self.generators.clock.now())?;
         let allowed = supervised_run(&tx, id, token)?
             .is_some_and(|run| run::check_ready_for_wrapper(&run).is_ok());
         ensure!(allowed, "run is not ready for its wrapper");
@@ -845,7 +858,10 @@ impl SqliteQueue {
     pub fn heartbeat_wrapper(&self, id: &RunId, pid: u32) -> Result<()> {
         // Registration is immutable and a run ID is never reused.
         assert_wrapper(&self.conn, id, pid)?;
-        self.conn.execute("UPDATE run_processes SET heartbeat_at=unixepoch() WHERE run_id=?1 AND exited_at IS NULL", [id])?;
+        self.conn.execute(
+            "UPDATE run_processes SET heartbeat_at=?2 WHERE run_id=?1 AND exited_at IS NULL",
+            params![id, self.generators.clock.now()],
+        )?;
         Ok(())
     }
 
@@ -854,8 +870,11 @@ impl SqliteQueue {
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         assert_wrapper(&tx, id, pid)?;
-        tx.execute("UPDATE run_processes SET exited_at=unixepoch(),exit_code=?2,heartbeat_at=unixepoch() WHERE run_id=?1 AND exited_at IS NULL",
-            params![id,exit_code])?;
+        tx.execute(
+            "UPDATE run_processes SET exited_at=?3,exit_code=?2,heartbeat_at=?3
+             WHERE run_id=?1 AND exited_at IS NULL",
+            params![id, exit_code, self.generators.clock.now()],
+        )?;
         run_event(&tx, id, "session_exited", json!({"exit_code": exit_code}))?;
         tx.commit()?;
         Ok(())
@@ -888,8 +907,8 @@ impl SqliteQueue {
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let fresh: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM run_leases WHERE run_id=?1 AND heartbeat_at >= unixepoch()-?2)",
-            params![id, HEARTBEAT_TIMEOUT_SECS],
+            "SELECT EXISTS(SELECT 1 FROM run_leases WHERE run_id=?1 AND heartbeat_at >= ?2-?3)",
+            params![id, self.generators.clock.now(), HEARTBEAT_TIMEOUT_SECS],
             |r| r.get(0),
         )?;
         ensure!(!fresh, "run lease heartbeat is fresh");
@@ -939,7 +958,7 @@ impl SqliteQueue {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        assert_lease(&tx, id, token)?;
+        assert_lease(&tx, id, token, self.generators.clock.now())?;
         let code: i32 = tx.query_row(
             "SELECT exit_code FROM run_processes WHERE run_id=?1 AND role='wrapper' AND exited_at IS NOT NULL",
             [id], |r| r.get(0)
@@ -970,7 +989,7 @@ impl SqliteQueue {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        assert_lease(&tx, id, token)?;
+        assert_lease(&tx, id, token, self.generators.clock.now())?;
         let run = apply(
             &tx,
             id,
@@ -996,7 +1015,7 @@ impl SqliteQueue {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        assert_lease(&tx, id, token)?;
+        assert_lease(&tx, id, token, self.generators.clock.now())?;
         let run = apply(
             &tx,
             id,
@@ -1051,7 +1070,7 @@ impl SqliteQueue {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        assert_lease(&tx, id, token)?;
+        assert_lease(&tx, id, token, self.generators.clock.now())?;
         let refusal = || "run is not validating under this supervisor".to_owned();
         let run = apply(&tx, id, Some(token), refusal, |run| {
             match (validation.accepted, validation.result_commit.clone()) {
@@ -1267,10 +1286,10 @@ impl SqliteQueue {
         // owns the run.
         ensure!(
             tx.execute(
-                "INSERT INTO run_leases(run_id,token,pid) VALUES (?1,?2,?3)
-                 ON CONFLICT(run_id) DO UPDATE SET pid=excluded.pid,heartbeat_at=unixepoch()
+                "INSERT INTO run_leases(run_id,token,pid,heartbeat_at) VALUES (?1,?2,?3,?4)
+                 ON CONFLICT(run_id) DO UPDATE SET pid=excluded.pid,heartbeat_at=excluded.heartbeat_at
                  WHERE run_leases.token=excluded.token",
-                params![id, token, std::process::id()],
+                params![id, token, std::process::id(), self.generators.clock.now()],
             )? == 1,
             "run is still leased"
         );
@@ -1329,7 +1348,7 @@ impl SqliteQueue {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let now: i64 = tx.query_row("SELECT unixepoch()", [], |r| r.get(0))?;
+        let now = self.generators.clock.now();
         let Some(run) = stored_run(&tx, id)?.filter(|run| run::check_resumable(run).is_ok()) else {
             return Ok(None);
         };
@@ -1378,7 +1397,7 @@ impl SqliteQueue {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let now: i64 = tx.query_row("SELECT unixepoch()", [], |r| r.get(0))?;
+        let now = self.generators.clock.now();
         // No session starts: the earlier session's rows stay as they are.
         let Some(previous) = lease_parked_run(&tx, id, token, now, false)? else {
             return Ok(None);
@@ -1425,7 +1444,7 @@ impl SqliteQueue {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        assert_lease(&tx, id, token)?;
+        assert_lease(&tx, id, token, self.generators.clock.now())?;
         if let Some(status) = status {
             apply(
                 &tx,
@@ -1531,7 +1550,7 @@ impl SqliteQueue {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        assert_lease(&tx, id, token)?;
+        assert_lease(&tx, id, token, self.generators.clock.now())?;
         let run = apply(
             &tx,
             id,
@@ -1565,7 +1584,8 @@ impl SqliteQueue {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        assert_lease(&tx, id, token)?;
+        let at = self.generators.clock.system_time();
+        assert_lease(&tx, id, token, unix_seconds(at))?;
         let run = apply(
             &tx,
             id,
@@ -1580,9 +1600,9 @@ impl SqliteQueue {
         )?;
         ensure!(
             tx.execute(
-                "UPDATE tasks SET status='completed', updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+                "UPDATE tasks SET status='completed', updated_at=?2
                  WHERE id=?1 AND status='in_progress'",
-                [run.task_id()]
+                params![run.task_id(), timestamp(at)]
             )? == 1,
             "task {} is not in progress",
             run.task_id()
@@ -1630,8 +1650,8 @@ impl SqliteQueue {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        assert_lease(&tx, id, token)?;
-        let now: i64 = tx.query_row("SELECT unixepoch()", [], |r| r.get(0))?;
+        let now = self.generators.clock.now();
+        assert_lease(&tx, id, token, now)?;
         let result = apply(&tx, id, Some(token), not_at_rest, |run| {
             run::workspace_closed(run, now)
         })?
@@ -1652,7 +1672,7 @@ impl SqliteQueue {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        assert_lease(&tx, id, token)?;
+        assert_lease(&tx, id, token, self.generators.clock.now())?;
         let result = apply(&tx, id, Some(token), not_at_rest, |run| {
             run::record_close_failure(run, message.to_owned())
         })?
@@ -1715,7 +1735,7 @@ impl SqliteQueue {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let now: i64 = tx.query_row("SELECT unixepoch()", [], |r| r.get(0))?;
+        let now = self.generators.clock.now();
         let run = tx
             .query_row(
                 "SELECT r.* FROM task_runs r JOIN tasks t ON t.id=r.task_id
@@ -1749,8 +1769,8 @@ impl SqliteQueue {
             tx.execute("DELETE FROM run_leases WHERE run_id=?1", [id])?;
         }
         tx.execute(
-            "INSERT INTO run_leases(run_id,token,pid) VALUES (?1,?2,?3)",
-            params![id, token, std::process::id()],
+            "INSERT INTO run_leases(run_id,token,pid,heartbeat_at) VALUES (?1,?2,?3,?4)",
+            params![id, token, std::process::id(), now],
         )?;
         let attempt = events.iter().filter(|e| e.kind == "triage_started").count() + 1;
         run_event(
@@ -1784,7 +1804,7 @@ impl SqliteQueue {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        assert_lease(&tx, id, token)?;
+        assert_lease(&tx, id, token, self.generators.clock.now())?;
         let run = tx.query_row(
             "SELECT * FROM task_runs WHERE id=?1",
             [id],
@@ -1797,7 +1817,12 @@ impl SqliteQueue {
         );
         match action {
             TriageAction::Retry => {
-                super::sqlite::transition_task(&tx, run.task_id(), TaskAction::Ready)?;
+                super::sqlite::transition_task(
+                    &tx,
+                    run.task_id(),
+                    TaskAction::Ready,
+                    &self.generators.clock.timestamp(),
+                )?;
             }
             TriageAction::Resume { instruction } => {
                 apply(
@@ -1841,7 +1866,7 @@ impl SqliteQueue {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let now: i64 = tx.query_row("SELECT unixepoch()", [], |r| r.get(0))?;
+        let now = self.generators.clock.now();
         let run = tx
             .query_row(
                 "SELECT r.* FROM task_runs r JOIN tasks t ON t.id=r.task_id
@@ -1899,7 +1924,7 @@ impl SqliteQueue {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let now: i64 = tx.query_row("SELECT unixepoch()", [], |r| r.get(0))?;
+        let now = self.generators.clock.now();
         if let Some(run) = stored_run(&tx, id)? {
             let from = run.status();
             let run = run::triage_closed_workspace(run, workspace_id, now)?;
@@ -1932,7 +1957,7 @@ impl SqliteQueue {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let now: i64 = tx.query_row("SELECT unixepoch()", [], |r| r.get(0))?;
+        let now = self.generators.clock.now();
         let lease = tx
             .query_row(
                 "SELECT run_id,token,pid,heartbeat_at FROM run_leases WHERE run_id=?1",
@@ -1976,7 +2001,12 @@ impl SqliteQueue {
         );
         match answer {
             "retry" => {
-                super::sqlite::transition_task(&tx, run.task_id(), TaskAction::Ready)?;
+                super::sqlite::transition_task(
+                    &tx,
+                    run.task_id(),
+                    TaskAction::Ready,
+                    &self.generators.clock.timestamp(),
+                )?;
             }
             "resume" => {
                 apply(
@@ -1988,13 +2018,18 @@ impl SqliteQueue {
                 )?;
             }
             "cancel" => {
-                super::sqlite::transition_task(&tx, run.task_id(), TaskAction::Cancel)?;
+                super::sqlite::transition_task(
+                    &tx,
+                    run.task_id(),
+                    TaskAction::Cancel,
+                    &self.generators.clock.timestamp(),
+                )?;
             }
             other => bail!("{other:?} is not an answer the triage applies"),
         }
         tx.execute(
-            "UPDATE asks SET closed_at=unixepoch() WHERE id=?1 AND closed_at IS NULL",
-            [ask_id],
+            "UPDATE asks SET closed_at=?2 WHERE id=?1 AND closed_at IS NULL",
+            params![ask_id, now],
         )?;
         let result = tx.query_row(
             "SELECT * FROM task_runs WHERE id=?1",
@@ -2108,9 +2143,13 @@ fn not_at_rest() -> String {
         .to_owned()
 }
 
-fn assert_lease(conn: &Connection, id: &RunId, token: &str) -> Result<()> {
-    let valid: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM run_leases WHERE run_id=?1 AND token=?2 AND heartbeat_at >= unixepoch()-?3)",
-        params![id,token,HEARTBEAT_TIMEOUT_SECS], |r| r.get(0))?;
+/// Whether `token` holds a lease on the run that is fresh at `now`.
+fn assert_lease(conn: &Connection, id: &RunId, token: &str, now: i64) -> Result<()> {
+    let valid: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM run_leases WHERE run_id=?1 AND token=?2 AND heartbeat_at >= ?3-?4)",
+        params![id, token, now, HEARTBEAT_TIMEOUT_SECS],
+        |r| r.get(0),
+    )?;
     ensure!(valid, "run lease is missing or stale");
     Ok(())
 }
@@ -2204,8 +2243,8 @@ fn lease_parked_run(
         tx.execute("DELETE FROM run_processes WHERE run_id=?1", [id])?;
     }
     tx.execute(
-        "INSERT INTO run_leases(run_id,token,pid) VALUES (?1,?2,?3)",
-        params![id, token, std::process::id()],
+        "INSERT INTO run_leases(run_id,token,pid,heartbeat_at) VALUES (?1,?2,?3,?4)",
+        params![id, token, std::process::id(), now],
     )?;
     tx.execute(
         "UPDATE task_runs SET supervisor_token=?2 WHERE id=?1",

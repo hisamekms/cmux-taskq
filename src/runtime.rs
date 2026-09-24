@@ -6,8 +6,8 @@
 //! supervisor with a free slot instead of being rerun (ADR-0012).
 use crate::{
     application::{
-        AgentProvider, MainRemote, SupervisorEnvironment, TaskStore, WorkspaceBackend,
-        WorkspaceTags, dependency_graph,
+        AgentProvider, Clock, Generators, MainRemote, SupervisorEnvironment, TaskStore,
+        WorkspaceBackend, WorkspaceTags, dependency_graph,
     },
     domain::{
         AskKind, ClaimOutcome, CommitSha, EvidenceCheck, Goal, IntegrationOutcome, LANDING_OPTIONS,
@@ -26,6 +26,7 @@ use crate::{
             process_alive, resume_workspace_description, run_shell_to_log, shell_join,
             workspace_description, workspace_group_name,
         },
+        clock::{self, SystemClock},
         location::{QueueLocation, runs_dir},
         run_env::load_run_env,
         runtime_store::{
@@ -52,16 +53,8 @@ use std::{
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
-use uuid::Uuid;
 
 use crate::observer::ObserveMode;
-
-pub fn unix_time() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64
-}
 
 /// How the supervisor loop is driven. `stop` is the graceful drain switch
 /// (SIGINT in the CLI): no more claims, exit once every active run rests.
@@ -86,6 +79,8 @@ pub struct SuperviseOptions {
     pub tick: Duration,
     /// Pause between two looks for claimable work while no run is active.
     pub idle_poll: Duration,
+    /// The clock and IDs of everything the supervisor records; tests fix them.
+    pub generators: Generators,
 }
 
 impl SuperviseOptions {
@@ -99,6 +94,7 @@ impl SuperviseOptions {
             observe_daily: false,
             tick: TICK,
             idle_poll: IDLE_POLL,
+            generators: clock::system(),
         }
     }
 }
@@ -109,12 +105,14 @@ impl SuperviseOptions {
 #[derive(Clone, Default)]
 pub struct SupervisorLog {
     file: Option<Arc<Mutex<fs::File>>>,
+    /// Timestamps the lines of `file`.
+    clock: Option<Arc<dyn Clock>>,
     pub path: Option<PathBuf>,
 }
 
 impl SupervisorLog {
     /// `<dir>/supervisor-<started_at>-<pid>.log`, appended to if it exists.
-    pub fn open(dir: &Path, started_at: i64, pid: u32) -> Result<Self> {
+    pub fn open(dir: &Path, started_at: i64, pid: u32, clock: Arc<dyn Clock>) -> Result<Self> {
         fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
         let path = dir.join(format!("supervisor-{started_at}-{pid}.log"));
         let file = fs::OpenOptions::new()
@@ -124,6 +122,7 @@ impl SupervisorLog {
             .with_context(|| format!("open {}", path.display()))?;
         Ok(Self {
             file: Some(Arc::new(Mutex::new(file))),
+            clock: Some(clock),
             path: Some(path),
         })
     }
@@ -132,10 +131,10 @@ impl SupervisorLog {
     /// accepting writes does not stop the supervisor.
     pub fn note(&self, message: &str) {
         eprintln!("{message}");
-        if let Some(file) = &self.file
+        if let (Some(file), Some(clock)) = (&self.file, &self.clock)
             && let Ok(mut file) = file.lock()
         {
-            let _ = writeln!(file, "[{}] {message}", unix_time());
+            let _ = writeln!(file, "[{}] {message}", clock.now());
         }
     }
 }
@@ -149,13 +148,13 @@ struct Heartbeat {
 }
 
 impl Heartbeat {
-    fn start(db: PathBuf, token: String) -> Self {
+    fn start(db: PathBuf, token: String, generators: Generators) -> Self {
         let (stop, recv) = mpsc::channel();
         let failed = Arc::new(AtomicBool::new(false));
         let flag = failed.clone();
         let worker = thread::spawn(move || {
             let result = (|| -> Result<()> {
-                let mut queue = SqliteQueue::open(db)?;
+                let mut queue = SqliteQueue::open(db)?.with_generators(generators);
                 loop {
                     queue.heartbeat(&token)?;
                     match recv.recv_timeout(Duration::from_secs(2)) {
@@ -248,9 +247,9 @@ pub fn supervise_with_reviewer(
         executable: claude.into(),
     }
     .preflight()?;
-    let mut queue = SqliteQueue::open(&db)?;
+    let mut queue = SqliteQueue::open(&db)?.with_generators(options.generators.clone());
     queue.bind_repository(&path_text(&repository.common_dir)?)?;
-    let token = Uuid::new_v4().to_string();
+    let token = options.generators.ids.uuid();
     // Registered before the first heartbeat so the loop is visible to
     // `status` from its first second, runs or not.
     let parallel =
@@ -258,7 +257,12 @@ pub fn supervise_with_reviewer(
     let pid = std::process::id();
     let registration = queue.register_supervisor(&token, pid, parallel, crate::VERSION)?;
     let log = match &options.log_dir {
-        Some(dir) => match SupervisorLog::open(dir, registration.started_at, pid) {
+        Some(dir) => match SupervisorLog::open(
+            dir,
+            registration.started_at,
+            pid,
+            options.generators.clock.clone(),
+        ) {
             Ok(log) => log,
             Err(error) => {
                 // Not a supervisor after all: leave no row for `status`.
@@ -274,7 +278,7 @@ pub fn supervise_with_reviewer(
         db.display(),
         repository.root.display()
     ));
-    let heartbeat = Heartbeat::start(db.clone(), token.clone());
+    let heartbeat = Heartbeat::start(db.clone(), token.clone(), options.generators.clone());
     let queue_hash = QueueLocation::explicit(&db).hash();
     let cmux = RecordingBackend::new(cmux, db.clone(), Some(token.clone()));
     let mut supervisor = Supervisor {
@@ -297,6 +301,7 @@ pub fn supervise_with_reviewer(
         observer: None,
         observers_launched: Vec::new(),
         triaged: Vec::new(),
+        generators: options.generators.clone(),
     };
     let result = supervisor.run_loop(options);
     match &result {
@@ -518,6 +523,8 @@ struct Supervisor<'a> {
     observers_launched: Vec<(ObserveMode, Instant)>,
     /// The runs this process triaged, with where each one went.
     triaged: Vec<Value>,
+    /// The clock and IDs `queue` also uses.
+    generators: Generators,
 }
 
 /// One executing run between provisioning and rest.
@@ -829,7 +836,7 @@ impl Supervisor<'_> {
         if options.observe_interval.is_zero() {
             return Ok(None);
         }
-        let now = unix_time();
+        let now = self.generators.clock.now();
         let mut modes = vec![(
             ObserveMode::Hourly,
             i64::try_from(options.observe_interval.as_secs())?,
@@ -1152,6 +1159,7 @@ impl Supervisor<'_> {
                     self.repository.clone(),
                     run.clone(),
                     self.log.clone(),
+                    self.generators.clone(),
                 );
                 slot.run = run;
                 slot.phase = Phase::Validating(Some(handle), Some(session));
@@ -1266,6 +1274,7 @@ impl Supervisor<'_> {
                             self.repository.clone(),
                             run.clone(),
                             self.log.clone(),
+                            self.generators.clone(),
                         );
                         slot.run = run;
                         slot.phase = Phase::Validating(Some(handle), Some(session));
@@ -1273,7 +1282,7 @@ impl Supervisor<'_> {
                     ReviseOutcome::Mismatch(why) => {
                         let message = revise_mismatch_request(&slot.run, &label, &why)?;
                         // Only what the session writes after this counts.
-                        let sent_at = SystemTime::now();
+                        let sent_at = SystemClock.system_time();
                         match self.cmux.send_text(&session.workspace, &message) {
                             Ok(()) => {
                                 watch.sent_at = sent_at;
@@ -1403,8 +1412,9 @@ impl Supervisor<'_> {
             .iter()
             .find(|e| e.kind == "integration_approved")
             .is_none_or(|e| e.payload.get("push") != Some(&json!(false)));
+        let generators = self.generators.clone();
         Ok(thread::spawn(move || {
-            let mut queue = SqliteQueue::open(&db)?;
+            let mut queue = SqliteQueue::open(&db)?.with_generators(generators);
             land_integrating(
                 &mut queue,
                 &db,
@@ -1561,7 +1571,7 @@ impl Supervisor<'_> {
                 let message = revise_request(&task, run, attempt, &verdict.reasons)?;
                 let run_dir = Path::new(run.run_dir().context("missing run directory")?);
                 fs::write(run_dir.join(format!("revise-{attempt}.txt")), &message)?;
-                let sent_at = SystemTime::now();
+                let sent_at = SystemClock.system_time();
                 if let Err(error) = self.cmux.send_text(&live.workspace, &message) {
                     let why = format!("the revise request could not be sent: {error:#}");
                     self.log.note(&format!("run {}: {why}", run.id()));
@@ -1674,7 +1684,7 @@ impl Supervisor<'_> {
                 let message = resume_request(&task, run, &request, &landed)?;
                 let run_dir = Path::new(run.run_dir().context("missing run directory")?);
                 fs::write(run_dir.join(format!("conflict-{attempt}.txt")), &message)?;
-                let sent_at = SystemTime::now();
+                let sent_at = SystemClock.system_time();
                 self.cmux
                     .send_text(&live.workspace, &message)
                     .map(|()| sent_at)
@@ -1891,7 +1901,7 @@ impl Supervisor<'_> {
     /// supervisor`) and go to the triage, never straight to `ready`. A run
     /// that changed meanwhile is left for a later pass.
     fn recover_dead_runs(&mut self) -> Result<()> {
-        let now = unix_time();
+        let now = self.generators.clock.now();
         for run in self.queue.active_runs()? {
             if run.status() == RunStatus::Integrating || self.queue.run_lease(run.id())?.is_some() {
                 continue;
@@ -1992,7 +2002,7 @@ impl Supervisor<'_> {
     /// someone leases (a session still asked to exit) waits. A triage that
     /// cannot even start fails right away.
     fn triage_runs(&mut self, parallel: usize) -> Result<()> {
-        let now = unix_time();
+        let now = self.generators.clock.now();
         for run in self.queue.runs_to_triage()? {
             if self.slots.len() >= parallel {
                 break;
@@ -2366,7 +2376,7 @@ impl Supervisor<'_> {
                 wrapper,
                 attempts,
             } = candidate;
-            let now = unix_time();
+            let now = self.generators.clock.now();
             let session_alive = wrapper
                 .as_ref()
                 .is_some_and(|w| w.exited_at.is_none() && process_alive(w.pid));
@@ -2535,6 +2545,7 @@ impl Supervisor<'_> {
                     self.repository.clone(),
                     run.clone(),
                     self.log.clone(),
+                    self.generators.clone(),
                 )),
                 None,
             )
@@ -2693,7 +2704,7 @@ impl Supervisor<'_> {
             run_dir,
             receipt_path: PathBuf::from(run.receipt_path().context("missing receipt path")?),
             idle_marker: run.idle_marker_path()?,
-            started_at: SystemTime::now(),
+            started_at: SystemClock.system_time(),
             startup: Instant::now(),
             message,
             agent_seen: None,
@@ -2776,6 +2787,7 @@ impl Supervisor<'_> {
                     self.repository.clone(),
                     run.clone(),
                     self.log.clone(),
+                    self.generators.clone(),
                 );
                 slot.run = run;
                 slot.phase = Phase::Validating(
@@ -2816,7 +2828,7 @@ impl Supervisor<'_> {
             if self.slots.len() >= parallel {
                 break;
             }
-            let now = unix_time();
+            let now = self.generators.clock.now();
             let LeasedRun {
                 run,
                 lease,
@@ -2907,6 +2919,7 @@ impl Supervisor<'_> {
                     self.repository.clone(),
                     run.clone(),
                     self.log.clone(),
+                    self.generators.clone(),
                 )),
                 self.session_of(run)?,
             ),
@@ -3390,7 +3403,7 @@ impl SessionWatch {
                 return queue.finish_supervision(run.id(), token).map(Some);
             }
             ensure!(
-                unix_time() - wrapper.heartbeat_at <= HEARTBEAT_TIMEOUT_SECS,
+                queue.generators().clock.now() - wrapper.heartbeat_at <= HEARTBEAT_TIMEOUT_SECS,
                 "wrapper heartbeat expired; session may still be alive"
             );
             if self.exit_requested.is_none() {
@@ -4122,6 +4135,9 @@ struct ResumeWatch {
     receipt_path: PathBuf,
     idle_marker: PathBuf,
     /// A receipt no newer than this is the one from before the resume.
+    /// Like every time compared with a file's mtime (`sent_at` of a revise
+    /// or conflict request, `message_sent`), it is read from the wall clock
+    /// that stamps the files, not from the injected [`Clock`].
     started_at: SystemTime,
     startup: Instant,
     message: String,
@@ -4244,7 +4260,7 @@ impl ResumeWatch {
             }));
         }
         ensure!(
-            unix_time() - wrapper.heartbeat_at <= HEARTBEAT_TIMEOUT_SECS,
+            queue.generators().clock.now() - wrapper.heartbeat_at <= HEARTBEAT_TIMEOUT_SECS,
             "resumed session's wrapper heartbeat expired; session may still be alive"
         );
         let Some((sent, sent_at)) = self.message_sent else {
@@ -4252,7 +4268,7 @@ impl ResumeWatch {
                 let seen = *self.agent_seen.get_or_insert_with(Instant::now);
                 if seen.elapsed() >= cmux.resume_prompt_delay() {
                     cmux.send_text(&self.workspace, &self.message)?;
-                    self.message_sent = Some((Instant::now(), SystemTime::now()));
+                    self.message_sent = Some((Instant::now(), SystemClock.system_time()));
                     log.note(&format!(
                         "resolution request sent to run {} in workspace {}",
                         run.id(),
@@ -4572,7 +4588,7 @@ impl ReviseWatch {
             )));
         };
         ensure!(
-            unix_time() - wrapper.heartbeat_at <= HEARTBEAT_TIMEOUT_SECS,
+            queue.generators().clock.now() - wrapper.heartbeat_at <= HEARTBEAT_TIMEOUT_SECS,
             "wrapper heartbeat expired; session may still be alive"
         );
         let receipt = Path::new(run.receipt_path().context("missing receipt path")?);
@@ -4723,7 +4739,7 @@ impl ExitWatch {
             return Ok(true);
         };
         ensure!(
-            unix_time() - wrapper.heartbeat_at <= HEARTBEAT_TIMEOUT_SECS,
+            queue.generators().clock.now() - wrapper.heartbeat_at <= HEARTBEAT_TIMEOUT_SECS,
             "wrapper heartbeat expired; session may still be alive"
         );
         match self.requested {
@@ -5170,9 +5186,10 @@ fn spawn_validation(
     repository: GitRepository,
     run: TaskRun,
     log: SupervisorLog,
+    generators: Generators,
 ) -> thread::JoinHandle<Result<Validation>> {
     thread::spawn(move || {
-        let mut queue = SqliteQueue::open(&db)?;
+        let mut queue = SqliteQueue::open(&db)?.with_generators(generators);
         let task = queue.show(run.task_id())?.task;
         let checked = check_receipt(&repository, &task, &run)?;
         Ok(match checked {
@@ -5451,7 +5468,7 @@ pub fn integrate(
     // A run the supervisor holds (its review, ADR-0027, or its resume) is
     // not approved by a call that cannot land it.
     if let Some(lease) = queue.run_lease(run.id())?
-        && !lease_is_stale(&lease, unix_time())
+        && !lease_is_stale(&lease, queue.generators().clock.now())
     {
         bail!(
             "run {} is held by the supervisor (its review or resume is in progress); see show for its review_finished / resume_finished events",
@@ -5469,10 +5486,10 @@ pub fn integrate(
         )?;
     }
     let previous = run.status();
-    let token = Uuid::new_v4().to_string();
+    let token = queue.generators().ids.uuid();
     let main = repository.main_head()?;
     let run = queue.begin_integration(run.id(), &token, &main)?;
-    let heartbeat = Heartbeat::start(db.clone(), token.clone());
+    let heartbeat = Heartbeat::start(db.clone(), token.clone(), queue.generators().clone());
     let outcome = land_integrating(
         &mut queue,
         &db,
@@ -6811,7 +6828,7 @@ pub fn status_for(db: &Path, role: Option<crate::domain::SessionRole>) -> Result
     // Read before the state it describes, so a transition in between is
     // seen again by `watch --after cursor` rather than missed.
     let cursor = queue.latest_event_id()?;
-    let now = unix_time();
+    let now = queue.generators().clock.now();
     let registrations = queue.supervisors()?;
     let leases = queue.run_leases()?;
     let runs = queue
@@ -6871,7 +6888,7 @@ pub fn status_for(db: &Path, role: Option<crate::domain::SessionRole>) -> Result
 pub fn stats(db: &Path, query: &crate::domain::stats::StatsQuery) -> Result<Value> {
     use crate::domain::stats::{SlotSnapshot, stats};
     let queue = SqliteQueue::open(db)?;
-    let now = unix_time();
+    let now = queue.generators().clock.now();
     let events = queue.all_events()?;
     let goals = queue.task_goals()?;
     let registrations = queue.supervisors()?;
@@ -6919,7 +6936,7 @@ pub fn stats(db: &Path, query: &crate::domain::stats::StatsQuery) -> Result<Valu
 /// ([`RunHealth::summary`], [`SupervisorHealth::summary`]).
 pub fn doctor(db: &Path, full: bool) -> Result<Value> {
     let queue = SqliteQueue::open(db)?;
-    let now = unix_time();
+    let now = queue.generators().clock.now();
     let registrations = queue.supervisors()?;
     let leases = queue.run_leases()?;
     let runs = queue
@@ -6969,7 +6986,7 @@ pub fn recover(db: &Path, id: &RunId) -> Result<Value> {
         "run {id} is {}; only unfinished runs can be recovered",
         run.status().as_str()
     );
-    let now = unix_time();
+    let now = queue.generators().clock.now();
     let lease = queue.run_lease(id)?.map(|l| lease_health(&l, now));
     let processes = queue.processes(run.id())?;
     let health = run_health(&run, &processes, lease, now);
@@ -7038,7 +7055,7 @@ pub fn rebind(db: &Path, repo: &Path) -> Result<Value> {
             log,
             "{}",
             json!({
-                "at": unix_time(),
+                "at": queue.generators().clock.now(),
                 "previous_git_common_dir": previous,
                 "git_common_dir": common_dir,
                 "binary_version": crate::VERSION,
@@ -7480,7 +7497,7 @@ mod idle_tests {
         assert!(!background_running(&marker).unwrap());
         assert!(idle_after_receipt(&receipt, &marker).is_none());
         fs::write(&receipt, "{}").unwrap();
-        let before = SystemTime::now() - Duration::from_secs(60);
+        let before = clock::SystemClock.system_time() - Duration::from_secs(60);
         for (hook, running) in [
             // An older Claude Code writes no `background_tasks`.
             (json!({"hook_event_name": "Stop"}), false),
@@ -7502,7 +7519,7 @@ mod idle_tests {
             assert_eq!(idle.background_running(), running, "{hook}");
             assert_eq!(background_running(&marker).unwrap(), running);
             assert_eq!(idle.idle_since(before), !running, "{hook}");
-            assert!(!idle.idle_since(SystemTime::now() + Duration::from_secs(60)));
+            assert!(!idle.idle_since(clock::SystemClock.system_time() + Duration::from_secs(60)));
             assert_eq!(
                 idle_after_receipt(&receipt, &marker).is_some(),
                 !running,
@@ -7519,7 +7536,7 @@ mod idle_tests {
         // Nor does a marker older than the receipt count.
         fs::write(&marker, "{}").unwrap();
         let file = fs::File::options().write(true).open(&marker).unwrap();
-        file.set_modified(SystemTime::now() - Duration::from_secs(3600))
+        file.set_modified(clock::SystemClock.system_time() - Duration::from_secs(3600))
             .unwrap();
         assert!(idle_after_receipt(&receipt, &marker).is_none());
     }

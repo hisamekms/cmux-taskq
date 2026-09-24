@@ -104,8 +104,8 @@ impl SqliteQueue {
         let ask = read_ask(&tx, id)?;
         ensure!(ask.is_open(), "ask {id} is not open");
         tx.execute(
-            "UPDATE asks SET answer=?2, answered_at=unixepoch() WHERE id=?1",
-            params![id, text],
+            "UPDATE asks SET answer=?2, answered_at=?3 WHERE id=?1",
+            params![id, text, self.generators.clock.now()],
         )?;
         let mut payload = json!({"ask_id": id, "kind": ask.kind});
         if ask.kind == AskKind::WorkerQuestion
@@ -177,7 +177,10 @@ impl SqliteQueue {
             ask.answered_at.is_some(),
             "ask {id} is not answered yet; answer it (for example that it is withdrawn) before closing it"
         );
-        tx.execute("UPDATE asks SET closed_at=unixepoch() WHERE id=?1", [id])?;
+        tx.execute(
+            "UPDATE asks SET closed_at=?2 WHERE id=?1",
+            params![id, self.generators.clock.now()],
+        )?;
         let closed = read_ask(&tx, id)?;
         tx.commit()?;
         Ok(closed)
@@ -254,7 +257,10 @@ impl SqliteQueue {
             return Ok(ask);
         }
         ensure!(ask.answered_at.is_some(), "ask {id} is not answered");
-        tx.execute("UPDATE asks SET closed_at=unixepoch() WHERE id=?1", [id])?;
+        tx.execute(
+            "UPDATE asks SET closed_at=?2 WHERE id=?1",
+            params![id, self.generators.clock.now()],
+        )?;
         ask_event(
             &tx,
             ask.task_id,
@@ -309,12 +315,13 @@ impl SqliteQueue {
             )?
             .query_map(params![run_id, kind.as_str()], ask_row)?
             .collect::<rusqlite::Result<_>>()?;
+        let now = self.generators.clock.now();
         let mut closed = Vec::with_capacity(unclosed.len());
         for ask in unclosed {
             if ask.is_open() {
                 tx.execute(
-                    "UPDATE asks SET answer=?2, answered_at=unixepoch() WHERE id=?1",
-                    params![ask.id, answer],
+                    "UPDATE asks SET answer=?2, answered_at=?3 WHERE id=?1",
+                    params![ask.id, answer, now],
                 )?;
                 ask_event(
                     &tx,
@@ -325,8 +332,8 @@ impl SqliteQueue {
                 )?;
             }
             tx.execute(
-                "UPDATE asks SET closed_at=unixepoch() WHERE id=?1",
-                [ask.id],
+                "UPDATE asks SET closed_at=?2 WHERE id=?1",
+                params![ask.id, now],
             )?;
             closed.push(read_ask(&tx, ask.id)?);
         }

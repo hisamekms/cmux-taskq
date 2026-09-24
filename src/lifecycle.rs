@@ -37,7 +37,7 @@ use crate::{
         runtime_store::HEARTBEAT_TIMEOUT_SECS,
         sqlite::SqliteQueue,
     },
-    runtime::{RecordingBackend, inbox_prompt, planner_prompt, unix_time},
+    runtime::{RecordingBackend, inbox_prompt, planner_prompt},
 };
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Value, json};
@@ -214,7 +214,7 @@ pub fn up(
             continue;
         }
         existing.insert(registration.token.clone());
-        if fresh(&registration, processes) {
+        if fresh(&registration, processes, queue.generators().clock.now()) {
             live.push(registration);
         }
         // Alive but silent: not ours to kill; it shows up as stale in doctor.
@@ -848,9 +848,8 @@ fn supervise_arguments(
     ])
 }
 
-fn fresh(registration: &SupervisorRegistration, processes: &dyn ProcessControl) -> bool {
-    processes.alive(registration.pid)
-        && unix_time() - registration.heartbeat_at <= HEARTBEAT_TIMEOUT_SECS
+fn fresh(registration: &SupervisorRegistration, processes: &dyn ProcessControl, now: i64) -> bool {
+    processes.alive(registration.pid) && now - registration.heartbeat_at <= HEARTBEAT_TIMEOUT_SECS
 }
 
 /// The registration the supervisor `up` has just started writes for
@@ -867,8 +866,9 @@ fn wait_for_registration(
 ) -> Result<SupervisorRegistration> {
     let deadline = Instant::now() + options.startup_timeout;
     loop {
+        let now = queue.generators().clock.now();
         if let Some(registration) = queue.supervisors()?.into_iter().find(|registration| {
-            !existing.contains(&registration.token) && fresh(registration, processes)
+            !existing.contains(&registration.token) && fresh(registration, processes, now)
         }) {
             return Ok(registration);
         }
@@ -929,7 +929,7 @@ fn session_command(claude: &Path, plugin_dir: Option<&Path>, prompt: String) -> 
 /// lease still has a live, heartbeating owner, and the runs that wait for
 /// review (`awaiting_integration`) or a resumed session (`needs_session`).
 fn open_work(queue: &SqliteQueue, processes: &dyn ProcessControl) -> Result<Value> {
-    let now = unix_time();
+    let now = queue.generators().clock.now();
     let leases = queue.run_leases()?;
     let unfinished: Vec<Value> = queue
         .active_runs()?
