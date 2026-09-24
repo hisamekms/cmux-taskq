@@ -738,7 +738,8 @@ fn graph_reports_unfinished_dependencies_releases_and_the_critical_chain() {
     assert_eq!(
         tasks[1],
         serde_json::json!({
-            "id": 2, "status": "ready", "title": "root", "goal_id": null,
+            "id": 2, "status": "ready", "priority": "normal",
+            "effective_priority": "normal", "title": "root", "goal_id": null,
             "depends_on": [], "goal_dependencies": [], "blocks": [3], "unblocks": 2,
             "ready_after": [],
         })
@@ -1784,6 +1785,91 @@ fn add_paths_is_stored_shown_and_replaced() {
     ] {
         assert!(!invoke(&db, args).status.success(), "{args:?}");
     }
+}
+
+/// `add --priority` and `set-priority` take the level names only; `show`,
+/// `list`, `candidates` and `graph` print them, and `candidates` and
+/// `graph` agree on the claim order (ADR-0040 decision 4).
+#[test]
+fn priority_is_named_changed_while_editable_and_orders_candidates() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("queue.db");
+    ok(&db, &["init"]);
+    assert_eq!(ok(&db, &["add", "plain"])["priority"], "normal");
+    let low = ok(&db, &["add", "later", "--priority", "low"]);
+    assert_eq!(low["priority"], "low");
+    ok(&db, &["add", "base"]);
+    ok(
+        &db,
+        &[
+            "add",
+            "urgent waiter",
+            "--priority",
+            "urgent",
+            "--depends-on",
+            "3",
+        ],
+    );
+    for id in ["1", "2", "3", "4"] {
+        ok(&db, &["ready", id]);
+    }
+    assert_eq!(ok(&db, &["show", "2"])["task"]["priority"], "low");
+    assert_eq!(ok(&db, &["list"])["tasks"][0]["priority"], "urgent");
+
+    let candidates = ok(&db, &["candidates"]);
+    let order: Vec<(i64, &str, &str)> = candidates
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| {
+            (
+                t["id"].as_i64().unwrap(),
+                t["priority"].as_str().unwrap(),
+                t["effective_priority"].as_str().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        order,
+        [
+            (3, "normal", "urgent"),
+            (1, "normal", "normal"),
+            (2, "low", "low")
+        ]
+    );
+    assert_eq!(
+        ok(&db, &["graph"])["candidates"],
+        serde_json::json!([3, 1, 2])
+    );
+
+    let raised = ok(&db, &["set-priority", "2", "interrupt"]);
+    assert_eq!(raised["priority"], "interrupt");
+    assert_eq!(
+        ok(&db, &["graph"])["candidates"],
+        serde_json::json!([2, 3, 1])
+    );
+    let ids: Vec<i64> = ok(&db, &["candidates"])
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["id"].as_i64().unwrap())
+        .collect();
+    assert_eq!(ids, [2, 3, 1]);
+
+    for args in [
+        &["add", "numeric", "--priority", "3"][..],
+        &["add", "unknown", "--priority", "critical"][..],
+        &["set-priority", "1", "4"][..],
+        &["set-priority", "1", "High"][..],
+        &["set-priority", "1"][..],
+    ] {
+        assert!(!invoke(&db, args).status.success(), "{args:?}");
+    }
+    ok(&db, &["cancel", "1"]);
+    assert_eq!(
+        refused(&db, &["set-priority", "1", "high"]),
+        "the priority can only be changed for draft or ready tasks"
+    );
 }
 
 #[test]

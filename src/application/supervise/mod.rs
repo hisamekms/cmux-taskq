@@ -538,8 +538,9 @@ impl Supervisor<'_> {
             self.triage_runs(parallel)?;
         }
         while self.slots.len() < parallel {
-            // Most-releasing candidate first, lowest ID on a tie (ADR-0023);
-            // `graph` shows the same order, so it is not recorded.
+            // Highest effective priority, then most-releasing, then lowest
+            // ID (ADR-0040 decision 4); `candidates` and `graph` show the
+            // same order, so it is not recorded.
             let order = dependency_graph(self.queue.graph_input()?, None).candidates;
             if order.is_empty() {
                 break;

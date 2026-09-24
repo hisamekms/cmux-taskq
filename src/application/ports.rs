@@ -17,9 +17,9 @@ use super::{GraphInput, TaskPage, TaskQuery, timestamp, unix_seconds};
 use crate::domain::{
     Ask, AskId, AskKind, AskOutcome, ClaimOutcome, CommitSha, EventId, EvidenceCheck, Goal,
     GoalDetail, GoalEdit, GoalId, GoalPredecessor, GoalSummary, GoalVerdict, NewAsk, NewGoal,
-    NewNote, NewTask, NotePage, NoteQuery, Predecessor, Reason, ReasonCode, RunEvent, RunId,
-    RunLease, RunPlan, RunProcess, RunStatus, SessionRole, SupervisorMode, SupervisorRegistration,
-    Task, TaskAction, TaskDetail, TaskId, TaskRun,
+    NewNote, NewTask, NotePage, NoteQuery, Predecessor, Priority, Reason, ReasonCode, RunEvent,
+    RunId, RunLease, RunPlan, RunProcess, RunStatus, SessionRole, SupervisorMode,
+    SupervisorRegistration, Task, TaskAction, TaskDetail, TaskId, TaskRun,
 };
 
 pub trait TaskStore {
@@ -34,7 +34,8 @@ pub trait TaskStore {
     /// (ADR-0038); never its own goal, never a cycle.
     fn add_goal_dependency(&mut self, task_id: TaskId, goal_id: GoalId) -> Result<()>;
     fn remove_goal_dependency(&mut self, task_id: TaskId, goal_id: GoalId) -> Result<()>;
-    /// Dependency-ready tasks; each task is limited to one unfinished run.
+    /// Dependency-ready tasks in claim order (ADR-0040 decision 4); each
+    /// task is limited to one unfinished run.
     fn candidates(&self) -> Result<Vec<Task>>;
     /// The unfinished tasks with their direct predecessors and the IDs of
     /// `candidates`, read in one snapshot.
@@ -62,6 +63,9 @@ pub trait TaskStore {
     /// Replace the globs of the paths a draft or ready task may change
     /// (ADR-0029); an empty list removes the limit.
     fn set_paths(&mut self, task_id: TaskId, paths: Vec<String>) -> Result<Task>;
+    /// Give a draft or ready task another priority (ADR-0040 decision 4);
+    /// it takes effect at the next claim.
+    fn set_priority(&mut self, task_id: TaskId, priority: Priority) -> Result<Task>;
     /// Open a draft goal so its tasks become candidates (ADR-0024 decision 5).
     fn ready_goal(&mut self, goal_id: GoalId) -> Result<Goal>;
     /// Record a note as an `observation` run event on its task, run or goal.

@@ -28,7 +28,8 @@ pub use recording::reason_of_error;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::domain::{
-    EvidenceCheck, GoalId, GoalStatus, GoalVerdict, RunId, RunStatus, Task, TaskId, TaskStatus,
+    EvidenceCheck, GoalId, GoalStatus, GoalVerdict, Priority, RunId, RunStatus, Task, TaskId,
+    TaskStatus,
 };
 
 /// Which task statuses `list` returns.
@@ -90,6 +91,7 @@ pub struct TaskPage {
 pub struct TaskListItem {
     pub id: TaskId,
     pub status: TaskStatus,
+    pub priority: Priority,
     pub title: String,
     pub goal_id: Option<GoalId>,
     /// IDs of the direct predecessors, ascending.
@@ -141,6 +143,7 @@ impl TaskListItem {
         Self {
             id: task.id(),
             status: task.status(),
+            priority: task.priority(),
             title: task.title().to_owned(),
             goal_id: task.goal_id(),
             dependencies,
@@ -157,6 +160,7 @@ impl TaskListItem {
 pub struct GraphTask {
     pub id: TaskId,
     pub status: TaskStatus,
+    pub priority: Priority,
     pub title: String,
     pub goal_id: Option<GoalId>,
     /// Status of the task's goal; a draft goal's tasks are not candidates.
@@ -200,11 +204,16 @@ pub struct GraphInput {
     pub candidates: Vec<TaskId>,
 }
 
-/// An unfinished task as `graph` shows it (ADR-0023 decision 4).
+/// An unfinished task as `graph` shows it (ADR-0040 decision 4).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct GraphNode {
     pub id: TaskId,
     pub status: TaskStatus,
+    /// The priority a person gave the task.
+    pub priority: Priority,
+    /// The priority the claim order compares: the highest of its own and
+    /// those of the ready tasks that wait for it (see [`ClaimRank`]).
+    pub effective_priority: Priority,
     pub title: String,
     pub goal_id: Option<GoalId>,
     /// Status of the task's goal, present only for a task in a goal.
@@ -231,14 +240,60 @@ pub struct GraphNode {
 pub struct DependencyGraph {
     /// Unfinished tasks in ID order.
     pub tasks: Vec<GraphNode>,
-    /// Claimable tasks in the order the supervisor claims them: most
-    /// `unblocks` first, then ascending ID.
+    /// Claimable tasks in the order the supervisor claims them
+    /// ([`ClaimRank`]): highest effective priority first, then most
+    /// `unblocks`, then ascending ID.
     pub candidates: Vec<TaskId>,
     /// The chain from the task with the most `unblocks` (lowest ID on a tie),
     /// each step to the directly blocked task with the most `unblocks`
     /// (lowest ID on a tie), down to a task that blocks nothing. Empty when
     /// no task blocks another.
     pub critical: Vec<TaskId>,
+}
+
+/// Where a task stands in the claim order (ADR-0040 decision 4); the
+/// smaller rank is claimed first. The one ordering `candidates`, `graph`
+/// and the supervisor's claims share.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ClaimRank {
+    /// Highest effective priority first.
+    priority: std::cmp::Reverse<Priority>,
+    // The goal's rank (goal 13) goes here, once goals have one: after the
+    // priority, before `unblocks`.
+    /// Most tasks released first.
+    unblocks: std::cmp::Reverse<usize>,
+    /// Lowest ID first.
+    id: TaskId,
+}
+
+impl ClaimRank {
+    /// `effective_priority` is [`effective_priority`] of the task and
+    /// `unblocks` how many unfinished tasks wait for it.
+    pub fn new(effective_priority: Priority, unblocks: usize, id: TaskId) -> Self {
+        Self {
+            priority: std::cmp::Reverse(effective_priority),
+            unblocks: std::cmp::Reverse(unblocks),
+            id,
+        }
+    }
+}
+
+/// The priority the claim order compares for a task whose own is `own`:
+/// the highest of it and those of `waiters`, the tasks that wait for it
+/// directly or transitively. Only a ready task outside a draft goal passes
+/// its priority on; a draft, canceled or completed one, or one in a draft
+/// goal, is set aside or will not run, so it never raises another task.
+pub fn effective_priority<'a>(
+    own: Priority,
+    waiters: impl IntoIterator<Item = &'a GraphTask>,
+) -> Priority {
+    waiters
+        .into_iter()
+        .filter(|waiter| {
+            waiter.status == TaskStatus::Ready && waiter.goal_status != Some(GoalStatus::Draft)
+        })
+        .map(|waiter| waiter.priority)
+        .fold(own, Ord::max)
 }
 
 /// Compute the dependency view. Counts always span every unfinished task;
@@ -280,22 +335,33 @@ pub fn dependency_graph(input: GraphInput, goal_id: Option<GoalId>) -> Dependenc
         dependents.dedup();
     }
     let direct = |id: TaskId| blocks.get(&id).map(Vec::as_slice).unwrap_or_default();
-    let unblocks: BTreeMap<TaskId, usize> = open
+    let by_id: BTreeMap<TaskId, &GraphTask> =
+        input.tasks.iter().map(|task| (task.id, task)).collect();
+    // Per task: how many unfinished tasks wait for it, and its effective
+    // priority over those same waiters.
+    let reach: BTreeMap<TaskId, (usize, Priority)> = input
+        .tasks
         .iter()
-        .map(|&id| {
+        .map(|task| {
             let mut reached = BTreeSet::new();
-            let mut pending = direct(id).to_vec();
+            let mut pending = direct(task.id).to_vec();
             while let Some(next) = pending.pop() {
                 if reached.insert(next) {
                     pending.extend_from_slice(direct(next));
                 }
             }
-            (id, reached.len())
+            let priority = effective_priority(
+                task.priority,
+                reached.iter().filter_map(|id| by_id.get(id).copied()),
+            );
+            (task.id, (reached.len(), priority))
         })
         .collect();
-    let count = |id: TaskId| unblocks.get(&id).copied().unwrap_or(0);
-    // Most unblocks first, lowest ID on a tie.
+    let count = |id: TaskId| reach.get(&id).map_or(0, |(unblocks, _)| *unblocks);
+    let effective = |id: TaskId| reach.get(&id).map_or(Priority::Normal, |(_, p)| *p);
+    // Most unblocks first, lowest ID on a tie: the critical chain.
     let rank = |id: &TaskId| (std::cmp::Reverse(count(*id)), *id);
+    let claim_rank = |id: &TaskId| ClaimRank::new(effective(*id), count(*id), *id);
     let in_goal = |task: &GraphTask| goal_id.is_none() || task.goal_id == goal_id;
     let goal_ids: BTreeSet<TaskId> = input
         .tasks
@@ -309,7 +375,7 @@ pub fn dependency_graph(input: GraphInput, goal_id: Option<GoalId>) -> Dependenc
         .copied()
         .filter(|id| goal_id.is_none() || goal_ids.contains(id))
         .collect();
-    candidates.sort_by_key(rank);
+    candidates.sort_by_key(claim_rank);
     let mut critical = Vec::new();
     let mut step = goal_ids.iter().copied().min_by_key(rank);
     if step.is_some_and(|id| count(id) == 0) {
@@ -324,6 +390,7 @@ pub fn dependency_graph(input: GraphInput, goal_id: Option<GoalId>) -> Dependenc
         .into_iter()
         .filter(|task| goal_ids.contains(&task.id))
         .map(|task| GraphNode {
+            effective_priority: effective(task.id),
             blocks: direct(task.id).to_vec(),
             unblocks: count(task.id),
             ready_after: task
@@ -348,6 +415,7 @@ pub fn dependency_graph(input: GraphInput, goal_id: Option<GoalId>) -> Dependenc
                 .collect(),
             id: task.id,
             status: task.status,
+            priority: task.priority,
             title: task.title,
             goal_id: task.goal_id,
             goal_status: task.goal_status,
@@ -359,6 +427,32 @@ pub fn dependency_graph(input: GraphInput, goal_id: Option<GoalId>) -> Dependenc
         candidates,
         critical,
     }
+}
+
+/// A claimable task as `candidates` prints it: the task and the priority
+/// the claim order compares for it.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct Candidate {
+    #[serde(flatten)]
+    pub task: Task,
+    pub effective_priority: Priority,
+}
+
+/// `tasks` (the claimable ones, in claim order) each with its effective
+/// priority from `graph`; a task `graph` does not hold, read after it,
+/// keeps its own.
+pub fn claim_candidates(tasks: Vec<Task>, graph: &DependencyGraph) -> Vec<Candidate> {
+    tasks
+        .into_iter()
+        .map(|task| Candidate {
+            effective_priority: graph
+                .tasks
+                .iter()
+                .find(|node| node.id == task.id())
+                .map_or(task.priority(), |node| node.effective_priority),
+            task,
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -377,6 +471,7 @@ mod tests {
             } else {
                 TaskStatus::Draft
             },
+            priority: Priority::Normal,
             title: format!("task {id}"),
             goal_id: goal_id.map(GoalId::new),
             goal_status: goal_id.map(|_| GoalStatus::Open),
@@ -490,6 +585,137 @@ mod tests {
             Some(GoalId::new(1)),
         );
         assert_eq!(in_goal.critical, ids(&[1, 8]));
+    }
+
+    #[test]
+    fn claim_rank_compares_priority_then_unblocks_then_id() {
+        let rank = |p, unblocks, id| ClaimRank::new(p, unblocks, TaskId::new(id));
+        let mut ranks = vec![
+            rank(Priority::Normal, 5, 1),
+            rank(Priority::Low, 9, 1),
+            rank(Priority::Normal, 5, 2),
+            rank(Priority::Interrupt, 0, 9),
+            rank(Priority::Normal, 6, 3),
+        ];
+        ranks.sort();
+        assert_eq!(
+            ranks,
+            [
+                rank(Priority::Interrupt, 0, 9),
+                rank(Priority::Normal, 6, 3),
+                rank(Priority::Normal, 5, 1),
+                rank(Priority::Normal, 5, 2),
+                rank(Priority::Low, 9, 1),
+            ]
+        );
+    }
+
+    #[test]
+    fn only_ready_tasks_outside_a_draft_goal_pass_their_priority_on() {
+        let waiter = |status, goal_status, priority| GraphTask {
+            status,
+            goal_status,
+            priority,
+            ..task(9, None, &[])
+        };
+        let set_aside = [
+            waiter(TaskStatus::Draft, None, Priority::Interrupt),
+            waiter(TaskStatus::Canceled, None, Priority::Interrupt),
+            waiter(TaskStatus::Completed, None, Priority::Interrupt),
+            waiter(TaskStatus::InProgress, None, Priority::Interrupt),
+            waiter(
+                TaskStatus::Ready,
+                Some(GoalStatus::Draft),
+                Priority::Interrupt,
+            ),
+        ];
+        assert_eq!(effective_priority(Priority::Low, &set_aside), Priority::Low);
+        let ready = [
+            waiter(TaskStatus::Ready, Some(GoalStatus::Open), Priority::High),
+            waiter(TaskStatus::Ready, None, Priority::Normal),
+        ];
+        assert_eq!(effective_priority(Priority::Low, &ready), Priority::High);
+        // The task's own priority is never lowered.
+        assert_eq!(
+            effective_priority(Priority::Urgent, &ready),
+            Priority::Urgent
+        );
+    }
+
+    #[test]
+    fn a_ready_task_lifts_what_it_waits_for_transitively_ahead_of_unblocks() {
+        let with = |mut task: GraphTask, status, priority| {
+            task.status = status;
+            task.priority = priority;
+            task
+        };
+        // Beside `input`: 11 (ready, urgent) waits on 8 (draft), which
+        // waits on the candidate 10, so 10 inherits urgent through 8.
+        let mut input = input();
+        input.tasks.push(with(
+            task(8, None, &[10]),
+            TaskStatus::Draft,
+            Priority::Normal,
+        ));
+        input.tasks.push(task(10, None, &[]));
+        input.tasks.push(with(
+            task(11, None, &[8]),
+            TaskStatus::Ready,
+            Priority::Urgent,
+        ));
+        // A draft interrupt task waiting on 1 lifts nothing.
+        input.tasks.push(with(
+            task(12, None, &[1]),
+            TaskStatus::Draft,
+            Priority::Interrupt,
+        ));
+        input.candidates = ids(&[1, 2, 7, 10]);
+        let graph = dependency_graph(input, None);
+        let node = |id: i64| graph.tasks.iter().find(|t| t.id.as_i64() == id).unwrap();
+        assert_eq!(node(10).priority, Priority::Normal);
+        assert_eq!(node(10).effective_priority, Priority::Urgent);
+        assert_eq!(node(8).effective_priority, Priority::Urgent);
+        assert_eq!(node(1).effective_priority, Priority::Normal);
+        assert_eq!(node(12).effective_priority, Priority::Interrupt);
+        assert_eq!(graph.candidates, ids(&[10, 2, 1, 7]));
+        // The critical chain still follows unblocks only.
+        assert_eq!(graph.critical, ids(&[2, 3, 5]));
+        let json = serde_json::to_value(node(10)).unwrap();
+        assert_eq!(json["priority"], "normal");
+        assert_eq!(json["effective_priority"], "urgent");
+    }
+
+    #[test]
+    fn candidates_carry_the_effective_priority_of_the_graph() {
+        let task = |id: i64| {
+            Task::restore(crate::domain::TaskRecord {
+                id: TaskId::new(id),
+                title: format!("task {id}"),
+                description: String::new(),
+                acceptance: String::new(),
+                verification_commands: Vec::new(),
+                required_evidence: Vec::new(),
+                paths: Vec::new(),
+                priority: Priority::Low,
+                status: TaskStatus::Ready,
+                goal_id: None,
+                context: String::new(),
+                created_at: String::new(),
+                updated_at: String::new(),
+            })
+            .unwrap()
+        };
+        let mut input = input();
+        input.tasks[1].priority = Priority::High;
+        let graph = dependency_graph(input, None);
+        let candidates = claim_candidates(vec![task(2), task(99)], &graph);
+        assert_eq!(candidates[0].effective_priority, Priority::High);
+        // A task read after the graph keeps its own priority.
+        assert_eq!(candidates[1].effective_priority, Priority::Low);
+        let json = serde_json::to_value(&candidates[0]).unwrap();
+        assert_eq!(json["id"], 2);
+        assert_eq!(json["priority"], "low");
+        assert_eq!(json["effective_priority"], "high");
     }
 
     #[test]

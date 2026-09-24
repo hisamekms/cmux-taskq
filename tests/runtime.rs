@@ -3,12 +3,12 @@ use dagq::{
     VERSION,
     application::{
         AgentProvider, Clock, CommandSpec, Generators, IdGenerator, MainRemote,
-        SupervisorEnvironment, TaskStore, WorkspaceBackend, WorkspaceTags,
+        SupervisorEnvironment, TaskStore, WorkspaceBackend, WorkspaceTags, dependency_graph,
     },
     domain::{
         AskId, AskKind, CommitSha, EventId, EvidenceCheck, GoalEdit, GoalId, NewAsk, NewGoal,
-        NewTask, ReasonCode, RunId, RunStatus, SessionRole, Task, TaskAction, TaskId, TaskRun,
-        TaskStatus,
+        NewTask, Priority, ReasonCode, RunId, RunStatus, SessionRole, Task, TaskAction, TaskId,
+        TaskRun, TaskStatus,
     },
     infrastructure::{
         adapters::{GitRepository, shell_join, workspace_handle},
@@ -81,6 +81,7 @@ fn add_ready_task(queue: &mut SqliteQueue, title: &str, dependencies: &[TaskId])
             verification_commands: vec!["test -f seed.txt".into()],
             required_evidence: Vec::new(),
             paths: Vec::new(),
+            priority: Default::default(),
             dependencies: dependencies.to_vec(),
             goal_dependencies: Vec::new(),
             goal_id: None,
@@ -2428,6 +2429,39 @@ fn supervisor_claims_the_candidate_that_releases_the_most_tasks_first() {
     assert_eq!(outcome["runs"][1]["task_id"], 2);
 }
 
+/// The supervisor claims in the order `candidates` and `graph` show: the
+/// highest effective priority first, whatever the ID or unblocks, and a
+/// candidate that an urgent ready task waits for inherits urgent
+/// (ADR-0040 decision 4).
+#[test]
+fn supervisor_claims_by_effective_priority_like_candidates_and_graph() {
+    let (_dir, repo, db) = fixture();
+    let mut queue = SqliteQueue::open(&db).unwrap();
+    let low = add_ready_task(&mut queue, "later", &[]);
+    queue.set_priority(low, Priority::Low).unwrap();
+    let base = add_ready_task(&mut queue, "base", &[]);
+    let waiter = add_ready_task(&mut queue, "urgent waiter", &[base]);
+    queue.set_priority(waiter, Priority::Urgent).unwrap();
+    let high = add_ready_task(&mut queue, "high", &[]);
+    queue.set_priority(high, Priority::High).unwrap();
+    let expected = [base, high, TaskId::new(1), low];
+    let candidates: Vec<TaskId> = queue.candidates().unwrap().iter().map(|t| t.id()).collect();
+    assert_eq!(candidates, expected);
+    assert_eq!(
+        dependency_graph(queue.graph_input().unwrap(), None).candidates,
+        expected
+    );
+    let backend = TestWorkspace::new(&db, false, VALID_AGENT);
+    let outcome = supervise_with(&db, &repo, &backend, &supervise_options(1, true)).unwrap();
+    let claimed: Vec<TaskId> = outcome["runs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|run| TaskId::new(run["task_id"].as_i64().unwrap()))
+        .collect();
+    assert_eq!(claimed, expected);
+}
+
 #[test]
 fn claim_creates_a_lease_that_only_its_owner_can_use_or_release() {
     use dagq::{domain::ClaimOutcome, infrastructure::runtime_store::RunPlan};
@@ -3522,6 +3556,7 @@ fn add_file_task(
             verification_commands: verify.iter().map(|v| (*v).to_owned()).collect(),
             required_evidence: Vec::new(),
             paths: Vec::new(),
+            priority: Default::default(),
             dependencies: vec![],
             goal_dependencies: Vec::new(),
             goal_id: None,
@@ -3630,6 +3665,7 @@ fn awaiting_run() -> (TempDir, PathBuf, PathBuf, TaskRun) {
             verification_commands: vec![],
             required_evidence: Vec::new(),
             paths: Vec::new(),
+            priority: Default::default(),
             dependencies: vec![TaskId::new(1)],
             goal_dependencies: Vec::new(),
             goal_id: None,
@@ -4115,6 +4151,7 @@ fn add_ready_task_in(
             verification_commands: vec!["test -f seed.txt".into()],
             required_evidence: Vec::new(),
             paths: Vec::new(),
+            priority: Default::default(),
             dependencies: vec![],
             goal_dependencies: Vec::new(),
             goal_id,
@@ -5921,6 +5958,7 @@ fn verification_failure_after_rebase_needs_a_session_and_keeps_the_rebased_tree(
             verification_commands: vec!["true".into()],
             required_evidence: Vec::new(),
             paths: Vec::new(),
+            priority: Default::default(),
             dependencies: vec![],
             goal_dependencies: Vec::new(),
             goal_id: None,
@@ -8337,6 +8375,7 @@ fn dagq_toml_run_env_reaches_the_workspace_and_the_verification_commands() {
             ],
             required_evidence: Vec::new(),
             paths: Vec::new(),
+            priority: Default::default(),
             dependencies: vec![],
             goal_dependencies: Vec::new(),
             goal_id: None,
@@ -8417,6 +8456,7 @@ fn evidence_fixture(evidence: &[EvidenceCheck]) -> (TempDir, PathBuf, PathBuf) {
             verification_commands: vec!["test -f seed.txt".into()],
             required_evidence: evidence.to_vec(),
             paths: Vec::new(),
+            priority: Default::default(),
             dependencies: Vec::new(),
             goal_dependencies: Vec::new(),
             goal_id: None,
@@ -8640,6 +8680,7 @@ fn scope_fixture(paths: &[&str]) -> (TempDir, PathBuf, PathBuf) {
             verification_commands: vec!["test -f seed.txt".into()],
             required_evidence: Vec::new(),
             paths: paths.iter().map(|p| (*p).to_owned()).collect(),
+            priority: Default::default(),
             dependencies: Vec::new(),
             goal_dependencies: Vec::new(),
             goal_id: None,

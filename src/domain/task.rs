@@ -5,7 +5,7 @@
 use serde::Serialize;
 
 use super::{
-    DomainError, EvidenceCheck, GoalId, NewTask, TaskId, TaskRecord, TaskStatus, require,
+    DomainError, EvidenceCheck, GoalId, NewTask, Priority, TaskId, TaskRecord, TaskStatus, require,
     scope::{dedup_globs, validate_path_globs},
 };
 
@@ -67,6 +67,8 @@ pub struct Task {
     /// `integrate` refuse a diff with a path none of them matches. Empty:
     /// no limit.
     paths: Vec<String>,
+    /// How urgently a person wants it claimed (ADR-0040 decision 4).
+    priority: Priority,
     status: TaskStatus,
     goal_id: Option<GoalId>,
     context: String,
@@ -86,6 +88,7 @@ impl Task {
             id,
             required_evidence: new.required_evidence(),
             paths: dedup_globs(&new.paths),
+            priority: new.priority,
             title: new.title,
             description: new.description,
             acceptance: new.acceptance,
@@ -117,6 +120,7 @@ impl Task {
             verification_commands: record.verification_commands,
             required_evidence: record.required_evidence,
             paths: record.paths,
+            priority: record.priority,
             status: record.status,
             goal_id: record.goal_id,
             context: record.context,
@@ -151,6 +155,10 @@ impl Task {
 
     pub fn paths(&self) -> &[String] {
         &self.paths
+    }
+
+    pub fn priority(&self) -> Priority {
+        self.priority
     }
 
     pub fn status(&self) -> TaskStatus {
@@ -239,6 +247,14 @@ pub fn set_paths(mut task: Task, paths: Vec<String>) -> Result<Task, DomainError
     Ok(task)
 }
 
+/// Give `task` another priority (ADR-0040 decision 4): only before it is
+/// claimed, so a running run is never preempted.
+pub fn set_priority(mut task: Task, priority: Priority) -> Result<Task, DomainError> {
+    require_editable(&task, "the priority")?;
+    task.priority = priority;
+    Ok(task)
+}
+
 /// A task never depends on itself; checked before either task is read.
 pub fn check_not_self(task_id: TaskId, predecessor_id: TaskId) -> Result<(), DomainError> {
     require(task_id != predecessor_id, || DomainError::SelfDependency)
@@ -317,6 +333,7 @@ mod tests {
             verification_commands: vec!["cargo test".into()],
             required_evidence: vec![EvidenceCheck::E2e, EvidenceCheck::E2e],
             paths: vec!["docs/**".into(), "docs/**".into()],
+            priority: Default::default(),
             dependencies: vec![TaskId::new(1)],
             goal_dependencies: Vec::new(),
             goal_id: Some(GoalId::new(2)),
@@ -333,6 +350,7 @@ mod tests {
             verification_commands: Vec::new(),
             required_evidence: Vec::new(),
             paths: Vec::new(),
+            priority: Default::default(),
             status,
             goal_id: None,
             context: String::new(),
@@ -467,10 +485,22 @@ mod tests {
         assert_eq!(moved.goal_id(), Some(GoalId::new(4)));
         let scoped = set_paths(moved, vec!["src/**".into(), "src/**".into()]).unwrap();
         assert_eq!(scoped.paths(), ["src/**"]);
+        assert_eq!(scoped.priority(), Priority::Normal);
+        let urgent = set_priority(scoped, Priority::Urgent).unwrap();
+        assert_eq!(urgent.priority(), Priority::Urgent);
+        assert_eq!(
+            serde_json::to_value(&urgent).unwrap()["priority"],
+            serde_json::json!("urgent")
+        );
         assert!(matches!(
-            set_paths(scoped, vec![" ".into()]),
+            set_paths(urgent, vec![" ".into()]),
             Err(DomainError::InvalidPathGlob { .. })
         ));
+        let draft = Task::restore(record(TaskStatus::Draft)).unwrap();
+        assert_eq!(
+            set_priority(draft, Priority::Low).unwrap().priority(),
+            Priority::Low
+        );
 
         let claimed = || Task::restore(record(TaskStatus::InProgress)).unwrap();
         assert!(!dependencies_editable(&claimed()));
@@ -482,6 +512,19 @@ mod tests {
             set_paths(claimed(), Vec::new()).unwrap_err().to_string(),
             "the paths can only be changed for draft or ready tasks"
         );
+        for status in [
+            TaskStatus::InProgress,
+            TaskStatus::Completed,
+            TaskStatus::Canceled,
+        ] {
+            let task = Task::restore(record(status)).unwrap();
+            assert_eq!(
+                set_priority(task, Priority::Interrupt)
+                    .unwrap_err()
+                    .to_string(),
+                "the priority can only be changed for draft or ready tasks"
+            );
+        }
         assert_eq!(
             check_dependencies_editable(&claimed())
                 .unwrap_err()

@@ -6,8 +6,8 @@
 use serde::{Deserialize, Serialize};
 
 use super::{
-    CommitSha, DomainError, EvidenceCheck, GoalId, GoalStatus, GoalVerdict, Provider, RunId,
-    RunStatus, TaskId, TaskStatus, require, scope,
+    CommitSha, DomainError, EvidenceCheck, GoalId, GoalStatus, GoalVerdict, Priority, Provider,
+    RunId, RunStatus, TaskId, TaskStatus, require, scope,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -31,6 +31,9 @@ pub struct NewTask {
     /// Globs of the paths the task may change (ADR-0029); empty: no limit.
     #[serde(default)]
     pub paths: Vec<String>,
+    /// How urgently the task should be claimed (ADR-0040 decision 4).
+    #[serde(default)]
+    pub priority: Priority,
 }
 
 impl NewTask {
@@ -132,6 +135,7 @@ pub struct TaskRecord {
     pub verification_commands: Vec<String>,
     pub required_evidence: Vec<EvidenceCheck>,
     pub paths: Vec<String>,
+    pub priority: Priority,
     pub status: TaskStatus,
     pub goal_id: Option<GoalId>,
     pub context: String,

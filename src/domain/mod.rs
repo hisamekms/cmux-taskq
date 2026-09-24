@@ -249,6 +249,76 @@ string_enum!(EvidenceCheck {
     SubagentReview => "subagent_review",
 });
 
+/// How urgently a person wants a task claimed (ADR-0040 decision 4), lowest
+/// first so the derived `Ord` is the claim order's first key. The CLI and
+/// the JSON use the names only; the queue stores `low`=0 … `interrupt`=4.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum Priority {
+    /// Later: a conditional proposal and the like.
+    Low,
+    #[default]
+    Normal,
+    /// Soon: groundwork other work builds on.
+    High,
+    /// A defect that stops the operation.
+    Urgent,
+    /// Ahead of every other ready task.
+    Interrupt,
+}
+
+impl Priority {
+    const ALL: [Self; 5] = [
+        Self::Low,
+        Self::Normal,
+        Self::High,
+        Self::Urgent,
+        Self::Interrupt,
+    ];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Normal => "normal",
+            Self::High => "high",
+            Self::Urgent => "urgent",
+            Self::Interrupt => "interrupt",
+        }
+    }
+
+    /// The stored value: `low`=0 … `interrupt`=4.
+    pub const fn as_i64(self) -> i64 {
+        self as i64
+    }
+
+    /// The level stored as `value`.
+    pub fn from_i64(value: i64) -> Result<Self, DomainError> {
+        usize::try_from(value)
+            .ok()
+            .and_then(|index| Self::ALL.get(index).copied())
+            .ok_or_else(|| DomainError::UnknownValue {
+                kind: "Priority",
+                value: value.to_string(),
+            })
+    }
+}
+
+impl std::str::FromStr for Priority {
+    type Err = DomainError;
+    /// Only the names; a number is not a level.
+    fn from_str(value: &str) -> Result<Self, DomainError> {
+        Self::ALL
+            .into_iter()
+            .find(|level| level.as_str() == value)
+            .ok_or_else(|| DomainError::UnknownValue {
+                kind: "Priority",
+                value: value.to_owned(),
+            })
+    }
+}
+
 mod error;
 pub mod goal;
 pub mod ids;
@@ -459,6 +529,29 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_priority_is_a_name_ordered_low_to_interrupt_and_stored_as_0_to_4() {
+        let names = ["low", "normal", "high", "urgent", "interrupt"];
+        let levels: Vec<Priority> = names.iter().map(|name| name.parse().unwrap()).collect();
+        assert!(levels.windows(2).all(|pair| pair[0] < pair[1]));
+        for (value, level) in levels.iter().enumerate() {
+            assert_eq!(level.as_i64(), value as i64);
+            assert_eq!(Priority::from_i64(value as i64).unwrap(), *level);
+            assert_eq!(level.as_str(), names[value]);
+            assert_eq!(serde_json::to_value(level).unwrap(), names[value]);
+        }
+        assert_eq!(Priority::default(), Priority::Normal);
+        for bad in ["1", "Normal", "", "critical"] {
+            assert_eq!(
+                bad.parse::<Priority>().unwrap_err().to_string(),
+                format!("unknown Priority: {bad}")
+            );
+        }
+        for bad in [-1, 5] {
+            assert!(Priority::from_i64(bad).is_err());
+        }
+    }
+
+    #[test]
     fn a_note_needs_text_and_a_slug_kind() {
         let note = |text: &str, kind: Option<&str>| NewNote {
             target: NoteTarget::Goal(GoalId::new(1)),
@@ -528,6 +621,7 @@ mod tests {
             verification_commands: vec![],
             required_evidence: Vec::new(),
             paths: Vec::new(),
+            priority: Default::default(),
             dependencies: vec![TaskId::new(0)],
             goal_dependencies: Vec::new(),
             goal_id: None,
@@ -614,6 +708,7 @@ mod tests {
             verification_commands: Vec::new(),
             required_evidence: vec![EvidenceCheck::E2e, EvidenceCheck::Tests, EvidenceCheck::E2e],
             paths: Vec::new(),
+            priority: Default::default(),
             dependencies: Vec::new(),
             goal_dependencies: Vec::new(),
             goal_id: None,

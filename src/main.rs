@@ -15,7 +15,7 @@ use clap::{Parser, Subcommand};
 use serde_json::{Value, json};
 
 use dagq::{
-    application::{StatusFilter, TaskQuery, TaskStore, dependency_graph},
+    application::{StatusFilter, TaskQuery, TaskStore, claim_candidates, dependency_graph},
     domain::{
         AskId, AskKind, EventId, GoalEdit, GoalId, GoalVerdict, NewAsk, NewGoal, NewNote, NewTask,
         NoteQuery, NoteTarget, RunId, SessionRole, TaskAction, TaskId, TaskStatus,
@@ -74,6 +74,11 @@ enum Command {
         /// integrate refuses to land it. Omitted: no limit.
         #[arg(long = "paths")]
         paths: Vec<String>,
+        /// How urgently the supervisor should claim it: interrupt (ahead of every other ready
+        /// task), urgent (a defect stopping the operation), high (groundwork other work needs
+        /// soon), normal, or low (later). A ready task it waits for inherits it.
+        #[arg(long, default_value = "normal", value_parser = PRIORITIES)]
+        priority: String,
     },
     /// List one page of tasks, newest first: unfinished ones unless --status or --all says otherwise.
     /// Prints {"tasks", "next", "total"}; pass `next` to --before for the following page (null: none).
@@ -151,6 +156,15 @@ enum Command {
         #[arg(long)]
         none: bool,
     },
+    /// Give a draft or ready task another priority (`add --priority`); it takes effect at the
+    /// next claim and never stops a running run.
+    SetPriority {
+        /// Draft or ready task.
+        task: i64,
+        /// interrupt, urgent, high, normal or low.
+        #[arg(value_parser = PRIORITIES)]
+        level: String,
+    },
     /// Record a note (an `observation` run event) on a task, a run or a goal.
     #[command(group = clap::ArgGroup::new("target").required(true))]
     Note {
@@ -182,13 +196,15 @@ enum Command {
         limit: u32,
     },
     /// List ready tasks whose prerequisites are all completed, whose goal dependencies are all
-    /// closed as achieved and whose goal is not a draft; does not claim.
+    /// closed as achieved and whose goal is not a draft, in claim order (highest
+    /// `effective_priority`, then most `unblocks`, then lowest ID); does not claim.
     Candidates,
     /// Show the unfinished tasks' dependencies: per task its direct predecessors (`depends_on`),
     /// its goal dependencies (`goal_dependencies`), what it still waits for (`ready_after`: unfinished
     /// predecessors, then `{"goal": ID}` for goals not closed as achieved), the tasks it blocks
     /// directly (including those waiting for its open goal) and how many it releases transitively
-    /// (`unblocks`); `candidates` in claim order and the `critical` chain.
+    /// (`unblocks`), its `priority` and the `effective_priority` it inherits from the ready tasks
+    /// waiting for it; `candidates` in claim order and the `critical` chain.
     Graph {
         /// Only this goal's tasks and candidates; counts still span every goal.
         #[arg(long = "goal")]
@@ -434,6 +450,8 @@ enum Command {
 
 /// The session roles attention is addressed to.
 const ROLES: [&str; 2] = ["inbox", "planner"];
+/// The names of the task priorities (ADR-0040 decision 4), highest first.
+const PRIORITIES: [&str; 5] = ["interrupt", "urgent", "high", "normal", "low"];
 
 fn parse_role(value: Option<String>) -> Result<Option<SessionRole>> {
     Ok(value.map(|value| value.parse()).transpose()?)
@@ -669,6 +687,7 @@ fn execute(cli: Cli) -> Result<Value> {
             context,
             required_evidence,
             paths,
+            priority,
         } => serde_json::to_value(
             queue.add(NewTask {
                 title,
@@ -684,6 +703,7 @@ fn execute(cli: Cli) -> Result<Value> {
                     .map(|name| name.parse())
                     .collect::<Result<_, _>>()?,
                 paths,
+                priority: priority.parse()?,
             })?,
         )?,
         Command::List {
@@ -824,6 +844,9 @@ fn execute(cli: Cli) -> Result<Value> {
             paths,
             none: _,
         } => serde_json::to_value(queue.set_paths(TaskId::new(task), paths)?)?,
+        Command::SetPriority { task, level } => {
+            serde_json::to_value(queue.set_priority(TaskId::new(task), level.parse()?)?)?
+        }
         Command::Note {
             task,
             run,
@@ -854,7 +877,10 @@ fn execute(cli: Cli) -> Result<Value> {
             since: since.map(EventId::new),
             limit: usize::try_from(limit)?,
         })?)?,
-        Command::Candidates => serde_json::to_value(queue.candidates()?)?,
+        Command::Candidates => {
+            let graph = dependency_graph(queue.graph_input()?, None);
+            serde_json::to_value(claim_candidates(queue.candidates()?, &graph))?
+        }
         Command::Graph { goal_id } => serde_json::to_value(dependency_graph(
             queue.graph_input()?,
             goal_id.map(GoalId::new),

@@ -194,6 +194,7 @@ mod tests {
             verification_commands: vec!["true".into()],
             required_evidence: Vec::new(),
             paths: Vec::new(),
+            priority: Default::default(),
             status: TaskStatus::InProgress,
             goal_id: None,
             context: String::new(),

@@ -5,10 +5,13 @@ use std::{
 
 use dagq::{
     VERSION,
-    application::{Clock, Generators, IdGenerator, StatusFilter, TaskQuery, TaskStore, timestamp},
+    application::{
+        Clock, Generators, IdGenerator, StatusFilter, TaskQuery, TaskStore, dependency_graph,
+        timestamp,
+    },
     domain::{
         ClaimOutcome, CommitSha, EventId, GoalEdit, GoalId, GoalStatus, GoalVerdict, NewGoal,
-        NewNote, NewTask, NotePage, NoteQuery, NoteTarget, Provider, RunId, RunStatus,
+        NewNote, NewTask, NotePage, NoteQuery, NoteTarget, Priority, Provider, RunId, RunStatus,
         SupervisorMode, TaskAction, TaskId, TaskStatus,
     },
     infrastructure::sqlite::SqliteQueue,
@@ -30,6 +33,7 @@ fn new_task(title: &str) -> NewTask {
         verification_commands: vec!["cargo test".into()],
         required_evidence: Vec::new(),
         paths: Vec::new(),
+        priority: Default::default(),
         dependencies: vec![],
         goal_dependencies: Vec::new(),
         goal_id: None,
@@ -1014,10 +1018,10 @@ fn migration_from_v6_adds_goals_and_keeps_tasks_runs_and_events() {
     // (supervisor binary version), 0011 (session workspaces), 0012
     // (queue-level backend failures), 0013 (goal draft), 0014 (asks) and
     // 0015 (required evidence), 0016 (observer events and task-less
-    // blocked asks), 0017 (the stuck_exit ask), 0018 (task paths) and 0019
-    // (goal dependencies) are applied together.
-    assert_eq!(SqliteQueue::SCHEMA_VERSION, 19);
-    assert_eq!(queue.schema_version().unwrap(), 19);
+    // blocked asks), 0017 (the stuck_exit ask), 0018 (task paths), 0019
+    // (goal dependencies) and 0020 (task priority) are applied together.
+    assert_eq!(SqliteQueue::SCHEMA_VERSION, 20);
+    assert_eq!(queue.schema_version().unwrap(), 20);
     assert_eq!(
         queue
             .session_workspace(dagq::domain::SessionRole::Inbox)
@@ -1030,6 +1034,7 @@ fn migration_from_v6_adds_goals_and_keeps_tasks_runs_and_events() {
     assert_eq!(landed.task.goal_id(), None);
     assert_eq!(landed.task.context(), "");
     assert!(landed.task.paths().is_empty());
+    assert_eq!(landed.task.priority(), Priority::Normal);
     assert_eq!(landed.task.status(), TaskStatus::Completed);
     assert_eq!(landed.runs.len(), 1);
     assert_eq!(landed.runs[0].status(), RunStatus::Integrated);
@@ -1571,6 +1576,117 @@ fn paths_are_stored_and_replaced_while_the_task_is_editable() {
     assert!(queue.set_paths(TaskId::new(99), Vec::new()).is_err());
 }
 
+/// `add` stores the priority and `set_priority` changes it on a draft or
+/// ready task only, recording `task_priority_changed` when it changes; the
+/// column refuses anything outside 0..=4 (ADR-0040 decision 4).
+#[test]
+fn priority_is_stored_changed_while_editable_and_checked_by_the_schema() {
+    let (dir, mut queue) = fixture();
+    let mut spec = new_task("urgent");
+    spec.priority = Priority::Urgent;
+    let task = queue.add(spec).unwrap();
+    assert_eq!(task.priority(), Priority::Urgent);
+    assert_eq!(
+        queue.show(task.id()).unwrap().task.priority(),
+        Priority::Urgent
+    );
+    // No change, no event.
+    queue.set_priority(task.id(), Priority::Urgent).unwrap();
+    queue.transition(task.id(), TaskAction::Ready).unwrap();
+    let low = queue.set_priority(task.id(), Priority::Low).unwrap();
+    assert_eq!(low.priority(), Priority::Low);
+    let changes: Vec<_> = queue
+        .show(task.id())
+        .unwrap()
+        .events
+        .into_iter()
+        .filter(|e| e.kind == "task_priority_changed")
+        .map(|e| e.payload)
+        .collect();
+    assert_eq!(
+        changes,
+        [serde_json::json!({"from": "urgent", "to": "low"})]
+    );
+    queue.claim(&base()).unwrap();
+    assert_eq!(
+        queue
+            .set_priority(task.id(), Priority::Interrupt)
+            .unwrap_err()
+            .to_string(),
+        "the priority can only be changed for draft or ready tasks"
+    );
+    assert!(queue.set_priority(TaskId::new(99), Priority::Low).is_err());
+
+    let raw = Connection::open(dir.path().join("queue.db")).unwrap();
+    for value in [-1, 5] {
+        let error = raw
+            .execute("UPDATE tasks SET priority=?1 WHERE id=1", [value])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("CHECK constraint failed"), "{error}");
+    }
+    raw.execute("UPDATE tasks SET priority=4 WHERE id=1", [])
+        .unwrap();
+    assert_eq!(
+        queue.show(task.id()).unwrap().task.priority(),
+        Priority::Interrupt
+    );
+}
+
+/// `candidates`, `graph` and successive claims follow one order: highest
+/// effective priority, then most unblocks, then lowest ID. A ready task
+/// passes its priority to what it waits for; a draft task and a task of a
+/// draft goal do not.
+#[test]
+fn candidates_graph_and_claims_share_the_priority_order() {
+    let (_dir, mut queue) = fixture();
+    let mut draft_goal = new_goal("parked goal");
+    draft_goal.draft = true;
+    let draft_goal = queue.add_goal(draft_goal).unwrap().id();
+    let mut add = |title: &str, priority: Priority, depends_on: &[TaskId], goal: Option<GoalId>| {
+        let mut spec = new_task(title);
+        spec.priority = priority;
+        spec.dependencies = depends_on.to_vec();
+        spec.goal_id = goal;
+        queue.add(spec).unwrap().id()
+    };
+    let plain = add("plain", Priority::Normal, &[], None);
+    let releasing = add("releasing", Priority::Normal, &[], None);
+    let parked = add("parked", Priority::Interrupt, &[releasing], None);
+    let low = add("low", Priority::Low, &[], None);
+    let lifted = add("lifted", Priority::Normal, &[], None);
+    let waiter = add("waiter", Priority::Urgent, &[lifted], None);
+    let high = add("high", Priority::High, &[], None);
+    let in_draft_goal = add(
+        "in draft goal",
+        Priority::Interrupt,
+        &[low],
+        Some(draft_goal),
+    );
+    for id in [plain, releasing, low, lifted, waiter, high, in_draft_goal] {
+        queue.transition(id, TaskAction::Ready).unwrap();
+    }
+    assert_eq!(queue.show(parked).unwrap().task.status(), TaskStatus::Draft);
+
+    let expected = [lifted, high, releasing, plain, low];
+    let candidates: Vec<TaskId> = queue.candidates().unwrap().iter().map(|t| t.id()).collect();
+    assert_eq!(candidates, expected);
+    let graph = dependency_graph(queue.graph_input().unwrap(), None);
+    assert_eq!(graph.candidates, expected);
+    let node = |id: TaskId| graph.tasks.iter().find(|n| n.id == id).unwrap();
+    assert_eq!(node(lifted).priority, Priority::Normal);
+    assert_eq!(node(lifted).effective_priority, Priority::Urgent);
+    assert_eq!(node(releasing).effective_priority, Priority::Normal);
+    assert_eq!(node(low).effective_priority, Priority::Low);
+    assert_eq!(node(parked).effective_priority, Priority::Interrupt);
+
+    let mut claimed = Vec::new();
+    while let ClaimOutcome::Claimed { run } = queue.claim(&base()).unwrap() {
+        claimed.push(run.task_id());
+    }
+    assert_eq!(claimed, expected);
+}
+
 #[test]
 fn goal_events_are_recorded_without_a_run() {
     let (_dir, mut queue) = fixture();
@@ -1687,9 +1803,11 @@ fn list_defaults_to_unfinished_tasks_newest_first_with_compact_items() {
         serde_json::to_value(&page).unwrap(),
         serde_json::json!({
             "tasks": [
-                {"id": d, "status": "ready", "title": "waiting", "goal_id": null,
+                {"id": d, "status": "ready", "priority": "normal", "title": "waiting",
+                 "goal_id": null,
                  "dependencies": [], "goal_dependencies": [], "latest_run": null},
-                {"id": c, "status": "in_progress", "title": "claimed", "goal_id": goal,
+                {"id": c, "status": "in_progress", "priority": "normal", "title": "claimed",
+                 "goal_id": goal,
                  "dependencies": [a], "goal_dependencies": [],
                  "latest_run": {"id": run.id(), "status": "claimed"}},
             ],

@@ -1599,6 +1599,7 @@ mod tests {
             verification_commands: Vec::new(),
             required_evidence: Vec::new(),
             paths: Vec::new(),
+            priority: Default::default(),
             status: crate::domain::TaskStatus::InProgress,
             goal_id: None,
             context: String::new(),

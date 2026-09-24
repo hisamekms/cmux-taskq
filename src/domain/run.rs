@@ -649,6 +649,7 @@ mod tests {
                 context: String::new(),
                 required_evidence: Vec::new(),
                 paths: Vec::new(),
+                priority: Default::default(),
             },
             "now".into(),
         )

@@ -15,14 +15,14 @@ use serde_json::json;
 use crate::{
     application::{
         Generators, GraphGoalDependency, GraphInput, GraphTask, IdGenerator, LatestRun,
-        StatusFilter, TaskListItem, TaskPage, TaskQuery, TaskStore, timestamp,
+        StatusFilter, TaskListItem, TaskPage, TaskQuery, TaskStore, dependency_graph, timestamp,
     },
     domain::{
         ClaimOutcome, CommitSha, DomainError, EventId, Goal, GoalDetail, GoalEdit, GoalId,
         GoalPredecessor, GoalRecord, GoalSummary, GoalTask, GoalVerdict, NewGoal, NewNote, NewTask,
-        NotePage, NoteQuery, NoteTarget, OBSERVATION_KIND, Predecessor, Provider, RunEvent, RunId,
-        RunRecord, Task, TaskAction, TaskDetail, TaskId, TaskRecord, TaskRun, TaskStatus,
-        TaskStatusCounts, goal, scope::validate_path_globs, task,
+        NotePage, NoteQuery, NoteTarget, OBSERVATION_KIND, Predecessor, Priority, Provider,
+        RunEvent, RunId, RunRecord, Task, TaskAction, TaskDetail, TaskId, TaskRecord, TaskRun,
+        TaskStatus, TaskStatusCounts, goal, scope::validate_path_globs, task,
     },
     infrastructure::{clock, location::runs_dir},
 };
@@ -48,10 +48,13 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../../migrations/0017_stuck_exit_ask.sql"),
     include_str!("../../migrations/0018_task_paths.sql"),
     include_str!("../../migrations/0019_task_goal_dependencies.sql"),
+    include_str!("../../migrations/0020_task_priority.sql"),
 ];
 /// Ready tasks whose predecessors are completed, whose goal dependencies
 /// are all closed as achieved (ADR-0038), that own no unfinished run and
 /// whose goal, if any, is not a draft (ADR-0024 decision 5).
+/// In ID order: the claim order (ADR-0040 decision 4) needs the whole
+/// dependency graph, so [`claim_order`] applies it, not SQL.
 const READY_QUERY: &str = "
     SELECT t.* FROM tasks t
     WHERE t.status = 'ready'
@@ -209,12 +212,13 @@ impl TaskStore for SqliteQueue {
         let id = task.id();
         tx.execute(
             "INSERT INTO tasks(id, title, description, acceptance, verification_commands, status, goal_id,
-                               context, required_evidence, paths, created_at, updated_at)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+                               context, required_evidence, paths, priority, created_at, updated_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
             params![id, task.title(), task.description(), task.acceptance(),
                 serde_json::to_string(task.verification_commands())?, task.status().as_str(),
                 task.goal_id(), task.context(), serde_json::to_string(task.required_evidence())?,
-                serde_json::to_string(task.paths())?, task.created_at(), task.updated_at()],
+                serde_json::to_string(task.paths())?, task.priority().as_i64(), task.created_at(),
+                task.updated_at()],
         )?;
         event(
             &tx,
@@ -453,61 +457,16 @@ impl TaskStore for SqliteQueue {
     }
 
     fn candidates(&self) -> Result<Vec<Task>> {
-        Ok(self
-            .conn
-            .prepare(READY_QUERY)?
-            .query_map([], task_row)?
-            .collect::<rusqlite::Result<_>>()?)
+        let tx = self.conn.unchecked_transaction()?;
+        let order = claim_order(&tx)?;
+        let mut ready = ready_tasks(&tx)?;
+        ready.sort_by_key(|task| order.iter().position(|id| *id == task.id()));
+        Ok(ready)
     }
 
     fn graph_input(&self) -> Result<GraphInput> {
         let tx = self.conn.unchecked_transaction()?;
-        let tasks: Vec<Task> = tx
-            .prepare(
-                "SELECT * FROM tasks WHERE status IN ('draft','ready','in_progress') ORDER BY id",
-            )?
-            .query_map([], task_row)?
-            .collect::<rusqlite::Result<_>>()?;
-        let mut dependencies = tx.prepare(
-            "SELECT predecessor_id FROM task_dependencies WHERE task_id=?1 ORDER BY predecessor_id",
-        )?;
-        let mut goal_dependencies = tx.prepare(
-            "SELECT g.* FROM task_goal_dependencies d JOIN goals g ON g.id = d.goal_id
-             WHERE d.task_id=?1 ORDER BY g.id",
-        )?;
-        let tasks = tasks
-            .into_iter()
-            .map(|task| {
-                let goal_status = task
-                    .goal_id()
-                    .map(|goal_id| read_goal(&tx, goal_id).map(|goal| goal.status()))
-                    .transpose()?;
-                Ok(GraphTask {
-                    depends_on: dependencies
-                        .query_map([task.id()], |r| r.get(0))?
-                        .collect::<rusqlite::Result<_>>()?,
-                    goal_dependencies: goal_dependencies
-                        .query_map([task.id()], goal_row)?
-                        .map(|goal| {
-                            goal.map(|goal| GraphGoalDependency {
-                                goal_id: goal.id(),
-                                verdict: goal.verdict(),
-                            })
-                        })
-                        .collect::<rusqlite::Result<_>>()?,
-                    goal_status,
-                    id: task.id(),
-                    status: task.status(),
-                    goal_id: task.goal_id(),
-                    title: task.into_title(),
-                })
-            })
-            .collect::<Result<_>>()?;
-        let candidates = tx
-            .prepare(READY_QUERY)?
-            .query_map([], |r| r.get("id"))?
-            .collect::<rusqlite::Result<_>>()?;
-        Ok(GraphInput { tasks, candidates })
+        read_graph_input(&tx)
     }
 
     fn claim(&mut self, base_commit: &CommitSha) -> Result<ClaimOutcome> {
@@ -886,6 +845,35 @@ impl TaskStore for SqliteQueue {
         tx.commit()?;
         Ok(result)
     }
+
+    fn set_priority(&mut self, task_id: TaskId, priority: Priority) -> Result<Task> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let task = read_task(&tx, task_id)?;
+        let from = task.priority();
+        let task = task::set_priority(task, priority)?;
+        if from != task.priority() {
+            tx.execute(
+                "UPDATE tasks SET priority=?1, updated_at=?2 WHERE id=?3",
+                params![
+                    task.priority().as_i64(),
+                    self.generators.clock.timestamp(),
+                    task_id
+                ],
+            )?;
+            event(
+                &tx,
+                task_id,
+                None,
+                "task_priority_changed",
+                json!({"from": from, "to": task.priority()}),
+            )?;
+        }
+        let result = read_task(&tx, task_id)?;
+        tx.commit()?;
+        Ok(result)
+    }
 }
 
 fn read_goal(conn: &Connection, goal_id: GoalId) -> Result<Goal> {
@@ -1025,9 +1013,76 @@ fn goal_event(
     Ok(())
 }
 
+/// The claimable tasks, in ID order.
+fn ready_tasks(conn: &Connection) -> Result<Vec<Task>> {
+    Ok(conn
+        .prepare(READY_QUERY)?
+        .query_map([], task_row)?
+        .collect::<rusqlite::Result<_>>()?)
+}
+
+/// The unfinished tasks with their predecessors, goal dependencies and
+/// priorities, and the IDs of the claimable ones, read inside the caller's
+/// transaction so they are one snapshot.
+fn read_graph_input(conn: &Connection) -> Result<GraphInput> {
+    let tasks: Vec<Task> = conn
+        .prepare("SELECT * FROM tasks WHERE status IN ('draft','ready','in_progress') ORDER BY id")?
+        .query_map([], task_row)?
+        .collect::<rusqlite::Result<_>>()?;
+    let mut dependencies = conn.prepare(
+        "SELECT predecessor_id FROM task_dependencies WHERE task_id=?1 ORDER BY predecessor_id",
+    )?;
+    let mut goal_dependencies = conn.prepare(
+        "SELECT g.* FROM task_goal_dependencies d JOIN goals g ON g.id = d.goal_id
+         WHERE d.task_id=?1 ORDER BY g.id",
+    )?;
+    let tasks = tasks
+        .into_iter()
+        .map(|task| {
+            let goal_status = task
+                .goal_id()
+                .map(|goal_id| read_goal(conn, goal_id).map(|goal| goal.status()))
+                .transpose()?;
+            Ok(GraphTask {
+                depends_on: dependencies
+                    .query_map([task.id()], |r| r.get(0))?
+                    .collect::<rusqlite::Result<_>>()?,
+                goal_dependencies: goal_dependencies
+                    .query_map([task.id()], goal_row)?
+                    .map(|goal| {
+                        goal.map(|goal| GraphGoalDependency {
+                            goal_id: goal.id(),
+                            verdict: goal.verdict(),
+                        })
+                    })
+                    .collect::<rusqlite::Result<_>>()?,
+                goal_status,
+                id: task.id(),
+                status: task.status(),
+                priority: task.priority(),
+                goal_id: task.goal_id(),
+                title: task.into_title(),
+            })
+        })
+        .collect::<Result<_>>()?;
+    let candidates = conn
+        .prepare(READY_QUERY)?
+        .query_map([], |r| r.get("id"))?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(GraphInput { tasks, candidates })
+}
+
+/// The claimable task IDs in claim order (ADR-0040 decision 4), from the
+/// one ordering [`dependency_graph`] applies, so `candidates`, `graph` and
+/// every claim agree.
+fn claim_order(conn: &Connection) -> Result<Vec<TaskId>> {
+    Ok(dependency_graph(read_graph_input(conn)?, None).candidates)
+}
+
 /// Reserve a dependency-ready task inside the caller's write transaction:
-/// the first task of `order` that is still a candidate, or the lowest-ID
-/// candidate when none of them is (an empty `order` means ID order). There
+/// the first task of `order` that is still a candidate, or the first
+/// candidate in claim order when none of them is (an empty `order` means
+/// claim order). There
 /// is no queue-wide execution slot; `one_unfinished_run_per_task` is the
 /// only limit, so concurrent claims take different tasks. The run is
 /// created at `at` with an ID from `ids`.
@@ -1039,17 +1094,18 @@ pub(super) fn claim_task(
     base_commit: &CommitSha,
     order: &[TaskId],
 ) -> Result<ClaimOutcome> {
-    let mut ready: Vec<Task> = tx
-        .prepare(READY_QUERY)?
-        .query_map([], task_row)?
-        .collect::<rusqlite::Result<_>>()?;
-    let preferred = order
-        .iter()
-        .find_map(|id| ready.iter().position(|task| task.id() == *id))
-        .unwrap_or(0);
+    let mut ready = ready_tasks(tx)?;
     if ready.is_empty() {
         return Ok(ClaimOutcome::NoReadyTask);
     }
+    let position = |ids: &[TaskId]| {
+        ids.iter()
+            .find_map(|id| ready.iter().position(|task| task.id() == *id))
+    };
+    let preferred = match position(order) {
+        Some(index) => index,
+        None => position(&claim_order(tx)?).unwrap_or(0),
+    };
     let task = task::claim(ready.swap_remove(preferred))?;
     let now = timestamp(at);
     let run_id = RunId::new(ids.uuid())?;
@@ -1250,6 +1306,7 @@ fn task_row(row: &Row<'_>) -> rusqlite::Result<Task> {
         verification_commands: json_col(row, "verification_commands")?,
         required_evidence: json_col(row, "required_evidence")?,
         paths: json_col(row, "paths")?,
+        priority: Priority::from_i64(row.get("priority")?).map_err(restore_error)?,
         status: enum_col(row, "status")?,
         goal_id: row.get("goal_id")?,
         context: row.get("context")?,
