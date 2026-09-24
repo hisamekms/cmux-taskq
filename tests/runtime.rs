@@ -11107,3 +11107,44 @@ fn a_silent_wrapper_that_dies_after_the_exit_closes_its_ask() {
         "{outcome}"
     );
 }
+
+#[test]
+fn a_refused_run_transition_keeps_the_domain_reason_beside_the_old_error() {
+    use dagq::{domain::ClaimOutcome, infrastructure::runtime_store::REFUSALS_LOG};
+    let (_dir, _repo, db) = fixture();
+    let mut queue = SqliteQueue::open(&db).unwrap();
+    let base = "0123456789abcdef0123456789abcdef01234567";
+    let ClaimOutcome::Claimed { run } = queue.claim_for_supervisor(&sha(base), "owner").unwrap()
+    else {
+        panic!()
+    };
+    let run_dir = dagq::infrastructure::location::runs_dir(&db.canonicalize().unwrap())
+        .join(run.id().as_str());
+    fs::create_dir_all(&run_dir).unwrap();
+    // A claimed run is not awaiting integration: the error keeps the
+    // store's message, and the domain's reason goes to the run's log.
+    let error = queue.restart_validation(run.id(), "owner").unwrap_err();
+    assert_eq!(
+        format!("{error:#}"),
+        "run is not awaiting integration under this supervisor"
+    );
+    assert_eq!(queue.run(run.id()).unwrap().status(), RunStatus::Claimed);
+    let log = fs::read_to_string(run_dir.join(REFUSALS_LOG)).unwrap();
+    let line = log.lines().next().unwrap();
+    assert!(line.starts_with('['), "{line}");
+    assert!(
+        line.ends_with(
+            "] run is not awaiting integration under this supervisor: \
+             cannot validate again a run in claimed state"
+        ),
+        "{line}"
+    );
+    // A refusal whose run directory is gone still fails the same way.
+    fs::remove_dir_all(&run_dir).unwrap();
+    let error = queue.restart_validation(run.id(), "owner").unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "run is not awaiting integration under this supervisor"
+    );
+    assert!(!run_dir.exists());
+}

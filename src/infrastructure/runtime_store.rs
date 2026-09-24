@@ -1,5 +1,8 @@
 //! Durable per-run supervisor ownership and one-shot wrapper registration.
 use std::collections::HashMap;
+use std::fs;
+use std::io::Write;
+use std::path::Path;
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
@@ -11,10 +14,11 @@ use super::{
         SqliteQueue, claim_task, enum_col, event, event_row, read_task, run_row, stored_run_row,
     },
 };
-use crate::application::{AskStore, RunStore, timestamp, unix_seconds};
+use crate::application::{AskStore, Generators, RunStore, timestamp, unix_seconds};
 use crate::domain::{
-    ClaimOutcome, CommitSha, DomainError, GoalId, RunEvent, RunId, RunLease, RunProcess, RunStatus,
-    SessionRole, SupervisorMode, SupervisorRegistration, Task, TaskAction, TaskId, TaskRun, run,
+    ClaimOutcome, CommitSha, DomainError, GoalId, RunEvent, RunId, RunLease, RunPaths, RunProcess,
+    RunStatus, SessionRole, SupervisorMode, SupervisorRegistration, Task, TaskAction, TaskId,
+    TaskRun, run,
 };
 
 pub use crate::application::{
@@ -402,6 +406,7 @@ impl SqliteQueue {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let run = apply(
             &tx,
+            refusals(&self.runs_dir, &self.generators),
             id,
             None,
             || "run does not exist".to_owned(),
@@ -540,6 +545,7 @@ impl SqliteQueue {
         assert_lease(&tx, id, token, self.generators.clock.now())?;
         apply(
             &tx,
+            refusals(&self.runs_dir, &self.generators),
             id,
             Some(token),
             || "run cannot be provisioned twice".to_owned(),
@@ -557,6 +563,7 @@ impl SqliteQueue {
         assert_lease(&tx, id, token, self.generators.clock.now())?;
         apply(
             &tx,
+            refusals(&self.runs_dir, &self.generators),
             id,
             Some(token),
             || "workspace cannot be attached to this run".to_owned(),
@@ -700,6 +707,7 @@ impl SqliteQueue {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         apply(
             &tx,
+            refusals(&self.runs_dir, &self.generators),
             id,
             None,
             || "run does not exist".to_owned(),
@@ -785,6 +793,7 @@ impl SqliteQueue {
         )?;
         apply(
             &tx,
+            refusals(&self.runs_dir, &self.generators),
             id,
             None,
             || "run is not starting".to_owned(),
@@ -871,6 +880,7 @@ impl SqliteQueue {
             .status();
         let run = apply(
             &tx,
+            refusals(&self.runs_dir, &self.generators),
             id,
             None,
             || {
@@ -910,6 +920,7 @@ impl SqliteQueue {
         ).context("wrapper has not reported session exit")?;
         let run = apply(
             &tx,
+            refusals(&self.runs_dir, &self.generators),
             id,
             Some(token),
             || "run is not owned by this supervisor".to_owned(),
@@ -937,6 +948,7 @@ impl SqliteQueue {
         assert_lease(&tx, id, token, self.generators.clock.now())?;
         let run = apply(
             &tx,
+            refusals(&self.runs_dir, &self.generators),
             id,
             Some(token),
             || "run is not owned by this supervisor".to_owned(),
@@ -963,6 +975,7 @@ impl SqliteQueue {
         assert_lease(&tx, id, token, self.generators.clock.now())?;
         let run = apply(
             &tx,
+            refusals(&self.runs_dir, &self.generators),
             id,
             Some(token),
             || "run is not awaiting integration under this supervisor".to_owned(),
@@ -994,6 +1007,7 @@ impl SqliteQueue {
         ensure!(!leased, "run {id} is leased");
         let run = apply(
             &tx,
+            refusals(&self.runs_dir, &self.generators),
             id,
             None,
             || format!("run {id} is not awaiting integration"),
@@ -1017,8 +1031,13 @@ impl SqliteQueue {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         assert_lease(&tx, id, token, self.generators.clock.now())?;
         let refusal = || "run is not validating under this supervisor".to_owned();
-        let run = apply(&tx, id, Some(token), refusal, |run| {
-            match (validation.accepted, validation.result_commit.clone()) {
+        let run = apply(
+            &tx,
+            refusals(&self.runs_dir, &self.generators),
+            id,
+            Some(token),
+            refusal,
+            |run| match (validation.accepted, validation.result_commit.clone()) {
                 (true, Some(commit)) => run::accept(run, commit),
                 (true, None) => Err(DomainError::InvalidCommit {
                     field: "accepted result commit",
@@ -1030,8 +1049,8 @@ impl SqliteQueue {
                     !validation.evidence_missing.is_empty()
                         || !validation.scope_violation.is_empty(),
                 ),
-            }
-        })?;
+            },
+        )?;
         let status = run.status();
         let mut payload = serde_json::to_value(validation)?;
         payload["status"] = json!(status);
@@ -1216,6 +1235,7 @@ impl SqliteQueue {
             .status();
         let run = apply(
             &tx,
+            refusals(&self.runs_dir, &self.generators),
             id,
             None,
             || {
@@ -1349,6 +1369,7 @@ impl SqliteQueue {
         };
         let run = apply(
             &tx,
+            refusals(&self.runs_dir, &self.generators),
             id,
             None,
             || format!("run {id} is not needs_session"),
@@ -1393,6 +1414,7 @@ impl SqliteQueue {
         if let Some(status) = status {
             apply(
                 &tx,
+                refusals(&self.runs_dir, &self.generators),
                 id,
                 None,
                 || format!("run {id} is not needs_session"),
@@ -1498,6 +1520,7 @@ impl SqliteQueue {
         assert_lease(&tx, id, token, self.generators.clock.now())?;
         let run = apply(
             &tx,
+            refusals(&self.runs_dir, &self.generators),
             id,
             None,
             || format!("run {id} is not integrating"),
@@ -1533,6 +1556,7 @@ impl SqliteQueue {
         assert_lease(&tx, id, token, unix_seconds(at))?;
         let run = apply(
             &tx,
+            refusals(&self.runs_dir, &self.generators),
             id,
             None,
             || format!("run {id} is not integrating"),
@@ -1577,6 +1601,7 @@ impl SqliteQueue {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         apply(
             &tx,
+            refusals(&self.runs_dir, &self.generators),
             id,
             None,
             || "run does not exist".to_owned(),
@@ -1597,9 +1622,14 @@ impl SqliteQueue {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let now = self.generators.clock.now();
         assert_lease(&tx, id, token, now)?;
-        let result = apply(&tx, id, Some(token), not_at_rest, |run| {
-            run::workspace_closed(run, now)
-        })?
+        let result = apply(
+            &tx,
+            refusals(&self.runs_dir, &self.generators),
+            id,
+            Some(token),
+            not_at_rest,
+            |run| run::workspace_closed(run, now),
+        )?
         .relocated(&self.runs_dir);
         run_event(
             &tx,
@@ -1618,9 +1648,14 @@ impl SqliteQueue {
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         assert_lease(&tx, id, token, self.generators.clock.now())?;
-        let result = apply(&tx, id, Some(token), not_at_rest, |run| {
-            run::record_close_failure(run, message.to_owned())
-        })?
+        let result = apply(
+            &tx,
+            refusals(&self.runs_dir, &self.generators),
+            id,
+            Some(token),
+            not_at_rest,
+            |run| run::record_close_failure(run, message.to_owned()),
+        )?
         .relocated(&self.runs_dir);
         run_event(
             &tx,
@@ -1748,6 +1783,7 @@ impl SqliteQueue {
             TriageAction::Resume { instruction } => {
                 apply(
                     &tx,
+                    refusals(&self.runs_dir, &self.generators),
                     id,
                     None,
                     || format!("run {id} changed"),
@@ -1815,6 +1851,7 @@ impl SqliteQueue {
         tx.execute("DELETE FROM run_leases WHERE run_id=?1", [id])?;
         let result = apply(
             &tx,
+            refusals(&self.runs_dir, &self.generators),
             id,
             None,
             || format!("run {id} changed"),
@@ -1932,6 +1969,7 @@ impl SqliteQueue {
             "resume" => {
                 apply(
                     &tx,
+                    refusals(&self.runs_dir, &self.generators),
                     id,
                     None,
                     || format!("run {id} changed"),
@@ -2040,9 +2078,11 @@ fn save_run(
 /// the caller's transaction; the stored (not relocated) run comes back.
 /// A missing run, a command the domain refuses and a row that changed
 /// meanwhile all fail with `refusal`, the message the store has always
-/// given for the operation.
+/// given for the operation. The reason of a domain refusal is not part of
+/// that message; it is kept in `refusals` instead.
 fn apply(
     conn: &Connection,
+    refusals: Refusals<'_>,
     id: &RunId,
     token: Option<&str>,
     refusal: impl Fn() -> String,
@@ -2050,9 +2090,59 @@ fn apply(
 ) -> Result<TaskRun> {
     let run = stored_run(conn, id)?.ok_or_else(|| anyhow!(refusal()))?;
     let from = run.status();
-    let run = command(run).map_err(|_| anyhow!(refusal()))?;
+    let run = command(run).map_err(|reason| {
+        let message = refusal();
+        refusals.record(id, &message, &reason);
+        anyhow!(message)
+    })?;
     ensure!(save_run(conn, &run, from, token)?, refusal());
     Ok(run)
+}
+
+/// The file in a run's directory that keeps why the domain refused a
+/// transition of the run: one `[<unix seconds>] <message>: <DomainError>`
+/// line per refusal, `<message>` being the error the operation returned.
+pub const REFUSALS_LOG: &str = "refusals.log";
+
+/// Where [`apply`] leaves the reason of a refused transition. The
+/// operation's error keeps the message the store has always given, so the
+/// CLI's `{"error"}` and `last_error` do not change; the domain's reason
+/// (the status the run was in and the command) goes to [`REFUSALS_LOG`].
+/// The caller's transaction rolls back after a refusal, which is why the
+/// reason is not a run event.
+#[derive(Clone, Copy)]
+struct Refusals<'a> {
+    runs_dir: &'a Path,
+    generators: &'a Generators,
+}
+
+fn refusals<'a>(runs_dir: &'a Path, generators: &'a Generators) -> Refusals<'a> {
+    Refusals {
+        runs_dir,
+        generators,
+    }
+}
+
+impl Refusals<'_> {
+    /// Append the line. A run directory that is gone or does not accept the
+    /// write loses the line and not the operation's error.
+    fn record(&self, id: &RunId, message: &str, reason: &DomainError) {
+        let run_dir = RunPaths::new(self.runs_dir, id).run_dir;
+        if !run_dir.is_dir() {
+            return;
+        }
+        if let Ok(mut file) = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(run_dir.join(REFUSALS_LOG))
+        {
+            let _ = writeln!(
+                file,
+                "[{}] {message}: {reason}",
+                self.generators.clock.now()
+            );
+        }
+    }
 }
 
 /// Why a workspace close of a run is not recorded.

@@ -203,7 +203,7 @@ domainの関数は業務上の拒否を`DomainError`（`src/domain/error.rs`）�
 | `RunInconsistent` | `TaskRun::restore` | run ID、理由 | `run <id> <reason>` |
 | `InvalidNoteKind` | `NewNote::validate` | kind | `note kind "<kind>" must be a slug of lowercase letters, digits, '-' and '_'` |
 
-`goal close`の判断（閉じたgoalは閉じられない、verdictが所属taskのstatusを許すか）は`goal::close`が持ち、`SqliteQueue::close_goal`はgoalとstatus別件数を読んで渡し、返ったgoalを書くだけである。taskの手動遷移、goalの付け替え、pathsと依存の変更、閉じたgoalへの追加も同じく、`sqlite.rs`は読んでdomainの関数に渡し、その結果を保存する（`ensure!`で業務上の拒否を決める箇所は残っていない）。runの遷移も同じく`runtime_store.rs`は読んで`run`のコマンドに渡し、その結果を保存する。ただしrunのコマンドの拒否（`RunTransitionNotAllowed`）はCLIの`{"error"}`と`last_error`に出る文を変えないため、storeが操作ごとの従来の文（`run is not owned by this supervisor`、`run <id> is not integrating`など）に置き換えて返す。各エラー文はdomainの単体テストで固定している。DBに保存された文字列が既知のenum値でないときは、`enum_col`が`UnknownValue`を`rusqlite`の変換エラーの原因として包む。
+`goal close`の判断（閉じたgoalは閉じられない、verdictが所属taskのstatusを許すか）は`goal::close`が持ち、`SqliteQueue::close_goal`はgoalとstatus別件数を読んで渡し、返ったgoalを書くだけである。taskの手動遷移、goalの付け替え、pathsと依存の変更、閉じたgoalへの追加も同じく、`sqlite.rs`は読んでdomainの関数に渡し、その結果を保存する（`ensure!`で業務上の拒否を決める箇所は残っていない）。runの遷移も同じく`runtime_store.rs`は読んで`run`のコマンドに渡し、その結果を保存する。ただしrunのコマンドの拒否（`RunTransitionNotAllowed`）はCLIの`{"error"}`と`last_error`に出る文を変えないため、storeが操作ごとの従来の文（`run is not owned by this supervisor`、`run <id> is not integrating`など）に置き換えて返す。置き換えたdomainの拒否の理由はrun directoryの`refusals.log`に残す（[persistence](persistence.md#集約の読み書き)）。各エラー文はdomainの単体テストで固定している。DBに保存された文字列が既知のenum値でないときは、`enum_col`が`UnknownValue`を`rusqlite`の変換エラーの原因として包む。
 
 ## Invariants
 
