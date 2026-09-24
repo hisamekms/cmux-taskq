@@ -51,28 +51,15 @@ impl Supervisor<'_> {
                 self.queue
                     .adopt_run(run.id(), &lease.token, &self.token, pid, observed)?
             else {
-                self.log.note(&format!(
-                    "run {} was not adopted: its lease changed while judging it",
-                    run.id()
-                ));
+                info!(run_id = %run.id(), "run {} was not adopted: its lease changed while judging it", run.id());
                 continue;
             };
-            self.log.note(&format!(
-                "run {} adopted from supervisor {} (pid {}, heartbeat {}s old; wrapper pid {} {}): task {} in workspace {}",
-                run.id(),
-                lease.token,
-                lease.pid,
-                now - lease.heartbeat_at,
-                wrapper.as_ref().map_or(0, |w| w.pid),
-                match wrapper.as_ref().map(|w| w.exited_at) {
+            info!(run_id = %run.id(), task_id = %run.task_id(), "run {} adopted from supervisor {} (pid {}, heartbeat {}s old; wrapper pid {} {}): task {} in workspace {}", run.id(), lease.token, lease.pid, now - lease.heartbeat_at, wrapper.as_ref().map_or(0, |w| w.pid), match wrapper.as_ref().map(|w| w.exited_at) {
                     Some(Some(at)) => format!("exited at {at}"),
                     Some(None) if alive == Some(true) => "alive".to_owned(),
                     Some(None) => "gone".to_owned(),
                     None => "none since resume_skipped".to_owned(),
-                },
-                run.task_id(),
-                run.workspace_id().unwrap_or("?")
-            ));
+                }, run.task_id(), run.workspace_id().unwrap_or("?"));
             let phase = if run.status() == RunStatus::AwaitingIntegration {
                 self.adopt_review(&run)
             } else {
@@ -84,7 +71,7 @@ impl Supervisor<'_> {
                     // The lease is this process's now; give it up like any
                     // other runtime error so `recover` can judge the run.
                     let message = format!("run {} could not be resumed: {error:#}", run.id());
-                    self.log.note(&message);
+                    warn!(run_id = %run.id(), error = %format_args!("{error:#}"), "{}", message);
                     self.abandon(&run, message);
                 }
             }

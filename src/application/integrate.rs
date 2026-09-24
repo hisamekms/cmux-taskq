@@ -8,6 +8,7 @@
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
+use tracing::{info, warn};
 
 use super::{
     Clock, IdGenerator, Landing, MainRemote, ProcessControl, Queue, Repository, RunFiles, RunStore,
@@ -311,7 +312,12 @@ pub fn land_integrating(
     let queue = &mut *ctx.queue;
     let repository = ctx.repository;
     let task = queue.show(run.task_id())?.task;
-    eprintln!(
+    // Every event of the landing, the push and the follow-ups carries the run.
+    let _span =
+        tracing::info_span!("integrate", run_id = %run.id(), task_id = %run.task_id()).entered();
+    info!(
+        op = "integrate",
+        main = %main,
         "run {} integrating task {} onto main {main}",
         run.id(),
         run.task_id()
@@ -324,7 +330,12 @@ pub fn land_integrating(
             if let Err(record) =
                 queue.abort_integration(run.id(), token, previous.as_str(), &message)
             {
-                eprintln!("run {}: could not record the error: {record:#}", run.id());
+                warn!(
+                    op = "integrate",
+                    error = %format_args!("{record:#}"),
+                    "run {}: could not record the error: {record:#}",
+                    run.id()
+                );
             }
             return Err(error.context(format!(
                 "run {} returned to {}",
@@ -344,7 +355,9 @@ pub fn land_integrating(
                         landing.commit, run.id()
                     )
                 })?;
-            eprintln!(
+            info!(
+                op = "integrate",
+                commit = %landing.commit,
                 "task {} landed as {} on main; run {} integrated",
                 task.id(),
                 landing.commit,
@@ -362,7 +375,12 @@ pub fn land_integrating(
             }
         }
         Verdict::Deferred { reason, mut detail } => {
-            eprintln!("run {} needs a session: {reason}", run.id());
+            warn!(
+                op = "integrate",
+                reason = %reason,
+                "run {} needs a session: {reason}",
+                run.id()
+            );
             // How many more times the supervisor resumes it (ADR-0019); the
             // event is a person's only once none are left (as an ask).
             detail["resumes_left"] =
@@ -375,7 +393,12 @@ pub fn land_integrating(
             }
         }
         Verdict::ReceiptFailed { reason, receipt } => {
-            eprintln!("run {} failed: {reason}", run.id());
+            warn!(
+                op = "integrate",
+                reason = %reason,
+                "run {} failed: {reason}",
+                run.id()
+            );
             let run = queue.fail_integration(run.id(), token, &reason, receipt)?;
             IntegrationOutcome::Failed {
                 run: Box::new(run),
@@ -431,11 +454,28 @@ fn push_main(
         ),
     };
     match &report.error {
-        Some(error) => eprintln!("run {run_id}: push of main failed: {error}"),
-        None => eprintln!("run {run_id}: {kind} ({PUSH_REMOTE})"),
+        Some(error) => warn!(
+            op = "push",
+            run_id = %run_id,
+            remote = PUSH_REMOTE,
+            error = %error,
+            "run {run_id}: push of main failed: {error}"
+        ),
+        None => info!(
+            op = "push",
+            run_id = %run_id,
+            remote = PUSH_REMOTE,
+            outcome = kind,
+            "run {run_id}: {kind} ({PUSH_REMOTE})"
+        ),
     }
     if let Err(error) = queue.record_runtime_event(run_id, kind, payload) {
-        eprintln!("run {run_id}: could not record {kind}: {error:#}");
+        warn!(
+            op = "push",
+            run_id = %run_id,
+            error = %format_args!("{error:#}"),
+            "run {run_id}: could not record {kind}: {error:#}"
+        );
     }
     report
 }
@@ -480,7 +520,12 @@ pub fn register_follow_ups<Q: Queue + ?Sized>(
             .filter_map(|e| e.payload["index"].as_u64())
             .collect(),
         Err(error) => {
-            eprintln!("run {run_id}: follow_ups not registered: {error:#}");
+            warn!(
+                op = "follow_up",
+                run_id = %run_id,
+                error = %format_args!("{error:#}"),
+                "run {run_id}: follow_ups not registered: {error:#}"
+            );
             return Vec::new();
         }
     };
@@ -488,7 +533,12 @@ pub fn register_follow_ups<Q: Queue + ?Sized>(
         Some(goal_id) => match queue.show_goal(goal_id) {
             Ok(detail) => detail.closed,
             Err(error) => {
-                eprintln!("run {run_id}: follow_ups not registered: {error:#}");
+                warn!(
+                    op = "follow_up",
+                    run_id = %run_id,
+                    error = %format_args!("{error:#}"),
+                    "run {run_id}: follow_ups not registered: {error:#}"
+                );
                 return Vec::new();
             }
         },
@@ -509,7 +559,12 @@ pub fn register_follow_ups<Q: Queue + ?Sized>(
             None
         };
         if let Some(reason) = skipped {
-            eprintln!("run {run_id}: follow_up {index} was not registered: {reason}");
+            warn!(
+                op = "follow_up",
+                run_id = %run_id,
+                reason,
+                "run {run_id}: follow_up {index} was not registered: {reason}"
+            );
             let payload = json!({
                 "task_id": null,
                 "title": entry["title"],
@@ -519,7 +574,12 @@ pub fn register_follow_ups<Q: Queue + ?Sized>(
             });
             if let Err(error) = queue.record_runtime_event(run_id, "follow_up_registered", payload)
             {
-                eprintln!("run {run_id}: could not record follow_up_registered: {error:#}");
+                warn!(
+                    op = "follow_up",
+                    run_id = %run_id,
+                    error = %format_args!("{error:#}"),
+                    "run {run_id}: could not record follow_up_registered: {error:#}"
+                );
             }
             continue;
         }
@@ -541,7 +601,12 @@ pub fn register_follow_ups<Q: Queue + ?Sized>(
         let created = match queue.add(new) {
             Ok(created) => created,
             Err(error) => {
-                eprintln!("run {run_id}: follow_up {title:?} was not registered: {error:#}");
+                warn!(
+                    op = "follow_up",
+                    run_id = %run_id,
+                    error = %format_args!("{error:#}"),
+                    "run {run_id}: follow_up {title:?} was not registered: {error:#}"
+                );
                 continue;
             }
         };
@@ -551,9 +616,17 @@ pub fn register_follow_ups<Q: Queue + ?Sized>(
             payload["goal_closed"] = json!(true);
         }
         if let Err(error) = queue.record_runtime_event(run_id, "follow_up_registered", payload) {
-            eprintln!("run {run_id}: could not record follow_up_registered: {error:#}");
+            warn!(
+                op = "follow_up",
+                run_id = %run_id,
+                error = %format_args!("{error:#}"),
+                "run {run_id}: could not record follow_up_registered: {error:#}"
+            );
         }
-        eprintln!(
+        info!(
+            op = "follow_up",
+            run_id = %run_id,
+            follow_up_task_id = %created.id(),
             "run {run_id}: follow_up {:?} registered as draft task {}",
             created.title(),
             created.id()
@@ -907,12 +980,18 @@ fn remove_landed_worktree(queue: &mut dyn Queue, repository: &dyn Repository, ru
         ),
         Err(error) => {
             let message = format!("landed worktree {worktree} could not be removed: {error:#}");
-            eprintln!("run {}: {message}", run.id());
+            warn!(op = "cleanup", run_id = %run.id(), "run {}: {message}", run.id());
             queue.record_cleanup_failure(run.id(), &message)
         }
     };
     if let Err(error) = recorded {
-        eprintln!("run {}: could not record the cleanup: {error:#}", run.id());
+        warn!(
+            op = "cleanup",
+            run_id = %run.id(),
+            error = %format_args!("{error:#}"),
+            "run {}: could not record the cleanup: {error:#}",
+            run.id()
+        );
     }
 }
 

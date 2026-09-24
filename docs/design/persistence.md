@@ -119,9 +119,11 @@ $XDG_DATA_HOME/dagq/<hash>/              XDG_DATA_HOME が未設定・空・相�
   queue.db                               SQLite（WAL の -wal / -shm も隣に置かれる）
   repository                             束縛先の Git common directory（人向けの逆引き）
   runs/<run-id>/                         prompt、runner、worktree/、claude-settings.json、idle.json、receipt.json、refusals.log、ログ
-  logs/                                  supervisor-<started_at>-<pid>.log（supervise --log-dir）、launchd.log
+  logs/                                  <process>-<UTC time>-<pid>.jsonl（supervise・integrate・observe・session の JSON Lines）、launchd.log、rebind.jsonl、旧 supervisor-<started_at>-<pid>.log
 ~/Library/LaunchAgents/com.dagq.<hash>.plist   up が書く supervisor の LaunchAgent（down が消す）
 ```
+
+`logs/`の中身: `supervise`・`integrate`・`observe`・session wrapperはprocessごとに`<process>-<YYYYMMDDTHHMMSSZ>-<pid>.jsonl`を書く（1行1レコード。`timestamp`・`level`・`target`・`message`・`fields`・`spans`。書式と書けないときの扱いは[supervisor-lifecycle](supervisor-lifecycle.md#logs)、[ADR-0033](../adr/0033-one-tracing-pipeline-with-local-json-lines-and-optional-otlp.md)）。`launchd.log`はlaunchdが拾ったsupervisorのstdout / stderr、`rebind.jsonl`は`rebind`の記録（ADR-0020）。以前のバイナリが書いた`supervisor-<started_at>-<pid>.log`は残し、runtimeは読まない。どれもローテーションせず、消すのは人。
 
 - `<hash>`はcanonicalizeしたGit common directoryのUTF-8 bytesのSHA-256のhex先頭16文字（`repository_hash`）。symlink経由やworktreeからでも同じhashになる。
 - `--db PATH`は明示override。run dirは`dirname PATH`/`runs/`、log dirは`dirname PATH`/`logs/`で、規則はcwd解決と同じ（`runs_dir`）。`git_common_dir`は持たず、`locate`の`source`は`db_flag`になる。LaunchAgentのlabelはrepository queueでは`com.dagq.<hash>`、`--db` queueではDBのpathを同じ関数でhashした`com.dagq.<hash of PATH>`（PATHは正規化した絶対path。ファイルがまだ無ければ存在する親までを正規化して残りを繋ぐ。`up --db ./q.db`と`down --db /abs/q.db`が同じlabelを指すため）。

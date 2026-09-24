@@ -12,7 +12,6 @@ impl Supervisor<'_> {
             self.repository.clone(),
             self.files.clone(),
             run,
-            self.log.clone(),
         )
     }
     /// Plan paths, create the run directory, worktree and workspace. Any
@@ -27,11 +26,8 @@ impl Supervisor<'_> {
         match self.cmux.ensure_group(&self.layout.queue_hash, &name) {
             Ok(group) => Some(group),
             Err(error) => {
-                self.log.note(&format!(
-                    "warning: cmux workspace group {name:?} (external ID {}) could not be made, \
-so the run workspace opens outside it: {error:#}",
-                    self.layout.queue_hash
-                ));
+                warn!(error = %format_args!("{error:#}"), "warning: cmux workspace group {name:?} (external ID {}) could not be made, \
+so the run workspace opens outside it: {error:#}", self.layout.queue_hash);
                 None
             }
         }
@@ -111,12 +107,7 @@ so the run workspace opens outside it: {error:#}",
         let workspace = self.cmux.create(&task, &run, &command, &tags)?;
         self.queue
             .workspace_created(run.id(), &self.token, &workspace)?;
-        self.log.note(&format!(
-            "task {} running in workspace {}; run {}",
-            run.task_id(),
-            workspace,
-            run.id()
-        ));
+        info!(task_id = %run.task_id(), run_id = %run.id(), "task {} running in workspace {}; run {}", run.task_id(), workspace, run.id());
         Ok(SessionWatch {
             workspace,
             run_dir,
@@ -193,10 +184,7 @@ impl SessionWatch {
                 "receipt_observed",
                 json!({"path": path_text(&self.receipt_path)?, "validated": false}),
             )?;
-            sv.log.note(&format!(
-                "receipt received for {}; waiting for the session to go idle (or a person's /exit)",
-                run.id()
-            ));
+            info!(run_id = %run.id(), "receipt received for {}; waiting for the session to go idle (or a person's /exit)", run.id());
         }
         let wrapper = processes.iter().find(|p| p.role == "wrapper");
         // A session that already ended (on its own, by a person's /exit,
@@ -227,10 +215,7 @@ impl SessionWatch {
             // The session stays open through validation and review, and
             // is asked to exit only once the verdict is known (ADR-0027
             // decision 1).
-            sv.log.note(&format!(
-                "session of {} is idle after its receipt; validating with the session open",
-                run.id()
-            ));
+            info!(run_id = %run.id(), "session of {} is idle after its receipt; validating with the session open", run.id());
             return sv
                 .queue
                 .finish_supervision_live(run.id(), &sv.token)
@@ -254,11 +239,7 @@ impl SessionWatch {
                     .queue
                     .close_stuck_exit_asks(run.id(), STUCK_EXIT_CLOSED)?
                 {
-                    sv.log.note(&format!(
-                        "session of {} exited; closed its stuck_exit ask {}",
-                        run.id(),
-                        ask.id
-                    ));
+                    info!(run_id = %run.id(), ask_id = %ask.id, "session of {} exited; closed its stuck_exit ask {}", run.id(), ask.id);
                 }
                 close_answer_prompt_asks(sv, run, PROMPT_EXITED_CLOSED)?;
                 return sv.queue.finish_supervision(run.id(), &sv.token).map(Some);
@@ -282,10 +263,7 @@ impl SessionWatch {
                         json!({"workspace_id": self.workspace, "timeout_secs": timeout.as_secs()}),
                     )?;
                     sv.cmux.send_exit(&self.workspace)?;
-                    sv.log.note(&format!(
-                        "exit requested for {} after its wrapper went silent; waiting for session exit",
-                        run.id()
-                    ));
+                    info!(run_id = %run.id(), "exit requested for {} after its wrapper went silent; waiting for session exit", run.id());
                     self.exit_requested = Some(Instant::now());
                     self.exit_for_silence = true;
                 }
@@ -322,12 +300,7 @@ impl SessionWatch {
                     "exit_request_timed_out",
                     json!({"workspace_id": self.workspace, "timeout_secs": timeout.as_secs()}),
                 )?;
-                sv.log.note(&format!(
-                    "session for {} did not exit within {}s of the exit request; keeping the run and asking the inbox to send /exit in workspace {}",
-                    run.id(),
-                    timeout.as_secs(),
-                    self.workspace
-                ));
+                warn!(run_id = %run.id(), "session for {} did not exit within {}s of the exit request; keeping the run and asking the inbox to send /exit in workspace {}", run.id(), timeout.as_secs(), self.workspace);
                 self.exit_timed_out = true;
             }
         }
@@ -365,10 +338,7 @@ impl SessionWatch {
         let head = match sv.repository.head(Path::new(worktree)) {
             Ok(head) => head,
             Err(error) => {
-                sv.log.note(&format!(
-                    "HEAD of {} could not be read for its first commit: {error:#}",
-                    run.id()
-                ));
+                warn!(run_id = %run.id(), error = %format_args!("{error:#}"), "HEAD of {} could not be read for its first commit: {error:#}", run.id());
                 return Ok(());
             }
         };
@@ -427,10 +397,7 @@ impl SessionWatch {
         let screen = match sv.cmux.capture(&self.workspace) {
             Ok(screen) => screen,
             Err(error) => {
-                sv.log.note(&format!(
-                    "screen of {} could not be read for a dialog: {error:#}",
-                    run.id()
-                ));
+                warn!(run_id = %run.id(), error = %format_args!("{error:#}"), "screen of {} could not be read for a dialog: {error:#}", run.id());
                 return Ok(());
             }
         };
@@ -449,12 +416,7 @@ impl SessionWatch {
                             "prompt": kind,
                         }),
                     )?;
-                    sv.log.note(&format!(
-                        "run {} waits at a {} dialog in workspace {}; asking the inbox",
-                        run.id(),
-                        kind,
-                        self.workspace
-                    ));
+                    info!(run_id = %run.id(), "run {} waits at a {} dialog in workspace {}; asking the inbox", run.id(), kind, self.workspace);
                     // A changed screen under an open ask keeps that ask (the
                     // open ask of the run is returned, and nobody is notified
                     // again), so a ticking line cannot flood the inbox.
@@ -505,17 +467,12 @@ impl SessionWatch {
                 // Sent: failing to record it must not cost the live run its
                 // lease, so it is only noted (the ask then shows unclosed).
                 Ok(()) => match sv.queue.ask_delivered(ask.id, &self.workspace) {
-                    Ok(_) => sv.log.note(&format!(
-                        "answer of ask {} sent to run {} in workspace {}",
-                        ask.id,
-                        run.id(),
-                        self.workspace
-                    )),
-                    Err(error) => sv.log.note(&format!(
-                        "answer of ask {} was sent to run {} but could not be recorded: {error:#}",
-                        ask.id,
-                        run.id()
-                    )),
+                    Ok(_) => {
+                        info!(ask_id = %ask.id, run_id = %run.id(), "answer of ask {} sent to run {} in workspace {}", ask.id, run.id(), self.workspace)
+                    }
+                    Err(error) => {
+                        warn!(ask_id = %ask.id, run_id = %run.id(), error = %format_args!("{error:#}"), "answer of ask {} was sent to run {} but could not be recorded: {error:#}", ask.id, run.id())
+                    }
                 },
                 Err(error) => {
                     sv.queue.record_runtime_event(
@@ -527,10 +484,7 @@ impl SessionWatch {
                             "error": format!("{error:#}"),
                         }),
                     )?;
-                    sv.log.note(&format!(
-                        "answer of ask {} could not be sent to run {} in workspace {}: {error:#}; it is left to the inbox",
-                        ask.id, run.id(), self.workspace
-                    ));
+                    warn!(ask_id = %ask.id, run_id = %run.id(), error = %format_args!("{error:#}"), "answer of ask {} could not be sent to run {} in workspace {}: {error:#}; it is left to the inbox", ask.id, run.id(), self.workspace);
                 }
             }
         }
@@ -545,7 +499,7 @@ impl SessionWatch {
                 "prompt_cleared",
                 json!({"workspace_id": self.workspace}),
             )?;
-            sv.log.note(&format!("dialog of {} is gone", run.id()));
+            info!(run_id = %run.id(), "dialog of {} is gone", run.id());
             close_answer_prompt_asks(sv, run, PROMPT_CLEARED_CLOSED)?;
         }
         Ok(())
@@ -584,12 +538,7 @@ pub(super) fn ask_answer_prompt(
         },
         sv.cmux,
     )?;
-    sv.log.note(&format!(
-        "answer_prompt ask {} for {} (notified: {})",
-        outcome["id"],
-        run.id(),
-        outcome["notified"]
-    ));
+    info!(ask_id = %outcome["id"], run_id = %run.id(), "answer_prompt ask {} for {} (notified: {})", outcome["id"], run.id(), outcome["notified"]);
     Ok(())
 }
 
@@ -600,11 +549,7 @@ pub(super) fn close_answer_prompt_asks(
     answer: &str,
 ) -> Result<()> {
     for ask in sv.queue.close_answer_prompt_asks(run.id(), answer)? {
-        sv.log.note(&format!(
-            "closed the answer_prompt ask {} of {}: {answer}",
-            ask.id,
-            run.id()
-        ));
+        info!(ask_id = %ask.id, run_id = %run.id(), "closed the answer_prompt ask {} of {}: {answer}", ask.id, run.id());
     }
     Ok(())
 }

@@ -16,6 +16,7 @@ use dagq::{
         location::QueueLocation,
         run_files::LocalRunFiles,
         sqlite::SqliteQueue,
+        telemetry::Telemetry,
     },
     runtime::{self, IntegrateTarget, SuperviseOptions},
 };
@@ -2285,15 +2286,16 @@ fn failed_backend_calls_are_recorded_with_the_load_and_counted_by_stats() {
 /// log, and the run opens outside any group (ADR-0026).
 #[test]
 fn a_workspace_group_cmux_cannot_make_is_a_logged_warning() {
-    let (dir, repo, db) = fixture();
+    let (_dir, repo, db) = fixture();
     let mut queue = SqliteQueue::open(&db).unwrap();
     add_ready_task(&mut queue, "grouped", &[]);
     let mut backend = TestWorkspace::new(&db, false, VALID_AGENT);
     backend.group_fails = true;
-    let mut options = supervise_options(1, true);
-    let logs = dir.path().join("logs");
-    options.log_dir = Some(logs.clone());
-    let outcome = supervise_with(&db, &repo, &backend, &options).unwrap();
+    let options = supervise_options(1, true);
+    let (telemetry, captured) = Telemetry::capture();
+    let outcome = telemetry
+        .in_scope(|| supervise_with(&db, &repo, &backend, &options))
+        .unwrap();
     backend.join();
     assert_eq!(outcome["errors"], json!([]), "{outcome}");
     assert_eq!(
@@ -2301,13 +2303,11 @@ fn a_workspace_group_cmux_cannot_make_is_a_logged_warning() {
         RunStatus::AwaitingIntegration
     );
     assert_eq!(backend.tags.lock().unwrap()[0].group, None);
-    let log = fs::read_dir(&logs)
-        .unwrap()
-        .map(|entry| fs::read_to_string(entry.unwrap().path()).unwrap())
-        .collect::<String>();
+    let log = captured.text();
     assert!(
         log.contains("warning: cmux workspace group")
-            && log.contains("workspace-group create failed"),
+            && log.contains("workspace-group create failed")
+            && log.contains("\"level\":\"WARN\""),
         "{log}"
     );
     // The group belongs to no run, so its failure is recorded without one.
@@ -2797,45 +2797,40 @@ fn resident_supervisor_without_runs_is_listed_until_it_stops() {
     assert!(queue.show(TaskId::new(1)).unwrap().runs.is_empty());
 }
 
-/// `--log-dir` adds one file per supervisor start, named by the
-/// registration's `started_at` and the PID, with the startup facts, the
-/// progress messages that also go to stderr, and the final result.
+/// A supervisor's progress goes to its process's JSON Lines file in the
+/// log directory (ADR-0033): one record per line, with the startup facts,
+/// the progress messages that also go to stderr, their run and task IDs as
+/// fields, and the final result.
 #[test]
-fn supervise_log_dir_records_each_start_in_its_own_file() {
+fn supervise_records_its_progress_as_json_lines() {
     let (dir, repo, db) = fixture();
     let log_dir = dir.path().join("logs").join("nested");
-    let mut options = supervise_options(2, true);
-    options.log_dir = Some(log_dir.clone());
+    let options = supervise_options(2, true);
     let backend = TestWorkspace::new(&db, false, VALID_AGENT);
-    let before = SystemClock.now();
-    let outcome = supervise_with(&db, &repo, &backend, &options).unwrap();
+    let telemetry = Telemetry::open(&log_dir, "supervise");
+    let outcome = telemetry
+        .in_scope(|| supervise_with(&db, &repo, &backend, &options))
+        .unwrap();
     backend.join();
     assert_eq!(outcome["outcome"], "finished");
     let pid = std::process::id();
-    let logs = |pid: u32| -> Vec<PathBuf> {
-        let mut logs: Vec<PathBuf> = fs::read_dir(&log_dir)
-            .unwrap()
-            .map(|entry| entry.unwrap().path())
-            .filter(|path| {
-                let name = path.file_name().unwrap().to_str().unwrap();
-                name.starts_with("supervisor-") && name.ends_with(&format!("-{pid}.log"))
-            })
-            .collect();
-        logs.sort();
-        logs
-    };
-    let first = logs(pid);
-    assert_eq!(first.len(), 1, "{first:?}");
-    let name = first[0].file_name().unwrap().to_str().unwrap();
-    let started_at: i64 = name
-        .strip_prefix("supervisor-")
-        .unwrap()
-        .strip_suffix(&format!("-{pid}.log"))
-        .unwrap()
-        .parse()
-        .unwrap();
-    assert!(started_at >= before && started_at <= SystemClock.now());
-    let text = fs::read_to_string(&first[0]).unwrap();
+    let path = telemetry.path.clone().unwrap();
+    let name = path.file_name().unwrap().to_str().unwrap();
+    assert!(
+        name.starts_with("supervise-") && name.ends_with(&format!("Z-{pid}.jsonl")),
+        "{name}"
+    );
+    assert_eq!(path.parent().unwrap(), log_dir);
+    let text = fs::read_to_string(&path).unwrap();
+    let records: Vec<Value> = text
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(records[0]["message"], "dagq supervise started");
+    let messages: Vec<&str> = records
+        .iter()
+        .map(|r| r["message"].as_str().unwrap())
+        .collect();
     let mut queue = SqliteQueue::open(&db).unwrap();
     let run = queue.show(TaskId::new(1)).unwrap().runs.remove(0);
     let token: String = Connection::open(&db)
@@ -2847,43 +2842,32 @@ fn supervise_log_dir_records_each_start_in_its_own_file() {
         )
         .unwrap();
     assert!(
-        text.contains(&format!(
-            "] supervisor {token} started: version {VERSION}, pid {pid}, parallel 2, db {}, repository {}",
+        messages.contains(&format!(
+            "supervisor {token} started: version {VERSION}, pid {pid}, parallel 2, db {}, repository {}",
             db.canonicalize().unwrap().display(),
             repo.canonicalize().unwrap().display()
-        )),
+        ).as_str()),
         "{text}"
     );
-    assert!(text.contains(&format!(
-        "task 1 running in workspace {WORKSPACE_ID}; run {}",
-        run.id()
-    )));
+    let running = records
+        .iter()
+        .find(|r| {
+            r["message"]
+                == format!(
+                    "task 1 running in workspace {WORKSPACE_ID}; run {}",
+                    run.id()
+                )
+        })
+        .unwrap();
+    assert_eq!(running["fields"]["run_id"], run.id().as_str());
+    assert_eq!(running["fields"]["task_id"], "1");
+    assert_eq!(running["level"], "INFO");
+    assert_eq!(running["target"], "dagq::application::supervise::session");
     assert!(text.contains(&format!("receipt received for {}", run.id())));
     assert!(text.contains(&format!("run {} is awaiting_integration", run.id())));
-    assert!(text.contains(&format!(
-        "] supervisor {token} exiting: {{\"errors\":[],\"outcome\":\"finished\""
-    )));
-
-    // A second start in a later second gets its own file.
-    while SystemClock.now() <= started_at {
-        thread::sleep(Duration::from_millis(20));
-    }
-    let outcome = supervise_with(&db, &repo, &backend, &options).unwrap();
-    assert_eq!(outcome["outcome"], "finished");
-    assert_eq!(outcome["runs"], json!([]));
-    let second = logs(pid);
-    assert_eq!(second.len(), 2, "{second:?}");
-    let text = fs::read_to_string(second.iter().find(|p| *p != &first[0]).unwrap()).unwrap();
-    assert!(text.contains(&format!("started: version {VERSION}, pid")));
-    assert!(!text.contains("task 1 running"));
-
-    // A log directory that cannot be created is a startup failure that
-    // leaves no registration behind (launchd would retry forever).
-    options.log_dir = Some(dir.path().join("seed-file-as-dir"));
-    fs::write(options.log_dir.as_ref().unwrap(), "not a directory").unwrap();
-    let error = supervise_with(&db, &repo, &backend, &options).unwrap_err();
-    assert!(format!("{error:#}").contains("create"), "{error:#}");
-    assert!(queue.supervisors().unwrap().is_empty());
+    assert!(messages.iter().any(|m| m.starts_with(&format!(
+        "supervisor {token} exiting: {{\"errors\":[],\"outcome\":\"finished\""
+    ))));
 }
 
 /// A registration whose process died, or whose heartbeat stopped, is

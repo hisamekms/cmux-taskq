@@ -92,11 +92,7 @@ impl ExitWatch {
                 .queue
                 .close_stuck_exit_asks(run.id(), STUCK_EXIT_CLOSED)?
             {
-                sv.log.note(&format!(
-                    "session of {} exited; closed its stuck_exit ask {}",
-                    run.id(),
-                    ask.id
-                ));
+                info!(run_id = %run.id(), ask_id = %ask.id, "session of {} exited; closed its stuck_exit ask {}", run.id(), ask.id);
             }
             return Ok(true);
         };
@@ -121,10 +117,7 @@ impl ExitWatch {
                 // the work ends and writes a marker without it.
                 if !self.background_noted {
                     self.background_noted = true;
-                    sv.log.note(&format!(
-                        "session of {} has background work running; /exit waits for it",
-                        run.id()
-                    ));
+                    info!(run_id = %run.id(), "session of {} has background work running; /exit waits for it", run.id());
                 }
             }
             None => {
@@ -138,10 +131,7 @@ impl ExitWatch {
                 )?;
                 // Ask once, the way a person would; never kill the session.
                 sv.cmux.send_exit(&session.workspace)?;
-                sv.log.note(&format!(
-                    "exit requested for {}; waiting for session exit",
-                    run.id()
-                ));
+                info!(run_id = %run.id(), "exit requested for {}; waiting for session exit", run.id());
                 self.requested = Some(Instant::now());
                 self.exit_for_silence = matches!(pulse, WrapperPulse::Silent);
             }
@@ -152,12 +142,7 @@ impl ExitWatch {
                     "exit_request_timed_out",
                     json!({"workspace_id": session.workspace, "timeout_secs": timeout.as_secs()}),
                 )?;
-                sv.log.note(&format!(
-                    "session for {} did not exit within {}s of the exit request; keeping the run and asking the inbox to send /exit in workspace {}",
-                    run.id(),
-                    timeout.as_secs(),
-                    session.workspace
-                ));
+                warn!(run_id = %run.id(), "session for {} did not exit within {}s of the exit request; keeping the run and asking the inbox to send /exit in workspace {}", run.id(), timeout.as_secs(), session.workspace);
                 self.timed_out = true;
             }
             Some(_) => (),
@@ -209,12 +194,7 @@ pub(super) fn ask_stuck_exit(
         },
         sv.cmux,
     )?;
-    sv.log.note(&format!(
-        "stuck_exit ask {} for {} (notified: {})",
-        outcome["id"],
-        run.id(),
-        outcome["notified"]
-    ));
+    info!(ask_id = %outcome["id"], run_id = %run.id(), "stuck_exit ask {} for {} (notified: {})", outcome["id"], run.id(), outcome["notified"]);
     Ok(())
 }
 
@@ -267,11 +247,7 @@ pub(super) fn wrapper_pulse(
                 .queue
                 .close_stuck_exit_asks(run.id(), STUCK_EXIT_CLOSED)?
             {
-                sv.log.note(&format!(
-                    "wrapper of {} died without recording its exit; closed its stuck_exit ask {}",
-                    run.id(),
-                    ask.id
-                ));
+                info!(run_id = %run.id(), ask_id = %ask.id, "wrapper of {} died without recording its exit; closed its stuck_exit ask {}", run.id(), ask.id);
             }
         }
         bail!("{message}");
@@ -282,11 +258,7 @@ pub(super) fn wrapper_pulse(
             "wrapper_heartbeat_expired",
             json!({"pid": wrapper.pid, "heartbeat_age_secs": age, "workspace_id": workspace}),
         )?;
-        sv.log.note(&format!(
-            "wrapper of {} (pid {}) stopped heartbeating {age}s ago but its process is alive; asking its session in workspace {workspace} to exit",
-            run.id(),
-            wrapper.pid
-        ));
+        info!(run_id = %run.id(), "wrapper of {} (pid {}) stopped heartbeating {age}s ago but its process is alive; asking its session in workspace {workspace} to exit", run.id(), wrapper.pid);
         *noted = true;
     }
     Ok(WrapperPulse::Silent)

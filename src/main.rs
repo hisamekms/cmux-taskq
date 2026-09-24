@@ -205,8 +205,9 @@ enum Command {
         /// Claude Code executable; a bare name is resolved on PATH.
         #[arg(long, default_value = "claude")]
         claude: PathBuf,
-        /// Write one supervisor-<started_at>-<pid>.log per start into this
-        /// directory (created if missing) in addition to stderr.
+        /// Write this start's JSON Lines log (supervise-<UTC time>-<pid>.jsonl)
+        /// into this directory (created if missing) instead of the queue's
+        /// logs/; messages also go to stderr.
         #[arg(long)]
         log_dir: Option<PathBuf>,
         /// Start the observer job (`observe`) when this many seconds passed
@@ -588,6 +589,7 @@ fn execute(cli: Cli) -> Result<Value> {
     let cwd = env::current_dir().context("working directory is unavailable")?;
     let location = QueueLocation::resolve(cli.db.as_deref(), &cwd)?;
     let db = location.db.clone();
+    install_telemetry(&cli.command, &location);
     // The binding is checked on every command of a repository queue; a `--db`
     // queue is bound by its first `supervise` and checked there and by `integrate`.
     let common_dir = location
@@ -871,7 +873,7 @@ fn execute(cli: Cli) -> Result<Value> {
             once,
             cmux,
             claude,
-            log_dir,
+            log_dir: _,
             observe_interval,
             observe_daily,
         } => {
@@ -879,7 +881,6 @@ fn execute(cli: Cli) -> Result<Value> {
             use dagq::infrastructure::adapters::{Cmux, executable};
             let options = SuperviseOptions {
                 stop: install_stop_signal()?,
-                log_dir,
                 // A one-shot pass observes only when asked to.
                 observe_interval: Duration::from_secs(observe_interval.unwrap_or(if once {
                     0
@@ -1056,6 +1057,30 @@ fn execute(cli: Cli) -> Result<Value> {
     })
 }
 
+/// The subscriber of this process's progress and diagnostic events
+/// (ADR-0033): the long-running and landing processes (`supervise`,
+/// `integrate`, `observe` and the session wrapper) keep a JSON Lines file
+/// in the queue's `logs/` (a supervisor's `--log-dir` if given); every
+/// other command prints its messages on stderr only.
+fn install_telemetry(command: &Command, location: &QueueLocation) {
+    use dagq::infrastructure::telemetry::Telemetry;
+    let file = match command {
+        Command::Supervise { log_dir, .. } => Some((
+            "supervise",
+            log_dir.clone().unwrap_or_else(|| location.log_dir.clone()),
+        )),
+        Command::Integrate { .. } => Some(("integrate", location.log_dir.clone())),
+        Command::Observe { .. } => Some(("observe", location.log_dir.clone())),
+        Command::Session { .. } => Some(("session", location.log_dir.clone())),
+        _ => None,
+    };
+    let telemetry = match file {
+        Some((process, dir)) => Telemetry::open(&dir, process),
+        None => Telemetry::stderr(),
+    };
+    telemetry.install();
+}
+
 fn current_uid() -> u32 {
     // SAFETY: getuid has no preconditions and cannot fail.
     unsafe { libc::getuid() }
@@ -1099,6 +1124,13 @@ fn main() -> ExitCode {
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
+            // The command's own failure, in its log file too; stderr gets
+            // the error JSON below as always.
+            tracing::error!(
+                target: "dagq::telemetry::exit",
+                error = %format_args!("{error:#}"),
+                "dagq exited with an error: {error:#}"
+            );
             eprintln!("{}", json!({"error": format!("{error:#}")}));
             ExitCode::FAILURE
         }

@@ -1719,6 +1719,22 @@ impl Drop for AgentGuard {
     }
 }
 
+/// The records of a JSON Lines log; each line must be one JSON object.
+fn log_records(path: &Path) -> Vec<Value> {
+    fs::read_to_string(path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap_or_else(|e| panic!("{e}: {line}")))
+        .collect()
+}
+
+fn log_messages(path: &Path) -> Vec<String> {
+    log_records(path)
+        .iter()
+        .map(|record| record["message"].as_str().unwrap().to_owned())
+        .collect()
+}
+
 fn uid() -> u32 {
     // SAFETY: getuid has no preconditions.
     unsafe { libc::getuid() }
@@ -1859,16 +1875,16 @@ fn up_starts_a_launchd_supervisor_that_status_lists_and_down_wait_stops_it() {
                 .unwrap()
                 .to_str()
                 .unwrap()
-                .ends_with(&format!("-{pid}.log"))
+                .ends_with(&format!("-{pid}.jsonl"))
         })
         .collect();
     assert_eq!(logs.len(), 1, "{logs:?}");
-    let log = fs::read_to_string(&logs[0]).unwrap();
+    let log = log_messages(&logs[0]);
     assert!(
-        log.contains(&format!(
+        log.iter().any(|m| m.contains(&format!(
             "started: version {VERSION}, pid {pid}, parallel 2"
-        )),
-        "{log}"
+        ))),
+        "{log:?}"
     );
 
     let status = dagq(env, &["status"]);
@@ -1906,10 +1922,11 @@ fn up_starts_a_launchd_supervisor_that_status_lists_and_down_wait_stops_it() {
     assert!(!plist.exists(), "the plist was not removed");
     let status = dagq(env, &["status"]);
     assert_eq!(status["supervisors"], Value::Array(vec![]), "{status}");
-    let log = fs::read_to_string(&logs[0]).unwrap();
+    let log = log_messages(&logs[0]);
     assert!(
-        log.contains("exiting: {\"errors\":[],\"outcome\":\"stopped\""),
-        "{log}"
+        log.iter()
+            .any(|m| m.contains("exiting: {\"errors\":[],\"outcome\":\"stopped\"")),
+        "{log:?}"
     );
     // The inbox and planner workspaces are left open by `down`; the guard
     // closes them.
@@ -2043,23 +2060,99 @@ fn up_in_cmux_starts_a_supervisor_in_a_workspace_that_down_wait_stops_and_closes
             .success(),
         "launchd has an agent for {label}"
     );
-    // The supervisor in the workspace writes to the queue's log directory,
-    // exactly as the launchd-run one does: `--log-dir` is on its command.
+    // The supervisor in the workspace writes its JSON Lines log to the
+    // queue's log directory, exactly as the launchd-run one does
+    // (ADR-0033): the file outlives the workspace.
     let logs: Vec<PathBuf> = fs::read_dir(&log_dir)
         .unwrap()
         .map(|entry| entry.unwrap().path())
         .filter(|path| {
-            path.file_name()
-                .unwrap()
-                .to_str()
-                .unwrap()
-                .ends_with(&format!("-{pid}.log"))
+            let name = path.file_name().unwrap().to_str().unwrap();
+            name.starts_with("supervise-") && name.ends_with(&format!("-{pid}.jsonl"))
         })
         .collect();
     assert_eq!(logs.len(), 1, "{logs:?} in {}", log_dir.display());
-    assert!(fs::read_to_string(&logs[0]).unwrap().contains(&format!(
-        "started: version {VERSION}, pid {pid}, parallel 2"
-    )));
+    let supervisor_log = logs[0].clone();
+    assert!(
+        log_messages(&supervisor_log)
+            .iter()
+            .any(|m| m.contains(&format!(
+                "started: version {VERSION}, pid {pid}, parallel 2"
+            )))
+    );
+
+    // The in-cmux supervisor lands a task, and its integrate progress and
+    // the failed push of main (origin does not exist) are records in that
+    // file, not only lines on the workspace's screen.
+    let task_id = add_ready_task_described(
+        env,
+        "logged landing",
+        "Add e2e.txt to the worktree. E2E-REVIEW-PASS",
+        &[],
+        &[],
+    );
+    let missing_origin = repo.parent().unwrap().join("missing-origin.git");
+    git(
+        repo,
+        &["remote", "add", "origin", missing_origin.to_str().unwrap()],
+    );
+    let deadline = Instant::now() + Duration::from_secs(180);
+    let run_id = loop {
+        let detail = dagq(env, &["show", &task_id, "--full"]);
+        if let Some(id) = detail["runs"][0]["workspace_id"].as_str()
+            && !workspaces.ids.iter().any(|known| known == id)
+        {
+            workspaces.ids.push(id.to_owned());
+        }
+        if detail["task"]["status"] == "completed" {
+            break detail["runs"][0]["id"].as_str().unwrap().to_owned();
+        }
+        assert!(
+            Instant::now() < deadline,
+            "task {task_id} did not land: {detail}\n{:?}",
+            log_messages(&supervisor_log)
+        );
+        thread::sleep(Duration::from_millis(500));
+    };
+    // main is pushed after the task completes; wait for its record.
+    let pushed = format!("run {run_id}: push of main failed");
+    let records = loop {
+        let records = log_records(&supervisor_log);
+        if records
+            .iter()
+            .any(|r| r["message"].as_str().unwrap().contains(&pushed))
+        {
+            break records;
+        }
+        assert!(Instant::now() < deadline, "no push record: {records:#?}");
+        thread::sleep(Duration::from_millis(200));
+    };
+    let find = |needle: &str| {
+        records
+            .iter()
+            .find(|r| r["message"].as_str().unwrap().contains(needle))
+            .unwrap_or_else(|| panic!("no record with {needle:?} in {records:#?}"))
+            .clone()
+    };
+    let integrating = find(&format!(
+        "run {run_id} integrating task {task_id} onto main"
+    ));
+    assert_eq!(integrating["level"], "INFO");
+    assert_eq!(integrating["target"], "dagq::application::integrate");
+    assert_eq!(integrating["fields"]["op"], "integrate");
+    assert_eq!(integrating["fields"]["run_id"], run_id.as_str());
+    assert_eq!(integrating["fields"]["task_id"], task_id.as_str());
+    assert_eq!(integrating["spans"][0]["name"], "integrate");
+    let landed = find(&format!("task {task_id} landed as"));
+    assert_eq!(landed["fields"]["run_id"], run_id.as_str());
+    let push = find(&pushed);
+    assert_eq!(push["level"], "WARN");
+    assert_eq!(push["fields"]["op"], "push");
+    assert!(push["fields"]["error"].as_str().is_some(), "{push}");
+    eprintln!("in-cmux supervisor log {}:", supervisor_log.display());
+    for record in [&integrating, &landed, &push] {
+        eprintln!("{record}");
+    }
 
     let status = dagq(env, &["status"]);
     let supervisors = status["supervisors"].as_array().unwrap();

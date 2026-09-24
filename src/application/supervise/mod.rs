@@ -12,8 +12,10 @@
 //! ([`Verifier`]), cmux ([`WorkspaceBackend`]), the agent
 //! ([`AgentProvider`]) and what it shows and writes ([`AgentSignals`]),
 //! the processes it starts ([`Spawner`]) and checks ([`ProcessControl`]),
-//! the run files ([`RunFiles`]), its log ([`NoteLog`]) and the time and
-//! IDs ([`Generators`]).
+//! the run files ([`RunFiles`]) and the time and IDs ([`Generators`]).
+//! Progress and diagnostics are `tracing` events with `run_id` /
+//! `task_id` / `ask_id` / `error` fields; the entry point picks their
+//! subscriber (ADR-0033).
 //!
 //! This module holds the loop and the state machine of a slot (`Phase`,
 //! `step`); each phase's watch and the supervisor's methods for it are in
@@ -36,9 +38,10 @@ use std::{
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+use tracing::{error, info, warn};
 
 use super::{
-    AgentProvider, AgentSignals, CommandSpec, Generators, IdleHook, LeasedRun, MainRemote, NoteLog,
+    AgentProvider, AgentSignals, CommandSpec, Generators, IdleHook, LeasedRun, MainRemote,
     ProcessControl, Queue, QueueOpener, Repository, ResumeCandidate, RunFiles, Spawned, Spawner,
     Streams, TRIAGE_ASKER, TriageAction, Validation, Verifier, WorkspaceBackend, WorkspaceTags,
     ask, dependency_graph,
@@ -171,10 +174,19 @@ pub struct Ports<'a> {
     /// Writes a task's review material (`review`) and reports its path.
     pub review_material: &'a dyn Fn(TaskId) -> Result<Value>,
     /// The log of this start, given the registration's `started_at`.
-    pub open_log: &'a dyn Fn(i64) -> Result<Arc<dyn NoteLog>>,
     /// The 1-minute load average recorded with a failed cmux call.
     pub load_average: fn() -> Option<f64>,
     pub layout: Layout,
+}
+
+/// Spawn a thread that reports its `tracing` events to the subscriber of
+/// the spawning thread, so a supervisor run under a scoped subscriber (the
+/// tests) keeps the events of its heartbeat, validations and landings.
+pub fn spawn_traced<T: Send + 'static>(
+    work: impl FnOnce() -> T + Send + 'static,
+) -> thread::JoinHandle<T> {
+    let dispatch = tracing::dispatcher::get_default(Clone::clone);
+    thread::spawn(move || tracing::dispatcher::with_default(&dispatch, work))
 }
 
 /// One process heartbeats its registration (a resident supervisor) and every
@@ -190,7 +202,7 @@ impl Heartbeat {
         let (stop, recv) = mpsc::channel();
         let failed = Arc::new(AtomicBool::new(false));
         let flag = failed.clone();
-        let worker = thread::spawn(move || {
+        let worker = spawn_traced(move || {
             let result = (|| -> Result<()> {
                 let mut queue = queues.open()?;
                 loop {
@@ -203,7 +215,7 @@ impl Heartbeat {
                 Ok(())
             })();
             if let Err(error) = result {
-                eprintln!("supervisor heartbeat failed: {error:#}");
+                error!(error = %format_args!("{error:#}"), "supervisor heartbeat failed: {error:#}");
                 flag.store(true, Ordering::SeqCst);
             }
         });
@@ -263,21 +275,13 @@ pub fn supervise(ports: &Ports<'_>, settings: &LoopSettings) -> Result<Value> {
     let parallel =
         u32::try_from(settings.parallel).context("parallel does not fit a registration")?;
     let pid = layout.pid;
-    let registration = queue.register_supervisor(&token, pid, parallel, &layout.version)?;
-    let log = match (ports.open_log)(registration.started_at) {
-        Ok(log) => log,
-        Err(error) => {
-            // Not a supervisor after all: leave no row for `status`.
-            let _ = queue.deregister_supervisor(&token);
-            return Err(error);
-        }
-    };
-    log.note(&format!(
+    queue.register_supervisor(&token, pid, parallel, &layout.version)?;
+    info!(
         "supervisor {token} started: version {}, pid {pid}, parallel {parallel}, db {}, repository {}",
         layout.version,
         layout.db.display(),
         layout.repo_root.display()
-    ));
+    );
     let heartbeat = Heartbeat::start(ports.queues.clone(), token.clone());
     let cmux = RecordingBackend::over(
         ports.cmux,
@@ -301,7 +305,6 @@ pub fn supervise(ports: &Ports<'_>, settings: &LoopSettings) -> Result<Value> {
         review_material: ports.review_material,
         token,
         heartbeat,
-        log: log.clone(),
         slots: Vec::new(),
         finished: Vec::new(),
         errors: Vec::new(),
@@ -314,11 +317,10 @@ pub fn supervise(ports: &Ports<'_>, settings: &LoopSettings) -> Result<Value> {
     };
     let result = supervisor.run_loop(settings);
     match &result {
-        Ok(value) => log.note(&format!("supervisor {} exiting: {value}", supervisor.token)),
-        Err(error) => log.note(&format!(
-            "supervisor {} failed: {error:#}",
-            supervisor.token
-        )),
+        Ok(value) => info!("supervisor {} exiting: {value}", supervisor.token),
+        Err(error) => {
+            error!(error = %format_args!("{error:#}"), "supervisor {} failed: {error:#}", supervisor.token)
+        }
     }
     result
 }
@@ -342,7 +344,6 @@ struct Supervisor<'a> {
     review_material: &'a dyn Fn(TaskId) -> Result<Value>,
     token: String,
     heartbeat: Heartbeat,
-    log: Arc<dyn NoteLog>,
     slots: Vec<Slot>,
     finished: Vec<TaskRun>,
     errors: Vec<RunError>,
@@ -453,9 +454,7 @@ impl Supervisor<'_> {
         if self.heartbeat.check().is_ok()
             && let Err(error) = self.queue.deregister_supervisor(&self.token)
         {
-            self.log.note(&format!(
-                "supervisor registration could not be removed: {error:#}"
-            ));
+            warn!(error = %format_args!("{error:#}"), "supervisor registration could not be removed: {error:#}");
         }
         result
     }
@@ -560,8 +559,7 @@ impl Supervisor<'_> {
                 }
                 Err(error) => {
                     let message = format!("run {} provisioning failed: {error:#}", run.id());
-                    self.log
-                        .note(&format!("{message}; no further tasks will be claimed"));
+                    warn!(run_id = %run.id(), error = %format_args!("{error:#}"), "{message}; no further tasks will be claimed");
                     self.abandon(&run, message.clone());
                     self.claiming = false;
                     self.provisioning_error = Some(message);
@@ -581,8 +579,7 @@ impl Supervisor<'_> {
                     index += 1;
                 }
                 Ok(Step::Done(run)) => {
-                    self.log
-                        .note(&format!("run {} is {}", run.id(), run.status().as_str()));
+                    info!(run_id = %run.id(), "run {} is {}", run.id(), run.status().as_str());
                     self.finished.push(*run);
                 }
                 Ok(Step::Triaged(run)) => self.note_triaged(&run),
@@ -615,12 +612,9 @@ impl Supervisor<'_> {
                     // The resume already recorded its `resume_finished`;
                     // only the lease it kept for the landing goes.
                     let message = format!("landing could not start: {error:#}");
-                    self.log.note(&format!("run {}: {message}", slot.run.id()));
+                    warn!(run_id = %slot.run.id(), "run {}: {message}", slot.run.id());
                     if let Err(error) = self.queue.release_lease(slot.run.id(), &self.token) {
-                        self.log.note(&format!(
-                            "run {}: could not release the lease: {error:#}",
-                            slot.run.id()
-                        ));
+                        warn!(run_id = %slot.run.id(), error = %format_args!("{error:#}"), "run {}: could not release the lease: {error:#}", slot.run.id());
                     }
                     self.errors.push(RunError {
                         run_id: slot.run.id().clone(),
@@ -630,10 +624,7 @@ impl Supervisor<'_> {
                 }
                 Err(error) if matches!(slot.phase, Phase::Resume(_)) => {
                     let message = format!("{error:#}");
-                    self.log.note(&format!(
-                        "run {} resume stopped: {message}; its workspace is kept for inspection",
-                        slot.run.id()
-                    ));
+                    warn!(run_id = %slot.run.id(), "run {} resume stopped: {message}; its workspace is kept for inspection", slot.run.id());
                     let (attempt, workspace) = match &slot.phase {
                         Phase::Resume(watch) => (watch.attempt, Some(watch.workspace.clone())),
                         _ => unreachable!("matched a resume"),
@@ -647,11 +638,7 @@ impl Supervisor<'_> {
                     // progress is stopped: nobody would read its verdict.
                     stop_job(&mut slot);
                     let message = format!("{error:#}");
-                    self.log.note(&format!(
-                        "run {} retained for inspection: {message}; see show {} and doctor",
-                        slot.run.id(),
-                        slot.run.task_id()
-                    ));
+                    warn!(run_id = %slot.run.id(), "run {} retained for inspection: {message}; see show {} and doctor", slot.run.id(), slot.run.task_id());
                     self.abandon(&slot.run, message);
                 }
             }
@@ -698,8 +685,7 @@ impl Supervisor<'_> {
             Ok(Some(mode)) => mode,
             Ok(None) => return,
             Err(error) => {
-                self.log
-                    .note(&format!("observer schedule could not be read: {error:#}"));
+                warn!(error = %format_args!("{error:#}"), "observer schedule could not be read: {error:#}");
                 return;
             }
         };
@@ -722,17 +708,12 @@ impl Supervisor<'_> {
         }
         match self.spawner.spawn(&command, Streams::Null) {
             Ok(child) => {
-                self.log.note(&format!(
-                    "observer ({}) started: pid {}",
-                    mode.as_str(),
-                    child.id()
-                ));
+                info!("observer ({}) started: pid {}", mode.as_str(), child.id());
                 self.observer = Some((mode, child));
             }
-            Err(error) => self.log.note(&format!(
-                "observer ({}) could not start: {error:#}",
-                mode.as_str()
-            )),
+            Err(error) => {
+                warn!(error = %format_args!("{error:#}"), "observer ({}) could not start: {error:#}", mode.as_str())
+            }
         }
     }
     /// Reap the observer once it exited; its own `observe_finished` is the
@@ -745,15 +726,11 @@ impl Supervisor<'_> {
         match child.try_wait() {
             Ok(None) => {}
             Ok(Some(status)) => {
-                self.log
-                    .note(&format!("observer ({}) exited: {status}", mode.as_str()));
+                info!("observer ({}) exited: {status}", mode.as_str());
                 self.observer = None;
             }
             Err(error) => {
-                self.log.note(&format!(
-                    "observer ({}) could not be waited for: {error:#}",
-                    mode.as_str()
-                ));
+                warn!(error = %format_args!("{error:#}"), "observer ({}) could not be waited for: {error:#}", mode.as_str());
                 self.observer = None;
             }
         }
@@ -769,7 +746,7 @@ impl Supervisor<'_> {
             // Its checks finish on their own; the new owner runs its own.
             message.push_str("; a validation already in progress runs to completion unrecorded");
         }
-        self.log.note(&message);
+        warn!(run_id = %slot.run.id(), "{}", message);
         self.errors.push(RunError {
             run_id: slot.run.id().clone(),
             task_id: slot.run.task_id(),
@@ -778,10 +755,7 @@ impl Supervisor<'_> {
     }
     fn abandon(&mut self, run: &TaskRun, message: String) {
         if let Err(error) = self.queue.abandon_run(run.id(), &self.token, &message) {
-            self.log.note(&format!(
-                "run {}: could not record the error: {error:#}",
-                run.id()
-            ));
+            warn!(run_id = %run.id(), error = %format_args!("{error:#}"), "run {}: could not record the error: {error:#}", run.id());
         }
         self.errors.push(RunError {
             run_id: run.id().clone(),
@@ -818,10 +792,7 @@ impl Supervisor<'_> {
             self.queue
                 .finish_resume(run.id(), &self.token, None, None, false, payload)
         {
-            self.log.note(&format!(
-                "run {}: could not record the resume error: {error:#}",
-                run.id()
-            ));
+            warn!(run_id = %run.id(), error = %format_args!("{error:#}"), "run {}: could not record the resume error: {error:#}", run.id());
         }
         let session_may_live = self.queue.processes(run.id()).map_or(true, |processes| {
             processes
@@ -830,15 +801,9 @@ impl Supervisor<'_> {
         });
         if let Some(workspace) = workspace {
             if session_may_live {
-                self.log.note(&format!(
-                    "run {}: resume workspace {workspace} is kept; its session may still run",
-                    run.id()
-                ));
+                info!(run_id = %run.id(), "run {}: resume workspace {workspace} is kept; its session may still run", run.id());
             } else if let Err(error) = self.cmux.close(&workspace) {
-                self.log.note(&format!(
-                    "run {}: resume workspace {workspace} could not be closed: {error:#}",
-                    run.id()
-                ));
+                warn!(run_id = %run.id(), error = %format_args!("{error:#}"), "run {}: resume workspace {workspace} could not be closed: {error:#}", run.id());
             }
         }
         self.errors.push(RunError {
@@ -862,15 +827,11 @@ impl Supervisor<'_> {
             match landed.and_then(|result| result) {
                 Ok(outcome) => {
                     let outcome = serde_json::to_value(&outcome)?;
-                    self.log.note(&format!(
-                        "run {} landing: {}",
-                        slot.run.id(),
-                        outcome["outcome"]
-                    ));
+                    info!(run_id = %slot.run.id(), "run {} landing: {}", slot.run.id(), outcome["outcome"]);
                 }
                 Err(error) => {
                     let message = format!("landing failed: {error:#}");
-                    self.log.note(&format!("run {}: {message}", slot.run.id()));
+                    warn!(run_id = %slot.run.id(), "run {}: {message}", slot.run.id());
                     self.errors.push(RunError {
                         run_id: slot.run.id().clone(),
                         task_id: slot.run.task_id(),
@@ -918,11 +879,7 @@ impl Supervisor<'_> {
                     }
                     Err(error) => return Err(error),
                 };
-                self.log.note(&format!(
-                    "run {} lands onto main {main} ({})",
-                    run.id(),
-                    previous.as_str()
-                ));
+                info!(run_id = %run.id(), "run {} lands onto main {main} ({})", run.id(), previous.as_str());
                 slot.phase =
                     Phase::Landing(Some(self.spawn_landing(run.clone(), previous, main)?));
                 slot.run = run;
@@ -1020,19 +977,11 @@ impl Supervisor<'_> {
                                 "attempt": attempt,
                             }),
                         )?;
-                        self.log.note(&format!(
-                            "run {} review {attempt}: {} ({})",
-                            run.id(),
-                            verdict.verdict.as_str(),
-                            verdict.summary
-                        ));
+                        info!(run_id = %run.id(), "run {} review {attempt}: {} ({})", run.id(), verdict.verdict.as_str(), verdict.summary);
                         self.act_on_verdict(&run, session, verdict)?
                     }
                     Err(error) => {
-                        self.log.note(&format!(
-                            "run {} review {attempt} failed: {error}; the run waits for a review by hand",
-                            run.id()
-                        ));
+                        warn!(run_id = %run.id(), error = %error, "run {} review {attempt} failed: {error}; the run waits for a review by hand", run.id());
                         Phase::Exiting(ExitWatch::new(
                             session,
                             AfterExit::ReviewFailed {
@@ -1063,10 +1012,7 @@ impl Supervisor<'_> {
                             kind,
                             json!({"attempt": watch.attempt, "head": head}),
                         )?;
-                        self.log.note(&format!(
-                            "run {} rewrote its receipt for {label} (head {head}); validating again",
-                            slot.run.id()
-                        ));
+                        info!(run_id = %slot.run.id(), "run {} rewrote its receipt for {label} (head {head}); validating again", slot.run.id());
                         let run = self.queue.restart_validation(slot.run.id(), &self.token)?;
                         let handle = self.validate(run.clone());
                         slot.run = run;
@@ -1088,26 +1034,20 @@ impl Supervisor<'_> {
                                     kind,
                                     json!({"attempt": watch.attempt, "reason": why}),
                                 )?;
-                                self.log.note(&format!(
-                                    "run {}: {why}; asked the session to fix it ({label})",
-                                    slot.run.id()
-                                ));
+                                info!(run_id = %slot.run.id(), "run {}: {why}; asked the session to fix it ({label})", slot.run.id());
                             }
                             Err(error) => {
                                 let why = format!(
                                     "{why}, and the request to fix it could not be sent: {error:#}"
                                 );
-                                self.log.note(&format!("run {}: {why}", slot.run.id()));
+                                warn!(run_id = %slot.run.id(), "run {}: {why}", slot.run.id());
                                 let then = watch.fix.ask(why.clone(), why);
                                 slot.phase = Phase::Exiting(ExitWatch::new(Some(session), then));
                             }
                         }
                     }
                     ReviseOutcome::Ended(why) => {
-                        self.log.note(&format!(
-                            "run {}: the session {why} after {label}; asking a person",
-                            slot.run.id()
-                        ));
+                        info!(run_id = %slot.run.id(), "run {}: the session {why} after {label}; asking a person", slot.run.id());
                         let then = watch.fix.ask(
                             format!("the session {why}"),
                             format!("the session {why} after {label}"),
@@ -1147,8 +1087,7 @@ impl Supervisor<'_> {
                             &summary,
                             why.as_deref(),
                         )?;
-                        self.log
-                            .note(&format!("run {} waits for a person in ask {ask}", run.id()));
+                        info!(run_id = %run.id(), "run {} waits for a person in ask {ask}", run.id());
                         self.queue.release_lease(run.id(), &self.token)?;
                         Ok(Step::Done(Box::new(self.queue.run(run.id())?)))
                     }
@@ -1219,9 +1158,8 @@ fn spawn_validation(
     repository: Arc<dyn Repository + Send + Sync>,
     files: Arc<dyn RunFiles>,
     run: TaskRun,
-    log: Arc<dyn NoteLog>,
 ) -> thread::JoinHandle<Result<Validation>> {
-    thread::spawn(move || {
+    spawn_traced(move || {
         let mut queue = queues.open()?;
         let task = queue.show(run.task_id())?.task;
         let checked = check_receipt(&*repository, &*files, &task, &run)?;
@@ -1236,7 +1174,7 @@ fn spawn_validation(
                 allowed_paths: Vec::new(),
             },
             Err(rejection) => {
-                log.note(&format!("run {} rejected: {}", run.id(), rejection.reason));
+                warn!(run_id = %run.id(), "run {} rejected: {}", run.id(), rejection.reason);
                 Validation {
                     accepted: false,
                     result_commit: rejection.commit,
@@ -1267,14 +1205,13 @@ fn close_workspace(
     cmux: &dyn WorkspaceBackend,
     token: &str,
     run: &TaskRun,
-    log: &dyn NoteLog,
 ) -> Result<TaskRun> {
     let workspace = run.workspace_id().context("missing workspace")?;
     match cmux.close(workspace) {
         Ok(()) => queue.workspace_closed(run.id(), token),
         Err(error) => {
             let message = format!("workspace {workspace} could not be closed: {error:#}");
-            log.note(&format!("run {}: {message}", run.id()));
+            warn!(run_id = %run.id(), "run {}: {message}", run.id());
             queue.cleanup_failed(run.id(), token, &message)
         }
     }

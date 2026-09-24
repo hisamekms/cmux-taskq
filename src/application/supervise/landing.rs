@@ -31,7 +31,7 @@ impl Supervisor<'_> {
             .find(|e| e.kind == "integration_approved")
             .is_none_or(|e| e.payload.get("push") != Some(&json!(false)));
         let generators = self.generators.clone();
-        Ok(thread::spawn(move || {
+        Ok(spawn_traced(move || {
             let mut queue = queues.open()?;
             integration::land_integrating(
                 &mut Integration {
@@ -85,11 +85,7 @@ impl Supervisor<'_> {
         )?;
         Ok(match self.spawn_review(run, attempt) {
             Ok((child, stdout, stderr)) => {
-                self.log.note(&format!(
-                    "run {} review {attempt} started (session {})",
-                    run.id(),
-                    if live { "kept open" } else { "ended" }
-                ));
+                info!(run_id = %run.id(), "run {} review {attempt} started (session {})", run.id(), if live { "kept open" } else { "ended" });
                 Phase::Review(ReviewWatch {
                     session,
                     attempt,
@@ -105,7 +101,7 @@ impl Supervisor<'_> {
             }
             Err(error) => {
                 let error = format!("the headless review could not start: {error:#}");
-                self.log.note(&format!("run {}: {error}", run.id()));
+                warn!(run_id = %run.id(), error = %error, "run {}: {error}", run.id());
                 Phase::Exiting(ExitWatch::new(
                     session,
                     AfterExit::ReviewFailed {
@@ -208,7 +204,7 @@ impl Supervisor<'_> {
                 let sent_at = self.files.now();
                 if let Err(error) = self.cmux.send_text(&live.workspace, &message) {
                     let why = format!("the revise request could not be sent: {error:#}");
-                    self.log.note(&format!("run {}: {why}", run.id()));
+                    warn!(run_id = %run.id(), "run {}: {why}", run.id());
                     return Ok(ask(Some(why), verdict, session));
                 }
                 self.queue.record_runtime_event(
@@ -216,11 +212,7 @@ impl Supervisor<'_> {
                     "revise_requested",
                     json!({"attempt": attempt, "reasons": verdict.reasons, "sent_at": unix_seconds(sent_at)}),
                 )?;
-                self.log.note(&format!(
-                    "revise {attempt} of {MAX_REVISE_ATTEMPTS} sent to run {} in workspace {}",
-                    run.id(),
-                    live.workspace
-                ));
+                info!(run_id = %run.id(), "revise {attempt} of {MAX_REVISE_ATTEMPTS} sent to run {} in workspace {}", run.id(), live.workspace);
                 Ok(Phase::Revise(ReviseWatch {
                     session: live,
                     attempt,
@@ -259,10 +251,7 @@ impl Supervisor<'_> {
         {
             Ok(conflicts) => conflicts,
             Err(error) => {
-                self.log.note(&format!(
-                    "run {}: the conflict precheck against main {main} failed: {error:#}; landing",
-                    run.id()
-                ));
+                warn!(run_id = %run.id(), error = %format_args!("{error:#}"), "run {}: the conflict precheck against main {main} failed: {error:#}; landing", run.id());
                 return Ok(land(session));
             }
         };
@@ -295,8 +284,7 @@ impl Supervisor<'_> {
             payload["asked"] = json!(why);
             self.queue
                 .record_runtime_event(run.id(), "conflict_precheck", payload)?;
-            self.log
-                .note(&format!("run {}: {why}; asking a person", run.id()));
+            info!(run_id = %run.id(), "run {}: {why}; asking a person", run.id());
             return Ok(Phase::Exiting(ExitWatch::new(
                 session,
                 Fix::Conflict(verdict).ask(String::new(), why),
@@ -339,21 +327,14 @@ impl Supervisor<'_> {
             payload["error"] = json!(error);
             self.queue
                 .record_runtime_event(run.id(), "conflict_precheck", payload)?;
-            self.log.note(&format!(
-                "run {}: {why}, and {error}; landing, whose rebase parks it for a resume",
-                run.id()
-            ));
+            warn!(run_id = %run.id(), error = %error, "run {}: {why}, and {error}; landing, whose rebase parks it for a resume", run.id());
             return Ok(land(session));
         };
         payload["requested"] = json!(true);
         payload["sent_at"] = json!(unix_seconds(*sent_at));
         self.queue
             .record_runtime_event(run.id(), "conflict_precheck", payload)?;
-        self.log.note(&format!(
-            "run {}: {why}; asked its live session in workspace {} to rebase (request {attempt})",
-            run.id(),
-            live.workspace
-        ));
+        info!(run_id = %run.id(), "run {}: {why}; asked its live session in workspace {} to rebase (request {attempt})", run.id(), live.workspace);
         Ok(Phase::Revise(ReviseWatch {
             session: live,
             attempt,
@@ -368,7 +349,7 @@ impl Supervisor<'_> {
     pub(super) fn close_session(&mut self, run: &TaskRun, session: &SessionRef) -> Result<TaskRun> {
         match session.resume {
             None if run.workspace_closed_at().is_none() && run.workspace_id().is_some() => {
-                close_workspace(&mut *self.queue, self.cmux, &self.token, run, &*self.log)
+                close_workspace(&mut *self.queue, self.cmux, &self.token, run)
             }
             None => Ok(run.clone()),
             Some(attempt) => {
@@ -383,7 +364,7 @@ impl Supervisor<'_> {
                             "resume workspace {} could not be closed: {error:#}",
                             session.workspace
                         );
-                        self.log.note(&format!("run {}: {message}", run.id()));
+                        warn!(run_id = %run.id(), "run {}: {message}", run.id());
                         self.queue.record_cleanup_failure(run.id(), &message)?;
                     }
                 }
@@ -463,11 +444,7 @@ impl Supervisor<'_> {
                 continue;
             }
             if let Err(error) = self.apply_landing_answer(&run, ask.id, &answer) {
-                self.log.note(&format!(
-                    "run {}: the answer {answer:?} of ask {} could not be applied: {error:#}",
-                    run.id(),
-                    ask.id
-                ));
+                warn!(run_id = %run.id(), ask_id = %ask.id, error = %format_args!("{error:#}"), "run {}: the answer {answer:?} of ask {} could not be applied: {error:#}", run.id(), ask.id);
             }
         }
         Ok(())
@@ -491,10 +468,7 @@ impl Supervisor<'_> {
                 let main = self.repository.main_head()?;
                 let landing = self.queue.begin_integration(run.id(), &self.token, &main)?;
                 self.queue.close_ask(ask_id)?;
-                self.log.note(&format!(
-                    "run {} lands onto main {main} as ask {ask_id} answered",
-                    run.id()
-                ));
+                info!(run_id = %run.id(), "run {} lands onto main {main} as ask {ask_id} answered", run.id());
                 let handle =
                     self.spawn_landing(landing.clone(), RunStatus::AwaitingIntegration, main)?;
                 self.slots.push(Slot {
@@ -515,10 +489,7 @@ impl Supervisor<'_> {
                 self.queue
                     .decide_landing(run.id(), RunStatus::NeedsSession, &reason, payload)?;
                 self.queue.close_ask(ask_id)?;
-                self.log.note(&format!(
-                    "run {} was sent back by ask {ask_id}; it waits for a resume",
-                    run.id()
-                ));
+                info!(run_id = %run.id(), "run {} was sent back by ask {ask_id}; it waits for a resume", run.id());
             }
             _ => {
                 let reason = format!("canceled by ask {ask_id}");
@@ -526,11 +497,7 @@ impl Supervisor<'_> {
                     .decide_landing(run.id(), RunStatus::Failed, &reason, payload)?;
                 self.queue.transition(run.task_id(), TaskAction::Cancel)?;
                 self.queue.close_ask(ask_id)?;
-                self.log.note(&format!(
-                    "run {} failed and task {} was canceled by ask {ask_id}",
-                    run.id(),
-                    run.task_id()
-                ));
+                info!(run_id = %run.id(), task_id = %run.task_id(), "run {} failed and task {} was canceled by ask {ask_id}", run.id(), run.task_id());
             }
         }
         Ok(())

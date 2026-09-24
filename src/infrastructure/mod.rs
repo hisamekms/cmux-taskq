@@ -10,3 +10,4 @@ pub mod run_files;
 pub mod runtime_store;
 pub mod sql_ids;
 pub mod sqlite;
+pub mod telemetry;

@@ -1,7 +1,7 @@
 //! The names the runtime's use cases had before they moved to
 //! `application` (ADR-0013), kept for the tests and the CLI: the entry
 //! points are [`crate::compose`], the use cases and their types are in
-//! `application`, and the supervisor log is in `infrastructure`. The
+//! `application`, and the log subscriber is in `infrastructure::telemetry`. The
 //! run-directory helpers read the local file system.
 pub use crate::application::{
     health::{DoctorReport, LeaseHealth, ProcessHealth, RunHealth, SupervisorHealth},
@@ -19,10 +19,7 @@ pub use crate::compose::{
     review, session, session_with_provider, stats, status, status_for, supervise,
     supervise_with_reviewer, triage_prompt,
 };
-pub use crate::infrastructure::{
-    claude::{PromptKind, detect_prompt},
-    run_files::SupervisorLog,
-};
+pub use crate::infrastructure::claude::{PromptKind, detect_prompt};
 
 use std::path::{Path, PathBuf};
 

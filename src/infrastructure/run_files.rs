@@ -1,17 +1,15 @@
-//! The run directory on the local file system ([`RunFiles`]) and the
-//! supervisor's log file ([`SupervisorLog`]).
+//! The run directory on the local file system ([`RunFiles`]).
 
 use std::{
     fs,
     io::{self, BufWriter, Read, Write},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
     time::SystemTime,
 };
 
 use anyhow::{Context, Result};
 
-use crate::application::{Clock, NoteLog, RunFiles};
+use crate::application::RunFiles;
 
 /// The run files as the local file system holds them.
 pub struct LocalRunFiles;
@@ -122,56 +120,9 @@ fn backtick_run_and_last_byte(path: &Path) -> Result<(usize, Option<u8>)> {
     }
 }
 
-/// Where the supervisor's progress messages go: stderr as always and, with
-/// `--log-dir`, a file per start so a launchd-resident supervisor (whose
-/// stderr is one shared `launchd.log`) leaves a record per process.
-#[derive(Clone, Default)]
-pub struct SupervisorLog {
-    file: Option<Arc<Mutex<fs::File>>>,
-    /// Timestamps the lines of `file`.
-    clock: Option<Arc<dyn Clock>>,
-    pub path: Option<PathBuf>,
-}
-
-impl SupervisorLog {
-    /// `<dir>/supervisor-<started_at>-<pid>.log`, appended to if it exists.
-    pub fn open(dir: &Path, started_at: i64, pid: u32, clock: Arc<dyn Clock>) -> Result<Self> {
-        fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
-        let path = dir.join(format!("supervisor-{started_at}-{pid}.log"));
-        let file = fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-            .with_context(|| format!("open {}", path.display()))?;
-        Ok(Self {
-            file: Some(Arc::new(Mutex::new(file))),
-            clock: Some(clock),
-            path: Some(path),
-        })
-    }
-
-    /// One line on stderr and, timestamped, in the file. A file that stops
-    /// accepting writes does not stop the supervisor.
-    pub fn note(&self, message: &str) {
-        eprintln!("{message}");
-        if let (Some(file), Some(clock)) = (&self.file, &self.clock)
-            && let Ok(mut file) = file.lock()
-        {
-            let _ = writeln!(file, "[{}] {message}", clock.now());
-        }
-    }
-}
-
-impl NoteLog for SupervisorLog {
-    fn note(&self, message: &str) {
-        SupervisorLog::note(self, message)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::infrastructure::clock::SystemClock;
     use std::time::Duration;
 
     #[test]
@@ -199,20 +150,5 @@ mod tests {
         assert!(files.read_stamped(&run_dir.join("none")).unwrap().is_none());
         assert!(files.read_stamped(&run_dir).is_err());
         assert!(files.modified(&run_dir.join("none")).is_err());
-    }
-
-    #[test]
-    fn the_supervisor_log_appends_timestamped_lines() {
-        let dir = tempfile::tempdir().unwrap();
-        let log =
-            SupervisorLog::open(&dir.path().join("logs"), 7, 42, Arc::new(SystemClock)).unwrap();
-        NoteLog::note(&log, "first");
-        log.note("second");
-        let path = log.path.clone().unwrap();
-        assert!(path.ends_with("logs/supervisor-7-42.log"));
-        let text = fs::read_to_string(path).unwrap();
-        assert_eq!(text.lines().count(), 2);
-        assert!(text.lines().all(|line| line.starts_with('[')), "{text}");
-        SupervisorLog::default().note("stderr only");
     }
 }

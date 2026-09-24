@@ -22,11 +22,7 @@ impl Supervisor<'_> {
                     .queue
                     .close_stuck_exit_asks(candidate.run.id(), STUCK_EXIT_CLOSED)?
                 {
-                    self.log.note(&format!(
-                        "session of {} exited; closed its stuck_exit ask {}",
-                        candidate.run.id(),
-                        ask.id
-                    ));
+                    info!(run_id = %candidate.run.id(), ask_id = %ask.id, "session of {} exited; closed its stuck_exit ask {}", candidate.run.id(), ask.id);
                 }
             }
         }
@@ -49,10 +45,7 @@ impl Supervisor<'_> {
             // Out of attempts: a person decides, whether or not a slot is free.
             if attempts >= MAX_RESUME_ATTEMPTS {
                 if let Err(error) = self.exhaust_resumes(&run, attempts) {
-                    self.log.note(&format!(
-                        "run {}: its used-up resumes could not be handed to a person: {error:#}",
-                        run.id()
-                    ));
+                    warn!(run_id = %run.id(), error = %format_args!("{error:#}"), "run {}: its used-up resumes could not be handed to a person: {error:#}", run.id());
                 }
                 continue;
             }
@@ -83,10 +76,7 @@ impl Supervisor<'_> {
             };
             match self.start_resume(&run, attempt, &request) {
                 Ok(watch) => {
-                    self.log.note(&format!(
-                        "run {} of task {} resumed (attempt {attempt} of {MAX_RESUME_ATTEMPTS}) in workspace {}",
-                        run.id(), run.task_id(), watch.workspace
-                    ));
+                    info!(run_id = %run.id(), task_id = %run.task_id(), "run {} of task {} resumed (attempt {attempt} of {MAX_RESUME_ATTEMPTS}) in workspace {}", run.id(), run.task_id(), watch.workspace);
                     self.slots.push(Slot {
                         run,
                         phase: Phase::Resume(watch),
@@ -94,7 +84,7 @@ impl Supervisor<'_> {
                 }
                 Err(error) => {
                     let message = format!("run {} could not be resumed: {error:#}", run.id());
-                    self.log.note(&message);
+                    warn!(run_id = %run.id(), error = %format_args!("{error:#}"), "{}", message);
                     self.give_up_resume(&run, attempt, None, message);
                 }
             }
@@ -196,16 +186,11 @@ impl Supervisor<'_> {
         else {
             return Ok(());
         };
-        self.log.note(&format!(
-            "run {} of task {} was already resolved at {head} on main {main}; {} without a resume",
-            run.id(),
-            run.task_id(),
-            if approved {
-                "landing it"
-            } else {
-                "validating it"
-            }
-        ));
+        info!(run_id = %run.id(), task_id = %run.task_id(), "run {} of task {} was already resolved at {head} on main {main}; {} without a resume", run.id(), run.task_id(), if approved {
+            "landing it"
+        } else {
+            "validating it"
+        });
         let phase = if approved {
             Phase::AwaitingSlot
         } else {
@@ -280,11 +265,7 @@ impl Supervisor<'_> {
             }
             return Ok(());
         };
-        self.log.note(&format!(
-            "run {} of task {} used up its resumes; it is failed and waits for ask {ask_id}",
-            failed.id(),
-            failed.task_id()
-        ));
+        warn!(run_id = %failed.id(), task_id = %failed.task_id(), "run {} of task {} used up its resumes; it is failed and waits for ask {ask_id}", failed.id(), failed.task_id());
         self.close_triaged_workspaces(&failed)?;
         self.note_triaged(&failed);
         Ok(())
@@ -305,10 +286,7 @@ impl Supervisor<'_> {
             .collect();
         for workspace in left {
             if self.cmux.exists(&workspace)? {
-                self.log.note(&format!(
-                    "run {}: closing resume workspace {workspace} left by an earlier attempt; its session has ended",
-                    run.id()
-                ));
+                info!(run_id = %run.id(), "run {}: closing resume workspace {workspace} left by an earlier attempt; its session has ended", run.id());
                 self.cmux.close(&workspace)?;
             }
         }
@@ -412,10 +390,7 @@ impl Supervisor<'_> {
             && match self.cmux.close(workspace) {
                 Ok(()) => true,
                 Err(error) => {
-                    self.log.note(&format!(
-                        "run {}: resume workspace {workspace} could not be closed: {error:#}",
-                        slot.run.id()
-                    ));
+                    warn!(run_id = %slot.run.id(), error = %format_args!("{error:#}"), "run {}: resume workspace {workspace} could not be closed: {error:#}", slot.run.id());
                     false
                 }
             };
@@ -723,22 +698,14 @@ impl ResumeWatch {
         if matches!(pulse, WrapperPulse::Silent) && self.exit_requested.is_none() {
             // Ask once, the way a person would; never kill the session.
             sv.cmux.send_exit(&self.workspace)?;
-            sv.log.note(&format!(
-                "resumed session of {} lost its wrapper heartbeat; exit requested",
-                run.id()
-            ));
+            warn!(run_id = %run.id(), "resumed session of {} lost its wrapper heartbeat; exit requested", run.id());
             self.exit_requested = Some(Instant::now());
             self.exit_for_silence = true;
         }
         if let Some(requested) = self.exit_requested {
             if requested.elapsed() >= sv.cmux.exit_timeout() {
                 // /exit is not resent (it could pick a dialog's option).
-                sv.log.note(&format!(
-                    "resumed session of {} did not exit within {}s of the exit request; letting it go as unresolved (its workspace {} is kept)",
-                    run.id(),
-                    sv.cmux.exit_timeout().as_secs(),
-                    self.workspace
-                ));
+                warn!(run_id = %run.id(), "resumed session of {} did not exit within {}s of the exit request; letting it go as unresolved (its workspace {} is kept)", run.id(), sv.cmux.exit_timeout().as_secs(), self.workspace);
                 // Its dialog stays until someone answers it: raise it to
                 // the inbox, as for the worker's session (task 104). The
                 // next pass closes the ask once the session ended. A failed
@@ -752,10 +719,7 @@ impl ResumeWatch {
                     },
                 );
                 if let Err(error) = ask_stuck_exit(sv, run, &self.workspace, &after) {
-                    sv.log.note(&format!(
-                        "stuck_exit ask for {} could not be opened: {error:#}",
-                        run.id()
-                    ));
+                    warn!(run_id = %run.id(), error = %format_args!("{error:#}"), "stuck_exit ask for {} could not be opened: {error:#}", run.id());
                 }
                 return Ok(Some(ResumeVerdict {
                     kind: ResumeOutcome::Unresolved,
@@ -772,11 +736,7 @@ impl ResumeWatch {
                 if seen.elapsed() >= sv.cmux.resume_prompt_delay() {
                     sv.cmux.send_text(&self.workspace, &self.message)?;
                     self.message_sent = Some((Instant::now(), sv.files.now()));
-                    sv.log.note(&format!(
-                        "resolution request sent to run {} in workspace {}",
-                        run.id(),
-                        self.workspace
-                    ));
+                    info!(run_id = %run.id(), "resolution request sent to run {} in workspace {}", run.id(), self.workspace);
                 }
             }
             return Ok(None);
@@ -803,10 +763,7 @@ impl ResumeWatch {
         // An unapproved resolved run keeps its session for
         // validation and review (ADR-0027 decision 3).
         if matches!(verdict, ResumeOutcome::Resolved) && !self.approved && idle_after_receipt {
-            sv.log.note(&format!(
-                "resumed session of {} rewrote its receipt and went idle (head {head}); validating with the session open",
-                run.id()
-            ));
+            info!(run_id = %run.id(), "resumed session of {} rewrote its receipt and went idle (head {head}); validating with the session open", run.id());
             return Ok(Some(ResumeVerdict {
                 kind: ResumeOutcome::Resolved,
                 head: Some(head),
@@ -828,10 +785,7 @@ impl ResumeWatch {
         if let Some(why) = why {
             // Ask once, the way a person would; never kill the session.
             sv.cmux.send_exit(&self.workspace)?;
-            sv.log.note(&format!(
-                "resumed session of {} {why} (head {head}); exit requested",
-                run.id()
-            ));
+            info!(run_id = %run.id(), "resumed session of {} {why} (head {head}); exit requested", run.id());
             self.exit_requested = Some(Instant::now());
         }
         Ok(None)

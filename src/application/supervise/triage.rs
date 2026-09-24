@@ -25,16 +25,12 @@ impl Supervisor<'_> {
             }
             let report = json!({"run": health, "by": "supervisor"});
             match self.queue.recover_run(run.id(), processes.len(), report) {
-                Ok(recovered) => self.log.note(&format!(
-                    "run {} of task {} recovered from {}: nobody leases it and its session is gone; it goes to triage",
-                    recovered.id(),
-                    recovered.task_id(),
-                    run.status().as_str()
-                )),
-                Err(error) => self.log.note(&format!(
-                    "run {} could not be recovered: {error:#}",
-                    run.id()
-                )),
+                Ok(recovered) => {
+                    info!(run_id = %recovered.id(), task_id = %recovered.task_id(), "run {} of task {} recovered from {}: nobody leases it and its session is gone; it goes to triage", recovered.id(), recovered.task_id(), run.status().as_str())
+                }
+                Err(error) => {
+                    warn!(run_id = %run.id(), error = %format_args!("{error:#}"), "run {} could not be recovered: {error:#}", run.id())
+                }
             }
         }
         Ok(())
@@ -69,12 +65,7 @@ impl Supervisor<'_> {
                     .last()
                     .is_some_and(|latest| *latest.id() != *run.id())
             {
-                self.log.note(&format!(
-                    "ask {} of run {} is closed: task {} moved on without it",
-                    ask.id,
-                    run.id(),
-                    run.task_id()
-                ));
+                info!(ask_id = %ask.id, run_id = %run.id(), task_id = %run.task_id(), "ask {} of run {} is closed: task {} moved on without it", ask.id, run.id(), run.task_id());
                 self.queue.close_ask(ask.id)?;
                 continue;
             }
@@ -91,18 +82,12 @@ impl Supervisor<'_> {
                 );
             let reason = format!("{reason} (a person chose {answer} in ask {})", ask.id);
             match self.queue.decide_triage(run.id(), ask.id, &answer, &reason) {
-                Ok(decided) => self.log.note(&format!(
-                    "run {} of task {}: {answer} as ask {} answered; the run is {}",
-                    decided.id(),
-                    decided.task_id(),
-                    ask.id,
-                    decided.status().as_str()
-                )),
-                Err(error) => self.log.note(&format!(
-                    "run {}: the answer {answer:?} of ask {} could not be applied: {error:#}",
-                    run.id(),
-                    ask.id
-                )),
+                Ok(decided) => {
+                    info!(run_id = %decided.id(), task_id = %decided.task_id(), ask_id = %ask.id, "run {} of task {}: {answer} as ask {} answered; the run is {}", decided.id(), decided.task_id(), ask.id, decided.status().as_str())
+                }
+                Err(error) => {
+                    warn!(run_id = %run.id(), ask_id = %ask.id, error = %format_args!("{error:#}"), "run {}: the answer {answer:?} of ask {} could not be applied: {error:#}", run.id(), ask.id)
+                }
             }
         }
         Ok(())
@@ -130,12 +115,7 @@ impl Supervisor<'_> {
             };
             match self.spawn_triage(&run, attempt) {
                 Ok(watch) => {
-                    self.log.note(&format!(
-                        "run {} of task {} ({}) triage {attempt} started",
-                        run.id(),
-                        run.task_id(),
-                        run.status().as_str()
-                    ));
+                    info!(run_id = %run.id(), task_id = %run.task_id(), "run {} of task {} ({}) triage {attempt} started", run.id(), run.task_id(), run.status().as_str());
                     self.slots.push(Slot {
                         run,
                         phase: Phase::Triage(watch),
@@ -265,30 +245,17 @@ impl Supervisor<'_> {
         let triaged = self
             .queue
             .finish_triage(run.id(), &self.token, &action, payload)?;
-        self.log.note(&format!(
-            "run {} triage {attempt}: {}{} ({}); the run is {}",
-            run.id(),
-            verdict.verdict.as_str(),
-            match &overridden {
+        info!(run_id = %run.id(), "run {} triage {attempt}: {}{} ({}); the run is {}", run.id(), verdict.verdict.as_str(), match &overridden {
                 Some(why) => format!(" became ask: {why}"),
                 None => String::new(),
-            },
-            verdict.reason,
-            triaged.status().as_str()
-        ));
+            }, verdict.reason, triaged.status().as_str());
         // The verdict is acted on: what fails from here on is logged, not
         // a failed triage.
         if let Err(error) = self.close_triaged_workspaces(&triaged) {
-            self.log.note(&format!(
-                "run {}: its workspaces could not all be closed: {error:#}",
-                run.id()
-            ));
+            warn!(run_id = %run.id(), error = %format_args!("{error:#}"), "run {}: its workspaces could not all be closed: {error:#}", run.id());
         }
         if let Err(error) = self.queue.release_lease(run.id(), &self.token) {
-            self.log.note(&format!(
-                "run {}: could not release the lease: {error:#}",
-                run.id()
-            ));
+            warn!(run_id = %run.id(), error = %format_args!("{error:#}"), "run {}: could not release the lease: {error:#}", run.id());
         }
         self.queue.run(run.id())
     }
@@ -381,7 +348,7 @@ impl Supervisor<'_> {
                 Ok(false) => {}
                 Err(error) => {
                     let message = format!("workspace {workspace} could not be closed: {error:#}");
-                    self.log.note(&format!("run {}: {message}", run.id()));
+                    warn!(run_id = %run.id(), "run {}: {message}", run.id());
                     self.queue.record_runtime_event(
                         run.id(),
                         "cleanup_failed",
@@ -409,10 +376,7 @@ impl Supervisor<'_> {
         error: String,
         duration_secs: u64,
     ) {
-        self.log.note(&format!(
-            "run {} triage {attempt} failed: {error}; the run waits for a triage by hand",
-            run.id()
-        ));
+        warn!(run_id = %run.id(), error = %error, "run {} triage {attempt} failed: {error}; the run waits for a triage by hand", run.id());
         let recorded = self.queue.record_runtime_event(
             run.id(),
             "triage_failed",
@@ -424,10 +388,7 @@ impl Supervisor<'_> {
             }),
         );
         if let Err(error) = recorded {
-            self.log.note(&format!(
-                "run {}: could not record the triage failure: {error:#}",
-                run.id()
-            ));
+            warn!(run_id = %run.id(), error = %format_args!("{error:#}"), "run {}: could not record the triage failure: {error:#}", run.id());
         }
         if self
             .queue
@@ -435,10 +396,7 @@ impl Supervisor<'_> {
             .unwrap_or(false)
             && let Err(error) = self.queue.release_lease(run.id(), &self.token)
         {
-            self.log.note(&format!(
-                "run {}: could not release the lease: {error:#}",
-                run.id()
-            ));
+            warn!(run_id = %run.id(), error = %format_args!("{error:#}"), "run {}: could not release the lease: {error:#}", run.id());
         }
     }
     pub(super) fn note_triaged(&mut self, run: &TaskRun) {
@@ -446,15 +404,10 @@ impl Supervisor<'_> {
             .queue
             .show(run.task_id())
             .map(|detail| detail.task.status());
-        self.log.note(&format!(
-            "run {} triaged: the run is {}{}",
-            run.id(),
-            run.status().as_str(),
-            match task {
-                Ok(status) => format!(", task {} is {}", run.task_id(), status.as_str()),
-                Err(_) => String::new(),
-            }
-        ));
+        info!(run_id = %run.id(), "run {} triaged: the run is {}{}", run.id(), run.status().as_str(), match task {
+            Ok(status) => format!(", task {} is {}", run.task_id(), status.as_str()),
+            Err(_) => String::new(),
+        });
         self.triaged.push(json!({
             "run_id": run.id(),
             "task_id": run.task_id(),

@@ -228,11 +228,6 @@ pub trait RunFiles: Send + Sync {
     fn now(&self) -> SystemTime;
 }
 
-/// Where the supervisor's progress messages go.
-pub trait NoteLog: Send + Sync {
-    fn note(&self, message: &str);
-}
-
 /// Opens connections to the queue: the supervisor's own, and one for each
 /// thread that works beside its loop (the heartbeat, validations,
 /// landings).

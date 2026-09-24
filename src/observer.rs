@@ -137,6 +137,12 @@ pub fn observe(db: &Path, provider: &dyn AgentProvider, options: &ObserveOptions
         "observe_started",
         json!({"mode": options.mode.as_str(), "since": since, "dir": dir}),
     )?;
+    tracing::info!(
+        mode = options.mode.as_str(),
+        since,
+        "observer ({}) started",
+        options.mode.as_str()
+    );
     let clock = Instant::now();
     // `failed`: the agent exited non-zero or by a signal; `error`: it could
     // not start or ran past the timeout.
@@ -165,6 +171,17 @@ pub fn observe(db: &Path, provider: &dyn AgentProvider, options: &ObserveOptions
         "dir": dir,
     });
     queue.record_queue_event("observe_finished", payload.clone())?;
+    tracing::info!(
+        mode = options.mode.as_str(),
+        outcome,
+        exit_code,
+        error,
+        notes,
+        asks,
+        goals,
+        "observer ({}) finished: {outcome}",
+        options.mode.as_str()
+    );
     Ok(payload)
 }
 

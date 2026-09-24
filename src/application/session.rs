@@ -127,7 +127,11 @@ fn drive_agent(
         }
         if let Err(error) = queue.heartbeat_wrapper(run.id(), pid) {
             // Keep owning/waiting on the existing child even during a DB outage.
-            eprintln!("wrapper heartbeat failed: {error:#}");
+            tracing::warn!(
+                run_id = %run.id(),
+                error = %format_args!("{error:#}"),
+                "wrapper heartbeat failed: {error:#}"
+            );
         }
         thread::sleep(provider.wait_interval());
     }

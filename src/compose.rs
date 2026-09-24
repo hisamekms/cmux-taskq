@@ -17,7 +17,7 @@ use std::{
 
 use crate::{
     application::{
-        AgentProvider, Generators, LaunchAgent, MainRemote, NoteLog, ProcessControl, QueueOpener,
+        AgentProvider, Generators, LaunchAgent, MainRemote, ProcessControl, QueueOpener,
         Repository, WorkspaceBackend, health,
         integrate::{self as integration, IntegrateTarget, Integration},
         lifecycle::{
@@ -45,7 +45,7 @@ use crate::{
         location::{QueueLocation, REPOSITORY_FILE_NAME, data_home, runs_dir},
         process::LocalSpawner,
         run_env::ShellVerifier,
-        run_files::{LocalRunFiles, SupervisorLog},
+        run_files::LocalRunFiles,
         runtime_store::SqliteOpener,
         sqlite::SqliteQueue,
     },
@@ -64,9 +64,6 @@ pub struct SuperviseOptions {
     /// polling for new work.
     pub once: bool,
     pub stop: Arc<AtomicBool>,
-    /// Directory for one `supervisor-<started_at>-<pid>.log` per start,
-    /// created if missing; `None` keeps the messages on stderr only.
-    pub log_dir: Option<PathBuf>,
     /// Start the observer job when this long passed since the last one
     /// started or finished (ADR-0024 decision 4); zero disables the
     /// observer, the daily one included.
@@ -87,7 +84,6 @@ impl SuperviseOptions {
             parallel,
             once,
             stop: Arc::new(AtomicBool::new(false)),
-            log_dir: None,
             observe_interval: Duration::ZERO,
             observe_daily: false,
             tick: TICK,
@@ -166,14 +162,6 @@ pub fn supervise_with_reviewer(
     };
     let review_db = db.clone();
     let review_material = move |task_id: TaskId| review(&review_db, task_id);
-    let log_dir = options.log_dir.clone();
-    let log_clock = generators.clock.clone();
-    let open_log = move |started_at: i64| -> Result<Arc<dyn NoteLog>> {
-        Ok(Arc::new(match &log_dir {
-            Some(dir) => SupervisorLog::open(dir, started_at, pid, log_clock.clone())?,
-            None => SupervisorLog::default(),
-        }))
-    };
     let ports = Ports {
         queues: Arc::new(SqliteOpener {
             db: db.clone(),
@@ -194,7 +182,6 @@ pub fn supervise_with_reviewer(
         processes: Arc::new(SystemProcesses),
         generators,
         review_material: &review_material,
-        open_log: &open_log,
         load_average,
         layout,
     };
