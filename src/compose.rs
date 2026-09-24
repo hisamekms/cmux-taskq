@@ -24,6 +24,7 @@ use crate::{
             self, DownOptions, Ports as LifecyclePorts, QUEUE_ENV, QueuePaths, REVIEWER_ROLE,
             ROLE_ENV, RepositoryPaths, UpEnvironment, UpOptions, session_env,
         },
+        prompt,
         rebind::{self as rebinding, Rebind, RebindTarget},
         recording::RecordingBackend,
         review::{self as reviewing, Review},
@@ -186,6 +187,7 @@ pub fn supervise_with_reviewer(
         repository: Arc::new(repository),
         cmux,
         agent: &agent,
+        signals: &agent,
         reviewer,
         spawner: &LocalSpawner,
         files: Arc::new(LocalRunFiles),
@@ -434,14 +436,14 @@ fn main_checkout(repository: &GitRepository) -> PathBuf {
 }
 
 /// What the headless triage is asked about a run (see
-/// [`supervisor::triage_prompt`]), its files read from `dir`.
+/// [`prompt::triage_prompt`]), its files read from `dir`.
 pub fn triage_prompt(
     detail: &TaskDetail,
     run: &TaskRun,
     resumes: usize,
     dir: &Path,
 ) -> Result<String> {
-    supervisor::triage_prompt(&LocalRunFiles, detail, run, resumes, dir)
+    prompt::triage_prompt(&LocalRunFiles, detail, run, resumes, dir)
 }
 
 /// Run from cmux, not from a pipe; stdout must remain a terminal for Claude.

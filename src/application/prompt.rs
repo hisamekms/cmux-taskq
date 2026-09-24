@@ -2,14 +2,24 @@
 //! of its landed predecessors, the tasks running alongside it and what the
 //! receipt must hold. Built from what the queue returned at claim time.
 //! Also the initial prompts of the inbox and the planner sessions `up`
-//! opens.
+//! opens, and what the supervisor asks of an agent: the headless review and
+//! triage, and the requests it types into a live session (a resume, a
+//! revise, a receipt that does not match).
 
 use anyhow::{Context, Result};
 use serde::Serialize;
+use serde_json::Value;
 use std::path::{Path, PathBuf};
 
-use super::RunFiles;
-use crate::domain::{CommitSha, Goal, Predecessor, Receipt, Task, TaskId, TaskRun};
+use super::{
+    RunFiles, fenced,
+    integrate::{integrate_logs, log_names},
+    or_none, tail,
+};
+use crate::domain::{
+    CommitSha, Goal, MAX_RESUME_ATTEMPTS, MAX_REVISE_ATTEMPTS, Predecessor, Receipt, RunStatus,
+    TRIAGE_RETRY_FAILURES, Task, TaskDetail, TaskId, TaskRun,
+};
 
 /// What the prompt says about one direct predecessor: the task, the squash
 /// commit `integrate` put on `main` for it, and the summary its agent wrote.
@@ -236,4 +246,410 @@ pub fn planner_prompt(db: &Path) -> Result<String> {
          Never open the queue database directly; use the dagq CLI only.\n",
         db = super::path_text(db)?,
     ))
+}
+
+/// What the resolution request tells a resumed session.
+pub(crate) struct ResumeRequest {
+    /// The `main` head the session rebases onto.
+    pub main: CommitSha,
+    pub reason: String,
+    pub kind: ResumeKind,
+}
+
+/// Why the run waits for a session, which decides the request's steps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ResumeKind {
+    /// A landing was deferred (a conflict, failed verification): rebase.
+    Landing,
+    /// Validation's `evidence_missing`: add the evidence instead.
+    EvidenceMissing,
+    /// A person sent a review's concern back (`landing_decided`): fix
+    /// the findings.
+    SentBack,
+    /// The diff changes paths outside the task's `paths` (validation's
+    /// `scope_violation`, or a landing deferred for it): take them out.
+    ScopeViolation,
+    /// A passed run's live session, before its `/exit`: the precheck found
+    /// that it conflicts with main (ADR-0027 decision 4). Rebase, like
+    /// `Landing`.
+    Precheck,
+    /// The triage of a `failed` / `interrupted` run sent it back to its
+    /// session (`triage_finished` with action `resume`, or a person's
+    /// `resume` answer, `triage_decided`): do what the reason asks.
+    Triage,
+}
+
+/// The fixed resolution request the supervisor types into a resumed
+/// session (ADR-0019 decision 1), or into a passed run's live session whose
+/// head conflicts with main (ADR-0027 decision 4), one instruction per
+/// line; the backend sends it as one line.
+pub(crate) fn resume_request(
+    task: &Task,
+    run: &TaskRun,
+    request: &ResumeRequest,
+    landed: &[PredecessorSummary],
+) -> Result<String> {
+    let receipt = run.receipt_path().context("missing receipt path")?;
+    let mut lines = vec![match request.kind {
+        ResumeKind::EvidenceMissing => format!(
+            "dagq: the supervisor's validation of run {} (task {}) found required evidence missing from the receipt, so the run is needs_session.",
+            run.id(),
+            task.id()
+        ),
+        ResumeKind::SentBack => format!(
+            "dagq: the supervisor's review of run {} (task {}) raised findings a person sent back to you, so the run is needs_session.",
+            run.id(),
+            task.id()
+        ),
+        ResumeKind::ScopeViolation => format!(
+            "dagq: run {} (task {}) changes paths outside the task's --paths ({}), so the run is needs_session.",
+            run.id(),
+            task.id(),
+            task.paths().join(", ")
+        ),
+        ResumeKind::Landing => format!(
+            "dagq: integrate could not land run {} (task {}) and returned needs_session.",
+            run.id(),
+            task.id()
+        ),
+        ResumeKind::Precheck => format!(
+            "dagq: the supervisor's review of run {} (task {}) passed, but integrate would conflict with main, so the run was not landed.",
+            run.id(),
+            task.id()
+        ),
+        ResumeKind::Triage => format!(
+            "dagq: run {} (task {}) failed or was interrupted, and the supervisor's triage sent it back to this session to finish, so the run is needs_session.",
+            run.id(),
+            task.id()
+        ),
+    }];
+    lines.push(format!("Reason: {}", request.reason));
+    lines.push(format!(
+        "main is now {} (your base commit was {}).",
+        request.main,
+        run.base_commit()
+    ));
+    if landed.is_empty() {
+        lines.push("Tasks landed on main since your base: none.".to_owned());
+    } else {
+        lines.push("Tasks landed on main since your base:".to_owned());
+        for task in landed {
+            lines.push(format!(
+                "- task {}: {}; summary: {}",
+                task.task_id, task.title, task.summary
+            ));
+        }
+    }
+    lines.push("Steps:".to_owned());
+    let verify = serde_json::to_string(task.verification_commands())?;
+    if request.kind == ResumeKind::EvidenceMissing {
+        lines.push(
+            "1. Run the checks the reason names as missing and write their evidence into the receipt."
+                .to_owned(),
+        );
+        lines.push(format!(
+            "2. If that changes files, commit them and rerun the verification commands {verify}."
+        ));
+    } else if request.kind == ResumeKind::ScopeViolation {
+        lines.push(format!(
+            "1. Take the changes to the paths the reason names out of the run branch: restore each to its state at git merge-base HEAD {} (delete the ones that did not exist there) and commit; if the task cannot be done without them, write the receipt with result failed and say which paths it needs.",
+            request.main
+        ));
+        lines.push(format!("2. Rerun the verification commands {verify}."));
+    } else if request.kind == ResumeKind::SentBack {
+        lines.push(format!(
+            "1. Fix the findings in the reason and commit; if main moved, git rebase {} first.",
+            request.main
+        ));
+        lines.push(format!("2. Rerun the verification commands {verify}."));
+    } else if request.kind == ResumeKind::Triage {
+        lines.push(format!(
+            "1. Do what the reason asks in this worktree and commit; if main moved, git rebase {} first.",
+            request.main
+        ));
+        lines.push(format!("2. Rerun the verification commands {verify}."));
+    } else {
+        lines.push(format!(
+            "1. In this worktree run git rebase {} and resolve the conflicts.",
+            request.main
+        ));
+        lines.push(format!(
+            "2. Rerun the verification commands {verify} and commit the result."
+        ));
+    }
+    lines.push("3. Keep the worktree clean.".to_owned());
+    lines.push(format!("4. {STOP_BACKGROUND}"));
+    lines.push(format!(
+        "5. Rewrite the receipt at {receipt} with the new head commit, writing a temporary file in the same directory and renaming it."
+    ));
+    lines.push(
+        "6. If the change is no longer needed, write the receipt with result failed and the reason in summary."
+            .to_owned(),
+    );
+    lines.push(
+        "7. Do not merge or push. When done, report briefly and stop; do not run /exit.".to_owned(),
+    );
+    Ok(lines.join("\n"))
+}
+
+/// The fixed request the supervisor types into the live session when the
+/// receipt it rewrote for a revise or a conflict request does not name its clean worktree HEAD.
+pub(crate) fn revise_mismatch_request(run: &TaskRun, label: &str, why: &str) -> Result<String> {
+    let receipt = run.receipt_path().context("missing receipt path")?;
+    Ok([
+        format!(
+            "dagq: the receipt you rewrote for {label} of run {} cannot be accepted: {why}.",
+            run.id()
+        ),
+        "Steps:".to_owned(),
+        "1. Commit every change you meant to make, so the worktree is clean.".to_owned(),
+        format!(
+            "2. Rewrite the receipt at {receipt} with the current HEAD commit (git rev-parse HEAD), writing a temporary file in the same directory and renaming it."
+        ),
+        format!("3. {STOP_BACKGROUND}"),
+        "4. Do not merge or push. When done, report briefly and stop; do not run /exit."
+            .to_owned(),
+    ]
+    .join("\n"))
+}
+
+/// What the headless reviewer is asked (ADR-0023 decision 2, ADR-0027
+/// decision 2): where the material is, the task's acceptance, the verdict
+/// schema and where `revise` ends and `concern` begins.
+pub fn review_prompt(task: &Task, run: &TaskRun, review_path: &str) -> String {
+    format!(
+        "You review run {run_id} of dagq task {task_id} ({title}) before it lands on main.\n\
+         Read the review material at {review_path}: the task, its goal, the receipt, the commits and the full diff. Read the worktree if you need more. Do not change any file.\n\n\
+         Acceptance criteria of the task:\n{acceptance}\n\n\
+         Decide one verdict:\n\
+         - pass: the diff meets the acceptance criteria and the task's instructions and nothing needs fixing.\n\
+         - revise: findings the worker can fix without a person's judgment: missing tests or evidence, lint, fmt or clippy findings, a receipt that disagrees with the diff where fixing the diff settles it, or an obvious gap inside the instructed scope.\n\
+         - concern: findings that need a person's judgment: a mismatch with the acceptance criteria, changes the task did not ask for, or a finding that involves a judgment call.\n\n\
+         Answer with one JSON object and nothing else, matching this schema:\n\
+         {{\"verdict\": \"pass\" | \"revise\" | \"concern\", \"reasons\": [string], \"summary\": string}}\n\
+         reasons lists each finding (empty for pass); summary is one or two sentences.\n",
+        run_id = run.id(),
+        task_id = task.id(),
+        title = task.title(),
+        acceptance = or_none(task.acceptance()),
+    )
+}
+
+/// The tools the headless triage may use beyond what needs no permission:
+/// reading only.
+pub const TRIAGE_TOOLS: &[&str] = &["Read", "Grep", "Glob"];
+
+/// Bytes of each log, receipt and screen the triage prompt carries (their
+/// ends).
+const TRIAGE_TAIL_BYTES: usize = 3000;
+
+/// Logs of a run directory the triage reads: the latest integrate
+/// attempt's `integrate-<attempt>-verify-N.log` (see [`integrate_logs`]) and
+/// `verify-N.log`, at most this many.
+const TRIAGE_LOGS: usize = 8;
+
+/// What the headless triage is asked (ADR-0024 decision 3): the task, the
+/// run's error, receipt, verification logs, final screen and events, the
+/// task's earlier runs, the verdict schema and the rule that a task with
+/// [`TRIAGE_RETRY_FAILURES`] failed or interrupted runs is not retried.
+/// `dir` is where the run's files are.
+pub fn triage_prompt(
+    files: &dyn RunFiles,
+    detail: &TaskDetail,
+    run: &TaskRun,
+    resumes: usize,
+    dir: &Path,
+) -> Result<String> {
+    let task = &detail.task;
+    let failures = detail
+        .runs
+        .iter()
+        .filter(|r| matches!(r.status(), RunStatus::Failed | RunStatus::Interrupted))
+        .count();
+    let read = |path: &Path| {
+        files
+            .read(path)
+            .ok()
+            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+    };
+    let mut material = String::new();
+    let receipt = run.receipt_path().map(Path::new).and_then(read);
+    material.push_str(&format!(
+        "Receipt ({}):\n{}\n",
+        run.receipt_path().unwrap_or("none"),
+        fenced(
+            "json",
+            or_none(tail(
+                receipt.as_deref().unwrap_or_default().trim(),
+                TRIAGE_TAIL_BYTES
+            ))
+        )
+    ));
+    let (latest, earlier) = integrate_logs(files, dir);
+    let mut logs = latest;
+    // `verify-N.log` is what validation wrote before ADR-0023.
+    let mut validation: Vec<PathBuf> = log_names(files, dir)
+        .into_iter()
+        .filter(|(name, _)| name.starts_with("verify-") && name.ends_with(".log"))
+        .map(|(_, path)| path)
+        .collect();
+    validation.sort();
+    logs.extend(validation);
+    logs.truncate(TRIAGE_LOGS);
+    if !earlier.is_empty() {
+        material.push_str(&format!(
+            "Logs of earlier integrate attempts (not shown): {}\n",
+            earlier
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    if logs.is_empty() {
+        material.push_str("Verification logs: none\n");
+    }
+    for log in &logs {
+        let text = read(log).unwrap_or_default();
+        material.push_str(&format!(
+            "Verification log {} (end):\n{}\n",
+            log.display(),
+            fenced("text", or_none(tail(text.trim(), TRIAGE_TAIL_BYTES)))
+        ));
+    }
+    let screen = read(&dir.join("terminal-final.txt"));
+    material.push_str(&format!(
+        "Final screen of the session (end of terminal-final.txt):\n{}\n",
+        fenced(
+            "text",
+            or_none(tail(
+                screen.as_deref().unwrap_or_default().trim(),
+                TRIAGE_TAIL_BYTES
+            ))
+        )
+    ));
+    let events: Vec<Value> = detail
+        .events
+        .iter()
+        .filter(|e| e.run_id.as_ref() == Some(run.id()))
+        .map(super::health::compact_event)
+        .collect();
+    let events = &events[events.len().saturating_sub(40)..];
+    material.push_str(&format!(
+        "Events of the run (the last {}):\n{}\n",
+        events.len(),
+        fenced(
+            "json",
+            &events
+                .iter()
+                .map(Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n")
+        )
+    ));
+    let earlier: Vec<String> = detail
+        .runs
+        .iter()
+        .filter(|r| *r.id() != *run.id())
+        .map(|r| {
+            let verdicts: Vec<String> = detail
+                .events
+                .iter()
+                .filter(|e| e.run_id.as_ref() == Some(r.id()) && e.kind == "triage_finished")
+                .map(|e| format!("{}", e.payload.get("action").unwrap_or(&Value::Null)))
+                .collect();
+            format!(
+                "- run {} {}: {}{}",
+                r.id(),
+                r.status().as_str(),
+                or_none(tail(r.last_error().unwrap_or_default(), 300)),
+                if verdicts.is_empty() {
+                    String::new()
+                } else {
+                    format!(" (triaged: {})", verdicts.join(", "))
+                }
+            )
+        })
+        .collect();
+    let retry_rule = if failures >= TRIAGE_RETRY_FAILURES {
+        format!(
+            "This task has {failures} failed or interrupted runs, this one included: do not answer retry (the supervisor turns it into ask)."
+        )
+    } else {
+        format!(
+            "This task has {failures} failed or interrupted run(s), this one included; from {TRIAGE_RETRY_FAILURES} on, retry is not allowed and the supervisor turns it into ask."
+        )
+    };
+    let resume_rule = if resumes >= MAX_RESUME_ATTEMPTS {
+        format!("The run was resumed {resumes} times already: do not answer resume.")
+    } else {
+        format!(
+            "The run was resumed {resumes} time(s) (at most {MAX_RESUME_ATTEMPTS}); resume needs the run's worktree."
+        )
+    };
+    Ok(format!(
+        "You triage run {run_id} of dagq task {task_id} ({title}), which ended {status}. Decide what the supervisor does next.\n\
+         Read only: the material below, and the files it names if you need more (the run directory is {dir}, the worktree {worktree}). Do not change any file.\n\n\
+         Task description:\n{description}\n\n\
+         Acceptance criteria:\n{acceptance}\n\n\
+         Last error of the run:\n{last_error}\n\n\
+         {material}\n\
+         Earlier runs of the task:\n{earlier}\n\n\
+         Decide one verdict:\n\
+         - retry: the failure is transient or came from the environment (the machine slept, a process was killed, the session never started, an outage), and a new run from the current main is likely to succeed. The task goes back to ready and a new run starts from scratch; this run's work is not reused.\n\
+         - resume: this run's worktree holds useful work that its own session can finish with a concrete instruction (fix the failing test, commit and rewrite the receipt, rebase). instruction is what the session must do, written to it.\n\
+         - ask: a person has to decide: the task's instructions or acceptance look wrong or impossible, the same failure repeats, the work is no longer needed, or you cannot tell. instruction is the question for the person.\n\
+         Rules: {retry_rule} {resume_rule}\n\n\
+         Answer with one JSON object and nothing else, matching this schema:\n\
+         {{\"verdict\": \"retry\" | \"resume\" | \"ask\", \"reason\": string, \"instruction\": string}}\n\
+         reason is one or two sentences on why; instruction may be empty for retry.\n",
+        run_id = run.id(),
+        task_id = task.id(),
+        title = task.title(),
+        status = run.status().as_str(),
+        dir = dir.display(),
+        worktree = run.worktree_path().unwrap_or("none"),
+        description = or_none(task.description()),
+        acceptance = or_none(task.acceptance()),
+        last_error = or_none(run.last_error().unwrap_or_default()),
+        earlier = if earlier.is_empty() {
+            "none".to_owned()
+        } else {
+            earlier.join("\n")
+        },
+    ))
+}
+
+/// The fixed request the supervisor types into the live session for a
+/// `revise` verdict (ADR-0027 decision 2), one instruction per line; the
+/// backend sends it as one line.
+pub(crate) fn revise_request(
+    task: &Task,
+    run: &TaskRun,
+    attempt: usize,
+    reasons: &[String],
+) -> Result<String> {
+    let receipt = run.receipt_path().context("missing receipt path")?;
+    let verify = serde_json::to_string(task.verification_commands())?;
+    let mut lines = vec![format!(
+        "dagq: the supervisor's review of run {} (task {}) asks for changes (revise {attempt} of {MAX_REVISE_ATTEMPTS}).",
+        run.id(),
+        task.id()
+    )];
+    lines.push("Findings:".to_owned());
+    for reason in reasons {
+        lines.push(format!("- {reason}"));
+    }
+    lines.push("Steps:".to_owned());
+    lines.push("1. Fix the findings in this worktree and commit.".to_owned());
+    lines.push(format!("2. Run the verification commands {verify}."));
+    lines.push("3. Keep the worktree clean.".to_owned());
+    lines.push(format!("4. {STOP_BACKGROUND}"));
+    lines.push(format!(
+        "5. Rewrite the receipt at {receipt} with the new head commit, writing a temporary file in the same directory and renaming it."
+    ));
+    lines.push(
+        "6. Do not merge or push. When done, report briefly and stop; do not run /exit.".to_owned(),
+    );
+    Ok(lines.join("\n"))
 }

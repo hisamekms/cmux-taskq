@@ -7,19 +7,22 @@ pub use crate::application::{
     health::{DoctorReport, LeaseHealth, ProcessHealth, RunHealth, SupervisorHealth},
     integrate::{IntegrateTarget, integrate_verify_log, register_follow_ups},
     prompt::{
-        PredecessorSummary, STOP_BACKGROUND, WORKER_READING, inbox_prompt, planner_prompt, prompt,
-        siblings_in_progress,
+        PredecessorSummary, STOP_BACKGROUND, TRIAGE_TOOLS, WORKER_READING, inbox_prompt,
+        planner_prompt, prompt, review_prompt, siblings_in_progress,
     },
     rebind::REBIND_LOG,
     recording::{BACKEND_ERROR_CHARS, RecordingBackend, backend_failure_payload},
-    supervise::{PromptKind, RunError, TRIAGE_TOOLS, detect_prompt, review_prompt},
+    supervise::RunError,
 };
 pub use crate::compose::{
     SuperviseOptions, ask, doctor, integrate, rebind, recover, resume_session_with_provider,
     review, session, session_with_provider, stats, status, status_for, supervise,
     supervise_with_reviewer, triage_prompt,
 };
-pub use crate::infrastructure::run_files::SupervisorLog;
+pub use crate::infrastructure::{
+    claude::{PromptKind, detect_prompt},
+    run_files::SupervisorLog,
+};
 
 use std::path::{Path, PathBuf};
 

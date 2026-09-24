@@ -27,7 +27,14 @@ AgentProvider
   review_command(run, prompt) -- 実装済み: supervisorのheadless review（stdoutがverdict JSON）
   review_timeout()         -- 実装済み: headless reviewの上限（既定600秒）
   inspect / interrupt / collect_result  -- 後続
+
+AgentSignals
+  detect_prompt(screen)    -- 実装済み: 画面の末尾のダイアログのkind（trust / choice / confirm）
+  screen_excerpt(screen)   -- 実装済み: askと`prompt_waiting`に載せる画面の末尾
+  idle_hook(content)       -- 実装済み: idle markerの内容（background_running、evidenceに記録するhookのフィールド）
 ```
+
+`AgentSignals`はsupervisorが生きているsessionのagentについて読むもの（画面とidle marker）で、形式がagent固有なのでproviderのadapterが実装する（Claude Codeは`src/infrastructure/claude.rs`）。applicationはkindの名前・画面の抜粋・background workの有無だけを受け取り、それがrunにとって何を意味するか（askにする、`/exit`を待つ）を決める。
 
 コマンドを返すメソッドは`std::process::Command`ではなくapplicationの`CommandSpec`（program、引数、環境変数の設定と削除、cwdだけを持つ値。`Command`と同じ名前のbuilderを持つ）を返す。起動はapplicationの`Spawner` portが行い、標準入出力の行き先（wrapperの端末を継承、null、`<run-dir>`のファイル）は呼び出す側が`Streams`で決める。実装は`infrastructure::process::LocalSpawner`で、`CommandSpec`を`Command`に変えて子プロセスとして起動する（`infrastructure::process::command`。observerの`observe`もこれで`Command`にする）。こうしてsupervisorとsession wrapperのユースケース（`application::supervise` / `application::session`）はプロセスを直接扱わない（[supervisor-lifecycle](supervisor-lifecycle.md#supervise)）。
 

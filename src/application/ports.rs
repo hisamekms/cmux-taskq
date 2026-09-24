@@ -286,6 +286,34 @@ pub trait AgentProvider {
     }
 }
 
+/// What the supervisor reads of the agent of a live session: its screen,
+/// for a dialog that holds it (ADR-0019 decision 6), and the idle marker
+/// its hook writes when it stops (ADR-0016). Both formats are the agent's
+/// own (for Claude Code, its TUI and its `Stop` hook input), so the
+/// provider's adapter implements this; the supervisor decides what a dialog
+/// or an idle agent means for the run.
+pub trait AgentSignals {
+    /// The kind of dialog at the bottom of `screen` that holds the session
+    /// (recorded as `prompt` of `prompt_waiting`), or `None` while it works.
+    fn detect_prompt(&self, screen: &str) -> Option<&'static str>;
+    /// The last lines of `screen` an ask and `prompt_waiting` carry.
+    fn screen_excerpt(&self, screen: &str) -> String;
+    /// What the idle marker's content says. A content the adapter cannot
+    /// read still marks a stop.
+    fn idle_hook(&self, content: &[u8]) -> IdleHook;
+}
+
+/// The content of an idle marker, as [`AgentSignals::idle_hook`] read it.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct IdleHook {
+    /// Background work the agent left running when it stopped: a `/exit`
+    /// sent now stops at the agent's own dialog.
+    pub background_running: bool,
+    /// The fields of the hook input recorded with the evidence of a stop,
+    /// by name.
+    pub evidence: Vec<(&'static str, serde_json::Value)>,
+}
+
 /// The Git remote `integrate` pushes the landed `main` to (ADR-0019
 /// decision 3), replaceable in tests.
 pub trait MainRemote {
