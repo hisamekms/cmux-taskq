@@ -1936,7 +1936,7 @@ impl Supervisor<'_> {
                 continue;
             }
             let detail = self.queue.show(run.task_id)?;
-            if detail.task.status != TaskStatus::InProgress
+            if detail.task.status() != TaskStatus::InProgress
                 || detail.runs.last().is_some_and(|latest| latest.id != run.id)
             {
                 self.log.note(&format!(
@@ -2302,7 +2302,7 @@ impl Supervisor<'_> {
         let task = self
             .queue
             .show(run.task_id)
-            .map(|detail| detail.task.status);
+            .map(|detail| detail.task.status());
         self.log.note(&format!(
             "run {} triaged: the run is {}{}",
             run.id,
@@ -2465,7 +2465,9 @@ impl Supervisor<'_> {
         let task = self.queue.show(run.task_id)?.task;
         if receipt.run_id != run.id.as_str()
             || receipt.result != ReceiptResult::Succeeded
-            || !receipt.missing_evidence(&task.required_evidence).is_empty()
+            || !receipt
+                .missing_evidence(task.required_evidence())
+                .is_empty()
         {
             return Ok(None);
         }
@@ -2536,7 +2538,7 @@ impl Supervisor<'_> {
     /// on is left alone.
     fn exhaust_resumes(&mut self, run: &TaskRun, attempts: usize) -> Result<()> {
         let detail = self.queue.show(run.task_id)?;
-        if detail.task.status != TaskStatus::InProgress
+        if detail.task.status() != TaskStatus::InProgress
             || detail.runs.last().is_some_and(|latest| latest.id != run.id)
         {
             return Ok(());
@@ -2550,7 +2552,7 @@ impl Supervisor<'_> {
             "Run {} of task {} ({}) was resumed {attempts} times (at most {MAX_RESUME_ATTEMPTS}) and still needs a session, so the supervisor stops resuming it.\nLast error: {}",
             run.id,
             run.task_id,
-            detail.task.title,
+            detail.task.title(),
             or_none(tail(&last_error, 500))
         );
         if let Some(run_dir) = &run.run_dir {
@@ -2677,7 +2679,7 @@ impl Supervisor<'_> {
             agent_seen: None,
             message_sent: None,
             exit_requested: None,
-            required_evidence: task.required_evidence.clone(),
+            required_evidence: task.required_evidence().to_vec(),
             approved: self.queue.has_run_event(&run.id, "integration_approved")?,
         })
     }
@@ -3180,11 +3182,11 @@ so the run workspace opens outside it: {error:#}",
         let task = self.queue.show(run.task_id)?.task;
         let predecessors: Vec<PredecessorSummary> = self
             .queue
-            .predecessors(task.id)?
+            .predecessors(task.id())?
             .iter()
             .map(PredecessorSummary::from_predecessor)
             .collect();
-        let goal = match task.goal_id {
+        let goal = match task.goal_id() {
             Some(goal_id) => Some(self.queue.show_goal(goal_id)?.goal),
             None => None,
         };
@@ -3979,29 +3981,34 @@ fn resume_request(
     let mut lines = vec![match request.kind {
         ResumeKind::EvidenceMissing => format!(
             "dagq: the supervisor's validation of run {} (task {}) found required evidence missing from the receipt, so the run is needs_session.",
-            run.id, task.id
+            run.id,
+            task.id()
         ),
         ResumeKind::SentBack => format!(
             "dagq: the supervisor's review of run {} (task {}) raised findings a person sent back to you, so the run is needs_session.",
-            run.id, task.id
+            run.id,
+            task.id()
         ),
         ResumeKind::ScopeViolation => format!(
             "dagq: run {} (task {}) changes paths outside the task's --paths ({}), so the run is needs_session.",
             run.id,
-            task.id,
-            task.paths.join(", ")
+            task.id(),
+            task.paths().join(", ")
         ),
         ResumeKind::Landing => format!(
             "dagq: integrate could not land run {} (task {}) and returned needs_session.",
-            run.id, task.id
+            run.id,
+            task.id()
         ),
         ResumeKind::Precheck => format!(
             "dagq: the supervisor's review of run {} (task {}) passed, but integrate would conflict with main, so the run was not landed.",
-            run.id, task.id
+            run.id,
+            task.id()
         ),
         ResumeKind::Triage => format!(
             "dagq: run {} (task {}) failed or was interrupted, and the supervisor's triage sent it back to this session to finish, so the run is needs_session.",
-            run.id, task.id
+            run.id,
+            task.id()
         ),
     }];
     lines.push(format!("Reason: {}", request.reason));
@@ -4021,7 +4028,7 @@ fn resume_request(
         }
     }
     lines.push("Steps:".to_owned());
-    let verify = serde_json::to_string(&task.verification_commands)?;
+    let verify = serde_json::to_string(task.verification_commands())?;
     if request.kind == ResumeKind::EvidenceMissing {
         lines.push(
             "1. Run the checks the reason names as missing and write their evidence into the receipt."
@@ -4787,9 +4794,9 @@ pub fn review_prompt(task: &Task, run: &TaskRun, review_path: &str) -> String {
          {{\"verdict\": \"pass\" | \"revise\" | \"concern\", \"reasons\": [string], \"summary\": string}}\n\
          reasons lists each finding (empty for pass); summary is one or two sentences.\n",
         run_id = run.id,
-        task_id = task.id,
-        title = task.title,
-        acceptance = or_none(&task.acceptance),
+        task_id = task.id(),
+        title = task.title(),
+        acceptance = or_none(task.acceptance()),
     )
 }
 
@@ -4955,13 +4962,13 @@ pub fn triage_prompt(
          {{\"verdict\": \"retry\" | \"resume\" | \"ask\", \"reason\": string, \"instruction\": string}}\n\
          reason is one or two sentences on why; instruction may be empty for retry.\n",
         run_id = run.id,
-        task_id = task.id,
-        title = task.title,
+        task_id = task.id(),
+        title = task.title(),
         status = run.status.as_str(),
         dir = dir.display(),
         worktree = run.worktree_path.as_deref().unwrap_or("none"),
-        description = or_none(&task.description),
-        acceptance = or_none(&task.acceptance),
+        description = or_none(task.description()),
+        acceptance = or_none(task.acceptance()),
         last_error = or_none(run.last_error.as_deref().unwrap_or_default()),
         earlier = if earlier.is_empty() {
             "none".to_owned()
@@ -4981,10 +4988,11 @@ fn revise_request(
     reasons: &[String],
 ) -> Result<String> {
     let receipt = run.receipt_path.as_ref().context("missing receipt path")?;
-    let verify = serde_json::to_string(&task.verification_commands)?;
+    let verify = serde_json::to_string(task.verification_commands())?;
     let mut lines = vec![format!(
         "dagq: the supervisor's review of run {} (task {}) asks for changes (revise {attempt} of {MAX_REVISE_ATTEMPTS}).",
-        run.id, task.id
+        run.id,
+        task.id()
     )];
     lines.push("Findings:".to_owned());
     for reason in reasons {
@@ -5152,7 +5160,7 @@ fn spawn_validation(
                     allowed_paths: if rejection.scope_violation.is_empty() {
                         Vec::new()
                     } else {
-                        task.paths.clone()
+                        task.paths().to_vec()
                     },
                     scope_violation: rejection.scope_violation,
                 }
@@ -5224,7 +5232,7 @@ fn check_receipt(
         Ok(receipt) => receipt,
         Err(error) => return reject(format!("{error:#}"), None, None),
     };
-    if let Err(error) = receipt.check_requiring(&run.id, &task.required_evidence) {
+    if let Err(error) = receipt.check_requiring(&run.id, task.required_evidence()) {
         return reject(format!("{error:#}"), None, Some(receipt));
     }
     // The commit must be the head of the run branch, checked out in the worktree,
@@ -5287,14 +5295,14 @@ fn check_receipt(
     // task's paths (ADR-0029). The diff starts where the branch forked from
     // the current main, not at the base commit: a resumed session that
     // rebased carries what other tasks landed since, which is not its change.
-    let outside = if task.paths.is_empty() {
+    let outside = if task.paths().is_empty() {
         Vec::new()
     } else {
         let fork = repository
             .merge_base(repository.main_head()?.as_str(), commit.as_str())?
             .context("the run branch shares no history with main")?;
         out_of_scope(
-            &task.paths,
+            task.paths(),
             &repository.changed_paths(fork.as_str(), commit.as_str())?,
         )
     };
@@ -5309,7 +5317,7 @@ fn check_receipt(
     }
     // Only a run that is otherwise sound waits for a session to add the
     // evidence (ADR-0019 decision 5).
-    let missing = receipt.missing_evidence(&task.required_evidence);
+    let missing = receipt.missing_evidence(task.required_evidence());
     if !missing.is_empty() {
         return Ok(Err(Rejection {
             reason: evidence_missing_reason(&missing),
@@ -5391,7 +5399,7 @@ pub fn integrate(
                 .with_context(|| {
                     format!(
                         "task {task_id} ({}) has no run awaiting integration or a session",
-                        detail.task.status.as_str()
+                        detail.task.status().as_str()
                     )
                 })?
         }
@@ -5487,7 +5495,9 @@ fn land_integrating(
                 })?;
             eprintln!(
                 "task {} landed as {} on main; run {} integrated",
-                task.id, landing.commit, run.id
+                task.id(),
+                landing.commit,
+                run.id
             );
             remove_landed_worktree(queue, repository, &run);
             let push = push_main(queue, remote, &run.id, &landing.commit);
@@ -5623,7 +5633,7 @@ pub fn register_follow_ups(
             return Vec::new();
         }
     };
-    let goal_closed = match task.goal_id {
+    let goal_closed = match task.goal_id() {
         Some(goal_id) => match queue.show_goal(goal_id) {
             Ok(detail) => detail.closed,
             Err(error) => {
@@ -5670,10 +5680,11 @@ pub fn register_follow_ups(
             required_evidence: Vec::new(),
             paths: Vec::new(),
             dependencies: Vec::new(),
-            goal_id: task.goal_id.filter(|_| !goal_closed),
+            goal_id: task.goal_id().filter(|_| !goal_closed),
             context: format!(
                 "task {}（{}）の run {run_id} の receipt が提案した follow_up",
-                task.id, task.title
+                task.id(),
+                task.title()
             ),
         };
         let created = match queue.add(new) {
@@ -5683,7 +5694,8 @@ pub fn register_follow_ups(
                 continue;
             }
         };
-        let mut payload = json!({"task_id": created.id, "title": created.title, "index": index});
+        let mut payload =
+            json!({"task_id": created.id(), "title": created.title(), "index": index});
         if goal_closed {
             payload["goal_closed"] = json!(true);
         }
@@ -5692,11 +5704,12 @@ pub fn register_follow_ups(
         }
         eprintln!(
             "run {run_id}: follow_up {:?} registered as draft task {}",
-            created.title, created.id
+            created.title(),
+            created.id()
         );
         added.push(RegisteredFollowUp {
-            task_id: created.id,
-            title: created.title,
+            task_id: created.id(),
+            title: created.title().to_owned(),
         });
     }
     added
@@ -5782,12 +5795,12 @@ fn land(
             receipt: serde_json::to_value(&receipt)?,
         });
     }
-    if let Err(error) = receipt.check_requiring(&run.id, &task.required_evidence) {
+    if let Err(error) = receipt.check_requiring(&run.id, task.required_evidence()) {
         return defer(format!("{error:#}"), json!({}));
     }
     // A resumed session may have come back without the evidence it was
     // asked for; `checks` tells the next resume to ask for it again.
-    let missing = receipt.missing_evidence(&task.required_evidence);
+    let missing = receipt.missing_evidence(task.required_evidence());
     if !missing.is_empty() {
         return defer(
             evidence_missing_reason(&missing),
@@ -5878,7 +5891,7 @@ fn land(
     // the task's paths (ADR-0029): the rebase may have changed it since
     // validation, and a resumed session may have committed more.
     let outside = out_of_scope(
-        &task.paths,
+        task.paths(),
         &repository.changed_paths(main.as_str(), rebased.as_str())?,
     );
     if !outside.is_empty() {
@@ -5887,12 +5900,12 @@ fn land(
                 "{} after the rebase onto main {main}; take them out of the run branch (or ask for the task's --paths to be widened), commit, and rewrite the receipt with the new head",
                 scope_violation_reason(&outside)
             ),
-            json!({"main": main, "head": rebased, "scope_violation": outside, "allowed": task.paths}),
+            json!({"main": main, "head": rebased, "scope_violation": outside, "allowed": task.paths()}),
         );
     }
     // The task's verification commands run here, once per commit, on the
     // rebased tree: validation only checks the receipt (ADR-0023 decision 1).
-    let commands = &task.verification_commands;
+    let commands = task.verification_commands();
     let run_env = if commands.is_empty() {
         Vec::new()
     } else {
@@ -5949,12 +5962,12 @@ fn land(
 /// Title, the receipt's summary, and the trailers that tie the commit to
 /// the queue, as paragraphs.
 fn commit_message(task: &Task, run: &TaskRun, receipt: &Receipt) -> Vec<String> {
-    let mut paragraphs = vec![task.title.trim().to_owned()];
+    let mut paragraphs = vec![task.title().trim().to_owned()];
     let summary = receipt.summary.trim();
     if !summary.is_empty() {
         paragraphs.push(summary.to_owned());
     }
-    paragraphs.push(format!("Dagq-Task: {}\nDagq-Run: {}", task.id, run.id));
+    paragraphs.push(format!("Dagq-Task: {}\nDagq-Run: {}", task.id(), run.id));
     paragraphs
 }
 
@@ -6006,11 +6019,11 @@ pub fn review(db: &Path, task_id: TaskId) -> Result<Value> {
         .with_context(|| {
             format!(
                 "task {task_id} ({}) has no run awaiting integration or a session",
-                detail.task.status.as_str()
+                detail.task.status().as_str()
             )
         })?;
     let task = detail.task;
-    let goal = match task.goal_id {
+    let goal = match task.goal_id() {
         Some(goal_id) => Some(queue.show_goal(goal_id)?.goal),
         None => None,
     };
@@ -6060,7 +6073,7 @@ pub fn review(db: &Path, task_id: TaskId) -> Result<Value> {
     }
     Ok(json!({
         "run_id": run.id,
-        "task_id": task.id,
+        "task_id": task.id(),
         "path": path_text(&path)?,
         "base": base,
         "head": head,
@@ -6168,27 +6181,27 @@ fn review_markdown(
          ### Description\n\n{description}\n\n\
          ### Acceptance\n\n{acceptance}\n\n\
          ### Verification commands\n\n{verify}\n",
-        id = task.id,
-        title = task.title,
+        id = task.id(),
+        title = task.title(),
         run_id = run.id,
         status = run.status.as_str(),
         run_base = run.base_commit,
         branch = run.branch.as_deref().unwrap_or("(none)"),
         worktree = run.worktree_path.as_deref().unwrap_or("(none)"),
         run_dir = run.run_dir.as_deref().unwrap_or("(none)"),
-        description = or_none(&task.description),
-        acceptance = or_none(&task.acceptance),
-        verify = fenced("sh", &task.verification_commands.join("\n")),
+        description = or_none(task.description()),
+        acceptance = or_none(task.acceptance()),
+        verify = fenced("sh", &task.verification_commands().join("\n")),
     );
     if let Some(goal) = goal {
         out.push_str(&format!(
             "\n## Goal {id}: {title}\n\n\
              ### Goal acceptance\n\n{acceptance}\n\n\
              ### Goal constraints\n\n{constraints}\n",
-            id = goal.id,
-            title = goal.title,
-            acceptance = or_none(&goal.acceptance),
-            constraints = or_none(&goal.constraints),
+            id = goal.id(),
+            title = goal.title(),
+            acceptance = or_none(goal.acceptance()),
+            constraints = or_none(goal.constraints()),
         ));
     }
     out.push_str(&format!(
@@ -6287,8 +6300,8 @@ impl PredecessorSummary {
             })
             .unwrap_or_else(|| "(receipt unavailable)".to_owned());
         Self {
-            task_id: predecessor.task.id,
-            title: predecessor.task.title.clone(),
+            task_id: predecessor.task.id(),
+            title: predecessor.task.title().to_owned(),
             result_commit: run
                 .and_then(|run| run.result_commit.as_ref())
                 .map_or_else(|| "(not landed)".to_owned(), CommitSha::to_string),
@@ -6303,8 +6316,8 @@ impl PredecessorSummary {
 pub fn siblings_in_progress(task: &Task, in_progress: Vec<Task>) -> Vec<Task> {
     in_progress
         .into_iter()
-        .filter(|other| other.id != task.id)
-        .filter(|other| task.goal_id.is_none() || other.goal_id == task.goal_id)
+        .filter(|other| other.id() != task.id())
+        .filter(|other| task.goal_id().is_none() || other.goal_id() == task.goal_id())
         .collect()
 }
 
@@ -6341,26 +6354,25 @@ pub fn prompt(
              Goal ID: {id}\nGoal title: {title}\nGoal description:\n{description}\n\
              Goal acceptance:\n{acceptance}\nGoal constraints:\n{constraints}\n\
              Goal doc: {doc}\n",
-            id = goal.id,
-            title = goal.title,
-            description = goal.description,
-            acceptance = goal.acceptance,
-            constraints = goal.constraints,
+            id = goal.id(),
+            title = goal.title(),
+            description = goal.description(),
+            acceptance = goal.acceptance(),
+            constraints = goal.constraints(),
             doc = goal
-                .doc
-                .as_deref()
+                .doc()
                 .map(|doc| format!(
                     "{doc} (a path in the repository; read it for the full picture)"
                 ))
                 .unwrap_or_else(|| "none".to_owned()),
         ),
     };
-    let context = if task.context.trim().is_empty() {
+    let context = if task.context().trim().is_empty() {
         "Context: none\n".to_owned()
     } else {
         format!(
             "Context (why this task exists and what to read first):\n{}\n",
-            task.context
+            task.context()
         )
     };
     let predecessors = if predecessors.is_empty() {
@@ -6386,27 +6398,31 @@ pub fn prompt(
             "Sibling tasks in progress (other tasks executing now, each owning its own scope):\n"
                 .to_owned();
         for other in siblings {
-            text.push_str(&format!("- task {}: {}\n", other.id, other.title));
+            text.push_str(&format!("- task {}: {}\n", other.id(), other.title()));
         }
         text
     };
     // Known up front, so the receipt carries it (ADR-0019 decision 5).
-    let evidence = if task.required_evidence.is_empty() {
+    let evidence = if task.required_evidence().is_empty() {
         String::new()
     } else {
-        let names: Vec<&str> = task.required_evidence.iter().map(|c| c.as_str()).collect();
+        let names: Vec<&str> = task
+            .required_evidence()
+            .iter()
+            .map(|c| c.as_str())
+            .collect();
         format!(
             "Required evidence: {} (each must be passed with evidence in the receipt, or the run waits for a session to add it)\n",
             names.join(", ")
         )
     };
     // The declared scope (ADR-0029): changing anything else parks the run.
-    let paths = if task.paths.is_empty() {
+    let paths = if task.paths().is_empty() {
         String::new()
     } else {
         format!(
             "Paths you may change (globs from the repository root; `*` stays in one directory, `**` spans any depth): {}. A commit that changes any other path is not accepted: the run waits for a session to take it out. If the task needs another path, ask instead of changing it.\n",
-            task.paths.join(", ")
+            task.paths().join(", ")
         )
     };
     Ok(format!(
@@ -6429,14 +6445,14 @@ pub fn prompt(
          When you need a decision you cannot make from the task and the repository, do not write the question to the terminal and wait: run `dagq ask --run {run_id} --kind worker_question --question '...'` in the worktree (one ask at a time, with everything you need decided in its question), report briefly that you asked, and stop. The answer arrives in this terminal as `answer to ask <id>: ...`; continue from it.\n\
          {stop_background}\n\
          After submitting, report the outcome briefly and stop; do not run /exit yourself. Once you are idle the supervisor ends the session, and a person can still send /exit. A receipt does not itself end the session.\n",
-        task_id = task.id,
+        task_id = task.id(),
         run_id = run.id,
         reading = WORKER_READING,
         stop_background = STOP_BACKGROUND,
-        title = task.title,
-        description = task.description,
-        acceptance = task.acceptance,
-        verification = serde_json::to_string_pretty(&task.verification_commands)?,
+        title = task.title(),
+        description = task.description(),
+        acceptance = task.acceptance(),
+        verification = serde_json::to_string_pretty(&task.verification_commands())?,
     ))
 }
 

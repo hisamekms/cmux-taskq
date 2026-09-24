@@ -82,8 +82,8 @@ fn add_ready_task(queue: &mut SqliteQueue, title: &str, dependencies: &[TaskId])
             context: String::new(),
         })
         .unwrap();
-    queue.transition(task.id, TaskAction::Ready).unwrap();
-    task.id
+    queue.transition(task.id(), TaskAction::Ready).unwrap();
+    task.id()
 }
 
 /// Shell prelude for the fake agent: `receipt COMMIT [RUN_ID]` writes an
@@ -401,7 +401,7 @@ impl WorkspaceBackend for TestWorkspace {
         command: &str,
         tags: &WorkspaceTags,
     ) -> Result<String> {
-        assert_eq!(task.id, run.task_id);
+        assert_eq!(task.id(), run.task_id);
         self.tags.lock().unwrap().push(tags.clone());
         assert!(
             Path::new(run.worktree_path.as_ref().unwrap())
@@ -463,7 +463,7 @@ impl WorkspaceBackend for TestWorkspace {
         command: &str,
         tags: &WorkspaceTags,
     ) -> Result<String> {
-        assert_eq!(task.id, run.task_id);
+        assert_eq!(task.id(), run.task_id);
         assert!(command.ends_with(" '--resume'"), "{command}");
         // The worker's env (ADR-0026) and `run <run-id> resume` (ADR-0028).
         assert!(
@@ -717,7 +717,7 @@ fn run_agent_with(script: &str, close_fail: bool) -> (TempDir, PathBuf, dagq::do
     assert_eq!(outcome["errors"], json!([]));
     let mut queue = SqliteQueue::open(&db).unwrap();
     let detail = queue.show(TaskId::new(1)).unwrap();
-    assert_eq!(detail.task.status, TaskStatus::InProgress);
+    assert_eq!(detail.task.status(), TaskStatus::InProgress);
     let run = &detail.runs[0];
     assert_eq!(outcome["runs"][0]["id"], json!(run.id));
     // Runs live in `runs/` next to the (canonicalized) database, worktree inside.
@@ -1924,7 +1924,7 @@ fn failed_agent_retains_worktree_and_does_not_complete_task() {
     assert!(backend.notifications.lock().unwrap().is_empty());
     let mut queue = SqliteQueue::open(&db).unwrap();
     let detail = queue.show(TaskId::new(1)).unwrap();
-    assert_eq!(detail.task.status, TaskStatus::InProgress);
+    assert_eq!(detail.task.status(), TaskStatus::InProgress);
     assert_eq!(
         detail.runs[0].last_error.as_deref(),
         Some("session exited with code 7")
@@ -1938,7 +1938,7 @@ fn failed_agent_retains_worktree_and_does_not_complete_task() {
         .transition(TaskId::new(1), TaskAction::Cancel)
         .unwrap();
     assert_eq!(
-        queue.show(TaskId::new(1)).unwrap().task.status,
+        queue.show(TaskId::new(1)).unwrap().task.status(),
         TaskStatus::Canceled
     );
 }
@@ -1964,7 +1964,7 @@ fn provisioning_failure_retains_the_run_and_stops_claiming_other_tasks() {
     assert!(Path::new(run.worktree_path.as_ref().unwrap()).exists());
     // The environment is suspect: the second candidate was left alone.
     assert!(queue.show(TaskId::new(2)).unwrap().runs.is_empty());
-    assert_eq!(queue.candidates().unwrap()[0].id, TaskId::new(2));
+    assert_eq!(queue.candidates().unwrap()[0].id(), TaskId::new(2));
     // The run is disowned, so nothing has to be stopped before recovering it;
     // the drained loop took its registration with it.
     assert!(queue.run_leases().unwrap().is_empty());
@@ -2310,7 +2310,10 @@ fn migration_from_v1_preserves_task_and_initializes_runtime_tables() {
     raw.execute("INSERT INTO tasks(title,description,acceptance,verification_commands) VALUES ('preserved','','','[]')", []).unwrap();
     let mut queue = SqliteQueue::open(&db).unwrap();
     assert_eq!(queue.schema_version().unwrap(), SqliteQueue::SCHEMA_VERSION);
-    assert_eq!(queue.show(TaskId::new(1)).unwrap().task.title, "preserved");
+    assert_eq!(
+        queue.show(TaskId::new(1)).unwrap().task.title(),
+        "preserved"
+    );
     assert!(queue.run_leases().unwrap().is_empty());
 }
 
@@ -2905,7 +2908,7 @@ fn recover_requires_dead_processes_and_stale_lease_then_allows_a_new_run() {
     assert_eq!(outcome["outcome"], "recovered");
     assert_eq!(outcome["run"]["status"], "interrupted");
     let detail = queue.show(TaskId::new(1)).unwrap();
-    assert_eq!(detail.task.status, TaskStatus::InProgress);
+    assert_eq!(detail.task.status(), TaskStatus::InProgress);
     assert_eq!(detail.runs[0].status, RunStatus::Interrupted);
     assert!(queue.run_leases().unwrap().is_empty());
     let recovered = detail
@@ -2988,7 +2991,7 @@ fn recover_ignores_exited_processes_and_tolerates_a_missing_lease() {
     );
     queue.transition(TaskId::new(1), TaskAction::Draft).unwrap();
     assert_eq!(
-        queue.show(TaskId::new(1)).unwrap().task.status,
+        queue.show(TaskId::new(1)).unwrap().task.status(),
         TaskStatus::Draft
     );
     assert!(runtime::recover(&db, &RunId::new("no-such-run").unwrap()).is_err());
@@ -3105,7 +3108,7 @@ fn a_failed_push_keeps_the_landing_and_waits_as_attention() {
     );
     let mut queue = SqliteQueue::open(&db).unwrap();
     assert_eq!(
-        queue.show(TaskId::new(1)).unwrap().task.status,
+        queue.show(TaskId::new(1)).unwrap().task.status(),
         TaskStatus::Completed
     );
     drop(queue);
@@ -3228,14 +3231,14 @@ fn add_file_task(
             context: String::new(),
         })
         .unwrap();
-    queue.transition(task.id, TaskAction::Ready).unwrap();
+    queue.transition(task.id(), TaskAction::Ready).unwrap();
     backend.script_for(
-        task.id.as_i64(),
+        task.id().as_i64(),
         &format!(
             "printf '{content}\\n' > '{file}' && git add '{file}' && git commit -q -m '{title}'; receipt \"$(git rev-parse HEAD)\""
         ),
     );
-    task.id
+    task.id()
 }
 
 /// Rewrite the run's receipt the way a resumed session would after its work.
@@ -3337,7 +3340,7 @@ fn awaiting_run() -> (TempDir, PathBuf, PathBuf, TaskRun) {
             context: String::new(),
         })
         .unwrap();
-    queue.transition(dependent.id, TaskAction::Ready).unwrap();
+    queue.transition(dependent.id(), TaskAction::Ready).unwrap();
     assert!(queue.candidates().unwrap().is_empty());
     let repo = dir.path().join("repo's directory");
     (dir, repo, db, run)
@@ -3357,7 +3360,7 @@ fn review_writes_the_run_material_to_review_md_and_returns_only_its_size() {
             draft: false,
         })
         .unwrap();
-    queue.set_goal(TaskId::new(1), Some(goal.id)).unwrap();
+    queue.set_goal(TaskId::new(1), Some(goal.id())).unwrap();
     // A task without a run to review is refused.
     let error = format!("{:#}", runtime::review(&db, TaskId::new(1)).unwrap_err());
     assert!(
@@ -3508,7 +3511,7 @@ fn conflict_free_run_lands_as_one_squash_commit_and_releases_dependents() {
     assert_eq!(outcome["run"]["status"], "integrated");
     let mut queue = SqliteQueue::open(&db).unwrap();
     let detail = queue.show(TaskId::new(1)).unwrap();
-    assert_eq!(detail.task.status, TaskStatus::Completed);
+    assert_eq!(detail.task.status(), TaskStatus::Completed);
     let landed = detail.runs[0].clone();
     assert_landed(&repo, &landed, "test task", &seed);
     assert!(landed.last_error.is_none());
@@ -3595,7 +3598,7 @@ fn conflict_free_run_lands_as_one_squash_commit_and_releases_dependents() {
             .candidates()
             .unwrap()
             .iter()
-            .map(|t| t.id)
+            .map(|t| t.id())
             .collect::<Vec<_>>(),
         [TaskId::new(2)]
     );
@@ -3736,8 +3739,8 @@ fn prompt_describes_landed_predecessors_and_sibling_tasks_in_progress() {
     // The queue's read-only view the prompt is built from.
     let predecessors = queue.predecessors(TaskId::new(2)).unwrap();
     assert_eq!(predecessors.len(), 1);
-    assert_eq!(predecessors[0].task.id, TaskId::new(1));
-    assert_eq!(predecessors[0].task.title, "test task");
+    assert_eq!(predecessors[0].task.id(), TaskId::new(1));
+    assert_eq!(predecessors[0].task.title(), "test task");
     let integrated = predecessors[0].integrated_run.as_ref().unwrap();
     assert_eq!(integrated.id, run.id);
     assert_eq!(
@@ -3815,8 +3818,8 @@ fn add_ready_task_in(
             context: context.into(),
         })
         .unwrap();
-    queue.transition(task.id, TaskAction::Ready).unwrap();
-    task.id
+    queue.transition(task.id(), TaskAction::Ready).unwrap();
+    task.id()
 }
 
 /// The section headings of a prompt in order of appearance, so tests can
@@ -3863,7 +3866,7 @@ fn prompt_describes_the_goal_and_the_context_and_keeps_one_shape_without_them() 
     add_ready_task_in(
         &mut queue,
         "grouped",
-        Some(goal.id),
+        Some(goal.id()),
         "why this task exists\nread docs/design/x.md first",
     );
     let backend = TestWorkspace::new(&db, false, VALID_AGENT);
@@ -3887,7 +3890,7 @@ fn prompt_describes_the_goal_and_the_context_and_keeps_one_shape_without_them() 
              Goal ID: {}\nGoal title: goal title\nGoal description:\ngoal description\nsecond line\n\
              Goal acceptance:\ngoal acceptance\nGoal constraints:\ngoal constraints\n\
              Goal doc: docs/plans/goal.md (a path in the repository; read it for the full picture)\n",
-            goal.id
+            goal.id()
         )),
         "{grouped}"
     );
@@ -3953,7 +3956,7 @@ fn prompt_lists_only_the_siblings_of_the_same_goal_in_progress() {
     backend.join();
     let mut queue = SqliteQueue::open(&db).unwrap();
     assert_eq!(
-        queue.show(TaskId::new(1)).unwrap().task.status,
+        queue.show(TaskId::new(1)).unwrap().task.status(),
         TaskStatus::InProgress
     );
     let a = queue
@@ -3969,15 +3972,15 @@ fn prompt_lists_only_the_siblings_of_the_same_goal_in_progress() {
         })
         .unwrap();
     assert_eq!(
-        add_ready_task_in(&mut queue, "a first", Some(a.id), ""),
+        add_ready_task_in(&mut queue, "a first", Some(a.id()), ""),
         TaskId::new(2)
     );
     assert_eq!(
-        add_ready_task_in(&mut queue, "b only", Some(b.id), ""),
+        add_ready_task_in(&mut queue, "b only", Some(b.id()), ""),
         TaskId::new(3)
     );
     assert_eq!(
-        add_ready_task_in(&mut queue, "a second", Some(a.id), ""),
+        add_ready_task_in(&mut queue, "a second", Some(a.id()), ""),
         TaskId::new(4)
     );
     assert_eq!(
@@ -4039,7 +4042,7 @@ fn prompt_snapshots_the_goal_at_claim_time() {
             ..NewGoal::default()
         })
         .unwrap();
-    add_ready_task_in(&mut queue, "early", Some(goal.id), "");
+    add_ready_task_in(&mut queue, "early", Some(goal.id()), "");
     let backend = TestWorkspace::new(&db, false, VALID_AGENT);
     assert_eq!(
         supervise(&db, &repo, &backend).unwrap()["errors"],
@@ -4056,7 +4059,7 @@ fn prompt_snapshots_the_goal_at_claim_time() {
 
     queue
         .edit_goal(
-            goal.id,
+            goal.id(),
             GoalEdit {
                 title: Some("after edit".into()),
                 acceptance: Some("new acceptance".into()),
@@ -4064,7 +4067,7 @@ fn prompt_snapshots_the_goal_at_claim_time() {
             },
         )
         .unwrap();
-    add_ready_task_in(&mut queue, "late", Some(goal.id), "");
+    add_ready_task_in(&mut queue, "late", Some(goal.id()), "");
     assert_eq!(
         supervise(&db, &repo, &backend).unwrap()["errors"],
         json!([])
@@ -4246,7 +4249,10 @@ fn runs_land_fifo_by_validation_time_and_later_ones_are_rebased() {
     assert_eq!(rebased.payload["head_before"], json!(second.result_commit));
     assert_eq!(rebased.payload["head_after"], json!(history));
     for task in [a, b] {
-        assert_eq!(queue.show(task).unwrap().task.status, TaskStatus::Completed);
+        assert_eq!(
+            queue.show(task).unwrap().task.status(),
+            TaskStatus::Completed
+        );
     }
     assert!(queue.run_leases().unwrap().is_empty());
 }
@@ -4309,7 +4315,7 @@ fn conflicting_run_needs_a_session_and_lands_after_the_session_resolves_it() {
             .unwrap()
             .contains("CONFLICT")
     );
-    assert_eq!(detail.task.status, TaskStatus::InProgress);
+    assert_eq!(detail.task.status(), TaskStatus::InProgress);
     assert!(queue.run_leases().unwrap().is_empty());
     // A parked run still owns its task and is not picked by --next.
     assert!(queue.transition(TaskId::new(2), TaskAction::Ready).is_err());
@@ -4442,7 +4448,7 @@ fn conflicting_run_needs_a_session_and_lands_after_the_session_resolves_it() {
         Some("resolved")
     );
     assert_eq!(
-        queue.show(TaskId::new(2)).unwrap().task.status,
+        queue.show(TaskId::new(2)).unwrap().task.status(),
         TaskStatus::Completed
     );
     // The parked attempts were before the landing; the reason is cleared.
@@ -4530,7 +4536,7 @@ fn approved_needs_session_run_is_resumed_until_the_runtime_lands_it() {
     let detail = queue.show(TaskId::new(2)).unwrap();
     let landed = detail.runs[0].clone();
     assert_landed(&repo, &landed, "second", &first_landed);
-    assert_eq!(detail.task.status, TaskStatus::Completed);
+    assert_eq!(detail.task.status(), TaskStatus::Completed);
     assert_eq!(
         fs::read_to_string(repo.join("change.txt")).unwrap(),
         "resolved by the resumed session\n"
@@ -4853,7 +4859,7 @@ fn an_approved_run_resolved_by_an_earlier_resume_lands_without_a_session() {
 
     let detail = queue.show(TaskId::new(2)).unwrap();
     assert_landed(&repo, &detail.runs[0], "second", &first_landed);
-    assert_eq!(detail.task.status, TaskStatus::Completed);
+    assert_eq!(detail.task.status(), TaskStatus::Completed);
     assert!(backend.resumes.lock().unwrap().is_empty());
     assert!(backend.texts().is_empty());
     assert_eq!(payloads(&detail, "resume_started").len(), 1);
@@ -5289,7 +5295,7 @@ fn resuming_stops_after_three_attempts() {
     let outcome = supervise(&db, &repo, &backend).unwrap();
     assert_eq!(outcome["errors"], json!([]), "{outcome}");
     let detail = queue.show(TaskId::new(2)).unwrap();
-    assert_eq!(detail.task.status, TaskStatus::Canceled);
+    assert_eq!(detail.task.status(), TaskStatus::Canceled);
     assert_eq!(
         payloads(&detail, "triage_decided")[0]["answer"],
         json!("cancel")
@@ -5552,7 +5558,7 @@ fn failed_receipt_from_a_session_ends_the_run_without_landing() {
             == 1
     );
     assert_eq!(
-        queue.show(TaskId::new(2)).unwrap().task.status,
+        queue.show(TaskId::new(2)).unwrap().task.status(),
         TaskStatus::InProgress
     );
     assert!(queue.run_leases().unwrap().is_empty());
@@ -5604,7 +5610,7 @@ fn verification_failure_after_rebase_needs_a_session_and_keeps_the_rebased_tree(
             context: String::new(),
         })
         .unwrap()
-        .id;
+        .id();
     queue.transition(breaker, TaskAction::Ready).unwrap();
     backend.script_for(
         breaker.as_i64(),
@@ -6037,7 +6043,7 @@ fn failed_runs_in_the_same_pass_do_not_affect_the_accepted_run() {
     // Failed tasks can be retried independently; the accepted one still owns its slot.
     queue.transition(TaskId::new(2), TaskAction::Ready).unwrap();
     assert!(queue.transition(TaskId::new(1), TaskAction::Ready).is_err());
-    assert_eq!(queue.candidates().unwrap()[0].id, TaskId::new(2));
+    assert_eq!(queue.candidates().unwrap()[0].id(), TaskId::new(2));
 }
 
 /// Recovering one orphaned run touches neither the lease nor the processes of
@@ -7803,7 +7809,7 @@ fn integrate_registers_the_landed_follow_ups_as_draft_tasks_of_the_goal_once() {
             draft: false,
         })
         .unwrap();
-    queue.set_goal(TaskId::new(1), Some(goal.id)).unwrap();
+    queue.set_goal(TaskId::new(1), Some(goal.id())).unwrap();
     let backend = TestWorkspace::new(&db, false, VALID_AGENT);
     supervise(&db, &repo, &backend).unwrap();
     backend.join();
@@ -7850,13 +7856,13 @@ fn integrate_registers_the_landed_follow_ups_as_draft_tasks_of_the_goal_once() {
     );
     for (id, title, description) in [(2, "later work", "outside the task"), (3, "more work", "")] {
         let detail = queue.show(TaskId::new(id)).unwrap();
-        assert_eq!(detail.task.status, TaskStatus::Draft);
-        assert_eq!(detail.task.title, title);
-        assert_eq!(detail.task.description, description);
-        assert_eq!(detail.task.goal_id, Some(goal.id));
-        assert_eq!(detail.task.context, context);
-        assert_eq!(detail.task.acceptance, "");
-        assert!(detail.task.verification_commands.is_empty());
+        assert_eq!(detail.task.status(), TaskStatus::Draft);
+        assert_eq!(detail.task.title(), title);
+        assert_eq!(detail.task.description(), description);
+        assert_eq!(detail.task.goal_id(), Some(goal.id()));
+        assert_eq!(detail.task.context(), context);
+        assert_eq!(detail.task.acceptance(), "");
+        assert!(detail.task.verification_commands().is_empty());
         assert!(detail.dependencies.is_empty());
     }
     assert_eq!(
@@ -7889,15 +7895,15 @@ fn integrate_registers_the_landed_follow_ups_as_draft_tasks_of_the_goal_once() {
 
     // A closed goal takes no task: a new follow-up is registered without it.
     queue
-        .close_goal(goal.id, dagq::domain::GoalVerdict::Abandoned)
+        .close_goal(goal.id(), dagq::domain::GoalVerdict::Abandoned)
         .unwrap();
     let mut extended = follow_ups.as_array().unwrap().clone();
     extended.push(json!({"title": "after the goal", "description": "d"}));
     let added = runtime::register_follow_ups(&mut queue, &task, &run.id, Some(&json!(extended)));
     assert_eq!(added.len(), 1);
     let detail = queue.show(added[0].task_id).unwrap();
-    assert_eq!(detail.task.status, TaskStatus::Draft);
-    assert_eq!(detail.task.goal_id, None);
+    assert_eq!(detail.task.status(), TaskStatus::Draft);
+    assert_eq!(detail.task.goal_id(), None);
     assert_eq!(
         events_of(&db, &run.id, "follow_up_registered")[4],
         json!({"task_id": added[0].task_id, "title": "after the goal", "index": 4, "goal_closed": true})
@@ -7935,13 +7941,18 @@ fn dagq_toml_run_env_reaches_the_workspace_and_the_verification_commands() {
     queue
         .transition(TaskId::new(1), TaskAction::Cancel)
         .unwrap();
-    queue.transition(task.id, TaskAction::Ready).unwrap();
+    queue.transition(task.id(), TaskAction::Ready).unwrap();
     drop(queue);
     let backend = TestWorkspace::new(&db, false, VALID_AGENT);
     let outcome = supervise(&db, &repo, &backend).unwrap();
     backend.join();
     assert_eq!(outcome["errors"], json!([]), "{outcome}");
-    let run = SqliteQueue::open(&db).unwrap().show(task.id).unwrap().runs[0].clone();
+    let run = SqliteQueue::open(&db)
+        .unwrap()
+        .show(task.id())
+        .unwrap()
+        .runs[0]
+        .clone();
     assert_eq!(run.status, RunStatus::AwaitingIntegration);
     let canonical = db.canonicalize().unwrap();
     let queue_dir = canonical.parent().unwrap().to_str().unwrap().to_owned();
@@ -7969,7 +7980,7 @@ fn dagq_toml_run_env_reaches_the_workspace_and_the_verification_commands() {
     git(&repo, &["add", "other.txt"]);
     git(&repo, &["commit", "-m", "main moved"]);
     let worktree = PathBuf::from(run.worktree_path.as_ref().unwrap());
-    let outcome = integrate(&db, task.id.as_i64(), &worktree).unwrap();
+    let outcome = integrate(&db, task.id().as_i64(), &worktree).unwrap();
     assert_eq!(outcome["outcome"], "integrated", "{outcome}");
     let line = format!("{queue_dir}/target {run_dir}\n");
     assert_eq!(fs::read_to_string(&seen).unwrap(), line);
@@ -8006,9 +8017,9 @@ fn evidence_fixture(evidence: &[EvidenceCheck]) -> (TempDir, PathBuf, PathBuf) {
             context: String::new(),
         })
         .unwrap();
-    assert_eq!(task.id, TaskId::new(2));
-    assert_eq!(task.required_evidence, evidence);
-    queue.transition(task.id, TaskAction::Ready).unwrap();
+    assert_eq!(task.id(), TaskId::new(2));
+    assert_eq!(task.required_evidence(), evidence);
+    queue.transition(task.id(), TaskAction::Ready).unwrap();
     (dir, repo, db)
 }
 
@@ -8222,8 +8233,8 @@ fn scope_fixture(paths: &[&str]) -> (TempDir, PathBuf, PathBuf) {
             context: String::new(),
         })
         .unwrap();
-    assert_eq!(task.id, TaskId::new(2));
-    queue.transition(task.id, TaskAction::Ready).unwrap();
+    assert_eq!(task.id(), TaskId::new(2));
+    queue.transition(task.id(), TaskAction::Ready).unwrap();
     (dir, repo, db)
 }
 
@@ -8410,7 +8421,7 @@ fn integrate_refuses_a_rebased_diff_outside_the_declared_paths() {
     );
     let detail = queue.show(TaskId::new(2)).unwrap();
     assert_eq!(
-        detail.task.status,
+        detail.task.status(),
         TaskStatus::Completed,
         "{:?}",
         event_kinds(&detail)
@@ -8536,7 +8547,7 @@ echo 'wrote 1 note, 1 ask, 1 draft goal'
     // Nothing changed state: the task is still ready and the goal a draft.
     let mut queue = SqliteQueue::open(&db).unwrap();
     assert_eq!(
-        queue.show(TaskId::new(1)).unwrap().task.status,
+        queue.show(TaskId::new(1)).unwrap().task.status(),
         TaskStatus::Ready
     );
     assert!(queue.show_goal(GoalId::new(1)).unwrap().goal.is_draft());
@@ -8908,7 +8919,7 @@ fn a_passing_review_exits_the_live_session_and_lands_it() {
     assert_eq!(outcome["runs"][0]["status"], "integrated", "{outcome}");
     let mut queue = SqliteQueue::open(&db).unwrap();
     let detail = queue.show(TaskId::new(1)).unwrap();
-    assert_eq!(detail.task.status, TaskStatus::Completed);
+    assert_eq!(detail.task.status(), TaskStatus::Completed);
     let run = detail.runs[0].clone();
     assert_landed(&repo, &run, "test task", &base);
     assert!(queue.run_leases().unwrap().is_empty());
@@ -9124,7 +9135,7 @@ fn a_third_review_that_does_not_pass_asks_a_person_and_land_lands_it() {
     assert_eq!(outcome["errors"], json!([]), "{outcome}");
     let detail = queue.show(TaskId::new(1)).unwrap();
     assert_landed_run(&detail.runs[0], &repo, &base);
-    assert_eq!(detail.task.status, TaskStatus::Completed);
+    assert_eq!(detail.task.status(), TaskStatus::Completed);
     assert!(queue.read_ask(ask.id).unwrap().closed_at.is_some());
     let approved = payloads(&detail, "integration_approved");
     assert_eq!(approved.len(), 1);
@@ -9269,7 +9280,7 @@ fn a_concern_canceled_fails_the_run_and_cancels_the_task() {
     queue.answer(ask.id, "cancel").unwrap();
     supervise_reviewed(&db, &repo, &backend, &reviewer);
     let detail = queue.show(TaskId::new(1)).unwrap();
-    assert_eq!(detail.task.status, TaskStatus::Canceled);
+    assert_eq!(detail.task.status(), TaskStatus::Canceled);
     assert_eq!(detail.runs[0].status, RunStatus::Failed);
     assert_eq!(
         detail.runs[0].last_error.as_deref(),
@@ -9886,7 +9897,7 @@ fn a_passed_run_that_conflicts_with_main_is_rebased_by_its_live_session_and_land
     assert_eq!(outcome["runs"][0]["status"], "integrated", "{outcome}");
     let mut queue = SqliteQueue::open(&db).unwrap();
     let detail = queue.show(TaskId::new(1)).unwrap();
-    assert_eq!(detail.task.status, TaskStatus::Completed);
+    assert_eq!(detail.task.status(), TaskStatus::Completed);
     let run = detail.runs[0].clone();
     let moved = git_out(&repo, &["rev-parse", "main~1"]);
     assert_eq!(git_out(&repo, &["rev-parse", "main~2"]), seed);
@@ -10089,7 +10100,7 @@ fn a_failed_run_triaged_retry_runs_again_and_a_second_failure_is_asked() {
     );
     let mut queue = SqliteQueue::open(&db).unwrap();
     let detail = queue.show(TaskId::new(1)).unwrap();
-    assert_eq!(detail.task.status, TaskStatus::InProgress);
+    assert_eq!(detail.task.status(), TaskStatus::InProgress);
     assert_eq!(detail.runs.len(), 2);
     let (first, second) = (&detail.runs[0], &detail.runs[1]);
     assert_eq!(first.status, RunStatus::Failed);
@@ -10271,7 +10282,7 @@ fn a_triage_ask_waits_for_a_person_and_the_supervisor_applies_the_answer() {
     let detail = queue.show(TaskId::new(1)).unwrap();
     let run = detail.runs[0].clone();
     assert_eq!(run.status, RunStatus::Failed);
-    assert_eq!(detail.task.status, TaskStatus::InProgress);
+    assert_eq!(detail.task.status(), TaskStatus::InProgress);
     let finished = payloads(&detail, "triage_finished");
     assert_eq!(finished[0]["action"], "ask");
     assert_eq!(finished[0]["status"], "failed");
@@ -10329,7 +10340,7 @@ fn a_triage_ask_waits_for_a_person_and_the_supervisor_applies_the_answer() {
     let outcome = supervise_reviewed(&db, &repo, &backend, &reviewer);
     assert_eq!(outcome["errors"], json!([]), "{outcome}");
     let detail = queue.show(TaskId::new(1)).unwrap();
-    assert_eq!(detail.task.status, TaskStatus::Canceled);
+    assert_eq!(detail.task.status(), TaskStatus::Canceled);
     assert_eq!(detail.runs[0].status, RunStatus::Failed);
     let decided = payloads(&detail, "triage_decided");
     assert_eq!(decided.len(), 1);
@@ -10420,7 +10431,7 @@ fn triage_answers_resume_the_run_or_ready_the_task() {
         .decide_triage(&run.id, second.id, "retry", "x")
         .unwrap();
     assert_eq!(
-        queue.show(TaskId::new(1)).unwrap().task.status,
+        queue.show(TaskId::new(1)).unwrap().task.status(),
         TaskStatus::Ready
     );
 }

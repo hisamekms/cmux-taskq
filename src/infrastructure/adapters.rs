@@ -1210,7 +1210,7 @@ pub fn run_workspace_name(task: &Task, run: &TaskRun) -> Result<String> {
         "[{}]worker#{} - {}",
         repository_name(repo),
         run.task_id,
-        task.title
+        task.title()
     ))
 }
 
@@ -1567,7 +1567,7 @@ mod tests {
     }
 
     fn task(title: &str) -> Task {
-        Task {
+        Task::restore(crate::domain::TaskRecord {
             id: TaskId::new(15),
             title: title.into(),
             description: String::new(),
@@ -1580,7 +1580,8 @@ mod tests {
             context: String::new(),
             created_at: "2026-09-22 00:00:00".into(),
             updated_at: "2026-09-22 00:00:00".into(),
-        }
+        })
+        .unwrap()
     }
 
     /// One cmux serves several repositories, so every workspace name

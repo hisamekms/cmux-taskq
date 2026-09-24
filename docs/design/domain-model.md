@@ -25,7 +25,7 @@ related:
 
 ## Implementation status
 
-ステップ2で`Task`、`TaskDependency`、`TaskRun`、`RunEvent`、ステップ3で`RunProcess`と`SupervisorLease`、ステップ4で`Receipt`を実装した。ステップ6（[017](../journal/017-parallel-runs.md)）で`SupervisorLease`を`RunLease`に置き換え、ステップ7（[018](../journal/018-merge-queue.md)）でrunの`integrating`と`needs_session`、`IntegrationOutcome`の`needs_session` / `failed` / `no_run_awaiting`を加えた。[020](../journal/020-goal-groups-task-definitions.md)のT2で`Goal`と`Task.goal_id` / `Task.context`、receiptの`follow_ups`を加えた（[ADR-0009](../adr/0009-goal-groups-tasks.md)）。goal 12でgoalのdraft状態（`GoalStatus`）と、run_eventsのkind `observation`で表すnote（`NewNote`）を加えた（ADR-0024の決定4、5）。goal 8のtask 73で`Task.required_evidence`（`EvidenceCheck`）と`Receipt::missing_evidence`を加えた（ADR-0019の決定5）。Rustの型と手動遷移規則は`src/domain.rs`、ストレージとprovider/workspaceの契約は`src/application.rs`、永続化は`src/infrastructure/sqlite.rs`と`src/infrastructure/runtime_store.rs`にある。`AgentSession`と`Workspace`は独立エンティティにせず、TaskRunの`id`（Claude session ID）と`workspace_id`で表す。
+ステップ2で`Task`、`TaskDependency`、`TaskRun`、`RunEvent`、ステップ3で`RunProcess`と`SupervisorLease`、ステップ4で`Receipt`を実装した。ステップ6（[017](../journal/017-parallel-runs.md)）で`SupervisorLease`を`RunLease`に置き換え、ステップ7（[018](../journal/018-merge-queue.md)）でrunの`integrating`と`needs_session`、`IntegrationOutcome`の`needs_session` / `failed` / `no_run_awaiting`を加えた。[020](../journal/020-goal-groups-task-definitions.md)のT2で`Goal`と`Task.goal_id` / `Task.context`、receiptの`follow_ups`を加えた（[ADR-0009](../adr/0009-goal-groups-tasks.md)）。goal 12でgoalのdraft状態（`GoalStatus`）と、run_eventsのkind `observation`で表すnote（`NewNote`）を加えた（ADR-0024の決定4、5）。goal 8のtask 73で`Task.required_evidence`（`EvidenceCheck`）と`Receipt::missing_evidence`を加えた（ADR-0019の決定5）。Rustの型と手動遷移規則は`src/domain/`（構成は[集約: TaskとGoal](#集約-taskとgoal)）、ストレージとprovider/workspaceの契約は`src/application.rs`、永続化は`src/infrastructure/sqlite.rs`と`src/infrastructure/runtime_store.rs`にある。`AgentSession`と`Workspace`は独立エンティティにせず、TaskRunの`id`（Claude session ID）と`workspace_id`で表す。
 
 ## Entities
 
@@ -60,10 +60,10 @@ related:
 - `RunEvent.run_id`はtask登録・依存変更などrun作成前のイベントではnullになる。goal単位のイベント（`goal_created`、`goal_updated`、`goal_closed`）は`task_id`がnullで`goal_id`を持ち、`goal show`に並ぶ。`task_goal_changed`はtaskのイベントで、`from`と`to`にgoal IDを持つ。
 - `goal add`でgoalを作り、`add --goal ID`と`set-goal TASK GOAL`でtaskを所属させ、`set-goal TASK --none`で外す。所属の変更は依存の追加・削除と同じくdraft/readyのtaskだけに許し、閉じたgoalへの追加と付け替えは拒否する。`task_created`のpayloadは`goal_id`を持ち、`set-goal`は変化があったときだけ`task_goal_changed`を記録する。
 - `goal edit`はtitle、description、acceptance、constraints、docを差し替え、`goal_updated`のpayloadに`old`と`new`のgoal全体を残す。閉じたgoalも編集できる（記録の訂正のため）。走行中のrunは`prompt.txt`のスナップショットのままで、次のclaimから新しい記述が使われる。
-- `goal close ID --verdict achieved|abandoned`はverdictを1回だけ記録する。`achieved`は所属taskに`completed` / `canceled`以外があれば拒否し、`abandoned`は`in_progress`があれば拒否する（`GoalVerdict::allows`、判断の入口は`GoalVerdict::check_close`）。閉じたgoalを再び閉じることはできず、続きは新しいgoalに登録する。`goal_closed`のpayloadはverdictとclose時点のstatus別件数を持つ。
+- `goal close ID --verdict achieved|abandoned`はverdictを1回だけ記録する。`achieved`は所属taskに`completed` / `canceled`以外があれば拒否し、`abandoned`は`in_progress`があれば拒否する（`GoalVerdict::allows`、判断の入口は`domain::goal::close`）。閉じたgoalを再び閉じることはできず、続きは新しいgoalに登録する。`goal_closed`のpayloadはverdictとclose時点のstatus別件数を持つ。
 - `list`は既定で終端状態（`TaskStatus::is_terminal`）でないtaskを新しい順（ID降順）に最大20件、`{"tasks", "next", "total"}`で返す。要素はid/status/title/goal_id/dependencies/latest_run（最新runのidとstatus）に縮約し、`--full`で残りの全項目を足す。`next`は次ページの先頭task ID（`--before`に渡す。`--before ID`はID以下のtaskを返す）で、続きがなければnull。`total`はフィルタ後の件数。フィルタとページの条件はapplication層の`TaskQuery`、出力は`TaskPage` / `TaskListItem`で、domainの`Task`は変えない。
 - `goal list`はgoalごとに`status`（`draft` | `open`）、`closed`、`verdict`、所属taskのstatus別件数（`TaskStatusCounts`）を返し、`goal show`はgoal（`status`を含む）、所属taskのid/title/status、goalのイベントを返す。
-- `goal add --draft`はdraftのgoalを作り、`goal ready ID`がdraftを`open`にして`goal_status_changed`（`from: draft`、`to: open`）を記録する。`goal ready`は閉じていないdraftにだけ許す（`Goal::check_ready`）。draftのgoalにも`add --goal`と`set-goal`でtaskを所属させられ、`goal close`もできる（採らない提案は`abandoned`で閉じる）。draftのgoalのtaskは`ready`にしても`candidates`・`graph`の`candidates`・supervisorのclaimに出ない（`READY_QUERY`がgoalの`status = 'draft'`を除く）。`graph`は所属goalのあるtaskに`goal_status`を添える。
+- `goal add --draft`はdraftのgoalを作り、`goal ready ID`がdraftを`open`にして`goal_status_changed`（`from: draft`、`to: open`）を記録する。`goal ready`は閉じていないdraftにだけ許す（`domain::goal::ready`）。draftのgoalにも`add --goal`と`set-goal`でtaskを所属させられ、`goal close`もできる（採らない提案は`abandoned`で閉じる）。draftのgoalのtaskは`ready`にしても`candidates`・`graph`の`candidates`・supervisorのclaimに出ない（`READY_QUERY`がgoalの`status = 'draft'`を除く）。`graph`は所属goalのあるtaskに`goal_status`を添える。
 - `note --task ID | --run RUN_ID | --goal ID --text TEXT [--kind SLUG]`はkind `observation`のrun_eventを1件書いて返す。`--task`はtaskのイベント、`--run`はそのrunのtaskとrunのイベント、`--goal`はgoal単位のイベントになる。`notes [--goal ID] [--task ID] [--since CURSOR] [--limit N]`はobservationだけを古い順に返し（`{"notes", "cursor"}`）、`--since`なしは直近`--limit`件（既定20）、`--since`ありはcursorより後の最初の`--limit`件。`--goal`はgoalのnoteに加えて所属taskとそのrunのnoteを、`--task`はtaskとそのrunのnoteを含む。`cursor`は最後のnoteのイベントID（空なら`--since`の値、それも無ければ0）。
 - `DAGQ_ROLE=observer`の環境からは、CLIの入口（`main.rs`の`observer_access`）が許可の一覧にないコマンドを`{"error": "observer may not change queue state"}`で拒否する（ADR-0024の決定4）。許すのは読み取り（`locate` / `list` / `show` / `candidates` / `graph` / `status` / `events` / `watch` / `stats` / `doctor` / `goal list` / `goal show` / `notes`）、`note`、`goal add --draft`、そしてdraftで閉じていないgoalへの`add --goal`（taskはdraftで登録される）だけ。`ready` / `draft` / `cancel` / `integrate` / `recover` / `goal ready` / `goal close` / `goal edit` / 通常の`goal add` / goalなしかopenなgoalへの`add` / `dependency` / `set-goal` / `review` / `init` / `up` / `down`などは拒否する。一覧に載せない限り後から足したコマンドも拒否される。task 99で`ask --kind blocked`（observerが閾値超えをinboxに上げるask。taskにもrunにも紐づかなくてよい唯一のkind）を一覧に足した。ほかのkindの`ask`、`answer`、`ask close`、`observe`、`supervise`は拒否する。判定は`DAGQ_ROLE`の申告に依存する柵で、悪意ある実行は防がない。
 - `show`と`goal show`の既定出力は`src/view.rs`が`TaskDetail` / `GoalDetail`から作る圧縮形で、全文は`--full`（ADR-0016の決定4）。キー名は全文と同じで、省くか切り詰めるだけ。長い文字列（taskの`description`/`acceptance`/`context`、goalの`title`/`description`/`acceptance`/`constraints`、runの`last_error`、eventの要点の値）は300文字で切って`…`を付け、それを持つobjectに`truncated: true`を足す。`show`は最新runの`id`/`status`/`branch`/`result_commit`/`last_error`/`worktree_path`/`workspace_id`だけを`runs`に1件、そのrunの`processes`、直近10件（`--events N`で変更）のイベントを`id`/`kind`/`created_at`、runに属するイベントなら`run_id`、payloadの`status`/`reason`/`last_error`/`from`/`to`だけで返し、pathは出さない。`goal show`はイベントを直近10件の`kind`/`created_at`だけにする。どちらも全件数を`runs_total` / `events_total`で添える。どちらも`observations`に、自分に紐づくnote（`show`はtaskとそのrun、`goal show`はgoal自身）の直近5件を`id`/`created_at`/`run_id`（あれば）/`text`（300文字で切る）/`kind`/`by`で古い順に添える。
@@ -85,19 +85,45 @@ IDとcommitはドメインプリミティブのnewtype（`src/domain/ids.rs`、`
 - CLIの引数はclapでは`i64` / `String`のまま受け、`main.rs`がnewtypeに変えてからapplicationに渡す。`--run`に空白だけを渡すと`run ID must not be blank`になる。
 - 例外: `Receipt`の`run_id`と`commit`はagentが書くファイルの形のまま`String`で持つ。`Receipt::check`が決まった順で検証し（run_idの一致、result、各check、commitの形式）、最初に外れた項目のエラー文を`last_error`に書くため、パースの時点では検証しない。`GitRepository`の`rebase` / `is_ancestor` / `diff_*` / `changed_paths` / `tree_of`などの引数は`main`やref、`<commit>^{tree}`も受けるGitのrevisionなので`&str`のまま。`supervisor_token`とcmuxの`workspace_id`は対象外。
 
+## 集約: TaskとGoal
+
+`src/domain/`はファイルを観点ごとに分けたディレクトリモジュールで、`mod.rs`が従来の`pub use`を持つので`crate::domain::Task`などのパスは変わらない（[ADR-0013](../adr/0013-layered-architecture-and-type-function-style.md)の決定3、5）。
+
+| ファイル | 中身 |
+| --- | --- |
+| `mod.rs` | `string_enum!`のenum（`TaskStatus`、`GoalStatus`、`GoalVerdict`など）、review / triageのverdict、ask、note、push、attention |
+| `error.rs` | `DomainError`と`require` |
+| `ids.rs` | `TaskId`・`GoalId`・`RunId`・`CommitSha` |
+| `task.rs` | 集約`Task`、`TaskAction`、`TaskStatus`の遷移規則、taskのコマンドとクエリ |
+| `goal.rs` | 集約`Goal`、`GoalVerdict::allows`、goalのコマンドとクエリ |
+| `input.rs` | 入力型`NewTask`・`NewGoal`・`GoalEdit`と、復元用の`TaskRecord`・`GoalRecord`（公開フィールドのplain data） |
+| `run.rs` | `TaskRun`と`RunPaths`（カプセル化は次のタスク。今は移動だけ） |
+| `views.rs` | 集約でない読み取り用の型（`TaskDetail`、`GoalSummary`、`GoalDetail`、`GoalTask`、`Predecessor`、`RunEvent`、`RunProcess`、`RunLease`、`SupervisorRegistration`、`TaskStatusCounts`）、`ClaimOutcome`・`IntegrationOutcome`・`RegisteredFollowUp`、`Receipt` |
+| `scope.rs`、`stats.rs` | pathのglob、`stats`の集計（従来どおり） |
+
+`Task`と`Goal`のフィールドは非公開で、`task.rs` / `goal.rs`の外からは下の関数でしか作れず、変えられない。
+
+- 新規作成: `Task::new(id, NewTask, created_at)`は`NewTask::validate`（作成時のルール）を通し、statusを`draft`、`required_evidence`とpathsを重複除去、`updated_at`を`created_at`にする。`NewTask.dependencies`はtaskの外の辺なのでstoreが別に保存する。`Goal::new(id, NewGoal, created_at)`は`NewGoal::validate`を通し、`draft`なら`draft`、それ以外は`open`、未close、空白の`doc`はnullにする。IDはstoreが採番し（`AUTOINCREMENT`の次の値）、`created_at`はDBの現在時刻を渡す。
+- 復元: `Task::restore(TaskRecord)`と`Goal::restore(GoalRecord)`は保存済みの状態をそのまま再現し、作成時のルールは再適用しない。検証するのは保存済みの行が必ず満たすことだけ: 正のID（`NonPositiveId`の`task ID` / `goal ID`）、空白でないtitle、taskの`goal_id`が正、goalの`closed_at`と`verdict`が同時にnullか同時に非null（`GoalCloseInconsistent`）。infrastructureの`task_row` / `goal_row`がrowからrecordを組み、復元の拒否は`rusqlite`の変換エラーの原因として包む。
+- `Serialize`は残し、フィールド名と順序は従来と同じなのでCLIのJSON出力は変わらない。`Deserialize`は集約から外した（`TaskDetail`・`GoalDetail`・`Predecessor`・`IntegrationOutcome`も集約を含むので外した）。入力型の`NewTask` / `NewGoal` / `GoalEdit`は`Deserialize`を持つ。
+- taskのコマンド（所有権を受け取り、成功時に更新後のtaskを返す）: `task::transition(task, action, unfinished_run)`（遷移の判断は`TaskStatus::transition`）、`task::set_goal(task, goal_id)`（draft / readyのtaskだけ。移し先のgoalが開いているかは`goal::check_accepts_tasks`）、`task::set_paths(task, paths)`（globを検査し重複を除く。draft / readyだけ）。依存の辺はtaskの外なので判断だけを持つ: `task::check_not_self`（自己依存）、`task::check_dependencies_editable`（draft / readyだけ）、`task::check_acyclic(task_id, predecessor_id, creates_cycle)`（循環はSQLの再帰CTEが全依存グラフから見つけ、その結果を渡す）。
+- goalのコマンド: `goal::edit(goal, GoalEdit)`、`goal::ready(goal)`、`goal::close(goal, verdict, &counts, closed_at)`（閉じたgoalは閉じられない、verdictが所属taskのstatusを許すか。成功すると`closed_at`・`verdict`・`updated_at`を設定する）。クエリは`goal::check_accepts_tasks(&goal)`、`Goal::is_closed` / `is_draft`。
+- 値の取り出しは`Task`・`Goal`のメソッド（`id()`、`title()`、`status()`、`goal_id()`、`paths()`、`verdict()`など。文字列と配列は借用で返す）と`task::dependencies_editable(&task)`。`into_title()`はtitleだけを所有権ごと取り出す。
+- `updated_at`はDBの`strftime(...,'now')`が更新のたびに書き（schemaの一部）、storeは保存後に読み直して返す。`goal::close`だけは`closed_at`と`updated_at`を同じ値にするため時刻を引数に取る。
+
 ## DomainError
 
-domainの関数は業務上の拒否を`DomainError`（`src/domain.rs`）で返す。`std::error::Error`と`Display`を実装し、`anyhow`・`rusqlite`などI/OやDBのライブラリには依存しない。I/Oを行うapplication / infrastructure / runtimeは境界で`?`により`anyhow::Error`へ変換し、原因の説明が要る場所だけ`context`を足す。`Display`はCLIが`{"error": ...}`に出す文、runtimeが`last_error`に書く文そのもので、`DomainError`の導入前の文字列と一致する。variantは業務上の拒否だけで、汎用の`Other(String)`は持たない。
+domainの関数は業務上の拒否を`DomainError`（`src/domain/error.rs`）で返す。`std::error::Error`と`Display`を実装し、`anyhow`・`rusqlite`などI/OやDBのライブラリには依存しない。I/Oを行うapplication / infrastructure / runtimeは境界で`?`により`anyhow::Error`へ変換し、原因の説明が要る場所だけ`context`を足す。`Display`はCLIが`{"error": ...}`に出す文、runtimeが`last_error`に書く文そのもので、`DomainError`の導入前の文字列と一致する。variantは業務上の拒否だけで、汎用の`Other(String)`は持たない。
 
 | variant | 返す関数 | 持つ情報 | `Display` |
 | --- | --- | --- | --- |
 | `UnknownValue` | `string_enum!`の`FromStr`（`TaskStatus`、`RunStatus`、`Provider`、`SupervisorMode`、`SessionRole`、`GoalStatus`、`GoalVerdict`、`ReceiptResult`、`CheckStatus`） | enum名、値 | `unknown <Enum>: <value>` |
 | `TaskHasUnfinishedRun` | `TaskStatus::transition` | action | `task has an unfinished run; recover or integrate it before applying <Action>` |
 | `TransitionNotAllowed` | `TaskStatus::transition` | 現在のstatus、action | `cannot apply <Action> to task in <status> state` |
-| `Blank` | `NewTask::validate`、`NewGoal::validate`、`GoalEdit::apply`、`NewNote::validate`、`RunId::new` | field名（`task title`、`verification commands`、`goal title`、`note text`、`run ID`） | `<field> must not be blank` |
-| `NonPositiveId` | `NewTask::validate` | field名（`dependency IDs`、`goal ID`） | `<field> must be positive` |
-| `GoalAlreadyClosed` | `GoalVerdict::check_close`、`Goal::check_ready` | goal ID、記録済みのverdict | `goal <id> is already closed as <verdict>` |
-| `GoalCloseBlocked` | `GoalVerdict::check_close` | goal ID、verdict、verdictを許さないstatusと件数 | `goal <id> cannot be closed as <verdict>: <n> task(s) <status>, ...` |
+| `Blank` | `NewTask::validate`、`NewGoal::validate`、`goal::edit`、`Task::restore`、`Goal::restore`、`NewNote::validate`、`RunId::new` | field名（`task title`、`verification commands`、`goal title`、`note text`、`run ID`） | `<field> must not be blank` |
+| `NonPositiveId` | `NewTask::validate`、`Task::new` / `restore`、`Goal::new` / `restore` | field名（`dependency IDs`、`goal ID`、`task ID`） | `<field> must be positive` |
+| `GoalAlreadyClosed` | `goal::close`、`goal::ready` | goal ID、記録済みのverdict | `goal <id> is already closed as <verdict>` |
+| `GoalCloseBlocked` | `goal::close` | goal ID、verdict、verdictを許さないstatusと件数 | `goal <id> cannot be closed as <verdict>: <n> task(s) <status>, ...` |
 | `MalformedReceipt` | `Receipt::parse` | パーサーの理由 | `receipt is not a valid completion receipt: <reason>` |
 | `ReceiptRunMismatch` | `Receipt::check` | receiptのrun_id、runのID | `receipt run_id <a> does not match run <b>` |
 | `AgentReportedResult` | `Receipt::check` | result、summary | `agent reported result <result>: <summary>` |
@@ -106,10 +132,15 @@ domainの関数は業務上の拒否を`DomainError`（`src/domain.rs`）で返�
 | `InvalidCommit` | `Receipt::check`、`CommitSha::parse` / `TryFrom` | field名（`receipt commit`、`base commit`、`commit`、Gitの出力なら`HEAD`・`main commit`など） | `<field>: must be a full 40- or 64-character hexadecimal Git object ID` |
 | `FollowUpsNotArray` | `Receipt::check` | なし | `receipt follow_ups must be an array` |
 | `MissingRunDirectory` | `TaskRun::idle_marker_path` | なし | `missing run directory` |
-| `GoalNotDraft` | `Goal::check_ready` | goal ID | `goal <id> is not a draft` |
+| `GoalNotDraft` | `goal::ready` | goal ID | `goal <id> is not a draft` |
+| `GoalClosed` | `goal::check_accepts_tasks`（`add --goal`と`set-goal`） | goal ID、記録済みのverdict | `goal <id> is closed as <verdict>; create a new goal for further work` |
+| `GoalCloseInconsistent` | `Goal::restore` | goal ID | `goal <id> has a close time without a verdict or a verdict without a close time` |
+| `TaskNotEditable` | `task::set_goal`、`task::set_paths`、`task::check_dependencies_editable` | 変える対象（`the goal`、`the paths`、`dependencies`） | `<what> can only be changed for draft or ready tasks` |
+| `SelfDependency` | `task::check_not_self` | なし | `a task cannot depend on itself` |
+| `DependencyCycle` | `task::check_acyclic` | task ID、predecessor ID | `dependency <task> -> <predecessor> would create a cycle` |
 | `InvalidNoteKind` | `NewNote::validate` | kind | `note kind "<kind>" must be a slug of lowercase letters, digits, '-' and '_'` |
 
-`goal close`の判断（閉じたgoalは閉じられない、verdictが所属taskのstatusを許すか）は`GoalVerdict::check_close`が持ち、`SqliteQueue::close_goal`はgoalとstatus別件数を読んで渡し、結果を書くだけである。DBに保存された文字列が既知のenum値でないときは、`enum_col`が`UnknownValue`を`rusqlite`の変換エラーの原因として包む。
+`goal close`の判断（閉じたgoalは閉じられない、verdictが所属taskのstatusを許すか）は`goal::close`が持ち、`SqliteQueue::close_goal`はgoalとstatus別件数を読んで渡し、返ったgoalを書くだけである。taskの手動遷移、goalの付け替え、pathsと依存の変更、閉じたgoalへの追加も同じく、`sqlite.rs`は読んでdomainの関数に渡し、その結果を保存する（`ensure!`で業務上の拒否を決める箇所は残っていない）。各エラー文はdomainの単体テストで固定している。DBに保存された文字列が既知のenum値でないときは、`enum_col`が`UnknownValue`を`rusqlite`の変換エラーの原因として包む。
 
 ## Invariants
 

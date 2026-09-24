@@ -1,0 +1,223 @@
+use std::fmt;
+
+use super::{
+    AskKind, CheckStatus, GoalId, GoalVerdict, ReceiptResult, RunId, TaskAction, TaskId, TaskStatus,
+};
+
+/// A business rejection by the domain: an invalid value, a transition the
+/// task's status does not allow, or a condition that does not hold. Each
+/// variant carries only what its message needs, and `Display` is the message
+/// the CLI prints and the runtime writes to `last_error`. I/O failures are not
+/// domain errors; the layers that perform I/O convert this at their boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DomainError {
+    /// A stored or given string is not a value of the enum `kind`.
+    UnknownValue {
+        kind: &'static str,
+        value: String,
+    },
+    /// A manual transition of an in-progress task that still owns an unfinished run.
+    TaskHasUnfinishedRun {
+        action: TaskAction,
+    },
+    /// `action` is not allowed from `status`.
+    TransitionNotAllowed {
+        status: TaskStatus,
+        action: TaskAction,
+    },
+    /// A goal that is closed takes no task (`add --goal`, `set-goal`).
+    GoalClosed {
+        goal_id: GoalId,
+        verdict: Option<GoalVerdict>,
+    },
+    /// A stored goal with a close time but no verdict, or the reverse.
+    GoalCloseInconsistent {
+        goal_id: GoalId,
+    },
+    /// `what` of a task that is neither a draft nor ready.
+    TaskNotEditable {
+        what: &'static str,
+    },
+    /// A dependency of a task on itself.
+    SelfDependency,
+    /// The predecessor already depends on the task, directly or not.
+    DependencyCycle {
+        task_id: TaskId,
+        predecessor_id: TaskId,
+    },
+    /// A required text field is blank.
+    Blank {
+        field: &'static str,
+    },
+    /// An ID field is zero or negative.
+    NonPositiveId {
+        field: &'static str,
+    },
+    /// A goal records its verdict once.
+    GoalAlreadyClosed {
+        goal_id: GoalId,
+        verdict: Option<GoalVerdict>,
+    },
+    /// Tasks in `blocking` (status and count) do not allow `verdict`.
+    GoalCloseBlocked {
+        goal_id: GoalId,
+        verdict: GoalVerdict,
+        blocking: Vec<(TaskStatus, usize)>,
+    },
+    /// The receipt text is not a completion receipt; `reason` is the parser's.
+    MalformedReceipt {
+        reason: String,
+    },
+    ReceiptRunMismatch {
+        receipt_run_id: String,
+        run_id: RunId,
+    },
+    /// The agent itself reported the run as not succeeded.
+    AgentReportedResult {
+        result: ReceiptResult,
+        summary: String,
+    },
+    /// The receipt reports the check `check` as failed.
+    ReceiptCheckFailed {
+        check: &'static str,
+        evidence_or_reason: String,
+    },
+    /// The receipt claims `status` for `check` without evidence or reason.
+    ReceiptCheckUnexplained {
+        check: &'static str,
+        status: CheckStatus,
+    },
+    /// `field` is not a full Git object ID.
+    InvalidCommit {
+        field: &'static str,
+    },
+    FollowUpsNotArray,
+    /// The run has no run directory yet.
+    MissingRunDirectory,
+    /// `goal ready` on a goal that is not a draft.
+    GoalNotDraft {
+        goal_id: GoalId,
+    },
+    /// A note kind that is not a lowercase slug.
+    InvalidNoteKind {
+        kind: String,
+    },
+    /// An ask of `kind` names neither a task nor a run; only `blocked` may.
+    AskWithoutTarget {
+        kind: AskKind,
+    },
+    /// A `--paths` glob a task may not declare.
+    InvalidPathGlob {
+        glob: String,
+        reason: &'static str,
+    },
+}
+
+impl fmt::Display for DomainError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnknownValue { kind, value } => write!(f, "unknown {kind}: {value}"),
+            Self::TaskHasUnfinishedRun { action } => write!(
+                f,
+                "task has an unfinished run; recover or integrate it before applying {action:?}"
+            ),
+            Self::TransitionNotAllowed { status, action } => write!(
+                f,
+                "cannot apply {action:?} to task in {} state",
+                status.as_str()
+            ),
+            Self::GoalClosed { goal_id, verdict } => write!(
+                f,
+                "goal {goal_id} is closed as {}; create a new goal for further work",
+                verdict.map_or("?", GoalVerdict::as_str)
+            ),
+            Self::GoalCloseInconsistent { goal_id } => write!(
+                f,
+                "goal {goal_id} has a close time without a verdict or a verdict without a close time"
+            ),
+            Self::TaskNotEditable { what } => {
+                write!(f, "{what} can only be changed for draft or ready tasks")
+            }
+            Self::SelfDependency => f.write_str("a task cannot depend on itself"),
+            Self::DependencyCycle {
+                task_id,
+                predecessor_id,
+            } => write!(
+                f,
+                "dependency {task_id} -> {predecessor_id} would create a cycle"
+            ),
+            Self::Blank { field } => write!(f, "{field} must not be blank"),
+            Self::InvalidPathGlob { glob, reason } => {
+                write!(f, "invalid --paths glob {glob:?}: {reason}")
+            }
+            Self::AskWithoutTarget { kind } => write!(
+                f,
+                "a {} ask needs a task or a run; only a blocked ask may have neither",
+                kind.as_str()
+            ),
+            Self::NonPositiveId { field } => write!(f, "{field} must be positive"),
+            Self::GoalAlreadyClosed { goal_id, verdict } => write!(
+                f,
+                "goal {goal_id} is already closed as {}",
+                verdict.map_or("?", GoalVerdict::as_str)
+            ),
+            Self::GoalCloseBlocked {
+                goal_id,
+                verdict,
+                blocking,
+            } => write!(
+                f,
+                "goal {goal_id} cannot be closed as {}: {}",
+                verdict.as_str(),
+                blocking
+                    .iter()
+                    .map(|(status, n)| format!("{n} task(s) {}", status.as_str()))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            Self::MalformedReceipt { reason } => {
+                write!(f, "receipt is not a valid completion receipt: {reason}")
+            }
+            Self::ReceiptRunMismatch {
+                receipt_run_id,
+                run_id,
+            } => write!(
+                f,
+                "receipt run_id {receipt_run_id} does not match run {run_id}"
+            ),
+            Self::AgentReportedResult { result, summary } => {
+                write!(f, "agent reported result {}: {summary}", result.as_str())
+            }
+            Self::ReceiptCheckFailed {
+                check,
+                evidence_or_reason,
+            } => write!(f, "receipt reports {check} as failed: {evidence_or_reason}"),
+            Self::ReceiptCheckUnexplained { check, status } => write!(
+                f,
+                "receipt {check} is {} without evidence or reason",
+                status.as_str()
+            ),
+            Self::InvalidCommit { field } => write!(
+                f,
+                "{field}: must be a full 40- or 64-character hexadecimal Git object ID"
+            ),
+            Self::FollowUpsNotArray => f.write_str("receipt follow_ups must be an array"),
+            Self::MissingRunDirectory => f.write_str("missing run directory"),
+            Self::GoalNotDraft { goal_id } => write!(f, "goal {goal_id} is not a draft"),
+            Self::InvalidNoteKind { kind } => write!(
+                f,
+                "note kind {kind:?} must be a slug of lowercase letters, digits, '-' and '_'"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for DomainError {}
+
+/// Fails with `error()` unless `condition` holds.
+pub(super) fn require(
+    condition: bool,
+    error: impl FnOnce() -> DomainError,
+) -> Result<(), DomainError> {
+    if condition { Ok(()) } else { Err(error()) }
+}

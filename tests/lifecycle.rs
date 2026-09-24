@@ -437,7 +437,7 @@ fn claim_a_run(fixture: &Fixture, queue: &mut SqliteQueue, token: &str) -> Strin
             context: String::new(),
         })
         .unwrap();
-    queue.transition(task.id, TaskAction::Ready).unwrap();
+    queue.transition(task.id(), TaskAction::Ready).unwrap();
     let repository = GitRepository::inspect(&fixture.repo).unwrap();
     match queue
         .claim_for_supervisor(&repository.base_commit, token)
@@ -1030,7 +1030,7 @@ fn the_cmux_adapter_sends_one_line_and_names_the_resume_workspace() {
     };
     assert_eq!(
         cmux.create_resume(
-            &Task {
+            &Task::restore(dagq::domain::TaskRecord {
                 id: dagq::domain::TaskId::new(3),
                 title: "fix it".into(),
                 description: String::new(),
@@ -1043,7 +1043,8 @@ fn the_cmux_adapter_sends_one_line_and_names_the_resume_workspace() {
                 context: String::new(),
                 created_at: String::new(),
                 updated_at: String::new(),
-            },
+            })
+            .unwrap(),
             &run,
             "runner session --resume",
             &WorkspaceTags {
@@ -1211,7 +1212,7 @@ fn up_prunes_dead_registrations_and_keeps_live_ones_and_leases() {
             context: String::new(),
         })
         .unwrap();
-    queue.transition(task.id, TaskAction::Ready).unwrap();
+    queue.transition(task.id(), TaskAction::Ready).unwrap();
     let repository = GitRepository::inspect(&fixture.repo).unwrap();
     queue
         .claim_for_supervisor(&repository.base_commit, "live")
@@ -1248,7 +1249,7 @@ fn up_prunes_dead_registrations_and_keeps_live_ones_and_leases() {
     let unfinished = report["doctor"]["unfinished_runs"].as_array().unwrap();
     assert_eq!(unfinished.len(), 1);
     assert_eq!(unfinished[0]["run_id"], json!(leases_before[0].run_id));
-    assert_eq!(unfinished[0]["task_id"], json!(task.id));
+    assert_eq!(unfinished[0]["task_id"], json!(task.id()));
     assert_eq!(unfinished[0]["status"], "claimed");
     assert_eq!(unfinished[0]["lease_stale"], false);
 
@@ -1282,7 +1283,7 @@ fn up_reports_runs_that_wait_for_a_person_or_the_supervisor() {
                 context: String::new(),
             })
             .unwrap();
-        queue.transition(task.id, TaskAction::Ready).unwrap();
+        queue.transition(task.id(), TaskAction::Ready).unwrap();
         let dagq::domain::ClaimOutcome::Claimed { run } = queue
             .claim_for_supervisor(&repository.base_commit, "gone")
             .unwrap()

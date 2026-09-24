@@ -55,9 +55,9 @@ fn tasks_dependencies_runs_and_events_survive_reopen() {
     let (dir, mut queue) = fixture();
     let a = queue.add(new_task("先行タスク 'quoted' 🦀")).unwrap();
     let mut spec = new_task("後続タスク");
-    spec.dependencies = vec![a.id, a.id];
+    spec.dependencies = vec![a.id(), a.id()];
     let b = queue.add(spec).unwrap();
-    queue.transition(a.id, TaskAction::Ready).unwrap();
+    queue.transition(a.id(), TaskAction::Ready).unwrap();
     let ClaimOutcome::Claimed { run } = queue.claim(&base()).unwrap() else {
         panic!()
     };
@@ -67,10 +67,10 @@ fn tasks_dependencies_runs_and_events_survive_reopen() {
     drop(queue);
 
     let mut reopened = SqliteQueue::open(dir.path().join("queue.db")).unwrap();
-    let detail = reopened.show(a.id).unwrap();
-    assert_eq!(detail.task.title, a.title);
-    assert_eq!(detail.task.status, TaskStatus::InProgress);
-    assert_eq!(detail.task.verification_commands, vec!["cargo test"]);
+    let detail = reopened.show(a.id()).unwrap();
+    assert_eq!(detail.task.title(), a.title());
+    assert_eq!(detail.task.status(), TaskStatus::InProgress);
+    assert_eq!(detail.task.verification_commands(), vec!["cargo test"]);
     assert_eq!(detail.runs[0].id, run.id);
     assert_eq!(detail.runs[0].base_commit.as_str(), BASE);
     assert!(detail.runs[0].workspace_id.is_none());
@@ -86,8 +86,8 @@ fn tasks_dependencies_runs_and_events_survive_reopen() {
         detail.events[2].run_id.as_ref().map(RunId::as_str),
         Some(run.id.as_str())
     );
-    let second = reopened.show(b.id).unwrap();
-    assert_eq!(second.dependencies, vec![a.id]);
+    let second = reopened.show(b.id()).unwrap();
+    assert_eq!(second.dependencies, vec![a.id()]);
     assert_eq!(second.events.len(), 2); // Duplicate dependency is idempotent.
     // The dependent stays blocked; the claimed task owns its run.
     assert!(matches!(
@@ -101,7 +101,7 @@ fn invalid_registration_rolls_back_task_dependencies_and_events() {
     let (_dir, mut queue) = fixture();
     let a = queue.add(new_task("existing")).unwrap();
     let mut spec = new_task("invalid dependency");
-    spec.dependencies = vec![a.id, TaskId::new(999)];
+    spec.dependencies = vec![a.id(), TaskId::new(999)];
     assert!(queue.add(spec).is_err());
     assert!(queue.add(new_task(" \n\t")).is_err());
     let mut spec = new_task("blank verification");
@@ -109,17 +109,17 @@ fn invalid_registration_rolls_back_task_dependencies_and_events() {
     assert!(queue.add(spec).is_err());
     assert_eq!(queue.list(&TaskQuery::default()).unwrap().total, 1);
     let b = queue.add(new_task("next")).unwrap();
-    assert_eq!(queue.show(b.id).unwrap().events.len(), 1);
-    assert!(queue.show(b.id).unwrap().dependencies.is_empty());
+    assert_eq!(queue.show(b.id()).unwrap().events.len(), 1);
+    assert!(queue.show(b.id()).unwrap().dependencies.is_empty());
     assert!(queue.show(TaskId::new(999)).is_err());
 }
 
 #[test]
 fn dependencies_reject_self_cycles_and_missing_tasks_and_can_be_removed() {
     let (_dir, mut queue) = fixture();
-    let a = queue.add(new_task("a")).unwrap().id;
-    let b = queue.add(new_task("b")).unwrap().id;
-    let c = queue.add(new_task("c")).unwrap().id;
+    let a = queue.add(new_task("a")).unwrap().id();
+    let b = queue.add(new_task("b")).unwrap().id();
+    let c = queue.add(new_task("c")).unwrap().id();
     queue.add_dependency(b, a).unwrap();
     queue.add_dependency(c, b).unwrap();
     assert!(queue.add_dependency(a, a).is_err());
@@ -130,7 +130,7 @@ fn dependencies_reject_self_cycles_and_missing_tasks_and_can_be_removed() {
     queue.transition(c, TaskAction::Ready).unwrap();
     assert!(queue.candidates().unwrap().is_empty());
     queue.remove_dependency(c, b).unwrap();
-    assert_eq!(queue.candidates().unwrap()[0].id, c);
+    assert_eq!(queue.candidates().unwrap()[0].id(), c);
     assert!(queue.remove_dependency(c, b).is_err());
     assert_eq!(
         queue.show(c).unwrap().events.last().unwrap().kind,
@@ -141,9 +141,9 @@ fn dependencies_reject_self_cycles_and_missing_tasks_and_can_be_removed() {
 #[test]
 fn candidates_require_every_predecessor_to_be_completed() {
     let (dir, mut queue) = fixture();
-    let a = queue.add(new_task("a")).unwrap().id;
-    let b = queue.add(new_task("b")).unwrap().id;
-    let c = queue.add(new_task("c")).unwrap().id;
+    let a = queue.add(new_task("a")).unwrap().id();
+    let b = queue.add(new_task("b")).unwrap().id();
+    let c = queue.add(new_task("c")).unwrap().id();
     queue.add_dependency(c, a).unwrap();
     queue.add_dependency(c, b).unwrap();
     queue.transition(c, TaskAction::Ready).unwrap();
@@ -163,7 +163,7 @@ fn candidates_require_every_predecessor_to_be_completed() {
         )
         .unwrap();
         assert!(
-            !queue.candidates().unwrap().iter().any(|t| t.id == c),
+            !queue.candidates().unwrap().iter().any(|t| t.id() == c),
             "{status}"
         );
     }
@@ -174,7 +174,7 @@ fn candidates_require_every_predecessor_to_be_completed() {
             .candidates()
             .unwrap()
             .iter()
-            .map(|t| t.id)
+            .map(|t| t.id())
             .collect::<Vec<_>>(),
         vec![c]
     );
@@ -189,9 +189,9 @@ fn candidates_require_every_predecessor_to_be_completed() {
 #[test]
 fn predecessors_carry_the_integrated_run_and_in_progress_tasks_are_listed() {
     let (dir, mut queue) = fixture();
-    let a = queue.add(new_task("a")).unwrap().id;
-    let b = queue.add(new_task("b")).unwrap().id;
-    let c = queue.add(new_task("c")).unwrap().id;
+    let a = queue.add(new_task("a")).unwrap().id();
+    let b = queue.add(new_task("b")).unwrap().id();
+    let c = queue.add(new_task("c")).unwrap().id();
     queue.add_dependency(c, b).unwrap();
     queue.add_dependency(c, a).unwrap();
     assert!(queue.predecessors(a).unwrap().is_empty());
@@ -207,7 +207,7 @@ fn predecessors_carry_the_integrated_run_and_in_progress_tasks_are_listed() {
             .tasks_in_progress()
             .unwrap()
             .iter()
-            .map(|t| t.id)
+            .map(|t| t.id())
             .collect::<Vec<_>>(),
         vec![a]
     );
@@ -229,7 +229,7 @@ fn predecessors_carry_the_integrated_run_and_in_progress_tasks_are_listed() {
     assert_eq!(
         predecessors
             .iter()
-            .map(|p| (p.task.id, p.task.title.as_str()))
+            .map(|p| (p.task.id(), p.task.title()))
             .collect::<Vec<_>>(),
         vec![(a, "a"), (b, "b")]
     );
@@ -257,18 +257,18 @@ fn predecessors_carry_the_integrated_run_and_in_progress_tasks_are_listed() {
 #[test]
 fn manual_transitions_cannot_change_claimed_or_terminal_tasks() {
     let (_dir, mut queue) = fixture();
-    let a = queue.add(new_task("a")).unwrap().id;
+    let a = queue.add(new_task("a")).unwrap().id();
     assert!(queue.transition(a, TaskAction::Draft).is_err());
     queue.transition(a, TaskAction::Ready).unwrap();
     queue.transition(a, TaskAction::Draft).unwrap();
     queue.transition(a, TaskAction::Ready).unwrap();
     assert!(CommitSha::try_from("main").is_err());
-    assert_eq!(queue.show(a).unwrap().task.status, TaskStatus::Ready);
+    assert_eq!(queue.show(a).unwrap().task.status(), TaskStatus::Ready);
     queue.claim(&base()).unwrap();
     for action in [TaskAction::Ready, TaskAction::Draft, TaskAction::Cancel] {
         assert!(queue.transition(a, action).is_err());
     }
-    let b = queue.add(new_task("b")).unwrap().id;
+    let b = queue.add(new_task("b")).unwrap().id();
     assert!(queue.add_dependency(a, b).is_err());
     assert!(queue.remove_dependency(a, b).is_err());
     queue.transition(b, TaskAction::Cancel).unwrap();
@@ -281,7 +281,7 @@ fn concurrent_connections_claim_each_ready_task_once() {
     let (dir, mut queue) = fixture();
     for title in ["first", "second"] {
         let task = queue.add(new_task(title)).unwrap();
-        queue.transition(task.id, TaskAction::Ready).unwrap();
+        queue.transition(task.id(), TaskAction::Ready).unwrap();
     }
     let barrier = Arc::new(Barrier::new(8));
     let workers: Vec<_> = (0..8)
@@ -321,8 +321,8 @@ fn concurrent_connections_claim_each_ready_task_once() {
 #[test]
 fn concurrent_opposite_edges_cannot_create_a_cycle() {
     let (dir, mut queue) = fixture();
-    let a = queue.add(new_task("a")).unwrap().id;
-    let b = queue.add(new_task("b")).unwrap().id;
+    let a = queue.add(new_task("a")).unwrap().id();
+    let b = queue.add(new_task("b")).unwrap().id();
     let barrier = Arc::new(Barrier::new(2));
     let workers: Vec<_> = [(a, b), (b, a)]
         .into_iter()
@@ -353,7 +353,7 @@ fn concurrent_opposite_edges_cannot_create_a_cycle() {
 fn event_write_failure_rolls_back_claim_and_task_transition() {
     let (dir, mut queue) = fixture();
     let task = queue.add(new_task("atomic claim")).unwrap();
-    queue.transition(task.id, TaskAction::Ready).unwrap();
+    queue.transition(task.id(), TaskAction::Ready).unwrap();
     let raw = Connection::open(dir.path().join("queue.db")).unwrap();
     raw.execute_batch(
         "CREATE TRIGGER reject_claim_event BEFORE INSERT ON run_events
@@ -361,8 +361,8 @@ fn event_write_failure_rolls_back_claim_and_task_transition() {
     )
     .unwrap();
     assert!(queue.claim(&base()).is_err());
-    let detail = queue.show(task.id).unwrap();
-    assert_eq!(detail.task.status, TaskStatus::Ready);
+    let detail = queue.show(task.id()).unwrap();
+    assert_eq!(detail.task.status(), TaskStatus::Ready);
     assert!(detail.runs.is_empty());
     assert_eq!(detail.events.len(), 2);
     raw.execute_batch("DROP TRIGGER reject_claim_event;")
@@ -376,9 +376,9 @@ fn event_write_failure_rolls_back_claim_and_task_transition() {
 #[test]
 fn awaiting_integration_keeps_dependents_blocked_but_frees_execution_slot() {
     let (dir, mut queue) = fixture();
-    let a = queue.add(new_task("a")).unwrap().id;
-    let b = queue.add(new_task("depends on a")).unwrap().id;
-    let c = queue.add(new_task("independent")).unwrap().id;
+    let a = queue.add(new_task("a")).unwrap().id();
+    let b = queue.add(new_task("depends on a")).unwrap().id();
+    let c = queue.add(new_task("independent")).unwrap().id();
     queue.add_dependency(b, a).unwrap();
     for id in [a, b, c] {
         queue.transition(id, TaskAction::Ready).unwrap();
@@ -397,7 +397,7 @@ fn awaiting_integration_keeps_dependents_blocked_but_frees_execution_slot() {
     drop(queue);
     let mut queue = SqliteQueue::open(dir.path().join("queue.db")).unwrap();
     let detail = queue.show(a).unwrap();
-    assert_eq!(detail.task.status, TaskStatus::InProgress);
+    assert_eq!(detail.task.status(), TaskStatus::InProgress);
     assert_eq!(detail.runs[0].status, RunStatus::AwaitingIntegration);
     // Stored paths are resolved again under the queue's `runs/<run-id>/`.
     let run_dir = dir
@@ -420,7 +420,7 @@ fn awaiting_integration_keeps_dependents_blocked_but_frees_execution_slot() {
             .candidates()
             .unwrap()
             .iter()
-            .map(|t| t.id)
+            .map(|t| t.id())
             .collect::<Vec<_>>(),
         [c]
     );
@@ -475,8 +475,8 @@ fn foreign_and_future_databases_are_rejected_without_rewriting_them() {
 #[test]
 fn dependency_change_and_claim_are_serialized() {
     let (dir, mut queue) = fixture();
-    let task = queue.add(new_task("ready task")).unwrap().id;
-    let prerequisite = queue.add(new_task("unfinished prerequisite")).unwrap().id;
+    let task = queue.add(new_task("ready task")).unwrap().id();
+    let prerequisite = queue.add(new_task("unfinished prerequisite")).unwrap().id();
     queue.transition(task, TaskAction::Ready).unwrap();
     let mut claimant = SqliteQueue::open(dir.path().join("queue.db")).unwrap();
     let mut editor = SqliteQueue::open(dir.path().join("queue.db")).unwrap();
@@ -497,12 +497,12 @@ fn dependency_change_and_claim_are_serialized() {
         ClaimOutcome::Claimed { .. } => {
             assert!(edit.is_err());
             assert!(detail.dependencies.is_empty());
-            assert_eq!(detail.task.status, TaskStatus::InProgress);
+            assert_eq!(detail.task.status(), TaskStatus::InProgress);
         }
         ClaimOutcome::NoReadyTask => {
             edit.unwrap();
             assert_eq!(detail.dependencies, [prerequisite]);
-            assert_eq!(detail.task.status, TaskStatus::Ready);
+            assert_eq!(detail.task.status(), TaskStatus::Ready);
             assert!(detail.runs.is_empty());
         }
     }
@@ -511,8 +511,8 @@ fn dependency_change_and_claim_are_serialized() {
 #[test]
 fn database_constraints_guard_per_task_runs_and_integration_ownership() {
     let (dir, mut queue) = fixture();
-    let a = queue.add(new_task("a")).unwrap().id;
-    let b = queue.add(new_task("b")).unwrap().id;
+    let a = queue.add(new_task("a")).unwrap().id();
+    let b = queue.add(new_task("b")).unwrap().id();
     queue.transition(a, TaskAction::Ready).unwrap();
     queue.claim(&base()).unwrap();
     let raw = Connection::open(dir.path().join("queue.db")).unwrap();
@@ -938,12 +938,12 @@ fn migration_from_v6_adds_goals_and_keeps_tasks_runs_and_events() {
         None
     );
     let landed = queue.show(TaskId::new(1)).unwrap();
-    assert_eq!(landed.task.title, "landed");
-    assert_eq!(landed.task.description, "why");
-    assert_eq!(landed.task.goal_id, None);
-    assert_eq!(landed.task.context, "");
-    assert!(landed.task.paths.is_empty());
-    assert_eq!(landed.task.status, TaskStatus::Completed);
+    assert_eq!(landed.task.title(), "landed");
+    assert_eq!(landed.task.description(), "why");
+    assert_eq!(landed.task.goal_id(), None);
+    assert_eq!(landed.task.context(), "");
+    assert!(landed.task.paths().is_empty());
+    assert_eq!(landed.task.status(), TaskStatus::Completed);
     assert_eq!(landed.runs.len(), 1);
     assert_eq!(landed.runs[0].status, RunStatus::Integrated);
     // Events keep their IDs, order and run reference across the rebuild.
@@ -960,16 +960,16 @@ fn migration_from_v6_adds_goals_and_keeps_tasks_runs_and_events() {
         [(1, Some(1), None), (2, Some(1), Some("run-landed"))]
     );
     let waiting = queue.show(TaskId::new(2)).unwrap();
-    assert_eq!(waiting.task.goal_id, None);
-    assert_eq!(waiting.task.context, "");
+    assert_eq!(waiting.task.goal_id(), None);
+    assert_eq!(waiting.task.context(), "");
     assert_eq!(waiting.dependencies, [TaskId::new(1)]);
     assert_eq!(waiting.events[0].id, 3);
-    assert_eq!(queue.candidates().unwrap()[0].id, TaskId::new(2));
+    assert_eq!(queue.candidates().unwrap()[0].id(), TaskId::new(2));
     assert!(queue.list_goals().unwrap().is_empty());
     // New goals and events continue the sequences; foreign keys are enforced.
     let goal = queue.add_goal(new_goal("after")).unwrap();
-    assert_eq!(goal.id, GoalId::new(1));
-    assert_eq!(queue.show_goal(goal.id).unwrap().events[0].id, 4);
+    assert_eq!(goal.id(), GoalId::new(1));
+    assert_eq!(queue.show_goal(goal.id()).unwrap().events[0].id, 4);
     let raw = Connection::open(&path).unwrap();
     raw.pragma_update(None, "foreign_keys", true).unwrap();
     assert!(
@@ -1077,13 +1077,13 @@ fn goals_of_a_version_12_queue_migrate_as_open() {
             .show(TaskId::new(1))
             .unwrap()
             .task
-            .required_evidence
+            .required_evidence()
             .is_empty()
     );
     let goal = queue.show_goal(GoalId::new(1)).unwrap().goal;
-    assert_eq!(goal.status, GoalStatus::Open);
+    assert_eq!(goal.status(), GoalStatus::Open);
     assert_eq!(queue.list_goals().unwrap()[0].status, GoalStatus::Open);
-    assert_eq!(queue.candidates().unwrap()[0].id, TaskId::new(1));
+    assert_eq!(queue.candidates().unwrap()[0].id(), TaskId::new(1));
     let raw = Connection::open(&path).unwrap();
     assert!(
         raw.execute("UPDATE goals SET status='closed' WHERE id=1", [])
@@ -1100,27 +1100,27 @@ fn draft_goal_tasks_are_not_candidates_until_the_goal_is_ready() {
             ..new_goal("proposal")
         })
         .unwrap();
-    assert_eq!(draft.status, GoalStatus::Draft);
+    assert_eq!(draft.status(), GoalStatus::Draft);
     let task = queue
         .add(NewTask {
-            goal_id: Some(draft.id),
+            goal_id: Some(draft.id()),
             ..new_task("proposed")
         })
         .unwrap();
     let plain = queue.add(new_task("plain")).unwrap();
-    queue.transition(task.id, TaskAction::Ready).unwrap();
-    queue.transition(plain.id, TaskAction::Ready).unwrap();
+    queue.transition(task.id(), TaskAction::Ready).unwrap();
+    queue.transition(plain.id(), TaskAction::Ready).unwrap();
     let ids = |queue: &SqliteQueue| {
         queue
             .candidates()
             .unwrap()
             .iter()
-            .map(|t| t.id)
+            .map(|t| t.id())
             .collect::<Vec<_>>()
     };
-    assert_eq!(ids(&queue), [plain.id]);
+    assert_eq!(ids(&queue), [plain.id()]);
     let graph = queue.graph_input().unwrap();
-    assert_eq!(graph.candidates, [plain.id]);
+    assert_eq!(graph.candidates, [plain.id()]);
     assert_eq!(graph.tasks[0].goal_status, Some(GoalStatus::Draft));
     assert_eq!(graph.tasks[1].goal_status, None);
     // The supervisor's claim skips the draft goal's task as well.
@@ -1128,24 +1128,24 @@ fn draft_goal_tasks_are_not_candidates_until_the_goal_is_ready() {
         ClaimOutcome::Claimed { run } => run.task_id,
         ClaimOutcome::NoReadyTask => panic!("plain task is claimable"),
     };
-    assert_eq!(claimed, plain.id);
+    assert_eq!(claimed, plain.id());
     assert!(matches!(
         queue.claim(&base()).unwrap(),
         ClaimOutcome::NoReadyTask
     ));
 
-    let opened = queue.ready_goal(draft.id).unwrap();
-    assert_eq!(opened.status, GoalStatus::Open);
-    assert_eq!(ids(&queue), [task.id]);
-    let events = queue.show_goal(draft.id).unwrap().events;
+    let opened = queue.ready_goal(draft.id()).unwrap();
+    assert_eq!(opened.status(), GoalStatus::Open);
+    assert_eq!(ids(&queue), [task.id()]);
+    let events = queue.show_goal(draft.id()).unwrap().events;
     assert_eq!(events.last().unwrap().kind, "goal_status_changed");
     assert_eq!(
         events.last().unwrap().payload,
         serde_json::json!({"from": "draft", "to": "open"})
     );
     assert_eq!(
-        queue.ready_goal(draft.id).unwrap_err().to_string(),
-        format!("goal {} is not a draft", draft.id)
+        queue.ready_goal(draft.id()).unwrap_err().to_string(),
+        format!("goal {} is not a draft", draft.id())
     );
     assert!(queue.ready_goal(GoalId::new(99)).is_err());
     let abandoned = queue
@@ -1155,9 +1155,9 @@ fn draft_goal_tasks_are_not_candidates_until_the_goal_is_ready() {
         })
         .unwrap();
     queue
-        .close_goal(abandoned.id, GoalVerdict::Abandoned)
+        .close_goal(abandoned.id(), GoalVerdict::Abandoned)
         .unwrap();
-    assert!(queue.ready_goal(abandoned.id).is_err());
+    assert!(queue.ready_goal(abandoned.id()).is_err());
     drop(dir);
 }
 
@@ -1167,12 +1167,12 @@ fn notes_attach_to_tasks_runs_and_goals_and_page_by_cursor() {
     let goal = queue.add_goal(new_goal("observed")).unwrap();
     let task = queue
         .add(NewTask {
-            goal_id: Some(goal.id),
+            goal_id: Some(goal.id()),
             ..new_task("in goal")
         })
         .unwrap();
     let other = queue.add(new_task("elsewhere")).unwrap();
-    queue.transition(task.id, TaskAction::Ready).unwrap();
+    queue.transition(task.id(), TaskAction::Ready).unwrap();
     let run = match queue.claim(&base()).unwrap() {
         ClaimOutcome::Claimed { run } => run,
         ClaimOutcome::NoReadyTask => panic!("task is claimable"),
@@ -1184,10 +1184,10 @@ fn notes_attach_to_tasks_runs_and_goals_and_page_by_cursor() {
         by: "observer".into(),
     };
     let on_goal = queue
-        .add_note(note(NoteTarget::Goal(goal.id), "goal note"))
+        .add_note(note(NoteTarget::Goal(goal.id()), "goal note"))
         .unwrap();
     assert_eq!(on_goal.kind, "observation");
-    assert_eq!(on_goal.goal_id, Some(goal.id));
+    assert_eq!(on_goal.goal_id, Some(goal.id()));
     assert_eq!(on_goal.task_id, None);
     assert_eq!(
         on_goal.payload,
@@ -1199,13 +1199,13 @@ fn notes_attach_to_tasks_runs_and_goals_and_page_by_cursor() {
             ..note(NoteTarget::Run(run.id.clone()), "run note")
         })
         .unwrap();
-    assert_eq!(on_run.task_id, Some(task.id));
+    assert_eq!(on_run.task_id, Some(task.id()));
     assert_eq!(
         on_run.run_id.as_ref().map(RunId::as_str),
         Some(run.id.as_str())
     );
     let on_other = queue
-        .add_note(note(NoteTarget::Task(other.id), "other note"))
+        .add_note(note(NoteTarget::Task(other.id()), "other note"))
         .unwrap();
     assert!(
         queue
@@ -1224,7 +1224,7 @@ fn notes_attach_to_tasks_runs_and_goals_and_page_by_cursor() {
     );
     assert!(
         queue
-            .add_note(note(NoteTarget::Goal(goal.id), " "))
+            .add_note(note(NoteTarget::Goal(goal.id()), " "))
             .is_err()
     );
 
@@ -1246,7 +1246,7 @@ fn notes_attach_to_tasks_runs_and_goals_and_page_by_cursor() {
     assert_eq!(ids(&latest), [on_run.id, on_other.id]);
     let in_goal = queue
         .notes(&NoteQuery {
-            goal_id: Some(goal.id),
+            goal_id: Some(goal.id()),
             limit: 10,
             ..NoteQuery::default()
         })
@@ -1254,7 +1254,7 @@ fn notes_attach_to_tasks_runs_and_goals_and_page_by_cursor() {
     assert_eq!(ids(&in_goal), [on_goal.id, on_run.id]);
     let of_task = queue
         .notes(&NoteQuery {
-            task_id: Some(task.id),
+            task_id: Some(task.id()),
             limit: 10,
             ..NoteQuery::default()
         })
@@ -1286,41 +1286,38 @@ fn goal_close_verdicts_depend_on_task_statuses() {
     let (dir, mut queue) = fixture();
     let goal = queue.add_goal(new_goal("feature")).unwrap();
     assert!(!goal.is_closed());
-    assert_eq!(
-        goal.doc.as_deref(),
-        Some("docs/adr/0009-goal-groups-tasks.md")
-    );
+    assert_eq!(goal.doc(), Some("docs/adr/0009-goal-groups-tasks.md"));
     let mut spec = new_task("first");
-    spec.goal_id = Some(goal.id);
+    spec.goal_id = Some(goal.id());
     let a = queue.add(spec).unwrap();
-    assert_eq!(a.goal_id, Some(goal.id));
+    assert_eq!(a.goal_id(), Some(goal.id()));
     let mut spec = new_task("second");
-    spec.goal_id = Some(goal.id);
-    let b = queue.add(spec).unwrap().id;
+    spec.goal_id = Some(goal.id());
+    let b = queue.add(spec).unwrap().id();
     // Draft tasks block `achieved` but not `abandoned`.
-    assert!(queue.close_goal(goal.id, GoalVerdict::Achieved).is_err());
-    queue.transition(a.id, TaskAction::Ready).unwrap();
+    assert!(queue.close_goal(goal.id(), GoalVerdict::Achieved).is_err());
+    queue.transition(a.id(), TaskAction::Ready).unwrap();
     queue.claim(&base()).unwrap();
     // An in-progress task blocks both verdicts.
     let error = format!(
         "{:#}",
         queue
-            .close_goal(goal.id, GoalVerdict::Abandoned)
+            .close_goal(goal.id(), GoalVerdict::Abandoned)
             .unwrap_err()
     );
     assert!(error.contains("1 task(s) in_progress"), "{error}");
-    assert!(queue.close_goal(goal.id, GoalVerdict::Achieved).is_err());
-    assert!(!queue.show_goal(goal.id).unwrap().closed);
+    assert!(queue.close_goal(goal.id(), GoalVerdict::Achieved).is_err());
+    assert!(!queue.show_goal(goal.id()).unwrap().closed);
     let raw = Connection::open(dir.path().join("queue.db")).unwrap();
-    raw.execute("UPDATE tasks SET status='completed' WHERE id=?1", [a.id])
+    raw.execute("UPDATE tasks SET status='completed' WHERE id=?1", [a.id()])
         .unwrap();
-    assert!(queue.close_goal(goal.id, GoalVerdict::Achieved).is_err());
+    assert!(queue.close_goal(goal.id(), GoalVerdict::Achieved).is_err());
     queue.transition(b, TaskAction::Cancel).unwrap();
-    let closed = queue.close_goal(goal.id, GoalVerdict::Achieved).unwrap();
+    let closed = queue.close_goal(goal.id(), GoalVerdict::Achieved).unwrap();
     assert!(closed.is_closed());
-    assert_eq!(closed.verdict, Some(GoalVerdict::Achieved));
-    assert!(closed.closed_at.is_some());
-    assert!(queue.close_goal(goal.id, GoalVerdict::Abandoned).is_err());
+    assert_eq!(closed.verdict(), Some(GoalVerdict::Achieved));
+    assert!(closed.closed_at().is_some());
+    assert!(queue.close_goal(goal.id(), GoalVerdict::Abandoned).is_err());
     let summary = &queue.list_goals().unwrap()[0];
     assert!(summary.closed);
     assert_eq!(summary.verdict, Some(GoalVerdict::Achieved));
@@ -1336,12 +1333,14 @@ fn goal_close_verdicts_depend_on_task_statuses() {
     // Nothing running: an untouched goal may be abandoned with draft tasks left.
     let other = queue.add_goal(new_goal("dropped")).unwrap();
     let mut spec = new_task("never started");
-    spec.goal_id = Some(other.id);
-    let c = queue.add(spec).unwrap().id;
+    spec.goal_id = Some(other.id());
+    let c = queue.add(spec).unwrap().id();
     queue.transition(c, TaskAction::Ready).unwrap();
-    let abandoned = queue.close_goal(other.id, GoalVerdict::Abandoned).unwrap();
-    assert_eq!(abandoned.verdict, Some(GoalVerdict::Abandoned));
-    assert_eq!(queue.show(c).unwrap().task.status, TaskStatus::Ready);
+    let abandoned = queue
+        .close_goal(other.id(), GoalVerdict::Abandoned)
+        .unwrap();
+    assert_eq!(abandoned.verdict(), Some(GoalVerdict::Abandoned));
+    assert_eq!(queue.show(c).unwrap().task.status(), TaskStatus::Ready);
     assert!(queue.show_goal(GoalId::new(99)).is_err());
     assert!(
         queue
@@ -1361,8 +1360,8 @@ fn goal_close_verdicts_depend_on_task_statuses() {
 #[test]
 fn set_goal_and_add_with_goal_follow_the_dependency_rules() {
     let (_dir, mut queue) = fixture();
-    let open = queue.add_goal(new_goal("open")).unwrap().id;
-    let closed = queue.add_goal(new_goal("closed")).unwrap().id;
+    let open = queue.add_goal(new_goal("open")).unwrap().id();
+    let closed = queue.add_goal(new_goal("closed")).unwrap().id();
     queue.close_goal(closed, GoalVerdict::Achieved).unwrap();
     let mut spec = new_task("into closed goal");
     spec.goal_id = Some(closed);
@@ -1375,26 +1374,26 @@ fn set_goal_and_add_with_goal_follow_the_dependency_rules() {
     assert!(queue.add(spec).is_err());
     assert_eq!(queue.list(&TaskQuery::default()).unwrap().total, 0);
 
-    let task = queue.add(new_task("movable")).unwrap().id;
+    let task = queue.add(new_task("movable")).unwrap().id();
     assert_eq!(
-        queue.set_goal(task, Some(open)).unwrap().goal_id,
+        queue.set_goal(task, Some(open)).unwrap().goal_id(),
         Some(open)
     );
     assert!(queue.set_goal(task, Some(closed)).is_err());
     assert!(queue.set_goal(task, Some(GoalId::new(99))).is_err());
-    assert_eq!(queue.show(task).unwrap().task.goal_id, Some(open));
+    assert_eq!(queue.show(task).unwrap().task.goal_id(), Some(open));
     queue.transition(task, TaskAction::Ready).unwrap();
-    assert_eq!(queue.set_goal(task, None).unwrap().goal_id, None);
+    assert_eq!(queue.set_goal(task, None).unwrap().goal_id(), None);
     assert_eq!(
-        queue.set_goal(task, Some(open)).unwrap().goal_id,
+        queue.set_goal(task, Some(open)).unwrap().goal_id(),
         Some(open)
     );
     queue.claim(&base()).unwrap();
     assert!(queue.set_goal(task, None).is_err());
     assert!(queue.set_goal(task, Some(open)).is_err());
-    assert_eq!(queue.show(task).unwrap().task.goal_id, Some(open));
+    assert_eq!(queue.show(task).unwrap().task.goal_id(), Some(open));
     assert!(queue.set_goal(TaskId::new(99), Some(open)).is_err());
-    let canceled = queue.add(new_task("canceled")).unwrap().id;
+    let canceled = queue.add(new_task("canceled")).unwrap().id();
     queue.transition(canceled, TaskAction::Cancel).unwrap();
     assert!(queue.set_goal(canceled, Some(open)).is_err());
     // The goal's task list and counts follow the moves.
@@ -1427,27 +1426,27 @@ fn paths_are_stored_and_replaced_while_the_task_is_editable() {
     let mut spec = new_task("docs only");
     spec.paths = globs(&["docs/**", "*.md", "docs/**"]);
     let task = queue.add(spec).unwrap();
-    assert_eq!(task.paths, globs(&["docs/**", "*.md"]));
-    assert_eq!(queue.show(task.id).unwrap().task.paths, task.paths);
+    assert_eq!(task.paths(), globs(&["docs/**", "*.md"]));
+    assert_eq!(queue.show(task.id()).unwrap().task.paths(), task.paths());
     // No change, no event.
     queue
-        .set_paths(task.id, globs(&["docs/**", "*.md"]))
+        .set_paths(task.id(), globs(&["docs/**", "*.md"]))
         .unwrap();
-    assert!(queue.set_paths(task.id, globs(&["../x"])).is_err());
-    queue.transition(task.id, TaskAction::Ready).unwrap();
+    assert!(queue.set_paths(task.id(), globs(&["../x"])).is_err());
+    queue.transition(task.id(), TaskAction::Ready).unwrap();
     let widened = queue
-        .set_paths(task.id, globs(&["docs/**", "src/**"]))
+        .set_paths(task.id(), globs(&["docs/**", "src/**"]))
         .unwrap();
-    assert_eq!(widened.paths, globs(&["docs/**", "src/**"]));
+    assert_eq!(widened.paths(), globs(&["docs/**", "src/**"]));
     assert!(
         queue
-            .set_paths(task.id, Vec::new())
+            .set_paths(task.id(), Vec::new())
             .unwrap()
-            .paths
+            .paths()
             .is_empty()
     );
     let changes: Vec<_> = queue
-        .show(task.id)
+        .show(task.id())
         .unwrap()
         .events
         .into_iter()
@@ -1470,7 +1469,7 @@ fn paths_are_stored_and_replaced_while_the_task_is_editable() {
     // Once claimed, the run keeps the scope it started with.
     queue.claim(&base()).unwrap();
     let error = queue
-        .set_paths(task.id, globs(&["docs/**"]))
+        .set_paths(task.id(), globs(&["docs/**"]))
         .unwrap_err()
         .to_string();
     assert_eq!(
@@ -1484,11 +1483,11 @@ fn paths_are_stored_and_replaced_while_the_task_is_editable() {
 fn goal_events_are_recorded_without_a_run() {
     let (_dir, mut queue) = fixture();
     let goal = queue.add_goal(new_goal("tracked")).unwrap();
-    assert!(queue.edit_goal(goal.id, GoalEdit::default()).is_err());
+    assert!(queue.edit_goal(goal.id(), GoalEdit::default()).is_err());
     assert!(
         queue
             .edit_goal(
-                goal.id,
+                goal.id(),
                 GoalEdit {
                     title: Some(" ".into()),
                     ..GoalEdit::default()
@@ -1498,7 +1497,7 @@ fn goal_events_are_recorded_without_a_run() {
     );
     let edited = queue
         .edit_goal(
-            goal.id,
+            goal.id(),
             GoalEdit {
                 title: Some("renamed".into()),
                 doc: Some(String::new()),
@@ -1506,21 +1505,21 @@ fn goal_events_are_recorded_without_a_run() {
             },
         )
         .unwrap();
-    assert_eq!(edited.title, "renamed");
-    assert_eq!(edited.doc, None);
-    assert_eq!(edited.acceptance, goal.acceptance);
-    let task = queue.add(new_task("member")).unwrap().id;
-    queue.set_goal(task, Some(goal.id)).unwrap();
-    queue.set_goal(task, Some(goal.id)).unwrap(); // Unchanged: no event.
+    assert_eq!(edited.title(), "renamed");
+    assert_eq!(edited.doc(), None);
+    assert_eq!(edited.acceptance(), goal.acceptance());
+    let task = queue.add(new_task("member")).unwrap().id();
+    queue.set_goal(task, Some(goal.id())).unwrap();
+    queue.set_goal(task, Some(goal.id())).unwrap(); // Unchanged: no event.
     queue.set_goal(task, None).unwrap();
-    queue.close_goal(goal.id, GoalVerdict::Achieved).unwrap();
+    queue.close_goal(goal.id(), GoalVerdict::Achieved).unwrap();
     assert!(
         queue
             .edit_goal(GoalId::new(99), GoalEdit::default())
             .is_err()
     );
 
-    let detail = queue.show_goal(goal.id).unwrap();
+    let detail = queue.show_goal(goal.id()).unwrap();
     assert!(detail.closed);
     assert!(detail.tasks.is_empty());
     assert_eq!(
@@ -1530,9 +1529,9 @@ fn goal_events_are_recorded_without_a_run() {
             .map(|e| (e.kind.as_str(), e.goal_id, e.task_id, e.run_id.clone()))
             .collect::<Vec<_>>(),
         [
-            ("goal_created", Some(goal.id), None, None),
-            ("goal_updated", Some(goal.id), None, None),
-            ("goal_closed", Some(goal.id), None, None),
+            ("goal_created", Some(goal.id()), None, None),
+            ("goal_updated", Some(goal.id()), None, None),
+            ("goal_closed", Some(goal.id()), None, None),
         ]
     );
     assert_eq!(detail.events[0].payload["goal"]["title"], "tracked");
@@ -1558,8 +1557,8 @@ fn goal_events_are_recorded_without_a_run() {
     );
     assert!(task_events[0].payload["goal_id"].is_null());
     assert_eq!(task_events[1].payload["from"], serde_json::Value::Null);
-    assert_eq!(task_events[1].payload["to"], goal.id.as_i64());
-    assert_eq!(task_events[2].payload["from"], goal.id.as_i64());
+    assert_eq!(task_events[1].payload["to"], goal.id().as_i64());
+    assert_eq!(task_events[2].payload["from"], goal.id().as_i64());
     assert!(task_events[2].payload["to"].is_null());
 }
 
@@ -1571,14 +1570,14 @@ fn listed_ids(queue: &SqliteQueue, query: &TaskQuery) -> Vec<TaskId> {
 #[test]
 fn list_defaults_to_unfinished_tasks_newest_first_with_compact_items() {
     let (dir, mut queue) = fixture();
-    let goal = queue.add_goal(new_goal("grouped")).unwrap().id;
-    let a = queue.add(new_task("landed")).unwrap().id;
-    let b = queue.add(new_task("dropped")).unwrap().id;
+    let goal = queue.add_goal(new_goal("grouped")).unwrap().id();
+    let a = queue.add(new_task("landed")).unwrap().id();
+    let b = queue.add(new_task("dropped")).unwrap().id();
     let mut spec = new_task("claimed");
     spec.dependencies = vec![a];
     spec.goal_id = Some(goal);
-    let c = queue.add(spec).unwrap().id;
-    let d = queue.add(new_task("waiting")).unwrap().id;
+    let c = queue.add(spec).unwrap().id();
+    let d = queue.add(new_task("waiting")).unwrap().id();
     let raw = Connection::open(dir.path().join("queue.db")).unwrap();
     raw.execute("UPDATE tasks SET status='completed' WHERE id=?1", [a])
         .unwrap();
@@ -1653,7 +1652,7 @@ fn list_full_items_carry_every_task_field() {
 fn list_pages_by_limit_with_next_as_the_following_before() {
     let (_dir, mut queue) = fixture();
     let ids: Vec<TaskId> = (0..21)
-        .map(|n| queue.add(new_task(&format!("task {n}"))).unwrap().id)
+        .map(|n| queue.add(new_task(&format!("task {n}"))).unwrap().id())
         .collect();
     let newest_first: Vec<TaskId> = ids.iter().rev().copied().collect();
 

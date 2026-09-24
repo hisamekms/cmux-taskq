@@ -47,7 +47,17 @@ asks                 -- 0014（0016と0017で作り直し）: 人に答えを求
 
 `tasks.required_evidence`（0015、ADR-0019の決定5）はtaskがreceiptに要求するcheck名のJSON配列（`TEXT NOT NULL DEFAULT '[]'`）で、v14以前のtaskは移行後に`[]`（要求なし）になる。値は`add --evidence`が`tests` / `e2e` / `subagent_review`に限って書く。
 
-`tasks.paths`（0018、[ADR-0029](../adr/0029-task-declares-paths-and-verification-follows-the-kind-of-change.md)）はtaskのrunが変えてよいパスのglobのJSON配列（`TEXT NOT NULL DEFAULT '[]'`）で、v17以前のtaskは移行後に`[]`（制限なし）になる。`add --paths`が与えた順に重複を除いて書き、`set-paths`がdraft / readyのtaskについて置き換える（`BEGIN IMMEDIATE`でstatusの確認と書き込みを同じトランザクションで行い、変化があったときだけ`task_paths_changed`を記録する）。globの形の検査（空、`/`始まり、`.` / `..` / 空のsegmentを拒否）はdomainの`validate_path_globs`が書き込み前に行い、DBにCHECKは置かない。
+`tasks.paths`（0018、[ADR-0029](../adr/0029-task-declares-paths-and-verification-follows-the-kind-of-change.md)）はtaskのrunが変えてよいパスのglobのJSON配列（`TEXT NOT NULL DEFAULT '[]'`）で、v17以前のtaskは移行後に`[]`（制限なし）になる。`add --paths`が与えた順に重複を除いて書き、`set-paths`がdraft / readyのtaskについて置き換える（`BEGIN IMMEDIATE`でstatusの確認と書き込みを同じトランザクションで行い、変化があったときだけ`task_paths_changed`を記録する）。globの形の検査（空、`/`始まり、`.` / `..` / 空のsegmentを拒否）はdomainの`validate_path_globs`が書き込み前に行い（taskを読む前に1回、`task::set_paths`の中でもう1回）、DBにCHECKは置かない。
+
+## 集約の読み書き
+
+`tasks`と`goals`の行はdomainの集約`Task` / `Goal`（非公開フィールド。[domain-model](domain-model.md#集約-taskとgoal)）と次のように行き来する。schemaは変えていない。
+
+- 読み出し: `task_row` / `goal_row`がrowから`TaskRecord` / `GoalRecord`を組み、`Task::restore` / `Goal::restore`で復元する。enumの列は従来どおり`enum_col`、JSONの列は`json_col`で変換する。復元が拒否した行（空白のtitle、正でないID、`closed_at`と`verdict`の片方だけ）は、`DomainError`を原因にした`rusqlite::Error::FromSqlConversionFailure`になる。
+- 新規作成（`add` / `add_goal`）: `BEGIN IMMEDIATE`の中で、`next_id`がそのtableの`AUTOINCREMENT`の次の値（`sqlite_sequence`の`seq`と`max(id)`の大きい方＋1）を、`now`がDBの`strftime('%Y-%m-%dT%H:%M:%fZ','now')`を読み、`Task::new` / `Goal::new`に渡す。作成時のルールを通った集約の値をそのIDで`INSERT`する（status、`created_at`、`updated_at`も明示する）。書き込みトランザクションの中なので他の挿入が同じIDを先に取ることはない。`add --goal`は`goal::check_accepts_tasks`で閉じたgoalを拒否してから書く。依存（`NewTask.dependencies`）は挿入後に`insert_dependency`で1本ずつ足し、最後に行を読み直して返す。
+- 更新: 行を読んで復元し、domainのコマンド（`task::transition`、`task::set_goal`、`task::set_paths`、`goal::edit`、`goal::ready`、`goal::close`）に渡して、返った集約の値を`UPDATE`する。`updated_at`は従来どおりDBの`strftime(...,'now')`（`close_goal`だけは`goal::close`に渡した`closed_at`と同じ値）で、書いた後に行を読み直して返す。`transition_task`の`WHERE status=<読んだstatus>`と`close_goal`の`WHERE closed_at IS NULL`は並行の変更を見つけるための条件で（`BEGIN IMMEDIATE`の中なので通常は起きない）、どの遷移を許すかの判断はdomainにある。`goal_updated`の`old`は`goal::edit`が集約を消費する前にJSONにしておく。
+- 依存: `insert_dependency`は`task::check_not_self`、taskを読んで`task::check_dependencies_editable`、predecessorの存在確認、再帰CTEによる循環の検出、`task::check_acyclic`の順に確かめる。循環の検出は全依存グラフが要るのでSQLに残し（ADR-0013のDDDのトリレンマの例外）、拒否するかの判断とエラー文はdomainが持つ。`remove_dependency`も`task::check_dependencies_editable`を通す。
+- claimの`UPDATE tasks SET status='in_progress'`とintegrateの`completed`化はまだSQLにある。runの状態遷移と合わせてTaskRunのカプセル化以降のタスクで扱う。
 
 `task_dependencies(task_id, predecessor_id)`は依存関係を保存する。TaskRunは試行ごとに新しい行を作り、Taskに履歴を持たせる。workspace、worktree、receipt、log、repo、run directory、supervisor token、last errorの参照列をtask_runsに置き、claim時点ではnullにする。`result_commit`は検証で確認したcommitで、着地後は`main`に積んだsquash commitに置き換わる（rebase後のrun headは`refs/dagq/runs/<run-id>`と`run_integrated`イベントの`source_commit`が持つ）。`last_error`は検証の拒否理由、`needs_session`の理由、cleanup失敗、またはruntime errorを持ち、着地で消える。`workspace_closed_at`（0003）はcmuxがcloseを確認した時刻で、nullの間はworkspaceを開いているものとして扱う。成果物hashは未実装。
 

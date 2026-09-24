@@ -174,7 +174,7 @@ mod tests {
     };
 
     fn task(description: &str) -> Task {
-        Task {
+        Task::restore(crate::domain::TaskRecord {
             id: TaskId::new(1),
             title: "t".into(),
             description: description.into(),
@@ -187,7 +187,8 @@ mod tests {
             context: String::new(),
             created_at: "c".into(),
             updated_at: "u".into(),
-        }
+        })
+        .unwrap()
     }
 
     fn run(id: &str) -> TaskRun {
@@ -313,7 +314,7 @@ mod tests {
     #[test]
     fn goal_detail_truncates_texts_and_keeps_kinds_of_latest_events() {
         let detail = GoalDetail {
-            goal: Goal {
+            goal: Goal::restore(crate::domain::GoalRecord {
                 id: GoalId::new(1),
                 title: "g".into(),
                 description: "x".repeat(TEXT_LIMIT * 2),
@@ -325,7 +326,8 @@ mod tests {
                 verdict: None,
                 created_at: "c".into(),
                 updated_at: "u".into(),
-            },
+            })
+            .unwrap(),
             closed: false,
             tasks: vec![GoalTask {
                 id: TaskId::new(2),

@@ -19,11 +19,11 @@ use crate::{
         TaskStore,
     },
     domain::{
-        ClaimOutcome, CommitSha, DomainError, Goal, GoalDetail, GoalEdit, GoalId, GoalStatus,
+        ClaimOutcome, CommitSha, DomainError, Goal, GoalDetail, GoalEdit, GoalId, GoalRecord,
         GoalSummary, GoalTask, GoalVerdict, NewGoal, NewNote, NewTask, NotePage, NoteQuery,
         NoteTarget, OBSERVATION_KIND, Predecessor, RunEvent, RunId, Task, TaskAction, TaskDetail,
-        TaskId, TaskRun, TaskStatus, TaskStatusCounts,
-        scope::{dedup_globs, validate_path_globs},
+        TaskId, TaskRecord, TaskRun, TaskStatus, TaskStatusCounts, goal,
+        scope::validate_path_globs, task,
     },
     infrastructure::location::runs_dir,
 };
@@ -172,30 +172,35 @@ impl SqliteQueue {
 }
 
 impl TaskStore for SqliteQueue {
-    fn add(&mut self, task: NewTask) -> Result<Task> {
-        task.validate()?;
+    fn add(&mut self, new: NewTask) -> Result<Task> {
+        // Rejected before taking the write lock; `new` checks it again.
+        new.validate()?;
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        if let Some(goal_id) = task.goal_id {
-            ensure_goal_open(&tx, goal_id)?;
+        let dependencies = new.dependencies.clone();
+        let task = Task::new(TaskId::new(next_id(&tx, "tasks")?), new, now(&tx)?)?;
+        if let Some(goal_id) = task.goal_id() {
+            goal::check_accepts_tasks(&read_goal(&tx, goal_id)?)?;
         }
+        let id = task.id();
         tx.execute(
-            "INSERT INTO tasks(title, description, acceptance, verification_commands, goal_id, context, required_evidence, paths)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
-            params![task.title, task.description, task.acceptance, serde_json::to_string(&task.verification_commands)?,
-                task.goal_id, task.context, serde_json::to_string(&task.required_evidence())?,
-                serde_json::to_string(&dedup_globs(&task.paths))?],
+            "INSERT INTO tasks(id, title, description, acceptance, verification_commands, status, goal_id,
+                               context, required_evidence, paths, created_at, updated_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+            params![id, task.title(), task.description(), task.acceptance(),
+                serde_json::to_string(task.verification_commands())?, task.status().as_str(),
+                task.goal_id(), task.context(), serde_json::to_string(task.required_evidence())?,
+                serde_json::to_string(task.paths())?, task.created_at(), task.updated_at()],
         )?;
-        let id = TaskId::new(tx.last_insert_rowid());
         event(
             &tx,
             id,
             None,
             "task_created",
-            json!({"goal_id": task.goal_id}),
+            json!({"goal_id": task.goal_id()}),
         )?;
-        for predecessor in task.dependencies {
+        for predecessor in dependencies {
             insert_dependency(&tx, id, predecessor)?;
         }
         let result = read_task(&tx, id)?;
@@ -262,7 +267,7 @@ impl TaskStore for SqliteQueue {
             .query_map(params_from_iter(&values), task_row)?
             .collect::<rusqlite::Result<_>>()?;
         let next = if tasks.len() > query.limit {
-            tasks.pop().map(|task| task.id)
+            tasks.pop().map(|task| task.id())
         } else {
             None
         };
@@ -276,10 +281,10 @@ impl TaskStore for SqliteQueue {
             .into_iter()
             .map(|task| {
                 let dependencies = dependencies
-                    .query_map([task.id], |r| r.get(0))?
+                    .query_map([task.id()], |r| r.get(0))?
                     .collect::<rusqlite::Result<_>>()?;
                 let latest_run = latest_run
-                    .query_row([task.id], |row| {
+                    .query_row([task.id()], |row| {
                         Ok(LatestRun {
                             id: row.get("id")?,
                             status: enum_col(row, "status")?,
@@ -349,10 +354,7 @@ impl TaskStore for SqliteQueue {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        ensure!(
-            read_task(&tx, task_id)?.status.dependencies_editable(),
-            "dependencies can only be changed for draft or ready tasks"
-        );
+        task::check_dependencies_editable(&read_task(&tx, task_id)?)?;
         let changed = tx.execute(
             "DELETE FROM task_dependencies WHERE task_id=?1 AND predecessor_id=?2",
             params![task_id, predecessor_id],
@@ -396,18 +398,18 @@ impl TaskStore for SqliteQueue {
             .into_iter()
             .map(|task| {
                 let goal_status = task
-                    .goal_id
-                    .map(|goal_id| read_goal(&tx, goal_id).map(|goal| goal.status))
+                    .goal_id()
+                    .map(|goal_id| read_goal(&tx, goal_id).map(|goal| goal.status()))
                     .transpose()?;
                 Ok(GraphTask {
                     depends_on: dependencies
-                        .query_map([task.id], |r| r.get(0))?
+                        .query_map([task.id()], |r| r.get(0))?
                         .collect::<rusqlite::Result<_>>()?,
                     goal_status,
-                    id: task.id,
-                    status: task.status,
-                    title: task.title,
-                    goal_id: task.goal_id,
+                    id: task.id(),
+                    status: task.status(),
+                    goal_id: task.goal_id(),
+                    title: task.into_title(),
                 })
             })
             .collect::<Result<_>>()?;
@@ -444,7 +446,7 @@ impl TaskStore for SqliteQueue {
                     .conn
                     .query_row(
                         "SELECT * FROM task_runs WHERE task_id = ?1 AND status = 'integrated'",
-                        [task.id],
+                        [task.id()],
                         run_row(&self.runs_dir),
                     )
                     .optional()?;
@@ -464,29 +466,30 @@ impl TaskStore for SqliteQueue {
             .collect::<rusqlite::Result<_>>()?)
     }
 
-    fn add_goal(&mut self, goal: NewGoal) -> Result<Goal> {
-        goal.validate()?;
+    fn add_goal(&mut self, new: NewGoal) -> Result<Goal> {
+        // Rejected before taking the write lock; `new` checks it again.
+        new.validate()?;
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let goal = Goal::new(GoalId::new(next_id(&tx, "goals")?), new, now(&tx)?)?;
+        let id = goal.id();
         tx.execute(
-            "INSERT INTO goals(title, description, acceptance, constraints, doc, status)
-             VALUES (?1,?2,?3,?4,?5,?6)",
+            "INSERT INTO goals(id, title, description, acceptance, constraints, doc, status,
+                               created_at, updated_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
             params![
-                goal.title,
-                goal.description,
-                goal.acceptance,
-                goal.constraints,
-                goal.doc.filter(|d| !d.trim().is_empty()),
-                if goal.draft {
-                    GoalStatus::Draft
-                } else {
-                    GoalStatus::Open
-                }
-                .as_str()
+                id,
+                goal.title(),
+                goal.description(),
+                goal.acceptance(),
+                goal.constraints(),
+                goal.doc(),
+                goal.status().as_str(),
+                goal.created_at(),
+                goal.updated_at()
             ],
         )?;
-        let id = GoalId::new(tx.last_insert_rowid());
         let result = read_goal(&tx, id)?;
         goal_event(&tx, id, "goal_created", json!({"goal": result}))?;
         tx.commit()?;
@@ -503,12 +506,12 @@ impl TaskStore for SqliteQueue {
             .into_iter()
             .map(|goal| {
                 Ok(GoalSummary {
-                    id: goal.id,
-                    status: goal.status,
+                    id: goal.id(),
+                    status: goal.status(),
                     closed: goal.is_closed(),
-                    verdict: goal.verdict,
-                    tasks: task_counts(&self.conn, goal.id)?,
-                    title: goal.title,
+                    verdict: goal.verdict(),
+                    tasks: task_counts(&self.conn, goal.id())?,
+                    title: goal.into_title(),
                 })
             })
             .collect()
@@ -546,16 +549,18 @@ impl TaskStore for SqliteQueue {
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let old = read_goal(&tx, goal_id)?;
-        let new = edit.apply(&old)?;
+        // The event keeps the goal before the edit, which consumes it.
+        let old_json = serde_json::to_value(&old)?;
+        let new = goal::edit(old, edit)?;
         tx.execute(
             "UPDATE goals SET title=?1, description=?2, acceptance=?3, constraints=?4, doc=?5,
              updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?6",
             params![
-                new.title,
-                new.description,
-                new.acceptance,
-                new.constraints,
-                new.doc,
+                new.title(),
+                new.description(),
+                new.acceptance(),
+                new.constraints(),
+                new.doc(),
                 goal_id
             ],
         )?;
@@ -563,7 +568,7 @@ impl TaskStore for SqliteQueue {
             &tx,
             goal_id,
             "goal_updated",
-            json!({"old": old, "new": new}),
+            json!({"old": old_json, "new": new}),
         )?;
         let result = read_goal(&tx, goal_id)?;
         tx.commit()?;
@@ -576,12 +581,20 @@ impl TaskStore for SqliteQueue {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let goal = read_goal(&tx, goal_id)?;
         let counts = task_counts(&tx, goal_id)?;
-        verdict.check_close(&goal, &counts)?;
-        tx.execute(
-            "UPDATE goals SET closed_at=strftime('%Y-%m-%dT%H:%M:%fZ','now'), verdict=?1,
-             updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?2",
-            params![verdict.as_str(), goal_id],
+        let closed = goal::close(goal, verdict, &counts, now(&tx)?)?;
+        // `closed_at IS NULL` only detects a concurrent close; the domain
+        // decided whether this one may happen.
+        let changed = tx.execute(
+            "UPDATE goals SET closed_at=?1, verdict=?2, updated_at=?3
+             WHERE id=?4 AND closed_at IS NULL",
+            params![
+                closed.closed_at(),
+                closed.verdict().map(GoalVerdict::as_str),
+                closed.updated_at(),
+                goal_id
+            ],
         )?;
+        ensure!(changed == 1, "goal {goal_id} was closed concurrently");
         goal_event(
             &tx,
             goal_id,
@@ -597,17 +610,19 @@ impl TaskStore for SqliteQueue {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        read_goal(&tx, goal_id)?.check_ready()?;
+        let draft = read_goal(&tx, goal_id)?;
+        let from = draft.status();
+        let opened = goal::ready(draft)?;
         tx.execute(
-            "UPDATE goals SET status='open', updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
-             WHERE id=?1",
-            [goal_id],
+            "UPDATE goals SET status=?1, updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+             WHERE id=?2",
+            params![opened.status().as_str(), goal_id],
         )?;
         goal_event(
             &tx,
             goal_id,
             "goal_status_changed",
-            json!({"from": GoalStatus::Draft, "to": GoalStatus::Open}),
+            json!({"from": from, "to": opened.status()}),
         )?;
         let result = read_goal(&tx, goal_id)?;
         tx.commit()?;
@@ -694,24 +709,22 @@ impl TaskStore for SqliteQueue {
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let task = read_task(&tx, task_id)?;
-        ensure!(
-            task.status.dependencies_editable(),
-            "the goal can only be changed for draft or ready tasks"
-        );
-        if let Some(goal_id) = goal_id {
-            ensure_goal_open(&tx, goal_id)?;
+        let from = task.goal_id();
+        let task = task::set_goal(task, goal_id)?;
+        if let Some(goal_id) = task.goal_id() {
+            goal::check_accepts_tasks(&read_goal(&tx, goal_id)?)?;
         }
-        if task.goal_id != goal_id {
+        if from != task.goal_id() {
             tx.execute(
                 "UPDATE tasks SET goal_id=?1, updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?2",
-                params![goal_id, task_id],
+                params![task.goal_id(), task_id],
             )?;
             event(
                 &tx,
                 task_id,
                 None,
                 "task_goal_changed",
-                json!({"from": task.goal_id, "to": goal_id}),
+                json!({"from": from, "to": task.goal_id()}),
             )?;
         }
         let result = read_task(&tx, task_id)?;
@@ -720,27 +733,25 @@ impl TaskStore for SqliteQueue {
     }
 
     fn set_paths(&mut self, task_id: TaskId, paths: Vec<String>) -> Result<Task> {
+        // Checked before the task is read, so a bad glob is reported first.
         validate_path_globs(&paths)?;
-        let paths = dedup_globs(&paths);
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let task = read_task(&tx, task_id)?;
-        ensure!(
-            task.status.dependencies_editable(),
-            "the paths can only be changed for draft or ready tasks"
-        );
-        if task.paths != paths {
+        let from = task.paths().to_vec();
+        let task = task::set_paths(task, paths)?;
+        if from != task.paths() {
             tx.execute(
                 "UPDATE tasks SET paths=?1, updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?2",
-                params![serde_json::to_string(&paths)?, task_id],
+                params![serde_json::to_string(task.paths())?, task_id],
             )?;
             event(
                 &tx,
                 task_id,
                 None,
                 "task_paths_changed",
-                json!({"from": task.paths, "to": paths}),
+                json!({"from": from, "to": task.paths()}),
             )?;
         }
         let result = read_task(&tx, task_id)?;
@@ -755,15 +766,28 @@ fn read_goal(conn: &Connection, goal_id: GoalId) -> Result<Goal> {
         .with_context(|| format!("goal {goal_id} does not exist"))
 }
 
-/// Tasks join and move between open goals only; a closed goal is a record.
-fn ensure_goal_open(conn: &Connection, goal_id: GoalId) -> Result<()> {
-    let goal = read_goal(conn, goal_id)?;
-    ensure!(
-        !goal.is_closed(),
-        "goal {goal_id} is closed as {}; create a new goal for further work",
-        goal.verdict.map_or("?", GoalVerdict::as_str)
-    );
-    Ok(())
+/// The ID an `AUTOINCREMENT` insert into `table` would take now: one past
+/// the highest ever used. Inside the caller's write transaction no other
+/// insert can take it first, so the aggregate is built with its ID before
+/// it is saved.
+fn next_id(conn: &Connection, table: &str) -> Result<i64> {
+    Ok(conn.query_row(
+        &format!(
+            "SELECT max(coalesce((SELECT seq FROM sqlite_sequence WHERE name=?1), 0),
+                        coalesce((SELECT max(id) FROM {table}), 0)) + 1"
+        ),
+        [table],
+        |r| r.get(0),
+    )?)
+}
+
+/// The database's current time in the format of its timestamp columns.
+fn now(conn: &Connection) -> Result<String> {
+    Ok(
+        conn.query_row("SELECT strftime('%Y-%m-%dT%H:%M:%fZ','now')", [], |r| {
+            r.get(0)
+        })?,
+    )
 }
 
 fn task_counts(conn: &Connection, goal_id: GoalId) -> Result<TaskStatusCounts> {
@@ -812,7 +836,7 @@ pub(super) fn claim_task(
         .collect::<rusqlite::Result<_>>()?;
     let preferred = order
         .iter()
-        .find_map(|id| ready.iter().position(|task| task.id == *id))
+        .find_map(|id| ready.iter().position(|task| task.id() == *id))
         .unwrap_or(0);
     if ready.is_empty() {
         return Ok(ClaimOutcome::NoReadyTask);
@@ -820,15 +844,15 @@ pub(super) fn claim_task(
     let task = ready.swap_remove(preferred);
     let run_id = RunId::new(Uuid::new_v4().to_string())?;
     tx.execute("UPDATE tasks SET status='in_progress', updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?1",
-        [task.id])?;
+        [task.id()])?;
     tx.execute(
         "INSERT INTO task_runs(id,task_id,status,requested_provider,actual_provider,base_commit)
          VALUES (?1,?2,'claimed','claude','claude',?3)",
-        params![run_id, task.id, base_commit.as_str().to_ascii_lowercase()],
+        params![run_id, task.id(), base_commit.as_str().to_ascii_lowercase()],
     )?;
     event(
         tx,
-        task.id,
+        task.id(),
         Some(&run_id),
         "run_claimed",
         json!({"from": "ready", "to": "in_progress", "provider": "claude"}),
@@ -852,19 +876,21 @@ pub(super) fn transition_task(
     action: TaskAction,
 ) -> Result<Task> {
     let task = read_task(conn, task_id)?;
-    let next = task
-        .status
-        .transition(action, has_unfinished_run(conn, task_id)?)?;
-    conn.execute(
-        "UPDATE tasks SET status=?1, updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?2",
-        params![next.as_str(), task_id],
+    let from = task.status();
+    let task = task::transition(task, action, has_unfinished_run(conn, task_id)?)?;
+    // `status=?3` only detects a concurrent change; the domain decided the move.
+    let changed = conn.execute(
+        "UPDATE tasks SET status=?1, updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+         WHERE id=?2 AND status=?3",
+        params![task.status().as_str(), task_id, from.as_str()],
     )?;
+    ensure!(changed == 1, "task {task_id} changed concurrently");
     event(
         conn,
         task_id,
         None,
         "task_status_changed",
-        json!({"from": task.status, "to": next}),
+        json!({"from": from, "to": task.status()}),
     )?;
     read_task(conn, task_id)
 }
@@ -886,11 +912,8 @@ pub(super) fn read_task(conn: &Connection, task_id: TaskId) -> Result<Task> {
 }
 
 fn insert_dependency(conn: &Connection, task_id: TaskId, predecessor_id: TaskId) -> Result<()> {
-    ensure!(task_id != predecessor_id, "a task cannot depend on itself");
-    ensure!(
-        read_task(conn, task_id)?.status.dependencies_editable(),
-        "dependencies can only be changed for draft or ready tasks"
-    );
+    task::check_not_self(task_id, predecessor_id)?;
+    task::check_dependencies_editable(&read_task(conn, task_id)?)?;
     read_task(conn, predecessor_id)?;
     let cycle: bool = conn.query_row(
         "WITH RECURSIVE ancestors(id) AS (
@@ -900,10 +923,9 @@ fn insert_dependency(conn: &Connection, task_id: TaskId, predecessor_id: TaskId)
         params![predecessor_id, task_id],
         |r| r.get(0),
     )?;
-    ensure!(
-        !cycle,
-        "dependency {task_id} -> {predecessor_id} would create a cycle"
-    );
+    // The cycle is found in SQL because it needs the whole dependency
+    // graph; whether it rejects the edge is the domain's rule.
+    task::check_acyclic(task_id, predecessor_id, cycle)?;
     let inserted = conn.execute(
         "INSERT INTO task_dependencies(task_id, predecessor_id) VALUES (?1,?2)
          ON CONFLICT(task_id, predecessor_id) DO NOTHING",
@@ -970,7 +992,7 @@ pub(super) fn json_col<T: DeserializeOwned>(row: &Row<'_>, name: &str) -> rusqli
 }
 
 fn task_row(row: &Row<'_>) -> rusqlite::Result<Task> {
-    Ok(Task {
+    Task::restore(TaskRecord {
         id: row.get("id")?,
         title: row.get("title")?,
         description: row.get("description")?,
@@ -984,11 +1006,12 @@ fn task_row(row: &Row<'_>) -> rusqlite::Result<Task> {
         created_at: row.get("created_at")?,
         updated_at: row.get("updated_at")?,
     })
+    .map_err(restore_error)
 }
 
 fn goal_row(row: &Row<'_>) -> rusqlite::Result<Goal> {
     let verdict: Option<String> = row.get("verdict")?;
-    Ok(Goal {
+    Goal::restore(GoalRecord {
         id: row.get("id")?,
         title: row.get("title")?,
         description: row.get("description")?,
@@ -1003,6 +1026,13 @@ fn goal_row(row: &Row<'_>) -> rusqlite::Result<Goal> {
         created_at: row.get("created_at")?,
         updated_at: row.get("updated_at")?,
     })
+    .map_err(restore_error)
+}
+
+/// A stored row the domain refuses to restore, reported like a column that
+/// does not convert, with the domain's message as the cause.
+fn restore_error(error: DomainError) -> rusqlite::Error {
+    rusqlite::Error::FromSqlConversionFailure(0, Type::Null, Box::new(error))
 }
 
 /// Reads a run with its queue-local paths resolved under `runs_dir`.
