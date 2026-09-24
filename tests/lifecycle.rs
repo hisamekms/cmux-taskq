@@ -443,7 +443,7 @@ fn claim_a_run(fixture: &Fixture, queue: &mut SqliteQueue, token: &str) -> Strin
         .claim_for_supervisor(&repository.base_commit, token)
         .unwrap()
     {
-        dagq::domain::ClaimOutcome::Claimed { run } => run.id,
+        dagq::domain::ClaimOutcome::Claimed { run } => run.id.into_string(),
         outcome => panic!("expected a claim, got {outcome:?}"),
     }
 }
@@ -1010,12 +1010,12 @@ fn the_cmux_adapter_sends_one_line_and_names_the_resume_workspace() {
     );
     fs::remove_file(&dump).unwrap();
     let run = TaskRun {
-        id: "run-1".into(),
-        task_id: 3,
+        id: dagq::domain::RunId::new("run-1").unwrap(),
+        task_id: dagq::domain::TaskId::new(3),
         status: dagq::domain::RunStatus::NeedsSession,
         requested_provider: dagq::domain::Provider::Claude,
         actual_provider: dagq::domain::Provider::Claude,
-        base_commit: "0".repeat(40),
+        base_commit: dagq::domain::CommitSha::try_from("0".repeat(40)).unwrap(),
         repo_path: Some("/src/my-repo".into()),
         run_dir: Some(dir.path().to_string_lossy().into_owned()),
         worktree_path: Some(dir.path().to_string_lossy().into_owned()),
@@ -1031,7 +1031,7 @@ fn the_cmux_adapter_sends_one_line_and_names_the_resume_workspace() {
     assert_eq!(
         cmux.create_resume(
             &Task {
-                id: 3,
+                id: dagq::domain::TaskId::new(3),
                 title: "fix it".into(),
                 description: String::new(),
                 acceptance: String::new(),
@@ -1598,7 +1598,7 @@ fn up_warns_and_goes_on_when_the_workspace_group_cannot_be_made() {
     let failures = backend_failures(&fixture);
     assert_eq!(failures.len(), 1, "{failures:?}");
     let failure = &failures[0];
-    assert_eq!((failure.task_id, failure.run_id.as_deref()), (None, None));
+    assert_eq!((failure.task_id, failure.run_id.as_ref()), (None, None));
     assert_eq!(failure.payload["op"], "ensure_group");
     assert_eq!(failure.payload["workspace_id"], Value::Null);
     assert_eq!(failure.payload["timeout_secs"], 30);

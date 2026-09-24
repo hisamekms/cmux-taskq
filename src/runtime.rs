@@ -10,13 +10,13 @@ use crate::{
         WorkspaceTags, dependency_graph,
     },
     domain::{
-        AskKind, ClaimOutcome, EvidenceCheck, Goal, IntegrationOutcome, LANDING_OPTIONS,
+        AskKind, ClaimOutcome, CommitSha, EvidenceCheck, Goal, IntegrationOutcome, LANDING_OPTIONS,
         MAX_RESUME_ATTEMPTS, MAX_REVISE_ATTEMPTS, NewAsk, NewTask, PUSH_REMOTE, Predecessor,
         PushReport, PushResult, Receipt, ReceiptResult, RegisteredFollowUp, ReviewDecision,
-        ReviewVerdict, RunLease, RunPaths, RunProcess, RunStatus, SessionRole, SupervisorMode,
-        SupervisorRegistration, TRIAGE_OPTIONS, TRIAGE_RETRY_FAILURES, Task, TaskAction,
-        TaskDetail, TaskRun, TaskStatus, TriageDecision, TriageState, TriageVerdict,
-        evidence_missing_reason, heartbeat_stale,
+        ReviewVerdict, RunId, RunLease, RunPaths, RunProcess, RunStatus, SessionRole,
+        SupervisorMode, SupervisorRegistration, TRIAGE_OPTIONS, TRIAGE_RETRY_FAILURES, Task,
+        TaskAction, TaskDetail, TaskId, TaskRun, TaskStatus, TriageDecision, TriageState,
+        TriageVerdict, evidence_missing_reason, heartbeat_stale,
         scope::{out_of_scope, scope_violation_reason},
         triage_state,
     },
@@ -199,8 +199,8 @@ impl Drop for Heartbeat {
 /// the message in `last_error`.
 #[derive(Debug, Clone, Serialize)]
 pub struct RunError {
-    pub run_id: String,
-    pub task_id: i64,
+    pub run_id: RunId,
+    pub task_id: TaskId,
     pub message: String,
 }
 
@@ -363,7 +363,7 @@ impl<'a> RecordingBackend<'a> {
         &self,
         op: &str,
         workspace_id: Option<&str>,
-        run_id: Option<&str>,
+        run_id: Option<&RunId>,
         result: Result<T>,
     ) -> Result<T> {
         if let Err(error) = &result {
@@ -376,18 +376,18 @@ impl<'a> RecordingBackend<'a> {
         &self,
         op: &str,
         workspace_id: Option<&str>,
-        run_id: Option<&str>,
+        run_id: Option<&RunId>,
         error: &str,
     ) -> Result<()> {
         let queue = SqliteQueue::open(&self.db)?;
         let run_id = match (run_id, workspace_id) {
-            (Some(run_id), _) => Some(run_id.to_owned()),
+            (Some(run_id), _) => Some(run_id.clone()),
             (None, Some(workspace_id)) => queue.run_in_workspace(workspace_id)?,
             (None, None) => None,
         };
         let (slots, parallel) = queue.backend_slots(self.token.as_deref())?;
         queue.record_backend_failure(
-            run_id.as_deref(),
+            run_id.as_ref(),
             backend_failure_payload(
                 op,
                 workspace_id,
@@ -1389,7 +1389,7 @@ impl Supervisor<'_> {
         &self,
         run: TaskRun,
         previous: RunStatus,
-        main: String,
+        main: CommitSha,
     ) -> Result<thread::JoinHandle<Result<IntegrationOutcome>>> {
         let db = self.db.clone();
         let repository = self.repository.clone();
@@ -1607,7 +1607,10 @@ impl Supervisor<'_> {
             .clone()
             .context("accepted run has no result commit")?;
         let main = self.repository.main_head()?;
-        let conflicts = match self.repository.merge_conflicts(&main, &head) {
+        let conflicts = match self
+            .repository
+            .merge_conflicts(main.as_str(), head.as_str())
+        {
             Ok(conflicts) => conflicts,
             Err(error) => {
                 self.log.note(&format!(
@@ -1631,7 +1634,7 @@ impl Supervisor<'_> {
             "main": main,
             "head": head,
             // Recorded for the reader; a failure to find it does not stop the request.
-            "merge_base": self.repository.merge_base(&main, &head).ok().flatten(),
+            "merge_base": self.repository.merge_base(main.as_str(), head.as_str()).ok().flatten(),
             "conflicts": conflicts,
             "attempt": attempt,
             "requested": false,
@@ -2019,7 +2022,7 @@ impl Supervisor<'_> {
     fn spawn_triage(&mut self, run: &TaskRun, attempt: usize) -> Result<TriageWatch> {
         let dir = match &run.run_dir {
             Some(dir) => PathBuf::from(dir),
-            None => runs_dir(&self.db).join(&run.id),
+            None => runs_dir(&self.db).join(run.id.as_str()),
         };
         fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
         let detail = self.queue.show(run.task_id)?;
@@ -2427,7 +2430,7 @@ impl Supervisor<'_> {
     /// cannot be read, and the run is resumed as before. Back in
     /// `needs_session` after a skip, however it got there, the run needs a
     /// resume first, so a skip never repeats without one.
-    fn resolved_head(&mut self, run: &TaskRun, main: &str) -> Result<Option<String>> {
+    fn resolved_head(&mut self, run: &TaskRun, main: &CommitSha) -> Result<Option<CommitSha>> {
         const PARKING: [&str; 5] = [
             "integration_deferred",
             "integration_error",
@@ -2460,7 +2463,7 @@ impl Supervisor<'_> {
             return Ok(None);
         };
         let task = self.queue.show(run.task_id)?.task;
-        if receipt.run_id != run.id
+        if receipt.run_id != run.id.as_str()
             || receipt.result != ReceiptResult::Succeeded
             || !receipt.missing_evidence(&task.required_evidence).is_empty()
         {
@@ -2470,13 +2473,16 @@ impl Supervisor<'_> {
         let Ok(head) = self.repository.head(worktree) else {
             return Ok(None);
         };
-        let resolved = head == receipt.commit.to_ascii_lowercase()
-            && head != main
+        let resolved = head.as_str() == receipt.commit.to_ascii_lowercase()
+            && head != *main
             && self
                 .repository
                 .status(worktree)
                 .is_ok_and(|status| status.trim().is_empty())
-            && self.repository.is_ancestor(main, &head).unwrap_or(false);
+            && self
+                .repository
+                .is_ancestor(main.as_str(), head.as_str())
+                .unwrap_or(false);
         Ok(resolved.then_some(head))
     }
 
@@ -2484,7 +2490,7 @@ impl Supervisor<'_> {
     /// a session or using an attempt: record `resume_skipped` and, under
     /// its lease, land it when its integrate was approved, or validate and
     /// review it (with no session to keep) otherwise.
-    fn skip_resume(&mut self, run: &TaskRun, head: &str, main: &str) -> Result<()> {
+    fn skip_resume(&mut self, run: &TaskRun, head: &CommitSha, main: &CommitSha) -> Result<()> {
         let approved = self.queue.has_run_event(&run.id, "integration_approved")?;
         let Some(run) = self
             .queue
@@ -2644,7 +2650,7 @@ impl Supervisor<'_> {
             path_text(&self.db)?,
             "session".into(),
             "--run".into(),
-            run.id.clone(),
+            run.id.to_string(),
             "--lease".into(),
             self.token.clone(),
             "--claude".into(),
@@ -2939,7 +2945,7 @@ impl Supervisor<'_> {
 
     /// Whether the run's last resume event is `resume_skipped`: it was moved
     /// on without a session, and no resume opened one since.
-    fn skipped_resume(&self, id: &str) -> Result<bool> {
+    fn skipped_resume(&self, id: &RunId) -> Result<bool> {
         Ok(self
             .queue
             .run_events(id)?
@@ -3202,7 +3208,7 @@ so the run workspace opens outside it: {error:#}",
             path_text(&self.db)?,
             "session".into(),
             "--run".into(),
-            run.id.clone(),
+            run.id.to_string(),
             "--lease".into(),
             self.token.clone(),
             "--claude".into(),
@@ -3847,7 +3853,7 @@ fn screen_tail(screen: &str, count: usize) -> String {
 
 /// How many resumes of the run were started, for a resume error recorded
 /// outside the resume watch; unreadable counts as the last attempt.
-fn resume_attempts(queue: &SqliteQueue, id: &str) -> usize {
+fn resume_attempts(queue: &SqliteQueue, id: &RunId) -> usize {
     queue
         .run_events(id)
         .map(|events| events.iter().filter(|e| e.kind == "resume_started").count())
@@ -3857,7 +3863,7 @@ fn resume_attempts(queue: &SqliteQueue, id: &str) -> usize {
 /// What the resolution request tells a resumed session.
 struct ResumeRequest {
     /// The `main` head the session rebases onto.
-    main: String,
+    main: CommitSha,
     reason: String,
     kind: ResumeKind,
 }
@@ -3938,10 +3944,10 @@ fn landed_since(
     queue: &mut SqliteQueue,
     repository: &GitRepository,
     run: &TaskRun,
-    main: &str,
+    main: &CommitSha,
 ) -> Result<Vec<PredecessorSummary>> {
     let mut landed = Vec::new();
-    for task_id in repository.landed_task_ids(&run.base_commit, main)? {
+    for task_id in repository.landed_task_ids(run.base_commit.as_str(), main.as_str())? {
         let Ok(detail) = queue.show(task_id) else {
             continue;
         };
@@ -4104,7 +4110,7 @@ enum ResumeOutcome {
 
 struct ResumeVerdict {
     kind: ResumeOutcome,
-    head: Option<String>,
+    head: Option<CommitSha>,
     /// The session did not exit within the exit timeout of `/exit`: it is
     /// let go (still running, its workspace kept) so the slot and the lease
     /// are not held forever.
@@ -4136,14 +4142,15 @@ impl ResumeWatch {
 
     /// `head` is the worktree's HEAD when the worktree is clean, `None`
     /// otherwise: a resolved receipt must name a clean head.
-    fn verdict(&self, run: &TaskRun, head: Option<&str>) -> ResumeOutcome {
+    fn verdict(&self, run: &TaskRun, head: Option<&CommitSha>) -> ResumeOutcome {
         match self.rewritten_receipt() {
-            Some(receipt) if receipt.run_id != run.id => ResumeOutcome::Unresolved,
+            Some(receipt) if receipt.run_id != run.id.as_str() => ResumeOutcome::Unresolved,
             Some(receipt) if receipt.result == ReceiptResult::Failed => ResumeOutcome::Failed(
                 format!("session reported the run as failed: {}", receipt.summary),
             ),
             Some(receipt)
-                if head.is_some_and(|head| head == receipt.commit.to_ascii_lowercase())
+                if head
+                    .is_some_and(|head| head.as_str() == receipt.commit.to_ascii_lowercase())
                     && receipt.missing_evidence(&self.required_evidence).is_empty() =>
             {
                 ResumeOutcome::Resolved
@@ -4190,7 +4197,7 @@ impl ResumeWatch {
                 .status(worktree)
                 .is_ok_and(|status| status.trim().is_empty());
             return Ok(Some(ResumeVerdict {
-                kind: self.verdict(run, head.as_deref().filter(|_| clean)),
+                kind: self.verdict(run, head.as_ref().filter(|_| clean)),
                 head,
                 exit_timed_out: false,
                 live: false,
@@ -4228,7 +4235,7 @@ impl ResumeWatch {
                 // never ends by itself; or no idle at all within the
                 // resume timeout (a lost request, a dialog, background
                 // work that does not end).
-                let verdict = self.verdict(run, clean.then_some(head.as_str()));
+                let verdict = self.verdict(run, clean.then_some(&head));
                 let idle_after_receipt = match (&idle, &verdict) {
                     (Some(idle), ResumeOutcome::Resolved | ResumeOutcome::Failed(_)) => {
                         idle.idle_after_receipt(&self.receipt_path)?.is_some()
@@ -4341,7 +4348,7 @@ fn stop_job(slot: &mut Slot) {
 }
 
 /// Whether the run's session wrapper is registered and has not exited.
-fn session_alive(queue: &SqliteQueue, run_id: &str) -> Result<bool> {
+fn session_alive(queue: &SqliteQueue, run_id: &RunId) -> Result<bool> {
     Ok(queue
         .processes(run_id)?
         .iter()
@@ -4349,7 +4356,7 @@ fn session_alive(queue: &SqliteQueue, run_id: &str) -> Result<bool> {
 }
 
 /// The `reasons` of the run's latest `review_finished`.
-fn latest_review_reasons(queue: &SqliteQueue, run_id: &str) -> Result<Vec<String>> {
+fn latest_review_reasons(queue: &SqliteQueue, run_id: &RunId) -> Result<Vec<String>> {
     Ok(queue
         .run_events(run_id)?
         .into_iter()
@@ -4496,7 +4503,7 @@ enum ReviseOutcome {
     /// The receipt was rewritten after the request, names the clean
     /// worktree HEAD (or reports `failed`), and the session went idle after
     /// it; the worktree HEAD at that time. Validation judges the receipt.
-    Rewritten(String),
+    Rewritten(CommitSha),
     /// The session rewrote the receipt and went idle, but the receipt does
     /// not name the clean worktree HEAD (an old commit, a commit after the
     /// receipt, uncommitted changes) or cannot be read: validation would
@@ -4551,10 +4558,10 @@ impl ReviseWatch {
                 Ok(receipt) if receipt.result == ReceiptResult::Failed => {
                     ReviseOutcome::Rewritten(head)
                 }
-                Ok(receipt) if receipt.commit.to_ascii_lowercase() == head && clean => {
+                Ok(receipt) if receipt.commit.to_ascii_lowercase() == head.as_str() && clean => {
                     ReviseOutcome::Rewritten(head)
                 }
-                Ok(receipt) if receipt.commit.to_ascii_lowercase() != head => {
+                Ok(receipt) if receipt.commit.to_ascii_lowercase() != head.as_str() => {
                     ReviseOutcome::Mismatch(format!(
                         "the rewritten receipt names commit {} but the worktree HEAD is {head}",
                         receipt.commit
@@ -4875,7 +4882,7 @@ pub fn triage_prompt(
     let events: Vec<Value> = detail
         .events
         .iter()
-        .filter(|e| e.run_id.as_deref() == Some(run.id.as_str()))
+        .filter(|e| e.run_id.as_ref() == Some(&run.id))
         .map(crate::watch::compact_event)
         .collect();
     let events = &events[events.len().saturating_sub(40)..];
@@ -4899,9 +4906,7 @@ pub fn triage_prompt(
             let verdicts: Vec<String> = detail
                 .events
                 .iter()
-                .filter(|e| {
-                    e.run_id.as_deref() == Some(r.id.as_str()) && e.kind == "triage_finished"
-                })
+                .filter(|e| e.run_id.as_ref() == Some(&r.id) && e.kind == "triage_finished")
                 .map(|e| format!("{}", e.payload.get("action").unwrap_or(&Value::Null)))
                 .collect();
             format!(
@@ -5179,7 +5184,7 @@ fn close_workspace(
 
 struct Rejection {
     reason: String,
-    commit: Option<String>,
+    commit: Option<CommitSha>,
     receipt: Option<Receipt>,
     /// The task's required checks the receipt does not back, when that is
     /// all that is wrong: the run waits for a session instead of failing.
@@ -5193,8 +5198,8 @@ fn check_receipt(
     repository: &GitRepository,
     task: &Task,
     run: &TaskRun,
-) -> Result<std::result::Result<(Receipt, String), Rejection>> {
-    let reject = |reason: String, commit: Option<String>, receipt: Option<Receipt>| {
+) -> Result<std::result::Result<(Receipt, CommitSha), Rejection>> {
+    let reject = |reason: String, commit: Option<CommitSha>, receipt: Option<Receipt>| {
         Ok(Err(Rejection {
             reason,
             commit,
@@ -5241,7 +5246,7 @@ fn check_receipt(
         }
     }
     let head = repository.head(worktree)?;
-    if head != receipt.commit.to_ascii_lowercase() {
+    if head.as_str() != receipt.commit.to_ascii_lowercase() {
         return reject(
             format!(
                 "receipt commit {} is not the head of {branch} ({head})",
@@ -5259,7 +5264,7 @@ fn check_receipt(
             Some(receipt),
         );
     }
-    if !repository.is_ancestor(&run.base_commit, &commit)? {
+    if !repository.is_ancestor(run.base_commit.as_str(), commit.as_str())? {
         return reject(
             format!(
                 "commit {commit} does not descend from base {}",
@@ -5286,9 +5291,12 @@ fn check_receipt(
         Vec::new()
     } else {
         let fork = repository
-            .merge_base(&repository.main_head()?, &commit)?
+            .merge_base(repository.main_head()?.as_str(), commit.as_str())?
             .context("the run branch shares no history with main")?;
-        out_of_scope(&task.paths, &repository.changed_paths(&fork, &commit)?)
+        out_of_scope(
+            &task.paths,
+            &repository.changed_paths(fork.as_str(), commit.as_str())?,
+        )
     };
     if !outside.is_empty() {
         return Ok(Err(Rejection {
@@ -5318,7 +5326,7 @@ fn check_receipt(
 #[derive(Debug, Clone, Copy)]
 pub enum IntegrateTarget {
     /// The task's run that awaits integration or comes back from a session.
-    Task(i64),
+    Task(TaskId),
     /// The oldest run awaiting integration by validation time (FIFO).
     Next,
 }
@@ -5443,7 +5451,7 @@ fn land_integrating(
     repository: &GitRepository,
     run: &TaskRun,
     previous: RunStatus,
-    main: &str,
+    main: &CommitSha,
     token: &str,
     common_dir: &str,
     remote: Option<&dyn MainRemote>,
@@ -5501,7 +5509,7 @@ fn land_integrating(
             let run = queue.defer_integration(&run.id, token, &reason, detail)?;
             IntegrationOutcome::NeedsSession {
                 run: Box::new(run),
-                main: main.to_owned(),
+                main: main.clone(),
                 reason,
             }
         }
@@ -5522,8 +5530,8 @@ fn land_integrating(
 fn push_main(
     queue: &SqliteQueue,
     remote: Option<&dyn MainRemote>,
-    run_id: &str,
-    commit: &str,
+    run_id: &RunId,
+    commit: &CommitSha,
 ) -> PushReport {
     let skipped = |reason: &str| PushReport {
         outcome: PushResult::Skipped,
@@ -5598,7 +5606,7 @@ fn failed_push(error: &anyhow::Error) -> PushReport {
 pub fn register_follow_ups(
     queue: &mut SqliteQueue,
     task: &Task,
-    run_id: &str,
+    run_id: &RunId,
     follow_ups: Option<&Value>,
 ) -> Vec<RegisteredFollowUp> {
     let Some(entries) = follow_ups.and_then(Value::as_array) else {
@@ -5713,7 +5721,7 @@ fn land(
     repository: &GitRepository,
     task: &Task,
     run: &TaskRun,
-    main: &str,
+    main: &CommitSha,
 ) -> Result<Verdict> {
     let defer = |reason: String, detail: Value| Ok(Verdict::Deferred { reason, detail });
     let worktree = Path::new(run.worktree_path.as_ref().context("missing worktree")?);
@@ -5798,7 +5806,7 @@ fn land(
             "receipt": serde_json::to_value(&receipt)?,
         }),
     )?;
-    if head != receipt.commit.to_ascii_lowercase() {
+    if head.as_str() != receipt.commit.to_ascii_lowercase() {
         return defer(
             format!(
                 "receipt commit {} is not the head of {branch} ({head}); rerun the verification commands and rewrite the receipt for the current head",
@@ -5815,7 +5823,7 @@ fn land(
         );
     }
     // Onto the current main. A no-op when the run already sits on it.
-    if let Err(output) = repository.rebase(worktree, main)? {
+    if let Err(output) = repository.rebase(worktree, main.as_str())? {
         let conflicts = repository.conflicted_files(worktree).unwrap_or_default();
         if repository.rebase_in_progress(worktree)? {
             repository.rebase_abort(worktree)?;
@@ -5844,7 +5852,7 @@ fn land(
         "integration_rebased",
         json!({"main": main, "head_before": head, "head_after": rebased}),
     )?;
-    if rebased == main {
+    if rebased == *main {
         return defer(
             format!(
                 "no commit remains on top of main {main} after the rebase; if the change is no longer needed, write a failed receipt with the reason"
@@ -5853,7 +5861,7 @@ fn land(
         );
     }
     ensure!(
-        repository.is_ancestor(main, &rebased)?,
+        repository.is_ancestor(main.as_str(), rebased.as_str())?,
         "rebased head {rebased} does not descend from main {main}"
     );
     let status = repository.status(worktree)?;
@@ -5869,7 +5877,10 @@ fn land(
     // What lands is the squash of main..rebased, so that is the diff held to
     // the task's paths (ADR-0029): the rebase may have changed it since
     // validation, and a resumed session may have committed more.
-    let outside = out_of_scope(&task.paths, &repository.changed_paths(main, &rebased)?);
+    let outside = out_of_scope(
+        &task.paths,
+        &repository.changed_paths(main.as_str(), rebased.as_str())?,
+    );
     if !outside.is_empty() {
         return defer(
             format!(
@@ -5917,16 +5928,16 @@ fn land(
     // One commit on main with the rebased tree; the run's own history stays
     // reachable under refs/dagq/runs/<run-id>.
     let paragraphs = commit_message(task, run, &receipt);
-    let tree = repository.tree_of(&rebased)?;
-    let commit = repository.commit_tree(&tree, main, &paragraphs)?;
+    let tree = repository.tree_of(rebased.as_str())?;
+    let commit = repository.commit_tree(&tree, main.as_str(), &paragraphs)?;
     let history_ref = format!("refs/dagq/runs/{}", run.id);
-    repository.update_ref(&history_ref, &rebased)?;
-    repository.advance_main(main, &commit)?;
+    repository.update_ref(&history_ref, rebased.as_str())?;
+    repository.advance_main(main.as_str(), commit.as_str())?;
     Ok(Verdict::Landed(
         Landing {
             commit,
             source_commit: rebased,
-            main_before: main.to_owned(),
+            main_before: main.clone(),
             history_ref,
             message: paragraphs.join("\n\n"),
             verification_skipped: false,
@@ -5979,7 +5990,7 @@ fn remove_landed_worktree(queue: &mut SqliteQueue, repository: &GitRepository, r
 /// `main`, `base` is that `main` instead, so the review does not repeat
 /// what other tasks landed meanwhile. The diff itself is never returned, so the caller
 /// hands the path to a subagent instead of reading it.
-pub fn review(db: &Path, task_id: i64) -> Result<Value> {
+pub fn review(db: &Path, task_id: TaskId) -> Result<Value> {
     let mut queue = SqliteQueue::open(db)?;
     let detail = queue.show(task_id)?;
     let run = detail
@@ -6017,10 +6028,10 @@ pub fn review(db: &Path, task_id: i64) -> Result<Value> {
     let repository = GitRepository::inspect(Path::new(checkout))?;
     let head = receipt.commit.to_ascii_lowercase();
     let main = repository.main_head()?;
-    let base = if main != run.base_commit && repository.is_ancestor(&main, &head)? {
-        main
+    let base = if main != run.base_commit && repository.is_ancestor(main.as_str(), &head)? {
+        main.into_string()
     } else {
-        run.base_commit.clone()
+        run.base_commit.to_string()
     };
     let log = repository.log_oneline(&base, &head)?;
     let stat = repository.diff_stat(&base, &head)?;
@@ -6235,7 +6246,7 @@ fn tail(text: &str, max_bytes: usize) -> &str {
 /// commit `integrate` put on `main` for it, and the summary its agent wrote.
 #[derive(Debug, Clone, Serialize)]
 pub struct PredecessorSummary {
-    pub task_id: i64,
+    pub task_id: TaskId,
     pub title: String,
     /// `result_commit` of the integrated run; `(not landed)` without one.
     pub result_commit: String,
@@ -6279,8 +6290,8 @@ impl PredecessorSummary {
             task_id: predecessor.task.id,
             title: predecessor.task.title.clone(),
             result_commit: run
-                .and_then(|run| run.result_commit.clone())
-                .unwrap_or_else(|| "(not landed)".to_owned()),
+                .and_then(|run| run.result_commit.as_ref())
+                .map_or_else(|| "(not landed)".to_owned(), CommitSha::to_string),
             summary,
         }
     }
@@ -6493,7 +6504,7 @@ pub struct SupervisorHealth {
     pub heartbeat_at: i64,
     pub heartbeat_age_secs: i64,
     pub stale: bool,
-    pub run_ids: Vec<String>,
+    pub run_ids: Vec<RunId>,
 }
 
 /// Health of one registered wrapper/agent process. `alive` is only checked
@@ -6515,8 +6526,8 @@ pub struct ProcessHealth {
 /// processes count; other runs never block it.
 #[derive(Debug, Clone, Serialize)]
 pub struct RunHealth {
-    pub run_id: String,
-    pub task_id: i64,
+    pub run_id: RunId,
+    pub task_id: TaskId,
     pub status: RunStatus,
     pub workspace_id: Option<String>,
     pub worktree_path: Option<String>,
@@ -6798,7 +6809,7 @@ pub fn doctor(db: &Path, full: bool) -> Result<Value> {
 /// nothing registered for it is still alive. Never reruns, never deletes the
 /// worktree or workspace, leaves the task `in_progress`, and does not touch
 /// any other run.
-pub fn recover(db: &Path, id: &str) -> Result<Value> {
+pub fn recover(db: &Path, id: &RunId) -> Result<Value> {
     let mut queue = SqliteQueue::open(db)?;
     let run = queue.run(id)?;
     ensure!(
@@ -7068,7 +7079,7 @@ fn run_health(
 /// Run from cmux, not from a pipe; stdout must remain a terminal for Claude.
 /// `resume` reopens the session of a `needs_session` run the supervisor is
 /// resuming (ADR-0019) instead of starting the worker.
-pub fn session(db: &Path, id: &str, token: &str, claude: &Path, resume: bool) -> Result<Value> {
+pub fn session(db: &Path, id: &RunId, token: &str, claude: &Path, resume: bool) -> Result<Value> {
     ensure!(
         std::io::stdin().is_terminal() && std::io::stdout().is_terminal(),
         "interactive Claude wrapper requires a terminal"
@@ -7081,7 +7092,7 @@ pub fn session(db: &Path, id: &str, token: &str, claude: &Path, resume: bool) ->
 
 pub fn session_with_provider(
     db: &Path,
-    id: &str,
+    id: &RunId,
     token: &str,
     provider: &dyn AgentProvider,
 ) -> Result<Value> {
@@ -7091,7 +7102,7 @@ pub fn session_with_provider(
 /// The wrapper of a resumed session: `session --resume`.
 pub fn resume_session_with_provider(
     db: &Path,
-    id: &str,
+    id: &RunId,
     token: &str,
     provider: &dyn AgentProvider,
 ) -> Result<Value> {
@@ -7100,7 +7111,7 @@ pub fn resume_session_with_provider(
 
 fn run_session(
     db: &Path,
-    id: &str,
+    id: &RunId,
     token: &str,
     provider: &dyn AgentProvider,
     resume: bool,

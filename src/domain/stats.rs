@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, HashMap};
 use serde::Serialize;
 use serde_json::Value;
 
-use super::RunEvent;
+use super::{GoalId, RunEvent, RunId, TaskId};
 
 /// Runs returned without `--full`.
 pub const DEFAULT_RUNS: usize = 50;
@@ -31,7 +31,7 @@ pub struct StatsQuery {
     /// Only runs that finished after this event id (`--since`).
     pub since: Option<i64>,
     /// Only runs of tasks in this goal (`--goal`).
-    pub goal_id: Option<i64>,
+    pub goal_id: Option<GoalId>,
     /// Every finished run instead of [`DEFAULT_RUNS`] (`--full`).
     pub full: bool,
 }
@@ -49,9 +49,9 @@ pub struct SlotSnapshot {
 /// and counts.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RunStats {
-    pub run_id: String,
-    pub task_id: i64,
-    pub goal_id: Option<i64>,
+    pub run_id: RunId,
+    pub task_id: TaskId,
+    pub goal_id: Option<GoalId>,
     /// `integrated`, `failed` or `interrupted` for a finished run; the last
     /// status recorded for one still in flight.
     pub status: Option<String>,
@@ -92,7 +92,7 @@ pub struct Intervals {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct GoalStats {
-    pub goal_id: Option<i64>,
+    pub goal_id: Option<GoalId>,
     #[serde(flatten)]
     pub intervals: Intervals,
 }
@@ -100,8 +100,8 @@ pub struct GoalStats {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Alert {
     pub kind: &'static str,
-    pub task_id: Option<i64>,
-    pub run_id: Option<String>,
+    pub task_id: Option<TaskId>,
+    pub run_id: Option<RunId>,
     pub value: i64,
     pub threshold: i64,
 }
@@ -142,13 +142,13 @@ pub struct Stats {
 /// to, and `slots` is the supervisors' snapshot for the idle alert.
 pub fn stats(
     events: &[RunEvent],
-    goals: &HashMap<i64, Option<i64>>,
+    goals: &HashMap<TaskId, Option<GoalId>>,
     now: i64,
     slots: SlotSnapshot,
     query: &StatsQuery,
 ) -> Stats {
     let latest = events.iter().map(|e| e.id).max().unwrap_or(0);
-    let in_goal = |task_id: i64| {
+    let in_goal = |task_id: TaskId| {
         query
             .goal_id
             .is_none_or(|goal| goals.get(&task_id).copied().flatten() == Some(goal))
@@ -162,11 +162,11 @@ pub fn stats(
     }
     // Per task, over every run and not only this page: the `failed` count
     // and the latest run that failed.
-    let mut failures: BTreeMap<i64, (i64, String)> = BTreeMap::new();
+    let mut failures: BTreeMap<TaskId, (i64, RunId)> = BTreeMap::new();
     for track in tracks.iter().filter(|track| track.stats.failed > 0) {
         let entry = failures
             .entry(track.stats.task_id)
-            .or_insert((0, String::new()));
+            .or_insert_with(|| (0, track.stats.run_id.clone()));
         entry.0 += track.stats.failed;
         entry.1.clone_from(&track.stats.run_id);
     }
@@ -202,7 +202,7 @@ pub fn stats(
         }
     }
 
-    let mut by_goal: BTreeMap<(bool, Option<i64>), Vec<&RunStats>> = BTreeMap::new();
+    let mut by_goal: BTreeMap<(bool, Option<GoalId>), Vec<&RunStats>> = BTreeMap::new();
     for track in &finished {
         let goal = track.stats.goal_id;
         by_goal
@@ -335,7 +335,7 @@ fn backend_failures(
     events: &[RunEvent],
     after: i64,
     upto: i64,
-    counts: impl Fn(Option<i64>) -> bool,
+    counts: impl Fn(Option<TaskId>) -> bool,
 ) -> BackendFailures {
     let mut failures = BackendFailures::default();
     for event in events.iter().filter(|event| {
@@ -421,9 +421,9 @@ fn seconds_between(from: Option<i64>, to: Option<i64>) -> Option<i64> {
 }
 
 /// Group the run events by run, in order of each run's first event.
-fn runs(events: &[RunEvent], goals: &HashMap<i64, Option<i64>>) -> Vec<Track> {
-    let mut order: Vec<String> = Vec::new();
-    let mut tracks: HashMap<String, Track> = HashMap::new();
+fn runs(events: &[RunEvent], goals: &HashMap<TaskId, Option<GoalId>>) -> Vec<Track> {
+    let mut order: Vec<RunId> = Vec::new();
+    let mut tracks: HashMap<RunId, Track> = HashMap::new();
     for event in events {
         let (Some(run_id), Some(task_id)) = (&event.run_id, event.task_id) else {
             continue;
@@ -516,8 +516,8 @@ fn runs(events: &[RunEvent], goals: &HashMap<i64, Option<i64>>) -> Vec<Track> {
 }
 
 struct OpenAsk {
-    task_id: Option<i64>,
-    run_id: Option<String>,
+    task_id: Option<TaskId>,
+    run_id: Option<RunId>,
     opened_ms: i64,
 }
 

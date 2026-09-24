@@ -17,8 +17,8 @@ use serde_json::{Value, json};
 use dagq::{
     application::{StatusFilter, TaskQuery, TaskStore, dependency_graph},
     domain::{
-        AskKind, GoalEdit, GoalVerdict, NewAsk, NewGoal, NewNote, NewTask, NoteQuery, NoteTarget,
-        SessionRole, TaskAction, TaskStatus,
+        AskKind, GoalEdit, GoalId, GoalVerdict, NewAsk, NewGoal, NewNote, NewTask, NoteQuery,
+        NoteTarget, RunId, SessionRole, TaskAction, TaskId, TaskStatus,
     },
     infrastructure::{adapters::path_text, location::QueueLocation, sqlite::SqliteQueue},
 };
@@ -625,7 +625,7 @@ fn execute(cli: Cli) -> Result<Value> {
         queue.assert_repository(common_dir)?;
     }
     if let ObserverAccess::DraftGoal(goal_id) = access
-        && !queue.show_goal(goal_id)?.goal.is_draft()
+        && !queue.show_goal(GoalId::new(goal_id))?.goal.is_draft()
     {
         bail!(OBSERVER_DENIED);
     }
@@ -647,8 +647,8 @@ fn execute(cli: Cli) -> Result<Value> {
                 description,
                 acceptance,
                 verification_commands,
-                dependencies,
-                goal_id,
+                dependencies: dependencies.into_iter().map(TaskId::new).collect(),
+                goal_id: goal_id.map(GoalId::new),
                 context,
                 required_evidence: required_evidence
                     .iter()
@@ -679,35 +679,41 @@ fn execute(cli: Cli) -> Result<Value> {
             };
             serde_json::to_value(queue.list(&TaskQuery {
                 status,
-                goal_id,
+                goal_id: goal_id.map(GoalId::new),
                 limit: usize::try_from(limit)?,
-                before,
+                before: before.map(TaskId::new),
                 full,
             })?)?
         }
         Command::Show { id, full, events } => {
-            let detail = queue.show(id)?;
+            let detail = queue.show(TaskId::new(id))?;
             if full {
                 serde_json::to_value(detail)?
             } else {
                 dagq::view::task_detail(&detail, events)
             }
         }
-        Command::Ready { id } => serde_json::to_value(queue.transition(id, TaskAction::Ready)?)?,
-        Command::Draft { id } => serde_json::to_value(queue.transition(id, TaskAction::Draft)?)?,
-        Command::Cancel { id } => serde_json::to_value(queue.transition(id, TaskAction::Cancel)?)?,
+        Command::Ready { id } => {
+            serde_json::to_value(queue.transition(TaskId::new(id), TaskAction::Ready)?)?
+        }
+        Command::Draft { id } => {
+            serde_json::to_value(queue.transition(TaskId::new(id), TaskAction::Draft)?)?
+        }
+        Command::Cancel { id } => {
+            serde_json::to_value(queue.transition(TaskId::new(id), TaskAction::Cancel)?)?
+        }
         Command::Dependency { command } => {
             let id = match command {
                 DependencyCommand::Add { task, predecessor } => {
-                    queue.add_dependency(task, predecessor)?;
+                    queue.add_dependency(TaskId::new(task), TaskId::new(predecessor))?;
                     task
                 }
                 DependencyCommand::Remove { task, predecessor } => {
-                    queue.remove_dependency(task, predecessor)?;
+                    queue.remove_dependency(TaskId::new(task), TaskId::new(predecessor))?;
                     task
                 }
             };
-            serde_json::to_value(queue.show(id)?)?
+            serde_json::to_value(queue.show(TaskId::new(id))?)?
         }
         Command::Goal { command } => match command {
             GoalCommand::Add {
@@ -725,10 +731,10 @@ fn execute(cli: Cli) -> Result<Value> {
                 doc,
                 draft,
             })?)?,
-            GoalCommand::Ready { id } => serde_json::to_value(queue.ready_goal(id)?)?,
+            GoalCommand::Ready { id } => serde_json::to_value(queue.ready_goal(GoalId::new(id))?)?,
             GoalCommand::List => serde_json::to_value(queue.list_goals()?)?,
             GoalCommand::Show { id, full } => {
-                let detail = queue.show_goal(id)?;
+                let detail = queue.show_goal(GoalId::new(id))?;
                 if full {
                     serde_json::to_value(detail)?
                 } else {
@@ -743,7 +749,7 @@ fn execute(cli: Cli) -> Result<Value> {
                 constraints,
                 doc,
             } => serde_json::to_value(queue.edit_goal(
-                id,
+                GoalId::new(id),
                 GoalEdit {
                     title,
                     description,
@@ -752,20 +758,20 @@ fn execute(cli: Cli) -> Result<Value> {
                     doc,
                 },
             )?)?,
-            GoalCommand::Close { id, verdict } => {
-                serde_json::to_value(queue.close_goal(id, verdict.parse::<GoalVerdict>()?)?)?
-            }
+            GoalCommand::Close { id, verdict } => serde_json::to_value(
+                queue.close_goal(GoalId::new(id), verdict.parse::<GoalVerdict>()?)?,
+            )?,
         },
         Command::SetGoal {
             task,
             goal,
             none: _,
-        } => serde_json::to_value(queue.set_goal(task, goal)?)?,
+        } => serde_json::to_value(queue.set_goal(TaskId::new(task), goal.map(GoalId::new))?)?,
         Command::SetPaths {
             task,
             paths,
             none: _,
-        } => serde_json::to_value(queue.set_paths(task, paths)?)?,
+        } => serde_json::to_value(queue.set_paths(TaskId::new(task), paths)?)?,
         Command::Note {
             task,
             run,
@@ -774,9 +780,9 @@ fn execute(cli: Cli) -> Result<Value> {
             kind,
         } => {
             let target = match (task, run, goal) {
-                (Some(task), _, _) => NoteTarget::Task(task),
-                (_, Some(run), _) => NoteTarget::Run(run),
-                (_, _, goal) => NoteTarget::Goal(goal.context("note needs a target")?),
+                (Some(task), _, _) => NoteTarget::Task(TaskId::new(task)),
+                (_, Some(run), _) => NoteTarget::Run(RunId::new(run)?),
+                (_, _, goal) => NoteTarget::Goal(GoalId::new(goal.context("note needs a target")?)),
             };
             serde_json::to_value(queue.add_note(NewNote {
                 target,
@@ -791,15 +797,16 @@ fn execute(cli: Cli) -> Result<Value> {
             since,
             limit,
         } => serde_json::to_value(queue.notes(&NoteQuery {
-            goal_id,
-            task_id,
+            goal_id: goal_id.map(GoalId::new),
+            task_id: task_id.map(TaskId::new),
             since,
             limit: usize::try_from(limit)?,
         })?)?,
         Command::Candidates => serde_json::to_value(queue.candidates()?)?,
-        Command::Graph { goal_id } => {
-            serde_json::to_value(dependency_graph(queue.graph_input()?, goal_id))?
-        }
+        Command::Graph { goal_id } => serde_json::to_value(dependency_graph(
+            queue.graph_input()?,
+            goal_id.map(GoalId::new),
+        ))?,
         Command::Status { role: r } => dagq::runtime::status_for(&db, parse_role(r)?)?,
         Command::Ask {
             command: Some(AskCommand::Close { id }),
@@ -821,8 +828,8 @@ fn execute(cli: Cli) -> Result<Value> {
                 &cwd,
                 NewAsk {
                     kind: kind.unwrap_or_default().parse::<AskKind>()?,
-                    task_id,
-                    run_id: run,
+                    task_id: task_id.map(TaskId::new),
+                    run_id: run.map(RunId::new).transpose()?,
                     question: question.unwrap_or_default(),
                     options,
                     // The session's role; a person at a plain terminal has none.
@@ -974,7 +981,7 @@ fn execute(cli: Cli) -> Result<Value> {
         } => {
             use dagq::{infrastructure::adapters::GitRepository, runtime::IntegrateTarget};
             let target = match (id, next) {
-                (Some(id), false) => IntegrateTarget::Task(id),
+                (Some(id), false) => IntegrateTarget::Task(TaskId::new(id)),
                 _ => IntegrateTarget::Next,
             };
             let repo = checkout(repo);
@@ -992,7 +999,7 @@ fn execute(cli: Cli) -> Result<Value> {
                     .map(|r| r as &dyn dagq::application::MainRemote),
             )?
         }
-        Command::Review { id } => dagq::runtime::review(&db, id)?,
+        Command::Review { id } => dagq::runtime::review(&db, TaskId::new(id))?,
         Command::Stats {
             since,
             goal_id,
@@ -1001,7 +1008,7 @@ fn execute(cli: Cli) -> Result<Value> {
             &db,
             &dagq::domain::stats::StatsQuery {
                 since,
-                goal_id,
+                goal_id: goal_id.map(GoalId::new),
                 full,
             },
         )?,
@@ -1037,13 +1044,13 @@ fn execute(cli: Cli) -> Result<Value> {
             )?
         }
         Command::Doctor { full } => dagq::runtime::doctor(&db, full)?,
-        Command::Recover { run } => dagq::runtime::recover(&db, &run)?,
+        Command::Recover { run } => dagq::runtime::recover(&db, &RunId::new(run)?)?,
         Command::Session {
             run,
             lease,
             claude,
             resume,
-        } => dagq::runtime::session(&db, &run, &lease, &claude, resume)?,
+        } => dagq::runtime::session(&db, &RunId::new(run)?, &lease, &claude, resume)?,
     })
 }
 

@@ -3,7 +3,7 @@ use crate::{
         AgentProvider, DetachedRefusal, MainRemote, ProcessControl, SupervisorEnvironment,
         WorkspaceBackend, WorkspaceTags,
     },
-    domain::{Ask, SessionRole, Task, TaskRun},
+    domain::{Ask, CommitSha, RunId, SessionRole, Task, TaskId, TaskRun},
 };
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::Value;
@@ -323,14 +323,20 @@ pub fn git_common_dir(path: &Path) -> Result<PathBuf> {
         .context("resolve Git common directory")
 }
 
-fn main_head(git: &Path, root: &Path) -> Result<String> {
-    Ok(output(Command::new(git).arg("-C").arg(root).args([
-        "rev-parse",
-        "--verify",
-        "refs/heads/main^{commit}",
-    ]))?
-    .trim()
-    .to_owned())
+fn main_head(git: &Path, root: &Path) -> Result<CommitSha> {
+    object_id(
+        &output(Command::new(git).arg("-C").arg(root).args([
+            "rev-parse",
+            "--verify",
+            "refs/heads/main^{commit}",
+        ]))?,
+        "main commit",
+    )
+}
+
+/// The commit Git printed (a full object ID, surrounded by whitespace).
+fn object_id(text: &str, field: &'static str) -> Result<CommitSha> {
+    Ok(CommitSha::parse(text.trim(), field)?)
 }
 
 /// The size of a diff, as `git diff --numstat` counts it.
@@ -346,7 +352,7 @@ pub struct GitRepository {
     pub root: PathBuf,
     pub common_dir: PathBuf,
     /// `refs/heads/main` at inspection time; `main_head` rereads it.
-    pub base_commit: String,
+    pub base_commit: CommitSha,
     git: PathBuf,
 }
 
@@ -375,7 +381,7 @@ impl GitRepository {
 
     /// Current `refs/heads/main`, read again so that a task unblocked by an
     /// integration starts from the main that contains its predecessor.
-    pub fn main_head(&self) -> Result<String> {
+    pub fn main_head(&self) -> Result<CommitSha> {
         main_head(&self.git, &self.root)
     }
 
@@ -396,15 +402,14 @@ impl GitRepository {
         }
     }
 
-    pub fn head(&self, worktree: &Path) -> Result<String> {
-        Ok(
-            output(Command::new(&self.git).arg("-C").arg(worktree).args([
+    pub fn head(&self, worktree: &Path) -> Result<CommitSha> {
+        object_id(
+            &output(Command::new(&self.git).arg("-C").arg(worktree).args([
                 "rev-parse",
                 "--verify",
                 "HEAD^{commit}",
-            ]))?
-            .trim()
-            .to_owned(),
+            ]))?,
+            "HEAD",
         )
     }
 
@@ -427,7 +432,7 @@ impl GitRepository {
 
     /// `git merge-base <a> <b>`: their best common ancestor, `None` when
     /// they share no history.
-    pub fn merge_base(&self, a: &str, b: &str) -> Result<Option<String>> {
+    pub fn merge_base(&self, a: &str, b: &str) -> Result<Option<CommitSha>> {
         let (status, stdout, stderr) = capture(
             Command::new(&self.git)
                 .arg("-C")
@@ -436,7 +441,7 @@ impl GitRepository {
             Duration::from_secs(30),
         )?;
         match status.code() {
-            Some(0) => Ok(Some(stdout.trim().to_owned())),
+            Some(0) => Ok(Some(object_id(&stdout, "merge base")?)),
             Some(1) => Ok(None),
             _ => bail!("git merge-base failed ({status}): {stderr}"),
         }
@@ -493,7 +498,7 @@ impl GitRepository {
                 .args(["worktree", "add", "-b"])
                 .arg(run.branch.as_ref().context("missing branch")?)
                 .arg(run.worktree_path.as_ref().context("missing worktree")?)
-                .arg(&run.base_commit),
+                .arg(run.base_commit.as_str()),
         )
     }
 
@@ -567,15 +572,18 @@ impl GitRepository {
 
     /// The task IDs in the `Dagq-Task` trailers of `<base>..<head>`, oldest
     /// landing first: the tasks `integrate` put on `main` since `base`.
-    pub fn landed_task_ids(&self, base: &str, head: &str) -> Result<Vec<i64>> {
+    pub fn landed_task_ids(&self, base: &str, head: &str) -> Result<Vec<TaskId>> {
         let text = review_output(Command::new(&self.git).arg("-C").arg(&self.root).args([
             "log",
             "--reverse",
             "--format=%(trailers:key=Dagq-Task,valueonly)",
             &format!("{base}..{head}"),
         ]))?;
-        let mut ids: Vec<i64> = Vec::new();
-        for id in text.lines().filter_map(|line| line.trim().parse().ok()) {
+        let mut ids: Vec<TaskId> = Vec::new();
+        for id in text
+            .lines()
+            .filter_map(|line| line.trim().parse().ok().map(TaskId::new))
+        {
             if !ids.contains(&id) {
                 ids.push(id);
             }
@@ -659,7 +667,12 @@ impl GitRepository {
 
     /// One commit with `tree` on top of `parent`; `paragraphs` become the
     /// message separated by blank lines. No hook runs and no checkout changes.
-    pub fn commit_tree(&self, tree: &str, parent: &str, paragraphs: &[String]) -> Result<String> {
+    pub fn commit_tree(
+        &self,
+        tree: &str,
+        parent: &str,
+        paragraphs: &[String],
+    ) -> Result<CommitSha> {
         let mut command = Command::new(&self.git);
         command
             .arg("-C")
@@ -668,7 +681,7 @@ impl GitRepository {
         for paragraph in paragraphs {
             command.arg("-m").arg(paragraph);
         }
-        Ok(output(&mut command)?.trim().to_owned())
+        object_id(&output(&mut command)?, "new commit")
     }
 
     pub fn update_ref(&self, name: &str, value: &str) -> Result<()> {
@@ -680,7 +693,7 @@ impl GitRepository {
         Ok(())
     }
 
-    pub fn ref_exists(&self, name: &str) -> Result<Option<String>> {
+    pub fn ref_exists(&self, name: &str) -> Result<Option<CommitSha>> {
         let (status, stdout, stderr) = capture(
             Command::new(&self.git).arg("-C").arg(&self.root).args([
                 "rev-parse",
@@ -691,7 +704,7 @@ impl GitRepository {
             Duration::from_secs(30),
         )?;
         match status.code() {
-            Some(0) => Ok(Some(stdout.trim().to_owned())),
+            Some(0) => Ok(Some(object_id(&stdout, "ref")?)),
             Some(1) => Ok(None),
             _ => bail!("git rev-parse failed ({status}): {stderr}"),
         }
@@ -1208,8 +1221,8 @@ pub fn run_workspace_name(task: &Task, run: &TaskRun) -> Result<String> {
 pub fn workspace_description(
     role: SessionRole,
     queue_hash: &str,
-    run: Option<&str>,
-    task: Option<i64>,
+    run: Option<&RunId>,
+    task: Option<TaskId>,
 ) -> String {
     let mut description = format!("dagq role={} queue={queue_hash}", role.as_str());
     if let Some(run) = run {
@@ -1320,7 +1333,7 @@ impl AgentProvider for ClaudeCode {
         command
             .current_dir(run.worktree_path.as_ref().context("missing worktree")?)
             .arg("--session-id")
-            .arg(&run.id)
+            .arg(run.id.as_str())
             .arg("--debug-file")
             .arg(run.log_path.as_ref().context("missing log path")?)
             .arg("--add-dir")
@@ -1346,7 +1359,7 @@ impl AgentProvider for ClaudeCode {
         command
             .current_dir(run.worktree_path.as_ref().context("missing worktree")?)
             .arg("--resume")
-            .arg(&run.id)
+            .arg(run.id.as_str())
             .arg("--debug-file")
             .arg(run_dir.join("claude-resume.log"))
             .arg("--add-dir")
@@ -1533,12 +1546,12 @@ mod tests {
 
     fn run(repo_path: Option<&str>) -> TaskRun {
         TaskRun {
-            id: "0d8e3f1a-7c1b-4e35-9a11-3f6d2c9b8e47".into(),
-            task_id: 15,
+            id: RunId::new("0d8e3f1a-7c1b-4e35-9a11-3f6d2c9b8e47").unwrap(),
+            task_id: TaskId::new(15),
             status: RunStatus::Claimed,
             requested_provider: Provider::Claude,
             actual_provider: Provider::Claude,
-            base_commit: "a".repeat(40),
+            base_commit: CommitSha::try_from("a".repeat(40)).unwrap(),
             branch: None,
             worktree_path: None,
             workspace_id: None,
@@ -1555,7 +1568,7 @@ mod tests {
 
     fn task(title: &str) -> Task {
         Task {
-            id: 15,
+            id: TaskId::new(15),
             title: title.into(),
             description: String::new(),
             acceptance: String::new(),
@@ -1622,8 +1635,8 @@ mod tests {
             workspace_description(
                 SessionRole::Worker,
                 "77067154921b9014",
-                Some("0d8e3f1a-7c1b-4e35-9a11-3f6d2c9b8e47"),
-                Some(15)
+                Some(&RunId::new("0d8e3f1a-7c1b-4e35-9a11-3f6d2c9b8e47").unwrap()),
+                Some(TaskId::new(15))
             ),
             "dagq role=worker queue=77067154921b9014 run=0d8e3f1a-7c1b-4e35-9a11-3f6d2c9b8e47 task=15"
         );

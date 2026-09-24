@@ -280,12 +280,12 @@ pub enum DomainError {
     },
     /// A goal records its verdict once.
     GoalAlreadyClosed {
-        goal_id: i64,
+        goal_id: GoalId,
         verdict: Option<GoalVerdict>,
     },
     /// Tasks in `blocking` (status and count) do not allow `verdict`.
     GoalCloseBlocked {
-        goal_id: i64,
+        goal_id: GoalId,
         verdict: GoalVerdict,
         blocking: Vec<(TaskStatus, usize)>,
     },
@@ -295,7 +295,7 @@ pub enum DomainError {
     },
     ReceiptRunMismatch {
         receipt_run_id: String,
-        run_id: String,
+        run_id: RunId,
     },
     /// The agent itself reported the run as not succeeded.
     AgentReportedResult {
@@ -321,7 +321,7 @@ pub enum DomainError {
     MissingRunDirectory,
     /// `goal ready` on a goal that is not a draft.
     GoalNotDraft {
-        goal_id: i64,
+        goal_id: GoalId,
     },
     /// A note kind that is not a lowercase slug.
     InvalidNoteKind {
@@ -504,9 +504,9 @@ pub struct NewTask {
     pub description: String,
     pub acceptance: String,
     pub verification_commands: Vec<String>,
-    pub dependencies: Vec<i64>,
+    pub dependencies: Vec<TaskId>,
     /// Goal the task belongs to; must be open at registration.
-    pub goal_id: Option<i64>,
+    pub goal_id: Option<GoalId>,
     /// Why the task exists and what to read first; carried into the prompt.
     pub context: String,
     /// Receipt checks validation requires to be `passed` with evidence.
@@ -541,12 +541,12 @@ impl NewTask {
                 field: "verification commands",
             },
         )?;
-        require(self.dependencies.iter().all(|id| *id > 0), || {
+        require(self.dependencies.iter().all(|id| id.as_i64() > 0), || {
             DomainError::NonPositiveId {
                 field: "dependency IDs",
             }
         })?;
-        require(self.goal_id.is_none_or(|id| id > 0), || {
+        require(self.goal_id.is_none_or(|id| id.as_i64() > 0), || {
             DomainError::NonPositiveId { field: "goal ID" }
         })?;
         scope::validate_path_globs(&self.paths)
@@ -555,7 +555,7 @@ impl NewTask {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Task {
-    pub id: i64,
+    pub id: TaskId,
     pub title: String,
     pub description: String,
     pub acceptance: String,
@@ -569,7 +569,7 @@ pub struct Task {
     /// no limit.
     pub paths: Vec<String>,
     pub status: TaskStatus,
-    pub goal_id: Option<i64>,
+    pub goal_id: Option<GoalId>,
     pub context: String,
     pub created_at: String,
     pub updated_at: String,
@@ -581,7 +581,7 @@ pub struct Task {
 /// commands: machine checks belong to a task that depends on the others.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Goal {
-    pub id: i64,
+    pub id: GoalId,
     pub title: String,
     pub description: String,
     pub acceptance: String,
@@ -707,7 +707,7 @@ impl TaskStatusCounts {
 /// One row of `goal list`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GoalSummary {
-    pub id: i64,
+    pub id: GoalId,
     pub title: String,
     pub status: GoalStatus,
     pub closed: bool,
@@ -718,7 +718,7 @@ pub struct GoalSummary {
 /// A task as `goal show` lists it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GoalTask {
-    pub id: i64,
+    pub id: TaskId,
     pub title: String,
     pub status: TaskStatus,
 }
@@ -733,18 +733,18 @@ pub struct GoalDetail {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskRun {
-    pub id: String,
-    pub task_id: i64,
+    pub id: RunId,
+    pub task_id: TaskId,
     pub status: RunStatus,
     pub requested_provider: Provider,
     pub actual_provider: Provider,
-    pub base_commit: String,
+    pub base_commit: CommitSha,
     pub branch: Option<String>,
     pub worktree_path: Option<String>,
     pub workspace_id: Option<String>,
     pub receipt_path: Option<String>,
     pub log_path: Option<String>,
-    pub result_commit: Option<String>,
+    pub result_commit: Option<CommitSha>,
     pub repo_path: Option<String>,
     pub run_dir: Option<String>,
     pub last_error: Option<String>,
@@ -766,8 +766,8 @@ pub struct RunPaths {
 }
 
 impl RunPaths {
-    pub fn new(runs_dir: &std::path::Path, run_id: &str) -> Self {
-        let run_dir = runs_dir.join(run_id);
+    pub fn new(runs_dir: &std::path::Path, run_id: &RunId) -> Self {
+        let run_dir = runs_dir.join(run_id.as_str());
         Self {
             worktree: run_dir.join("worktree"),
             receipt: run_dir.join("receipt.json"),
@@ -817,8 +817,11 @@ pub struct Predecessor {
     pub integrated_run: Option<TaskRun>,
 }
 
+pub mod ids;
 pub mod scope;
 pub mod stats;
+
+pub use ids::{CommitSha, GoalId, RunId, TaskId};
 
 /// A question for a person (ADR-0022): about a task, or one of its runs when
 /// `run_id` is set; a `blocked` ask of the observer may be about neither
@@ -829,8 +832,8 @@ pub mod stats;
 pub struct Ask {
     pub id: i64,
     pub kind: AskKind,
-    pub task_id: Option<i64>,
-    pub run_id: Option<String>,
+    pub task_id: Option<TaskId>,
+    pub run_id: Option<RunId>,
     pub question: String,
     pub options: Vec<String>,
     pub answer: Option<String>,
@@ -860,8 +863,8 @@ impl Ask {
 #[derive(Debug, Clone)]
 pub struct NewAsk {
     pub kind: AskKind,
-    pub task_id: Option<i64>,
-    pub run_id: Option<String>,
+    pub task_id: Option<TaskId>,
+    pub run_id: Option<RunId>,
     pub question: String,
     pub options: Vec<String>,
     pub asked_by: String,
@@ -878,7 +881,7 @@ impl NewAsk {
         require(!self.asked_by.trim().is_empty(), || DomainError::Blank {
             field: "asked_by",
         })?;
-        require(self.task_id.is_none_or(|id| id > 0), || {
+        require(self.task_id.is_none_or(|id| id.as_i64() > 0), || {
             DomainError::NonPositiveId { field: "task ID" }
         })?;
         require(
@@ -901,9 +904,9 @@ pub struct AskOutcome {
 pub struct RunEvent {
     pub id: i64,
     /// Absent only for goal-level events (`goal_created`, `goal_updated`, `goal_closed`).
-    pub task_id: Option<i64>,
-    pub goal_id: Option<i64>,
-    pub run_id: Option<String>,
+    pub task_id: Option<TaskId>,
+    pub goal_id: Option<GoalId>,
+    pub run_id: Option<RunId>,
     pub kind: String,
     pub payload: serde_json::Value,
     pub created_at: String,
@@ -918,9 +921,9 @@ pub const DEFAULT_NOTE_KIND: &str = "note";
 /// What a note is attached to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NoteTarget {
-    Task(i64),
-    Run(String),
-    Goal(i64),
+    Task(TaskId),
+    Run(RunId),
+    Goal(GoalId),
 }
 
 /// A note to record as an `observation` run event.
@@ -967,8 +970,8 @@ impl NewNote {
 /// tasks and their runs) and/or a task (its own and its runs').
 #[derive(Debug, Clone, Default)]
 pub struct NoteQuery {
-    pub goal_id: Option<i64>,
-    pub task_id: Option<i64>,
+    pub goal_id: Option<GoalId>,
+    pub task_id: Option<TaskId>,
     pub since: Option<i64>,
     pub limit: usize,
 }
@@ -984,7 +987,7 @@ pub struct NotePage {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskDetail {
     pub task: Task,
-    pub dependencies: Vec<i64>,
+    pub dependencies: Vec<TaskId>,
     pub runs: Vec<TaskRun>,
     pub events: Vec<RunEvent>,
     pub processes: Vec<RunProcess>,
@@ -992,7 +995,7 @@ pub struct TaskDetail {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunProcess {
-    pub run_id: String,
+    pub run_id: RunId,
     pub role: String,
     pub pid: u32,
     pub heartbeat_at: i64,
@@ -1007,7 +1010,7 @@ pub struct RunProcess {
 /// [`SupervisorRegistration`] when the owner is a resident `supervise`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunLease {
-    pub run_id: String,
+    pub run_id: RunId,
     pub token: String,
     pub pid: u32,
     pub heartbeat_at: i64,
@@ -1072,7 +1075,7 @@ pub enum IntegrationOutcome {
     },
     NeedsSession {
         run: Box<TaskRun>,
-        main: String,
+        main: CommitSha,
         reason: String,
     },
     Failed {
@@ -1086,7 +1089,7 @@ pub enum IntegrationOutcome {
 /// `follow_ups` (ADR-0019 decision 4).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RegisteredFollowUp {
-    pub task_id: i64,
+    pub task_id: TaskId,
     pub title: String,
 }
 
@@ -1157,7 +1160,7 @@ impl Receipt {
     }
 
     /// Structural consistency only; Git state and verification commands are checked by the supervisor.
-    pub fn check(&self, run_id: &str) -> Result<(), DomainError> {
+    pub fn check(&self, run_id: &RunId) -> Result<(), DomainError> {
         self.check_requiring(run_id, &[])
     }
 
@@ -1167,12 +1170,14 @@ impl Receipt {
     /// of failing (ADR-0019 decision 5).
     pub fn check_requiring(
         &self,
-        run_id: &str,
+        run_id: &RunId,
         required: &[EvidenceCheck],
     ) -> Result<(), DomainError> {
-        require(self.run_id == run_id, || DomainError::ReceiptRunMismatch {
-            receipt_run_id: self.run_id.clone(),
-            run_id: run_id.to_owned(),
+        require(self.run_id == run_id.as_str(), || {
+            DomainError::ReceiptRunMismatch {
+                receipt_run_id: self.run_id.clone(),
+                run_id: run_id.clone(),
+            }
         })?;
         require(self.result == ReceiptResult::Succeeded, || {
             DomainError::AgentReportedResult {
@@ -1203,7 +1208,7 @@ impl Receipt {
                 }
             })?;
         }
-        validate_commit(&self.commit, "receipt commit")?;
+        CommitSha::parse(self.commit.as_str(), "receipt commit")?;
         require(
             self.follow_ups.as_ref().is_none_or(|f| f.is_array()),
             || DomainError::FollowUpsNotArray,
@@ -1241,24 +1246,13 @@ pub fn evidence_missing_reason(missing: &[EvidenceCheck]) -> String {
     format!("evidence missing: {}", names.join(", "))
 }
 
-pub fn validate_base_commit(commit: &str) -> Result<(), DomainError> {
-    validate_commit(commit, "base commit")
-}
-
-fn validate_commit(commit: &str, field: &'static str) -> Result<(), DomainError> {
-    require(
-        matches!(commit.len(), 40 | 64) && commit.bytes().all(|c| c.is_ascii_hexdigit()),
-        || DomainError::InvalidCommit { field },
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn goal(verdict: Option<GoalVerdict>) -> Goal {
         Goal {
-            id: 7,
+            id: GoalId::new(7),
             title: "g".into(),
             description: String::new(),
             acceptance: String::new(),
@@ -1298,7 +1292,7 @@ mod tests {
     #[test]
     fn a_note_needs_text_and_a_slug_kind() {
         let note = |text: &str, kind: Option<&str>| NewNote {
-            target: NoteTarget::Goal(1),
+            target: NoteTarget::Goal(GoalId::new(1)),
             text: text.into(),
             kind: kind.map(Into::into),
             by: "human".into(),
@@ -1365,7 +1359,7 @@ mod tests {
             verification_commands: vec![],
             required_evidence: Vec::new(),
             paths: Vec::new(),
-            dependencies: vec![0],
+            dependencies: vec![TaskId::new(0)],
             goal_id: None,
             context: String::new(),
         };
@@ -1382,7 +1376,9 @@ mod tests {
             "goal title must not be blank"
         );
         assert_eq!(
-            validate_base_commit("abc").unwrap_err().to_string(),
+            CommitSha::parse("abc", "base commit")
+                .unwrap_err()
+                .to_string(),
             "base commit: must be a full 40- or 64-character hexadecimal Git object ID"
         );
         assert!(
@@ -1409,25 +1405,32 @@ mod tests {
         assert!(receipt.missing_evidence(&[EvidenceCheck::Tests]).is_empty());
         // A blank or failed check fails the receipt unless it is required;
         // a required one is left to missing_evidence.
-        assert!(receipt.check("r").is_err());
+        assert!(receipt.check(&RunId::new("r").unwrap()).is_err());
         assert!(
             receipt
-                .check_requiring("r", &[EvidenceCheck::SubagentReview])
+                .check_requiring(&RunId::new("r").unwrap(), &[EvidenceCheck::SubagentReview])
                 .is_ok()
         );
         let mut failed = receipt.clone();
         failed.subagent_review.evidence_or_reason = "reviewed".into();
         failed.e2e.status = CheckStatus::Failed;
         assert_eq!(
-            failed.check("r").unwrap_err().to_string(),
+            failed
+                .check(&RunId::new("r").unwrap())
+                .unwrap_err()
+                .to_string(),
             "receipt reports e2e as failed: no surface"
         );
         assert!(
             failed
-                .check_requiring("r", &[EvidenceCheck::Tests])
+                .check_requiring(&RunId::new("r").unwrap(), &[EvidenceCheck::Tests])
                 .is_err()
         );
-        assert!(failed.check_requiring("r", &[EvidenceCheck::E2e]).is_ok());
+        assert!(
+            failed
+                .check_requiring(&RunId::new("r").unwrap(), &[EvidenceCheck::E2e])
+                .is_ok()
+        );
         assert_eq!(
             failed.missing_evidence(&[EvidenceCheck::E2e]),
             [EvidenceCheck::E2e]
@@ -1476,7 +1479,7 @@ mod tests {
                 .check_close(&goal(None), &counts)
                 .unwrap_err(),
             DomainError::GoalCloseBlocked {
-                goal_id: 7,
+                goal_id: GoalId::new(7),
                 verdict: GoalVerdict::Abandoned,
                 blocking: vec![(TaskStatus::InProgress, 1)]
             }
@@ -1788,8 +1791,8 @@ pub fn run_attention(
 /// `supervisors` table and never written to `run_events`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Attention {
-    pub run_id: Option<String>,
-    pub task_id: Option<i64>,
+    pub run_id: Option<RunId>,
+    pub task_id: Option<TaskId>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pid: Option<u32>,
     /// The ask of an `ask_opened` / `ask_answered` attention.
@@ -1864,7 +1867,7 @@ mod attention_tests {
         let mut ask = Ask {
             id: 1,
             kind: AskKind::Decide,
-            task_id: Some(1),
+            task_id: Some(TaskId::new(1)),
             run_id: None,
             question: "q".into(),
             options: vec![],
@@ -1893,7 +1896,7 @@ mod attention_tests {
     fn new_ask_rejects_blank_texts_and_bad_ids() {
         let valid = NewAsk {
             kind: AskKind::WorkerQuestion,
-            task_id: Some(1),
+            task_id: Some(TaskId::new(1)),
             run_id: None,
             question: "q".into(),
             options: vec!["a".into()],
@@ -1914,7 +1917,7 @@ mod attention_tests {
                 ..valid.clone()
             },
             NewAsk {
-                task_id: Some(0),
+                task_id: Some(TaskId::new(0)),
                 ..valid.clone()
             },
             NewAsk {
@@ -2359,9 +2362,9 @@ mod attention_tests {
     fn triage_state_follows_the_latest_triage_or_resume() {
         let event = |id: i64, kind: &str| RunEvent {
             id,
-            task_id: Some(1),
+            task_id: Some(TaskId::new(1)),
             goal_id: None,
-            run_id: Some("r".into()),
+            run_id: Some(RunId::new("r").unwrap()),
             kind: kind.into(),
             payload: serde_json::json!({}),
             created_at: String::new(),

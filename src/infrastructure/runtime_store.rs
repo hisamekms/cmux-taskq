@@ -11,8 +11,8 @@ use super::{
     sqlite::{SqliteQueue, claim_task, enum_col, event, event_row, read_task, run_row},
 };
 use crate::domain::{
-    ClaimOutcome, EvidenceCheck, RunEvent, RunLease, RunProcess, SessionRole, SupervisorMode,
-    SupervisorRegistration, Task, TaskAction, TaskRun, validate_base_commit,
+    ClaimOutcome, CommitSha, EvidenceCheck, GoalId, RunEvent, RunId, RunLease, RunProcess,
+    SessionRole, SupervisorMode, SupervisorRegistration, Task, TaskAction, TaskId, TaskRun,
 };
 
 pub use crate::domain::HEARTBEAT_TIMEOUT_SECS;
@@ -43,7 +43,7 @@ pub struct LeasedRun {
 #[derive(Debug, Serialize)]
 pub struct Validation {
     pub accepted: bool,
-    pub result_commit: Option<String>,
+    pub result_commit: Option<CommitSha>,
     pub reason: Option<String>,
     pub receipt: serde_json::Value,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -61,9 +61,9 @@ pub struct Validation {
 /// `run_integrated` payload's shape.
 #[derive(Debug, Serialize)]
 pub struct Landing {
-    pub commit: String,
-    pub source_commit: String,
-    pub main_before: String,
+    pub commit: CommitSha,
+    pub source_commit: CommitSha,
+    pub main_before: CommitSha,
     pub history_ref: String,
     pub message: String,
     pub verification_skipped: bool,
@@ -95,7 +95,11 @@ impl SqliteQueue {
     /// its `supervisor_token` and its lease row are created in one transaction,
     /// so a claimed run never exists without an owner. Concurrent supervisors
     /// on the same queue take different tasks.
-    pub fn claim_for_supervisor(&mut self, base_commit: &str, token: &str) -> Result<ClaimOutcome> {
+    pub fn claim_for_supervisor(
+        &mut self,
+        base_commit: &CommitSha,
+        token: &str,
+    ) -> Result<ClaimOutcome> {
         self.claim_for_supervisor_in_order(base_commit, token, &[])
     }
 
@@ -103,11 +107,10 @@ impl SqliteQueue {
     /// is still claimable (the lowest-ID candidate when none is).
     pub fn claim_for_supervisor_in_order(
         &mut self,
-        base_commit: &str,
+        base_commit: &CommitSha,
         token: &str,
-        order: &[i64],
+        order: &[TaskId],
     ) -> Result<ClaimOutcome> {
-        validate_base_commit(base_commit)?;
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -282,7 +285,7 @@ impl SqliteQueue {
 
     /// Give up ownership of a run that came to rest (`awaiting_integration`
     /// or `failed`). The run's `supervisor_token` stays as a record.
-    pub fn release_lease(&mut self, id: &str, token: &str) -> Result<()> {
+    pub fn release_lease(&mut self, id: &RunId, token: &str) -> Result<()> {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -354,7 +357,7 @@ impl SqliteQueue {
     /// are untouched.
     pub fn adopt_run(
         &mut self,
-        id: &str,
+        id: &RunId,
         previous_token: &str,
         token: &str,
         pid: u32,
@@ -419,7 +422,7 @@ impl SqliteQueue {
 
     /// Whether this process still holds the run's lease. An adopted-away or
     /// recovered run answers `false`, and its former owner must not touch it.
-    pub fn holds_lease(&self, id: &str, token: &str) -> Result<bool> {
+    pub fn holds_lease(&self, id: &RunId, token: &str) -> Result<bool> {
         Ok(self.conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM run_leases WHERE run_id=?1 AND token=?2)",
             params![id, token],
@@ -429,7 +432,7 @@ impl SqliteQueue {
 
     /// Whether the run has recorded at least one event of `kind`; an
     /// adopter rebuilds what the previous supervisor already did from these.
-    pub fn has_run_event(&self, id: &str, kind: &str) -> Result<bool> {
+    pub fn has_run_event(&self, id: &RunId, kind: &str) -> Result<bool> {
         Ok(self.conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM run_events WHERE run_id=?1 AND kind=?2)",
             params![id, kind],
@@ -442,7 +445,7 @@ impl SqliteQueue {
     /// `recover` judge the run by its registered processes alone while this
     /// supervisor keeps serving other runs; a wrapper that has not registered
     /// yet can no longer do so.
-    pub fn abandon_run(&mut self, id: &str, token: &str, message: &str) -> Result<TaskRun> {
+    pub fn abandon_run(&mut self, id: &RunId, token: &str, message: &str) -> Result<TaskRun> {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -562,7 +565,7 @@ impl SqliteQueue {
             .collect::<rusqlite::Result<_>>()?)
     }
 
-    pub fn run_lease(&self, id: &str) -> Result<Option<RunLease>> {
+    pub fn run_lease(&self, id: &RunId) -> Result<Option<RunLease>> {
         Ok(self
             .conn
             .query_row(
@@ -573,7 +576,7 @@ impl SqliteQueue {
             .optional()?)
     }
 
-    pub fn run(&self, id: &str) -> Result<TaskRun> {
+    pub fn run(&self, id: &RunId) -> Result<TaskRun> {
         self.conn
             .query_row(
                 "SELECT * FROM task_runs WHERE id=?1",
@@ -584,7 +587,7 @@ impl SqliteQueue {
             .with_context(|| format!("run {id} does not exist"))
     }
 
-    pub fn plan_run(&mut self, id: &str, token: &str, plan: &RunPlan) -> Result<()> {
+    pub fn plan_run(&mut self, id: &RunId, token: &str, plan: &RunPlan) -> Result<()> {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -612,7 +615,7 @@ impl SqliteQueue {
         Ok(())
     }
 
-    pub fn workspace_created(&mut self, id: &str, token: &str, workspace: &str) -> Result<()> {
+    pub fn workspace_created(&mut self, id: &RunId, token: &str, workspace: &str) -> Result<()> {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -637,7 +640,7 @@ impl SqliteQueue {
 
     pub fn record_runtime_event(
         &self,
-        id: &str,
+        id: &RunId,
         kind: &str,
         payload: serde_json::Value,
     ) -> Result<()> {
@@ -648,7 +651,7 @@ impl SqliteQueue {
     /// one, otherwise with neither a task nor a run.
     pub fn record_backend_failure(
         &self,
-        run: Option<&str>,
+        run: Option<&RunId>,
         payload: serde_json::Value,
     ) -> Result<()> {
         match run {
@@ -727,7 +730,7 @@ impl SqliteQueue {
     }
 
     /// The latest run whose session opened in `workspace_id`, if any.
-    pub fn run_in_workspace(&self, workspace_id: &str) -> Result<Option<String>> {
+    pub fn run_in_workspace(&self, workspace_id: &str) -> Result<Option<RunId>> {
         Ok(self
             .conn
             .query_row(
@@ -757,7 +760,7 @@ impl SqliteQueue {
         Ok((slots, parallel))
     }
 
-    pub fn record_runtime_error(&mut self, id: &str, message: &str) -> Result<()> {
+    pub fn record_runtime_error(&mut self, id: &RunId, message: &str) -> Result<()> {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -776,7 +779,7 @@ impl SqliteQueue {
     /// Register the wrapper of a resumed session (ADR-0019): the run is
     /// `needs_session` and leased to `token`, and `begin_resume` cleared the
     /// previous session's process rows.
-    pub fn register_resume_wrapper(&mut self, id: &str, token: &str, pid: u32) -> Result<()> {
+    pub fn register_resume_wrapper(&mut self, id: &RunId, token: &str, pid: u32) -> Result<()> {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -801,7 +804,7 @@ impl SqliteQueue {
     /// Register the agent of a resumed session; the run stays `needs_session`.
     pub fn register_resume_agent(
         &mut self,
-        id: &str,
+        id: &RunId,
         wrapper_pid: u32,
         agent_pid: u32,
     ) -> Result<()> {
@@ -823,7 +826,7 @@ impl SqliteQueue {
         Ok(())
     }
 
-    pub fn register_wrapper(&mut self, id: &str, token: &str, pid: u32) -> Result<()> {
+    pub fn register_wrapper(&mut self, id: &RunId, token: &str, pid: u32) -> Result<()> {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -845,7 +848,7 @@ impl SqliteQueue {
         Ok(())
     }
 
-    pub fn register_agent(&mut self, id: &str, wrapper_pid: u32, agent_pid: u32) -> Result<()> {
+    pub fn register_agent(&mut self, id: &RunId, wrapper_pid: u32, agent_pid: u32) -> Result<()> {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -871,14 +874,14 @@ impl SqliteQueue {
         Ok(())
     }
 
-    pub fn heartbeat_wrapper(&self, id: &str, pid: u32) -> Result<()> {
+    pub fn heartbeat_wrapper(&self, id: &RunId, pid: u32) -> Result<()> {
         // Registration is immutable and a run ID is never reused.
         assert_wrapper(&self.conn, id, pid)?;
         self.conn.execute("UPDATE run_processes SET heartbeat_at=unixepoch() WHERE run_id=?1 AND exited_at IS NULL", [id])?;
         Ok(())
     }
 
-    pub fn wrapper_exited(&mut self, id: &str, pid: u32, exit_code: i32) -> Result<()> {
+    pub fn wrapper_exited(&mut self, id: &RunId, pid: u32, exit_code: i32) -> Result<()> {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -909,7 +912,7 @@ impl SqliteQueue {
     /// goes back to `awaiting_integration`, since its validated result is intact.
     pub fn recover_run(
         &mut self,
-        id: &str,
+        id: &RunId,
         checked_processes: usize,
         mut report: serde_json::Value,
     ) -> Result<TaskRun> {
@@ -965,7 +968,7 @@ impl SqliteQueue {
         Ok(result)
     }
 
-    pub fn processes(&self, id: &str) -> Result<Vec<RunProcess>> {
+    pub fn processes(&self, id: &RunId) -> Result<Vec<RunProcess>> {
         Ok(self
             .conn
             .prepare("SELECT * FROM run_processes WHERE run_id=?1 ORDER BY role")?
@@ -973,7 +976,7 @@ impl SqliteQueue {
             .collect::<rusqlite::Result<_>>()?)
     }
 
-    pub fn finish_supervision(&mut self, id: &str, token: &str) -> Result<TaskRun> {
+    pub fn finish_supervision(&mut self, id: &RunId, token: &str) -> Result<TaskRun> {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -1006,7 +1009,7 @@ impl SqliteQueue {
     /// with the session still alive (ADR-0027 decision 1): `running` becomes
     /// `validating` under the same lease, and `supervision_finished` records
     /// `session_live: true` with no exit code.
-    pub fn finish_supervision_live(&mut self, id: &str, token: &str) -> Result<TaskRun> {
+    pub fn finish_supervision_live(&mut self, id: &RunId, token: &str) -> Result<TaskRun> {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -1038,7 +1041,7 @@ impl SqliteQueue {
     /// reviews it, after its live session rewrote the receipt for a
     /// `revise` verdict (ADR-0027 decision 2); `revise_finished` is the
     /// record of why.
-    pub fn restart_validation(&mut self, id: &str, token: &str) -> Result<TaskRun> {
+    pub fn restart_validation(&mut self, id: &RunId, token: &str) -> Result<TaskRun> {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -1066,7 +1069,7 @@ impl SqliteQueue {
     /// recorded as `landing_decided` with `payload`.
     pub fn decide_landing(
         &mut self,
-        id: &str,
+        id: &RunId,
         status: crate::domain::RunStatus,
         reason: &str,
         mut payload: serde_json::Value,
@@ -1102,7 +1105,7 @@ impl SqliteQueue {
 
     pub fn finish_validation(
         &mut self,
-        id: &str,
+        id: &RunId,
         token: &str,
         validation: &Validation,
     ) -> Result<TaskRun> {
@@ -1186,7 +1189,7 @@ impl SqliteQueue {
     }
 
     /// The goal of every task, for `stats`. A pure read.
-    pub fn task_goals(&self) -> Result<HashMap<i64, Option<i64>>> {
+    pub fn task_goals(&self) -> Result<HashMap<TaskId, Option<GoalId>>> {
         Ok(self
             .conn
             .prepare("SELECT id, goal_id FROM tasks")?
@@ -1219,7 +1222,7 @@ impl SqliteQueue {
     }
 
     /// Every event of one run, oldest first.
-    pub fn run_events(&self, id: &str) -> Result<Vec<RunEvent>> {
+    pub fn run_events(&self, id: &RunId) -> Result<Vec<RunEvent>> {
         Ok(self
             .conn
             .prepare("SELECT * FROM run_events WHERE run_id=?1 ORDER BY id")?
@@ -1292,11 +1295,16 @@ impl SqliteQueue {
     /// owns it through a lease row for the duration, so `doctor` can see who
     /// is landing what. A lease this `token` already holds (a supervisor
     /// landing the run it resumed) is kept; one under another token refuses. `one_integrating_run_per_queue` backs the explicit check.
-    pub fn begin_integration(&mut self, id: &str, token: &str, main: &str) -> Result<TaskRun> {
+    pub fn begin_integration(
+        &mut self,
+        id: &RunId,
+        token: &str,
+        main: &CommitSha,
+    ) -> Result<TaskRun> {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let busy: Option<String> = tx
+        let busy: Option<RunId> = tx
             .query_row(
                 "SELECT id FROM task_runs WHERE status='integrating'",
                 [],
@@ -1305,7 +1313,7 @@ impl SqliteQueue {
             .optional()?;
         if let Some(other) = busy {
             ensure!(
-                other == id,
+                other == *id,
                 "run {other} is integrating; one run lands at a time (see doctor if it is stuck)"
             );
             bail!("run {id} is already integrating (see doctor if it is stuck)");
@@ -1387,9 +1395,9 @@ impl SqliteQueue {
     /// another process took it or it changed meanwhile.
     pub fn begin_resume(
         &mut self,
-        id: &str,
+        id: &RunId,
         token: &str,
-        main: &str,
+        main: &CommitSha,
         reason: Option<&str>,
         max_attempts: usize,
     ) -> Result<Option<(TaskRun, usize)>> {
@@ -1448,10 +1456,10 @@ impl SqliteQueue {
     /// `Ok(None)` means another process took it or it changed meanwhile.
     pub fn skip_resume(
         &mut self,
-        id: &str,
+        id: &RunId,
         token: &str,
-        head: &str,
-        main: &str,
+        head: &CommitSha,
+        main: &CommitSha,
         approved: bool,
     ) -> Result<Option<TaskRun>> {
         let tx = self
@@ -1497,7 +1505,7 @@ impl SqliteQueue {
     /// `needs_session`.
     pub fn finish_resume(
         &mut self,
-        id: &str,
+        id: &RunId,
         token: &str,
         status: Option<crate::domain::RunStatus>,
         reason: Option<&str>,
@@ -1547,7 +1555,7 @@ impl SqliteQueue {
     /// as the landing attempt left it.
     pub fn defer_integration(
         &mut self,
-        id: &str,
+        id: &RunId,
         token: &str,
         reason: &str,
         detail: serde_json::Value,
@@ -1567,7 +1575,7 @@ impl SqliteQueue {
     /// otherwise holds only the receipt seen at validation time.
     pub fn fail_integration(
         &mut self,
-        id: &str,
+        id: &RunId,
         token: &str,
         reason: &str,
         receipt: serde_json::Value,
@@ -1586,7 +1594,7 @@ impl SqliteQueue {
     /// to the status it had when the landing started.
     pub fn abort_integration(
         &mut self,
-        id: &str,
+        id: &RunId,
         token: &str,
         revert_to: &str,
         message: &str,
@@ -1603,7 +1611,7 @@ impl SqliteQueue {
 
     fn leave_integration(
         &mut self,
-        id: &str,
+        id: &RunId,
         token: &str,
         status: &str,
         reason: &str,
@@ -1644,7 +1652,7 @@ impl SqliteQueue {
     /// predicates make a repeated or concurrent completion fail without effect.
     pub fn finish_integration(
         &mut self,
-        id: &str,
+        id: &RunId,
         token: &str,
         landing: &Landing,
         common_dir: &str,
@@ -1698,7 +1706,7 @@ impl SqliteQueue {
 
     /// Note a post-landing cleanup failure (worktree or branch removal) on a
     /// run whose status no longer changes.
-    pub fn record_cleanup_failure(&mut self, id: &str, message: &str) -> Result<()> {
+    pub fn record_cleanup_failure(&mut self, id: &RunId, message: &str) -> Result<()> {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -1718,7 +1726,7 @@ impl SqliteQueue {
 impl SqliteQueue {
     /// Record a confirmed cmux close. Only an accepted run whose workspace is
     /// still recorded as open qualifies; the worktree and branch stay for integration.
-    pub fn workspace_closed(&mut self, id: &str, token: &str) -> Result<TaskRun> {
+    pub fn workspace_closed(&mut self, id: &RunId, token: &str) -> Result<TaskRun> {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -1749,7 +1757,7 @@ impl SqliteQueue {
 
     /// A failed close leaves `workspace_closed_at` null so the workspace is never
     /// treated as cleaned; the run status does not change.
-    pub fn cleanup_failed(&mut self, id: &str, token: &str, message: &str) -> Result<TaskRun> {
+    pub fn cleanup_failed(&mut self, id: &RunId, token: &str, message: &str) -> Result<TaskRun> {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -1826,7 +1834,7 @@ impl SqliteQueue {
     /// is still the task's latest run, lease it to
     /// `token` and record `lease_acquired` and `triage_started` (`attempt`,
     /// `status`). `Ok(None)` means another process took it or it changed.
-    pub fn begin_triage(&mut self, id: &str, token: &str) -> Result<Option<(TaskRun, usize)>> {
+    pub fn begin_triage(&mut self, id: &RunId, token: &str) -> Result<Option<(TaskRun, usize)>> {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -1891,7 +1899,7 @@ impl SqliteQueue {
     /// stays for the workspace's close.
     pub fn finish_triage(
         &mut self,
-        id: &str,
+        id: &RunId,
         token: &str,
         action: &TriageAction,
         mut payload: serde_json::Value,
@@ -1948,7 +1956,7 @@ impl SqliteQueue {
     /// ask's answer is applied as a triage's. `Ok(None)` means it changed.
     pub fn exhaust_resumes(
         &mut self,
-        id: &str,
+        id: &RunId,
         max_attempts: usize,
         ask_id: i64,
         reason: &str,
@@ -2012,7 +2020,7 @@ impl SqliteQueue {
 
     /// Record that the triage closed `workspace_id` of the run: the worker's
     /// own (`workspace_closed_at` is set) or a resume's.
-    pub fn triage_closed_workspace(&mut self, id: &str, workspace_id: &str) -> Result<()> {
+    pub fn triage_closed_workspace(&mut self, id: &RunId, workspace_id: &str) -> Result<()> {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -2040,7 +2048,7 @@ impl SqliteQueue {
     /// `status`).
     pub fn decide_triage(
         &mut self,
-        id: &str,
+        id: &RunId,
         ask_id: i64,
         answer: &str,
         reason: &str,
@@ -2073,13 +2081,13 @@ impl SqliteQueue {
             "run {id} is {}, not failed or interrupted",
             run.status.as_str()
         );
-        let latest: String = tx.query_row(
+        let latest: RunId = tx.query_row(
             "SELECT id FROM task_runs WHERE task_id=?1 ORDER BY rowid DESC LIMIT 1",
             [run.task_id],
             |r| r.get(0),
         )?;
         ensure!(
-            latest == id,
+            latest == *id,
             "run {id} is no longer the latest run of task {}",
             run.task_id
         );
@@ -2147,7 +2155,7 @@ impl SqliteQueue {
 /// `asked_by` of the triage's `decide` asks: the supervisor that triaged.
 pub const TRIAGE_ASKER: &str = "supervisor";
 
-fn assert_lease(conn: &Connection, id: &str, token: &str) -> Result<()> {
+fn assert_lease(conn: &Connection, id: &RunId, token: &str) -> Result<()> {
     let valid: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM run_leases WHERE run_id=?1 AND token=?2 AND heartbeat_at >= unixepoch()-?3)",
         params![id,token,HEARTBEAT_TIMEOUT_SECS], |r| r.get(0))?;
     ensure!(valid, "run lease is missing or stale");
@@ -2179,17 +2187,18 @@ fn supervisor_row(r: &Row<'_>) -> rusqlite::Result<SupervisorRegistration> {
     })
 }
 
-fn assert_wrapper(conn: &Connection, id: &str, pid: u32) -> Result<()> {
+fn assert_wrapper(conn: &Connection, id: &RunId, pid: u32) -> Result<()> {
     let valid: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM run_processes WHERE run_id=?1 AND role='wrapper' AND pid=?2 AND exited_at IS NULL)",
         params![id,pid], |r| r.get(0))?;
     ensure!(valid, "wrapper is not the live owner of this run");
     Ok(())
 }
 
-fn run_event(conn: &Connection, id: &str, kind: &str, payload: serde_json::Value) -> Result<()> {
-    let task_id: i64 = conn.query_row("SELECT task_id FROM task_runs WHERE id=?1", [id], |r| {
-        r.get(0)
-    })?;
+fn run_event(conn: &Connection, id: &RunId, kind: &str, payload: serde_json::Value) -> Result<()> {
+    let task_id: TaskId =
+        conn.query_row("SELECT task_id FROM task_runs WHERE id=?1", [id], |r| {
+            r.get(0)
+        })?;
     event(conn, task_id, Some(id), kind, payload)
 }
 
@@ -2202,7 +2211,7 @@ fn run_event(conn: &Connection, id: &str, kind: &str, payload: serde_json::Value
 /// `Ok(None)` when the run is not free to take.
 fn lease_parked_run(
     tx: &Connection,
-    id: &str,
+    id: &RunId,
     token: &str,
     now: i64,
     clear_processes: bool,
@@ -2252,7 +2261,7 @@ fn lease_parked_run(
     Ok(Some(lease.map(|l| l.token)))
 }
 
-fn resume_attempts(conn: &Connection, id: &str) -> Result<usize> {
+fn resume_attempts(conn: &Connection, id: &RunId) -> Result<usize> {
     let count: i64 = conn.query_row(
         "SELECT count(*) FROM run_events WHERE run_id=?1 AND kind='resume_started'",
         [id],
@@ -2272,7 +2281,7 @@ fn process_row(r: &Row<'_>) -> rusqlite::Result<RunProcess> {
     })
 }
 
-pub(super) fn processes_for_task(conn: &Connection, task_id: i64) -> Result<Vec<RunProcess>> {
+pub(super) fn processes_for_task(conn: &Connection, task_id: TaskId) -> Result<Vec<RunProcess>> {
     Ok(conn.prepare("SELECT p.* FROM run_processes p JOIN task_runs r ON r.id=p.run_id WHERE r.task_id=?1 ORDER BY r.rowid,p.role")?
         .query_map([task_id], process_row)?.collect::<rusqlite::Result<_>>()?)
 }

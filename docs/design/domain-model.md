@@ -69,6 +69,22 @@ related:
 - `show`と`goal show`の既定出力は`src/view.rs`が`TaskDetail` / `GoalDetail`から作る圧縮形で、全文は`--full`（ADR-0016の決定4）。キー名は全文と同じで、省くか切り詰めるだけ。長い文字列（taskの`description`/`acceptance`/`context`、goalの`title`/`description`/`acceptance`/`constraints`、runの`last_error`、eventの要点の値）は300文字で切って`…`を付け、それを持つobjectに`truncated: true`を足す。`show`は最新runの`id`/`status`/`branch`/`result_commit`/`last_error`/`worktree_path`/`workspace_id`だけを`runs`に1件、そのrunの`processes`、直近10件（`--events N`で変更）のイベントを`id`/`kind`/`created_at`、runに属するイベントなら`run_id`、payloadの`status`/`reason`/`last_error`/`from`/`to`だけで返し、pathは出さない。`goal show`はイベントを直近10件の`kind`/`created_at`だけにする。どちらも全件数を`runs_total` / `events_total`で添える。どちらも`observations`に、自分に紐づくnote（`show`はtaskとそのrun、`goal show`はgoal自身）の直近5件を`id`/`created_at`/`run_id`（あれば）/`text`（300文字で切る）/`kind`/`by`で古い順に添える。
 - scheduling（`candidates`、`claim`）が見るgoalの性質は、draftのgoalのtaskを除くことだけ。supervisorのclaim順は解放数とIDだけで決まり、goalをまたぐ依存も許す。
 
+## IDとcommitのnewtype
+
+IDとcommitはドメインプリミティブのnewtype（`src/domain/ids.rs`、`domain`から再公開。[ADR-0013](../adr/0013-layered-architecture-and-type-function-style.md)の決定4）で、task IDとgoal IDのように意味の違う値を型で区別する。内部のフィールドは非公開で、生成は下の入口だけ、値の取り出しは`as_i64` / `as_str` / `into_string`で行う。型エイリアスは使わない。
+
+| 型 | 包む値 | 生成と検証 | trait | 使う場所 |
+| --- | --- | --- | --- | --- |
+| `TaskId` | `i64`（`tasks.id`） | `TaskId::new`（検証なし。正であることは`NewTask::validate`などが`NonPositiveId`で確かめる） | `Copy`、`Eq`、`Ord`、`Hash`、`Display` | `Task.id`、`TaskRun.task_id`、`GoalTask.id`、`RunEvent.task_id`、`Ask` / `NewAsk`の`task_id`、`NoteTarget::Task`、`NoteQuery.task_id`、`TaskDetail.dependencies`、`NewTask.dependencies`、`RegisteredFollowUp.task_id`、`Attention.task_id`、`stats`の`RunStats` / `Alert`、`TaskStore`の引数、`TaskQuery.before` / `TaskPage.next`、graphの型 |
+| `GoalId` | `i64`（`goals.id`） | `GoalId::new`（検証なし） | `TaskId`と同じ | `Goal.id`、`GoalSummary.id`、`Task.goal_id`、`NewTask.goal_id`、`RunEvent.goal_id`、`NoteTarget::Goal`、`NoteQuery` / `StatsQuery` / `TaskQuery`の`goal_id`、`DomainError`のgoal ID、`TaskStore`の引数 |
+| `RunId` | `String`（UUID） | `RunId::new` / `TryFrom<String>` / `TryFrom<&str>`。空白だけの値は`Blank { field: "run ID" }` | `Clone`、`Eq`、`Ord`、`Hash`、`Display`、`AsRef<str>`、文字列との`PartialEq` | `TaskRun.id`、`RunEvent` / `Ask` / `NewAsk` / `Attention`の`run_id`、`RunLease.run_id`、`RunProcess.run_id`、`NoteTarget::Run`、`RunPaths::new`、`Receipt::check`の引数、`runtime_store` / `asks`のrun ID引数 |
+| `CommitSha` | `String`（40桁か64桁の16進） | `CommitSha::parse(value, field)` / `TryFrom<String>` / `TryFrom<&str>`（field名`commit`）。外れれば`InvalidCommit { field }` | `RunId`と同じ | `TaskRun.base_commit` / `result_commit`、`IntegrationOutcome::NeedsSession.main`、`Validation.result_commit`、`Landing`の`commit` / `source_commit` / `main_before`、`TaskStore::claim`と`claim_for_supervisor`・`begin_integration`・`begin_resume`・`skip_resume`の引数、`GitRepository`の`main_head` / `head` / `merge_base` / `commit_tree`の戻り値 |
+
+- serdeでは`#[serde(transparent)]`で素の値として出るので、CLIのJSON出力は変わらない。`RunId`と`CommitSha`の`Deserialize`は生成と同じ検証を通す。
+- SQLiteとの変換（`ToSql` / `FromSql`）はinfrastructure（`src/infrastructure/sql_ids.rs`）にある。bindは素の値で、読み出しは生成と同じ検証を通すので、空のrun IDや不正なcommitを持つ行は変換エラーになる。`params_from_iter`に渡す`Value`だけは`as_i64()`で素の値にする。
+- CLIの引数はclapでは`i64` / `String`のまま受け、`main.rs`がnewtypeに変えてからapplicationに渡す。`--run`に空白だけを渡すと`run ID must not be blank`になる。
+- 例外: `Receipt`の`run_id`と`commit`はagentが書くファイルの形のまま`String`で持つ。`Receipt::check`が決まった順で検証し（run_idの一致、result、各check、commitの形式）、最初に外れた項目のエラー文を`last_error`に書くため、パースの時点では検証しない。`GitRepository`の`rebase` / `is_ancestor` / `diff_*` / `changed_paths` / `tree_of`などの引数は`main`やref、`<commit>^{tree}`も受けるGitのrevisionなので`&str`のまま。`supervisor_token`とcmuxの`workspace_id`は対象外。
+
 ## DomainError
 
 domainの関数は業務上の拒否を`DomainError`（`src/domain.rs`）で返す。`std::error::Error`と`Display`を実装し、`anyhow`・`rusqlite`などI/OやDBのライブラリには依存しない。I/Oを行うapplication / infrastructure / runtimeは境界で`?`により`anyhow::Error`へ変換し、原因の説明が要る場所だけ`context`を足す。`Display`はCLIが`{"error": ...}`に出す文、runtimeが`last_error`に書く文そのもので、`DomainError`の導入前の文字列と一致する。variantは業務上の拒否だけで、汎用の`Other(String)`は持たない。
@@ -78,7 +94,7 @@ domainの関数は業務上の拒否を`DomainError`（`src/domain.rs`）で返�
 | `UnknownValue` | `string_enum!`の`FromStr`（`TaskStatus`、`RunStatus`、`Provider`、`SupervisorMode`、`SessionRole`、`GoalStatus`、`GoalVerdict`、`ReceiptResult`、`CheckStatus`） | enum名、値 | `unknown <Enum>: <value>` |
 | `TaskHasUnfinishedRun` | `TaskStatus::transition` | action | `task has an unfinished run; recover or integrate it before applying <Action>` |
 | `TransitionNotAllowed` | `TaskStatus::transition` | 現在のstatus、action | `cannot apply <Action> to task in <status> state` |
-| `Blank` | `NewTask::validate`、`NewGoal::validate`、`GoalEdit::apply`、`NewNote::validate` | field名（`task title`、`verification commands`、`goal title`、`note text`） | `<field> must not be blank` |
+| `Blank` | `NewTask::validate`、`NewGoal::validate`、`GoalEdit::apply`、`NewNote::validate`、`RunId::new` | field名（`task title`、`verification commands`、`goal title`、`note text`、`run ID`） | `<field> must not be blank` |
 | `NonPositiveId` | `NewTask::validate` | field名（`dependency IDs`、`goal ID`） | `<field> must be positive` |
 | `GoalAlreadyClosed` | `GoalVerdict::check_close`、`Goal::check_ready` | goal ID、記録済みのverdict | `goal <id> is already closed as <verdict>` |
 | `GoalCloseBlocked` | `GoalVerdict::check_close` | goal ID、verdict、verdictを許さないstatusと件数 | `goal <id> cannot be closed as <verdict>: <n> task(s) <status>, ...` |
@@ -87,7 +103,7 @@ domainの関数は業務上の拒否を`DomainError`（`src/domain.rs`）で返�
 | `AgentReportedResult` | `Receipt::check` | result、summary | `agent reported result <result>: <summary>` |
 | `ReceiptCheckFailed` | `Receipt::check` | check名、evidence_or_reason | `receipt reports <check> as failed: <evidence>` |
 | `ReceiptCheckUnexplained` | `Receipt::check` | check名、status | `receipt <check> is <status> without evidence or reason` |
-| `InvalidCommit` | `Receipt::check`、`validate_base_commit` | field名（`receipt commit`、`base commit`） | `<field>: must be a full 40- or 64-character hexadecimal Git object ID` |
+| `InvalidCommit` | `Receipt::check`、`CommitSha::parse` / `TryFrom` | field名（`receipt commit`、`base commit`、`commit`、Gitの出力なら`HEAD`・`main commit`など） | `<field>: must be a full 40- or 64-character hexadecimal Git object ID` |
 | `FollowUpsNotArray` | `Receipt::check` | なし | `receipt follow_ups must be an array` |
 | `MissingRunDirectory` | `TaskRun::idle_marker_path` | なし | `missing run directory` |
 | `GoalNotDraft` | `Goal::check_ready` | goal ID | `goal <id> is not a draft` |

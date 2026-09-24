@@ -155,7 +155,7 @@ pub fn attention(
                 AttentionNext::AnswerAsk { ask_id: ask.id },
             )
         } else if ask.kind == AskKind::WorkerQuestion
-            && let Some(run_id) = ask.run_id.as_deref()
+            && let Some(run_id) = ask.run_id.as_ref()
         {
             // The supervisor holding a running worker's lease types the
             // answer into its terminal; a failed send, a run no longer
@@ -189,7 +189,7 @@ pub fn attention(
             }
         } else if ask.kind == AskKind::Decide
             && ask.asked_by == TRIAGE_ASKER
-            && let Some(run_id) = ask.run_id.as_deref()
+            && let Some(run_id) = ask.run_id.as_ref()
             && matches!(
                 queue.run(run_id)?.status,
                 RunStatus::Failed | RunStatus::Interrupted
@@ -206,7 +206,7 @@ pub fn attention(
                 AttentionNext::ApplyingAnswer { ask_id: ask.id },
             )
         } else if ask.kind == AskKind::ApproveLanding
-            && let Some(run_id) = ask.run_id.as_deref()
+            && let Some(run_id) = ask.run_id.as_ref()
             && queue.run(run_id)?.status == RunStatus::AwaitingIntegration
             && ask
                 .answer

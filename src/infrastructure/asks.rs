@@ -7,7 +7,8 @@ use serde_json::json;
 
 use super::sqlite::{SqliteQueue, enum_col, json_col};
 use crate::domain::{
-    Ask, AskKind, AskOutcome, LANDING_OPTIONS, NewAsk, RunStatus, SessionRole, TRIAGE_OPTIONS,
+    Ask, AskKind, AskOutcome, LANDING_OPTIONS, NewAsk, RunId, RunStatus, SessionRole,
+    TRIAGE_OPTIONS, TaskId,
 };
 
 /// Which asks `asks` lists. By default the ones nobody closed; `all` adds
@@ -33,7 +34,7 @@ impl SqliteQueue {
         let task_id = match (&ask.run_id, ask.task_id) {
             (Some(run_id), _) => tx
                 .query_row("SELECT task_id FROM task_runs WHERE id=?1", [run_id], |r| {
-                    r.get::<_, i64>(0)
+                    r.get::<_, TaskId>(0)
                 })
                 .optional()?
                 .with_context(|| format!("run {run_id} does not exist"))
@@ -81,7 +82,7 @@ impl SqliteQueue {
         ask_event(
             &tx,
             task_id,
-            ask.run_id.as_deref(),
+            ask.run_id.as_ref(),
             "ask_opened",
             json!({"ask_id": id, "kind": ask.kind, "asked_by": ask.asked_by}),
         )?;
@@ -108,7 +109,7 @@ impl SqliteQueue {
         )?;
         let mut payload = json!({"ask_id": id, "kind": ask.kind});
         if ask.kind == AskKind::WorkerQuestion
-            && let Some(run_id) = ask.run_id.as_deref()
+            && let Some(run_id) = ask.run_id.as_ref()
         {
             // The supervisor types it into a running worker's terminal; the
             // answer of a run that stopped running is the inbox's.
@@ -119,7 +120,7 @@ impl SqliteQueue {
             payload["runtime_delivers"] = json!(status == RunStatus::Running.as_str());
         }
         if ask.kind == AskKind::ApproveLanding
-            && let Some(run_id) = ask.run_id.as_deref()
+            && let Some(run_id) = ask.run_id.as_ref()
         {
             // The supervisor lands, sends back or cancels a run awaiting
             // integration as answered (ADR-0027); any other answer, or one
@@ -135,7 +136,7 @@ impl SqliteQueue {
         }
         if ask.kind == AskKind::Decide
             && ask.asked_by == super::runtime_store::TRIAGE_ASKER
-            && let Some(run_id) = ask.run_id.as_deref()
+            && let Some(run_id) = ask.run_id.as_ref()
         {
             // The supervisor retries, resumes or cancels a triaged run as
             // answered (ADR-0024 decision 3); any other answer, or one for
@@ -153,7 +154,7 @@ impl SqliteQueue {
         ask_event(
             &tx,
             ask.task_id,
-            ask.run_id.as_deref(),
+            ask.run_id.as_ref(),
             "ask_answered",
             payload,
         )?;
@@ -201,7 +202,7 @@ impl SqliteQueue {
     /// The answered `worker_question` asks of a run that nobody closed yet,
     /// oldest first: answers the supervisor still has to type into the
     /// worker's terminal.
-    pub fn undelivered_answers(&self, run_id: &str) -> Result<Vec<Ask>> {
+    pub fn undelivered_answers(&self, run_id: &RunId) -> Result<Vec<Ask>> {
         Ok(self
             .conn
             .prepare(
@@ -214,12 +215,12 @@ impl SqliteQueue {
 
     /// Whether the run has a `worker_question` nobody closed, answered or
     /// not: its worker stopped at the ask and waits for the answer.
-    pub fn has_unclosed_worker_question(&self, run_id: &str) -> Result<bool> {
+    pub fn has_unclosed_worker_question(&self, run_id: &RunId) -> Result<bool> {
         self.has_unclosed_ask(run_id, AskKind::WorkerQuestion)
     }
 
     /// Whether the run has an ask of `kind` nobody closed, answered or not.
-    pub fn has_unclosed_ask(&self, run_id: &str, kind: AskKind) -> Result<bool> {
+    pub fn has_unclosed_ask(&self, run_id: &RunId, kind: AskKind) -> Result<bool> {
         Ok(self.conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM asks WHERE run_id=?1 AND kind=?2
              AND closed_at IS NULL)",
@@ -257,7 +258,7 @@ impl SqliteQueue {
         ask_event(
             &tx,
             ask.task_id,
-            ask.run_id.as_deref(),
+            ask.run_id.as_ref(),
             "ask_delivered",
             json!({"ask_id": id, "workspace_id": workspace_id}),
         )?;
@@ -267,7 +268,7 @@ impl SqliteQueue {
     }
 
     /// Whether the run ever had a `stuck_exit` ask, closed or not.
-    pub fn has_stuck_exit_ask(&self, run_id: &str) -> Result<bool> {
+    pub fn has_stuck_exit_ask(&self, run_id: &RunId) -> Result<bool> {
         Ok(self.conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM asks WHERE run_id=?1 AND kind='stuck_exit')",
             [run_id],
@@ -281,20 +282,20 @@ impl SqliteQueue {
     /// `runtime_closed: true` (the one event that ends an ask, which is
     /// no attention); an answered one is only closed, like `ask close`.
     /// Returns the asks it closed, oldest first.
-    pub fn close_stuck_exit_asks(&mut self, run_id: &str, answer: &str) -> Result<Vec<Ask>> {
+    pub fn close_stuck_exit_asks(&mut self, run_id: &RunId, answer: &str) -> Result<Vec<Ask>> {
         self.close_runtime_asks(run_id, AskKind::StuckExit, answer)
     }
 
     /// Close every `answer_prompt` ask of the run nobody closed, the way
     /// [`Self::close_stuck_exit_asks`] does: the dialog it was about is gone
     /// (or the session ended), so nobody needs to answer it any more.
-    pub fn close_answer_prompt_asks(&mut self, run_id: &str, answer: &str) -> Result<Vec<Ask>> {
+    pub fn close_answer_prompt_asks(&mut self, run_id: &RunId, answer: &str) -> Result<Vec<Ask>> {
         self.close_runtime_asks(run_id, AskKind::AnswerPrompt, answer)
     }
 
     fn close_runtime_asks(
         &mut self,
-        run_id: &str,
+        run_id: &RunId,
         kind: AskKind,
         answer: &str,
     ) -> Result<Vec<Ask>> {
@@ -342,8 +343,8 @@ impl SqliteQueue {
 /// ask, on nothing.
 fn ask_event(
     conn: &Connection,
-    task_id: Option<i64>,
-    run_id: Option<&str>,
+    task_id: Option<TaskId>,
+    run_id: Option<&RunId>,
     kind: &str,
     payload: serde_json::Value,
 ) -> Result<()> {

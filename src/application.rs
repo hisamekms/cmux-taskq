@@ -3,9 +3,9 @@
 use anyhow::Result;
 
 use crate::domain::{
-    ClaimOutcome, EvidenceCheck, Goal, GoalDetail, GoalEdit, GoalStatus, GoalSummary, GoalVerdict,
-    NewGoal, NewNote, NewTask, NotePage, NoteQuery, Predecessor, RunEvent, RunStatus, Task,
-    TaskAction, TaskDetail, TaskStatus,
+    ClaimOutcome, CommitSha, EvidenceCheck, Goal, GoalDetail, GoalEdit, GoalId, GoalStatus,
+    GoalSummary, GoalVerdict, NewGoal, NewNote, NewTask, NotePage, NoteQuery, Predecessor,
+    RunEvent, RunId, RunStatus, Task, TaskAction, TaskDetail, TaskId, TaskStatus,
 };
 
 /// Which task statuses `list` returns.
@@ -25,12 +25,12 @@ pub enum StatusFilter {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskQuery {
     pub status: StatusFilter,
-    pub goal_id: Option<i64>,
+    pub goal_id: Option<GoalId>,
     /// Page size; at least one.
     pub limit: usize,
     /// Start the page at this task ID: only tasks whose ID is at most this.
     /// The previous page's `next` is the first task of the following page.
-    pub before: Option<i64>,
+    pub before: Option<TaskId>,
     /// Include description, acceptance, context, verification commands and timestamps.
     pub full: bool,
 }
@@ -57,7 +57,7 @@ impl Default for TaskQuery {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct TaskPage {
     pub tasks: Vec<TaskListItem>,
-    pub next: Option<i64>,
+    pub next: Option<TaskId>,
     pub total: usize,
 }
 
@@ -65,12 +65,12 @@ pub struct TaskPage {
 /// long fields only with `full`.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct TaskListItem {
-    pub id: i64,
+    pub id: TaskId,
     pub status: TaskStatus,
     pub title: String,
-    pub goal_id: Option<i64>,
+    pub goal_id: Option<GoalId>,
     /// IDs of the direct predecessors, ascending.
-    pub dependencies: Vec<i64>,
+    pub dependencies: Vec<TaskId>,
     /// The most recently created run, if any.
     pub latest_run: Option<LatestRun>,
     #[serde(flatten)]
@@ -79,7 +79,7 @@ pub struct TaskListItem {
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct LatestRun {
-    pub id: String,
+    pub id: RunId,
     pub status: RunStatus,
 }
 
@@ -98,7 +98,7 @@ pub struct TaskListDetails {
 impl TaskListItem {
     pub fn new(
         task: Task,
-        dependencies: Vec<i64>,
+        dependencies: Vec<TaskId>,
         latest_run: Option<LatestRun>,
         full: bool,
     ) -> Self {
@@ -128,14 +128,14 @@ impl TaskListItem {
 /// predecessor, finished or not: the input of [`dependency_graph`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GraphTask {
-    pub id: i64,
+    pub id: TaskId,
     pub status: TaskStatus,
     pub title: String,
-    pub goal_id: Option<i64>,
+    pub goal_id: Option<GoalId>,
     /// Status of the task's goal; a draft goal's tasks are not candidates.
     pub goal_status: Option<GoalStatus>,
     /// IDs of the direct predecessors, ascending.
-    pub depends_on: Vec<i64>,
+    pub depends_on: Vec<TaskId>,
 }
 
 /// One read of the queue for `graph`: the unfinished tasks in ID order and
@@ -143,28 +143,28 @@ pub struct GraphTask {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct GraphInput {
     pub tasks: Vec<GraphTask>,
-    pub candidates: Vec<i64>,
+    pub candidates: Vec<TaskId>,
 }
 
 /// An unfinished task as `graph` shows it (ADR-0023 decision 4).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct GraphNode {
-    pub id: i64,
+    pub id: TaskId,
     pub status: TaskStatus,
     pub title: String,
-    pub goal_id: Option<i64>,
+    pub goal_id: Option<GoalId>,
     /// Status of the task's goal, present only for a task in a goal.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub goal_status: Option<GoalStatus>,
     /// Every direct predecessor, ascending.
-    pub depends_on: Vec<i64>,
+    pub depends_on: Vec<TaskId>,
     /// Unfinished tasks that depend on this one directly, ascending.
-    pub blocks: Vec<i64>,
+    pub blocks: Vec<TaskId>,
     /// How many unfinished tasks depend on this one directly or transitively:
     /// the tasks its completion moves closer to running.
     pub unblocks: usize,
     /// The direct predecessors that are still unfinished, ascending.
-    pub ready_after: Vec<i64>,
+    pub ready_after: Vec<TaskId>,
 }
 
 /// The dependency view of the unfinished tasks.
@@ -174,12 +174,12 @@ pub struct DependencyGraph {
     pub tasks: Vec<GraphNode>,
     /// Claimable tasks in the order the supervisor claims them: most
     /// `unblocks` first, then ascending ID.
-    pub candidates: Vec<i64>,
+    pub candidates: Vec<TaskId>,
     /// The chain from the task with the most `unblocks` (lowest ID on a tie),
     /// each step to the directly blocked task with the most `unblocks`
     /// (lowest ID on a tie), down to a task that blocks nothing. Empty when
     /// no task blocks another.
-    pub critical: Vec<i64>,
+    pub critical: Vec<TaskId>,
 }
 
 /// Compute the dependency view. Counts always span every unfinished task;
@@ -187,10 +187,10 @@ pub struct DependencyGraph {
 /// (the chain may then leave the goal). The queue rejects cycles, so the
 /// dependencies form a DAG; a predecessor that is not in `input.tasks` is
 /// finished.
-pub fn dependency_graph(input: GraphInput, goal_id: Option<i64>) -> DependencyGraph {
+pub fn dependency_graph(input: GraphInput, goal_id: Option<GoalId>) -> DependencyGraph {
     use std::collections::{BTreeMap, BTreeSet};
-    let open: BTreeSet<i64> = input.tasks.iter().map(|task| task.id).collect();
-    let mut blocks: BTreeMap<i64, Vec<i64>> = BTreeMap::new();
+    let open: BTreeSet<TaskId> = input.tasks.iter().map(|task| task.id).collect();
+    let mut blocks: BTreeMap<TaskId, Vec<TaskId>> = BTreeMap::new();
     for task in &input.tasks {
         for predecessor in &task.depends_on {
             if open.contains(predecessor) {
@@ -202,8 +202,8 @@ pub fn dependency_graph(input: GraphInput, goal_id: Option<i64>) -> DependencyGr
         dependents.sort_unstable();
         dependents.dedup();
     }
-    let direct = |id: i64| blocks.get(&id).map(Vec::as_slice).unwrap_or_default();
-    let unblocks: BTreeMap<i64, usize> = open
+    let direct = |id: TaskId| blocks.get(&id).map(Vec::as_slice).unwrap_or_default();
+    let unblocks: BTreeMap<TaskId, usize> = open
         .iter()
         .map(|&id| {
             let mut reached = BTreeSet::new();
@@ -216,17 +216,17 @@ pub fn dependency_graph(input: GraphInput, goal_id: Option<i64>) -> DependencyGr
             (id, reached.len())
         })
         .collect();
-    let count = |id: i64| unblocks.get(&id).copied().unwrap_or(0);
+    let count = |id: TaskId| unblocks.get(&id).copied().unwrap_or(0);
     // Most unblocks first, lowest ID on a tie.
-    let rank = |id: &i64| (std::cmp::Reverse(count(*id)), *id);
+    let rank = |id: &TaskId| (std::cmp::Reverse(count(*id)), *id);
     let in_goal = |task: &GraphTask| goal_id.is_none() || task.goal_id == goal_id;
-    let goal_ids: BTreeSet<i64> = input
+    let goal_ids: BTreeSet<TaskId> = input
         .tasks
         .iter()
         .filter(|task| in_goal(task))
         .map(|task| task.id)
         .collect();
-    let mut candidates: Vec<i64> = input
+    let mut candidates: Vec<TaskId> = input
         .candidates
         .iter()
         .copied()
@@ -274,37 +274,37 @@ pub trait TaskStore {
     fn add(&mut self, task: NewTask) -> Result<Task>;
     /// One page of tasks matching `query`, newest first.
     fn list(&self, query: &TaskQuery) -> Result<TaskPage>;
-    fn show(&mut self, task_id: i64) -> Result<TaskDetail>;
-    fn transition(&mut self, task_id: i64, action: TaskAction) -> Result<Task>;
-    fn add_dependency(&mut self, task_id: i64, predecessor_id: i64) -> Result<()>;
-    fn remove_dependency(&mut self, task_id: i64, predecessor_id: i64) -> Result<()>;
+    fn show(&mut self, task_id: TaskId) -> Result<TaskDetail>;
+    fn transition(&mut self, task_id: TaskId, action: TaskAction) -> Result<Task>;
+    fn add_dependency(&mut self, task_id: TaskId, predecessor_id: TaskId) -> Result<()>;
+    fn remove_dependency(&mut self, task_id: TaskId, predecessor_id: TaskId) -> Result<()>;
     /// Dependency-ready tasks; each task is limited to one unfinished run.
     fn candidates(&self) -> Result<Vec<Task>>;
     /// The unfinished tasks with their direct predecessors and the IDs of
     /// `candidates`, read in one snapshot.
     fn graph_input(&self) -> Result<GraphInput>;
     /// Reserve one run atomically, without a lease. Does not start a process or validate Git objects.
-    fn claim(&mut self, base_commit: &str) -> Result<ClaimOutcome>;
+    fn claim(&mut self, base_commit: &CommitSha) -> Result<ClaimOutcome>;
     /// Direct predecessors of a task, each with the run that landed it, in ID order.
-    fn predecessors(&self, task_id: i64) -> Result<Vec<Predecessor>>;
+    fn predecessors(&self, task_id: TaskId) -> Result<Vec<Predecessor>>;
     /// Tasks that are `in_progress` right now, in ID order.
     fn tasks_in_progress(&self) -> Result<Vec<Task>>;
     fn add_goal(&mut self, goal: NewGoal) -> Result<Goal>;
     /// Every goal in ID order with its task counts by status.
     fn list_goals(&self) -> Result<Vec<GoalSummary>>;
-    fn show_goal(&mut self, goal_id: i64) -> Result<GoalDetail>;
+    fn show_goal(&mut self, goal_id: GoalId) -> Result<GoalDetail>;
     /// Replace the given fields; running runs keep their prompt snapshot.
-    fn edit_goal(&mut self, goal_id: i64, edit: GoalEdit) -> Result<Goal>;
+    fn edit_goal(&mut self, goal_id: GoalId, edit: GoalEdit) -> Result<Goal>;
     /// Record the verdict once. `achieved` is refused while a task is not
     /// completed or canceled; `abandoned` while a task is in progress.
-    fn close_goal(&mut self, goal_id: i64, verdict: GoalVerdict) -> Result<Goal>;
+    fn close_goal(&mut self, goal_id: GoalId, verdict: GoalVerdict) -> Result<Goal>;
     /// Move a draft or ready task to an open goal, or to none.
-    fn set_goal(&mut self, task_id: i64, goal_id: Option<i64>) -> Result<Task>;
+    fn set_goal(&mut self, task_id: TaskId, goal_id: Option<GoalId>) -> Result<Task>;
     /// Replace the globs of the paths a draft or ready task may change
     /// (ADR-0029); an empty list removes the limit.
-    fn set_paths(&mut self, task_id: i64, paths: Vec<String>) -> Result<Task>;
+    fn set_paths(&mut self, task_id: TaskId, paths: Vec<String>) -> Result<Task>;
     /// Open a draft goal so its tasks become candidates (ADR-0024 decision 5).
-    fn ready_goal(&mut self, goal_id: i64) -> Result<Goal>;
+    fn ready_goal(&mut self, goal_id: GoalId) -> Result<Goal>;
     /// Record a note as an `observation` run event on its task, run or goal.
     fn add_note(&mut self, note: NewNote) -> Result<RunEvent>;
     /// One page of notes, oldest first.
@@ -542,18 +542,22 @@ pub trait ProcessControl {
 mod tests {
     use super::*;
 
+    fn ids(ids: &[i64]) -> Vec<TaskId> {
+        ids.iter().copied().map(TaskId::new).collect()
+    }
+
     fn task(id: i64, goal_id: Option<i64>, depends_on: &[i64]) -> GraphTask {
         GraphTask {
-            id,
+            id: TaskId::new(id),
             status: if depends_on.is_empty() {
                 TaskStatus::Ready
             } else {
                 TaskStatus::Draft
             },
             title: format!("task {id}"),
-            goal_id,
+            goal_id: goal_id.map(GoalId::new),
             goal_status: goal_id.map(|_| GoalStatus::Open),
-            depends_on: depends_on.to_vec(),
+            depends_on: ids(depends_on),
         }
     }
 
@@ -569,34 +573,38 @@ mod tests {
                 task(6, Some(1), &[1]),
                 task(7, None, &[9]),
             ],
-            candidates: vec![1, 2, 7],
+            candidates: ids(&[1, 2, 7]),
         }
     }
 
     #[test]
     fn graph_counts_transitive_releases_and_follows_the_critical_chain() {
         let graph = dependency_graph(input(), None);
-        let unblocks: Vec<(i64, usize)> = graph.tasks.iter().map(|t| (t.id, t.unblocks)).collect();
+        let unblocks: Vec<(i64, usize)> = graph
+            .tasks
+            .iter()
+            .map(|t| (t.id.as_i64(), t.unblocks))
+            .collect();
         assert_eq!(
             unblocks,
             [(1, 1), (2, 3), (3, 1), (4, 1), (5, 0), (6, 0), (7, 0)]
         );
-        assert_eq!(graph.tasks[1].blocks, [3, 4]);
-        assert_eq!(graph.tasks[4].depends_on, [3, 4]);
-        assert_eq!(graph.tasks[4].ready_after, [3, 4]);
-        assert_eq!(graph.tasks[6].depends_on, [9]);
+        assert_eq!(graph.tasks[1].blocks, ids(&[3, 4]));
+        assert_eq!(graph.tasks[4].depends_on, ids(&[3, 4]));
+        assert_eq!(graph.tasks[4].ready_after, ids(&[3, 4]));
+        assert_eq!(graph.tasks[6].depends_on, ids(&[9]));
         assert!(graph.tasks[6].ready_after.is_empty());
-        assert_eq!(graph.candidates, [2, 1, 7]);
-        assert_eq!(graph.critical, [2, 3, 5]);
+        assert_eq!(graph.candidates, ids(&[2, 1, 7]));
+        assert_eq!(graph.critical, ids(&[2, 3, 5]));
     }
 
     #[test]
     fn goal_narrows_tasks_candidates_and_the_critical_start() {
-        let graph = dependency_graph(input(), Some(1));
-        let ids: Vec<i64> = graph.tasks.iter().map(|t| t.id).collect();
-        assert_eq!(ids, [1, 6]);
-        assert_eq!(graph.candidates, [1]);
-        assert_eq!(graph.critical, [1, 6]);
+        let graph = dependency_graph(input(), Some(GoalId::new(1)));
+        let tasks: Vec<TaskId> = graph.tasks.iter().map(|t| t.id).collect();
+        assert_eq!(tasks, ids(&[1, 6]));
+        assert_eq!(graph.candidates, ids(&[1]));
+        assert_eq!(graph.critical, ids(&[1, 6]));
     }
 
     #[test]
@@ -604,11 +612,11 @@ mod tests {
         let graph = dependency_graph(
             GraphInput {
                 tasks: vec![task(2, None, &[]), task(1, None, &[])],
-                candidates: vec![2, 1],
+                candidates: ids(&[2, 1]),
             },
             None,
         );
-        assert_eq!(graph.candidates, [1, 2]);
+        assert_eq!(graph.candidates, ids(&[1, 2]));
         assert!(graph.critical.is_empty());
         assert!(
             dependency_graph(GraphInput::default(), None)

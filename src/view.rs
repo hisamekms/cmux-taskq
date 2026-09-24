@@ -169,12 +169,13 @@ pub fn goal_detail(detail: &GoalDetail) -> Value {
 mod tests {
     use super::*;
     use crate::domain::{
-        Goal, GoalTask, Provider, RunProcess, RunStatus, Task, TaskRun, TaskStatus,
+        CommitSha, Goal, GoalId, GoalTask, Provider, RunId, RunProcess, RunStatus, Task, TaskId,
+        TaskRun, TaskStatus,
     };
 
     fn task(description: &str) -> Task {
         Task {
-            id: 1,
+            id: TaskId::new(1),
             title: "t".into(),
             description: description.into(),
             acceptance: "short".into(),
@@ -191,12 +192,12 @@ mod tests {
 
     fn run(id: &str) -> TaskRun {
         TaskRun {
-            id: id.into(),
-            task_id: 1,
+            id: RunId::new(id).unwrap(),
+            task_id: TaskId::new(1),
             status: RunStatus::Failed,
             requested_provider: Provider::Claude,
             actual_provider: Provider::Claude,
-            base_commit: "base".into(),
+            base_commit: CommitSha::try_from("b".repeat(40)).unwrap(),
             branch: Some(format!("dagq/{id}")),
             worktree_path: Some("/w".into()),
             workspace_id: Some("ws".into()),
@@ -214,9 +215,9 @@ mod tests {
     fn event(id: i64, payload: Value) -> RunEvent {
         RunEvent {
             id,
-            task_id: Some(1),
+            task_id: Some(TaskId::new(1)),
             goal_id: None,
-            run_id: Some("b".into()),
+            run_id: Some(RunId::new("b").unwrap()),
             kind: format!("kind{id}"),
             payload,
             created_at: format!("t{id}"),
@@ -225,7 +226,7 @@ mod tests {
 
     fn process(run_id: &str) -> RunProcess {
         RunProcess {
-            run_id: run_id.into(),
+            run_id: RunId::new(run_id).unwrap(),
             role: "wrapper".into(),
             pid: 1,
             heartbeat_at: 0,
@@ -245,7 +246,7 @@ mod tests {
     fn task_detail_keeps_the_latest_run_and_events_without_paths() {
         let detail = TaskDetail {
             task: task(&"d".repeat(TEXT_LIMIT + 5)),
-            dependencies: vec![3],
+            dependencies: vec![TaskId::new(3)],
             runs: vec![run("a"), run("b")],
             events: (1..=12)
                 .map(|id| {
@@ -313,7 +314,7 @@ mod tests {
     fn goal_detail_truncates_texts_and_keeps_kinds_of_latest_events() {
         let detail = GoalDetail {
             goal: Goal {
-                id: 1,
+                id: GoalId::new(1),
                 title: "g".into(),
                 description: "x".repeat(TEXT_LIMIT * 2),
                 acceptance: "a".into(),
@@ -327,7 +328,7 @@ mod tests {
             },
             closed: false,
             tasks: vec![GoalTask {
-                id: 2,
+                id: TaskId::new(2),
                 title: "t".into(),
                 status: TaskStatus::Ready,
             }],

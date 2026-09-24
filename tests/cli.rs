@@ -1044,7 +1044,7 @@ mod stats {
     use std::collections::HashMap;
 
     use dagq::domain::{
-        RunEvent,
+        GoalId, RunEvent, RunId, TaskId,
         stats::{SlotSnapshot, StatsQuery, stats, timestamp_millis},
     };
     use serde_json::{Value, json};
@@ -1059,9 +1059,9 @@ mod stats {
         fn push(&mut self, task: i64, run: Option<&str>, kind: &str, minute: i64, payload: Value) {
             self.0.push(RunEvent {
                 id: i64::try_from(self.0.len()).unwrap() + 1,
-                task_id: Some(task),
+                task_id: Some(TaskId::new(task)),
                 goal_id: None,
-                run_id: run.map(str::to_owned),
+                run_id: run.map(|run| RunId::new(run).unwrap()),
                 kind: kind.to_owned(),
                 payload,
                 created_at: format!(
@@ -1083,6 +1083,14 @@ mod stats {
         fn last_id(&self) -> i64 {
             self.0.last().unwrap().id
         }
+    }
+
+    /// Task → goal, as the queue maps them.
+    fn goals<const N: usize>(pairs: [(i64, Option<i64>); N]) -> HashMap<TaskId, Option<GoalId>> {
+        pairs
+            .into_iter()
+            .map(|(task, goal)| (TaskId::new(task), goal.map(GoalId::new)))
+            .collect()
     }
 
     /// 12:00 plus `minute` minutes, in unix seconds.
@@ -1166,7 +1174,7 @@ mod stats {
         events.push(4, Some("d"), "ask_opened", 55, json!({"ask_id": 1}));
         events.push(4, None, "ask_opened", 56, json!({"ask_id": 2}));
         events.push(4, None, "ask_answered", 57, json!({"ask_id": 2}));
-        let goals = HashMap::from([(1, Some(7)), (2, Some(7)), (3, None), (4, Some(7))]);
+        let goals = goals([(1, Some(7)), (2, Some(7)), (3, None), (4, Some(7))]);
         let slots = SlotSnapshot {
             free_slots: 2,
             candidates: 0,
@@ -1251,7 +1259,7 @@ mod stats {
             at(120),
             SlotSnapshot::default(),
             &StatsQuery {
-                goal_id: Some(7),
+                goal_id: Some(GoalId::new(7)),
                 ..Default::default()
             },
         ));
@@ -1344,7 +1352,7 @@ mod stats {
         );
         events.0.last_mut().unwrap().task_id = None;
         events.status(2, "b", "supervision_finished", 7, "failed");
-        let goals = HashMap::from([(1, None), (2, Some(5))]);
+        let goals = goals([(1, None), (2, Some(5))]);
         let run = |query: StatsQuery| {
             value(&stats(
                 &events.0,
@@ -1382,13 +1390,13 @@ mod stats {
 
         // --goal keeps only the failures of its runs; one is no alert.
         let goal = run(StatsQuery {
-            goal_id: Some(5),
+            goal_id: Some(GoalId::new(5)),
             since: Some(cursor),
             ..Default::default()
         });
         assert_eq!(goal["backend_failures"]["count"], 2);
         let only_close = run(StatsQuery {
-            goal_id: Some(9),
+            goal_id: Some(GoalId::new(9)),
             full: true,
             ..Default::default()
         });
@@ -1428,7 +1436,7 @@ mod stats {
             );
             events.run(task, &run, "run_integrated", work + 1);
         }
-        let goals = HashMap::from([(1, Some(1)), (2, Some(1)), (3, Some(1))]);
+        let goals = goals([(1, Some(1)), (2, Some(1)), (3, Some(1))]);
         let report = value(&stats(
             &events.0,
             &goals,
@@ -1500,7 +1508,10 @@ mod stats {
 
     #[test]
     fn cli_stats_reads_the_queue_and_since_returns_only_new_runs() {
-        use dagq::{domain::ClaimOutcome, infrastructure::sqlite::SqliteQueue};
+        use dagq::{
+            domain::{ClaimOutcome, CommitSha},
+            infrastructure::sqlite::SqliteQueue,
+        };
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("queue.db");
         ok(&db, &["init"]);
@@ -1515,7 +1526,9 @@ mod stats {
         ok(&db, &["ready", "2"]);
         let base = "0123456789abcdef0123456789abcdef01234567";
         let finish = |queue: &mut SqliteQueue| {
-            let ClaimOutcome::Claimed { run } = queue.claim_for_supervisor(base, "t").unwrap()
+            let ClaimOutcome::Claimed { run } = queue
+                .claim_for_supervisor(&CommitSha::try_from(base).unwrap(), "t")
+                .unwrap()
             else {
                 panic!("nothing to claim");
             };

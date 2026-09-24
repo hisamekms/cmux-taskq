@@ -19,11 +19,11 @@ use crate::{
         TaskStore,
     },
     domain::{
-        ClaimOutcome, DomainError, Goal, GoalDetail, GoalEdit, GoalStatus, GoalSummary, GoalTask,
-        GoalVerdict, NewGoal, NewNote, NewTask, NotePage, NoteQuery, NoteTarget, OBSERVATION_KIND,
-        Predecessor, RunEvent, Task, TaskAction, TaskDetail, TaskRun, TaskStatus, TaskStatusCounts,
+        ClaimOutcome, CommitSha, DomainError, Goal, GoalDetail, GoalEdit, GoalId, GoalStatus,
+        GoalSummary, GoalTask, GoalVerdict, NewGoal, NewNote, NewTask, NotePage, NoteQuery,
+        NoteTarget, OBSERVATION_KIND, Predecessor, RunEvent, RunId, Task, TaskAction, TaskDetail,
+        TaskId, TaskRun, TaskStatus, TaskStatusCounts,
         scope::{dedup_globs, validate_path_globs},
-        validate_base_commit,
     },
     infrastructure::location::runs_dir,
 };
@@ -187,7 +187,7 @@ impl TaskStore for SqliteQueue {
                 task.goal_id, task.context, serde_json::to_string(&task.required_evidence())?,
                 serde_json::to_string(&dedup_globs(&task.paths))?],
         )?;
-        let id = tx.last_insert_rowid();
+        let id = TaskId::new(tx.last_insert_rowid());
         event(
             &tx,
             id,
@@ -230,7 +230,7 @@ impl TaskStore for SqliteQueue {
         }
         if let Some(goal_id) = query.goal_id {
             filters.push("goal_id = ?".into());
-            values.push(Value::from(goal_id));
+            values.push(Value::from(goal_id.as_i64()));
         }
         let matching = if filters.is_empty() {
             String::new()
@@ -246,7 +246,7 @@ impl TaskStore for SqliteQueue {
         )?;
         if let Some(before) = query.before {
             filters.push("id <= ?".into());
-            values.push(Value::from(before));
+            values.push(Value::from(before.as_i64()));
         }
         let page = if filters.is_empty() {
             String::new()
@@ -301,7 +301,7 @@ impl TaskStore for SqliteQueue {
         })
     }
 
-    fn show(&mut self, task_id: i64) -> Result<TaskDetail> {
+    fn show(&mut self, task_id: TaskId) -> Result<TaskDetail> {
         // One read snapshot keeps task status, run history and events consistent.
         let tx = self.conn.transaction()?;
         let task = read_task(&tx, task_id)?;
@@ -327,7 +327,7 @@ impl TaskStore for SqliteQueue {
         })
     }
 
-    fn transition(&mut self, task_id: i64, action: TaskAction) -> Result<Task> {
+    fn transition(&mut self, task_id: TaskId, action: TaskAction) -> Result<Task> {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -336,7 +336,7 @@ impl TaskStore for SqliteQueue {
         Ok(result)
     }
 
-    fn add_dependency(&mut self, task_id: i64, predecessor_id: i64) -> Result<()> {
+    fn add_dependency(&mut self, task_id: TaskId, predecessor_id: TaskId) -> Result<()> {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -345,7 +345,7 @@ impl TaskStore for SqliteQueue {
         Ok(())
     }
 
-    fn remove_dependency(&mut self, task_id: i64, predecessor_id: i64) -> Result<()> {
+    fn remove_dependency(&mut self, task_id: TaskId, predecessor_id: TaskId) -> Result<()> {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -418,8 +418,7 @@ impl TaskStore for SqliteQueue {
         Ok(GraphInput { tasks, candidates })
     }
 
-    fn claim(&mut self, base_commit: &str) -> Result<ClaimOutcome> {
-        validate_base_commit(base_commit)?;
+    fn claim(&mut self, base_commit: &CommitSha) -> Result<ClaimOutcome> {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -428,7 +427,7 @@ impl TaskStore for SqliteQueue {
         Ok(outcome)
     }
 
-    fn predecessors(&self, task_id: i64) -> Result<Vec<Predecessor>> {
+    fn predecessors(&self, task_id: TaskId) -> Result<Vec<Predecessor>> {
         let tasks: Vec<Task> = self
             .conn
             .prepare(
@@ -487,7 +486,7 @@ impl TaskStore for SqliteQueue {
                 .as_str()
             ],
         )?;
-        let id = tx.last_insert_rowid();
+        let id = GoalId::new(tx.last_insert_rowid());
         let result = read_goal(&tx, id)?;
         goal_event(&tx, id, "goal_created", json!({"goal": result}))?;
         tx.commit()?;
@@ -515,7 +514,7 @@ impl TaskStore for SqliteQueue {
             .collect()
     }
 
-    fn show_goal(&mut self, goal_id: i64) -> Result<GoalDetail> {
+    fn show_goal(&mut self, goal_id: GoalId) -> Result<GoalDetail> {
         let tx = self.conn.transaction()?;
         let goal = read_goal(&tx, goal_id)?;
         let tasks = tx
@@ -541,7 +540,7 @@ impl TaskStore for SqliteQueue {
         })
     }
 
-    fn edit_goal(&mut self, goal_id: i64, edit: GoalEdit) -> Result<Goal> {
+    fn edit_goal(&mut self, goal_id: GoalId, edit: GoalEdit) -> Result<Goal> {
         ensure!(!edit.is_empty(), "goal edit changes nothing");
         let tx = self
             .conn
@@ -571,7 +570,7 @@ impl TaskStore for SqliteQueue {
         Ok(result)
     }
 
-    fn close_goal(&mut self, goal_id: i64, verdict: GoalVerdict) -> Result<Goal> {
+    fn close_goal(&mut self, goal_id: GoalId, verdict: GoalVerdict) -> Result<Goal> {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -594,7 +593,7 @@ impl TaskStore for SqliteQueue {
         Ok(result)
     }
 
-    fn ready_goal(&mut self, goal_id: i64) -> Result<Goal> {
+    fn ready_goal(&mut self, goal_id: GoalId) -> Result<Goal> {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -627,7 +626,7 @@ impl TaskStore for SqliteQueue {
                 event(&tx, *task_id, None, OBSERVATION_KIND, payload)?;
             }
             NoteTarget::Run(run_id) => {
-                let task_id: i64 = tx
+                let task_id: TaskId = tx
                     .query_row("SELECT task_id FROM task_runs WHERE id=?1", [run_id], |r| {
                         r.get(0)
                     })
@@ -657,11 +656,11 @@ impl TaskStore for SqliteQueue {
             filters.push(
                 "(goal_id = ? OR task_id IN (SELECT id FROM tasks WHERE goal_id = ?))".into(),
             );
-            values.extend([Value::from(goal_id), Value::from(goal_id)]);
+            values.extend([Value::from(goal_id.as_i64()), Value::from(goal_id.as_i64())]);
         }
         if let Some(task_id) = query.task_id {
             filters.push("task_id = ?".into());
-            values.push(Value::from(task_id));
+            values.push(Value::from(task_id.as_i64()));
         }
         // Past a cursor the page runs forward from it; without one it is
         // the latest `limit` notes. Either way it is printed oldest first.
@@ -690,7 +689,7 @@ impl TaskStore for SqliteQueue {
         Ok(NotePage { notes, cursor })
     }
 
-    fn set_goal(&mut self, task_id: i64, goal_id: Option<i64>) -> Result<Task> {
+    fn set_goal(&mut self, task_id: TaskId, goal_id: Option<GoalId>) -> Result<Task> {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -720,7 +719,7 @@ impl TaskStore for SqliteQueue {
         Ok(result)
     }
 
-    fn set_paths(&mut self, task_id: i64, paths: Vec<String>) -> Result<Task> {
+    fn set_paths(&mut self, task_id: TaskId, paths: Vec<String>) -> Result<Task> {
         validate_path_globs(&paths)?;
         let paths = dedup_globs(&paths);
         let tx = self
@@ -750,14 +749,14 @@ impl TaskStore for SqliteQueue {
     }
 }
 
-fn read_goal(conn: &Connection, goal_id: i64) -> Result<Goal> {
+fn read_goal(conn: &Connection, goal_id: GoalId) -> Result<Goal> {
     conn.query_row("SELECT * FROM goals WHERE id=?1", [goal_id], goal_row)
         .optional()?
         .with_context(|| format!("goal {goal_id} does not exist"))
 }
 
 /// Tasks join and move between open goals only; a closed goal is a record.
-fn ensure_goal_open(conn: &Connection, goal_id: i64) -> Result<()> {
+fn ensure_goal_open(conn: &Connection, goal_id: GoalId) -> Result<()> {
     let goal = read_goal(conn, goal_id)?;
     ensure!(
         !goal.is_closed(),
@@ -767,7 +766,7 @@ fn ensure_goal_open(conn: &Connection, goal_id: i64) -> Result<()> {
     Ok(())
 }
 
-fn task_counts(conn: &Connection, goal_id: i64) -> Result<TaskStatusCounts> {
+fn task_counts(conn: &Connection, goal_id: GoalId) -> Result<TaskStatusCounts> {
     let mut counts = TaskStatusCounts::default();
     let mut rows =
         conn.prepare("SELECT status, count(*) AS n FROM tasks WHERE goal_id=?1 GROUP BY status")?;
@@ -785,7 +784,7 @@ fn task_counts(conn: &Connection, goal_id: i64) -> Result<TaskStatusCounts> {
 
 fn goal_event(
     conn: &Connection,
-    goal_id: i64,
+    goal_id: GoalId,
     kind: &str,
     payload: serde_json::Value,
 ) -> Result<()> {
@@ -804,8 +803,8 @@ fn goal_event(
 pub(super) fn claim_task(
     tx: &Connection,
     runs_dir: &Path,
-    base_commit: &str,
-    order: &[i64],
+    base_commit: &CommitSha,
+    order: &[TaskId],
 ) -> Result<ClaimOutcome> {
     let mut ready: Vec<Task> = tx
         .prepare(READY_QUERY)?
@@ -819,13 +818,13 @@ pub(super) fn claim_task(
         return Ok(ClaimOutcome::NoReadyTask);
     }
     let task = ready.swap_remove(preferred);
-    let run_id = Uuid::new_v4().to_string();
+    let run_id = RunId::new(Uuid::new_v4().to_string())?;
     tx.execute("UPDATE tasks SET status='in_progress', updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?1",
         [task.id])?;
     tx.execute(
         "INSERT INTO task_runs(id,task_id,status,requested_provider,actual_provider,base_commit)
          VALUES (?1,?2,'claimed','claude','claude',?3)",
-        params![run_id, task.id, base_commit.to_ascii_lowercase()],
+        params![run_id, task.id, base_commit.as_str().to_ascii_lowercase()],
     )?;
     event(
         tx,
@@ -847,7 +846,11 @@ pub(super) fn claim_task(
 /// Apply `action` to the task inside the caller's transaction, recording
 /// `task_status_changed`: what `transition` does, and what the triage does
 /// to the task of the run it triaged.
-pub(super) fn transition_task(conn: &Connection, task_id: i64, action: TaskAction) -> Result<Task> {
+pub(super) fn transition_task(
+    conn: &Connection,
+    task_id: TaskId,
+    action: TaskAction,
+) -> Result<Task> {
     let task = read_task(conn, task_id)?;
     let next = task
         .status
@@ -866,7 +869,7 @@ pub(super) fn transition_task(conn: &Connection, task_id: i64, action: TaskActio
     read_task(conn, task_id)
 }
 
-fn has_unfinished_run(conn: &Connection, task_id: i64) -> Result<bool> {
+fn has_unfinished_run(conn: &Connection, task_id: TaskId) -> Result<bool> {
     Ok(conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM task_runs WHERE task_id=?1
          AND status IN ('claimed','starting','running','validating','awaiting_integration',
@@ -876,13 +879,13 @@ fn has_unfinished_run(conn: &Connection, task_id: i64) -> Result<bool> {
     )?)
 }
 
-pub(super) fn read_task(conn: &Connection, task_id: i64) -> Result<Task> {
+pub(super) fn read_task(conn: &Connection, task_id: TaskId) -> Result<Task> {
     conn.query_row("SELECT * FROM tasks WHERE id=?1", [task_id], task_row)
         .optional()?
         .with_context(|| format!("task {task_id} does not exist"))
 }
 
-fn insert_dependency(conn: &Connection, task_id: i64, predecessor_id: i64) -> Result<()> {
+fn insert_dependency(conn: &Connection, task_id: TaskId, predecessor_id: TaskId) -> Result<()> {
     ensure!(task_id != predecessor_id, "a task cannot depend on itself");
     ensure!(
         read_task(conn, task_id)?.status.dependencies_editable(),
@@ -919,7 +922,7 @@ fn insert_dependency(conn: &Connection, task_id: i64, predecessor_id: i64) -> Re
     Ok(())
 }
 
-fn touch(conn: &Connection, task_id: i64) -> Result<()> {
+fn touch(conn: &Connection, task_id: TaskId) -> Result<()> {
     conn.execute(
         "UPDATE tasks SET updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?1",
         [task_id],
@@ -929,8 +932,8 @@ fn touch(conn: &Connection, task_id: i64) -> Result<()> {
 
 pub(super) fn event(
     conn: &Connection,
-    task_id: i64,
-    run_id: Option<&str>,
+    task_id: TaskId,
+    run_id: Option<&RunId>,
     kind: &str,
     payload: serde_json::Value,
 ) -> Result<()> {
