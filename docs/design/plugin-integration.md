@@ -4,8 +4,8 @@ type: design
 title: Claude Code and Codex plugin integration
 status: current
 created: 2026-09-21
-updated: 2026-09-23
-last_verified: 2026-09-23
+updated: 2026-09-24
+last_verified: 2026-09-24
 scope: distribution
 related:
   - adr-0005
@@ -17,6 +17,7 @@ related:
   - adr-0021
   - adr-0026
   - adr-0028
+  - adr-0030
 ---
 
 # Claude Code and Codex plugin integration
@@ -68,6 +69,16 @@ install -m 755 dagq ~/.local/bin/dagq
 ```
 
 `shasum -a 256 -c SHA256SUMS`が`OK`を出さないarchiveは展開しない。`~/.local/bin`をPATHに入れておくと、pluginのlauncherもsupervisorの起動も同じバイナリを解決する。
+
+### crates.io（ADR-0030）
+
+crates.ioは追加の経路で、GitHub Releaseのartifactは上のとおり変わらない。release.ymlはReleaseに添付し終えた後、`https://crates.io/api/v1/crates/dagq/<version>`が200（同じversionがある）ならskipし、404なら`cargo publish --locked`する（それ以外のstatusはfail）。認証はTrusted Publishingで、jobの`id-token: write`から`rust-lang/crates-io-auth-action@v1`が短期tokenを得て`CARGO_REGISTRY_TOKEN`に渡す。長期tokenのsecretは持たない。release.ymlで許す第三者actionはこれだけ。
+
+packageは`Cargo.toml`の`include`で`src/`、`migrations/`（`include_str!`で埋め込む）、`Cargo.toml`、`Cargo.lock`、`README.md`、`LICENSE`に絞る。`cargo publish --dry-run --locked`で確かめる。
+
+利用者は`cargo install --locked dagq`でsourceからbuildする（Rust 1.93以上とCコンパイラ。対応はmacOS Apple Siliconだけで変わらない）。入る場所は`~/.cargo/bin/dagq`なので、`~/.local/bin/dagq`と併用せずPATH上の`dagq`を1つにする。更新は同じ`cargo install --locked dagq`で上書きしてから`dagq up`（version違いのsupervisorを入れ替える）。
+
+リリースは`Cargo.toml`と`plugin.json`のversionを上げてmainに着地し、`v<version>`のtagをpushすると、GitHub Releaseとcrates.ioの両方に出る。Trusted Publisherは既存のcrateにしか登録できないので、最初の1回はユーザーが手で`cargo publish`し、crates.ioでrepository `hisamekms/dagq`、workflow `release.yml`、environmentなしを登録する（手順はADR-0030の決定5）。
 
 ## Claude Code plugin (`plugins/claude-dagq`)
 

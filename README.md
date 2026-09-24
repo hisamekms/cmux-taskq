@@ -4,7 +4,7 @@ dagq is a dependency DAG queue: a Rust task orchestrator for running dependency-
 
 **It runs on macOS on Apple Silicon (`aarch64-apple-darwin`) only.** No other platform is built, released, or tested. It also needs cmux, which hosts a workspace per run, and an authenticated Claude Code on PATH, because every run is a Claude Code session.
 
-The runtime is distributed as a binary from [GitHub Releases](https://github.com/hisamekms/dagq/releases). The Claude Code integration is distributed as a plugin that invokes that binary, and this repository is also its marketplace. Claude Code is the only provider today; a Codex plugin is planned but does not exist yet.
+The runtime is distributed as a binary from [GitHub Releases](https://github.com/hisamekms/dagq/releases), and the same version is published to [crates.io](https://crates.io/crates/dagq) for `cargo install dagq`, which builds it from source. The Claude Code integration is distributed as a plugin that invokes that binary, and this repository is also its marketplace. Claude Code is the only provider today; a Codex plugin is planned but does not exist yet.
 
 ## Getting started
 
@@ -32,6 +32,13 @@ tar -xzf "dagq-v$VERSION-aarch64-apple-darwin.tar.gz"
 mkdir -p ~/.local/bin
 install -m 755 dagq ~/.local/bin/dagq
 command -v dagq   # expect the ~/.local/bin one, printed expanded
+```
+
+**Or build it with `cargo install`.** The same version is on crates.io; `cargo install` builds it from source into `~/.cargo/bin/dagq`. It needs Rust 1.93 or newer and a C compiler (for bundled SQLite), and the result still runs on macOS on Apple Silicon only. Use it instead of steps 1–3, not beside them: keep a single `dagq` on PATH, since the plugin's launcher and `up` take whichever one PATH resolves first.
+
+```sh
+cargo install --locked dagq
+command -v dagq   # expect ~/.cargo/bin/dagq
 ```
 
 One installed file is enough to serve the queue: it is what you type, what the plugin's launcher resolves ([Use from Claude Code](#use-from-claude-code)), and what the resident supervisor runs, since `up` starts `supervise` from the absolute path of the binary it was invoked as rather than from PATH.
@@ -76,6 +83,13 @@ A new release is installed exactly like the first one: download the tarball and 
 dagq up
 ```
 
+If you installed with `cargo install`, update by building the new version over the old one, then run the same `dagq up`:
+
+```sh
+cargo install --locked dagq
+dagq up
+```
+
 Nothing has to be stopped first. `up` reuses a live supervisor only while its `binary_version` matches its own, so once the file is replaced it drains the running supervisor — the agent is unloaded, the supervisor stops claiming and finishes the runs it holds — and starts one of the new binary in its place (`{"outcome": "restarted", ...}`). Use `up --no-wait` when you cannot sit through that drain: it refuses, changing nothing, whenever a run is in flight ([Updating the binary](#start-the-runtime-with-up)). A rebuild that does not bump the version reports the same `binary_version` and is reused rather than replaced, which matters only between releases.
 
 Update the plugin with Claude Code:
@@ -85,7 +99,7 @@ claude plugin marketplace update dagq
 claude plugin update claude-dagq@dagq
 ```
 
-The two are versioned together. When a session resolves the binary (`dagq --resolve`, which the skills run first), the launcher compares the plugin's version with the binary's and, when they differ in major.minor, writes one `{"warning": ...}` line to stderr and carries on — stdout and the exit status are untouched, so the command still works. Read it as "one of these two is out of date": update whichever is older, the plugin with `claude plugin update` and the binary from the releases page. A session that sees the warning passes it on rather than stopping.
+The two are versioned together. When a session resolves the binary (`dagq --resolve`, which the skills run first), the launcher compares the plugin's version with the binary's and, when they differ in major.minor, writes one `{"warning": ...}` line to stderr and carries on — stdout and the exit status are untouched, so the command still works. Read it as "one of these two is out of date": update whichever is older, the plugin with `claude plugin update` and the binary from the releases page (or `cargo install --locked dagq`). A session that sees the warning passes it on rather than stopping.
 
 ## Current status
 
@@ -324,7 +338,7 @@ Claude picks the skill from the request ("queue a task to …", "start the runti
 
 ## Development
 
-Building from source is for working on dagq itself; to use it, install the released binary ([Getting started](#getting-started)). Requires Rust 1.93 (`rust-toolchain.toml` pins 1.93.0 with rustfmt, clippy and llvm-tools-preview; rustup installs it on the first `cargo` run) and a C compiler for bundled SQLite; no separate SQLite installation is needed.
+Building from source is for working on dagq itself; to use it, install the released binary or `cargo install --locked dagq` ([Getting started](#getting-started)). Requires Rust 1.93 (`rust-toolchain.toml` pins 1.93.0 with rustfmt, clippy and llvm-tools-preview; rustup installs it on the first `cargo` run) and a C compiler for bundled SQLite; no separate SQLite installation is needed.
 
 ```sh
 cargo build --locked   # target/debug/dagq
@@ -342,6 +356,19 @@ cargo llvm-cov --locked --fail-under-lines 80
 GitHub Actions runs the same checks on a macOS runner for every push to `main` and every pull request ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)), without a separate `cargo test` step: `cargo llvm-cov` runs the same test binaries (the unit tests in `src/lib.rs` and `tests/*.rs`; the crate has no doctests) and fails if any test fails, so running both would only run every test twice. For the same reason, a task whose `verification_commands` include `cargo llvm-cov` does not also list `cargo test --locked`.
 
 The tests use temporary databases and repositories, point `XDG_DATA_HOME` at temporary directories, and do not require cmux, Claude Code, or network access after dependencies have been fetched. Line coverage must stay at or above 80% (`cargo install cargo-llvm-cov`). The end-to-end paths in `tests/e2e.rs` drive the real binary through cmux with a stub agent, resolving the queue from the disposable repository's working directory, and are ignored by default; run them with `cargo test --locked --test e2e -- --ignored` where cmux is available. They are: one task landed by `integrate`; two tasks in parallel followed by a dependent one, with a conflicting run parked as `needs_session` and landed after the test resolves it; one that kills a `supervise` process while its stub worker runs and checks that the next `supervise --once` adopts and lands the run; and `up` → `status` → `down --wait` once per supervisor mode, with the plist under a disposable `HOME`. The launchd `up` / `down` test is temporarily off by default, even under `--ignored`: no project runs the launchd mode now, and it needs cmux to accept the launchd-run supervisor's connection (a socket password in cmux's Settings), without which `up`'s preflight always stops it. It prints why and passes without running unless `DAGQ_E2E_LAUNCHD=1` is set. The `up --in-cmux` one always runs, needs no socket password, and asserts that no plist is written and that launchd has no agent for the queue. `tests/lifecycle.rs` covers `up` and `down` in both modes against fakes for launchd, cmux and process signals, including the version-mismatch replacement (drain and restart in each mode, the `--no-wait` refusal with a run in flight, and the reuse of a supervisor of this binary's own version).
+
+## Release
+
+A release is cut by a tag. Raise `version` in `Cargo.toml` (and in `plugins/claude-dagq/.claude-plugin/plugin.json`, which is versioned with it), land that on `main`, then push the matching tag:
+
+```sh
+git tag v0.4.0
+git push origin v0.4.0
+```
+
+[`.github/workflows/release.yml`](.github/workflows/release.yml) checks that the tag is `v` plus the `Cargo.toml` version, builds the `aarch64-apple-darwin` binary, attaches the tarball and `SHA256SUMS` to the GitHub Release, and then publishes the same version to crates.io. The publish authenticates with crates.io Trusted Publishing (a short-lived token from the job's OIDC identity; no registry secret is stored) and is skipped when crates.io already has that version, so rerunning the workflow is safe ([ADR-0030](docs/adr/0030-publish-to-crates-io-on-tag-push-with-trusted-publishing.md)). `cargo publish --dry-run --locked` checks the package locally; the package holds only `src/`, `migrations/`, `Cargo.toml`, `Cargo.lock`, `README.md` and `LICENSE`.
+
+Trusted Publishing can only be configured for a crate that exists, so the first publish is done once by hand, as ADR-0030 describes: verify your email address in crates.io Account Settings (an unverified account cannot publish), create a short-lived crates.io API token with the `publish-new` scope, `cargo login` with it and `cargo publish --locked` from a clean checkout of `main`, revoke the token and `cargo logout`; then in the crate's Settings → Trusted Publishing on crates.io add a GitHub publisher with owner `hisamekms`, repository `dagq`, workflow `release.yml` and no environment. From the next tag on, crates.io gets the new version automatically.
 
 ## Documentation
 

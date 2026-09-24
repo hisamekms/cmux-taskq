@@ -7,6 +7,9 @@ on:
 
 permissions:
   contents: write
+  # Trusted Publishing: the OIDC token that crates-io-auth-action exchanges
+  # for a short-lived crates.io token. No long-lived registry secret is used.
+  id-token: write
 
 env:
   TARGET: aarch64-apple-darwin
@@ -75,3 +78,36 @@ jobs:
             --generate-notes \
             "$archive" dist/SHA256SUMS \
             || gh release upload "$GITHUB_REF_NAME" --clobber "$archive" dist/SHA256SUMS
+
+      # crates.io is an additional channel (ADR-0030): publish only after the
+      # GitHub Release has its assets, and skip a version crates.io already
+      # has, so a rerun of this workflow succeeds like the Release step does.
+      - name: Check whether crates.io already has this version
+        id: crates
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          status="$(curl -sS -o /dev/null -w '%{http_code}' \
+            -A "dagq-release (https://github.com/hisamekms/dagq)" \
+            "https://crates.io/api/v1/crates/dagq/${VERSION}")"
+          case "$status" in
+            200) echo "dagq ${VERSION} is already on crates.io; skipping publish"
+                 echo "published=true" >> "$GITHUB_OUTPUT" ;;
+            404) echo "published=false" >> "$GITHUB_OUTPUT" ;;
+            *)   echo "crates.io answered HTTP ${status} for dagq ${VERSION}" >&2
+                 exit 1 ;;
+          esac
+
+      - name: Authenticate to crates.io
+        if: steps.crates.outputs.published != 'true'
+        id: crates-auth
+        # The one exception to "no third-party actions": the official action
+        # of the crates.io team (ADR-0030).
+        uses: rust-lang/crates-io-auth-action@v1
+
+      - name: Publish to crates.io
+        if: steps.crates.outputs.published != 'true'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.crates-auth.outputs.token }}
+        run: cargo publish --locked
