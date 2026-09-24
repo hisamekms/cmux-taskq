@@ -192,6 +192,8 @@ pub struct Integration<'a> {
     pub clock: &'a dyn Clock,
     pub ids: &'a dyn IdGenerator,
     pub processes: &'a dyn ProcessControl,
+    /// This process, recorded with the approval to land.
+    pub pid: u32,
 }
 
 /// A run that holds the integration slot under `token`: `previous` is the
@@ -280,7 +282,7 @@ pub fn begin(
         queue.record_runtime_event(
             run.id(),
             "integration_approved",
-            json!({"status": run.status().as_str(), "pid": std::process::id(), "push": ctx.remote.is_some()}),
+            json!({"status": run.status().as_str(), "pid": ctx.pid, "push": ctx.remote.is_some()}),
         )?;
     }
     let previous = run.status();
@@ -766,7 +768,7 @@ fn land(
     for (index, command) in commands.iter().enumerate() {
         let log = integrate_verify_log(run_dir, attempt, index + 1);
         let status = verifier.run_to_log(command, worktree, &run_env, &log)?;
-        let exit_code = status.code().unwrap_or(128);
+        let exit_code = status.code.unwrap_or(128);
         let output = fs::read_to_string(&log).unwrap_or_default();
         queue.record_runtime_event(
             run.id(),
@@ -1006,6 +1008,15 @@ mod tests {
             unimplemented!()
         }
         fn main_checkout(&self) -> Result<Option<PathBuf>> {
+            unimplemented!()
+        }
+        fn create_worktree(&self, _: &TaskRun) -> Result<String> {
+            unimplemented!()
+        }
+        fn merge_conflicts(&self, _: &str, _: &str) -> Result<Vec<String>> {
+            unimplemented!()
+        }
+        fn landed_task_ids(&self, _: &str, _: &str) -> Result<Vec<crate::domain::TaskId>> {
             unimplemented!()
         }
     }

@@ -24,29 +24,14 @@ use crate::{
 
 /// Notes the prompt carries.
 pub const PROMPT_NOTES: usize = 20;
-/// How far back the daily observation reads.
-pub const DAILY_WINDOW_SECS: i64 = 24 * 60 * 60;
 /// How long one observer run may take before it is killed.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 /// The tools the observer may use beyond reading: the queue CLI only.
 pub const ALLOWED_TOOLS: &[&str] = &["Bash(dagq:*)"];
 
-/// The two observations: the hourly one reads what finished since the last
-/// one (its cursor), the daily one the last 24 hours for trends.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ObserveMode {
-    Hourly,
-    Daily,
-}
-
-impl ObserveMode {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Hourly => "hourly",
-            Self::Daily => "daily",
-        }
-    }
-}
+/// The supervisor starts the observations on its timer, so their modes
+/// belong to its use case.
+pub use crate::application::supervise::{DAILY_WINDOW_SECS, ObserveMode};
 
 #[derive(Debug, Clone)]
 pub struct ObserveOptions {
@@ -215,7 +200,11 @@ fn run_agent(
     options: &ObserveOptions,
 ) -> Result<Option<i32>> {
     let log = fs::File::create(dir.join("output.log"))?;
-    let mut command = provider.headless_command(dir, prompt, ALLOWED_TOOLS)?;
+    let mut command = crate::infrastructure::process::command(&provider.headless_command(
+        dir,
+        prompt,
+        ALLOWED_TOOLS,
+    )?);
     let mut path = std::env::var_os("PATH").unwrap_or_default();
     if let Some(bin) = options.dagq.parent() {
         let mut paths = vec![bin.to_path_buf()];

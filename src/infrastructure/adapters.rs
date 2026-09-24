@@ -1,9 +1,9 @@
 use crate::{
     application::{
-        AgentProvider, DetachedRefusal, MainRemote, ProcessControl, Repository,
+        AgentProvider, CommandSpec, DetachedRefusal, MainRemote, ProcessControl, Repository,
         SupervisorEnvironment, WorkspaceBackend, WorkspaceTags,
     },
-    domain::{Ask, CommitSha, RunId, SessionRole, Task, TaskId, TaskRun},
+    domain::{CommitSha, SessionRole, Task, TaskId, TaskRun},
 };
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::Value;
@@ -20,20 +20,14 @@ use std::{
     time::{Duration, Instant},
 };
 
-/// Shell boundaries are cmux's terminal startup command and Claude's hook command.
-/// Quote every argument independently, including paths containing apostrophes.
-pub fn shell_join(args: &[String]) -> String {
-    args.iter()
-        .map(|s| shell_quote(s))
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-pub fn shell_quote(arg: &str) -> String {
-    format!("'{}'", arg.replace('\'', "'\"'\"'"))
-}
-
-pub use crate::application::path_text;
+use crate::application::naming::repository_name;
+pub use crate::application::{
+    naming::{
+        ask_notification_title, resume_workspace_description, shell_join, shell_quote,
+        workspace_description, workspace_group_name,
+    },
+    path_text,
+};
 
 pub fn executable(path: &Path) -> Result<PathBuf> {
     let candidate = if path.components().count() > 1 || path.is_absolute() {
@@ -872,6 +866,15 @@ impl Repository for GitRepository {
     fn main_checkout(&self) -> Result<Option<PathBuf>> {
         GitRepository::main_checkout(self)
     }
+    fn create_worktree(&self, run: &TaskRun) -> Result<String> {
+        GitRepository::create_worktree(self, run)
+    }
+    fn merge_conflicts(&self, main: &str, head: &str) -> Result<Vec<String>> {
+        GitRepository::merge_conflicts(self, main, head)
+    }
+    fn landed_task_ids(&self, base: &str, head: &str) -> Result<Vec<TaskId>> {
+        GitRepository::landed_task_ids(self, base, head)
+    }
 }
 
 /// Run against (and from) the common directory, since `root`, or the
@@ -1268,38 +1271,6 @@ pub fn run_workspace_name(task: &Task, run: &TaskRun) -> Result<String> {
     ))
 }
 
-/// `dagq role=<role> queue=<queue hash>[ run=<run-id>][ task=<id>]`: the one
-/// machine-readable description line every workspace of a queue carries,
-/// for people reading `cmux workspace list`; the runtime never reads it back
-/// (ADR-0026).
-pub fn workspace_description(
-    role: SessionRole,
-    queue_hash: &str,
-    run: Option<&RunId>,
-    task: Option<TaskId>,
-) -> String {
-    let mut description = format!("dagq role={} queue={queue_hash}", role.as_str());
-    if let Some(run) = run {
-        description.push_str(&format!(" run={run}"));
-    }
-    if let Some(task) = task {
-        description.push_str(&format!(" task={task}"));
-    }
-    description
-}
-
-/// `[<repo>]`: the name of the workspace group a queue's workspaces join.
-pub fn workspace_group_name(repo_root: &Path) -> String {
-    format!("[{}]", repository_name(repo_root))
-}
-
-/// `run <run-id> resume`: the description of the workspace the supervisor
-/// resumes a `needs_session` run's session in; its title is the worker's
-/// (`run_workspace_name`, ADR-0028).
-pub fn resume_workspace_description(run: &TaskRun) -> String {
-    format!("run {} resume", run.id())
-}
-
 /// `text` as one line for `cmux send`: line breaks and tabs become spaces
 /// and backslashes slashes, so nothing in it reads as a key.
 pub fn single_line(text: &str) -> String {
@@ -1330,26 +1301,8 @@ pub fn inbox_workspace_name(repo_root: &Path) -> String {
     role_workspace_name(repo_root, SessionRole::Inbox)
 }
 
-/// `[<repo>] ask #<id> <kind>`: the title of the notification `ask` sends
-/// the inbox for a new ask (ADR-0022 decision 5).
-pub fn ask_notification_title(repo_root: &Path, ask: &Ask) -> String {
-    format!(
-        "[{}] ask #{} {}",
-        repository_name(repo_root),
-        ask.id,
-        ask.kind.as_str()
-    )
-}
-
 fn role_workspace_name(repo_root: &Path, role: SessionRole) -> String {
     format!("[{}]{}", repository_name(repo_root), role.as_str())
-}
-
-fn repository_name(root: &Path) -> String {
-    root.file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .filter(|name| !name.is_empty())
-        .unwrap_or_else(|| root.to_string_lossy().into_owned())
 }
 
 pub fn workspace_handle(raw: &str) -> Result<&str> {
@@ -1378,12 +1331,12 @@ impl AgentProvider for ClaudeCode {
         Ok(())
     }
 
-    fn command(&self, run: &TaskRun, prompt: &str) -> Result<Command> {
+    fn command(&self, run: &TaskRun, prompt: &str) -> Result<CommandSpec> {
         let run_dir = Path::new(run.run_dir().context("missing run directory")?);
         let settings = run_dir.join("claude-settings.json");
         fs::write(&settings, stop_hook_settings(&run.idle_marker_path()?)?)
             .with_context(|| format!("write {}", settings.display()))?;
-        let mut command = Command::new(&self.executable);
+        let mut command = CommandSpec::new(&self.executable);
         command
             .current_dir(run.worktree_path().context("missing worktree")?)
             .arg("--session-id")
@@ -1395,21 +1348,18 @@ impl AgentProvider for ClaudeCode {
             .arg("--settings")
             .arg(&settings)
             .arg("--")
-            .arg(prompt)
-            .stdin(Stdio::inherit())
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit());
+            .arg(prompt);
         Ok(command)
     }
 
     /// `claude --resume <run-id>` in the worktree with the run's settings
     /// (its `Stop` hook), so the resumed session opens like the worker did.
-    fn resume_command(&self, run: &TaskRun) -> Result<Command> {
+    fn resume_command(&self, run: &TaskRun) -> Result<CommandSpec> {
         let run_dir = Path::new(run.run_dir().context("missing run directory")?);
         let settings = run_dir.join("claude-settings.json");
         fs::write(&settings, stop_hook_settings(&run.idle_marker_path()?)?)
             .with_context(|| format!("write {}", settings.display()))?;
-        let mut command = Command::new(&self.executable);
+        let mut command = CommandSpec::new(&self.executable);
         command
             .current_dir(run.worktree_path().context("missing worktree")?)
             .arg("--resume")
@@ -1419,10 +1369,7 @@ impl AgentProvider for ClaudeCode {
             .arg("--add-dir")
             .arg(run_dir)
             .arg("--settings")
-            .arg(&settings)
-            .stdin(Stdio::inherit())
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit());
+            .arg(&settings);
         Ok(command)
     }
 
@@ -1433,13 +1380,13 @@ impl AgentProvider for ClaudeCode {
         cwd: &Path,
         prompt: &str,
         allowed_tools: &[&str],
-    ) -> Result<Command> {
-        let mut command = Command::new(&self.executable);
+    ) -> Result<CommandSpec> {
+        let mut command = CommandSpec::new(&self.executable);
         command.current_dir(cwd).arg("-p");
         if !allowed_tools.is_empty() {
             command.arg("--allowedTools").args(allowed_tools);
         }
-        command.arg("--").arg(prompt).stdin(Stdio::null());
+        command.arg("--").arg(prompt);
         Ok(command)
     }
     /// `claude -p` in the worktree with `claude-review-settings.json` of
@@ -1447,12 +1394,12 @@ impl AgentProvider for ClaudeCode {
     /// the review never writes the live session's idle marker. It may only
     /// read (`Read`, `Grep`, `Glob` allowed; `Bash`, `Edit`, `Write`,
     /// `NotebookEdit` disallowed); `review.md` is in the run directory.
-    fn review_command(&self, run: &TaskRun, prompt: &str) -> Result<Command> {
+    fn review_command(&self, run: &TaskRun, prompt: &str) -> Result<CommandSpec> {
         let run_dir = Path::new(run.run_dir().context("missing run directory")?);
         let settings = run_dir.join("claude-review-settings.json");
         fs::write(&settings, review_settings()?)
             .with_context(|| format!("write {}", settings.display()))?;
-        let mut command = Command::new(&self.executable);
+        let mut command = CommandSpec::new(&self.executable);
         command
             .current_dir(run.worktree_path().context("missing worktree")?)
             .arg("-p")
@@ -1548,7 +1495,7 @@ pub fn stop_hook_settings(idle_marker: &Path) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::{Provider, RunStatus};
+    use crate::domain::{Provider, RunId, RunStatus};
 
     #[test]
     fn system_processes_signal_a_child_and_see_it_gone() {

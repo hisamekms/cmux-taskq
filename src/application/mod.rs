@@ -3,9 +3,15 @@
 //! landing of a validated run and `prompt` the worker's prompt. The query
 //! types and the dependency view of `list` and `graph` stay here.
 
+pub mod ask;
+pub mod health;
 pub mod integrate;
+pub mod naming;
 mod ports;
 pub mod prompt;
+pub mod recording;
+pub mod session;
+pub mod supervise;
 
 pub use ports::*;
 
@@ -439,6 +445,28 @@ pub fn tail(text: &str, max_bytes: usize) -> &str {
         start += 1;
     }
     &text[start..]
+}
+
+/// `text` in a fenced block whose fence is longer than any backtick run in
+/// it, labelled `info`.
+pub fn fenced(info: &str, text: &str) -> String {
+    let longest = text.split(|c| c != '`').map(str::len).max().unwrap_or(0);
+    let fence = "`".repeat(longest.max(2) + 1);
+    let body = text.trim_end_matches('\n');
+    if body.is_empty() {
+        format!("{fence}{info}\n{fence}\n")
+    } else {
+        format!("{fence}{info}\n{body}\n{fence}\n")
+    }
+}
+
+/// `text`, or `(none)` when it is blank.
+pub fn or_none(text: &str) -> &str {
+    if text.trim().is_empty() {
+        "(none)"
+    } else {
+        text.trim_end()
+    }
 }
 
 /// `path` as text; the runtime keeps every path it records as UTF-8.

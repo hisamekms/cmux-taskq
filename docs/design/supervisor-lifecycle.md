@@ -124,7 +124,7 @@ in-cmux modeのsupervisor workspaceは`down`が閉じる。閉じる相手は登
 
 ### Logs
 
-`supervise --log-dir DIR`はDIRを作り、`supervisor-<started_at unix>-<pid>.log`に起動時のtoken / pid / parallel / db / repositoryと、従来stderrに出していた進行メッセージ（claim、workspace、receipt受領、終了要求、run終了、abandon、rejection）と最後の結果JSON（またはerror）を`[unix time] message`の形で追記する。stderrにも従来どおり出す（`SupervisorLog`）。`up`が作るagentは`--log-dir <queue dir>/logs`で起動し、launchdが拾うstdout / stderrは同じdirの`launchd.log`に溜まる（起動ごとのファイルはruntimeが分け、`launchd.log`は分けない。ローテーションはしない）。`locate`は`log_dir`、`label`、`launch_agent`（plistのpath。存在しなくても出す）を返す。
+`supervise --log-dir DIR`はDIRを作り、`supervisor-<started_at unix>-<pid>.log`に起動時のtoken / pid / parallel / db / repositoryと、従来stderrに出していた進行メッセージ（claim、workspace、receipt受領、終了要求、run終了、abandon、rejection）と最後の結果JSON（またはerror）を`[unix time] message`の形で追記する。stderrにも従来どおり出す（`SupervisorLog`。`infrastructure::run_files`にあり、supervisorのユースケースはapplicationの`NoteLog` port越しに書く。`runtime::SupervisorLog`として再公開）。`up`が作るagentは`--log-dir <queue dir>/logs`で起動し、launchdが拾うstdout / stderrは同じdirの`launchd.log`に溜まる（起動ごとのファイルはruntimeが分け、`launchd.log`は分けない。ローテーションはしない）。`locate`は`log_dir`、`label`、`launch_agent`（plistのpath。存在しなくても出す）を返す。
 
 ### Naming
 
@@ -165,6 +165,8 @@ ADR-0016で次を決めた。`status`のattentionとcursor、`events --after`、
 - 人の経路のコマンドは既定で圧縮し（既存キー名を変えずに省く・切り詰める）、全文は`--full`。`show`・`goal show`・`doctor`は実装済み（`doctor`は上、`show`と`goal show`は[domain-model](domain-model.md)）。手でのレビューは`review ID`が`<run_dir>/review.md`を書き、subagentにpathを渡す（`review`は実装済み。下記「`review`」）。
 
 ## `supervise`
+
+ユースケースの本体はapplication層の`src/application/supervise.rs`にある（[ADR-0013](../adr/0013-layered-architecture-and-type-function-style.md)の方針1と8）。`supervise(&Ports, &LoopSettings)`が下の起動時の1〜4とループを行い、外のものにはすべて`Ports`のport越しに触れる: queueは`Queue`（`TaskStore + RunStore + AskStore`）で、ループ自身の接続とheartbeat・検証・着地の各threadの接続を`QueueOpener`が開く。Gitは`Repository`（worktreeの作成、`merge-tree`の衝突判定、着地したtaskの`Dagq-Task` trailerの読み取りを含む）と`MainRemote`、`[run.env]`と検証コマンドは`Verifier`、cmuxは`WorkspaceBackend`、agentは`AgentProvider`（sessionのagentとheadlessのreview / triageのコマンドをapplicationの`CommandSpec`で返す）、子プロセス（observer、review、triage）の起動は`Spawner`（標準入出力の行き先は`Streams`で指定）、pidの生死は`ProcessControl`、run directory・prompt・receipt・idle markerの読み書きとファイルの時刻と比べる壁時計は`RunFiles`、進行メッセージは`NoteLog`、時刻とIDは`Generators`。path（DB、`runs/`、repositoryのrootとcommon dir、`claude`、runner）とworker / job / observerの環境変数は`Layout`として値で渡す。`runtime::supervise`は`SqliteOpener`（`infrastructure::runtime_store`）、`GitRepository`、`ShellVerifier`、`LocalSpawner`（`infrastructure::process`）、`LocalRunFiles`と`SupervisorLog`（`infrastructure::run_files`）、`SystemProcesses`を組み立てて呼ぶ入口だけで、公開API（`SuperviseOptions`、`supervise`、`supervise_with_reviewer`）は変わらない。askの登録と通知は`application::ask`、doctor・`recover`と同じrunのhealth判定は`application::health`、workspaceの名前付けとshellの引用は`application::naming`にある。stale leaseのadopt（[ADR-0012](../adr/0012-adopt-stale-lease-of-live-wrapper.md)）とrun単位のleaseとheartbeat（[ADR-0007](../adr/0007-run-level-leases-parallel-execution.md)）の振る舞いは移す前と同じ。
 
 `dagq supervise [--parallel N] [--once] [--log-dir DIR] [--observe-interval SECS] [--observe-daily BOOL]`はrepository内で実行する常駐ループ（通常は`up`がlaunchdで起動する。手で専用ターミナルから起動してもよい）で、依存が解けたtaskを上限N（既定4）まで同時に実行する。queueはcwdから解決し（[persistence](persistence.md)のQueue location）、repositoryのcheckoutもcwdを使う。`--db PATH`と`--repo REPO`はそれぞれの明示override（[016](../journal/016-queue-per-repository.md)）。
 
@@ -251,7 +253,7 @@ ADR-0024の決定4。dagqが回っているかを観察して継続的改善の�
 
 ## `session` wrapper
 
-cmux workspaceが起動する隠しコマンド。TTYが必要で、パイプからは起動しない。
+cmux workspaceが起動する隠しコマンド。TTYが必要で、パイプからは起動しない。ユースケースは`src/application/session.rs`の`run_session`で、queue（`Queue`）、agentのコマンド（`AgentProvider`）、その起動（`Spawner`、標準入出力は端末を継承）、`prompt.txt`の読み取り（`RunFiles`）とwrapperのpidを`Session`として受け取る。`runtime::session`はTTYを確かめ、`SqliteQueue`、`ClaudeCode`、`LocalSpawner`、`LocalRunFiles`を渡す入口だけ。
 
 1. `workspace_id`が保存されるまで待ち（45秒以内）、wrapperのPIDを一度だけ登録する。leaseが無効なら登録できない。
 2. `prompt.txt`を読み、providerのコマンドでagentを起動して`agent_started`を記録し、runを`running`にする。
@@ -435,7 +437,7 @@ closeの成否は`task_runs.workspace_closed_at`で表す。nullは「閉じた�
 - **payload**: `op`（`create` / `create_named` / `capture` / `close` / `send_exit`（`send`と`send-key`）/ `exists` / `ensure_group`。`ask`の`notify`は記録しない（[人への通知](#人への通知cmux-notify)）。起動時の`preflight` / `preflight_detached`はcmuxに繋がるかの確認で、失敗すればコマンド自体が止まるので記録しない）、`workspace_id`（無い呼び出しはnull）、`timeout_secs`、`error`（先頭300文字）、`load_avg`（getloadavg(3)の1分値。取れなければnull）、`slots`、`parallel`。
 - **run**: runのための呼び出し（`create`、runの開いたworkspaceへの`capture` / `close` / `send_exit`）はそのrunのイベントとして`task_id`と`run_id`を持つ。workspaceからrunを引けない呼び出し（`up`のinbox / planner / supervisor workspaceの`create_named`と`exists`、queueのworkspace groupの`ensure_group`、`down`のsupervisor workspaceの`close`）は`task_id`も`run_id`も持たない（0012で`run_events`のCHECKがこのkindだけに認める）。
 - **slots / parallel**: supervisorの呼び出しはそのsupervisorのtokenのlease数（握っているslot）と`--parallel`。`up` / `down`の呼び出しは全leaseの数と、登録済みsupervisorの`parallel`の合計（登録が無ければnull）。
-- **記録する場所**: cmux adapterではなくapplication層の`runtime::RecordingBackend`（`WorkspaceBackend`を包むdecorator）が、`supervise`・`up`・`down`で渡されたbackendを包んで記録する（[ADR-0013](../adr/0013-layered-architecture-and-type-function-style.md)）。記録は自前の接続で書き、書けなくても呼び出し元へ返すエラーは元のまま。needs_sessionのresume（[`needs_session`](#needs_session)）の`create_resume`（runに記録）、`send_text`・`send_exit`・`close`・`exists`・`capture`も同じ経路を通る。resume workspaceのIDは`task_runs.workspace_id`に無いので、それらの失敗はrunを持たない記録になる（`create_resume`はrunに付く）。
+- **記録する場所**: cmux adapterではなくapplication層の`application::recording::RecordingBackend`（`WorkspaceBackend`を包むdecorator。`runtime::RecordingBackend`として再公開し、DBのpathから作る`new`は`runtime`にある）が、`supervise`・`up`・`down`で渡されたbackendを包んで記録する（[ADR-0013](../adr/0013-layered-architecture-and-type-function-style.md)。`supervise`ではユースケースが自分のtokenで包む）。記録は`QueueOpener`が開く自前の接続で書き、書けなくても呼び出し元へ返すエラーは元のまま。needs_sessionのresume（[`needs_session`](#needs_session)）の`create_resume`（runに記録）、`send_text`・`send_exit`・`close`・`exists`・`capture`も同じ経路を通る。resume workspaceのIDは`task_runs.workspace_id`に無いので、それらの失敗はrunを持たない記録になる（`create_resume`はrunに付く）。
 - 既存の記録はそのまま残す: closeの失敗は`cleanup_failed`、wrapper終了後の`read-screen`の失敗は`screen_capture_failed`で、どちらも同じ失敗を`backend_call_failed`としても記録する（呼び出しの直後なので`backend_call_failed`が先）。`/exit`後にsessionが終わらない`exit_request_timed_out`はcmuxの呼び出しの失敗ではないので`backend_call_failed`にならない（`backend_call_failed`になるのは`/exit`の送信（`send_exit`）そのものが失敗かtimeoutしたときだけ）。`create`の失敗（provisioningの失敗）と`/exit`の送信失敗はrunをabandonするが、`backend_call_failed`はabandonの`runtime_error`より前に入る。
 
 supervisorの再起動ではrunごとのleaseとheartbeatを確認し、孤児プロセスを勝手に再実行しない。wrapperが生きている（heartbeatが30秒以内か`exited_at`記録済み）`running` / `validating`のrunだけは、staleなleaseごと次のsupervisorが引き継いで同じrunを続ける（[ADR-0012](../adr/0012-adopt-stale-lease-of-live-wrapper.md)、[`supervise`](#supervise)の5）。それ以外（wrapperが死んだ・黙った、`claimed` / `starting`、`integrating`、leaseなし）はユーザーが`recover`で明示的に復旧した後に新しいTaskRunを作る。

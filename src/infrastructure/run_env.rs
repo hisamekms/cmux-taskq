@@ -8,10 +8,9 @@ use anyhow::{Context, Result, bail, ensure};
 use std::{
     fs,
     path::{Path, PathBuf},
-    process::ExitStatus,
 };
 
-use crate::application::Verifier;
+use crate::application::{Exit, Verifier};
 
 pub const CONFIG_FILE_NAME: &str = "dagq.toml";
 pub const QUEUE_DIR_VAR: &str = "DAGQ_QUEUE_DIR";
@@ -188,8 +187,8 @@ impl Verifier for ShellVerifier {
         cwd: &Path,
         env: &[(String, String)],
         log: &Path,
-    ) -> Result<ExitStatus> {
-        super::adapters::run_shell_to_log(command, cwd, env, log)
+    ) -> Result<Exit> {
+        super::adapters::run_shell_to_log(command, cwd, env, log).map(super::process::exit)
     }
 }
 

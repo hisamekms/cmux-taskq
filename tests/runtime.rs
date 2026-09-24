@@ -2,8 +2,8 @@ use anyhow::{Result, bail, ensure};
 use dagq::{
     VERSION,
     application::{
-        AgentProvider, Clock, Generators, IdGenerator, MainRemote, SupervisorEnvironment,
-        TaskStore, WorkspaceBackend, WorkspaceTags,
+        AgentProvider, Clock, CommandSpec, Generators, IdGenerator, MainRemote,
+        SupervisorEnvironment, TaskStore, WorkspaceBackend, WorkspaceTags,
     },
     domain::{
         AskKind, CommitSha, EvidenceCheck, GoalEdit, GoalId, NewAsk, NewGoal, NewTask, RunId,
@@ -188,9 +188,9 @@ struct TestProvider {
     db: PathBuf,
 }
 impl AgentProvider for TestProvider {
-    fn resume_command(&self, run: &TaskRun) -> Result<Command> {
+    fn resume_command(&self, run: &TaskRun) -> Result<CommandSpec> {
         let run_dir = run.run_dir().unwrap();
-        let mut command = Command::new("/bin/sh");
+        let mut command = CommandSpec::new("/bin/sh");
         command
             .current_dir(run.worktree_path().unwrap())
             .env("RUN_ID", run.id().as_str())
@@ -208,12 +208,12 @@ impl AgentProvider for TestProvider {
     fn wait_interval(&self) -> Duration {
         TEST_TICK
     }
-    fn review_command(&self, _: &TaskRun, _: &str) -> Result<Command> {
+    fn review_command(&self, _: &TaskRun, _: &str) -> Result<CommandSpec> {
         unreachable!("sessions do not review")
     }
     // `headless_command` keeps the default refusal: a run's provider has no
     // headless job, which the observer test relies on.
-    fn command(&self, run: &TaskRun, prompt: &str) -> Result<Command> {
+    fn command(&self, run: &TaskRun, prompt: &str) -> Result<CommandSpec> {
         assert!(prompt.contains("Acceptance criteria:"));
         assert!(prompt.contains("Verification commands (run in the worktree):"));
         // Every context section is present whether or not it has entries.
@@ -228,7 +228,7 @@ impl AgentProvider for TestProvider {
         )));
         // Background work is stopped before the receipt, or /exit stalls.
         assert!(prompt.contains(runtime::STOP_BACKGROUND), "{prompt}");
-        let mut command = Command::new("/bin/sh");
+        let mut command = CommandSpec::new("/bin/sh");
         command
             .current_dir(run.worktree_path().unwrap())
             .env("RUN_ID", run.id().as_str())
@@ -8702,20 +8702,20 @@ impl AgentProvider for ObserverProvider {
     fn preflight(&self) -> Result<()> {
         Ok(())
     }
-    fn command(&self, _: &TaskRun, _: &str) -> Result<Command> {
+    fn command(&self, _: &TaskRun, _: &str) -> Result<CommandSpec> {
         bail!("the observer has no run")
     }
-    fn resume_command(&self, _: &TaskRun) -> Result<Command> {
+    fn resume_command(&self, _: &TaskRun) -> Result<CommandSpec> {
         bail!("the observer has no run")
     }
-    fn headless_command(&self, cwd: &Path, prompt: &str, allowed: &[&str]) -> Result<Command> {
+    fn headless_command(&self, cwd: &Path, prompt: &str, allowed: &[&str]) -> Result<CommandSpec> {
         assert!(prompt.contains("You are the observer"), "{prompt}");
         assert_eq!(allowed, ["Bash(dagq:*)"]);
-        let mut command = Command::new("/bin/sh");
+        let mut command = CommandSpec::new("/bin/sh");
         command.current_dir(cwd).arg("-c").arg(&self.script);
         Ok(command)
     }
-    fn review_command(&self, _: &TaskRun, _: &str) -> Result<Command> {
+    fn review_command(&self, _: &TaskRun, _: &str) -> Result<CommandSpec> {
         bail!("the observer reviews no run")
     }
 }
@@ -9076,16 +9076,16 @@ impl AgentProvider for TestReviewer {
     fn preflight(&self) -> Result<()> {
         Ok(())
     }
-    fn command(&self, _: &TaskRun, _: &str) -> Result<Command> {
+    fn command(&self, _: &TaskRun, _: &str) -> Result<CommandSpec> {
         unreachable!("the reviewer starts no session")
     }
-    fn resume_command(&self, _: &TaskRun) -> Result<Command> {
+    fn resume_command(&self, _: &TaskRun) -> Result<CommandSpec> {
         unreachable!("the reviewer starts no session")
     }
     // A run that fails under these tests is triaged by this provider too:
     // with no triage script left, the triage fails and the run waits for a
     // person.
-    fn headless_command(&self, cwd: &Path, prompt: &str, tools: &[&str]) -> Result<Command> {
+    fn headless_command(&self, cwd: &Path, prompt: &str, tools: &[&str]) -> Result<CommandSpec> {
         assert_eq!(tools, runtime::TRIAGE_TOOLS);
         let mut triages = self.triages.lock().unwrap();
         ensure!(!triages.is_empty(), "the test reviewer has no triage left");
@@ -9093,11 +9093,11 @@ impl AgentProvider for TestReviewer {
             .lock()
             .unwrap()
             .push((prompt.into(), cwd.into()));
-        let mut command = Command::new("/bin/sh");
+        let mut command = CommandSpec::new("/bin/sh");
         command.current_dir(cwd).arg("-c").arg(triages.remove(0));
         Ok(command)
     }
-    fn review_command(&self, run: &TaskRun, prompt: &str) -> Result<Command> {
+    fn review_command(&self, run: &TaskRun, prompt: &str) -> Result<CommandSpec> {
         self.prompts.lock().unwrap().push(prompt.into());
         let mut scripts = self.scripts.lock().unwrap();
         let script = if scripts.len() > 1 {
@@ -9105,7 +9105,7 @@ impl AgentProvider for TestReviewer {
         } else {
             scripts[0].clone()
         };
-        let mut command = Command::new("/bin/sh");
+        let mut command = CommandSpec::new("/bin/sh");
         command
             .current_dir(run.worktree_path().unwrap())
             .arg("-c")

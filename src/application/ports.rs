@@ -3,13 +3,21 @@
 //! implements them and the entry points inject the implementations.
 
 use anyhow::Result;
-use std::{fmt, path::Path, process::ExitStatus, sync::Arc, time::SystemTime};
+use serde::Serialize;
+use std::{
+    ffi::{OsStr, OsString},
+    fmt, io,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::SystemTime,
+};
 
 use super::{GraphInput, TaskPage, TaskQuery, timestamp, unix_seconds};
 use crate::domain::{
-    ClaimOutcome, CommitSha, Goal, GoalDetail, GoalEdit, GoalId, GoalSummary, GoalVerdict, NewGoal,
-    NewNote, NewTask, NotePage, NoteQuery, Predecessor, RunEvent, RunId, RunLease, RunProcess,
-    RunStatus, SupervisorRegistration, Task, TaskAction, TaskDetail, TaskId, TaskRun,
+    Ask, AskOutcome, ClaimOutcome, CommitSha, EvidenceCheck, Goal, GoalDetail, GoalEdit, GoalId,
+    GoalSummary, GoalVerdict, NewAsk, NewGoal, NewNote, NewTask, NotePage, NoteQuery, Predecessor,
+    RunEvent, RunId, RunLease, RunPlan, RunProcess, RunStatus, SessionRole, SupervisorRegistration,
+    Task, TaskAction, TaskDetail, TaskId, TaskRun,
 };
 
 pub trait TaskStore {
@@ -53,14 +61,177 @@ pub trait TaskStore {
     fn notes(&self, query: &NoteQuery) -> Result<NotePage>;
 }
 
+/// A process to start: its program, arguments, environment changes and
+/// working directory, built like a command and started by a [`Spawner`],
+/// which also decides where its standard streams go.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CommandSpec {
+    program: OsString,
+    args: Vec<OsString>,
+    /// In the order given; `None` removes the variable.
+    envs: Vec<(OsString, Option<OsString>)>,
+    current_dir: Option<PathBuf>,
+}
+
+impl CommandSpec {
+    pub fn new(program: impl AsRef<OsStr>) -> Self {
+        Self {
+            program: program.as_ref().to_owned(),
+            ..Self::default()
+        }
+    }
+
+    pub fn arg(&mut self, arg: impl AsRef<OsStr>) -> &mut Self {
+        self.args.push(arg.as_ref().to_owned());
+        self
+    }
+
+    pub fn args<I, S>(&mut self, args: I) -> &mut Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        for arg in args {
+            self.arg(arg);
+        }
+        self
+    }
+
+    pub fn env(&mut self, key: impl AsRef<OsStr>, value: impl AsRef<OsStr>) -> &mut Self {
+        self.envs
+            .push((key.as_ref().to_owned(), Some(value.as_ref().to_owned())));
+        self
+    }
+
+    pub fn envs<I, K, V>(&mut self, vars: I) -> &mut Self
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: AsRef<OsStr>,
+        V: AsRef<OsStr>,
+    {
+        for (key, value) in vars {
+            self.env(key, value);
+        }
+        self
+    }
+
+    /// The process does not inherit `key`.
+    pub fn env_remove(&mut self, key: impl AsRef<OsStr>) -> &mut Self {
+        self.envs.push((key.as_ref().to_owned(), None));
+        self
+    }
+
+    pub fn current_dir(&mut self, dir: impl AsRef<Path>) -> &mut Self {
+        self.current_dir = Some(dir.as_ref().to_owned());
+        self
+    }
+
+    pub fn get_program(&self) -> &OsStr {
+        &self.program
+    }
+
+    pub fn get_args(&self) -> impl Iterator<Item = &OsStr> {
+        self.args.iter().map(OsString::as_os_str)
+    }
+
+    /// Every change to the environment in the order given; `None` removes.
+    pub fn get_envs(&self) -> impl Iterator<Item = (&OsStr, Option<&OsStr>)> {
+        self.envs
+            .iter()
+            .map(|(key, value)| (key.as_os_str(), value.as_deref()))
+    }
+
+    pub fn get_current_dir(&self) -> Option<&Path> {
+        self.current_dir.as_deref()
+    }
+}
+
+/// Where the standard streams of a started process go.
+#[derive(Debug, Clone, Copy)]
+pub enum Streams<'a> {
+    /// The starting process's own: the session wrapper's terminal.
+    Inherit,
+    /// Nowhere.
+    Null,
+    /// No input; stdout and stderr to these files, created or truncated.
+    Files { stdout: &'a Path, stderr: &'a Path },
+}
+
+/// How a process ended: `description` as the operating system words it
+/// (`exit status: 1`), `code` absent when a signal ended it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Exit {
+    pub success: bool,
+    pub code: Option<i32>,
+    pub description: String,
+}
+
+impl fmt::Display for Exit {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.description)
+    }
+}
+
+/// A process a [`Spawner`] started.
+pub trait Spawned: Send {
+    fn id(&self) -> u32;
+    /// `None` while it runs.
+    fn try_wait(&mut self) -> Result<Option<Exit>>;
+    fn kill(&mut self) -> Result<()>;
+    fn wait(&mut self) -> Result<Exit>;
+}
+
+/// Starts processes: the agent under the session wrapper, the headless
+/// review and triage jobs, and the observer.
+pub trait Spawner: Send + Sync {
+    fn spawn(&self, command: &CommandSpec, streams: Streams<'_>) -> Result<Box<dyn Spawned>>;
+}
+
+/// The files of the runs (the run directory, its prompt, the receipt and
+/// the idle marker) as the supervisor and the session wrapper read and
+/// write them. Errors are the operating system's, unchanged.
+pub trait RunFiles: Send + Sync {
+    /// Create `dir` and every missing parent.
+    fn create_dir_all(&self, dir: &Path) -> io::Result<()>;
+    /// Create `dir`, which must not exist yet.
+    fn create_new_dir(&self, dir: &Path) -> io::Result<()>;
+    fn write(&self, path: &Path, contents: &[u8]) -> io::Result<()>;
+    fn copy(&self, from: &Path, to: &Path) -> io::Result<()>;
+    fn read(&self, path: &Path) -> io::Result<Vec<u8>>;
+    fn read_to_string(&self, path: &Path) -> io::Result<String>;
+    /// When the file was last written.
+    fn modified(&self, path: &Path) -> io::Result<SystemTime>;
+    /// The modification time and the bytes of one open file, so both
+    /// belong to the same write; `None` when there is no file.
+    fn read_stamped(&self, path: &Path) -> Result<Option<(SystemTime, Vec<u8>)>>;
+    fn is_file(&self, path: &Path) -> bool;
+    fn is_dir(&self, path: &Path) -> bool;
+    fn exists(&self, path: &Path) -> bool;
+    /// The wall clock that stamps the files: a time compared with a
+    /// file's modification time is read here, not from the [`Clock`].
+    fn now(&self) -> SystemTime;
+}
+
+/// Where the supervisor's progress messages go.
+pub trait NoteLog: Send + Sync {
+    fn note(&self, message: &str);
+}
+
+/// Opens connections to the queue: the supervisor's own, and one for each
+/// thread that works beside its loop (the heartbeat, validations,
+/// landings).
+pub trait QueueOpener: Send + Sync {
+    fn open(&self) -> Result<Box<dyn Queue + Send>>;
+}
+
 /// Provider-specific CLI construction is kept outside supervisor orchestration.
 pub trait AgentProvider {
     fn preflight(&self) -> Result<()>;
-    fn command(&self, run: &crate::domain::TaskRun, prompt: &str) -> Result<std::process::Command>;
+    fn command(&self, run: &crate::domain::TaskRun, prompt: &str) -> Result<CommandSpec>;
     /// The same session reopened for a `needs_session` run (ADR-0019): the
     /// run's own settings and idle marker, without a prompt; the supervisor
     /// sends the resolution request to the terminal once it is up.
-    fn resume_command(&self, run: &crate::domain::TaskRun) -> Result<std::process::Command>;
+    fn resume_command(&self, run: &crate::domain::TaskRun) -> Result<CommandSpec>;
     /// A headless run of the agent for a job without a workspace (ADR-0024
     /// decision 2): `prompt` in `cwd`, allowed only `allowed_tools` beyond
     /// what needs no permission. The caller sets the environment and where
@@ -70,7 +241,7 @@ pub trait AgentProvider {
         cwd: &std::path::Path,
         prompt: &str,
         allowed_tools: &[&str],
-    ) -> Result<std::process::Command> {
+    ) -> Result<CommandSpec> {
         let _ = (cwd, prompt, allowed_tools);
         anyhow::bail!("this provider has no headless execution")
     }
@@ -92,11 +263,7 @@ pub trait AgentProvider {
     /// stdout is the verdict JSON. It must not touch the worker session's
     /// idle marker. The runtime wires stdin, stdout and stderr, waits at
     /// most [`AgentProvider::review_timeout`] and reads stdout.
-    fn review_command(
-        &self,
-        run: &crate::domain::TaskRun,
-        prompt: &str,
-    ) -> Result<std::process::Command>;
+    fn review_command(&self, run: &crate::domain::TaskRun, prompt: &str) -> Result<CommandSpec>;
     /// How long the headless review may take before it counts as failed.
     fn review_timeout(&self) -> std::time::Duration {
         std::time::Duration::from_secs(600)
@@ -342,6 +509,65 @@ pub struct Landing {
     pub verification_skipped: bool,
 }
 
+/// Outcome of supervisor-side receipt validation. `result_commit` is kept on
+/// rejection too when the commit itself was verified, so inspection can start there.
+/// A rejection for nothing but `evidence_missing` (the task's required checks
+/// the receipt does not back, ADR-0019 decision 5) parks the run as
+/// `needs_session` instead of failing it, and so does one for a diff that
+/// changes `scope_violation`, paths none of the task's `allowed_paths`
+/// match (ADR-0029).
+#[derive(Debug, Serialize)]
+pub struct Validation {
+    pub accepted: bool,
+    pub result_commit: Option<CommitSha>,
+    pub reason: Option<String>,
+    pub receipt: serde_json::Value,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub evidence_missing: Vec<EvidenceCheck>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub scope_violation: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub allowed_paths: Vec<String>,
+}
+
+/// A `needs_session` run as the supervisor judges it for a resume.
+#[derive(Debug, Clone)]
+pub struct ResumeCandidate {
+    pub run: TaskRun,
+    pub lease: Option<RunLease>,
+    /// The latest session's wrapper registration.
+    pub wrapper: Option<RunProcess>,
+    /// `resume_started` events so far.
+    pub attempts: usize,
+}
+
+/// What the triage does to a run once it has its verdict (ADR-0024
+/// decision 3), after the runtime's own rules (no retry of a task that
+/// failed twice, no resume past the attempts or without a worktree).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TriageAction {
+    /// The task goes back to `ready`; the next claim makes a new run.
+    Retry,
+    /// The run becomes `needs_session` with `instruction` as `last_error`,
+    /// and the supervisor resumes it (ADR-0019 decision 1).
+    Resume { instruction: String },
+    /// The run stays; the `decide` ask `ask_id` waits for a person.
+    Ask { ask_id: i64 },
+}
+
+impl TriageAction {
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Retry => "retry",
+            Self::Resume { .. } => "resume",
+            Self::Ask { .. } => "ask",
+        }
+    }
+}
+
+/// `asked_by` of the triage's `decide` asks: the supervisor that triaged.
+pub const TRIAGE_ASKER: &str = "supervisor";
+
 /// The durable state of runs: their leases, the supervisors that hold
 /// them, their events and the integration slot. Every transition that
 /// takes a `token` is refused unless that token holds the run's lease, so
@@ -447,12 +673,147 @@ pub trait RunStore {
     fn repository_binding(&self) -> Result<Option<String>>;
     fn bind_repository(&mut self, common_dir: &str) -> Result<()>;
     fn assert_repository(&self, common_dir: &str) -> Result<()>;
+    /// [`RunStore::claim_for_supervisor`], taking the first task of `order`
+    /// that is still claimable.
+    fn claim_for_supervisor_in_order(
+        &mut self,
+        base_commit: &CommitSha,
+        token: &str,
+        order: &[TaskId],
+    ) -> Result<ClaimOutcome>;
+    /// One heartbeat of the process `token`: its registration and every
+    /// lease it holds; how many leases there were.
+    fn heartbeat(&mut self, token: &str) -> Result<usize>;
+    /// The processes registered for the run (its wrapper and agent).
+    fn processes(&self, id: &RunId) -> Result<Vec<RunProcess>>;
+    /// Record a runtime error on the run without changing its status.
+    fn record_runtime_error(&mut self, id: &RunId, message: &str) -> Result<()>;
+    /// Save the paths a claimed run is provisioned at.
+    fn plan_run(&mut self, id: &RunId, token: &str, plan: &RunPlan) -> Result<()>;
+    fn workspace_created(&mut self, id: &RunId, token: &str, workspace: &str) -> Result<()>;
+    /// The session's wrapper exited: the run moves on by its exit code.
+    fn finish_supervision(&mut self, id: &RunId, token: &str) -> Result<TaskRun>;
+    /// The session went idle after its receipt and stays open: validating.
+    fn finish_supervision_live(&mut self, id: &RunId, token: &str) -> Result<TaskRun>;
+    fn finish_validation(
+        &mut self,
+        id: &RunId,
+        token: &str,
+        validation: &Validation,
+    ) -> Result<TaskRun>;
+    /// Validate a rewritten receipt again.
+    fn restart_validation(&mut self, id: &RunId, token: &str) -> Result<TaskRun>;
+    /// Apply a person's answer to an `approve_landing` ask.
+    fn decide_landing(
+        &mut self,
+        id: &RunId,
+        status: RunStatus,
+        reason: &str,
+        payload: serde_json::Value,
+    ) -> Result<TaskRun>;
+    /// The latest `failed` / `interrupted` run of every task in progress.
+    fn runs_to_triage(&self) -> Result<Vec<TaskRun>>;
+    /// Take the run's lease for its triage; the attempt, or `None` when
+    /// another process has it.
+    fn begin_triage(&mut self, id: &RunId, token: &str) -> Result<Option<(TaskRun, usize)>>;
+    fn finish_triage(
+        &mut self,
+        id: &RunId,
+        token: &str,
+        action: &TriageAction,
+        payload: serde_json::Value,
+    ) -> Result<TaskRun>;
+    fn triage_closed_workspace(&mut self, id: &RunId, workspace_id: &str) -> Result<()>;
+    /// Apply a person's answer to the triage's `decide` ask.
+    fn decide_triage(
+        &mut self,
+        id: &RunId,
+        ask_id: i64,
+        answer: &str,
+        reason: &str,
+    ) -> Result<TaskRun>;
+    fn runs_needing_session(&self) -> Result<Vec<ResumeCandidate>>;
+    /// Take the lease of a `needs_session` run for a resume; the attempt.
+    fn begin_resume(
+        &mut self,
+        id: &RunId,
+        token: &str,
+        main: &CommitSha,
+        reason: Option<&str>,
+        max_attempts: usize,
+    ) -> Result<Option<(TaskRun, usize)>>;
+    fn finish_resume(
+        &mut self,
+        id: &RunId,
+        token: &str,
+        status: Option<RunStatus>,
+        reason: Option<&str>,
+        keep_lease: bool,
+        payload: serde_json::Value,
+    ) -> Result<TaskRun>;
+    /// Move a run an earlier resume resolved on without a session.
+    fn skip_resume(
+        &mut self,
+        id: &RunId,
+        token: &str,
+        head: &CommitSha,
+        main: &CommitSha,
+        approved: bool,
+    ) -> Result<Option<TaskRun>>;
+    /// Fail a run whose resumes are used up, naming the ask for a person.
+    fn exhaust_resumes(
+        &mut self,
+        id: &RunId,
+        max_attempts: usize,
+        ask_id: i64,
+        reason: &str,
+    ) -> Result<Option<TaskRun>>;
+    /// When an observation of `mode` last started or finished.
+    fn last_observe(&self, mode: &str) -> Result<Option<i64>>;
+    /// The workspace `up` recorded for `role`.
+    fn session_workspace(&self, role: SessionRole) -> Result<Option<String>>;
+    fn register_wrapper(&mut self, id: &RunId, token: &str, pid: u32) -> Result<()>;
+    fn register_resume_wrapper(&mut self, id: &RunId, token: &str, pid: u32) -> Result<()>;
+    fn register_agent(&mut self, id: &RunId, wrapper_pid: u32, agent_pid: u32) -> Result<()>;
+    fn register_resume_agent(&mut self, id: &RunId, wrapper_pid: u32, agent_pid: u32)
+    -> Result<()>;
+    fn heartbeat_wrapper(&self, id: &RunId, pid: u32) -> Result<()>;
+    fn wrapper_exited(&mut self, id: &RunId, pid: u32, exit_code: i32) -> Result<()>;
+    /// The run whose workspace is `workspace_id`, the latest one first.
+    fn run_in_workspace(&self, workspace_id: &str) -> Result<Option<RunId>>;
+    /// The leases `token` holds (every lease with `None`) and the
+    /// `parallel` it registered (null without a supervisor).
+    fn backend_slots(&self, token: Option<&str>) -> Result<(i64, Option<i64>)>;
+    /// Record `backend_call_failed`, on `run` when the call was for one.
+    fn record_backend_failure(&self, run: Option<&RunId>, payload: serde_json::Value)
+    -> Result<()>;
 }
 
-/// The queue a use case works on: its tasks and goals and its runs.
-pub trait Queue: TaskStore + RunStore {}
+/// The questions the runtime and its sessions put to a person (ADR-0022).
+pub trait AskStore {
+    /// Register an ask, or return the open one it repeats.
+    fn ask(&mut self, ask: NewAsk) -> Result<AskOutcome>;
+    fn answer(&mut self, id: i64, text: &str) -> Result<Ask>;
+    fn close_ask(&mut self, id: i64) -> Result<Ask>;
+    /// Answered `approve_landing` asks nobody closed.
+    fn landing_answers(&self) -> Result<Vec<Ask>>;
+    /// Answered `decide` asks of the triage nobody closed.
+    fn triage_answers(&self) -> Result<Vec<Ask>>;
+    /// Answered `worker_question` asks of the run not yet delivered.
+    fn undelivered_answers(&self, run_id: &RunId) -> Result<Vec<Ask>>;
+    fn ask_delivered(&mut self, id: i64, workspace_id: &str) -> Result<Ask>;
+    fn has_stuck_exit_ask(&self, run_id: &RunId) -> Result<bool>;
+    fn has_unclosed_worker_question(&self, run_id: &RunId) -> Result<bool>;
+    /// Close the run's `stuck_exit` asks nobody closed, with `answer`.
+    fn close_stuck_exit_asks(&mut self, run_id: &RunId, answer: &str) -> Result<Vec<Ask>>;
+    /// Close the run's `answer_prompt` asks nobody closed, with `answer`.
+    fn close_answer_prompt_asks(&mut self, run_id: &RunId, answer: &str) -> Result<Vec<Ask>>;
+}
 
-impl<T: TaskStore + RunStore + ?Sized> Queue for T {}
+/// The queue a use case works on: its tasks and goals, its runs and its asks.
+pub trait Queue: TaskStore + RunStore + AskStore {}
+
+impl<T: TaskStore + RunStore + AskStore + ?Sized> Queue for T {}
 
 /// The Git operations `integrate` and the supervisor use on the repository
 /// the queue is bound to and on its run worktrees. Commits are named by
@@ -486,6 +847,15 @@ pub trait Repository {
     fn remove_worktree_and_branch(&self, worktree: &Path, branch: &str) -> Result<()>;
     /// The worktree that has `main` checked out, if any.
     fn main_checkout(&self) -> Result<Option<std::path::PathBuf>>;
+    /// Add the run's worktree on its new branch from its base commit; Git's
+    /// output.
+    fn create_worktree(&self, run: &TaskRun) -> Result<String>;
+    /// The paths `git merge-tree` finds conflicting between two commits,
+    /// without touching a worktree; empty when they merge cleanly.
+    fn merge_conflicts(&self, main: &str, head: &str) -> Result<Vec<String>>;
+    /// The tasks landed between two commits, oldest first, from their
+    /// `Dagq-Task` trailers.
+    fn landed_task_ids(&self, base: &str, head: &str) -> Result<Vec<TaskId>>;
 }
 
 /// Runs a task's verification commands for `integrate` (ADR-0023
@@ -500,5 +870,5 @@ pub trait Verifier {
         cwd: &Path,
         env: &[(String, String)],
         log: &Path,
-    ) -> Result<ExitStatus>;
+    ) -> Result<Exit>;
 }

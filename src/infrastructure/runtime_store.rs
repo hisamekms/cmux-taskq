@@ -3,7 +3,6 @@ use std::collections::HashMap;
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
-use serde::Serialize;
 use serde_json::json;
 
 use super::{
@@ -12,14 +11,15 @@ use super::{
         SqliteQueue, claim_task, enum_col, event, event_row, read_task, run_row, stored_run_row,
     },
 };
-use crate::application::{RunStore, timestamp, unix_seconds};
+use crate::application::{AskStore, RunStore, timestamp, unix_seconds};
 use crate::domain::{
-    ClaimOutcome, CommitSha, DomainError, EvidenceCheck, GoalId, RunEvent, RunId, RunLease,
-    RunProcess, RunStatus, SessionRole, SupervisorMode, SupervisorRegistration, Task, TaskAction,
-    TaskId, TaskRun, run,
+    ClaimOutcome, CommitSha, DomainError, GoalId, RunEvent, RunId, RunLease, RunProcess, RunStatus,
+    SessionRole, SupervisorMode, SupervisorRegistration, Task, TaskAction, TaskId, TaskRun, run,
 };
 
-pub use crate::application::{Landing, LeasedRun};
+pub use crate::application::{
+    Landing, LeasedRun, ResumeCandidate, TRIAGE_ASKER, TriageAction, Validation,
+};
 pub use crate::domain::{HEARTBEAT_TIMEOUT_SECS, RunPlan};
 
 /// Whether a lease no longer has a working process behind it: its pid is
@@ -27,38 +27,6 @@ pub use crate::domain::{HEARTBEAT_TIMEOUT_SECS, RunPlan};
 /// `status` / `doctor` report as `stale` and the one adoption re-checks.
 pub fn lease_is_stale(lease: &RunLease, now: i64) -> bool {
     !process_alive(lease.pid) || now - lease.heartbeat_at > HEARTBEAT_TIMEOUT_SECS
-}
-
-/// Outcome of supervisor-side receipt validation. `result_commit` is kept on
-/// rejection too when the commit itself was verified, so inspection can start there.
-/// A rejection for nothing but `evidence_missing` (the task's required checks
-/// the receipt does not back, ADR-0019 decision 5) parks the run as
-/// `needs_session` instead of failing it, and so does one for a diff that
-/// changes `scope_violation`, paths none of the task's `allowed_paths`
-/// match (ADR-0029).
-#[derive(Debug, Serialize)]
-pub struct Validation {
-    pub accepted: bool,
-    pub result_commit: Option<CommitSha>,
-    pub reason: Option<String>,
-    pub receipt: serde_json::Value,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub evidence_missing: Vec<EvidenceCheck>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub scope_violation: Vec<String>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub allowed_paths: Vec<String>,
-}
-
-/// A `needs_session` run as the supervisor judges it for a resume.
-#[derive(Debug, Clone)]
-pub struct ResumeCandidate {
-    pub run: TaskRun,
-    pub lease: Option<RunLease>,
-    /// The latest session's wrapper registration.
-    pub wrapper: Option<RunProcess>,
-    /// `resume_started` events so far.
-    pub attempts: usize,
 }
 
 impl SqliteQueue {
@@ -1665,30 +1633,6 @@ impl SqliteQueue {
     }
 }
 
-/// What the triage does to a run once it has its verdict (ADR-0024
-/// decision 3), after the runtime's own rules (no retry of a task that
-/// failed twice, no resume past the attempts or without a worktree).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum TriageAction {
-    /// The task goes back to `ready`; the next claim makes a new run.
-    Retry,
-    /// The run becomes `needs_session` with `instruction` as `last_error`,
-    /// and the supervisor resumes it (ADR-0019 decision 1).
-    Resume { instruction: String },
-    /// The run stays; the `decide` ask `ask_id` waits for a person.
-    Ask { ask_id: i64 },
-}
-
-impl TriageAction {
-    pub const fn as_str(&self) -> &'static str {
-        match self {
-            Self::Retry => "retry",
-            Self::Resume { .. } => "resume",
-            Self::Ask { .. } => "ask",
-        }
-    }
-}
-
 impl SqliteQueue {
     /// The latest run of every `in_progress` task that is `failed` or
     /// `interrupted`, oldest first: the runs the triage looks at. An older
@@ -2039,9 +1983,6 @@ impl SqliteQueue {
             .collect())
     }
 }
-
-/// `asked_by` of the triage's `decide` asks: the supervisor that triaged.
-pub const TRIAGE_ASKER: &str = "supervisor";
 
 /// The run as stored (its paths not relocated), for a command to start from.
 fn stored_run(conn: &Connection, id: &RunId) -> Result<Option<TaskRun>> {
@@ -2401,5 +2342,225 @@ impl RunStore for SqliteQueue {
     }
     fn assert_repository(&self, common_dir: &str) -> Result<()> {
         SqliteQueue::assert_repository(self, common_dir)
+    }
+    fn claim_for_supervisor_in_order(
+        &mut self,
+        base_commit: &CommitSha,
+        token: &str,
+        order: &[TaskId],
+    ) -> Result<ClaimOutcome> {
+        SqliteQueue::claim_for_supervisor_in_order(self, base_commit, token, order)
+    }
+    fn heartbeat(&mut self, token: &str) -> Result<usize> {
+        SqliteQueue::heartbeat(self, token)
+    }
+    fn processes(&self, id: &RunId) -> Result<Vec<RunProcess>> {
+        SqliteQueue::processes(self, id)
+    }
+    fn record_runtime_error(&mut self, id: &RunId, message: &str) -> Result<()> {
+        SqliteQueue::record_runtime_error(self, id, message)
+    }
+    fn plan_run(&mut self, id: &RunId, token: &str, plan: &crate::domain::RunPlan) -> Result<()> {
+        SqliteQueue::plan_run(self, id, token, plan)
+    }
+    fn workspace_created(&mut self, id: &RunId, token: &str, workspace: &str) -> Result<()> {
+        SqliteQueue::workspace_created(self, id, token, workspace)
+    }
+    fn finish_supervision(&mut self, id: &RunId, token: &str) -> Result<TaskRun> {
+        SqliteQueue::finish_supervision(self, id, token)
+    }
+    fn finish_supervision_live(&mut self, id: &RunId, token: &str) -> Result<TaskRun> {
+        SqliteQueue::finish_supervision_live(self, id, token)
+    }
+    fn finish_validation(
+        &mut self,
+        id: &RunId,
+        token: &str,
+        validation: &Validation,
+    ) -> Result<TaskRun> {
+        SqliteQueue::finish_validation(self, id, token, validation)
+    }
+    fn restart_validation(&mut self, id: &RunId, token: &str) -> Result<TaskRun> {
+        SqliteQueue::restart_validation(self, id, token)
+    }
+    fn decide_landing(
+        &mut self,
+        id: &RunId,
+        status: RunStatus,
+        reason: &str,
+        payload: serde_json::Value,
+    ) -> Result<TaskRun> {
+        SqliteQueue::decide_landing(self, id, status, reason, payload)
+    }
+    fn runs_to_triage(&self) -> Result<Vec<TaskRun>> {
+        SqliteQueue::runs_to_triage(self)
+    }
+    fn begin_triage(&mut self, id: &RunId, token: &str) -> Result<Option<(TaskRun, usize)>> {
+        SqliteQueue::begin_triage(self, id, token)
+    }
+    fn finish_triage(
+        &mut self,
+        id: &RunId,
+        token: &str,
+        action: &TriageAction,
+        payload: serde_json::Value,
+    ) -> Result<TaskRun> {
+        SqliteQueue::finish_triage(self, id, token, action, payload)
+    }
+    fn triage_closed_workspace(&mut self, id: &RunId, workspace_id: &str) -> Result<()> {
+        SqliteQueue::triage_closed_workspace(self, id, workspace_id)
+    }
+    fn decide_triage(
+        &mut self,
+        id: &RunId,
+        ask_id: i64,
+        answer: &str,
+        reason: &str,
+    ) -> Result<TaskRun> {
+        SqliteQueue::decide_triage(self, id, ask_id, answer, reason)
+    }
+    fn runs_needing_session(&self) -> Result<Vec<ResumeCandidate>> {
+        SqliteQueue::runs_needing_session(self)
+    }
+    fn begin_resume(
+        &mut self,
+        id: &RunId,
+        token: &str,
+        main: &CommitSha,
+        reason: Option<&str>,
+        max_attempts: usize,
+    ) -> Result<Option<(TaskRun, usize)>> {
+        SqliteQueue::begin_resume(self, id, token, main, reason, max_attempts)
+    }
+    fn finish_resume(
+        &mut self,
+        id: &RunId,
+        token: &str,
+        status: Option<RunStatus>,
+        reason: Option<&str>,
+        keep_lease: bool,
+        payload: serde_json::Value,
+    ) -> Result<TaskRun> {
+        SqliteQueue::finish_resume(self, id, token, status, reason, keep_lease, payload)
+    }
+    fn skip_resume(
+        &mut self,
+        id: &RunId,
+        token: &str,
+        head: &CommitSha,
+        main: &CommitSha,
+        approved: bool,
+    ) -> Result<Option<TaskRun>> {
+        SqliteQueue::skip_resume(self, id, token, head, main, approved)
+    }
+    fn exhaust_resumes(
+        &mut self,
+        id: &RunId,
+        max_attempts: usize,
+        ask_id: i64,
+        reason: &str,
+    ) -> Result<Option<TaskRun>> {
+        SqliteQueue::exhaust_resumes(self, id, max_attempts, ask_id, reason)
+    }
+    fn last_observe(&self, mode: &str) -> Result<Option<i64>> {
+        SqliteQueue::last_observe(self, mode)
+    }
+    fn session_workspace(&self, role: SessionRole) -> Result<Option<String>> {
+        SqliteQueue::session_workspace(self, role)
+    }
+    fn register_wrapper(&mut self, id: &RunId, token: &str, pid: u32) -> Result<()> {
+        SqliteQueue::register_wrapper(self, id, token, pid)
+    }
+    fn register_resume_wrapper(&mut self, id: &RunId, token: &str, pid: u32) -> Result<()> {
+        SqliteQueue::register_resume_wrapper(self, id, token, pid)
+    }
+    fn register_agent(&mut self, id: &RunId, wrapper_pid: u32, agent_pid: u32) -> Result<()> {
+        SqliteQueue::register_agent(self, id, wrapper_pid, agent_pid)
+    }
+    fn register_resume_agent(
+        &mut self,
+        id: &RunId,
+        wrapper_pid: u32,
+        agent_pid: u32,
+    ) -> Result<()> {
+        SqliteQueue::register_resume_agent(self, id, wrapper_pid, agent_pid)
+    }
+    fn heartbeat_wrapper(&self, id: &RunId, pid: u32) -> Result<()> {
+        SqliteQueue::heartbeat_wrapper(self, id, pid)
+    }
+    fn wrapper_exited(&mut self, id: &RunId, pid: u32, exit_code: i32) -> Result<()> {
+        SqliteQueue::wrapper_exited(self, id, pid, exit_code)
+    }
+    fn run_in_workspace(&self, workspace_id: &str) -> Result<Option<RunId>> {
+        SqliteQueue::run_in_workspace(self, workspace_id)
+    }
+    fn backend_slots(&self, token: Option<&str>) -> Result<(i64, Option<i64>)> {
+        SqliteQueue::backend_slots(self, token)
+    }
+    fn record_backend_failure(
+        &self,
+        run: Option<&RunId>,
+        payload: serde_json::Value,
+    ) -> Result<()> {
+        SqliteQueue::record_backend_failure(self, run, payload)
+    }
+}
+
+impl AskStore for SqliteQueue {
+    fn ask(&mut self, ask: crate::domain::NewAsk) -> Result<crate::domain::AskOutcome> {
+        SqliteQueue::ask(self, ask)
+    }
+    fn answer(&mut self, id: i64, text: &str) -> Result<crate::domain::Ask> {
+        SqliteQueue::answer(self, id, text)
+    }
+    fn close_ask(&mut self, id: i64) -> Result<crate::domain::Ask> {
+        SqliteQueue::close_ask(self, id)
+    }
+    fn landing_answers(&self) -> Result<Vec<crate::domain::Ask>> {
+        SqliteQueue::landing_answers(self)
+    }
+    fn triage_answers(&self) -> Result<Vec<crate::domain::Ask>> {
+        SqliteQueue::triage_answers(self)
+    }
+    fn undelivered_answers(&self, run_id: &RunId) -> Result<Vec<crate::domain::Ask>> {
+        SqliteQueue::undelivered_answers(self, run_id)
+    }
+    fn ask_delivered(&mut self, id: i64, workspace_id: &str) -> Result<crate::domain::Ask> {
+        SqliteQueue::ask_delivered(self, id, workspace_id)
+    }
+    fn has_stuck_exit_ask(&self, run_id: &RunId) -> Result<bool> {
+        SqliteQueue::has_stuck_exit_ask(self, run_id)
+    }
+    fn has_unclosed_worker_question(&self, run_id: &RunId) -> Result<bool> {
+        SqliteQueue::has_unclosed_worker_question(self, run_id)
+    }
+    fn close_stuck_exit_asks(
+        &mut self,
+        run_id: &RunId,
+        answer: &str,
+    ) -> Result<Vec<crate::domain::Ask>> {
+        SqliteQueue::close_stuck_exit_asks(self, run_id, answer)
+    }
+    fn close_answer_prompt_asks(
+        &mut self,
+        run_id: &RunId,
+        answer: &str,
+    ) -> Result<Vec<crate::domain::Ask>> {
+        SqliteQueue::close_answer_prompt_asks(self, run_id, answer)
+    }
+}
+
+/// Opens the queue at `db` with `generators` for each connection the
+/// supervisor needs.
+pub struct SqliteOpener {
+    pub db: std::path::PathBuf,
+    pub generators: crate::application::Generators,
+}
+
+impl crate::application::QueueOpener for SqliteOpener {
+    fn open(&self) -> Result<Box<dyn crate::application::Queue + Send>> {
+        Ok(Box::new(
+            SqliteQueue::open(&self.db)?.with_generators(self.generators.clone()),
+        ))
     }
 }
