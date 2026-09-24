@@ -1,6 +1,6 @@
 ---
 name: dagq-session
-description: Act on a dagq run's own Claude session in its cmux workspace: answer the trust or permission prompt a running worker (or a session the runtime resumed) stops at, answer a worker's worker_question ask (or forward it to the person as a decide ask), act on the answer of a stuck_exit ask (a session that held the supervisor's /exit back) by answering its dialog and sending /exit, close the workspace of a failed or interrupted run, and hand the person, through a decide ask, a needs_session run the runtime gave up resuming. Use when status or watch reports "resume session", "answer the prompt in workspace <id>", "send the answer of ask <id> to the worker and close it" or "inspect and close workspace", when a stuck_exit ask is answered, when status lists a worker_question ask, or a running run makes no progress. "resuming (runtime)" needs nothing. Not for landing (dagq-land) or a dead lease (dagq-recover).
+description: Act on a dagq run's own Claude session in its cmux workspace: answer the trust or permission prompt a running worker (or a session the runtime resumed) stops at, answer a worker's worker_question ask (or forward it to the person as a decide ask), act on the answer of a stuck_exit ask (a session that held the supervisor's /exit back) by answering its dialog and sending /exit, and hand the person, through a decide ask, a needs_session run the runtime gave up resuming. Use when status or watch reports "resume session", "answer the prompt in workspace <id>" or "send the answer of ask <id> to the worker and close it", when a stuck_exit ask is answered, when status lists a worker_question ask, or a running run makes no progress. "resuming (runtime)" and "triaging (runtime)" need nothing. Not for landing (dagq-land) or a dead lease (dagq-recover).
 ---
 
 # dagq: act on a run's session
@@ -33,15 +33,9 @@ A worker that needs a decision registers a `worker_question` ask (`--run`) and s
 
 When a session does not exit within the exit timeout of the supervisor's `/exit` (`exit_request_timed_out`), something in it, usually one of Claude Code's own dialogs such as "Background work is running", holds the exit back. The supervisor does not send `/exit` while the session's idle marker lists background work `running`, so the dialog means the work outlived the wait or started later. The run stays where it is with its lease (after a verdict `awaiting_integration`, `needs_session` or `failed`; on the older path `running`; a resumed session is let go instead, its run `needs_session` without a lease), and the supervisor registers a `stuck_exit` ask on it (`asked_by` `supervisor`, options `exit` / `wait`, the last 15 lines of the screen in the question) that the inbox shows the person. Do not act before it is answered, do not `recover` the run and do not `ready` the task again. On its `read the answer of ask <id> and close it`, read the ask with `"$DAGQ" asks --role maintainer` and follow `${CLAUDE_PLUGIN_ROOT}/skills/dagq-session/reference/stuck-exit.md`: read the screen, check the worktree and receipt before choosing "Exit and stop tasks", answer the dialog, send `/exit`. Judge whether the session is gone by its wrapper and screen, not the run's status. Once it exits, the supervisor closes the ask and moves the run on by its status (the reference lists how). The supervisor never resends `/exit`, and any drain waits for this run until its session exits.
 
-## 4. Close the workspace of a failed or interrupted run
+## 4. Failed and interrupted runs: the runtime triages them
 
-Attention `inspect and close workspace`: the runtime keeps the workspace of a `failed` or `interrupted` run for inspection. Report `last_error`; closing discards the screen, so read it first when `last_error` is not enough, then close it:
-
-```sh
-cmux workspace close <workspace_id>
-```
-
-The worktree, branch and run directory stay for manual cleanup. Retrying is the person's decision: register a `decide` ask on the run (`--option ready --option cancel`) and, on its answer, run `"$DAGQ" ready ID` (a new run) or `cancel ID`.
+The supervisor triages a `failed` or `interrupted` run itself (`next: triaging (runtime)`): its headless triage retries the task, resumes the run, or opens a `decide` ask for the inbox, and the supervisor then closes the run's workspace. Do not close it or `ready` the task yourself. Only a triage that failed (`triage by hand`) is a person's: the `dagq-recover` skill.
 
 ## 5. needs_session runs: the runtime resumes them
 

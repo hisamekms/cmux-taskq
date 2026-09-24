@@ -32,8 +32,8 @@ Read, in this order:
 2. `attention`: what waits for you now. Each entry has `run_id`, `task_id`, `status`, `kind`, `last_error` and a fixed `next`. Route it:
    - `review by hand` / `review and integrate`: `dagq-land`; `reviewing (runtime)`: nothing.
    - `resuming (runtime)` (`needs_session`): the supervisor is resolving it; nothing to do.
-   - `resume session` (`needs_session` the runtime gave up), `inspect and close workspace` (`failed`), `answer the prompt in workspace <id>` (`prompt_waiting`: a worker stopped at a dialog), `send the answer of ask <id> to the worker and close it`: the `dagq-session` skill.
-   - `recover run` (`kind` `runtime_error`: an unfinished run left without a lease): the `dagq-recover` skill.
+   - `resume session` (`needs_session` the runtime gave up), `answer the prompt in workspace <id>` (`prompt_waiting`: a worker stopped at a dialog), `send the answer of ask <id> to the worker and close it`: the `dagq-session` skill.
+   - `recover run` (a leaseless unfinished run whose session lives), `triage by hand` (`triage_failed`): `dagq-recover`; `triaging (runtime)`: nothing.
    - `restart supervisor` (`supervisor_stale`, `supervisor_stopped`): `up` as in step 1.
    - `push main` (`push_failed` on an `integrated` run): landed but not pushed; `dagq-land`, step 6.
    - `read the answer of ask <id> and close it` (`kind` `ask_answered`): an ask was answered; act on it as in step 4.

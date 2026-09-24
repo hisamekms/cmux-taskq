@@ -6,7 +6,9 @@ use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
 use serde_json::json;
 
 use super::sqlite::{SqliteQueue, enum_col, json_col};
-use crate::domain::{Ask, AskKind, AskOutcome, LANDING_OPTIONS, NewAsk, RunStatus, SessionRole};
+use crate::domain::{
+    Ask, AskKind, AskOutcome, LANDING_OPTIONS, NewAsk, RunStatus, SessionRole, TRIAGE_OPTIONS,
+};
 
 /// Which asks `asks` lists. By default the ones nobody closed; `all` adds
 /// the closed ones, `open` keeps only the unanswered ones, and `role` keeps
@@ -129,6 +131,22 @@ impl SqliteQueue {
             payload["runtime_delivers"] = json!(
                 status == RunStatus::AwaitingIntegration.as_str()
                     && LANDING_OPTIONS.contains(&text.trim())
+            );
+        }
+        if ask.kind == AskKind::Decide
+            && ask.asked_by == super::runtime_store::TRIAGE_ASKER
+            && let Some(run_id) = ask.run_id.as_deref()
+        {
+            // The supervisor retries, resumes or cancels a triaged run as
+            // answered (ADR-0024 decision 3); any other answer, or one for
+            // a run that moved on, is a person's to read.
+            let status: String =
+                tx.query_row("SELECT status FROM task_runs WHERE id=?1", [run_id], |r| {
+                    r.get(0)
+                })?;
+            payload["runtime_delivers"] = json!(
+                (status == RunStatus::Failed.as_str() || status == RunStatus::Interrupted.as_str())
+                    && TRIAGE_OPTIONS.contains(&text.trim())
             );
         }
         ask_event(

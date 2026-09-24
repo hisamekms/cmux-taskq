@@ -31,5 +31,5 @@ Once the session exits, the supervisor moves the run on by its status (the quest
 - `running` (the older path): `validating`, then the supervisor's review.
 - `awaiting_integration` after a `pass`: the workspace is closed and the run lands on `main`; after a `concern` (or a third review that does not pass): an `approve_landing` ask for the inbox; after a failed review: `review_failed`, a review by hand (the `dagq-land` skill).
 - `needs_session` (evidence missing): the workspace is closed and the runtime resumes the run in a workspace of its own.
-- `failed`: the workspace is kept for inspection (section 4 of the skill).
+- `failed`: the supervisor triages the run and closes its workspace (section 4 of the skill).
 - A resumed session (its question says `stays needs_session`): the supervisor let it go at the timeout, so the run is `needs_session` without a lease and `status` shows `resume session`. Once the session exits, the supervisor's next pass closes the ask; with attempts left it also closes the workspace it left and resumes the run again, and after the last attempt it leaves the run and the workspace to the person.

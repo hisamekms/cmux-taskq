@@ -134,16 +134,8 @@ impl ReviewVerdict {
     /// outermost `{...}` in it (a model may wrap the object in a fence or
     /// a sentence).
     pub fn parse(stdout: &str) -> Result<Self, String> {
-        let text = stdout.trim();
-        let parsed = serde_json::from_str::<Self>(text).or_else(|error| {
-            match (text.find('{'), text.rfind('}')) {
-                (Some(start), Some(end)) if start < end => {
-                    serde_json::from_str::<Self>(&text[start..=end])
-                }
-                _ => Err(error),
-            }
-        });
-        parsed.map_err(|error| format!("the review printed no verdict JSON: {error}"))
+        parse_json_object(stdout)
+            .map_err(|error| format!("the review printed no verdict JSON: {error}"))
     }
 }
 
@@ -155,6 +147,87 @@ pub const MAX_REVISE_ATTEMPTS: usize = 2;
 /// The options of the `approve_landing` ask a `concern` opens, which the
 /// supervisor acts on once answered (ADR-0027, ADR-0022 decision 3).
 pub const LANDING_OPTIONS: &[&str] = &["land", "send_back", "cancel"];
+
+// The verdict of the supervisor's headless triage of a `failed` or
+// `interrupted` run (ADR-0024 decision 3): `retry` makes the task `ready`
+// for a new run, `resume` sends the run to a session of its own as
+// `needs_session`, `ask` waits for a person in a `decide` ask.
+string_enum!(TriageDecision {
+    Retry => "retry",
+    Resume => "resume",
+    Ask => "ask",
+});
+
+/// What the headless triage prints on stdout: one JSON object. `instruction`
+/// is what the resumed session is asked to do for `resume`, the question for
+/// `ask`, and may be empty for `retry`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TriageVerdict {
+    pub verdict: TriageDecision,
+    pub reason: String,
+    #[serde(default)]
+    pub instruction: String,
+}
+
+impl TriageVerdict {
+    /// The verdict in the triage's stdout, found the way
+    /// [`ReviewVerdict::parse`] finds the review's.
+    pub fn parse(stdout: &str) -> Result<Self, String> {
+        parse_json_object(stdout)
+            .map_err(|error| format!("the triage printed no verdict JSON: {error}"))
+    }
+}
+
+/// The whole text as one JSON object of `T`, or else the outermost `{...}`
+/// in it (a model may wrap the object in a fence or a sentence).
+fn parse_json_object<T: serde::de::DeserializeOwned>(stdout: &str) -> serde_json::Result<T> {
+    let text = stdout.trim();
+    serde_json::from_str::<T>(text).or_else(|error| match (text.find('{'), text.rfind('}')) {
+        (Some(start), Some(end)) if start < end => serde_json::from_str::<T>(&text[start..=end]),
+        _ => Err(error),
+    })
+}
+
+/// The options of the `decide` ask a triage opens, which the supervisor acts
+/// on once answered: `retry` and `cancel` move the task, `resume` the run.
+pub const TRIAGE_OPTIONS: &[&str] = &["retry", "resume", "cancel"];
+
+/// A task with this many `failed` or `interrupted` runs, the triaged one
+/// included, is not retried by the triage: a `retry` verdict becomes an
+/// ask, so a failure that repeats reaches a person.
+pub const TRIAGE_RETRY_FAILURES: usize = 2;
+
+/// Where the triage of a `failed` or `interrupted` run stands, from the
+/// latest of its `resume_started`, `triage_finished` and `triage_failed`: a
+/// run resumed since its last triage is triaged again when it fails again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TriageState {
+    /// Not triaged yet: the supervisor triages it.
+    Pending,
+    /// The headless triage failed: a person decides.
+    Failed,
+    /// The verdict was acted on.
+    Finished,
+}
+
+pub fn triage_state(events: &[RunEvent]) -> TriageState {
+    match events
+        .iter()
+        .rev()
+        .find(|e| {
+            matches!(
+                e.kind.as_str(),
+                "resume_started" | "triage_finished" | "triage_failed"
+            )
+        })
+        .map(|e| e.kind.as_str())
+    {
+        Some("triage_finished") => TriageState::Finished,
+        Some("triage_failed") => TriageState::Failed,
+        _ => TriageState::Pending,
+    }
+}
 
 string_enum!(ReceiptResult {
     Succeeded => "succeeded",
@@ -1437,7 +1510,6 @@ pub const HEARTBEAT_TIMEOUT_SECS: i64 = 30;
 pub enum AttentionNext {
     ReviewAndIntegrate,
     ResumeSession,
-    InspectAndClose,
     RestartSupervisor,
     PushMain,
     RecoverRun,
@@ -1474,6 +1546,12 @@ pub enum AttentionNext {
     ApplyingAnswer {
         ask_id: i64,
     },
+    /// Not the maintainer's to act on: the supervisor triages the `failed`
+    /// or `interrupted` run and acts on the verdict (ADR-0024 decision 3).
+    Triaging,
+    /// The headless triage failed (`triage_failed`): a person decides
+    /// whether to `ready` the task again, resume or cancel.
+    TriageByHand,
 }
 
 /// How many times the supervisor resumes one `needs_session` run (one
@@ -1485,7 +1563,6 @@ impl fmt::Display for AttentionNext {
         match self {
             Self::ReviewAndIntegrate => f.write_str("review and integrate"),
             Self::ResumeSession => f.write_str("resume session"),
-            Self::InspectAndClose => f.write_str("inspect and close workspace"),
             Self::RestartSupervisor => f.write_str("restart supervisor"),
             Self::PushMain => f.write_str("push main"),
             Self::RecoverRun => f.write_str("recover run"),
@@ -1511,6 +1588,8 @@ impl fmt::Display for AttentionNext {
             Self::ApplyingAnswer { ask_id } => {
                 write!(f, "applying the answer of ask {ask_id} (runtime)")
             }
+            Self::Triaging => f.write_str("triaging (runtime)"),
+            Self::TriageByHand => f.write_str("triage by hand"),
         }
     }
 }
@@ -1535,6 +1614,7 @@ pub const ATTENTION_KINDS: &[&str] = &[
     "prompt_waiting",
     "resume_finished",
     "review_failed",
+    "triage_failed",
     "ask_opened",
     "ask_answered",
     "ask_delivery_failed",
@@ -1567,9 +1647,11 @@ pub const ASK_EVENT_KINDS: &[&str] = &[
 /// `workspace_id`. An `integration_deferred` with `resumes_left` above zero
 /// is not: the supervisor resumes that run. `resume_finished` is one when the
 /// resume put the run where a person decides (`awaiting_integration` for an
-/// unapproved run, `failed`), or when it was the last attempt and the run
-/// stays `needs_session` (`exhausted`); a resolved run the supervisor goes on
-/// to land is not.
+/// unapproved run), or when it was the last attempt and the run stays
+/// `needs_session` (`exhausted`); a resolved run the supervisor goes on to
+/// land is not. A run that became `failed` (by validation, the session's
+/// exit, a landing or a resume) is no attention either: the supervisor
+/// triages it (ADR-0024 decision 3), and only `triage_failed` is one.
 /// `validation_finished` into `awaiting_integration` is not one: the
 /// supervisor reviews the run (ADR-0027); `review_failed` is, since the
 /// run then waits for a review by hand.
@@ -1580,7 +1662,9 @@ pub const ASK_EVENT_KINDS: &[&str] = &[
 /// run no longer running and its `ask_delivery_failed` are the maintainer's.
 /// The answer of an `approve_landing` ask the supervisor applies
 /// (`runtime_delivers: true`: one of [`LANDING_OPTIONS`] for a run awaiting
-/// integration) is not one either.
+/// integration) is not one either, nor that of a triage's `decide` ask
+/// (`runtime_delivers: true`: one of [`TRIAGE_OPTIONS`] for a `failed` or
+/// `interrupted` run).
 pub fn event_attention(kind: &str, payload: &serde_json::Value) -> Option<AttentionNext> {
     let status = payload
         .get("status")
@@ -1591,10 +1675,9 @@ pub fn event_attention(kind: &str, payload: &serde_json::Value) -> Option<Attent
         // verdict itself (ADR-0023 decision 2, ADR-0027).
         ("validation_finished", Some(RunStatus::AwaitingIntegration)) => None,
         ("review_failed", _) => Some(AttentionNext::ReviewByHand),
-        (
-            "validation_finished" | "supervision_finished" | "integration_failed",
-            Some(RunStatus::Failed),
-        ) => Some(AttentionNext::InspectAndClose),
+        // The supervisor triages a failed run and acts on the verdict
+        // (ADR-0024 decision 3); only a triage that failed is a person's.
+        ("triage_failed", _) => Some(AttentionNext::TriageByHand),
         // The supervisor resumes a deferred run while it has attempts left
         // (`resumes_left`, absent before ADR-0019); only then is it a person's.
         ("integration_deferred", Some(RunStatus::NeedsSession))
@@ -1622,7 +1705,6 @@ pub fn event_attention(kind: &str, payload: &serde_json::Value) -> Option<Attent
         ("resume_finished", Some(RunStatus::AwaitingIntegration)) => {
             Some(AttentionNext::ReviewAndIntegrate)
         }
-        ("resume_finished", Some(RunStatus::Failed)) => Some(AttentionNext::InspectAndClose),
         ("resume_finished", Some(RunStatus::NeedsSession))
             if payload.get("exhausted") == Some(&serde_json::Value::Bool(true)) =>
         {
@@ -1645,11 +1727,14 @@ pub fn event_attention(kind: &str, payload: &serde_json::Value) -> Option<Attent
                 _ => None,
             }
         }
-        // An answer the supervisor applies to the run itself.
+        // An answer the supervisor applies to the run itself: an
+        // `approve_landing` one, or a triage's `decide` one.
         ("ask_answered", _)
-            if payload.get("kind").and_then(serde_json::Value::as_str)
-                == Some(AskKind::ApproveLanding.as_str())
-                && payload.get("runtime_delivers") == Some(&serde_json::Value::Bool(true)) =>
+            if matches!(
+                payload.get("kind").and_then(serde_json::Value::as_str),
+                Some(kind) if kind == AskKind::ApproveLanding.as_str()
+                    || kind == AskKind::Decide.as_str()
+            ) && payload.get("runtime_delivers") == Some(&serde_json::Value::Bool(true)) =>
         {
             None
         }
@@ -1732,7 +1817,10 @@ pub fn run_attention(
         RunStatus::AwaitingIntegration => Some(AttentionNext::ReviewAndIntegrate),
         RunStatus::NeedsSession if resuming => Some(AttentionNext::Resuming),
         RunStatus::NeedsSession => Some(AttentionNext::ResumeSession),
-        RunStatus::Failed => Some(AttentionNext::InspectAndClose),
+        // The caller tells a triage that failed or finished apart by the
+        // run's events ([`triage_state`]); by the status alone, the
+        // supervisor triages the run.
+        RunStatus::Failed | RunStatus::Interrupted => Some(AttentionNext::Triaging),
         RunStatus::Running if exit_pending => None,
         RunStatus::Running if prompt_waiting.is_some() => Some(answer_prompt(prompt_waiting)),
         _ => None,
@@ -1923,6 +2011,27 @@ mod attention_tests {
                 json!({"status": "awaiting_integration", "error": "x", "attempt": 1}),
                 Some(ReviewByHand),
             ),
+            (
+                "triage_failed",
+                json!({"status": "failed", "error": "x", "attempt": 1}),
+                Some(TriageByHand),
+            ),
+            ("triage_started", json!({"attempt": 1}), None),
+            (
+                "triage_finished",
+                json!({"verdict": "retry", "action": "retry", "status": "failed"}),
+                None,
+            ),
+            (
+                "ask_answered",
+                json!({"ask_id": 6, "kind": "decide", "runtime_delivers": true}),
+                None,
+            ),
+            (
+                "ask_answered",
+                json!({"ask_id": 6, "kind": "decide", "runtime_delivers": false}),
+                Some(ReadAnswer { ask_id: 6 }),
+            ),
             ("review_started", json!({"attempt": 1}), None),
             (
                 "review_finished",
@@ -1963,12 +2072,12 @@ mod attention_tests {
             (
                 "validation_finished",
                 json!({"status": "failed", "reason": "x"}),
-                Some(InspectAndClose),
+                None,
             ),
             (
                 "supervision_finished",
                 json!({"status": "failed", "exit_code": 1}),
-                Some(InspectAndClose),
+                None,
             ),
             (
                 "supervision_finished",
@@ -1983,7 +2092,7 @@ mod attention_tests {
             (
                 "integration_failed",
                 json!({"status": "failed", "reason": "x"}),
-                Some(InspectAndClose),
+                None,
             ),
             (
                 "integration_error",
@@ -2062,7 +2171,7 @@ mod attention_tests {
             (
                 "resume_finished",
                 json!({"status": "failed", "outcome": "failed"}),
-                Some(InspectAndClose),
+                None,
             ),
             (
                 "resume_finished",
@@ -2242,8 +2351,14 @@ mod attention_tests {
         assert_eq!(Resuming.to_string(), "resuming (runtime)");
         assert_eq!(
             run_attention(RunStatus::Failed, false, false, false, None, false),
-            Some(InspectAndClose)
+            Some(Triaging)
         );
+        assert_eq!(
+            run_attention(RunStatus::Interrupted, false, false, false, None, false),
+            Some(Triaging)
+        );
+        assert_eq!(Triaging.to_string(), "triaging (runtime)");
+        assert_eq!(TriageByHand.to_string(), "triage by hand");
         // The stuck_exit ask is the attention of a session holding `/exit`.
         assert_eq!(
             run_attention(RunStatus::Running, true, false, true, None, false),
@@ -2275,7 +2390,6 @@ mod attention_tests {
             RunStatus::Integrating,
             RunStatus::Integrated,
             RunStatus::Succeeded,
-            RunStatus::Interrupted,
         ] {
             assert_eq!(
                 run_attention(status, true, false, true, Some("w"), false),
@@ -2316,11 +2430,7 @@ mod attention_tests {
             run_attention(RunStatus::Running, true, false, false, None, false),
             Some(RecoverRun)
         );
-        for status in [
-            RunStatus::Integrated,
-            RunStatus::Succeeded,
-            RunStatus::Interrupted,
-        ] {
+        for status in [RunStatus::Integrated, RunStatus::Succeeded] {
             assert_eq!(
                 run_attention(status, false, false, false, None, false),
                 None,
@@ -2328,6 +2438,50 @@ mod attention_tests {
                 status.as_str()
             );
         }
+    }
+
+    #[test]
+    fn triage_verdict_is_read_from_the_output_and_instruction_defaults_to_empty() {
+        let verdict = TriageVerdict::parse(
+            "Here it is:\n```json\n{\"verdict\": \"resume\", \"reason\": \"r\", \"instruction\": \"fix it\"}\n```",
+        )
+        .unwrap();
+        assert_eq!(verdict.verdict, TriageDecision::Resume);
+        assert_eq!(verdict.instruction, "fix it");
+        let verdict =
+            TriageVerdict::parse("{\"verdict\": \"retry\", \"reason\": \"flaky\"}").unwrap();
+        assert_eq!(verdict.verdict, TriageDecision::Retry);
+        assert!(verdict.instruction.is_empty());
+        let error = TriageVerdict::parse("test provider").unwrap_err();
+        assert!(
+            error.starts_with("the triage printed no verdict JSON"),
+            "{error}"
+        );
+        assert!(TriageVerdict::parse("{\"verdict\": \"land\", \"reason\": \"x\"}").is_err());
+    }
+
+    #[test]
+    fn triage_state_follows_the_latest_triage_or_resume() {
+        let event = |id: i64, kind: &str| RunEvent {
+            id,
+            task_id: Some(1),
+            goal_id: None,
+            run_id: Some("r".into()),
+            kind: kind.into(),
+            payload: serde_json::json!({}),
+            created_at: String::new(),
+        };
+        assert_eq!(triage_state(&[]), TriageState::Pending);
+        let mut events = vec![event(1, "validation_finished"), event(2, "triage_started")];
+        assert_eq!(triage_state(&events), TriageState::Pending);
+        events.push(event(3, "triage_failed"));
+        assert_eq!(triage_state(&events), TriageState::Failed);
+        events.push(event(4, "triage_finished"));
+        assert_eq!(triage_state(&events), TriageState::Finished);
+        // A run resumed after its triage is triaged again once it fails.
+        events.push(event(5, "resume_started"));
+        events.push(event(6, "resume_finished"));
+        assert_eq!(triage_state(&events), TriageState::Pending);
     }
 
     #[test]

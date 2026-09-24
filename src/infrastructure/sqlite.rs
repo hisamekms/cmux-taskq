@@ -331,20 +331,7 @@ impl TaskStore for SqliteQueue {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let task = read_task(&tx, task_id)?;
-        let next = task
-            .status
-            .transition(action, has_unfinished_run(&tx, task_id)?)?;
-        tx.execute("UPDATE tasks SET status=?1, updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?2",
-            params![next.as_str(), task_id])?;
-        event(
-            &tx,
-            task_id,
-            None,
-            "task_status_changed",
-            json!({"from": task.status, "to": next}),
-        )?;
-        let result = read_task(&tx, task_id)?;
+        let result = transition_task(&tx, task_id, action)?;
         tx.commit()?;
         Ok(result)
     }
@@ -857,6 +844,28 @@ pub(super) fn claim_task(
 
 /// Executing, awaiting or undergoing integration, or waiting for a session;
 /// the same set as `one_unfinished_run_per_task`.
+/// Apply `action` to the task inside the caller's transaction, recording
+/// `task_status_changed`: what `transition` does, and what the triage does
+/// to the task of the run it triaged.
+pub(super) fn transition_task(conn: &Connection, task_id: i64, action: TaskAction) -> Result<Task> {
+    let task = read_task(conn, task_id)?;
+    let next = task
+        .status
+        .transition(action, has_unfinished_run(conn, task_id)?)?;
+    conn.execute(
+        "UPDATE tasks SET status=?1, updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?2",
+        params![next.as_str(), task_id],
+    )?;
+    event(
+        conn,
+        task_id,
+        None,
+        "task_status_changed",
+        json!({"from": task.status, "to": next}),
+    )?;
+    read_task(conn, task_id)
+}
+
 fn has_unfinished_run(conn: &Connection, task_id: i64) -> Result<bool> {
     Ok(conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM task_runs WHERE task_id=?1

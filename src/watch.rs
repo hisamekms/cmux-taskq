@@ -8,11 +8,14 @@ use crate::{
     domain::{
         ASK_EVENT_KINDS, ATTENTION_KINDS, AskKind, Attention, AttentionNext, LANDING_OPTIONS,
         MAX_RESUME_ATTEMPTS, RunEvent, RunStatus, SessionRole, SupervisorPulse,
-        SupervisorRegistration, attention_role, event_attention, run_attention,
-        supervisor_attention,
+        SupervisorRegistration, TRIAGE_OPTIONS, TriageState, attention_role, event_attention,
+        run_attention, supervisor_attention, triage_state,
     },
     infrastructure::{
-        adapters::process_alive, asks::AskQuery, runtime_store::lease_is_stale, sqlite::SqliteQueue,
+        adapters::process_alive,
+        asks::AskQuery,
+        runtime_store::{TRIAGE_ASKER, lease_is_stale},
+        sqlite::SqliteQueue,
     },
     runtime::{supervisors, unix_time},
 };
@@ -114,6 +117,14 @@ pub fn attention(
         ) else {
             continue;
         };
+        // A failed or interrupted run is the supervisor's triage until it
+        // finished (its verdict moved the task or the run on, or its ask is
+        // the attention) or failed (a person's).
+        let next = match (next, triage_state(&events)) {
+            (AttentionNext::Triaging, TriageState::Finished) => continue,
+            (AttentionNext::Triaging, TriageState::Failed) => AttentionNext::TriageByHand,
+            (next, _) => next,
+        };
         let kind = events
             .iter()
             .rev()
@@ -206,6 +217,24 @@ pub fn attention(
                     AttentionNext::DeliverAnswer { ask_id: ask.id },
                 )
             }
+        } else if ask.kind == AskKind::Decide
+            && ask.asked_by == TRIAGE_ASKER
+            && let Some(run_id) = ask.run_id.as_deref()
+            && matches!(
+                queue.run(run_id)?.status,
+                RunStatus::Failed | RunStatus::Interrupted
+            )
+            && ask
+                .answer
+                .as_deref()
+                .is_some_and(|answer| TRIAGE_OPTIONS.contains(&answer.trim()))
+        {
+            // The supervisor retries, resumes or cancels the triaged run.
+            (
+                "answered",
+                "ask_answered",
+                AttentionNext::ApplyingAnswer { ask_id: ask.id },
+            )
         } else if ask.kind == AskKind::ApproveLanding
             && let Some(run_id) = ask.run_id.as_deref()
             && queue.run(run_id)?.status == RunStatus::AwaitingIntegration

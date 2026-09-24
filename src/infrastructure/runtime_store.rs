@@ -12,7 +12,7 @@ use super::{
 };
 use crate::domain::{
     ClaimOutcome, EvidenceCheck, RunEvent, RunLease, RunProcess, SessionRole, SupervisorMode,
-    SupervisorRegistration, Task, TaskRun, validate_base_commit,
+    SupervisorRegistration, Task, TaskAction, TaskRun, validate_base_commit,
 };
 
 pub use crate::domain::HEARTBEAT_TIMEOUT_SECS;
@@ -1740,6 +1740,303 @@ impl SqliteQueue {
         Ok(result)
     }
 }
+
+/// What the triage does to a run once it has its verdict (ADR-0024
+/// decision 3), after the runtime's own rules (no retry of a task that
+/// failed twice, no resume past the attempts or without a worktree).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TriageAction {
+    /// The task goes back to `ready`; the next claim makes a new run.
+    Retry,
+    /// The run becomes `needs_session` with `instruction` as `last_error`,
+    /// and the supervisor resumes it (ADR-0019 decision 1).
+    Resume { instruction: String },
+    /// The run stays; the `decide` ask `ask_id` waits for a person.
+    Ask { ask_id: i64 },
+}
+
+impl TriageAction {
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Retry => "retry",
+            Self::Resume { .. } => "resume",
+            Self::Ask { .. } => "ask",
+        }
+    }
+}
+
+impl SqliteQueue {
+    /// The latest run of every `in_progress` task that is `failed` or
+    /// `interrupted`, oldest first: the runs the triage looks at. An older
+    /// run of a retried task is history.
+    pub fn runs_to_triage(&self) -> Result<Vec<TaskRun>> {
+        Ok(self
+            .latest_runs_in_progress()?
+            .into_iter()
+            .filter(|run| {
+                matches!(
+                    run.status,
+                    crate::domain::RunStatus::Failed | crate::domain::RunStatus::Interrupted
+                )
+            })
+            .collect())
+    }
+
+    /// Take a `failed` or `interrupted` run for its triage: in one
+    /// transaction, check that its task is `in_progress`, that it has no
+    /// lease but a stale one (which is replaced) and that it is not triaged
+    /// since its last resume ([`crate::domain::triage_state`]), and that it
+    /// is still the task's latest run, lease it to
+    /// `token` and record `lease_acquired` and `triage_started` (`attempt`,
+    /// `status`). `Ok(None)` means another process took it or it changed.
+    pub fn begin_triage(&mut self, id: &str, token: &str) -> Result<Option<(TaskRun, usize)>> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let now: i64 = tx.query_row("SELECT unixepoch()", [], |r| r.get(0))?;
+        let run = tx
+            .query_row(
+                "SELECT r.* FROM task_runs r JOIN tasks t ON t.id=r.task_id
+                 WHERE r.id=?1 AND r.status IN ('failed','interrupted') AND t.status='in_progress'
+                 AND r.rowid=(SELECT MAX(rowid) FROM task_runs WHERE task_id=r.task_id)",
+                [id],
+                run_row(&self.runs_dir),
+            )
+            .optional()?;
+        let Some(run) = run else {
+            return Ok(None);
+        };
+        let events: Vec<RunEvent> = tx
+            .prepare("SELECT * FROM run_events WHERE run_id=?1 ORDER BY id")?
+            .query_map([id], event_row)?
+            .collect::<rusqlite::Result<_>>()?;
+        if crate::domain::triage_state(&events) != crate::domain::TriageState::Pending {
+            return Ok(None);
+        }
+        let lease = tx
+            .query_row(
+                "SELECT run_id,token,pid,heartbeat_at FROM run_leases WHERE run_id=?1",
+                [id],
+                lease_row,
+            )
+            .optional()?;
+        if let Some(lease) = &lease {
+            if !lease_is_stale(lease, now) {
+                return Ok(None);
+            }
+            tx.execute("DELETE FROM run_leases WHERE run_id=?1", [id])?;
+        }
+        tx.execute(
+            "INSERT INTO run_leases(run_id,token,pid) VALUES (?1,?2,?3)",
+            params![id, token, std::process::id()],
+        )?;
+        let attempt = events.iter().filter(|e| e.kind == "triage_started").count() + 1;
+        run_event(
+            &tx,
+            id,
+            "lease_acquired",
+            json!({"pid": std::process::id(), "reason": "triage", "previous_token": lease.map(|l| l.token)}),
+        )?;
+        run_event(
+            &tx,
+            id,
+            "triage_started",
+            json!({"attempt": attempt, "status": run.status.as_str()}),
+        )?;
+        tx.commit()?;
+        Ok(Some((run, attempt)))
+    }
+
+    /// Act on the triage's verdict under the triage's lease and record
+    /// `triage_finished` with `payload`, the `action` and the run's status
+    /// after it, in one transaction: `Retry` makes the task `ready`,
+    /// `Resume` the run `needs_session`, `Ask` changes nothing. The lease
+    /// stays for the workspace's close.
+    pub fn finish_triage(
+        &mut self,
+        id: &str,
+        token: &str,
+        action: &TriageAction,
+        mut payload: serde_json::Value,
+    ) -> Result<TaskRun> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        assert_lease(&tx, id, token)?;
+        let run = tx.query_row(
+            "SELECT * FROM task_runs WHERE id=?1",
+            [id],
+            run_row(&self.runs_dir),
+        )?;
+        ensure!(
+            matches!(
+                run.status,
+                crate::domain::RunStatus::Failed | crate::domain::RunStatus::Interrupted
+            ),
+            "run {id} is {}; only failed or interrupted runs are triaged",
+            run.status.as_str()
+        );
+        match action {
+            TriageAction::Retry => {
+                super::sqlite::transition_task(&tx, run.task_id, TaskAction::Ready)?;
+            }
+            TriageAction::Resume { instruction } => {
+                tx.execute(
+                    "UPDATE task_runs SET status='needs_session',last_error=?2 WHERE id=?1",
+                    params![id, instruction],
+                )?;
+                payload["instruction"] = json!(instruction);
+            }
+            TriageAction::Ask { ask_id } => payload["ask_id"] = json!(ask_id),
+        }
+        let result = tx.query_row(
+            "SELECT * FROM task_runs WHERE id=?1",
+            [id],
+            run_row(&self.runs_dir),
+        )?;
+        payload["action"] = json!(action.as_str());
+        payload["status"] = json!(result.status.as_str());
+        run_event(&tx, id, "triage_finished", payload)?;
+        tx.commit()?;
+        Ok(result)
+    }
+
+    /// Record that the triage closed `workspace_id` of the run: the worker's
+    /// own (`workspace_closed_at` is set) or a resume's.
+    pub fn triage_closed_workspace(&mut self, id: &str, workspace_id: &str) -> Result<()> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute(
+            "UPDATE task_runs SET workspace_closed_at=unixepoch() WHERE id=?1
+             AND workspace_id=?2 AND workspace_closed_at IS NULL",
+            params![id, workspace_id],
+        )?;
+        run_event(
+            &tx,
+            id,
+            "workspace_closed",
+            json!({"workspace_id": workspace_id, "by": "triage"}),
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Apply the answer of a triage's `decide` ask to its `failed` or
+    /// `interrupted` run that nobody leases and that is still its task's
+    /// latest run, and close the ask, in one transaction (an ask closed
+    /// meanwhile, by another supervisor or a person, is refused): `retry` makes the task `ready`, `resume` the run
+    /// `needs_session` with `reason` as `last_error`, `cancel` cancels the
+    /// task. Recorded as `triage_decided` (`ask_id`, `answer`, `reason`,
+    /// `status`).
+    pub fn decide_triage(
+        &mut self,
+        id: &str,
+        ask_id: i64,
+        answer: &str,
+        reason: &str,
+    ) -> Result<TaskRun> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let now: i64 = tx.query_row("SELECT unixepoch()", [], |r| r.get(0))?;
+        let lease = tx
+            .query_row(
+                "SELECT run_id,token,pid,heartbeat_at FROM run_leases WHERE run_id=?1",
+                [id],
+                lease_row,
+            )
+            .optional()?;
+        ensure!(
+            lease.is_none_or(|lease| lease_is_stale(&lease, now)),
+            "run {id} is leased"
+        );
+        let run = tx.query_row(
+            "SELECT * FROM task_runs WHERE id=?1",
+            [id],
+            run_row(&self.runs_dir),
+        )?;
+        ensure!(
+            matches!(
+                run.status,
+                crate::domain::RunStatus::Failed | crate::domain::RunStatus::Interrupted
+            ),
+            "run {id} is {}, not failed or interrupted",
+            run.status.as_str()
+        );
+        let latest: String = tx.query_row(
+            "SELECT id FROM task_runs WHERE task_id=?1 ORDER BY rowid DESC LIMIT 1",
+            [run.task_id],
+            |r| r.get(0),
+        )?;
+        ensure!(
+            latest == id,
+            "run {id} is no longer the latest run of task {}",
+            run.task_id
+        );
+        let pending: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM asks WHERE id=?1 AND run_id=?2
+             AND answered_at IS NOT NULL AND closed_at IS NULL)",
+            params![ask_id, id],
+            |r| r.get(0),
+        )?;
+        ensure!(
+            pending,
+            "ask {ask_id} is not an answered, unclosed ask of run {id}"
+        );
+        match answer {
+            "retry" => {
+                super::sqlite::transition_task(&tx, run.task_id, TaskAction::Ready)?;
+            }
+            "resume" => {
+                tx.execute(
+                    "UPDATE task_runs SET status='needs_session',last_error=?2 WHERE id=?1",
+                    params![id, reason],
+                )?;
+            }
+            "cancel" => {
+                super::sqlite::transition_task(&tx, run.task_id, TaskAction::Cancel)?;
+            }
+            other => bail!("{other:?} is not an answer the triage applies"),
+        }
+        tx.execute(
+            "UPDATE asks SET closed_at=unixepoch() WHERE id=?1 AND closed_at IS NULL",
+            [ask_id],
+        )?;
+        let result = tx.query_row(
+            "SELECT * FROM task_runs WHERE id=?1",
+            [id],
+            run_row(&self.runs_dir),
+        )?;
+        run_event(
+            &tx,
+            id,
+            "triage_decided",
+            json!({"ask_id": ask_id, "answer": answer, "reason": reason, "status": result.status.as_str()}),
+        )?;
+        tx.commit()?;
+        Ok(result)
+    }
+
+    /// The answered `decide` asks the supervisor opened about a `failed` or
+    /// `interrupted` run that nobody closed, oldest first: the triage's
+    /// asks whose answers the supervisor applies.
+    pub fn triage_answers(&self) -> Result<Vec<crate::domain::Ask>> {
+        Ok(self
+            .asks(super::asks::AskQuery::default())?
+            .into_iter()
+            .filter(|ask| {
+                ask.kind == crate::domain::AskKind::Decide
+                    && ask.asked_by == TRIAGE_ASKER
+                    && ask.run_id.is_some()
+                    && ask.answered_at.is_some()
+            })
+            .collect())
+    }
+}
+
+/// `asked_by` of the triage's `decide` asks: the supervisor that triaged.
+pub const TRIAGE_ASKER: &str = "supervisor";
 
 fn assert_lease(conn: &Connection, id: &str, token: &str) -> Result<()> {
     let valid: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM run_leases WHERE run_id=?1 AND token=?2 AND heartbeat_at >= unixepoch()-?3)",

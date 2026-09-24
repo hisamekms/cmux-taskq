@@ -305,8 +305,8 @@ struct TestWorkspace {
     /// `send_text` records the call and then fails, as a `cmux send` to a
     /// workspace that went away does.
     text_fails: bool,
-    /// Resume workspaces opened and not closed yet, for `exists`.
-    open_resumes: Mutex<Vec<String>>,
+    /// `exists` fails, as `cmux workspace list` does when cmux is gone.
+    exists_fails: bool,
 }
 impl TestWorkspace {
     fn new(db: &Path, fail: bool, script: &str) -> Self {
@@ -336,7 +336,7 @@ impl TestWorkspace {
             resumes: Mutex::new(Vec::new()),
             texts: Mutex::new(Vec::new()),
             text_fails: false,
-            open_resumes: Mutex::new(Vec::new()),
+            exists_fails: false,
         }
     }
     /// Resumed-session script for one task.
@@ -495,8 +495,6 @@ impl WorkspaceBackend for TestWorkspace {
         let id = run.id.clone();
         let mut sessions = self.sessions.lock().unwrap();
         let workspace = workspace_id(sessions.len());
-        // Listed until closed, as cmux does.
-        self.open_resumes.lock().unwrap().push(workspace.clone());
         let worker = thread::spawn(move || {
             let provider = TestProvider {
                 script,
@@ -557,10 +555,6 @@ impl WorkspaceBackend for TestWorkspace {
             bail!("injected workspace close failure");
         }
         self.closed.lock().unwrap().push(workspace_id.into());
-        self.open_resumes
-            .lock()
-            .unwrap()
-            .retain(|open| open != workspace_id);
         Ok(())
     }
 
@@ -605,15 +599,17 @@ impl WorkspaceBackend for TestWorkspace {
     fn prompt_wait(&self) -> Duration {
         self.prompt_wait
     }
-    // The supervisor asks only whether a resume workspace it opened is open.
+    // A workspace is listed from its creation until it is closed, as cmux
+    // does; one this backend never opened is not.
     fn exists(&self, workspace_id: &str) -> Result<bool> {
-        let resumes = self.resumes.lock().unwrap();
-        let open = self.open_resumes.lock().unwrap();
-        ensure!(
-            !resumes.is_empty() || !open.is_empty(),
-            "not used by the supervisor outside a resume"
-        );
-        Ok(open.iter().any(|open| open == workspace_id))
+        ensure!(!self.exists_fails, "injected workspace list failure");
+        let created = self
+            .sessions
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(id, _)| id == workspace_id);
+        Ok(created && !self.closed().iter().any(|closed| closed == workspace_id))
     }
     fn create_named(&self, _: &str, _: &Path, _: &str, _: &WorkspaceTags) -> Result<String> {
         bail!("not used by the supervisor")
@@ -2046,6 +2042,7 @@ fn failed_backend_calls_are_recorded_with_the_load_and_counted_by_stats() {
     assert!(failures[0].id < abandoned.id);
 
     // A second failure in the same window is an alert.
+    backend.exists_fails = true;
     let recording = runtime::RecordingBackend::new(&backend, db.clone(), None);
     assert!(recording.exists(WORKSPACE_ID).is_err());
     let stats = runtime::stats(
@@ -4951,9 +4948,21 @@ fn resumed_session_with_a_failed_receipt_fails_the_run() {
     assert_eq!(finished[0]["status"], "failed");
     assert_eq!(git_out(&repo, &["rev-parse", "main"]), first_landed);
     assert!(Path::new(run.worktree_path.as_ref().unwrap()).exists());
+    // The failed run goes to the triage; the stub `claude` prints no
+    // verdict, so the triage fails and the run waits for a person.
+    let failed = payloads(&detail, "triage_failed");
+    assert_eq!(failed.len(), 1);
+    assert!(
+        failed[0]["error"]
+            .as_str()
+            .unwrap()
+            .contains("no verdict JSON"),
+        "{}",
+        failed[0]
+    );
     assert_eq!(
         run_attention_of(&runtime::status(&db).unwrap(), &run.id).unwrap()["next"],
-        "inspect and close workspace"
+        "triage by hand"
     );
 }
 
@@ -6872,12 +6881,24 @@ fn status_reports_failed_runs_and_unanswered_exit_requests() {
     let status = runtime::status(&db).unwrap();
     let failed = run_attention_of(&status, &run.id).unwrap();
     assert_eq!(failed["status"], "failed");
-    assert_eq!(failed["kind"], "supervision_finished");
+    // The failed run itself is the supervisor's triage; its triage failed
+    // (the stub `claude` prints no verdict), which is a person's.
+    assert_eq!(failed["kind"], "triage_failed");
     assert_eq!(failed["last_error"], "session exited with code 7");
-    assert_eq!(failed["next"], "inspect and close workspace");
+    assert_eq!(failed["next"], "triage by hand");
     let events = dagq::watch::events(&db, 0, 100, false).unwrap();
-    assert_eq!(events["events"][0]["kind"], "supervision_finished");
-    assert_eq!(events["events"][0]["exit_code"], 7);
+    assert_eq!(events["events"].as_array().unwrap().len(), 1, "{events}");
+    assert_eq!(events["events"][0]["kind"], "triage_failed");
+    assert_eq!(events["events"][0]["next"], "triage by hand");
+    // Before its triage, the failed run is the supervisor's.
+    Connection::open(&db)
+        .unwrap()
+        .execute("DELETE FROM run_events WHERE kind='triage_failed'", [])
+        .unwrap();
+    let status = runtime::status(&db).unwrap();
+    let pending = run_attention_of(&status, &run.id).unwrap();
+    assert_eq!(pending["kind"], "failed");
+    assert_eq!(pending["next"], "triaging (runtime)");
 
     // A running run whose /exit request went unanswered, until its session exits.
     let (_dir, repo, db) = fixture();
@@ -6914,10 +6935,12 @@ fn status_reports_failed_runs_and_unanswered_exit_requests() {
 }
 
 /// A run the supervisor gives up (here: its wrapper never registers) keeps
-/// its status without a lease, and nothing moves it on: it waits for
-/// `recover`. A `runtime_error` that releases no lease is only a note.
+/// its status without a lease; with its session gone, the supervisor itself
+/// recovers it on its next pass and triages it (ADR-0024 decision 3). One
+/// whose session may still live waits for `recover`. A `runtime_error` that
+/// releases no lease is only a note.
 #[test]
-fn an_abandoned_run_asks_for_recovery_until_it_is_recovered() {
+fn an_abandoned_run_is_recovered_and_triaged_by_the_supervisor() {
     let (_dir, repo, db) = fixture();
     let mut queue = SqliteQueue::open(&db).unwrap();
     let cursor = queue.latest_event_id().unwrap();
@@ -6935,40 +6958,55 @@ fn an_abandoned_run_asks_for_recovery_until_it_is_recovered() {
         "{outcome}"
     );
     let run = queue.show(1).unwrap().runs[0].clone();
+    assert_eq!(run.status, RunStatus::Interrupted);
     assert!(queue.run_lease(&run.id).unwrap().is_none());
-    let error = queue
-        .run_events(&run.id)
-        .unwrap()
-        .into_iter()
-        .rfind(|e| e.kind == "runtime_error")
-        .unwrap();
-    assert_eq!(error.payload["lease_released"], true);
+    let events = queue.run_events(&run.id).unwrap();
+    let kinds: Vec<&str> = events.iter().map(|e| e.kind.as_str()).collect();
+    let error = position(&kinds, "runtime_error");
+    assert_eq!(events[error].payload["lease_released"], true);
+    let recovered = position(&kinds, "run_recovered");
+    assert!(error < recovered, "{kinds:?}");
+    assert_eq!(events[recovered].payload["by"], "supervisor");
+    assert_eq!(events[recovered].payload["previous_status"], "starting");
+    assert_eq!(events[recovered].payload["run"]["blockers"], json!([]));
+    assert!(recovered < position(&kinds, "triage_started"), "{kinds:?}");
+    assert_eq!(outcome["triaged"][0]["run_id"], json!(run.id), "{outcome}");
+    assert_eq!(outcome["triaged"][0]["status"], "interrupted");
 
+    // The stub `claude` prints no verdict: a person triages the run.
     let status = runtime::status(&db).unwrap();
-    let abandoned = run_attention_of(&status, &run.id).unwrap();
-    assert_eq!(abandoned["status"], run.status.as_str());
-    assert_eq!(abandoned["kind"], "runtime_error");
-    assert_eq!(abandoned["next"], "recover run");
-    assert!(
-        abandoned["last_error"]
-            .as_str()
-            .unwrap()
-            .contains("did not register")
-    );
-    // The abandon is the only attention event of the pass, and it wakes watch.
+    let waiting = run_attention_of(&status, &run.id).unwrap();
+    assert_eq!(waiting["status"], "interrupted");
+    assert_eq!(waiting["kind"], "triage_failed");
+    assert_eq!(waiting["next"], "triage by hand");
     let woke = watch_for(&db, Some(cursor), Duration::from_secs(20));
-    let events = woke["events"].as_array().unwrap();
-    assert_eq!(events.len(), 1, "{woke}");
-    assert_eq!(events[0]["kind"], "runtime_error");
-    assert_eq!(events[0]["next"], "recover run");
-    assert_eq!(events[0]["run_id"], json!(run.id));
-
-    // Recovered, the run is interrupted and waits for nobody.
+    let kinds: Vec<&Value> = woke["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| &e["kind"])
+        .collect();
     assert_eq!(
-        runtime::recover(&db, &run.id).unwrap()["run"]["status"],
-        "interrupted"
+        kinds,
+        [&json!("runtime_error"), &json!("triage_failed")],
+        "{woke}"
     );
-    assert!(run_attention_of(&runtime::status(&db).unwrap(), &run.id).is_none());
+
+    // A run nobody leases whose session may still live is not recovered:
+    // it waits for `recover`.
+    add_ready_task(&mut queue, "abandoned", &[]);
+    let pid = std::process::id();
+    let abandoned = orphan_run(&repo, &db, "owner", pid, pid);
+    Connection::open(&db)
+        .unwrap()
+        .execute("DELETE FROM run_leases WHERE run_id=?1", [&abandoned.id])
+        .unwrap();
+    let status = runtime::status(&db).unwrap();
+    let still = run_attention_of(&status, &abandoned.id).unwrap();
+    assert_eq!(still["next"], "recover run");
+    supervise(&db, &repo, &backend).unwrap();
+    assert_eq!(queue.run(&abandoned.id).unwrap().status, RunStatus::Running);
+    assert!(!queue.has_run_event(&abandoned.id, "run_recovered").unwrap());
 
     // A runtime error recorded on a leased run is not an attention.
     add_ready_task(&mut queue, "noted", &[]);
@@ -8129,6 +8167,11 @@ struct TestReviewer {
     scripts: Mutex<Vec<String>>,
     prompts: Mutex<Vec<String>>,
     timeout: Duration,
+    /// Scripts of the headless triage, one per triage in order; without
+    /// one left, a triage cannot start.
+    triages: Mutex<Vec<String>>,
+    /// The triage prompts and the directories they ran in.
+    triage_prompts: Mutex<Vec<(String, PathBuf)>>,
 }
 
 impl TestReviewer {
@@ -8137,10 +8180,19 @@ impl TestReviewer {
             scripts: Mutex::new(scripts.to_vec()),
             prompts: Mutex::new(Vec::new()),
             timeout: Duration::from_secs(60),
+            triages: Mutex::new(Vec::new()),
+            triage_prompts: Mutex::new(Vec::new()),
         }
     }
     fn prompts(&self) -> Vec<String> {
         self.prompts.lock().unwrap().clone()
+    }
+    fn with_triages(self, scripts: &[String]) -> Self {
+        *self.triages.lock().unwrap() = scripts.to_vec();
+        self
+    }
+    fn triage_prompts(&self) -> Vec<(String, PathBuf)> {
+        self.triage_prompts.lock().unwrap().clone()
     }
 }
 
@@ -8154,8 +8206,20 @@ impl AgentProvider for TestReviewer {
     fn resume_command(&self, _: &TaskRun) -> Result<Command> {
         unreachable!("the reviewer starts no session")
     }
-    fn headless_command(&self, _: &Path, _: &str, _: &[&str]) -> Result<Command> {
-        unreachable!("the reviewer runs only reviews")
+    // A run that fails under these tests is triaged by this provider too:
+    // with no triage script left, the triage fails and the run waits for a
+    // person.
+    fn headless_command(&self, cwd: &Path, prompt: &str, tools: &[&str]) -> Result<Command> {
+        assert_eq!(tools, runtime::TRIAGE_TOOLS);
+        let mut triages = self.triages.lock().unwrap();
+        ensure!(!triages.is_empty(), "the test reviewer has no triage left");
+        self.triage_prompts
+            .lock()
+            .unwrap()
+            .push((prompt.into(), cwd.into()));
+        let mut command = Command::new("/bin/sh");
+        command.current_dir(cwd).arg("-c").arg(triages.remove(0));
+        Ok(command)
     }
     fn review_command(&self, run: &TaskRun, prompt: &str) -> Result<Command> {
         self.prompts.lock().unwrap().push(prompt.into());
@@ -9376,4 +9440,413 @@ fn conflict_requests_past_the_limit_ask_a_person() {
         "{}",
         ask.question
     );
+}
+
+/// A triage script that prints the verdict JSON (no apostrophes in the
+/// texts: the script quotes the JSON with them).
+fn triage(decision: &str, reason: &str, instruction: &str) -> String {
+    let json = json!({"verdict": decision, "reason": reason, "instruction": instruction});
+    format!("printf '%s\\n' '{json}'")
+}
+
+/// A failed run is triaged by the supervisor (ADR-0024 decision 3): `retry`
+/// makes the task `ready`, closes the run's workspace and the next pass
+/// runs the task again. A second failure is not retried whatever the
+/// triage answers: it becomes a `decide` ask for the inbox.
+#[test]
+fn a_failed_run_triaged_retry_runs_again_and_a_second_failure_is_asked() {
+    let (_dir, repo, db) = fixture();
+    let backend = TestWorkspace::new(
+        &db,
+        false,
+        "commit work; receipt \"$(git rev-parse HEAD)\"; exit 7",
+    );
+    let reviewer = TestReviewer::new(&[verdict("pass", &[], "unused")]).with_triages(&[
+        triage("retry", "the session died on its own", ""),
+        triage("retry", "it died again", ""),
+    ]);
+    let outcome = supervise_reviewed(&db, &repo, &backend, &reviewer);
+    assert_eq!(outcome["errors"], json!([]), "{outcome}");
+    assert_eq!(outcome["triaged"].as_array().unwrap().len(), 2, "{outcome}");
+    assert!(
+        reviewer.prompts().is_empty(),
+        "a failed run is not reviewed"
+    );
+    let mut queue = SqliteQueue::open(&db).unwrap();
+    let detail = queue.show(1).unwrap();
+    assert_eq!(detail.task.status, TaskStatus::InProgress);
+    assert_eq!(detail.runs.len(), 2);
+    let (first, second) = (&detail.runs[0], &detail.runs[1]);
+    assert_eq!(first.status, RunStatus::Failed);
+    assert_eq!(second.status, RunStatus::Failed);
+    assert!(queue.run_leases().unwrap().is_empty());
+
+    // The first triage: retry readied the task, then the workspace closed.
+    let first_events = queue.run_events(&first.id).unwrap();
+    let kinds: Vec<&str> = first_events.iter().map(|e| e.kind.as_str()).collect();
+    let started = position(&kinds, "triage_started");
+    assert_eq!(first_events[started].payload["status"], "failed");
+    assert_eq!(first_events[started].payload["attempt"], 1);
+    let finished = &first_events[position(&kinds, "triage_finished")].payload;
+    assert_eq!(finished["verdict"], "retry");
+    assert_eq!(finished["action"], "retry");
+    assert_eq!(finished["status"], "failed");
+    assert_eq!(finished["failures"], 1);
+    assert_eq!(finished["reason"], "the session died on its own");
+    assert!(finished["overridden"].is_null());
+    let closed = &first_events[position(&kinds, "workspace_closed")].payload;
+    assert_eq!(closed["workspace_id"], WORKSPACE_ID);
+    assert_eq!(closed["by"], "triage");
+    assert!(position(&kinds, "triage_finished") < position(&kinds, "workspace_closed"));
+    assert!(first.workspace_closed_at.is_some());
+    assert!(backend.closed().contains(&WORKSPACE_ID.to_owned()));
+    let readied = detail.events.iter().position(|e| {
+        e.kind == "task_status_changed"
+            && e.payload["from"] == "in_progress"
+            && e.payload["to"] == "ready"
+    });
+    let second_claimed = detail
+        .events
+        .iter()
+        .position(|e| e.run_id.as_deref() == Some(second.id.as_str()))
+        .unwrap();
+    assert!(readied.unwrap() < second_claimed);
+
+    // The second triage answered retry too, but the task failed twice.
+    let finished = payloads(&detail, "triage_finished");
+    assert_eq!(finished.len(), 2);
+    assert_eq!(finished[1]["verdict"], "retry");
+    assert_eq!(finished[1]["action"], "ask");
+    assert_eq!(finished[1]["failures"], 2);
+    assert!(
+        finished[1]["overridden"]
+            .as_str()
+            .unwrap()
+            .contains("has 2 failed or interrupted runs"),
+        "{}",
+        finished[1]
+    );
+    let ask = queue
+        .read_ask(finished[1]["ask_id"].as_i64().unwrap())
+        .unwrap();
+    assert_eq!(ask.kind, AskKind::Decide);
+    assert_eq!(ask.run_id.as_deref(), Some(second.id.as_str()));
+    assert_eq!(ask.asked_by, "supervisor");
+    assert_eq!(ask.options, ["retry", "resume", "cancel"]);
+    assert!(ask.is_open());
+    assert!(
+        ask.question.contains("is not retried without a person"),
+        "{}",
+        ask.question
+    );
+    assert_eq!(backend.notifications.lock().unwrap().len(), 1);
+    assert!(backend.closed().contains(&workspace_id(1)));
+
+    // The prompts carry the task, the error and the retry rule, and the
+    // second one the first run with its triage.
+    let prompts = reviewer.triage_prompts();
+    assert_eq!(prompts.len(), 2);
+    let (prompt, dir) = &prompts[0];
+    assert_eq!(dir, Path::new(first.run_dir.as_ref().unwrap()));
+    for expected in [
+        "of dagq task 1 (test task), which ended failed",
+        "Acceptance criteria:\nworks",
+        "Last error of the run:\nsession exited with code 7",
+        "\"result\":\"succeeded\"",
+        "Final screen of the session",
+        "from 2 on, retry is not allowed",
+        "Earlier runs of the task:\nnone",
+        "{\"verdict\": \"retry\" | \"resume\" | \"ask\"",
+    ] {
+        assert!(prompt.contains(expected), "{expected:?} in {prompt}");
+    }
+    assert!(dir.join("triage-prompt-1.txt").is_file());
+    assert!(dir.join("triage-1.out").is_file());
+    let (prompt, _) = &prompts[1];
+    assert!(
+        prompt.contains(
+            "This task has 2 failed or interrupted runs, this one included: do not answer retry"
+        ),
+        "{prompt}"
+    );
+    assert!(
+        prompt.contains(&format!(
+            "- run {} failed: session exited with code 7 (triaged: \"retry\")",
+            first.id
+        )),
+        "{prompt}"
+    );
+
+    // Neither run is an attention: the ask is.
+    let status = runtime::status(&db).unwrap();
+    assert!(run_attention_of(&status, &second.id).is_none(), "{status}");
+    assert_eq!(
+        ask_attention(&status, ask.id)[0]["next"],
+        format!("answer ask {}", ask.id)
+    );
+}
+
+/// `resume`: the run becomes `needs_session` with the triage's instruction,
+/// its workspace is closed, and the supervisor resumes its session with a
+/// request naming the instruction; the resumed run is validated, reviewed
+/// and landed like any other.
+#[test]
+fn a_failed_run_triaged_resume_is_resumed_in_its_session_and_lands() {
+    let (_dir, repo, db) = fixture();
+    let base = git_out(&repo, &["rev-parse", "main"]);
+    let backend = TestWorkspace::new(&db, false, "commit work; exit 7");
+    backend.resume_script_for(
+        1,
+        "await_message; receipt \"$(git rev-parse HEAD)\"; idle; await_exit",
+    );
+    let reviewer =
+        TestReviewer::new(&[verdict("pass", &[], "meets the acceptance")]).with_triages(&[triage(
+            "resume",
+            "the work is committed but the receipt is missing",
+            "write the receipt for your commit",
+        )]);
+    let outcome = supervise_reviewed(&db, &repo, &backend, &reviewer);
+    assert_eq!(outcome["errors"], json!([]), "{outcome}");
+    let mut queue = SqliteQueue::open(&db).unwrap();
+    let detail = queue.show(1).unwrap();
+    assert_eq!(detail.runs.len(), 1);
+    assert_landed_run(&detail.runs[0], &repo, &base);
+    let finished = payloads(&detail, "triage_finished");
+    assert_eq!(finished.len(), 1);
+    assert_eq!(finished[0]["action"], "resume");
+    assert_eq!(finished[0]["status"], "needs_session");
+    assert_eq!(
+        finished[0]["instruction"],
+        "write the receipt for your commit"
+    );
+    let kinds = event_kinds(&detail);
+    assert!(position(&kinds, "triage_finished") < position(&kinds, "workspace_closed"));
+    assert!(position(&kinds, "workspace_closed") < position(&kinds, "resume_started"));
+    assert_eq!(
+        payloads(&detail, "resume_started")[0]["reason"],
+        "write the receipt for your commit"
+    );
+    assert_eq!(backend.closed()[0], WORKSPACE_ID);
+    let text = &backend.texts()[0].1;
+    for expected in [
+        "the supervisor's triage sent it back to this session to finish",
+        "Reason: write the receipt for your commit",
+        "1. Do what the reason asks in this worktree and commit",
+    ] {
+        assert!(text.contains(expected), "{expected:?} in {text}");
+    }
+}
+
+/// `ask`: a `decide` ask for the inbox, the run stays `failed`; a cmux
+/// failure closing the workspace is recorded and the triage goes on. The
+/// supervisor applies the answer (`cancel` here) and closes the ask.
+#[test]
+fn a_triage_ask_waits_for_a_person_and_the_supervisor_applies_the_answer() {
+    let (_dir, repo, db) = fixture();
+    let mut backend = TestWorkspace::new(&db, false, "commit work; exit 7");
+    backend.close_fail = true;
+    let reviewer = TestReviewer::new(&[verdict("pass", &[], "unused")]).with_triages(&[triage(
+        "ask",
+        "the acceptance cannot be met",
+        "Is task 1 still wanted?",
+    )]);
+    let outcome = supervise_reviewed(&db, &repo, &backend, &reviewer);
+    assert_eq!(outcome["errors"], json!([]), "{outcome}");
+    let mut queue = SqliteQueue::open(&db).unwrap();
+    let detail = queue.show(1).unwrap();
+    let run = detail.runs[0].clone();
+    assert_eq!(run.status, RunStatus::Failed);
+    assert_eq!(detail.task.status, TaskStatus::InProgress);
+    let finished = payloads(&detail, "triage_finished");
+    assert_eq!(finished[0]["action"], "ask");
+    assert_eq!(finished[0]["status"], "failed");
+    let ask = queue
+        .read_ask(finished[0]["ask_id"].as_i64().unwrap())
+        .unwrap();
+    assert!(
+        ask.question
+            .contains("asks a person: Is task 1 still wanted?"),
+        "{}",
+        ask.question
+    );
+    assert!(
+        ask.question
+            .contains("Reason: the acceptance cannot be met")
+    );
+    assert!(
+        ask.question
+            .contains("Last error: session exited with code 7")
+    );
+    assert!(ask.question.contains("triage-prompt-1.txt"));
+    assert_eq!(backend.notifications.lock().unwrap().len(), 1);
+    // The close failed: recorded, the workspace kept, the ask still made.
+    let cleanup = payloads(&detail, "cleanup_failed");
+    assert_eq!(cleanup.len(), 1);
+    assert_eq!(cleanup[0]["workspace_id"], WORKSPACE_ID);
+    assert!(
+        cleanup[0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("injected workspace close failure")
+    );
+    assert!(run.workspace_closed_at.is_none());
+    assert!(!event_kinds(&detail).contains(&"workspace_closed"));
+    assert_eq!(
+        run.last_error.as_deref(),
+        Some("session exited with code 7")
+    );
+    let status = runtime::status(&db).unwrap();
+    assert!(run_attention_of(&status, &run.id).is_none(), "{status}");
+
+    // An answer the supervisor applies is its own, not a person's.
+    queue.answer(ask.id, "cancel").unwrap();
+    let answered = queue
+        .run_events(&run.id)
+        .unwrap()
+        .into_iter()
+        .rfind(|e| e.kind == "ask_answered")
+        .unwrap();
+    assert_eq!(answered.payload["runtime_delivers"], true);
+    assert_eq!(
+        ask_attention(&runtime::status(&db).unwrap(), ask.id)[0]["next"],
+        format!("applying the answer of ask {} (runtime)", ask.id)
+    );
+    let outcome = supervise_reviewed(&db, &repo, &backend, &reviewer);
+    assert_eq!(outcome["errors"], json!([]), "{outcome}");
+    let detail = queue.show(1).unwrap();
+    assert_eq!(detail.task.status, TaskStatus::Canceled);
+    assert_eq!(detail.runs[0].status, RunStatus::Failed);
+    let decided = payloads(&detail, "triage_decided");
+    assert_eq!(decided.len(), 1);
+    assert_eq!(decided[0]["answer"], "cancel");
+    assert_eq!(decided[0]["ask_id"], ask.id);
+    assert!(queue.read_ask(ask.id).unwrap().closed_at.is_some());
+    assert!(ask_attention(&runtime::status(&db).unwrap(), ask.id).is_empty());
+}
+
+/// The answers `resume` and `retry` of a triage's ask, applied by the
+/// queue: `resume` parks the run for a session with the reason, `retry`
+/// readies the task; an answer outside the options, a leased run, a run
+/// that is not failed and an ask already closed are refused.
+#[test]
+fn triage_answers_resume_the_run_or_ready_the_task() {
+    let (_dir, db, detail) = run_agent("commit work; exit 7");
+    let run = detail.runs[0].clone();
+    let mut queue = SqliteQueue::open(&db).unwrap();
+    let ask = |queue: &mut SqliteQueue| {
+        queue
+            .ask(NewAsk {
+                kind: AskKind::Decide,
+                task_id: None,
+                run_id: Some(run.id.clone()),
+                question: "what now?".into(),
+                options: vec!["retry".into(), "resume".into(), "cancel".into()],
+                asked_by: "supervisor".into(),
+            })
+            .unwrap()
+            .ask
+    };
+    let first = ask(&mut queue);
+    queue.answer(first.id, "resume").unwrap();
+    assert_eq!(queue.triage_answers().unwrap()[0].id, first.id);
+    assert!(queue.decide_triage(&run.id, first.id, "land", "x").is_err());
+    let parked = queue
+        .decide_triage(&run.id, first.id, "resume", "fix the test")
+        .unwrap();
+    assert_eq!(parked.status, RunStatus::NeedsSession);
+    assert_eq!(parked.last_error.as_deref(), Some("fix the test"));
+    assert!(queue.read_ask(first.id).unwrap().closed_at.is_some());
+    assert!(queue.triage_answers().unwrap().is_empty());
+    assert!(
+        queue
+            .decide_triage(&run.id, first.id, "retry", "x")
+            .unwrap_err()
+            .to_string()
+            .contains("not failed or interrupted")
+    );
+
+    Connection::open(&db)
+        .unwrap()
+        .execute(
+            "UPDATE task_runs SET status='failed' WHERE id=?1",
+            [&run.id],
+        )
+        .unwrap();
+    // An ask already applied (closed) is not applied twice, by another
+    // supervisor or later.
+    assert!(
+        queue
+            .decide_triage(&run.id, first.id, "retry", "x")
+            .unwrap_err()
+            .to_string()
+            .contains("not an answered, unclosed ask")
+    );
+    let second = ask(&mut queue);
+    queue.answer(second.id, "retry").unwrap();
+    Connection::open(&db)
+        .unwrap()
+        .execute(
+            "INSERT INTO run_leases(run_id,token,pid) VALUES (?1,'other',?2)",
+            rusqlite::params![run.id, std::process::id()],
+        )
+        .unwrap();
+    assert!(
+        queue
+            .decide_triage(&run.id, second.id, "retry", "x")
+            .unwrap_err()
+            .to_string()
+            .contains("is leased")
+    );
+    Connection::open(&db)
+        .unwrap()
+        .execute("DELETE FROM run_leases", [])
+        .unwrap();
+    queue
+        .decide_triage(&run.id, second.id, "retry", "x")
+        .unwrap();
+    assert_eq!(queue.show(1).unwrap().task.status, TaskStatus::Ready);
+}
+
+/// A run whose wrapper died and that nobody leases is recovered by the
+/// supervisor (ADR-0024 decision 3, amending ADR-0012) and triaged as
+/// `interrupted`; `retry` runs the task again, and it lands.
+#[test]
+fn a_dead_run_nobody_leases_is_recovered_triaged_and_retried() {
+    let (_dir, repo, db) = fixture();
+    let orphan = orphan_run(&repo, &db, "owner", dead_pid(), dead_pid());
+    Connection::open(&db)
+        .unwrap()
+        .execute("DELETE FROM run_leases", [])
+        .unwrap();
+    let base = git_out(&repo, &["rev-parse", "main"]);
+    let backend = TestWorkspace::new(&db, false, IDLE_AGENT);
+    let reviewer = TestReviewer::new(&[verdict("pass", &[], "meets the acceptance")])
+        .with_triages(&[triage("retry", "the machine restarted", "")]);
+    let outcome = supervise_reviewed(&db, &repo, &backend, &reviewer);
+    assert_eq!(outcome["errors"], json!([]), "{outcome}");
+    let mut queue = SqliteQueue::open(&db).unwrap();
+    let detail = queue.show(1).unwrap();
+    assert_eq!(detail.runs.len(), 2);
+    assert_eq!(detail.runs[0].id, orphan.id);
+    assert_eq!(detail.runs[0].status, RunStatus::Interrupted);
+    assert_landed_run(&detail.runs[1], &repo, &base);
+    let events = queue.run_events(&orphan.id).unwrap();
+    let kinds: Vec<&str> = events.iter().map(|e| e.kind.as_str()).collect();
+    let recovered = &events[position(&kinds, "run_recovered")].payload;
+    assert_eq!(recovered["by"], "supervisor");
+    assert_eq!(recovered["previous_status"], "running");
+    assert_eq!(recovered["lease_deleted"], false);
+    assert_eq!(
+        events[position(&kinds, "triage_started")].payload["status"],
+        "interrupted"
+    );
+    assert_eq!(
+        events[position(&kinds, "triage_finished")].payload["action"],
+        "retry"
+    );
+    // Its workspace is one cmux does not list: nothing to close.
+    assert!(!kinds.contains(&"workspace_closed"));
+    assert!(!kinds.contains(&"cleanup_failed"));
+    let (prompt, _) = &reviewer.triage_prompts()[0];
+    assert!(prompt.contains("which ended interrupted"), "{prompt}");
 }

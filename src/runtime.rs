@@ -14,9 +14,11 @@ use crate::{
         MAX_RESUME_ATTEMPTS, MAX_REVISE_ATTEMPTS, NewAsk, NewTask, PUSH_REMOTE, Predecessor,
         PushReport, PushResult, Receipt, ReceiptResult, RegisteredFollowUp, ReviewDecision,
         ReviewVerdict, RunLease, RunPaths, RunProcess, RunStatus, SessionRole, SupervisorMode,
-        SupervisorRegistration, Task, TaskAction, TaskRun, evidence_missing_reason,
-        heartbeat_stale,
+        SupervisorRegistration, TRIAGE_OPTIONS, TRIAGE_RETRY_FAILURES, Task, TaskAction,
+        TaskDetail, TaskRun, TaskStatus, TriageDecision, TriageState, TriageVerdict,
+        evidence_missing_reason, heartbeat_stale,
         scope::{out_of_scope, scope_violation_reason},
+        triage_state,
     },
     infrastructure::{
         adapters::{
@@ -27,8 +29,8 @@ use crate::{
         location::{QueueLocation, runs_dir},
         run_env::load_run_env,
         runtime_store::{
-            HEARTBEAT_TIMEOUT_SECS, Landing, LeasedRun, ResumeCandidate, RunPlan, Validation,
-            lease_is_stale,
+            HEARTBEAT_TIMEOUT_SECS, Landing, LeasedRun, ResumeCandidate, RunPlan, TRIAGE_ASKER,
+            TriageAction, Validation, lease_is_stale,
         },
         sqlite::SqliteQueue,
     },
@@ -294,6 +296,7 @@ pub fn supervise_with_reviewer(
         queue_hash,
         observer: None,
         observers_launched: Vec::new(),
+        triaged: Vec::new(),
     };
     let result = supervisor.run_loop(options);
     match &result {
@@ -513,6 +516,8 @@ struct Supervisor<'a> {
     /// When this process last launched each observation, so one that dies
     /// before it records anything is not relaunched on every pass.
     observers_launched: Vec<(ObserveMode, Instant)>,
+    /// The runs this process triaged, with where each one went.
+    triaged: Vec<Value>,
 }
 
 /// One executing run between provisioning and rest.
@@ -546,6 +551,9 @@ enum Phase {
     /// The run lands off the loop, like validation; the landing releases
     /// the lease itself.
     Landing(Option<thread::JoinHandle<Result<IntegrationOutcome>>>),
+    /// The headless triage of a `failed` or `interrupted` run (ADR-0024
+    /// decision 3), under a lease of its own.
+    Triage(TriageWatch),
 }
 
 /// The session of a run the supervisor keeps open through validation,
@@ -588,6 +596,8 @@ enum AfterExit {
 enum Step {
     Continue,
     Done(Box<TaskRun>),
+    /// The triage of a run ended (its verdict acted on, or it failed).
+    Triaged(Box<TaskRun>),
     /// The lease now carries another token (an adopter took the run, or
     /// `recover` released it): this process must not touch the run again.
     Disowned,
@@ -659,7 +669,12 @@ impl Supervisor<'_> {
         } else {
             "finished"
         };
-        Ok(json!({"outcome": outcome, "runs": self.finished, "errors": self.errors}))
+        Ok(json!({
+            "outcome": outcome,
+            "runs": self.finished,
+            "errors": self.errors,
+            "triaged": self.triaged,
+        }))
     }
 
     /// Adopt the runs other supervisors left behind, then claim and
@@ -670,11 +685,17 @@ impl Supervisor<'_> {
         if self.slots.len() < parallel {
             self.adopt_stale_runs(parallel)?;
         }
+        // Takes no slot: a dead run goes to the triage below.
+        self.recover_dead_runs()?;
         if self.slots.len() < parallel {
             self.apply_landing_answers(parallel)?;
         }
+        self.apply_triage_answers()?;
         if self.slots.len() < parallel {
             self.resume_parked_runs(parallel)?;
+        }
+        if self.slots.len() < parallel {
+            self.triage_runs(parallel)?;
         }
         while self.slots.len() < parallel {
             // Most-releasing candidate first, lowest ID on a tie (ADR-0023);
@@ -727,8 +748,9 @@ impl Supervisor<'_> {
                         .note(&format!("run {} is {}", run.id, run.status.as_str()));
                     self.finished.push(*run);
                 }
+                Ok(Step::Triaged(run)) => self.note_triaged(&run),
                 Ok(Step::Disowned) => {
-                    stop_reviewer(&mut slot);
+                    stop_job(&mut slot);
                     self.disown(&slot)
                 }
                 // A lease-guarded write that failed because the lease
@@ -741,6 +763,16 @@ impl Supervisor<'_> {
                         .unwrap_or(true) =>
                 {
                     self.disown(&slot)
+                }
+                Err(error) if matches!(slot.phase, Phase::Triage(_)) => {
+                    stop_job(&mut slot);
+                    let attempt = match &slot.phase {
+                        Phase::Triage(watch) => watch.attempt,
+                        _ => unreachable!("matched a triage"),
+                    };
+                    self.fail_triage(&slot.run, attempt, format!("{error:#}"), 0);
+                    let run = self.queue.run(&slot.run.id).unwrap_or(slot.run);
+                    self.note_triaged(&run);
                 }
                 Err(error) if matches!(slot.phase, Phase::AwaitingSlot) => {
                     // The resume already recorded its `resume_finished`;
@@ -776,7 +808,7 @@ impl Supervisor<'_> {
                     // session may be alive. Disown the run, delete nothing,
                     // and keep serving the other slots. A headless review in
                     // progress is stopped: nobody would read its verdict.
-                    stop_reviewer(&mut slot);
+                    stop_job(&mut slot);
                     let message = format!("{error:#}");
                     self.log.note(&format!(
                         "run {} retained for inspection: {message}; see show {} and doctor",
@@ -1073,6 +1105,26 @@ impl Supervisor<'_> {
                 Ok(Step::Continue)
             }
             Phase::Landing(_) => unreachable!("joined above"),
+            Phase::Triage(watch) => {
+                let Some(outcome) = watch.poll()? else {
+                    return Ok(Step::Continue);
+                };
+                let attempt = watch.attempt;
+                let duration_secs = watch.job.started.elapsed().as_secs();
+                let run = self.queue.run(&slot.run.id)?;
+                let acted = outcome
+                    .map_err(|error| anyhow!(error))
+                    .and_then(|verdict| self.act_on_triage(&run, attempt, duration_secs, verdict));
+                if let Err(error) = acted {
+                    // Another process took the run's lease meanwhile: its
+                    // triage is the record.
+                    if !self.queue.holds_lease(&run.id, &self.token)? {
+                        return Ok(Step::Disowned);
+                    }
+                    self.fail_triage(&run, attempt, format!("{error:#}"), duration_secs);
+                }
+                Ok(Step::Triaged(Box::new(self.queue.run(&run.id)?)))
+            }
             Phase::Session(watch) => {
                 let Some(run) = watch.poll(
                     &mut self.queue,
@@ -1141,7 +1193,7 @@ impl Supervisor<'_> {
                     return Ok(Step::Continue);
                 };
                 let attempt = watch.attempt;
-                let duration_secs = watch.started.elapsed().as_secs();
+                let duration_secs = watch.job.started.elapsed().as_secs();
                 let session = watch.session.take();
                 let run = self.queue.run(&slot.run.id)?;
                 slot.phase = match outcome {
@@ -1400,12 +1452,15 @@ impl Supervisor<'_> {
                 ));
                 Phase::Review(ReviewWatch {
                     session,
-                    child,
                     attempt,
-                    started: Instant::now(),
-                    timeout: self.reviewer.review_timeout(),
-                    stdout,
-                    stderr,
+                    job: HeadlessJob {
+                        what: "review",
+                        child,
+                        started: Instant::now(),
+                        timeout: self.reviewer.review_timeout(),
+                        stdout,
+                        stderr,
+                    },
                 })
             }
             Err(error) => {
@@ -1817,6 +1872,441 @@ impl Supervisor<'_> {
             }
         }
         Ok(())
+    }
+
+    /// Recover the unfinished runs nobody leases whose wrapper exited or
+    /// died (ADR-0024 decision 3, amending ADR-0012): `recover`'s own check
+    /// (no live process of the run; `doctor`'s blockers empty) on
+    /// `claimed` / `starting` / `running` / `validating` runs without a
+    /// lease row. They become `interrupted` with `run_recovered` (`by:
+    /// supervisor`) and go to the triage, never straight to `ready`. A run
+    /// that changed meanwhile is left for a later pass.
+    fn recover_dead_runs(&mut self) -> Result<()> {
+        let now = unix_time();
+        for run in self.queue.active_runs()? {
+            if run.status == RunStatus::Integrating || self.queue.run_lease(&run.id)?.is_some() {
+                continue;
+            }
+            let processes = self.queue.processes(&run.id)?;
+            let health = run_health(&run, &processes, None, now);
+            if !health.recoverable {
+                continue;
+            }
+            let report = json!({"run": health, "by": "supervisor"});
+            match self.queue.recover_run(&run.id, processes.len(), report) {
+                Ok(recovered) => self.log.note(&format!(
+                    "run {} of task {} recovered from {}: nobody leases it and its session is gone; it goes to triage",
+                    recovered.id,
+                    recovered.task_id,
+                    run.status.as_str()
+                )),
+                Err(error) => self.log.note(&format!(
+                    "run {} could not be recovered: {error:#}",
+                    run.id
+                )),
+            }
+        }
+        Ok(())
+    }
+
+    /// Apply the answered `decide` asks of the triage (one of
+    /// [`TRIAGE_OPTIONS`]) to their `failed` / `interrupted` run nobody
+    /// leases: `retry` readies the task, `resume` parks the run as
+    /// `needs_session` with the triage's reason, `cancel` cancels the task;
+    /// the ask is closed with it. An ask whose task is no longer in progress,
+    /// or has a newer run, has nothing left to apply and is closed. Any other answer is a
+    /// person's to read.
+    fn apply_triage_answers(&mut self) -> Result<()> {
+        for ask in self.queue.triage_answers()? {
+            let Some(run_id) = ask.run_id.clone() else {
+                continue;
+            };
+            let answer = ask.answer.as_deref().unwrap_or_default().trim().to_owned();
+            let run = self.queue.run(&run_id)?;
+            if !TRIAGE_OPTIONS.contains(&answer.as_str())
+                || !matches!(run.status, RunStatus::Failed | RunStatus::Interrupted)
+                || self.queue.run_lease(&run_id)?.is_some()
+            {
+                continue;
+            }
+            let detail = self.queue.show(run.task_id)?;
+            if detail.task.status != TaskStatus::InProgress
+                || detail.runs.last().is_some_and(|latest| latest.id != run.id)
+            {
+                self.log.note(&format!(
+                    "ask {} of run {} is closed: task {} moved on without it",
+                    ask.id, run.id, run.task_id
+                ));
+                self.queue.close_ask(ask.id)?;
+                continue;
+            }
+            let reason = self
+                .queue
+                .run_events(&run.id)?
+                .iter()
+                .rev()
+                .find(|e| e.kind == "triage_finished")
+                .and_then(|e| e.payload.get("reason").and_then(Value::as_str))
+                .map_or_else(|| run.last_error.clone().unwrap_or_default(), str::to_owned);
+            let reason = format!("{reason} (a person chose {answer} in ask {})", ask.id);
+            match self.queue.decide_triage(&run.id, ask.id, &answer, &reason) {
+                Ok(decided) => self.log.note(&format!(
+                    "run {} of task {}: {answer} as ask {} answered; the run is {}",
+                    decided.id,
+                    decided.task_id,
+                    ask.id,
+                    decided.status.as_str()
+                )),
+                Err(error) => self.log.note(&format!(
+                    "run {}: the answer {answer:?} of ask {} could not be applied: {error:#}",
+                    run.id, ask.id
+                )),
+            }
+        }
+        Ok(())
+    }
+
+    /// Start the triage of `failed` / `interrupted` runs not triaged since
+    /// their last resume, while slots are free (ADR-0024 decision 3). A run
+    /// someone leases (a session still asked to exit) waits. A triage that
+    /// cannot even start fails right away.
+    fn triage_runs(&mut self, parallel: usize) -> Result<()> {
+        let now = unix_time();
+        for run in self.queue.runs_to_triage()? {
+            if self.slots.len() >= parallel {
+                break;
+            }
+            if triage_state(&self.queue.run_events(&run.id)?) != TriageState::Pending
+                || self
+                    .queue
+                    .run_lease(&run.id)?
+                    .is_some_and(|lease| !lease_is_stale(&lease, now))
+            {
+                continue;
+            }
+            let Some((run, attempt)) = self.queue.begin_triage(&run.id, &self.token)? else {
+                continue;
+            };
+            match self.spawn_triage(&run, attempt) {
+                Ok(watch) => {
+                    self.log.note(&format!(
+                        "run {} of task {} ({}) triage {attempt} started",
+                        run.id,
+                        run.task_id,
+                        run.status.as_str()
+                    ));
+                    self.slots.push(Slot {
+                        run,
+                        phase: Phase::Triage(watch),
+                    });
+                }
+                Err(error) => {
+                    let error = format!("the headless triage could not start: {error:#}");
+                    self.fail_triage(&run, attempt, error, 0);
+                    let run = self.queue.run(&run.id)?;
+                    self.note_triaged(&run);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Write the triage's prompt and start the headless job in the run's
+    /// directory, allowed to read only (ADR-0024 decision 2).
+    fn spawn_triage(&mut self, run: &TaskRun, attempt: usize) -> Result<TriageWatch> {
+        let dir = match &run.run_dir {
+            Some(dir) => PathBuf::from(dir),
+            None => runs_dir(&self.db).join(&run.id),
+        };
+        fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
+        let detail = self.queue.show(run.task_id)?;
+        let resumes = resume_attempts(&self.queue, &run.id);
+        let prompt = triage_prompt(&detail, run, resumes, &dir)?;
+        fs::write(dir.join(format!("triage-prompt-{attempt}.txt")), &prompt)?;
+        let stdout = dir.join(format!("triage-{attempt}.out"));
+        let stderr = dir.join(format!("triage-{attempt}.err"));
+        let mut command = self
+            .reviewer
+            .headless_command(&dir, &prompt, TRIAGE_TOOLS)?;
+        // Like the review: the CLI knows the job by its role and allows it
+        // only reads of this queue.
+        command
+            .env(crate::lifecycle::ROLE_ENV, crate::lifecycle::REVIEWER_ROLE)
+            .env(crate::lifecycle::QUEUE_ENV, &self.db)
+            .stdin(std::process::Stdio::null())
+            .stdout(fs::File::create(&stdout)?)
+            .stderr(fs::File::create(&stderr)?);
+        let child = command.spawn().context("start the triage")?;
+        Ok(TriageWatch {
+            attempt,
+            job: HeadlessJob {
+                what: "triage",
+                child,
+                started: Instant::now(),
+                timeout: self.reviewer.review_timeout(),
+                stdout,
+                stderr,
+            },
+        })
+    }
+
+    /// Act on the triage's verdict (ADR-0024 decision 3). The runtime's own
+    /// rules come first: a task with [`TRIAGE_RETRY_FAILURES`] failed or
+    /// interrupted runs is not retried, and a run without resumes left or
+    /// without a worktree is not resumed; either becomes an ask. Then
+    /// `triage_finished` with the action, the workspaces the run left open
+    /// are closed, and the lease is released.
+    fn act_on_triage(
+        &mut self,
+        run: &TaskRun,
+        attempt: usize,
+        duration_secs: u64,
+        verdict: TriageVerdict,
+    ) -> Result<TaskRun> {
+        let failures = self
+            .queue
+            .show(run.task_id)?
+            .runs
+            .iter()
+            .filter(|r| matches!(r.status, RunStatus::Failed | RunStatus::Interrupted))
+            .count();
+        ensure!(
+            self.queue.holds_lease(&run.id, &self.token)?,
+            "the triage's lease of run {} was lost",
+            run.id
+        );
+        let resumes = resume_attempts(&self.queue, &run.id);
+        let worktree = run
+            .worktree_path
+            .as_deref()
+            .is_some_and(|path| Path::new(path).is_dir());
+        let overridden = match verdict.verdict {
+            TriageDecision::Retry if failures >= TRIAGE_RETRY_FAILURES => Some(format!(
+                "task {} has {failures} failed or interrupted runs, so it is not retried without a person",
+                run.task_id
+            )),
+            TriageDecision::Resume if resumes >= MAX_RESUME_ATTEMPTS => Some(format!(
+                "the run was resumed {resumes} times already (at most {MAX_RESUME_ATTEMPTS})"
+            )),
+            TriageDecision::Resume if !worktree || run.receipt_path.is_none() => {
+                Some("the run has no worktree a session could resume in".to_owned())
+            }
+            _ => None,
+        };
+        let action = match (verdict.verdict, &overridden) {
+            (TriageDecision::Retry, None) => TriageAction::Retry,
+            (TriageDecision::Resume, None) => TriageAction::Resume {
+                instruction: if verdict.instruction.trim().is_empty() {
+                    verdict.reason.clone()
+                } else {
+                    verdict.instruction.clone()
+                },
+            },
+            _ => TriageAction::Ask {
+                ask_id: self.open_triage_ask(run, attempt, &verdict, overridden.as_deref())?,
+            },
+        };
+        let payload = json!({
+            "attempt": attempt,
+            "verdict": verdict.verdict,
+            "reason": verdict.reason,
+            "instruction": verdict.instruction,
+            "overridden": overridden,
+            "failures": failures,
+            "duration_secs": duration_secs,
+        });
+        let triaged = self
+            .queue
+            .finish_triage(&run.id, &self.token, &action, payload)?;
+        self.log.note(&format!(
+            "run {} triage {attempt}: {}{} ({}); the run is {}",
+            run.id,
+            verdict.verdict.as_str(),
+            match &overridden {
+                Some(why) => format!(" became ask: {why}"),
+                None => String::new(),
+            },
+            verdict.reason,
+            triaged.status.as_str()
+        ));
+        // The verdict is acted on: what fails from here on is logged, not
+        // a failed triage.
+        if let Err(error) = self.close_triaged_workspaces(&triaged) {
+            self.log.note(&format!(
+                "run {}: its workspaces could not all be closed: {error:#}",
+                run.id
+            ));
+        }
+        if let Err(error) = self.queue.release_lease(&run.id, &self.token) {
+            self.log.note(&format!(
+                "run {}: could not release the lease: {error:#}",
+                run.id
+            ));
+        }
+        self.queue.run(&run.id)
+    }
+
+    /// Open the triage's `decide` ask (options [`TRIAGE_OPTIONS`]) through
+    /// `ask`, so the inbox is notified; returns its ID.
+    fn open_triage_ask(
+        &mut self,
+        run: &TaskRun,
+        attempt: usize,
+        verdict: &TriageVerdict,
+        overridden: Option<&str>,
+    ) -> Result<i64> {
+        let asked = match (verdict.verdict, overridden) {
+            (TriageDecision::Ask, _) if !verdict.instruction.trim().is_empty() => {
+                verdict.instruction.clone()
+            }
+            (_, Some(why)) => format!(
+                "the triage answered {} ({}), but {why}",
+                verdict.verdict.as_str(),
+                verdict.instruction.trim()
+            ),
+            _ => "what should happen to this run?".to_owned(),
+        };
+        let mut question = format!(
+            "The supervisor's triage of run {} (task {}, {}) asks a person: {asked}\nReason: {}\nLast error: {}",
+            run.id,
+            run.task_id,
+            run.status.as_str(),
+            verdict.reason,
+            or_none(tail(run.last_error.as_deref().unwrap_or_default(), 500))
+        );
+        if let Some(run_dir) = &run.run_dir {
+            question.push_str(&format!(
+                "\nTriage material: {run_dir}/triage-prompt-{attempt}.txt"
+            ));
+        }
+        question.push_str(
+            "\nretry: make the task ready for a new run. resume: resume the run's own session with the triage's reason. cancel: cancel the task.",
+        );
+        let outcome = ask_in(
+            &mut self.queue,
+            &self.repository.root,
+            NewAsk {
+                kind: AskKind::Decide,
+                task_id: None,
+                run_id: Some(run.id.clone()),
+                question,
+                options: TRIAGE_OPTIONS.iter().map(|o| (*o).to_owned()).collect(),
+                asked_by: TRIAGE_ASKER.to_owned(),
+            },
+            self.cmux,
+        )?;
+        outcome["id"].as_i64().context("ask returned no id")
+    }
+
+    /// Close the workspaces a triaged run left open: its worker workspace
+    /// (unless the runtime closed it) and the resume workspaces its
+    /// `resume_finished` events name as not closed, each only while cmux
+    /// still lists it. A close records `workspace_closed` (`by: triage`); a
+    /// cmux failure records `cleanup_failed` and the others go on. A
+    /// `stuck_exit` ask of the run is closed with its workspace.
+    fn close_triaged_workspaces(&mut self, run: &TaskRun) -> Result<()> {
+        let mut workspaces: Vec<String> = run
+            .workspace_id
+            .clone()
+            .filter(|_| run.workspace_closed_at.is_none())
+            .into_iter()
+            .collect();
+        for event in self.queue.run_events(&run.id)? {
+            if event.kind == "resume_finished"
+                && event.payload["workspace_closed"] != true
+                && let Some(workspace) = event.payload.get("workspace_id").and_then(Value::as_str)
+                && !workspaces.iter().any(|w| w == workspace)
+            {
+                workspaces.push(workspace.to_owned());
+            }
+        }
+        let mut closed = false;
+        for workspace in workspaces {
+            let result = self.cmux.exists(&workspace).and_then(|open| {
+                if open {
+                    self.cmux.close(&workspace)?;
+                }
+                Ok(open)
+            });
+            match result {
+                Ok(true) => {
+                    self.queue.triage_closed_workspace(&run.id, &workspace)?;
+                    closed = true;
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    let message = format!("workspace {workspace} could not be closed: {error:#}");
+                    self.log.note(&format!("run {}: {message}", run.id));
+                    self.queue.record_runtime_event(
+                        &run.id,
+                        "cleanup_failed",
+                        json!({"workspace_id": workspace, "message": message}),
+                    )?;
+                }
+            }
+        }
+        if closed {
+            self.queue
+                .close_stuck_exit_asks(&run.id, "the triage closed the run's workspace")?;
+        }
+        Ok(())
+    }
+
+    /// Record `triage_failed` (a person triages the run) and give the lease
+    /// back; the run stays as it is.
+    fn fail_triage(&mut self, run: &TaskRun, attempt: usize, error: String, duration_secs: u64) {
+        self.log.note(&format!(
+            "run {} triage {attempt} failed: {error}; the run waits for a triage by hand",
+            run.id
+        ));
+        let recorded = self.queue.record_runtime_event(
+            &run.id,
+            "triage_failed",
+            json!({
+                "attempt": attempt,
+                "error": error,
+                "duration_secs": duration_secs,
+                "status": run.status.as_str(),
+            }),
+        );
+        if let Err(error) = recorded {
+            self.log.note(&format!(
+                "run {}: could not record the triage failure: {error:#}",
+                run.id
+            ));
+        }
+        if self
+            .queue
+            .holds_lease(&run.id, &self.token)
+            .unwrap_or(false)
+            && let Err(error) = self.queue.release_lease(&run.id, &self.token)
+        {
+            self.log.note(&format!(
+                "run {}: could not release the lease: {error:#}",
+                run.id
+            ));
+        }
+    }
+
+    fn note_triaged(&mut self, run: &TaskRun) {
+        let task = self
+            .queue
+            .show(run.task_id)
+            .map(|detail| detail.task.status);
+        self.log.note(&format!(
+            "run {} triaged: the run is {}{}",
+            run.id,
+            run.status.as_str(),
+            match task {
+                Ok(status) => format!(", task {} is {}", run.task_id, status.as_str()),
+                Err(_) => String::new(),
+            }
+        ));
+        self.triaged.push(json!({
+            "run_id": run.id,
+            "task_id": run.task_id,
+            "status": run.status,
+        }));
     }
 
     /// Resume `needs_session` runs with attempts left (ADR-0019 decision 1),
@@ -3075,6 +3565,10 @@ enum ResumeKind {
     /// that it conflicts with main (ADR-0027 decision 4). Rebase, like
     /// `Landing`.
     Precheck,
+    /// The triage of a `failed` / `interrupted` run sent it back to its
+    /// session (`triage_finished` with action `resume`, or a person's
+    /// `resume` answer, `triage_decided`): do what the reason asks.
+    Triage,
 }
 
 /// Why the run waits for a session: the reason of its latest
@@ -3084,7 +3578,9 @@ enum ResumeKind {
 /// and what kind of request that makes: `evidence_missing` (or a landing
 /// deferred for missing evidence, whose payload names the `checks`),
 /// `scope_violation` (or a landing deferred for it, whose payload names the
-/// paths), a review sent back, or a landing.
+/// paths), a review sent back, the triage's resume (`triage_finished`,
+/// whose `instruction` is the reason, or a person's `triage_decided`), or a
+/// landing.
 fn resume_reason(queue: &SqliteQueue, run: &TaskRun) -> Result<(Option<String>, ResumeKind)> {
     let events = queue.run_events(&run.id)?;
     let parked = events.iter().rev().find(|e| {
@@ -3095,10 +3591,17 @@ fn resume_reason(queue: &SqliteQueue, run: &TaskRun) -> Result<(Option<String>, 
                 | "evidence_missing"
                 | "scope_violation"
                 | "landing_decided"
+                | "triage_finished"
+                | "triage_decided"
         )
     });
+    // The triage's resume asks for its `instruction`, not its reason.
+    let key = match parked {
+        Some(e) if e.kind == "triage_finished" => "instruction",
+        _ => "reason",
+    };
     let reason = parked
-        .and_then(|e| e.payload.get("reason").and_then(Value::as_str))
+        .and_then(|e| e.payload.get(key).and_then(Value::as_str))
         .map(str::to_owned)
         .or_else(|| run.last_error.clone());
     let kind = match parked {
@@ -3109,6 +3612,7 @@ fn resume_reason(queue: &SqliteQueue, run: &TaskRun) -> Result<(Option<String>, 
             ResumeKind::ScopeViolation
         }
         Some(e) if e.kind == "landing_decided" => ResumeKind::SentBack,
+        Some(e) if e.kind.starts_with("triage_") => ResumeKind::Triage,
         _ => ResumeKind::Landing,
     };
     Ok((reason, kind))
@@ -3175,6 +3679,10 @@ fn resume_request(
             "dagq: the supervisor's review of run {} (task {}) passed, but integrate would conflict with main, so the run was not landed.",
             run.id, task.id
         ),
+        ResumeKind::Triage => format!(
+            "dagq: run {} (task {}) failed or was interrupted, and the supervisor's triage sent it back to this session to finish, so the run is needs_session.",
+            run.id, task.id
+        ),
     }];
     lines.push(format!("Reason: {}", request.reason));
     lines.push(format!(
@@ -3211,6 +3719,12 @@ fn resume_request(
     } else if request.kind == ResumeKind::SentBack {
         lines.push(format!(
             "1. Fix the findings in the reason and commit; if main moved, git rebase {} first.",
+            request.main
+        ));
+        lines.push(format!("2. Rerun the verification commands {verify}."));
+    } else if request.kind == ResumeKind::Triage {
+        lines.push(format!(
+            "1. Do what the reason asks in this worktree and commit; if main moved, git rebase {} first.",
             request.main
         ));
         lines.push(format!("2. Rerun the verification commands {verify}."));
@@ -3502,11 +4016,13 @@ fn passed_before(events: &[crate::domain::RunEvent], before: i64) -> Option<Revi
         })
 }
 
-/// Kill the headless reviewer of a slot the supervisor stops watching.
-fn stop_reviewer(slot: &mut Slot) {
-    if let Phase::Review(watch) = &mut slot.phase {
-        let _ = watch.child.kill();
-        let _ = watch.child.wait();
+/// Kill the headless job (a review or a triage) of a slot the supervisor
+/// stops watching.
+fn stop_job(slot: &mut Slot) {
+    match &mut slot.phase {
+        Phase::Review(watch) => watch.job.stop(),
+        Phase::Triage(watch) => watch.job.stop(),
+        _ => {}
     }
 }
 
@@ -3529,31 +4045,30 @@ fn latest_review_reasons(queue: &SqliteQueue, run_id: &str) -> Result<Vec<String
         .unwrap_or_default())
 }
 
-/// The headless review in progress: the reviewer's process, whose stdout
-/// and stderr go to `review-N.out` / `review-N.err` in the run directory.
-struct ReviewWatch {
-    session: Option<SessionRef>,
+/// A headless job's process (a review or a triage) whose stdout and stderr
+/// go to files, waited for at most `timeout`.
+struct HeadlessJob {
+    /// What the job is, for its failure messages: `review`, `triage`.
+    what: &'static str,
     child: std::process::Child,
-    attempt: usize,
     started: Instant,
     timeout: Duration,
     stdout: PathBuf,
     stderr: PathBuf,
 }
 
-impl ReviewWatch {
-    /// `Some` once the review ended: its verdict, or why it failed (a
-    /// non-zero exit, stdout without a verdict, or the timeout, after which
-    /// the process is killed).
-    fn poll(&mut self) -> Result<Option<std::result::Result<ReviewVerdict, String>>> {
+impl HeadlessJob {
+    /// `Some` once the job ended: its stdout, or why it failed (a non-zero
+    /// exit, or the timeout, after which the process is killed).
+    fn poll(&mut self) -> Result<Option<std::result::Result<String, String>>> {
         let status = match self.child.try_wait()? {
             Some(status) => status,
             None if self.started.elapsed() < self.timeout => return Ok(None),
             None => {
-                let _ = self.child.kill();
-                let _ = self.child.wait();
+                self.stop();
                 return Ok(Some(Err(format!(
-                    "the headless review did not finish within {} seconds",
+                    "the headless {} did not finish within {} seconds",
+                    self.what,
                     self.timeout.as_secs()
                 ))));
             }
@@ -3561,12 +4076,54 @@ impl ReviewWatch {
         if !status.success() {
             let stderr = fs::read_to_string(&self.stderr).unwrap_or_default();
             return Ok(Some(Err(format!(
-                "the headless review exited with {status}: {}",
+                "the headless {} exited with {status}: {}",
+                self.what,
                 or_none(tail(stderr.trim(), 500))
             ))));
         }
-        let stdout = fs::read_to_string(&self.stdout).unwrap_or_default();
-        Ok(Some(ReviewVerdict::parse(&stdout)))
+        Ok(Some(Ok(
+            fs::read_to_string(&self.stdout).unwrap_or_default()
+        )))
+    }
+
+    fn stop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// The headless review in progress, with its output in `review-N.out` /
+/// `review-N.err` in the run directory.
+struct ReviewWatch {
+    session: Option<SessionRef>,
+    attempt: usize,
+    job: HeadlessJob,
+}
+
+impl ReviewWatch {
+    /// `Some` once the review ended: its verdict, or why it failed (the
+    /// job's failure, or stdout without a verdict).
+    fn poll(&mut self) -> Result<Option<std::result::Result<ReviewVerdict, String>>> {
+        Ok(self
+            .job
+            .poll()?
+            .map(|output| output.and_then(|stdout| ReviewVerdict::parse(&stdout))))
+    }
+}
+
+/// The headless triage in progress, with its output in `triage-N.out` /
+/// `triage-N.err` next to the run.
+struct TriageWatch {
+    attempt: usize,
+    job: HeadlessJob,
+}
+
+impl TriageWatch {
+    fn poll(&mut self) -> Result<Option<std::result::Result<TriageVerdict, String>>> {
+        Ok(self
+            .job
+            .poll()?
+            .map(|output| output.and_then(|stdout| TriageVerdict::parse(&stdout))))
     }
 }
 
@@ -3913,6 +4470,186 @@ pub fn review_prompt(task: &Task, run: &TaskRun, review_path: &str) -> String {
         title = task.title,
         acceptance = or_none(&task.acceptance),
     )
+}
+
+/// The tools the headless triage may use beyond what needs no permission:
+/// reading only.
+pub const TRIAGE_TOOLS: &[&str] = &["Read", "Grep", "Glob"];
+
+/// Bytes of each log, receipt and screen the triage prompt carries (their
+/// ends).
+const TRIAGE_TAIL_BYTES: usize = 3000;
+
+/// Logs of a run directory the triage reads: `integrate-verify-N.log` and
+/// `verify-N.log`, in name order, at most this many.
+const TRIAGE_LOGS: usize = 8;
+
+/// What the headless triage is asked (ADR-0024 decision 3): the task, the
+/// run's error, receipt, verification logs, final screen and events, the
+/// task's earlier runs, the verdict schema and the rule that a task with
+/// [`TRIAGE_RETRY_FAILURES`] failed or interrupted runs is not retried.
+/// `dir` is where the run's files are.
+pub fn triage_prompt(
+    detail: &TaskDetail,
+    run: &TaskRun,
+    resumes: usize,
+    dir: &Path,
+) -> Result<String> {
+    let task = &detail.task;
+    let failures = detail
+        .runs
+        .iter()
+        .filter(|r| matches!(r.status, RunStatus::Failed | RunStatus::Interrupted))
+        .count();
+    let read = |path: &Path| {
+        fs::read(path)
+            .ok()
+            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+    };
+    let mut material = String::new();
+    let receipt = run.receipt_path.as_deref().map(Path::new).and_then(read);
+    material.push_str(&format!(
+        "Receipt ({}):\n{}\n",
+        run.receipt_path.as_deref().unwrap_or("none"),
+        fenced(
+            "json",
+            or_none(tail(
+                receipt.as_deref().unwrap_or_default().trim(),
+                TRIAGE_TAIL_BYTES
+            ))
+        )
+    ));
+    let mut logs: Vec<PathBuf> = fs::read_dir(dir)
+        .map(|entries| {
+            entries
+                .filter_map(|entry| entry.ok().map(|e| e.path()))
+                .filter(|path| {
+                    path.file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|name| {
+                            (name.starts_with("integrate-verify-") || name.starts_with("verify-"))
+                                && name.ends_with(".log")
+                        })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    logs.sort();
+    logs.truncate(TRIAGE_LOGS);
+    if logs.is_empty() {
+        material.push_str("Verification logs: none\n");
+    }
+    for log in &logs {
+        let text = read(log).unwrap_or_default();
+        material.push_str(&format!(
+            "Verification log {} (end):\n{}\n",
+            log.display(),
+            fenced("text", or_none(tail(text.trim(), TRIAGE_TAIL_BYTES)))
+        ));
+    }
+    let screen = read(&dir.join("terminal-final.txt"));
+    material.push_str(&format!(
+        "Final screen of the session (end of terminal-final.txt):\n{}\n",
+        fenced(
+            "text",
+            or_none(tail(
+                screen.as_deref().unwrap_or_default().trim(),
+                TRIAGE_TAIL_BYTES
+            ))
+        )
+    ));
+    let events: Vec<Value> = detail
+        .events
+        .iter()
+        .filter(|e| e.run_id.as_deref() == Some(run.id.as_str()))
+        .map(crate::watch::compact_event)
+        .collect();
+    let events = &events[events.len().saturating_sub(40)..];
+    material.push_str(&format!(
+        "Events of the run (the last {}):\n{}\n",
+        events.len(),
+        fenced(
+            "json",
+            &events
+                .iter()
+                .map(Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n")
+        )
+    ));
+    let earlier: Vec<String> = detail
+        .runs
+        .iter()
+        .filter(|r| r.id != run.id)
+        .map(|r| {
+            let verdicts: Vec<String> = detail
+                .events
+                .iter()
+                .filter(|e| {
+                    e.run_id.as_deref() == Some(r.id.as_str()) && e.kind == "triage_finished"
+                })
+                .map(|e| format!("{}", e.payload.get("action").unwrap_or(&Value::Null)))
+                .collect();
+            format!(
+                "- run {} {}: {}{}",
+                r.id,
+                r.status.as_str(),
+                or_none(tail(r.last_error.as_deref().unwrap_or_default(), 300)),
+                if verdicts.is_empty() {
+                    String::new()
+                } else {
+                    format!(" (triaged: {})", verdicts.join(", "))
+                }
+            )
+        })
+        .collect();
+    let retry_rule = if failures >= TRIAGE_RETRY_FAILURES {
+        format!(
+            "This task has {failures} failed or interrupted runs, this one included: do not answer retry (the supervisor turns it into ask)."
+        )
+    } else {
+        format!(
+            "This task has {failures} failed or interrupted run(s), this one included; from {TRIAGE_RETRY_FAILURES} on, retry is not allowed and the supervisor turns it into ask."
+        )
+    };
+    let resume_rule = if resumes >= MAX_RESUME_ATTEMPTS {
+        format!("The run was resumed {resumes} times already: do not answer resume.")
+    } else {
+        format!(
+            "The run was resumed {resumes} time(s) (at most {MAX_RESUME_ATTEMPTS}); resume needs the run's worktree."
+        )
+    };
+    Ok(format!(
+        "You triage run {run_id} of dagq task {task_id} ({title}), which ended {status}. Decide what the supervisor does next.\n\
+         Read only: the material below, and the files it names if you need more (the run directory is {dir}, the worktree {worktree}). Do not change any file.\n\n\
+         Task description:\n{description}\n\n\
+         Acceptance criteria:\n{acceptance}\n\n\
+         Last error of the run:\n{last_error}\n\n\
+         {material}\n\
+         Earlier runs of the task:\n{earlier}\n\n\
+         Decide one verdict:\n\
+         - retry: the failure is transient or came from the environment (the machine slept, a process was killed, the session never started, an outage), and a new run from the current main is likely to succeed. The task goes back to ready and a new run starts from scratch; this run's work is not reused.\n\
+         - resume: this run's worktree holds useful work that its own session can finish with a concrete instruction (fix the failing test, commit and rewrite the receipt, rebase). instruction is what the session must do, written to it.\n\
+         - ask: a person has to decide: the task's instructions or acceptance look wrong or impossible, the same failure repeats, the work is no longer needed, or you cannot tell. instruction is the question for the person.\n\
+         Rules: {retry_rule} {resume_rule}\n\n\
+         Answer with one JSON object and nothing else, matching this schema:\n\
+         {{\"verdict\": \"retry\" | \"resume\" | \"ask\", \"reason\": string, \"instruction\": string}}\n\
+         reason is one or two sentences on why; instruction may be empty for retry.\n",
+        run_id = run.id,
+        task_id = task.id,
+        title = task.title,
+        status = run.status.as_str(),
+        dir = dir.display(),
+        worktree = run.worktree_path.as_deref().unwrap_or("none"),
+        description = or_none(&task.description),
+        acceptance = or_none(&task.acceptance),
+        last_error = or_none(run.last_error.as_deref().unwrap_or_default()),
+        earlier = if earlier.is_empty() {
+            "none".to_owned()
+        } else {
+            earlier.join("\n")
+        },
+    ))
 }
 
 /// The fixed request the supervisor types into the live session for a
