@@ -21,8 +21,8 @@ use crate::{
     domain::{
         ClaimOutcome, CommitSha, DomainError, Goal, GoalDetail, GoalEdit, GoalId, GoalRecord,
         GoalSummary, GoalTask, GoalVerdict, NewGoal, NewNote, NewTask, NotePage, NoteQuery,
-        NoteTarget, OBSERVATION_KIND, Predecessor, RunEvent, RunId, Task, TaskAction, TaskDetail,
-        TaskId, TaskRecord, TaskRun, TaskStatus, TaskStatusCounts, goal,
+        NoteTarget, OBSERVATION_KIND, Predecessor, Provider, RunEvent, RunId, RunRecord, Task,
+        TaskAction, TaskDetail, TaskId, TaskRecord, TaskRun, TaskStatus, TaskStatusCounts, goal,
         scope::validate_path_globs, task,
     },
     infrastructure::location::runs_dir,
@@ -841,27 +841,40 @@ pub(super) fn claim_task(
     if ready.is_empty() {
         return Ok(ClaimOutcome::NoReadyTask);
     }
-    let task = ready.swap_remove(preferred);
+    let task = task::claim(ready.swap_remove(preferred))?;
     let run_id = RunId::new(Uuid::new_v4().to_string())?;
-    tx.execute("UPDATE tasks SET status='in_progress', updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?1",
-        [task.id()])?;
+    let run = TaskRun::new(run_id, &task, base_commit, Provider::Claude, now(tx)?)?;
+    // `status='ready'` only detects a concurrent change; the domain decided the claim.
+    ensure!(
+        tx.execute(
+            "UPDATE tasks SET status=?1, updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+             WHERE id=?2 AND status='ready'",
+            params![task.status().as_str(), task.id()],
+        )? == 1,
+        "task {} changed concurrently",
+        task.id()
+    );
     tx.execute(
-        "INSERT INTO task_runs(id,task_id,status,requested_provider,actual_provider,base_commit)
-         VALUES (?1,?2,'claimed','claude','claude',?3)",
-        params![run_id, task.id(), base_commit.as_str().to_ascii_lowercase()],
+        "INSERT INTO task_runs(id,task_id,status,requested_provider,actual_provider,base_commit,created_at)
+         VALUES (?1,?2,?3,?4,?5,?6,?7)",
+        params![
+            run.id(),
+            run.task_id(),
+            run.status().as_str(),
+            run.requested_provider().as_str(),
+            run.actual_provider().as_str(),
+            run.base_commit(),
+            run.created_at()
+        ],
     )?;
     event(
         tx,
         task.id(),
-        Some(&run_id),
+        Some(run.id()),
         "run_claimed",
-        json!({"from": "ready", "to": "in_progress", "provider": "claude"}),
+        json!({"from": "ready", "to": task.status(), "provider": run.actual_provider()}),
     )?;
-    let run = tx.query_row(
-        "SELECT * FROM task_runs WHERE id=?1",
-        [&run_id],
-        run_row(runs_dir),
-    )?;
+    let run = run.relocated(runs_dir);
     Ok(ClaimOutcome::Claimed { run: Box::new(run) })
 }
 
@@ -1040,8 +1053,10 @@ pub(super) fn run_row(runs_dir: &Path) -> impl Fn(&Row<'_>) -> rusqlite::Result<
     move |row| Ok(stored_run_row(row)?.relocated(runs_dir))
 }
 
-fn stored_run_row(row: &Row<'_>) -> rusqlite::Result<TaskRun> {
-    Ok(TaskRun {
+/// Reads a run as stored, paths included: what a command starts from
+/// before the store saves its result.
+pub(super) fn stored_run_row(row: &Row<'_>) -> rusqlite::Result<TaskRun> {
+    TaskRun::restore(RunRecord {
         id: row.get("id")?,
         task_id: row.get("task_id")?,
         status: enum_col(row, "status")?,
@@ -1060,6 +1075,7 @@ fn stored_run_row(row: &Row<'_>) -> rusqlite::Result<TaskRun> {
         workspace_closed_at: row.get("workspace_closed_at")?,
         created_at: row.get("created_at")?,
     })
+    .map_err(restore_error)
 }
 
 pub(super) fn event_row(row: &Row<'_>) -> rusqlite::Result<RunEvent> {

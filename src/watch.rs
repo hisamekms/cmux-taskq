@@ -58,28 +58,28 @@ pub fn attention(
 ) -> Result<Vec<Attention>> {
     let mut attention = supervisor_attention(&pulses(registrations, now));
     for mut run in queue.latest_runs_in_progress()? {
-        let leased = queue.run_lease(&run.id)?.is_some();
+        let leased = queue.run_lease(run.id())?.is_some();
         if !leased {
             // A supervisor leaves the unfinished statuses before it releases
             // the lease, so a run read before a release and its lease read
             // after it would look abandoned: judge it by its status now.
-            run = queue.run(&run.id)?;
+            run = queue.run(run.id())?;
         }
         // A run whose review raised a concern waits in its
         // `approve_landing` ask, which is the attention (ADR-0027).
-        if run.status == RunStatus::AwaitingIntegration
+        if run.status() == RunStatus::AwaitingIntegration
             && !leased
-            && queue.has_unclosed_ask(&run.id, AskKind::ApproveLanding)?
+            && queue.has_unclosed_ask(run.id(), AskKind::ApproveLanding)?
         {
             continue;
         }
-        let events = queue.run_events(&run.id)?;
+        let events = queue.run_events(run.id())?;
         let exit_pending = events
             .iter()
             .rev()
             .find(|e| matches!(e.kind.as_str(), "exit_request_timed_out" | "session_exited"))
             .is_some_and(|e| e.kind == "exit_request_timed_out");
-        let Some(next) = run_attention(run.status, exit_pending, false, leased) else {
+        let Some(next) = run_attention(run.status(), exit_pending, false, leased) else {
             continue;
         };
         // A failed or interrupted run is the supervisor's triage until it
@@ -107,7 +107,7 @@ pub fn attention(
                         && event_attention(&e.kind, &e.payload).is_some()
                 }
             })
-            .map_or_else(|| run.status.as_str().to_owned(), |e| e.kind.clone());
+            .map_or_else(|| run.status().as_str().to_owned(), |e| e.kind.clone());
         // After a failed headless review the run is a person's to review.
         let next = match next {
             AttentionNext::ReviewAndIntegrate if kind == "review_failed" => {
@@ -116,32 +116,32 @@ pub fn attention(
             next => next,
         };
         attention.push(Attention {
-            run_id: Some(run.id),
-            task_id: Some(run.task_id),
+            run_id: Some(run.id().clone()),
+            task_id: Some(run.task_id()),
             pid: None,
             ask_id: None,
-            status: run.status.as_str().into(),
+            status: run.status().as_str().into(),
             kind,
-            last_error: run.last_error.as_deref().map(truncate),
+            last_error: run.last_error().map(truncate),
             next,
         });
     }
     for run in queue.runs_with_pending_push()? {
-        let Some(next) = run_attention(run.status, false, true, false) else {
+        let Some(next) = run_attention(run.status(), false, true, false) else {
             continue;
         };
         let error = queue
-            .run_events(&run.id)?
+            .run_events(run.id())?
             .into_iter()
             .rev()
             .find(|e| e.kind == "push_failed")
             .and_then(|e| e.payload.get("error").and_then(Value::as_str).map(truncate));
         attention.push(Attention {
-            run_id: Some(run.id),
-            task_id: Some(run.task_id),
+            run_id: Some(run.id().clone()),
+            task_id: Some(run.task_id()),
             pid: None,
             ask_id: None,
-            status: run.status.as_str().into(),
+            status: run.status().as_str().into(),
             kind: "push_failed".into(),
             last_error: error,
             next,
@@ -170,7 +170,7 @@ pub fn attention(
                     "ask_delivery_failed",
                     AttentionNext::DeliverAnswer { ask_id: ask.id },
                 )
-            } else if queue.run(run_id)?.status == RunStatus::Running
+            } else if queue.run(run_id)?.status() == RunStatus::Running
                 && queue
                     .run_lease(run_id)?
                     .is_some_and(|lease| !lease_is_stale(&lease, now))
@@ -191,7 +191,7 @@ pub fn attention(
             && ask.asked_by == TRIAGE_ASKER
             && let Some(run_id) = ask.run_id.as_ref()
             && matches!(
-                queue.run(run_id)?.status,
+                queue.run(run_id)?.status(),
                 RunStatus::Failed | RunStatus::Interrupted
             )
             && ask
@@ -207,7 +207,7 @@ pub fn attention(
             )
         } else if ask.kind == AskKind::ApproveLanding
             && let Some(run_id) = ask.run_id.as_ref()
-            && queue.run(run_id)?.status == RunStatus::AwaitingIntegration
+            && queue.run(run_id)?.status() == RunStatus::AwaitingIntegration
             && ask
                 .answer
                 .as_deref()

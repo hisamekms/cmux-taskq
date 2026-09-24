@@ -1,12 +1,13 @@
 //! Input types: what a caller asks to create or change, and the stored
 //! state a store hands back to restore an aggregate. They are plain data
-//! with public fields; the aggregates in [`super::task`] and [`super::goal`]
-//! apply the rules when built from them.
+//! with public fields; the aggregates in [`super::task`], [`super::goal`]
+//! and [`super::run`] apply the rules when built from them.
 
 use serde::{Deserialize, Serialize};
 
 use super::{
-    DomainError, EvidenceCheck, GoalId, GoalStatus, GoalVerdict, TaskId, TaskStatus, require, scope,
+    CommitSha, DomainError, EvidenceCheck, GoalId, GoalStatus, GoalVerdict, Provider, RunId,
+    RunStatus, TaskId, TaskStatus, require, scope,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -137,4 +138,39 @@ pub struct GoalRecord {
     pub verdict: Option<GoalVerdict>,
     pub created_at: String,
     pub updated_at: String,
+}
+
+/// A run as the store saved it, for [`super::TaskRun::restore`].
+#[derive(Debug, Clone)]
+pub struct RunRecord {
+    pub id: RunId,
+    pub task_id: TaskId,
+    pub status: RunStatus,
+    pub requested_provider: Provider,
+    pub actual_provider: Provider,
+    pub base_commit: CommitSha,
+    pub branch: Option<String>,
+    pub worktree_path: Option<String>,
+    pub workspace_id: Option<String>,
+    pub receipt_path: Option<String>,
+    pub log_path: Option<String>,
+    pub result_commit: Option<CommitSha>,
+    pub repo_path: Option<String>,
+    pub run_dir: Option<String>,
+    pub last_error: Option<String>,
+    pub workspace_closed_at: Option<i64>,
+    pub created_at: String,
+}
+
+/// Where a claimed run is provisioned: the repository, its run directory,
+/// branch and worktree, and the files its session writes. `run_planned`
+/// records it as is.
+#[derive(Debug, Clone, Serialize)]
+pub struct RunPlan {
+    pub repo_path: String,
+    pub run_dir: String,
+    pub branch: String,
+    pub worktree_path: String,
+    pub receipt_path: String,
+    pub log_path: String,
 }

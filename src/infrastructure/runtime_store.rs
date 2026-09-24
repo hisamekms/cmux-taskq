@@ -1,21 +1,24 @@
 //! Durable per-run supervisor ownership and one-shot wrapper registration.
 use std::collections::HashMap;
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
 use serde::Serialize;
 use serde_json::json;
 
 use super::{
     adapters::process_alive,
-    sqlite::{SqliteQueue, claim_task, enum_col, event, event_row, read_task, run_row},
+    sqlite::{
+        SqliteQueue, claim_task, enum_col, event, event_row, read_task, run_row, stored_run_row,
+    },
 };
 use crate::domain::{
-    ClaimOutcome, CommitSha, EvidenceCheck, GoalId, RunEvent, RunId, RunLease, RunProcess,
-    SessionRole, SupervisorMode, SupervisorRegistration, Task, TaskAction, TaskId, TaskRun,
+    ClaimOutcome, CommitSha, DomainError, EvidenceCheck, GoalId, RunEvent, RunId, RunLease,
+    RunProcess, RunStatus, SessionRole, SupervisorMode, SupervisorRegistration, Task, TaskAction,
+    TaskId, TaskRun, run,
 };
 
-pub use crate::domain::HEARTBEAT_TIMEOUT_SECS;
+pub use crate::domain::{HEARTBEAT_TIMEOUT_SECS, RunPlan};
 
 /// Whether a lease no longer has a working process behind it: its pid is
 /// dead or its heartbeat is older than `HEARTBEAT_TIMEOUT_SECS`. The rule
@@ -80,16 +83,6 @@ pub struct ResumeCandidate {
     pub attempts: usize,
 }
 
-#[derive(Debug, Serialize)]
-pub struct RunPlan {
-    pub repo_path: String,
-    pub run_dir: String,
-    pub branch: String,
-    pub worktree_path: String,
-    pub receipt_path: String,
-    pub log_path: String,
-}
-
 impl SqliteQueue {
     /// Reserve the next dependency-ready task for this supervisor: the run,
     /// its `supervisor_token` and its lease row are created in one transaction,
@@ -118,15 +111,15 @@ impl SqliteQueue {
         if let ClaimOutcome::Claimed { run } = &outcome {
             tx.execute(
                 "UPDATE task_runs SET supervisor_token=?2 WHERE id=?1",
-                params![run.id, token],
+                params![run.id(), token],
             )?;
             tx.execute(
                 "INSERT INTO run_leases(run_id,token,pid) VALUES (?1,?2,?3)",
-                params![run.id, token, std::process::id()],
+                params![run.id(), token, std::process::id()],
             )?;
             run_event(
                 &tx,
-                &run.id,
+                run.id(),
                 "lease_acquired",
                 json!({"pid": std::process::id()}),
             )?;
@@ -317,7 +310,7 @@ impl SqliteQueue {
             .query_map([token], |r| {
                 let run = run_row(&self.runs_dir)(r)?;
                 let lease = RunLease {
-                    run_id: run.id.clone(),
+                    run_id: run.id().clone(),
                     token: r.get("token")?,
                     pid: r.get("pid")?,
                     heartbeat_at: r.get("heartbeat_at")?,
@@ -331,7 +324,7 @@ impl SqliteQueue {
                     .conn
                     .query_row(
                         "SELECT * FROM run_processes WHERE run_id=?1 AND role='wrapper'",
-                        [&run.id],
+                        [&run.id()],
                         process_row,
                     )
                     .optional()?;
@@ -449,13 +442,13 @@ impl SqliteQueue {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        ensure!(
-            tx.execute(
-                "UPDATE task_runs SET last_error=?2 WHERE id=?1",
-                params![id, message]
-            )? == 1,
-            "run does not exist"
-        );
+        let run = apply(
+            &tx,
+            id,
+            None,
+            || "run does not exist".to_owned(),
+            |run| run::abandon(run, message.to_owned()),
+        )?;
         let released = tx.execute(
             "DELETE FROM run_leases WHERE run_id=?1 AND token=?2",
             params![id, token],
@@ -466,13 +459,8 @@ impl SqliteQueue {
             "runtime_error",
             json!({"message": message, "lease_released": released == 1}),
         )?;
-        let result = tx.query_row(
-            "SELECT * FROM task_runs WHERE id=?1",
-            [id],
-            run_row(&self.runs_dir),
-        )?;
         tx.commit()?;
-        Ok(result)
+        Ok(run.relocated(&self.runs_dir))
     }
 
     /// Bind the queue to a repository before any run exists, as `init` does for a
@@ -592,24 +580,13 @@ impl SqliteQueue {
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         assert_lease(&tx, id, token)?;
-        ensure!(
-            tx.execute(
-                "UPDATE task_runs SET status='starting',repo_path=?3,run_dir=?4,
-             branch=?5,worktree_path=?6,receipt_path=?7,log_path=?8
-             WHERE id=?1 AND status='claimed' AND supervisor_token=?2",
-                params![
-                    id,
-                    token,
-                    plan.repo_path,
-                    plan.run_dir,
-                    plan.branch,
-                    plan.worktree_path,
-                    plan.receipt_path,
-                    plan.log_path
-                ]
-            )? == 1,
-            "run cannot be provisioned twice"
-        );
+        apply(
+            &tx,
+            id,
+            Some(token),
+            || "run cannot be provisioned twice".to_owned(),
+            |run| run::start_provisioning(run, plan),
+        )?;
         run_event(&tx, id, "run_planned", serde_json::to_value(plan)?)?;
         tx.commit()?;
         Ok(())
@@ -620,14 +597,13 @@ impl SqliteQueue {
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         assert_lease(&tx, id, token)?;
-        ensure!(
-            tx.execute(
-                "UPDATE task_runs SET workspace_id=?3 WHERE id=?1 AND supervisor_token=?2
-             AND status='starting' AND workspace_id IS NULL",
-                params![id, token, workspace]
-            )? == 1,
-            "workspace cannot be attached to this run"
-        );
+        apply(
+            &tx,
+            id,
+            Some(token),
+            || "workspace cannot be attached to this run".to_owned(),
+            |run| run::attach_workspace(run, workspace.to_owned()),
+        )?;
         run_event(
             &tx,
             id,
@@ -764,13 +740,13 @@ impl SqliteQueue {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        ensure!(
-            tx.execute(
-                "UPDATE task_runs SET last_error=?2 WHERE id=?1",
-                params![id, message]
-            )? == 1,
-            "run does not exist"
-        );
+        apply(
+            &tx,
+            id,
+            None,
+            || "run does not exist".to_owned(),
+            |run| run::abandon(run, message.to_owned()),
+        )?;
         run_event(&tx, id, "runtime_error", json!({"message": message}))?;
         tx.commit()?;
         Ok(())
@@ -784,12 +760,8 @@ impl SqliteQueue {
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         assert_lease(&tx, id, token)?;
-        let allowed: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM task_runs WHERE id=?1 AND supervisor_token=?2
-             AND status='needs_session')",
-            params![id, token],
-            |r| r.get(0),
-        )?;
+        let allowed =
+            supervised_run(&tx, id, token)?.is_some_and(|run| run::check_resumable(&run).is_ok());
         ensure!(allowed, "run is not being resumed by this supervisor");
         tx.execute(
             "INSERT INTO run_processes(run_id,role,pid) VALUES (?1,'wrapper',?2)",
@@ -831,12 +803,8 @@ impl SqliteQueue {
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         assert_lease(&tx, id, token)?;
-        let allowed: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM task_runs WHERE id=?1 AND supervisor_token=?2
-             AND status='starting' AND workspace_id IS NOT NULL)",
-            params![id, token],
-            |r| r.get(0),
-        )?;
+        let allowed = supervised_run(&tx, id, token)?
+            .is_some_and(|run| run::check_ready_for_wrapper(&run).is_ok());
         ensure!(allowed, "run is not ready for its wrapper");
         tx.execute(
             "INSERT INTO run_processes(run_id,role,pid) VALUES (?1,'wrapper',?2)",
@@ -857,13 +825,13 @@ impl SqliteQueue {
             "INSERT INTO run_processes(run_id,role,pid) VALUES (?1,'agent',?2)",
             params![id, agent_pid],
         )?;
-        ensure!(
-            tx.execute(
-                "UPDATE task_runs SET status='running' WHERE id=?1 AND status='starting'",
-                [id]
-            )? == 1,
-            "run is not starting"
-        );
+        apply(
+            &tx,
+            id,
+            None,
+            || "run is not starting".to_owned(),
+            run::mark_running,
+        )?;
         run_event(
             &tx,
             id,
@@ -934,38 +902,29 @@ impl SqliteQueue {
             usize::try_from(registered).ok() == Some(checked_processes),
             "run processes changed during recovery; inspect doctor again"
         );
-        let previous: String = tx
-            .query_row("SELECT status FROM task_runs WHERE id=?1", [id], |r| {
-                r.get(0)
-            })
-            .optional()?
-            .with_context(|| format!("run {id} does not exist"))?;
-        let next = if previous == "integrating" {
-            "awaiting_integration"
-        } else {
-            "interrupted"
-        };
-        ensure!(
-            tx.execute(
-                "UPDATE task_runs SET status=?2 WHERE id=?1
-                 AND status IN ('claimed','starting','running','validating','integrating')",
-                params![id, next]
-            )? == 1,
-            "run {id} is {previous}; only unfinished runs can be recovered"
-        );
+        let previous = stored_run(&tx, id)?
+            .with_context(|| format!("run {id} does not exist"))?
+            .status();
+        let run = apply(
+            &tx,
+            id,
+            None,
+            || {
+                format!(
+                    "run {id} is {}; only unfinished runs can be recovered",
+                    previous.as_str()
+                )
+            },
+            run::interrupt,
+        )?;
         let leases_deleted = tx.execute("DELETE FROM run_leases WHERE run_id=?1", [id])?;
         report["previous_status"] = json!(previous);
-        report["status"] = json!(next);
+        report["status"] = json!(run.status());
         report["lease_deleted"] = json!(leases_deleted == 1);
         run_event(&tx, id, "run_recovered", report)?;
         // The task stays in_progress; a retry is an explicit `ready` and a new run.
-        let result = tx.query_row(
-            "SELECT * FROM task_runs WHERE id=?1",
-            [id],
-            run_row(&self.runs_dir),
-        )?;
         tx.commit()?;
-        Ok(result)
+        Ok(run.relocated(&self.runs_dir))
     }
 
     pub fn processes(&self, id: &RunId) -> Result<Vec<RunProcess>> {
@@ -985,24 +944,22 @@ impl SqliteQueue {
             "SELECT exit_code FROM run_processes WHERE run_id=?1 AND role='wrapper' AND exited_at IS NOT NULL",
             [id], |r| r.get(0)
         ).context("wrapper has not reported session exit")?;
-        let status = if code == 0 { "validating" } else { "failed" };
-        let error = (code != 0).then(|| format!("session exited with code {code}"));
-        ensure!(tx.execute("UPDATE task_runs SET status=?3,last_error=COALESCE(?4,last_error) WHERE id=?1 AND supervisor_token=?2 AND status IN ('starting','running')",
-            params![id,token,status,error])? == 1, "run is not owned by this supervisor");
+        let run = apply(
+            &tx,
+            id,
+            Some(token),
+            || "run is not owned by this supervisor".to_owned(),
+            |run| run::finish_session(run, Some(code)),
+        )?;
         run_event(
             &tx,
             id,
             "supervision_finished",
-            json!({"status": status, "exit_code": code}),
+            json!({"status": run.status(), "exit_code": code}),
         )?;
         // Completion and dependency release belong to the next validation stage.
-        let result = tx.query_row(
-            "SELECT * FROM task_runs WHERE id=?1",
-            [id],
-            run_row(&self.runs_dir),
-        )?;
         tx.commit()?;
-        Ok(result)
+        Ok(run.relocated(&self.runs_dir))
     }
 
     /// Hand a run whose session went idle after its receipt to validation
@@ -1014,27 +971,21 @@ impl SqliteQueue {
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         assert_lease(&tx, id, token)?;
-        ensure!(
-            tx.execute(
-                "UPDATE task_runs SET status='validating' WHERE id=?1 AND supervisor_token=?2
-                 AND status IN ('starting','running')",
-                params![id, token]
-            )? == 1,
-            "run is not owned by this supervisor"
-        );
+        let run = apply(
+            &tx,
+            id,
+            Some(token),
+            || "run is not owned by this supervisor".to_owned(),
+            |run| run::finish_session(run, None),
+        )?;
         run_event(
             &tx,
             id,
             "supervision_finished",
-            json!({"status": "validating", "exit_code": null, "session_live": true}),
-        )?;
-        let result = tx.query_row(
-            "SELECT * FROM task_runs WHERE id=?1",
-            [id],
-            run_row(&self.runs_dir),
+            json!({"status": run.status(), "exit_code": null, "session_live": true}),
         )?;
         tx.commit()?;
-        Ok(result)
+        Ok(run.relocated(&self.runs_dir))
     }
 
     /// Validate an `awaiting_integration` run again under the lease that
@@ -1046,21 +997,15 @@ impl SqliteQueue {
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         assert_lease(&tx, id, token)?;
-        ensure!(
-            tx.execute(
-                "UPDATE task_runs SET status='validating' WHERE id=?1 AND supervisor_token=?2
-                 AND status='awaiting_integration'",
-                params![id, token]
-            )? == 1,
-            "run is not awaiting integration under this supervisor"
-        );
-        let result = tx.query_row(
-            "SELECT * FROM task_runs WHERE id=?1",
-            [id],
-            run_row(&self.runs_dir),
+        let run = apply(
+            &tx,
+            id,
+            Some(token),
+            || "run is not awaiting integration under this supervisor".to_owned(),
+            run::restart_validation,
         )?;
         tx.commit()?;
-        Ok(result)
+        Ok(run.relocated(&self.runs_dir))
     }
 
     /// Apply the `send_back` or `cancel` answer of an `approve_landing` ask
@@ -1083,24 +1028,18 @@ impl SqliteQueue {
             |r| r.get(0),
         )?;
         ensure!(!leased, "run {id} is leased");
-        ensure!(
-            tx.execute(
-                "UPDATE task_runs SET status=?2,last_error=?3 WHERE id=?1
-                 AND status='awaiting_integration'",
-                params![id, status.as_str(), reason]
-            )? == 1,
-            "run {id} is not awaiting integration"
-        );
-        payload["status"] = json!(status.as_str());
+        let run = apply(
+            &tx,
+            id,
+            None,
+            || format!("run {id} is not awaiting integration"),
+            |run| run::decide_landing(run, status, reason.to_owned()),
+        )?;
+        payload["status"] = json!(run.status());
         payload["reason"] = json!(reason);
         run_event(&tx, id, "landing_decided", payload)?;
-        let result = tx.query_row(
-            "SELECT * FROM task_runs WHERE id=?1",
-            [id],
-            run_row(&self.runs_dir),
-        )?;
         tx.commit()?;
-        Ok(result)
+        Ok(run.relocated(&self.runs_dir))
     }
 
     pub fn finish_validation(
@@ -1113,34 +1052,29 @@ impl SqliteQueue {
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         assert_lease(&tx, id, token)?;
-        let status = if validation.accepted {
-            "awaiting_integration"
-        } else if !validation.evidence_missing.is_empty() || !validation.scope_violation.is_empty()
-        {
-            "needs_session"
-        } else {
-            "failed"
-        };
-        ensure!(
-            tx.execute(
-                "UPDATE task_runs SET status=?3,result_commit=?4,last_error=COALESCE(?5,last_error)
-                 WHERE id=?1 AND supervisor_token=?2 AND status='validating'",
-                params![
-                    id,
-                    token,
-                    status,
-                    validation.result_commit,
-                    validation.reason
-                ]
-            )? == 1,
-            "run is not validating under this supervisor"
-        );
+        let refusal = || "run is not validating under this supervisor".to_owned();
+        let run = apply(&tx, id, Some(token), refusal, |run| {
+            match (validation.accepted, validation.result_commit.clone()) {
+                (true, Some(commit)) => run::accept(run, commit),
+                (true, None) => Err(DomainError::InvalidCommit {
+                    field: "accepted result commit",
+                }),
+                (false, commit) => run::reject(
+                    run,
+                    commit,
+                    validation.reason.clone(),
+                    !validation.evidence_missing.is_empty()
+                        || !validation.scope_violation.is_empty(),
+                ),
+            }
+        })?;
+        let status = run.status();
         let mut payload = serde_json::to_value(validation)?;
         payload["status"] = json!(status);
         run_event(&tx, id, "validation_finished", payload)?;
         // No `status` in the payloads: `validation_finished` already
         // reports the park, and `stats` counts it once.
-        if status == "needs_session" && !validation.scope_violation.is_empty() {
+        if status == RunStatus::NeedsSession && !validation.scope_violation.is_empty() {
             run_event(
                 &tx,
                 id,
@@ -1151,7 +1085,7 @@ impl SqliteQueue {
                     "reason": validation.reason,
                 }),
             )?;
-        } else if status == "needs_session" {
+        } else if status == RunStatus::NeedsSession {
             run_event(
                 &tx,
                 id,
@@ -1160,13 +1094,8 @@ impl SqliteQueue {
             )?;
         }
         // Task completion still waits for integration into main.
-        let result = tx.query_row(
-            "SELECT * FROM task_runs WHERE id=?1",
-            [id],
-            run_row(&self.runs_dir),
-        )?;
         tx.commit()?;
-        Ok(result)
+        Ok(run.relocated(&self.runs_dir))
     }
 
     /// The newest `run_events` id, 0 for an empty queue: the cursor that
@@ -1318,20 +1247,21 @@ impl SqliteQueue {
             );
             bail!("run {id} is already integrating (see doctor if it is stuck)");
         }
-        let previous: String = tx
-            .query_row("SELECT status FROM task_runs WHERE id=?1", [id], |r| {
-                r.get(0)
-            })
-            .optional()?
-            .with_context(|| format!("run {id} does not exist"))?;
-        ensure!(
-            tx.execute(
-                "UPDATE task_runs SET status='integrating' WHERE id=?1
-                 AND status IN ('awaiting_integration','needs_session')",
-                [id]
-            )? == 1,
-            "run {id} is {previous}; only a run awaiting integration or a session can be integrated"
-        );
+        let previous = stored_run(&tx, id)?
+            .with_context(|| format!("run {id} does not exist"))?
+            .status();
+        let run = apply(
+            &tx,
+            id,
+            None,
+            || {
+                format!(
+                    "run {id} is {}; only a run awaiting integration or a session can be integrated",
+                    previous.as_str()
+                )
+            },
+            run::begin_integration,
+        )?;
         // A supervisor landing a run it resumed or reviewed already holds
         // its lease under the same token; any other lease means someone
         // owns the run.
@@ -1350,13 +1280,8 @@ impl SqliteQueue {
             "integration_started",
             json!({"main": main, "previous_status": previous, "pid": std::process::id()}),
         )?;
-        let result = tx.query_row(
-            "SELECT * FROM task_runs WHERE id=?1",
-            [id],
-            run_row(&self.runs_dir),
-        )?;
         tx.commit()?;
-        Ok(result)
+        Ok(run.relocated(&self.runs_dir))
     }
 
     /// `needs_session` runs, oldest first, with their lease (if any), their
@@ -1366,16 +1291,16 @@ impl SqliteQueue {
         let runs = self.runs_with_status(crate::domain::RunStatus::NeedsSession)?;
         runs.into_iter()
             .map(|run| {
-                let lease = self.run_lease(&run.id)?;
+                let lease = self.run_lease(run.id())?;
                 let wrapper = self
                     .conn
                     .query_row(
                         "SELECT * FROM run_processes WHERE run_id=?1 AND role='wrapper'",
-                        [&run.id],
+                        [&run.id()],
                         process_row,
                     )
                     .optional()?;
-                let attempts = resume_attempts(&self.conn, &run.id)?;
+                let attempts = resume_attempts(&self.conn, run.id())?;
                 Ok(ResumeCandidate {
                     run,
                     lease,
@@ -1405,14 +1330,7 @@ impl SqliteQueue {
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let now: i64 = tx.query_row("SELECT unixepoch()", [], |r| r.get(0))?;
-        let run = tx
-            .query_row(
-                "SELECT * FROM task_runs WHERE id=?1 AND status='needs_session'",
-                [id],
-                run_row(&self.runs_dir),
-            )
-            .optional()?;
-        let Some(run) = run else {
+        let Some(run) = stored_run(&tx, id)?.filter(|run| run::check_resumable(run).is_ok()) else {
             return Ok(None);
         };
         let attempts = resume_attempts(&tx, id)?;
@@ -1433,15 +1351,10 @@ impl SqliteQueue {
             &tx,
             id,
             "resume_started",
-            json!({"attempt": attempt, "reason": reason.or(run.last_error.as_deref()), "main": main}),
-        )?;
-        let run = tx.query_row(
-            "SELECT * FROM task_runs WHERE id=?1",
-            [id],
-            run_row(&self.runs_dir),
+            json!({"attempt": attempt, "reason": reason.or(run.last_error()), "main": main}),
         )?;
         tx.commit()?;
-        Ok(Some((run, attempt)))
+        Ok(Some((run.relocated(&self.runs_dir), attempt)))
     }
 
     /// Move a `needs_session` run on without a session because an earlier
@@ -1470,12 +1383,14 @@ impl SqliteQueue {
         let Some(previous) = lease_parked_run(&tx, id, token, now, false)? else {
             return Ok(None);
         };
-        let status = if approved {
-            crate::domain::RunStatus::NeedsSession
-        } else {
-            tx.execute("UPDATE task_runs SET status='validating' WHERE id=?1", [id])?;
-            crate::domain::RunStatus::Validating
-        };
+        let run = apply(
+            &tx,
+            id,
+            None,
+            || format!("run {id} is not needs_session"),
+            |run| run::skip_resume(run, approved),
+        )?;
+        let status = run.status();
         run_event(
             &tx,
             id,
@@ -1488,13 +1403,8 @@ impl SqliteQueue {
             "resume_skipped",
             json!({"head": head, "main": main, "approved": approved, "status": status.as_str()}),
         )?;
-        let run = tx.query_row(
-            "SELECT * FROM task_runs WHERE id=?1",
-            [id],
-            run_row(&self.runs_dir),
-        )?;
         tx.commit()?;
-        Ok(Some(run))
+        Ok(Some(run.relocated(&self.runs_dir)))
     }
 
     /// End a resume: record `resume_finished` (with `status`, the run's
@@ -1517,16 +1427,15 @@ impl SqliteQueue {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         assert_lease(&tx, id, token)?;
         if let Some(status) = status {
-            ensure!(
-                tx.execute(
-                    "UPDATE task_runs SET status=?2,last_error=COALESCE(?3,last_error)
-                     WHERE id=?1 AND status='needs_session'",
-                    params![id, status.as_str(), reason]
-                )? == 1,
-                "run {id} is not needs_session"
-            );
+            apply(
+                &tx,
+                id,
+                None,
+                || format!("run {id} is not needs_session"),
+                |run| run::finish_resume(run, status, reason.map(str::to_owned)),
+            )?;
         }
-        let status = status.unwrap_or(crate::domain::RunStatus::NeedsSession);
+        let status = status.unwrap_or(RunStatus::NeedsSession);
         payload["status"] = json!(status.as_str());
         run_event(&tx, id, "resume_finished", payload)?;
         if !keep_lease {
@@ -1563,7 +1472,7 @@ impl SqliteQueue {
         self.leave_integration(
             id,
             token,
-            "needs_session",
+            |run| run::defer_integration(run, reason.to_owned()),
             reason,
             "integration_deferred",
             detail,
@@ -1583,7 +1492,7 @@ impl SqliteQueue {
         self.leave_integration(
             id,
             token,
-            "failed",
+            |run| run::fail_integration(run, reason.to_owned()),
             reason,
             "integration_failed",
             json!({"receipt": receipt}),
@@ -1599,10 +1508,11 @@ impl SqliteQueue {
         revert_to: &str,
         message: &str,
     ) -> Result<TaskRun> {
+        let revert_to: RunStatus = revert_to.parse()?;
         self.leave_integration(
             id,
             token,
-            revert_to,
+            |run| run::abort_integration(run, revert_to, message.to_owned()),
             message,
             "integration_error",
             json!({}),
@@ -1613,7 +1523,7 @@ impl SqliteQueue {
         &mut self,
         id: &RunId,
         token: &str,
-        status: &str,
+        command: impl FnOnce(TaskRun) -> Result<TaskRun, DomainError>,
         reason: &str,
         kind: &str,
         mut detail: serde_json::Value,
@@ -1622,28 +1532,23 @@ impl SqliteQueue {
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         assert_lease(&tx, id, token)?;
-        ensure!(
-            tx.execute(
-                "UPDATE task_runs SET status=?2,last_error=?3 WHERE id=?1 AND status='integrating'",
-                params![id, status, reason]
-            )? == 1,
-            "run {id} is not integrating"
-        );
+        let run = apply(
+            &tx,
+            id,
+            None,
+            || format!("run {id} is not integrating"),
+            command,
+        )?;
         tx.execute(
             "DELETE FROM run_leases WHERE run_id=?1 AND token=?2",
             params![id, token],
         )?;
-        detail["status"] = json!(status);
+        detail["status"] = json!(run.status());
         detail["reason"] = json!(reason);
         run_event(&tx, id, kind, detail)?;
         run_event(&tx, id, "lease_released", json!({"reason": kind}))?;
-        let result = tx.query_row(
-            "SELECT * FROM task_runs WHERE id=?1",
-            [id],
-            run_row(&self.runs_dir),
-        )?;
         tx.commit()?;
-        Ok(result)
+        Ok(run.relocated(&self.runs_dir))
     }
 
     /// Complete the task once its run landed on `main`: the run becomes
@@ -1661,31 +1566,26 @@ impl SqliteQueue {
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         assert_lease(&tx, id, token)?;
-        ensure!(
-            tx.execute(
-                "UPDATE task_runs SET status='integrated',result_commit=?2,last_error=NULL
-                 WHERE id=?1 AND status='integrating'",
-                params![id, landing.commit]
-            )? == 1,
-            "run {id} is not integrating"
-        );
+        let run = apply(
+            &tx,
+            id,
+            None,
+            || format!("run {id} is not integrating"),
+            |run| run::finish_integration(run, landing.commit.clone()),
+        )?
+        .relocated(&self.runs_dir);
         tx.execute(
             "DELETE FROM run_leases WHERE run_id=?1 AND token=?2",
             params![id, token],
-        )?;
-        let run = tx.query_row(
-            "SELECT * FROM task_runs WHERE id=?1",
-            [id],
-            run_row(&self.runs_dir),
         )?;
         ensure!(
             tx.execute(
                 "UPDATE tasks SET status='completed', updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
                  WHERE id=?1 AND status='in_progress'",
-                [run.task_id]
+                [run.task_id()]
             )? == 1,
             "task {} is not in progress",
-            run.task_id
+            run.task_id()
         );
         let mut payload = serde_json::to_value(landing)?;
         payload["result_commit"] = json!(landing.commit);
@@ -1694,12 +1594,12 @@ impl SqliteQueue {
         run_event(&tx, id, "lease_released", json!({"reason": "integrated"}))?;
         event(
             &tx,
-            run.task_id,
+            run.task_id(),
             Some(id),
             "task_status_changed",
             json!({"from": "in_progress", "to": "completed"}),
         )?;
-        let task = read_task(&tx, run.task_id)?;
+        let task = read_task(&tx, run.task_id())?;
         tx.commit()?;
         Ok((task, run))
     }
@@ -1710,13 +1610,13 @@ impl SqliteQueue {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        ensure!(
-            tx.execute(
-                "UPDATE task_runs SET last_error=?2 WHERE id=?1",
-                params![id, message]
-            )? == 1,
-            "run does not exist"
-        );
+        apply(
+            &tx,
+            id,
+            None,
+            || "run does not exist".to_owned(),
+            |run| run::record_cleanup_failure(run, message.to_owned()),
+        )?;
         run_event(&tx, id, "cleanup_failed", json!({"message": message}))?;
         tx.commit()?;
         Ok(())
@@ -1731,25 +1631,16 @@ impl SqliteQueue {
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         assert_lease(&tx, id, token)?;
-        ensure!(
-            tx.execute(
-                "UPDATE task_runs SET workspace_closed_at=unixepoch() WHERE id=?1 AND supervisor_token=?2
-                 AND status IN ('awaiting_integration','needs_session') AND workspace_id IS NOT NULL
-                 AND workspace_closed_at IS NULL",
-                params![id, token]
-            )? == 1,
-            "run is not awaiting integration or a session with an open workspace under this supervisor"
-        );
-        let result = tx.query_row(
-            "SELECT * FROM task_runs WHERE id=?1",
-            [id],
-            run_row(&self.runs_dir),
-        )?;
+        let now: i64 = tx.query_row("SELECT unixepoch()", [], |r| r.get(0))?;
+        let result = apply(&tx, id, Some(token), not_at_rest, |run| {
+            run::workspace_closed(run, now)
+        })?
+        .relocated(&self.runs_dir);
         run_event(
             &tx,
             id,
             "workspace_closed",
-            json!({"workspace_id": result.workspace_id, "closed_at": result.workspace_closed_at}),
+            json!({"workspace_id": result.workspace_id(), "closed_at": result.workspace_closed_at()}),
         )?;
         tx.commit()?;
         Ok(result)
@@ -1762,24 +1653,15 @@ impl SqliteQueue {
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         assert_lease(&tx, id, token)?;
-        ensure!(
-            tx.execute(
-                "UPDATE task_runs SET last_error=?3 WHERE id=?1 AND supervisor_token=?2
-                 AND status IN ('awaiting_integration','needs_session') AND workspace_closed_at IS NULL",
-                params![id, token, message]
-            )? == 1,
-            "run is not awaiting integration or a session with an open workspace under this supervisor"
-        );
-        let result = tx.query_row(
-            "SELECT * FROM task_runs WHERE id=?1",
-            [id],
-            run_row(&self.runs_dir),
-        )?;
+        let result = apply(&tx, id, Some(token), not_at_rest, |run| {
+            run::record_close_failure(run, message.to_owned())
+        })?
+        .relocated(&self.runs_dir);
         run_event(
             &tx,
             id,
             "cleanup_failed",
-            json!({"workspace_id": result.workspace_id, "message": message}),
+            json!({"workspace_id": result.workspace_id(), "message": message}),
         )?;
         tx.commit()?;
         Ok(result)
@@ -1818,12 +1700,7 @@ impl SqliteQueue {
         Ok(self
             .latest_runs_in_progress()?
             .into_iter()
-            .filter(|run| {
-                matches!(
-                    run.status,
-                    crate::domain::RunStatus::Failed | crate::domain::RunStatus::Interrupted
-                )
-            })
+            .filter(|run| run::check_triageable(run).is_ok())
             .collect())
     }
 
@@ -1886,7 +1763,7 @@ impl SqliteQueue {
             &tx,
             id,
             "triage_started",
-            json!({"attempt": attempt, "status": run.status.as_str()}),
+            json!({"attempt": attempt, "status": run.status().as_str()}),
         )?;
         tx.commit()?;
         Ok(Some((run, attempt)))
@@ -1914,21 +1791,21 @@ impl SqliteQueue {
             run_row(&self.runs_dir),
         )?;
         ensure!(
-            matches!(
-                run.status,
-                crate::domain::RunStatus::Failed | crate::domain::RunStatus::Interrupted
-            ),
+            run::check_triageable(&run).is_ok(),
             "run {id} is {}; only failed or interrupted runs are triaged",
-            run.status.as_str()
+            run.status().as_str()
         );
         match action {
             TriageAction::Retry => {
-                super::sqlite::transition_task(&tx, run.task_id, TaskAction::Ready)?;
+                super::sqlite::transition_task(&tx, run.task_id(), TaskAction::Ready)?;
             }
             TriageAction::Resume { instruction } => {
-                tx.execute(
-                    "UPDATE task_runs SET status='needs_session',last_error=?2 WHERE id=?1",
-                    params![id, instruction],
+                apply(
+                    &tx,
+                    id,
+                    None,
+                    || format!("run {id} changed"),
+                    |run| run::resume_after_triage(run, instruction.clone()),
                 )?;
                 payload["instruction"] = json!(instruction);
             }
@@ -1940,7 +1817,7 @@ impl SqliteQueue {
             run_row(&self.runs_dir),
         )?;
         payload["action"] = json!(action.as_str());
-        payload["status"] = json!(result.status.as_str());
+        payload["status"] = json!(result.status().as_str());
         run_event(&tx, id, "triage_finished", payload)?;
         tx.commit()?;
         Ok(result)
@@ -1990,9 +1867,12 @@ impl SqliteQueue {
             return Ok(None);
         }
         tx.execute("DELETE FROM run_leases WHERE run_id=?1", [id])?;
-        tx.execute(
-            "UPDATE task_runs SET status='failed',last_error=?2 WHERE id=?1",
-            params![id, reason],
+        let result = apply(
+            &tx,
+            id,
+            None,
+            || format!("run {id} changed"),
+            |run| run::exhaust_resumes(run, reason.to_owned()),
         )?;
         run_event(
             &tx,
@@ -2005,17 +1885,12 @@ impl SqliteQueue {
                 "ask_id": ask_id,
                 "reason": reason,
                 "resumes": resumes,
-                "previous_status": run.status.as_str(),
-                "status": crate::domain::RunStatus::Failed.as_str(),
+                "previous_status": run.status().as_str(),
+                "status": result.status().as_str(),
             }),
         )?;
-        let result = tx.query_row(
-            "SELECT * FROM task_runs WHERE id=?1",
-            [id],
-            run_row(&self.runs_dir),
-        )?;
         tx.commit()?;
-        Ok(Some(result))
+        Ok(Some(result.relocated(&self.runs_dir)))
     }
 
     /// Record that the triage closed `workspace_id` of the run: the worker's
@@ -2024,11 +1899,12 @@ impl SqliteQueue {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        tx.execute(
-            "UPDATE task_runs SET workspace_closed_at=unixepoch() WHERE id=?1
-             AND workspace_id=?2 AND workspace_closed_at IS NULL",
-            params![id, workspace_id],
-        )?;
+        let now: i64 = tx.query_row("SELECT unixepoch()", [], |r| r.get(0))?;
+        if let Some(run) = stored_run(&tx, id)? {
+            let from = run.status();
+            let run = run::triage_closed_workspace(run, workspace_id, now)?;
+            save_run(&tx, &run, from, None)?;
+        }
         run_event(
             &tx,
             id,
@@ -2074,22 +1950,19 @@ impl SqliteQueue {
             run_row(&self.runs_dir),
         )?;
         ensure!(
-            matches!(
-                run.status,
-                crate::domain::RunStatus::Failed | crate::domain::RunStatus::Interrupted
-            ),
+            run::check_triageable(&run).is_ok(),
             "run {id} is {}, not failed or interrupted",
-            run.status.as_str()
+            run.status().as_str()
         );
         let latest: RunId = tx.query_row(
             "SELECT id FROM task_runs WHERE task_id=?1 ORDER BY rowid DESC LIMIT 1",
-            [run.task_id],
+            [run.task_id()],
             |r| r.get(0),
         )?;
         ensure!(
             latest == *id,
             "run {id} is no longer the latest run of task {}",
-            run.task_id
+            run.task_id()
         );
         let pending: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM asks WHERE id=?1 AND run_id=?2
@@ -2103,16 +1976,19 @@ impl SqliteQueue {
         );
         match answer {
             "retry" => {
-                super::sqlite::transition_task(&tx, run.task_id, TaskAction::Ready)?;
+                super::sqlite::transition_task(&tx, run.task_id(), TaskAction::Ready)?;
             }
             "resume" => {
-                tx.execute(
-                    "UPDATE task_runs SET status='needs_session',last_error=?2 WHERE id=?1",
-                    params![id, reason],
+                apply(
+                    &tx,
+                    id,
+                    None,
+                    || format!("run {id} changed"),
+                    |run| run::resume_after_triage(run, reason.to_owned()),
                 )?;
             }
             "cancel" => {
-                super::sqlite::transition_task(&tx, run.task_id, TaskAction::Cancel)?;
+                super::sqlite::transition_task(&tx, run.task_id(), TaskAction::Cancel)?;
             }
             other => bail!("{other:?} is not an answer the triage applies"),
         }
@@ -2129,7 +2005,7 @@ impl SqliteQueue {
             &tx,
             id,
             "triage_decided",
-            json!({"ask_id": ask_id, "answer": answer, "reason": reason, "status": result.status.as_str()}),
+            json!({"ask_id": ask_id, "answer": answer, "reason": reason, "status": result.status().as_str()}),
         )?;
         tx.commit()?;
         Ok(result)
@@ -2154,6 +2030,83 @@ impl SqliteQueue {
 
 /// `asked_by` of the triage's `decide` asks: the supervisor that triaged.
 pub const TRIAGE_ASKER: &str = "supervisor";
+
+/// The run as stored (its paths not relocated), for a command to start from.
+fn stored_run(conn: &Connection, id: &RunId) -> Result<Option<TaskRun>> {
+    Ok(conn
+        .query_row("SELECT * FROM task_runs WHERE id=?1", [id], stored_run_row)
+        .optional()?)
+}
+
+/// The run as stored if `token` is its supervisor.
+fn supervised_run(conn: &Connection, id: &RunId, token: &str) -> Result<Option<TaskRun>> {
+    Ok(conn
+        .query_row(
+            "SELECT * FROM task_runs WHERE id=?1 AND supervisor_token=?2",
+            params![id, token],
+            stored_run_row,
+        )
+        .optional()?)
+}
+
+/// Save what a domain command made of a run read with [`stored_run`].
+/// `status=from` (the status the command started from) and, when given,
+/// `supervisor_token=token` only detect a concurrent change: the domain
+/// decided the move. Whether a row was updated.
+fn save_run(
+    conn: &Connection,
+    run: &TaskRun,
+    from: RunStatus,
+    token: Option<&str>,
+) -> Result<bool> {
+    Ok(conn.execute(
+        "UPDATE task_runs SET status=?3,repo_path=?4,run_dir=?5,branch=?6,worktree_path=?7,
+         receipt_path=?8,log_path=?9,workspace_id=?10,result_commit=?11,last_error=?12,
+         workspace_closed_at=?13
+         WHERE id=?1 AND status=?2 AND (?14 IS NULL OR supervisor_token=?14)",
+        params![
+            run.id(),
+            from.as_str(),
+            run.status().as_str(),
+            run.repo_path(),
+            run.run_dir(),
+            run.branch(),
+            run.worktree_path(),
+            run.receipt_path(),
+            run.log_path(),
+            run.workspace_id(),
+            run.result_commit(),
+            run.last_error(),
+            run.workspace_closed_at(),
+            token,
+        ],
+    )? == 1)
+}
+
+/// Read the run, apply the domain `command` and save the result, inside
+/// the caller's transaction; the stored (not relocated) run comes back.
+/// A missing run, a command the domain refuses and a row that changed
+/// meanwhile all fail with `refusal`, the message the store has always
+/// given for the operation.
+fn apply(
+    conn: &Connection,
+    id: &RunId,
+    token: Option<&str>,
+    refusal: impl Fn() -> String,
+    command: impl FnOnce(TaskRun) -> Result<TaskRun, DomainError>,
+) -> Result<TaskRun> {
+    let run = stored_run(conn, id)?.ok_or_else(|| anyhow!(refusal()))?;
+    let from = run.status();
+    let run = command(run).map_err(|_| anyhow!(refusal()))?;
+    ensure!(save_run(conn, &run, from, token)?, refusal());
+    Ok(run)
+}
+
+/// Why a workspace close of a run is not recorded.
+fn not_at_rest() -> String {
+    "run is not awaiting integration or a session with an open workspace under this supervisor"
+        .to_owned()
+}
 
 fn assert_lease(conn: &Connection, id: &RunId, token: &str) -> Result<()> {
     let valid: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM run_leases WHERE run_id=?1 AND token=?2 AND heartbeat_at >= unixepoch()-?3)",

@@ -87,7 +87,7 @@ pub fn task_detail(detail: &TaskDetail, events: usize) -> Value {
     let processes: Vec<_> = detail
         .processes
         .iter()
-        .filter(|p| latest_run.is_some_and(|run| run.id == p.run_id))
+        .filter(|p| latest_run.is_some_and(|run| *run.id() == p.run_id))
         .collect();
     let events: Vec<Value> = latest(&detail.events, events)
         .iter()
@@ -192,7 +192,7 @@ mod tests {
     }
 
     fn run(id: &str) -> TaskRun {
-        TaskRun {
+        TaskRun::restore(crate::domain::RunRecord {
             id: RunId::new(id).unwrap(),
             task_id: TaskId::new(1),
             status: RunStatus::Failed,
@@ -210,7 +210,8 @@ mod tests {
             last_error: Some("e".repeat(TEXT_LIMIT + 1)),
             workspace_closed_at: None,
             created_at: "c".into(),
-        }
+        })
+        .unwrap()
     }
 
     fn event(id: i64, payload: Value) -> RunEvent {

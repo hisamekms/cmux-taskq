@@ -1,7 +1,8 @@
 use std::fmt;
 
 use super::{
-    AskKind, CheckStatus, GoalId, GoalVerdict, ReceiptResult, RunId, TaskAction, TaskId, TaskStatus,
+    AskKind, CheckStatus, GoalId, GoalVerdict, ReceiptResult, RunId, RunStatus, TaskAction, TaskId,
+    TaskStatus,
 };
 
 /// A business rejection by the domain: an invalid value, a transition the
@@ -106,6 +107,26 @@ pub enum DomainError {
     AskWithoutTarget {
         kind: AskKind,
     },
+    /// A claim of a task that is not ready.
+    TaskNotClaimable {
+        task_id: TaskId,
+        status: TaskStatus,
+    },
+    /// A new run for a task that is not in progress.
+    RunOfUnclaimedTask {
+        task_id: TaskId,
+        status: TaskStatus,
+    },
+    /// The run command `operation` is not allowed from `status`.
+    RunTransitionNotAllowed {
+        status: RunStatus,
+        operation: &'static str,
+    },
+    /// A stored run breaks an invariant every saved run keeps.
+    RunInconsistent {
+        run_id: RunId,
+        reason: &'static str,
+    },
     /// A `--paths` glob a task may not declare.
     InvalidPathGlob {
         glob: String,
@@ -203,6 +224,18 @@ impl fmt::Display for DomainError {
             ),
             Self::FollowUpsNotArray => f.write_str("receipt follow_ups must be an array"),
             Self::MissingRunDirectory => f.write_str("missing run directory"),
+            Self::TaskNotClaimable { task_id, status } => {
+                write!(f, "task {task_id} is {}, not ready", status.as_str())
+            }
+            Self::RunOfUnclaimedTask { task_id, status } => write!(
+                f,
+                "task {task_id} is {}; a run starts only for a claimed task",
+                status.as_str()
+            ),
+            Self::RunTransitionNotAllowed { status, operation } => {
+                write!(f, "cannot {operation} a run in {} state", status.as_str())
+            }
+            Self::RunInconsistent { run_id, reason } => write!(f, "run {run_id} {reason}"),
             Self::GoalNotDraft { goal_id } => write!(f, "goal {goal_id} is not a draft"),
             Self::InvalidNoteKind { kind } => write!(
                 f,

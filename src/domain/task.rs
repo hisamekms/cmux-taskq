@@ -209,6 +209,19 @@ pub fn transition(
     Ok(task)
 }
 
+/// A supervisor takes `task` for a new run: only a ready task is claimed,
+/// and it stays `in_progress` until its run lands or a person moves it.
+pub fn claim(mut task: Task) -> Result<Task, DomainError> {
+    require(task.status == TaskStatus::Ready, || {
+        DomainError::TaskNotClaimable {
+            task_id: task.id,
+            status: task.status,
+        }
+    })?;
+    task.status = TaskStatus::InProgress;
+    Ok(task)
+}
+
 /// Move `task` to `goal_id`, or out of any goal. Whether the goal takes tasks
 /// is [`super::goal::check_accepts_tasks`], which the caller applies to the
 /// goal it reads.
@@ -282,6 +295,21 @@ mod tests {
             created_at: "c".into(),
             updated_at: "u".into(),
         }
+    }
+
+    #[test]
+    fn claim_takes_only_a_ready_task() {
+        let task = claim(Task::restore(record(TaskStatus::Ready)).unwrap()).unwrap();
+        assert_eq!(task.status(), TaskStatus::InProgress);
+        let error = claim(task).unwrap_err();
+        assert_eq!(
+            error,
+            DomainError::TaskNotClaimable {
+                task_id: TaskId::new(5),
+                status: TaskStatus::InProgress,
+            }
+        );
+        assert_eq!(error.to_string(), "task 5 is in_progress, not ready");
     }
 
     #[test]

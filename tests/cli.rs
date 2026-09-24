@@ -1533,12 +1533,12 @@ mod stats {
                 panic!("nothing to claim");
             };
             queue
-                .record_runtime_event(&run.id, "receipt_observed", json!({}))
+                .record_runtime_event(run.id(), "receipt_observed", json!({}))
                 .unwrap();
             queue
-                .record_runtime_event(&run.id, "validation_finished", json!({"status": "failed"}))
+                .record_runtime_event(run.id(), "validation_finished", json!({"status": "failed"}))
                 .unwrap();
-            run.id
+            run.id().clone()
         };
         let mut queue = SqliteQueue::open(&db).unwrap();
         let first = finish(&mut queue);

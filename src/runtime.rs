@@ -416,7 +416,7 @@ impl WorkspaceBackend for RecordingBackend<'_> {
         tags: &WorkspaceTags,
     ) -> Result<String> {
         let result = self.inner.create(task, run, command, tags);
-        self.recorded("create", None, Some(&run.id), result)
+        self.recorded("create", None, Some(run.id()), result)
     }
     fn create_resume(
         &self,
@@ -426,7 +426,7 @@ impl WorkspaceBackend for RecordingBackend<'_> {
         tags: &WorkspaceTags,
     ) -> Result<String> {
         let result = self.inner.create_resume(task, run, command, tags);
-        self.recorded("create_resume", None, Some(&run.id), result)
+        self.recorded("create_resume", None, Some(run.id()), result)
     }
     fn send_text(&self, workspace_id: &str, text: &str) -> Result<()> {
         let result = self.inner.send_text(workspace_id, text);
@@ -629,7 +629,7 @@ impl Supervisor<'_> {
                 for slot in &self.slots {
                     let _ = self
                         .queue
-                        .record_runtime_error(&slot.run.id, &format!("{error:#}"));
+                        .record_runtime_error(slot.run.id(), &format!("{error:#}"));
                 }
                 return Err(error);
             }
@@ -714,14 +714,14 @@ impl Supervisor<'_> {
             };
             match self.provision(&run) {
                 Ok(watch) => {
-                    let run = self.queue.run(&run.id)?;
+                    let run = self.queue.run(run.id())?;
                     self.slots.push(Slot {
                         run,
                         phase: Phase::Session(watch),
                     });
                 }
                 Err(error) => {
-                    let message = format!("run {} provisioning failed: {error:#}", run.id);
+                    let message = format!("run {} provisioning failed: {error:#}", run.id());
                     self.log
                         .note(&format!("{message}; no further tasks will be claimed"));
                     self.abandon(&run, message.clone());
@@ -745,7 +745,7 @@ impl Supervisor<'_> {
                 }
                 Ok(Step::Done(run)) => {
                     self.log
-                        .note(&format!("run {} is {}", run.id, run.status.as_str()));
+                        .note(&format!("run {} is {}", run.id(), run.status().as_str()));
                     self.finished.push(*run);
                 }
                 Ok(Step::Triaged(run)) => self.note_triaged(&run),
@@ -759,7 +759,7 @@ impl Supervisor<'_> {
                 Err(_)
                     if !self
                         .queue
-                        .holds_lease(&slot.run.id, &self.token)
+                        .holds_lease(slot.run.id(), &self.token)
                         .unwrap_or(true) =>
                 {
                     self.disown(&slot)
@@ -771,23 +771,23 @@ impl Supervisor<'_> {
                         _ => unreachable!("matched a triage"),
                     };
                     self.fail_triage(&slot.run, attempt, format!("{error:#}"), 0);
-                    let run = self.queue.run(&slot.run.id).unwrap_or(slot.run);
+                    let run = self.queue.run(slot.run.id()).unwrap_or(slot.run);
                     self.note_triaged(&run);
                 }
                 Err(error) if matches!(slot.phase, Phase::AwaitingSlot) => {
                     // The resume already recorded its `resume_finished`;
                     // only the lease it kept for the landing goes.
                     let message = format!("landing could not start: {error:#}");
-                    self.log.note(&format!("run {}: {message}", slot.run.id));
-                    if let Err(error) = self.queue.release_lease(&slot.run.id, &self.token) {
+                    self.log.note(&format!("run {}: {message}", slot.run.id()));
+                    if let Err(error) = self.queue.release_lease(slot.run.id(), &self.token) {
                         self.log.note(&format!(
                             "run {}: could not release the lease: {error:#}",
-                            slot.run.id
+                            slot.run.id()
                         ));
                     }
                     self.errors.push(RunError {
-                        run_id: slot.run.id.clone(),
-                        task_id: slot.run.task_id,
+                        run_id: slot.run.id().clone(),
+                        task_id: slot.run.task_id(),
                         message,
                     });
                 }
@@ -795,7 +795,7 @@ impl Supervisor<'_> {
                     let message = format!("{error:#}");
                     self.log.note(&format!(
                         "run {} resume stopped: {message}; its workspace is kept for inspection",
-                        slot.run.id
+                        slot.run.id()
                     ));
                     let (attempt, workspace) = match &slot.phase {
                         Phase::Resume(watch) => (watch.attempt, Some(watch.workspace.clone())),
@@ -812,7 +812,8 @@ impl Supervisor<'_> {
                     let message = format!("{error:#}");
                     self.log.note(&format!(
                         "run {} retained for inspection: {message}; see show {} and doctor",
-                        slot.run.id, slot.run.task_id
+                        slot.run.id(),
+                        slot.run.task_id()
                     ));
                     self.abandon(&slot.run, message);
                 }
@@ -930,7 +931,7 @@ impl Supervisor<'_> {
     fn disown(&mut self, slot: &Slot) {
         let mut message = format!(
             "lease of run {} is held by another process; this supervisor stopped watching it",
-            slot.run.id
+            slot.run.id()
         );
         if matches!(slot.phase, Phase::Validating(Some(_), _)) {
             // Its checks finish on their own; the new owner runs its own.
@@ -938,22 +939,22 @@ impl Supervisor<'_> {
         }
         self.log.note(&message);
         self.errors.push(RunError {
-            run_id: slot.run.id.clone(),
-            task_id: slot.run.task_id,
+            run_id: slot.run.id().clone(),
+            task_id: slot.run.task_id(),
             message,
         });
     }
 
     fn abandon(&mut self, run: &TaskRun, message: String) {
-        if let Err(error) = self.queue.abandon_run(&run.id, &self.token, &message) {
+        if let Err(error) = self.queue.abandon_run(run.id(), &self.token, &message) {
             self.log.note(&format!(
                 "run {}: could not record the error: {error:#}",
-                run.id
+                run.id()
             ));
         }
         self.errors.push(RunError {
-            run_id: run.id.clone(),
-            task_id: run.task_id,
+            run_id: run.id().clone(),
+            task_id: run.task_id(),
             message,
         });
     }
@@ -985,14 +986,14 @@ impl Supervisor<'_> {
         });
         if let Err(error) =
             self.queue
-                .finish_resume(&run.id, &self.token, None, None, false, payload)
+                .finish_resume(run.id(), &self.token, None, None, false, payload)
         {
             self.log.note(&format!(
                 "run {}: could not record the resume error: {error:#}",
-                run.id
+                run.id()
             ));
         }
-        let session_may_live = self.queue.processes(&run.id).map_or(true, |processes| {
+        let session_may_live = self.queue.processes(run.id()).map_or(true, |processes| {
             processes
                 .iter()
                 .any(|p| p.role == "wrapper" && p.exited_at.is_none())
@@ -1001,18 +1002,18 @@ impl Supervisor<'_> {
             if session_may_live {
                 self.log.note(&format!(
                     "run {}: resume workspace {workspace} is kept; its session may still run",
-                    run.id
+                    run.id()
                 ));
             } else if let Err(error) = self.cmux.close(&workspace) {
                 self.log.note(&format!(
                     "run {}: resume workspace {workspace} could not be closed: {error:#}",
-                    run.id
+                    run.id()
                 ));
             }
         }
         self.errors.push(RunError {
-            run_id: run.id.clone(),
-            task_id: run.task_id,
+            run_id: run.id().clone(),
+            task_id: run.task_id(),
             message,
         });
     }
@@ -1034,22 +1035,23 @@ impl Supervisor<'_> {
                     let outcome = serde_json::to_value(&outcome)?;
                     self.log.note(&format!(
                         "run {} landing: {}",
-                        slot.run.id, outcome["outcome"]
+                        slot.run.id(),
+                        outcome["outcome"]
                     ));
                 }
                 Err(error) => {
                     let message = format!("landing failed: {error:#}");
-                    self.log.note(&format!("run {}: {message}", slot.run.id));
+                    self.log.note(&format!("run {}: {message}", slot.run.id()));
                     self.errors.push(RunError {
-                        run_id: slot.run.id.clone(),
-                        task_id: slot.run.task_id,
+                        run_id: slot.run.id().clone(),
+                        task_id: slot.run.task_id(),
                         message,
                     });
                 }
             }
-            return Ok(Step::Done(Box::new(self.queue.run(&slot.run.id)?)));
+            return Ok(Step::Done(Box::new(self.queue.run(slot.run.id())?)));
         }
-        if !self.queue.holds_lease(&slot.run.id, &self.token)? {
+        if !self.queue.holds_lease(slot.run.id(), &self.token)? {
             return Ok(Step::Disowned);
         }
         match &mut slot.phase {
@@ -1076,11 +1078,11 @@ impl Supervisor<'_> {
                 {
                     return Ok(Step::Continue);
                 }
-                let previous = self.queue.run(&slot.run.id)?.status;
+                let previous = self.queue.run(slot.run.id())?.status();
                 let main = self.repository.main_head()?;
                 let run = match self
                     .queue
-                    .begin_integration(&slot.run.id, &self.token, &main)
+                    .begin_integration(slot.run.id(), &self.token, &main)
                 {
                     Ok(run) => run,
                     // An `integrate` took the slot since the check: try again later.
@@ -1096,7 +1098,7 @@ impl Supervisor<'_> {
                 };
                 self.log.note(&format!(
                     "run {} lands onto main {main} ({})",
-                    run.id,
+                    run.id(),
                     previous.as_str()
                 ));
                 slot.phase =
@@ -1111,19 +1113,19 @@ impl Supervisor<'_> {
                 };
                 let attempt = watch.attempt;
                 let duration_secs = watch.job.started.elapsed().as_secs();
-                let run = self.queue.run(&slot.run.id)?;
+                let run = self.queue.run(slot.run.id())?;
                 let acted = outcome
                     .map_err(|error| anyhow!(error))
                     .and_then(|verdict| self.act_on_triage(&run, attempt, duration_secs, verdict));
                 if let Err(error) = acted {
                     // Another process took the run's lease meanwhile: its
                     // triage is the record.
-                    if !self.queue.holds_lease(&run.id, &self.token)? {
+                    if !self.queue.holds_lease(run.id(), &self.token)? {
                         return Ok(Step::Disowned);
                     }
                     self.fail_triage(&run, attempt, format!("{error:#}"), duration_secs);
                 }
-                Ok(Step::Triaged(Box::new(self.queue.run(&run.id)?)))
+                Ok(Step::Triaged(Box::new(self.queue.run(run.id())?)))
             }
             Phase::Session(watch) => {
                 let Some(run) = watch.poll(
@@ -1137,8 +1139,8 @@ impl Supervisor<'_> {
                 else {
                     return Ok(Step::Continue);
                 };
-                if run.status != RunStatus::Validating {
-                    self.queue.release_lease(&run.id, &self.token)?;
+                if run.status() != RunStatus::Validating {
+                    self.queue.release_lease(run.id(), &self.token)?;
                     return Ok(Step::Done(Box::new(run)));
                 }
                 let session = SessionRef {
@@ -1166,13 +1168,13 @@ impl Supervisor<'_> {
                     .map_err(|_| anyhow!("validation thread panicked"))??;
                 let run = self
                     .queue
-                    .finish_validation(&slot.run.id, &self.token, &validation)?;
+                    .finish_validation(slot.run.id(), &self.token, &validation)?;
                 let session = session.take();
-                slot.phase = match run.status {
+                slot.phase = match run.status() {
                     // An approved run (its integrate was called) lands without
                     // a review, as before (ADR-0027 decision 3).
                     RunStatus::AwaitingIntegration
-                        if self.queue.has_run_event(&run.id, "integration_approved")? =>
+                        if self.queue.has_run_event(run.id(), "integration_approved")? =>
                     {
                         Phase::Exiting(ExitWatch::new(session, AfterExit::Land))
                     }
@@ -1195,11 +1197,11 @@ impl Supervisor<'_> {
                 let attempt = watch.attempt;
                 let duration_secs = watch.job.started.elapsed().as_secs();
                 let session = watch.session.take();
-                let run = self.queue.run(&slot.run.id)?;
+                let run = self.queue.run(slot.run.id())?;
                 slot.phase = match outcome {
                     Ok(verdict) => {
                         self.queue.record_runtime_event(
-                            &run.id,
+                            run.id(),
                             "review_finished",
                             json!({
                                 "verdict": verdict.verdict,
@@ -1211,7 +1213,7 @@ impl Supervisor<'_> {
                         )?;
                         self.log.note(&format!(
                             "run {} review {attempt}: {} ({})",
-                            run.id,
+                            run.id(),
                             verdict.verdict.as_str(),
                             verdict.summary
                         ));
@@ -1220,7 +1222,7 @@ impl Supervisor<'_> {
                     Err(error) => {
                         self.log.note(&format!(
                             "run {} review {attempt} failed: {error}; the run waits for a review by hand",
-                            run.id
+                            run.id()
                         ));
                         Phase::Exiting(ExitWatch::new(
                             session,
@@ -1250,15 +1252,15 @@ impl Supervisor<'_> {
                             Fix::Conflict(_) => "conflict_resolved",
                         };
                         self.queue.record_runtime_event(
-                            &slot.run.id,
+                            slot.run.id(),
                             kind,
                             json!({"attempt": watch.attempt, "head": head}),
                         )?;
                         self.log.note(&format!(
                             "run {} rewrote its receipt for {label} (head {head}); validating again",
-                            slot.run.id
+                            slot.run.id()
                         ));
-                        let run = self.queue.restart_validation(&slot.run.id, &self.token)?;
+                        let run = self.queue.restart_validation(slot.run.id(), &self.token)?;
                         let handle = spawn_validation(
                             self.db.clone(),
                             self.repository.clone(),
@@ -1280,20 +1282,20 @@ impl Supervisor<'_> {
                                     Fix::Conflict(_) => "conflict_receipt_rejected",
                                 };
                                 self.queue.record_runtime_event(
-                                    &slot.run.id,
+                                    slot.run.id(),
                                     kind,
                                     json!({"attempt": watch.attempt, "reason": why}),
                                 )?;
                                 self.log.note(&format!(
                                     "run {}: {why}; asked the session to fix it ({label})",
-                                    slot.run.id
+                                    slot.run.id()
                                 ));
                             }
                             Err(error) => {
                                 let why = format!(
                                     "{why}, and the request to fix it could not be sent: {error:#}"
                                 );
-                                self.log.note(&format!("run {}: {why}", slot.run.id));
+                                self.log.note(&format!("run {}: {why}", slot.run.id()));
                                 let then = watch.fix.ask(why.clone(), why);
                                 slot.phase = Phase::Exiting(ExitWatch::new(Some(session), then));
                             }
@@ -1302,7 +1304,7 @@ impl Supervisor<'_> {
                     ReviseOutcome::Ended(why) => {
                         self.log.note(&format!(
                             "run {}: the session {why} after {label}; asking a person",
-                            slot.run.id
+                            slot.run.id()
                         ));
                         let then = watch.fix.ask(
                             format!("the session {why}"),
@@ -1325,7 +1327,7 @@ impl Supervisor<'_> {
                 }
                 let session = watch.session.take();
                 let then = std::mem::replace(&mut watch.then, AfterExit::Rest { close: false });
-                let mut run = self.queue.run(&slot.run.id)?;
+                let mut run = self.queue.run(slot.run.id())?;
                 let close = !matches!(then, AfterExit::Rest { close: false });
                 if close && let Some(session) = &session {
                     run = self.close_session(&run, session)?;
@@ -1350,9 +1352,9 @@ impl Supervisor<'_> {
                             why.as_deref(),
                         )?;
                         self.log
-                            .note(&format!("run {} waits for a person in ask {ask}", run.id));
-                        self.queue.release_lease(&run.id, &self.token)?;
-                        Ok(Step::Done(Box::new(self.queue.run(&run.id)?)))
+                            .note(&format!("run {} waits for a person in ask {ask}", run.id()));
+                        self.queue.release_lease(run.id(), &self.token)?;
+                        Ok(Step::Done(Box::new(self.queue.run(run.id())?)))
                     }
                     AfterExit::ReviewFailed {
                         attempt,
@@ -1360,20 +1362,20 @@ impl Supervisor<'_> {
                         duration_secs,
                     } => {
                         self.queue.record_runtime_event(
-                            &run.id,
+                            run.id(),
                             "review_failed",
                             json!({
                                 "attempt": attempt,
                                 "error": error,
                                 "duration_secs": duration_secs,
-                                "status": run.status.as_str(),
+                                "status": run.status().as_str(),
                             }),
                         )?;
-                        self.queue.release_lease(&run.id, &self.token)?;
-                        Ok(Step::Done(Box::new(self.queue.run(&run.id)?)))
+                        self.queue.release_lease(run.id(), &self.token)?;
+                        Ok(Step::Done(Box::new(self.queue.run(run.id())?)))
                     }
                     AfterExit::Rest { .. } => {
-                        self.queue.release_lease(&run.id, &self.token)?;
+                        self.queue.release_lease(run.id(), &self.token)?;
                         Ok(Step::Done(Box::new(run)))
                     }
                 }
@@ -1397,7 +1399,7 @@ impl Supervisor<'_> {
         let common_dir = path_text(&self.repository.common_dir)?;
         let push = self
             .queue
-            .run_events(&run.id)?
+            .run_events(run.id())?
             .iter()
             .find(|e| e.kind == "integration_approved")
             .is_none_or(|e| e.payload.get("push") != Some(&json!(false)));
@@ -1425,17 +1427,17 @@ impl Supervisor<'_> {
     fn start_review(&mut self, run: &TaskRun, session: Option<SessionRef>) -> Result<Phase> {
         let attempt = self
             .queue
-            .run_events(&run.id)?
+            .run_events(run.id())?
             .iter()
             .filter(|e| e.kind == "review_started")
             .count()
             + 1;
         let live = match &session {
-            Some(_) => session_alive(&self.queue, &run.id)?,
+            Some(_) => session_alive(&self.queue, run.id())?,
             None => false,
         };
         self.queue.record_runtime_event(
-            &run.id,
+            run.id(),
             "review_started",
             json!({
                 "attempt": attempt,
@@ -1447,7 +1449,7 @@ impl Supervisor<'_> {
             Ok((child, stdout, stderr)) => {
                 self.log.note(&format!(
                     "run {} review {attempt} started (session {})",
-                    run.id,
+                    run.id(),
                     if live { "kept open" } else { "ended" }
                 ));
                 Phase::Review(ReviewWatch {
@@ -1465,7 +1467,7 @@ impl Supervisor<'_> {
             }
             Err(error) => {
                 let error = format!("the headless review could not start: {error:#}");
-                self.log.note(&format!("run {}: {error}", run.id));
+                self.log.note(&format!("run {}: {error}", run.id()));
                 Phase::Exiting(ExitWatch::new(
                     session,
                     AfterExit::ReviewFailed {
@@ -1483,13 +1485,13 @@ impl Supervisor<'_> {
         run: &TaskRun,
         attempt: usize,
     ) -> Result<(std::process::Child, PathBuf, PathBuf)> {
-        let run_dir = PathBuf::from(run.run_dir.as_ref().context("missing run directory")?);
-        let material = review(&self.db, run.task_id)?;
+        let run_dir = PathBuf::from(run.run_dir().context("missing run directory")?);
+        let material = review(&self.db, run.task_id())?;
         let path = material["path"]
             .as_str()
             .context("review wrote no path")?
             .to_owned();
-        let task = self.queue.show(run.task_id)?.task;
+        let task = self.queue.show(run.task_id())?.task;
         let prompt = review_prompt(&task, run, &path);
         fs::write(
             run_dir.join(format!("review-prompt-{attempt}.txt")),
@@ -1539,7 +1541,7 @@ impl Supervisor<'_> {
             ReviewDecision::Revise => {
                 let revises = self
                     .queue
-                    .run_events(&run.id)?
+                    .run_events(run.id())?
                     .iter()
                     .filter(|e| e.kind == "revise_requested")
                     .count();
@@ -1549,30 +1551,31 @@ impl Supervisor<'_> {
                 }
                 let Some(live) = session
                     .clone()
-                    .filter(|_| session_alive(&self.queue, &run.id).unwrap_or(false))
+                    .filter(|_| session_alive(&self.queue, run.id()).unwrap_or(false))
                 else {
                     let why = "the session had ended, so nobody could revise the run".to_owned();
                     return Ok(ask(Some(why), verdict, session));
                 };
                 let attempt = revises + 1;
-                let task = self.queue.show(run.task_id)?.task;
+                let task = self.queue.show(run.task_id())?.task;
                 let message = revise_request(&task, run, attempt, &verdict.reasons)?;
-                let run_dir = Path::new(run.run_dir.as_ref().context("missing run directory")?);
+                let run_dir = Path::new(run.run_dir().context("missing run directory")?);
                 fs::write(run_dir.join(format!("revise-{attempt}.txt")), &message)?;
                 let sent_at = SystemTime::now();
                 if let Err(error) = self.cmux.send_text(&live.workspace, &message) {
                     let why = format!("the revise request could not be sent: {error:#}");
-                    self.log.note(&format!("run {}: {why}", run.id));
+                    self.log.note(&format!("run {}: {why}", run.id()));
                     return Ok(ask(Some(why), verdict, session));
                 }
                 self.queue.record_runtime_event(
-                    &run.id,
+                    run.id(),
                     "revise_requested",
                     json!({"attempt": attempt, "reasons": verdict.reasons, "sent_at": unix_seconds(sent_at)}),
                 )?;
                 self.log.note(&format!(
                     "revise {attempt} of {MAX_REVISE_ATTEMPTS} sent to run {} in workspace {}",
-                    run.id, live.workspace
+                    run.id(),
+                    live.workspace
                 ));
                 Ok(Phase::Revise(ReviseWatch {
                     session: live,
@@ -1603,8 +1606,8 @@ impl Supervisor<'_> {
     ) -> Result<Phase> {
         let land = |session| Phase::Exiting(ExitWatch::new(session, AfterExit::Land));
         let head = run
-            .result_commit
-            .clone()
+            .result_commit()
+            .cloned()
             .context("accepted run has no result commit")?;
         let main = self.repository.main_head()?;
         let conflicts = match self
@@ -1615,7 +1618,7 @@ impl Supervisor<'_> {
             Err(error) => {
                 self.log.note(&format!(
                     "run {}: the conflict precheck against main {main} failed: {error:#}; landing",
-                    run.id
+                    run.id()
                 ));
                 return Ok(land(session));
             }
@@ -1623,7 +1626,7 @@ impl Supervisor<'_> {
         if conflicts.is_empty() {
             return Ok(land(session));
         }
-        let events = self.queue.run_events(&run.id)?;
+        let events = self.queue.run_events(run.id())?;
         let requested = events
             .iter()
             .filter(|e| e.kind == "conflict_precheck" && e.payload["requested"] == true)
@@ -1648,9 +1651,9 @@ impl Supervisor<'_> {
             // What an adopter asks, if it takes the run over before the ask.
             payload["asked"] = json!(why);
             self.queue
-                .record_runtime_event(&run.id, "conflict_precheck", payload)?;
+                .record_runtime_event(run.id(), "conflict_precheck", payload)?;
             self.log
-                .note(&format!("run {}: {why}; asking a person", run.id));
+                .note(&format!("run {}: {why}; asking a person", run.id()));
             return Ok(Phase::Exiting(ExitWatch::new(
                 session,
                 Fix::Conflict(verdict).ask(String::new(), why),
@@ -1658,10 +1661,10 @@ impl Supervisor<'_> {
         }
         let live = session
             .clone()
-            .filter(|_| session_alive(&self.queue, &run.id).unwrap_or(false));
+            .filter(|_| session_alive(&self.queue, run.id()).unwrap_or(false));
         let sent = match &live {
             Some(live) => {
-                let task = self.queue.show(run.task_id)?.task;
+                let task = self.queue.show(run.task_id())?.task;
                 let landed = landed_since(&mut self.queue, &self.repository, run, &main)?;
                 let request = ResumeRequest {
                     main: main.clone(),
@@ -1669,7 +1672,7 @@ impl Supervisor<'_> {
                     kind: ResumeKind::Precheck,
                 };
                 let message = resume_request(&task, run, &request, &landed)?;
-                let run_dir = Path::new(run.run_dir.as_ref().context("missing run directory")?);
+                let run_dir = Path::new(run.run_dir().context("missing run directory")?);
                 fs::write(run_dir.join(format!("conflict-{attempt}.txt")), &message)?;
                 let sent_at = SystemTime::now();
                 self.cmux
@@ -1683,20 +1686,21 @@ impl Supervisor<'_> {
             let error = sent.err().unwrap_or_default();
             payload["error"] = json!(error);
             self.queue
-                .record_runtime_event(&run.id, "conflict_precheck", payload)?;
+                .record_runtime_event(run.id(), "conflict_precheck", payload)?;
             self.log.note(&format!(
                 "run {}: {why}, and {error}; landing, whose rebase parks it for a resume",
-                run.id
+                run.id()
             ));
             return Ok(land(session));
         };
         payload["requested"] = json!(true);
         payload["sent_at"] = json!(unix_seconds(*sent_at));
         self.queue
-            .record_runtime_event(&run.id, "conflict_precheck", payload)?;
+            .record_runtime_event(run.id(), "conflict_precheck", payload)?;
         self.log.note(&format!(
             "run {}: {why}; asked its live session in workspace {} to rebase (request {attempt})",
-            run.id, live.workspace
+            run.id(),
+            live.workspace
         ));
         Ok(Phase::Revise(ReviseWatch {
             session: live,
@@ -1712,14 +1716,14 @@ impl Supervisor<'_> {
     /// `workspace_closed` with its attempt.
     fn close_session(&mut self, run: &TaskRun, session: &SessionRef) -> Result<TaskRun> {
         match session.resume {
-            None if run.workspace_closed_at.is_none() && run.workspace_id.is_some() => {
+            None if run.workspace_closed_at().is_none() && run.workspace_id().is_some() => {
                 close_workspace(&mut self.queue, self.cmux, &self.token, run, &self.log)
             }
             None => Ok(run.clone()),
             Some(attempt) => {
                 match self.cmux.close(&session.workspace) {
                     Ok(()) => self.queue.record_runtime_event(
-                        &run.id,
+                        run.id(),
                         "workspace_closed",
                         json!({"workspace_id": session.workspace, "resume_attempt": attempt}),
                     )?,
@@ -1728,11 +1732,11 @@ impl Supervisor<'_> {
                             "resume workspace {} could not be closed: {error:#}",
                             session.workspace
                         );
-                        self.log.note(&format!("run {}: {message}", run.id));
-                        self.queue.record_cleanup_failure(&run.id, &message)?;
+                        self.log.note(&format!("run {}: {message}", run.id()));
+                        self.queue.record_cleanup_failure(run.id(), &message)?;
                     }
                 }
-                self.queue.run(&run.id)
+                self.queue.run(run.id())
             }
         }
     }
@@ -1749,15 +1753,15 @@ impl Supervisor<'_> {
     ) -> Result<i64> {
         let mut question = format!(
             "The supervisor's review of run {} (task {}) returned {}{}: {summary}",
-            run.id,
-            run.task_id,
+            run.id(),
+            run.task_id(),
             decision.as_str(),
             why.map(|why| format!(" ({why})")).unwrap_or_default()
         );
         for reason in reasons {
             question.push_str(&format!("\n- {reason}"));
         }
-        if let Some(run_dir) = &run.run_dir {
+        if let Some(run_dir) = &run.run_dir() {
             question.push_str(&format!("\nReview material: {run_dir}/review.md"));
         }
         question.push_str(
@@ -1770,7 +1774,7 @@ impl Supervisor<'_> {
             NewAsk {
                 kind: AskKind::ApproveLanding,
                 task_id: None,
-                run_id: Some(run.id.clone()),
+                run_id: Some(run.id().clone()),
                 question,
                 options: LANDING_OPTIONS.iter().map(|o| (*o).to_owned()).collect(),
                 asked_by: "supervisor".to_owned(),
@@ -1794,7 +1798,7 @@ impl Supervisor<'_> {
             };
             let answer = ask.answer.as_deref().unwrap_or_default().trim().to_owned();
             let run = self.queue.run(&run_id)?;
-            if run.status != RunStatus::AwaitingIntegration
+            if run.status() != RunStatus::AwaitingIntegration
                 || !LANDING_OPTIONS.contains(&answer.as_str())
                 || self.queue.run_lease(&run_id)?.is_some()
             {
@@ -1812,7 +1816,8 @@ impl Supervisor<'_> {
             if let Err(error) = self.apply_landing_answer(&run, ask.id, &answer) {
                 self.log.note(&format!(
                     "run {}: the answer {answer:?} of ask {} could not be applied: {error:#}",
-                    run.id, ask.id
+                    run.id(),
+                    ask.id
                 ));
             }
         }
@@ -1823,19 +1828,19 @@ impl Supervisor<'_> {
         let payload = json!({"ask_id": ask_id, "answer": answer});
         match answer {
             "land" => {
-                if !self.queue.has_run_event(&run.id, "integration_approved")? {
+                if !self.queue.has_run_event(run.id(), "integration_approved")? {
                     self.queue.record_runtime_event(
-                        &run.id,
+                        run.id(),
                         "integration_approved",
-                        json!({"status": run.status.as_str(), "pid": std::process::id(), "push": true, "ask_id": ask_id}),
+                        json!({"status": run.status().as_str(), "pid": std::process::id(), "push": true, "ask_id": ask_id}),
                     )?;
                 }
                 let main = self.repository.main_head()?;
-                let landing = self.queue.begin_integration(&run.id, &self.token, &main)?;
+                let landing = self.queue.begin_integration(run.id(), &self.token, &main)?;
                 self.queue.close_ask(ask_id)?;
                 self.log.note(&format!(
                     "run {} lands onto main {main} as ask {ask_id} answered",
-                    run.id
+                    run.id()
                 ));
                 let handle =
                     self.spawn_landing(landing.clone(), RunStatus::AwaitingIntegration, main)?;
@@ -1845,7 +1850,7 @@ impl Supervisor<'_> {
                 });
             }
             "send_back" => {
-                let reasons = latest_review_reasons(&self.queue, &run.id)?;
+                let reasons = latest_review_reasons(&self.queue, run.id())?;
                 let reason = format!(
                     "the review's findings were sent back by ask {ask_id}: {}",
                     if reasons.is_empty() {
@@ -1855,22 +1860,23 @@ impl Supervisor<'_> {
                     }
                 );
                 self.queue
-                    .decide_landing(&run.id, RunStatus::NeedsSession, &reason, payload)?;
+                    .decide_landing(run.id(), RunStatus::NeedsSession, &reason, payload)?;
                 self.queue.close_ask(ask_id)?;
                 self.log.note(&format!(
                     "run {} was sent back by ask {ask_id}; it waits for a resume",
-                    run.id
+                    run.id()
                 ));
             }
             _ => {
                 let reason = format!("canceled by ask {ask_id}");
                 self.queue
-                    .decide_landing(&run.id, RunStatus::Failed, &reason, payload)?;
-                self.queue.transition(run.task_id, TaskAction::Cancel)?;
+                    .decide_landing(run.id(), RunStatus::Failed, &reason, payload)?;
+                self.queue.transition(run.task_id(), TaskAction::Cancel)?;
                 self.queue.close_ask(ask_id)?;
                 self.log.note(&format!(
                     "run {} failed and task {} was canceled by ask {ask_id}",
-                    run.id, run.task_id
+                    run.id(),
+                    run.task_id()
                 ));
             }
         }
@@ -1887,25 +1893,25 @@ impl Supervisor<'_> {
     fn recover_dead_runs(&mut self) -> Result<()> {
         let now = unix_time();
         for run in self.queue.active_runs()? {
-            if run.status == RunStatus::Integrating || self.queue.run_lease(&run.id)?.is_some() {
+            if run.status() == RunStatus::Integrating || self.queue.run_lease(run.id())?.is_some() {
                 continue;
             }
-            let processes = self.queue.processes(&run.id)?;
+            let processes = self.queue.processes(run.id())?;
             let health = run_health(&run, &processes, None, now);
             if !health.recoverable {
                 continue;
             }
             let report = json!({"run": health, "by": "supervisor"});
-            match self.queue.recover_run(&run.id, processes.len(), report) {
+            match self.queue.recover_run(run.id(), processes.len(), report) {
                 Ok(recovered) => self.log.note(&format!(
                     "run {} of task {} recovered from {}: nobody leases it and its session is gone; it goes to triage",
-                    recovered.id,
-                    recovered.task_id,
-                    run.status.as_str()
+                    recovered.id(),
+                    recovered.task_id(),
+                    run.status().as_str()
                 )),
                 Err(error) => self.log.note(&format!(
                     "run {} could not be recovered: {error:#}",
-                    run.id
+                    run.id()
                 )),
             }
         }
@@ -1930,42 +1936,51 @@ impl Supervisor<'_> {
             // up is not offered `resume`.
             if !TRIAGE_OPTIONS.contains(&answer.as_str())
                 || !ask.options.contains(&answer)
-                || !matches!(run.status, RunStatus::Failed | RunStatus::Interrupted)
+                || !matches!(run.status(), RunStatus::Failed | RunStatus::Interrupted)
                 || self.queue.run_lease(&run_id)?.is_some()
             {
                 continue;
             }
-            let detail = self.queue.show(run.task_id)?;
+            let detail = self.queue.show(run.task_id())?;
             if detail.task.status() != TaskStatus::InProgress
-                || detail.runs.last().is_some_and(|latest| latest.id != run.id)
+                || detail
+                    .runs
+                    .last()
+                    .is_some_and(|latest| *latest.id() != *run.id())
             {
                 self.log.note(&format!(
                     "ask {} of run {} is closed: task {} moved on without it",
-                    ask.id, run.id, run.task_id
+                    ask.id,
+                    run.id(),
+                    run.task_id()
                 ));
                 self.queue.close_ask(ask.id)?;
                 continue;
             }
             let reason = self
                 .queue
-                .run_events(&run.id)?
+                .run_events(run.id())?
                 .iter()
                 .rev()
                 .find(|e| e.kind == "triage_finished")
                 .and_then(|e| e.payload.get("reason").and_then(Value::as_str))
-                .map_or_else(|| run.last_error.clone().unwrap_or_default(), str::to_owned);
+                .map_or_else(
+                    || run.last_error().map(str::to_owned).unwrap_or_default(),
+                    str::to_owned,
+                );
             let reason = format!("{reason} (a person chose {answer} in ask {})", ask.id);
-            match self.queue.decide_triage(&run.id, ask.id, &answer, &reason) {
+            match self.queue.decide_triage(run.id(), ask.id, &answer, &reason) {
                 Ok(decided) => self.log.note(&format!(
                     "run {} of task {}: {answer} as ask {} answered; the run is {}",
-                    decided.id,
-                    decided.task_id,
+                    decided.id(),
+                    decided.task_id(),
                     ask.id,
-                    decided.status.as_str()
+                    decided.status().as_str()
                 )),
                 Err(error) => self.log.note(&format!(
                     "run {}: the answer {answer:?} of ask {} could not be applied: {error:#}",
-                    run.id, ask.id
+                    run.id(),
+                    ask.id
                 )),
             }
         }
@@ -1982,24 +1997,24 @@ impl Supervisor<'_> {
             if self.slots.len() >= parallel {
                 break;
             }
-            if triage_state(&self.queue.run_events(&run.id)?) != TriageState::Pending
+            if triage_state(&self.queue.run_events(run.id())?) != TriageState::Pending
                 || self
                     .queue
-                    .run_lease(&run.id)?
+                    .run_lease(run.id())?
                     .is_some_and(|lease| !lease_is_stale(&lease, now))
             {
                 continue;
             }
-            let Some((run, attempt)) = self.queue.begin_triage(&run.id, &self.token)? else {
+            let Some((run, attempt)) = self.queue.begin_triage(run.id(), &self.token)? else {
                 continue;
             };
             match self.spawn_triage(&run, attempt) {
                 Ok(watch) => {
                     self.log.note(&format!(
                         "run {} of task {} ({}) triage {attempt} started",
-                        run.id,
-                        run.task_id,
-                        run.status.as_str()
+                        run.id(),
+                        run.task_id(),
+                        run.status().as_str()
                     ));
                     self.slots.push(Slot {
                         run,
@@ -2009,7 +2024,7 @@ impl Supervisor<'_> {
                 Err(error) => {
                     let error = format!("the headless triage could not start: {error:#}");
                     self.fail_triage(&run, attempt, error, 0);
-                    let run = self.queue.run(&run.id)?;
+                    let run = self.queue.run(run.id())?;
                     self.note_triaged(&run);
                 }
             }
@@ -2020,13 +2035,13 @@ impl Supervisor<'_> {
     /// Write the triage's prompt and start the headless job in the run's
     /// directory, allowed to read only (ADR-0024 decision 2).
     fn spawn_triage(&mut self, run: &TaskRun, attempt: usize) -> Result<TriageWatch> {
-        let dir = match &run.run_dir {
+        let dir = match &run.run_dir() {
             Some(dir) => PathBuf::from(dir),
-            None => runs_dir(&self.db).join(run.id.as_str()),
+            None => runs_dir(&self.db).join(run.id().as_str()),
         };
         fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
-        let detail = self.queue.show(run.task_id)?;
-        let resumes = resume_attempts(&self.queue, &run.id);
+        let detail = self.queue.show(run.task_id())?;
+        let resumes = resume_attempts(&self.queue, run.id());
         let prompt = triage_prompt(&detail, run, resumes, &dir)?;
         fs::write(dir.join(format!("triage-prompt-{attempt}.txt")), &prompt)?;
         let stdout = dir.join(format!("triage-{attempt}.out"));
@@ -2071,30 +2086,29 @@ impl Supervisor<'_> {
     ) -> Result<TaskRun> {
         let failures = self
             .queue
-            .show(run.task_id)?
+            .show(run.task_id())?
             .runs
             .iter()
-            .filter(|r| matches!(r.status, RunStatus::Failed | RunStatus::Interrupted))
+            .filter(|r| matches!(r.status(), RunStatus::Failed | RunStatus::Interrupted))
             .count();
         ensure!(
-            self.queue.holds_lease(&run.id, &self.token)?,
+            self.queue.holds_lease(run.id(), &self.token)?,
             "the triage's lease of run {} was lost",
-            run.id
+            run.id()
         );
-        let resumes = resume_attempts(&self.queue, &run.id);
+        let resumes = resume_attempts(&self.queue, run.id());
         let worktree = run
-            .worktree_path
-            .as_deref()
+            .worktree_path()
             .is_some_and(|path| Path::new(path).is_dir());
         let overridden = match verdict.verdict {
             TriageDecision::Retry if failures >= TRIAGE_RETRY_FAILURES => Some(format!(
                 "task {} has {failures} failed or interrupted runs, so it is not retried without a person",
-                run.task_id
+                run.task_id()
             )),
             TriageDecision::Resume if resumes >= MAX_RESUME_ATTEMPTS => Some(format!(
                 "the run was resumed {resumes} times already (at most {MAX_RESUME_ATTEMPTS})"
             )),
-            TriageDecision::Resume if !worktree || run.receipt_path.is_none() => {
+            TriageDecision::Resume if !worktree || run.receipt_path().is_none() => {
                 Some("the run has no worktree a session could resume in".to_owned())
             }
             _ => None,
@@ -2123,33 +2137,33 @@ impl Supervisor<'_> {
         });
         let triaged = self
             .queue
-            .finish_triage(&run.id, &self.token, &action, payload)?;
+            .finish_triage(run.id(), &self.token, &action, payload)?;
         self.log.note(&format!(
             "run {} triage {attempt}: {}{} ({}); the run is {}",
-            run.id,
+            run.id(),
             verdict.verdict.as_str(),
             match &overridden {
                 Some(why) => format!(" became ask: {why}"),
                 None => String::new(),
             },
             verdict.reason,
-            triaged.status.as_str()
+            triaged.status().as_str()
         ));
         // The verdict is acted on: what fails from here on is logged, not
         // a failed triage.
         if let Err(error) = self.close_triaged_workspaces(&triaged) {
             self.log.note(&format!(
                 "run {}: its workspaces could not all be closed: {error:#}",
-                run.id
+                run.id()
             ));
         }
-        if let Err(error) = self.queue.release_lease(&run.id, &self.token) {
+        if let Err(error) = self.queue.release_lease(run.id(), &self.token) {
             self.log.note(&format!(
                 "run {}: could not release the lease: {error:#}",
-                run.id
+                run.id()
             ));
         }
-        self.queue.run(&run.id)
+        self.queue.run(run.id())
     }
 
     /// Open the triage's `decide` ask (options [`TRIAGE_OPTIONS`]) through
@@ -2174,13 +2188,13 @@ impl Supervisor<'_> {
         };
         let mut question = format!(
             "The supervisor's triage of run {} (task {}, {}) asks a person: {asked}\nReason: {}\nLast error: {}",
-            run.id,
-            run.task_id,
-            run.status.as_str(),
+            run.id(),
+            run.task_id(),
+            run.status().as_str(),
             verdict.reason,
-            or_none(tail(run.last_error.as_deref().unwrap_or_default(), 500))
+            or_none(tail(run.last_error().unwrap_or_default(), 500))
         );
-        if let Some(run_dir) = &run.run_dir {
+        if let Some(run_dir) = &run.run_dir() {
             question.push_str(&format!(
                 "\nTriage material: {run_dir}/triage-prompt-{attempt}.txt"
             ));
@@ -2194,7 +2208,7 @@ impl Supervisor<'_> {
             NewAsk {
                 kind: AskKind::Decide,
                 task_id: None,
-                run_id: Some(run.id.clone()),
+                run_id: Some(run.id().clone()),
                 question,
                 options: TRIAGE_OPTIONS.iter().map(|o| (*o).to_owned()).collect(),
                 asked_by: TRIAGE_ASKER.to_owned(),
@@ -2212,12 +2226,12 @@ impl Supervisor<'_> {
     /// `stuck_exit` ask of the run is closed with its workspace.
     fn close_triaged_workspaces(&mut self, run: &TaskRun) -> Result<()> {
         let mut workspaces: Vec<String> = run
-            .workspace_id
-            .clone()
-            .filter(|_| run.workspace_closed_at.is_none())
+            .workspace_id()
+            .map(str::to_owned)
+            .filter(|_| run.workspace_closed_at().is_none())
             .into_iter()
             .collect();
-        for event in self.queue.run_events(&run.id)? {
+        for event in self.queue.run_events(run.id())? {
             if event.kind == "resume_finished"
                 && event.payload["workspace_closed"] != true
                 && let Some(workspace) = event.payload.get("workspace_id").and_then(Value::as_str)
@@ -2236,15 +2250,15 @@ impl Supervisor<'_> {
             });
             match result {
                 Ok(true) => {
-                    self.queue.triage_closed_workspace(&run.id, &workspace)?;
+                    self.queue.triage_closed_workspace(run.id(), &workspace)?;
                     closed = true;
                 }
                 Ok(false) => {}
                 Err(error) => {
                     let message = format!("workspace {workspace} could not be closed: {error:#}");
-                    self.log.note(&format!("run {}: {message}", run.id));
+                    self.log.note(&format!("run {}: {message}", run.id()));
                     self.queue.record_runtime_event(
-                        &run.id,
+                        run.id(),
                         "cleanup_failed",
                         json!({"workspace_id": workspace, "message": message}),
                     )?;
@@ -2253,12 +2267,12 @@ impl Supervisor<'_> {
         }
         if closed {
             self.queue
-                .close_stuck_exit_asks(&run.id, "the triage closed the run's workspace")?;
+                .close_stuck_exit_asks(run.id(), "the triage closed the run's workspace")?;
         }
         // Whatever path took the run out of `running`, no dialog of it waits
         // for an answer any more.
         self.queue
-            .close_answer_prompt_asks(&run.id, "the run was triaged; closed by the runtime")?;
+            .close_answer_prompt_asks(run.id(), "the run was triaged; closed by the runtime")?;
         Ok(())
     }
 
@@ -2267,33 +2281,33 @@ impl Supervisor<'_> {
     fn fail_triage(&mut self, run: &TaskRun, attempt: usize, error: String, duration_secs: u64) {
         self.log.note(&format!(
             "run {} triage {attempt} failed: {error}; the run waits for a triage by hand",
-            run.id
+            run.id()
         ));
         let recorded = self.queue.record_runtime_event(
-            &run.id,
+            run.id(),
             "triage_failed",
             json!({
                 "attempt": attempt,
                 "error": error,
                 "duration_secs": duration_secs,
-                "status": run.status.as_str(),
+                "status": run.status().as_str(),
             }),
         );
         if let Err(error) = recorded {
             self.log.note(&format!(
                 "run {}: could not record the triage failure: {error:#}",
-                run.id
+                run.id()
             ));
         }
         if self
             .queue
-            .holds_lease(&run.id, &self.token)
+            .holds_lease(run.id(), &self.token)
             .unwrap_or(false)
-            && let Err(error) = self.queue.release_lease(&run.id, &self.token)
+            && let Err(error) = self.queue.release_lease(run.id(), &self.token)
         {
             self.log.note(&format!(
                 "run {}: could not release the lease: {error:#}",
-                run.id
+                run.id()
             ));
         }
     }
@@ -2301,21 +2315,21 @@ impl Supervisor<'_> {
     fn note_triaged(&mut self, run: &TaskRun) {
         let task = self
             .queue
-            .show(run.task_id)
+            .show(run.task_id())
             .map(|detail| detail.task.status());
         self.log.note(&format!(
             "run {} triaged: the run is {}{}",
-            run.id,
-            run.status.as_str(),
+            run.id(),
+            run.status().as_str(),
             match task {
-                Ok(status) => format!(", task {} is {}", run.task_id, status.as_str()),
+                Ok(status) => format!(", task {} is {}", run.task_id(), status.as_str()),
                 Err(_) => String::new(),
             }
         ));
         self.triaged.push(json!({
-            "run_id": run.id,
-            "task_id": run.task_id,
-            "status": run.status,
+            "run_id": run.id(),
+            "task_id": run.task_id(),
+            "status": run.status(),
         }));
     }
 
@@ -2335,11 +2349,12 @@ impl Supervisor<'_> {
             if !alive {
                 for ask in self
                     .queue
-                    .close_stuck_exit_asks(&candidate.run.id, STUCK_EXIT_CLOSED)?
+                    .close_stuck_exit_asks(candidate.run.id(), STUCK_EXIT_CLOSED)?
                 {
                     self.log.note(&format!(
                         "session of {} exited; closed its stuck_exit ask {}",
-                        candidate.run.id, ask.id
+                        candidate.run.id(),
+                        ask.id
                     ));
                 }
             }
@@ -2365,7 +2380,7 @@ impl Supervisor<'_> {
                 if let Err(error) = self.exhaust_resumes(&run, attempts) {
                     self.log.note(&format!(
                         "run {}: its used-up resumes could not be handed to a person: {error:#}",
-                        run.id
+                        run.id()
                     ));
                 }
                 continue;
@@ -2381,7 +2396,7 @@ impl Supervisor<'_> {
             }
             let (reason, kind) = resume_reason(&self.queue, &run)?;
             let Some((run, attempt)) = self.queue.begin_resume(
-                &run.id,
+                run.id(),
                 &self.token,
                 &main,
                 reason.as_deref(),
@@ -2399,7 +2414,7 @@ impl Supervisor<'_> {
                 Ok(watch) => {
                     self.log.note(&format!(
                         "run {} of task {} resumed (attempt {attempt} of {MAX_RESUME_ATTEMPTS}) in workspace {}",
-                        run.id, run.task_id, watch.workspace
+                        run.id(), run.task_id(), watch.workspace
                     ));
                     self.slots.push(Slot {
                         run,
@@ -2407,7 +2422,7 @@ impl Supervisor<'_> {
                     });
                 }
                 Err(error) => {
-                    let message = format!("run {} could not be resumed: {error:#}", run.id);
+                    let message = format!("run {} could not be resumed: {error:#}", run.id());
                     self.log.note(&message);
                     self.give_up_resume(&run, attempt, None, message);
                 }
@@ -2438,7 +2453,7 @@ impl Supervisor<'_> {
             "scope_violation",
             "landing_decided",
         ];
-        let events = self.queue.run_events(&run.id)?;
+        let events = self.queue.run_events(run.id())?;
         let parked = events
             .iter()
             .rev()
@@ -2453,7 +2468,8 @@ impl Supervisor<'_> {
         {
             return Ok(None);
         }
-        let (Some(worktree), Some(receipt_path)) = (&run.worktree_path, &run.receipt_path) else {
+        let (Some(worktree), Some(receipt_path)) = (&run.worktree_path(), &run.receipt_path())
+        else {
             return Ok(None);
         };
         let Some(receipt) = fs::read_to_string(receipt_path)
@@ -2462,8 +2478,8 @@ impl Supervisor<'_> {
         else {
             return Ok(None);
         };
-        let task = self.queue.show(run.task_id)?.task;
-        if receipt.run_id != run.id.as_str()
+        let task = self.queue.show(run.task_id())?.task;
+        if receipt.run_id != *run.id().as_str()
             || receipt.result != ReceiptResult::Succeeded
             || !receipt
                 .missing_evidence(task.required_evidence())
@@ -2493,17 +2509,17 @@ impl Supervisor<'_> {
     /// its lease, land it when its integrate was approved, or validate and
     /// review it (with no session to keep) otherwise.
     fn skip_resume(&mut self, run: &TaskRun, head: &CommitSha, main: &CommitSha) -> Result<()> {
-        let approved = self.queue.has_run_event(&run.id, "integration_approved")?;
+        let approved = self.queue.has_run_event(run.id(), "integration_approved")?;
         let Some(run) = self
             .queue
-            .skip_resume(&run.id, &self.token, head, main, approved)?
+            .skip_resume(run.id(), &self.token, head, main, approved)?
         else {
             return Ok(());
         };
         self.log.note(&format!(
             "run {} of task {} was already resolved at {head} on main {main}; {} without a resume",
-            run.id,
-            run.task_id,
+            run.id(),
+            run.task_id(),
             if approved {
                 "landing it"
             } else {
@@ -2537,25 +2553,28 @@ impl Supervisor<'_> {
     /// left open are closed as after a triage. A run of a task that moved
     /// on is left alone.
     fn exhaust_resumes(&mut self, run: &TaskRun, attempts: usize) -> Result<()> {
-        let detail = self.queue.show(run.task_id)?;
+        let detail = self.queue.show(run.task_id())?;
         if detail.task.status() != TaskStatus::InProgress
-            || detail.runs.last().is_some_and(|latest| latest.id != run.id)
+            || detail
+                .runs
+                .last()
+                .is_some_and(|latest| *latest.id() != *run.id())
         {
             return Ok(());
         }
-        let last_error = run.last_error.clone().unwrap_or_default();
+        let last_error = run.last_error().map(str::to_owned).unwrap_or_default();
         let reason = format!(
             "resumed {attempts} times (at most {MAX_RESUME_ATTEMPTS}) and still needs a session: {}",
             tail(&last_error, 500)
         );
         let mut question = format!(
             "Run {} of task {} ({}) was resumed {attempts} times (at most {MAX_RESUME_ATTEMPTS}) and still needs a session, so the supervisor stops resuming it.\nLast error: {}",
-            run.id,
-            run.task_id,
+            run.id(),
+            run.task_id(),
             detail.task.title(),
             or_none(tail(&last_error, 500))
         );
-        if let Some(run_dir) = &run.run_dir {
+        if let Some(run_dir) = &run.run_dir() {
             question.push_str(&format!("\nRun directory: {run_dir}"));
         }
         question.push_str(
@@ -2567,7 +2586,7 @@ impl Supervisor<'_> {
             NewAsk {
                 kind: AskKind::Decide,
                 task_id: None,
-                run_id: Some(run.id.clone()),
+                run_id: Some(run.id().clone()),
                 question,
                 options: EXHAUSTED_OPTIONS.iter().map(|o| (*o).to_owned()).collect(),
                 asked_by: TRIAGE_ASKER.to_owned(),
@@ -2577,7 +2596,7 @@ impl Supervisor<'_> {
         let ask_id = outcome["id"].as_i64().context("ask returned no id")?;
         let Some(failed) =
             self.queue
-                .exhaust_resumes(&run.id, MAX_RESUME_ATTEMPTS, ask_id, &reason)?
+                .exhaust_resumes(run.id(), MAX_RESUME_ATTEMPTS, ask_id, &reason)?
         else {
             // The run changed meanwhile (another supervisor took it): an ask
             // this pass opened has nothing left to decide.
@@ -2592,7 +2611,8 @@ impl Supervisor<'_> {
         };
         self.log.note(&format!(
             "run {} of task {} used up its resumes; it is failed and waits for ask {ask_id}",
-            failed.id, failed.task_id
+            failed.id(),
+            failed.task_id()
         ));
         self.close_triaged_workspaces(&failed)?;
         self.note_triaged(&failed);
@@ -2607,7 +2627,7 @@ impl Supervisor<'_> {
     fn close_left_resume_workspaces(&mut self, run: &TaskRun) -> Result<()> {
         let left: Vec<String> = self
             .queue
-            .run_events(&run.id)?
+            .run_events(run.id())?
             .iter()
             .filter(|e| e.kind == "resume_finished" && e.payload["workspace_closed"] != true)
             .filter_map(|e| e.payload.get("workspace_id").and_then(Value::as_str))
@@ -2617,7 +2637,7 @@ impl Supervisor<'_> {
             if self.cmux.exists(&workspace)? {
                 self.log.note(&format!(
                     "run {}: closing resume workspace {workspace} left by an earlier attempt; its session has ended",
-                    run.id
+                    run.id()
                 ));
                 self.cmux.close(&workspace)?;
             }
@@ -2634,14 +2654,14 @@ impl Supervisor<'_> {
         attempt: usize,
         request: &ResumeRequest,
     ) -> Result<ResumeWatch> {
-        let run_dir = PathBuf::from(run.run_dir.as_ref().context("missing run directory")?);
-        let worktree = Path::new(run.worktree_path.as_ref().context("missing worktree")?);
+        let run_dir = PathBuf::from(run.run_dir().context("missing run directory")?);
+        let worktree = Path::new(run.worktree_path().context("missing worktree")?);
         ensure!(
             worktree.is_dir(),
             "worktree {} is missing",
             worktree.display()
         );
-        let task = self.queue.show(run.task_id)?.task;
+        let task = self.queue.show(run.task_id())?.task;
         let landed = landed_since(&mut self.queue, &self.repository, run, &request.main)?;
         let message = resume_request(&task, run, request, &landed)?;
         fs::write(run_dir.join(format!("resume-{attempt}.txt")), &message)?;
@@ -2652,7 +2672,7 @@ impl Supervisor<'_> {
             path_text(&self.db)?,
             "session".into(),
             "--run".into(),
-            run.id.to_string(),
+            run.id().to_string(),
             "--lease".into(),
             self.token.clone(),
             "--claude".into(),
@@ -2671,7 +2691,7 @@ impl Supervisor<'_> {
             workspace,
             attempt,
             run_dir,
-            receipt_path: PathBuf::from(run.receipt_path.as_ref().context("missing receipt path")?),
+            receipt_path: PathBuf::from(run.receipt_path().context("missing receipt path")?),
             idle_marker: run.idle_marker_path()?,
             started_at: SystemTime::now(),
             startup: Instant::now(),
@@ -2680,7 +2700,7 @@ impl Supervisor<'_> {
             message_sent: None,
             exit_requested: None,
             required_evidence: task.required_evidence().to_vec(),
-            approved: self.queue.has_run_event(&run.id, "integration_approved")?,
+            approved: self.queue.has_run_event(run.id(), "integration_approved")?,
         })
     }
 
@@ -2701,7 +2721,7 @@ impl Supervisor<'_> {
     ) -> Result<Step> {
         let approved = self
             .queue
-            .has_run_event(&slot.run.id, "integration_approved")?;
+            .has_run_event(slot.run.id(), "integration_approved")?;
         let reviewed = matches!(verdict.kind, ResumeOutcome::Resolved) && !approved;
         // A session let go after the exit timeout still runs: its
         // workspace stays, and blocks the next attempt until it ends. A
@@ -2713,7 +2733,7 @@ impl Supervisor<'_> {
                 Err(error) => {
                     self.log.note(&format!(
                         "run {}: resume workspace {workspace} could not be closed: {error:#}",
-                        slot.run.id
+                        slot.run.id()
                     ));
                     false
                 }
@@ -2732,7 +2752,7 @@ impl Supervisor<'_> {
         if reviewed {
             payload["session_live"] = json!(verdict.live);
         }
-        let id = slot.run.id.clone();
+        let id = slot.run.id().clone();
         let run = match verdict.kind {
             ResumeOutcome::Resolved if approved => {
                 let run = self
@@ -2808,7 +2828,7 @@ impl Supervisor<'_> {
             // A run moved on by `resume_skipped` has no session of its own
             // since: its supervisor alone owned it, whatever the wrapper of
             // an earlier session left behind.
-            let skipped = self.skipped_resume(&run.id)?;
+            let skipped = self.skipped_resume(run.id())?;
             let alive = wrapper.as_ref().and_then(|wrapper| {
                 wrapper.exited_at.is_none().then(|| {
                     process_alive(wrapper.pid)
@@ -2829,17 +2849,17 @@ impl Supervisor<'_> {
             let pid = std::process::id();
             let Some(run) =
                 self.queue
-                    .adopt_run(&run.id, &lease.token, &self.token, pid, observed)?
+                    .adopt_run(run.id(), &lease.token, &self.token, pid, observed)?
             else {
                 self.log.note(&format!(
                     "run {} was not adopted: its lease changed while judging it",
-                    run.id
+                    run.id()
                 ));
                 continue;
             };
             self.log.note(&format!(
                 "run {} adopted from supervisor {} (pid {}, heartbeat {}s old; wrapper pid {} {}): task {} in workspace {}",
-                run.id,
+                run.id(),
                 lease.token,
                 lease.pid,
                 now - lease.heartbeat_at,
@@ -2850,10 +2870,10 @@ impl Supervisor<'_> {
                     Some(None) => "gone".to_owned(),
                     None => "none since resume_skipped".to_owned(),
                 },
-                run.task_id,
-                run.workspace_id.as_deref().unwrap_or("?")
+                run.task_id(),
+                run.workspace_id().unwrap_or("?")
             ));
-            let phase = if run.status == RunStatus::AwaitingIntegration {
+            let phase = if run.status() == RunStatus::AwaitingIntegration {
                 self.adopt_review(&run)
             } else {
                 self.resume(&run)
@@ -2863,7 +2883,7 @@ impl Supervisor<'_> {
                 Err(error) => {
                     // The lease is this process's now; give it up like any
                     // other runtime error so `recover` can judge the run.
-                    let message = format!("run {} could not be resumed: {error:#}", run.id);
+                    let message = format!("run {} could not be resumed: {error:#}", run.id());
                     self.log.note(&message);
                     self.abandon(&run, message);
                 }
@@ -2880,7 +2900,7 @@ impl Supervisor<'_> {
     /// timeout applies. A `validating` run restarts validation from the
     /// beginning: it is a function of the receipt and the worktree alone.
     fn resume(&self, run: &TaskRun) -> Result<Phase> {
-        Ok(match run.status {
+        Ok(match run.status() {
             RunStatus::Validating => Phase::Validating(
                 Some(spawn_validation(
                     self.db.clone(),
@@ -2892,23 +2912,24 @@ impl Supervisor<'_> {
             ),
             _ => {
                 let receipt_path =
-                    PathBuf::from(run.receipt_path.as_ref().context("missing receipt path")?);
+                    PathBuf::from(run.receipt_path().context("missing receipt path")?);
                 let receipt_seen = receipt_path.is_file()
-                    && self.queue.has_run_event(&run.id, "receipt_observed")?;
+                    && self.queue.has_run_event(run.id(), "receipt_observed")?;
                 let exit_requested = self
                     .queue
-                    .has_run_event(&run.id, "exit_requested")?
+                    .has_run_event(run.id(), "exit_requested")?
                     .then(Instant::now);
                 let exit_timed_out = self
                     .queue
-                    .has_run_event(&run.id, "exit_request_timed_out")?;
-                let first_commit_seen =
-                    self.queue.has_run_event(&run.id, "first_commit_observed")?;
+                    .has_run_event(run.id(), "exit_request_timed_out")?;
+                let first_commit_seen = self
+                    .queue
+                    .has_run_event(run.id(), "first_commit_observed")?;
                 // A dialog recorded before adoption is not recorded again
                 // while the same screen stays up.
                 let prompt_hash = self
                     .queue
-                    .run_events(&run.id)?
+                    .run_events(run.id())?
                     .into_iter()
                     .rev()
                     .find(|e| {
@@ -2921,10 +2942,10 @@ impl Supervisor<'_> {
                     .and_then(|e| e.payload["screen_hash"].as_str().map(str::to_owned));
                 Phase::Session(SessionWatch {
                     workspace: run
-                        .workspace_id
-                        .clone()
+                        .workspace_id()
+                        .map(str::to_owned)
                         .context("adopted run has no workspace")?,
-                    run_dir: PathBuf::from(run.run_dir.as_ref().context("missing run directory")?),
+                    run_dir: PathBuf::from(run.run_dir().context("missing run directory")?),
                     receipt_path,
                     idle_marker: run.idle_marker_path()?,
                     startup: Instant::now(),
@@ -2939,7 +2960,7 @@ impl Supervisor<'_> {
                     // A timeout recorded without its ask (by a binary that
                     // made none, or a supervisor that died between the two)
                     // still gets one; one asked before is not asked again.
-                    exit_asked: !exit_timed_out || self.queue.has_stuck_exit_ask(&run.id)?,
+                    exit_asked: !exit_timed_out || self.queue.has_stuck_exit_ask(run.id())?,
                 })
             }
         })
@@ -2968,7 +2989,7 @@ impl Supervisor<'_> {
     /// `workspace_closed` of that resume followed, else the worker's own
     /// workspace while it is not closed.
     fn session_of(&self, run: &TaskRun) -> Result<Option<SessionRef>> {
-        let events = self.queue.run_events(&run.id)?;
+        let events = self.queue.run_events(run.id())?;
         let resumed = events.iter().rev().find(|e| {
             matches!(
                 e.kind.as_str(),
@@ -2997,9 +3018,9 @@ impl Supervisor<'_> {
             return Ok(None);
         }
         Ok(run
-            .workspace_id
-            .clone()
-            .filter(|_| run.workspace_closed_at.is_none())
+            .workspace_id()
+            .map(str::to_owned)
+            .filter(|_| run.workspace_closed_at().is_none())
             .map(|workspace| SessionRef {
                 workspace,
                 resume: None,
@@ -3016,7 +3037,7 @@ impl Supervisor<'_> {
     /// receipt and the commit.
     fn adopt_review(&mut self, run: &TaskRun) -> Result<Phase> {
         let session = self.session_of(run)?;
-        let events = self.queue.run_events(&run.id)?;
+        let events = self.queue.run_events(run.id())?;
         let Some(anchor) = events.iter().rev().find(|e| {
             matches!(
                 e.kind.as_str(),
@@ -3034,7 +3055,7 @@ impl Supervisor<'_> {
         let then = match anchor.kind.as_str() {
             "revise_requested" => {
                 if let Some(live) = session.clone()
-                    && session_alive(&self.queue, &run.id)?
+                    && session_alive(&self.queue, run.id())?
                 {
                     return Ok(Phase::Revise(ReviseWatch {
                         session: live,
@@ -3058,7 +3079,7 @@ impl Supervisor<'_> {
                 let passed = passed_before(&events, anchor.id);
                 if let Some(live) = session.clone()
                     && let Some(verdict) = passed
-                    && session_alive(&self.queue, &run.id)?
+                    && session_alive(&self.queue, run.id())?
                 {
                     return Ok(Phase::Revise(ReviseWatch {
                         session: live,
@@ -3135,7 +3156,7 @@ impl Supervisor<'_> {
         watch.timed_out = after("exit_request_timed_out");
         // A timeout recorded without its ask still gets one; one asked
         // before is not asked again (as for a running run, task 104).
-        watch.exit_asked = !watch.timed_out || self.queue.has_stuck_exit_ask(&run.id)?;
+        watch.exit_asked = !watch.timed_out || self.queue.has_stuck_exit_ask(run.id())?;
         Ok(Phase::Exiting(watch))
     }
 
@@ -3163,23 +3184,23 @@ so the run workspace opens outside it: {error:#}",
 
     fn provision(&mut self, claimed: &TaskRun) -> Result<SessionWatch> {
         let state_dir = runs_dir(&self.db);
-        let paths = RunPaths::new(&state_dir, &claimed.id);
+        let paths = RunPaths::new(&state_dir, claimed.id());
         let run_dir = paths.run_dir.clone();
         let plan = RunPlan {
             repo_path: path_text(&self.repository.root)?,
             run_dir: path_text(&run_dir)?,
-            branch: format!("dagq/{}", claimed.id),
+            branch: format!("dagq/{}", claimed.id()),
             worktree_path: path_text(&paths.worktree)?,
             receipt_path: path_text(&paths.receipt)?,
             log_path: path_text(&paths.log)?,
         };
         // Save intended paths before any external resource is created.
-        self.queue.plan_run(&claimed.id, &self.token, &plan)?;
+        self.queue.plan_run(claimed.id(), &self.token, &plan)?;
         fs::create_dir_all(&state_dir)?;
         fs::create_dir(&run_dir).context("run directory must be new")?;
         let run_env = run_env(&self.repository, &self.db, &run_dir)?;
-        let run = self.queue.run(&claimed.id)?;
-        let task = self.queue.show(run.task_id)?.task;
+        let run = self.queue.run(claimed.id())?;
+        let task = self.queue.show(run.task_id())?.task;
         let predecessors: Vec<PredecessorSummary> = self
             .queue
             .predecessors(task.id())?
@@ -3200,7 +3221,7 @@ so the run workspace opens outside it: {error:#}",
         let git_output = self.repository.create_worktree(&run)?;
         fs::write(run_dir.join("worktree-create.txt"), git_output)?;
         self.queue.record_runtime_event(
-            &run.id,
+            run.id(),
             "worktree_created",
             json!({"path": plan.worktree_path, "branch": plan.branch}),
         )?;
@@ -3210,7 +3231,7 @@ so the run workspace opens outside it: {error:#}",
             path_text(&self.db)?,
             "session".into(),
             "--run".into(),
-            run.id.to_string(),
+            run.id().to_string(),
             "--lease".into(),
             self.token.clone(),
             "--claude".into(),
@@ -3223,17 +3244,19 @@ so the run workspace opens outside it: {error:#}",
             description: Some(workspace_description(
                 SessionRole::Worker,
                 &self.queue_hash,
-                Some(&run.id),
-                Some(run.task_id),
+                Some(run.id()),
+                Some(run.task_id()),
             )),
             group: self.workspace_group(),
         };
         let workspace = self.cmux.create(&task, &run, &command, &tags)?;
         self.queue
-            .workspace_created(&run.id, &self.token, &workspace)?;
+            .workspace_created(run.id(), &self.token, &workspace)?;
         self.log.note(&format!(
             "task {} running in workspace {}; run {}",
-            run.task_id, workspace, run.id
+            run.task_id(),
+            workspace,
+            run.id()
         ));
         Ok(SessionWatch {
             workspace,
@@ -3298,19 +3321,19 @@ impl SessionWatch {
         run: &TaskRun,
         log: &SupervisorLog,
     ) -> Result<Option<TaskRun>> {
-        let processes = queue.processes(&run.id)?;
+        let processes = queue.processes(run.id())?;
         self.watch_first_commit(queue, repository, run, log)?;
         if !self.receipt_seen && self.receipt_path.is_file() {
             self.receipt_seen = true;
             self.receipt_seen_at = Some(Instant::now());
             queue.record_runtime_event(
-                &run.id,
+                run.id(),
                 "receipt_observed",
                 json!({"path": path_text(&self.receipt_path)?, "validated": false}),
             )?;
             log.note(&format!(
                 "receipt received for {}; waiting for the session to go idle (or a person's /exit)",
-                run.id
+                run.id()
             ));
         }
         let wrapper = processes.iter().find(|p| p.role == "wrapper");
@@ -3334,36 +3357,37 @@ impl SessionWatch {
                 None => None,
             }
         {
-            queue.record_runtime_event(&run.id, "session_idle_observed", evidence)?;
+            queue.record_runtime_event(run.id(), "session_idle_observed", evidence)?;
             // The session stays open through validation and review, and
             // is asked to exit only once the verdict is known (ADR-0027
             // decision 1).
             log.note(&format!(
                 "session of {} is idle after its receipt; validating with the session open",
-                run.id
+                run.id()
             ));
-            return queue.finish_supervision_live(&run.id, token).map(Some);
+            return queue.finish_supervision_live(run.id(), token).map(Some);
         }
         if let Some(wrapper) = wrapper {
             if wrapper.exited_at.is_some() {
                 match cmux.capture(&self.workspace) {
                     Ok(screen) => fs::write(self.run_dir.join("terminal-final.txt"), screen)?,
                     Err(error) => queue.record_runtime_event(
-                        &run.id,
+                        run.id(),
                         "screen_capture_failed",
                         json!({"error": format!("{error:#}")}),
                     )?,
                 }
                 // Nobody needs to send /exit to a session that exited, nor
                 // answer its dialog.
-                for ask in queue.close_stuck_exit_asks(&run.id, STUCK_EXIT_CLOSED)? {
+                for ask in queue.close_stuck_exit_asks(run.id(), STUCK_EXIT_CLOSED)? {
                     log.note(&format!(
                         "session of {} exited; closed its stuck_exit ask {}",
-                        run.id, ask.id
+                        run.id(),
+                        ask.id
                     ));
                 }
                 close_answer_prompt_asks(queue, run, PROMPT_EXITED_CLOSED, log)?;
-                return queue.finish_supervision(&run.id, token).map(Some);
+                return queue.finish_supervision(run.id(), token).map(Some);
             }
             ensure!(
                 unix_time() - wrapper.heartbeat_at <= HEARTBEAT_TIMEOUT_SECS,
@@ -3393,13 +3417,13 @@ impl SessionWatch {
                 // proceeds to validation once the session exits. /exit is not
                 // sent again, since it could pick another option of a dialog.
                 queue.record_runtime_event(
-                    &run.id,
+                    run.id(),
                     "exit_request_timed_out",
                     json!({"workspace_id": self.workspace, "timeout_secs": timeout.as_secs()}),
                 )?;
                 log.note(&format!(
                     "session for {} did not exit within {}s of the exit request; keeping the run and asking the inbox to send /exit in workspace {}",
-                    run.id,
+                    run.id(),
                     timeout.as_secs(),
                     self.workspace
                 ));
@@ -3436,7 +3460,7 @@ impl SessionWatch {
         if self.first_commit_seen {
             return Ok(());
         }
-        let Some(worktree) = run.worktree_path.as_deref() else {
+        let Some(worktree) = run.worktree_path() else {
             return Ok(());
         };
         let head = match repository.head(Path::new(worktree)) {
@@ -3444,16 +3468,16 @@ impl SessionWatch {
             Err(error) => {
                 log.note(&format!(
                     "HEAD of {} could not be read for its first commit: {error:#}",
-                    run.id
+                    run.id()
                 ));
                 return Ok(());
             }
         };
-        if head != run.base_commit {
+        if head != *run.base_commit() {
             queue.record_runtime_event(
-                &run.id,
+                run.id(),
                 "first_commit_observed",
-                json!({"commit": head, "base_commit": run.base_commit}),
+                json!({"commit": head, "base_commit": run.base_commit()}),
             )?;
             self.first_commit_seen = true;
         }
@@ -3487,7 +3511,7 @@ impl SessionWatch {
         }
         if self.idle_marker.exists()
             || !process_alive(agent.pid)
-            || queue.has_unclosed_worker_question(&run.id)?
+            || queue.has_unclosed_worker_question(run.id())?
         {
             // The agent finished a response, is gone, or stopped at an ask
             // that waits for its answer: no dialog holds it now, and a
@@ -3509,7 +3533,7 @@ impl SessionWatch {
             Err(error) => {
                 log.note(&format!(
                     "screen of {} could not be read for a dialog: {error:#}",
-                    run.id
+                    run.id()
                 ));
                 return Ok(());
             }
@@ -3520,7 +3544,7 @@ impl SessionWatch {
                 let hash = format!("{:x}", Sha256::digest(excerpt.as_bytes()));
                 if self.prompt_hash.as_deref() != Some(hash.as_str()) {
                     queue.record_runtime_event(
-                        &run.id,
+                        run.id(),
                         "prompt_waiting",
                         json!({
                             "workspace_id": self.workspace,
@@ -3531,7 +3555,7 @@ impl SessionWatch {
                     )?;
                     log.note(&format!(
                         "run {} waits at a {} dialog in workspace {}; asking the inbox",
-                        run.id,
+                        run.id(),
                         kind.as_str(),
                         self.workspace
                     ));
@@ -3569,7 +3593,7 @@ impl SessionWatch {
         run: &TaskRun,
         log: &SupervisorLog,
     ) -> Result<()> {
-        let answers = queue.undelivered_answers(&run.id)?;
+        let answers = queue.undelivered_answers(run.id())?;
         if answers.is_empty() {
             return Ok(());
         }
@@ -3581,7 +3605,7 @@ impl SessionWatch {
             Err(error) => return Err(error).context("inspect idle marker"),
         };
         let failed: Vec<i64> = queue
-            .run_events(&run.id)?
+            .run_events(run.id())?
             .iter()
             .filter(|e| e.kind == "ask_delivery_failed")
             .filter_map(|e| e.payload.get("ask_id").and_then(Value::as_i64))
@@ -3601,16 +3625,19 @@ impl SessionWatch {
                 Ok(()) => match queue.ask_delivered(ask.id, &self.workspace) {
                     Ok(_) => log.note(&format!(
                         "answer of ask {} sent to run {} in workspace {}",
-                        ask.id, run.id, self.workspace
+                        ask.id,
+                        run.id(),
+                        self.workspace
                     )),
                     Err(error) => log.note(&format!(
                         "answer of ask {} was sent to run {} but could not be recorded: {error:#}",
-                        ask.id, run.id
+                        ask.id,
+                        run.id()
                     )),
                 },
                 Err(error) => {
                     queue.record_runtime_event(
-                        &run.id,
+                        run.id(),
                         "ask_delivery_failed",
                         json!({
                             "ask_id": ask.id,
@@ -3620,7 +3647,7 @@ impl SessionWatch {
                     )?;
                     log.note(&format!(
                         "answer of ask {} could not be sent to run {} in workspace {}: {error:#}; it is left to the inbox",
-                        ask.id, run.id, self.workspace
+                        ask.id, run.id(), self.workspace
                     ));
                 }
             }
@@ -3637,11 +3664,11 @@ impl SessionWatch {
     ) -> Result<()> {
         if self.prompt_hash.take().is_some() {
             queue.record_runtime_event(
-                &run.id,
+                run.id(),
                 "prompt_cleared",
                 json!({"workspace_id": self.workspace}),
             )?;
-            log.note(&format!("dialog of {} is gone", run.id));
+            log.note(&format!("dialog of {} is gone", run.id()));
             close_answer_prompt_asks(queue, run, PROMPT_CLEARED_CLOSED, log)?;
         }
         Ok(())
@@ -3667,16 +3694,16 @@ fn ask_answer_prompt(
 ) -> Result<()> {
     let question = format!(
         "The session of run {run_id} (task {task_id}) waits at a {prompt} dialog in workspace {workspace}. Answer with the choice to send to it (or what to do instead); the dialog is answered in that workspace, and this ask closes itself once the dialog is gone.\n\nLast lines of the screen:\n{excerpt}",
-        run_id = run.id,
-        task_id = run.task_id,
+        run_id = run.id(),
+        task_id = run.task_id(),
     );
     let outcome = ask_in(
         queue,
         &repository.root,
         NewAsk {
             kind: AskKind::AnswerPrompt,
-            task_id: Some(run.task_id),
-            run_id: Some(run.id.clone()),
+            task_id: Some(run.task_id()),
+            run_id: Some(run.id().clone()),
             question,
             options: Vec::new(),
             asked_by: SessionRole::Supervisor.as_str().into(),
@@ -3685,7 +3712,9 @@ fn ask_answer_prompt(
     )?;
     log.note(&format!(
         "answer_prompt ask {} for {} (notified: {})",
-        outcome["id"], run.id, outcome["notified"]
+        outcome["id"],
+        run.id(),
+        outcome["notified"]
     ));
     Ok(())
 }
@@ -3697,10 +3726,11 @@ fn close_answer_prompt_asks(
     answer: &str,
     log: &SupervisorLog,
 ) -> Result<()> {
-    for ask in queue.close_answer_prompt_asks(&run.id, answer)? {
+    for ask in queue.close_answer_prompt_asks(run.id(), answer)? {
         log.note(&format!(
             "closed the answer_prompt ask {} of {}: {answer}",
-            ask.id, run.id
+            ask.id,
+            run.id()
         ));
     }
     Ok(())
@@ -3735,8 +3765,8 @@ fn ask_stuck_exit(
     };
     let question = format!(
         "The session of run {run_id} (task {task_id}) did not exit within {timeout}s of the supervisor's /exit (exit_request_timed_out): something on its screen, usually one of Claude Code's own dialogs such as \"Background work is running\", holds the exit back. {after}; this ask then closes itself. Answer `exit` to have the dialog answered so that the session exits and /exit sent in workspace {workspace}, or `wait` to leave the session as it is (or write what to do instead).\n\nLast lines of the screen:\n{screen}",
-        run_id = run.id,
-        task_id = run.task_id,
+        run_id = run.id(),
+        task_id = run.task_id(),
         timeout = cmux.exit_timeout().as_secs(),
     );
     let outcome = ask_in(
@@ -3744,8 +3774,8 @@ fn ask_stuck_exit(
         &repository.root,
         NewAsk {
             kind: AskKind::StuckExit,
-            task_id: Some(run.task_id),
-            run_id: Some(run.id.clone()),
+            task_id: Some(run.task_id()),
+            run_id: Some(run.id().clone()),
             question,
             options: vec!["exit".into(), "wait".into()],
             asked_by: SessionRole::Supervisor.as_str().into(),
@@ -3754,7 +3784,9 @@ fn ask_stuck_exit(
     )?;
     log.note(&format!(
         "stuck_exit ask {} for {} (notified: {})",
-        outcome["id"], run.id, outcome["notified"]
+        outcome["id"],
+        run.id(),
+        outcome["notified"]
     ));
     Ok(())
 }
@@ -3904,7 +3936,7 @@ enum ResumeKind {
 /// whose `instruction` is the reason, or a person's `triage_decided`), or a
 /// landing.
 fn resume_reason(queue: &SqliteQueue, run: &TaskRun) -> Result<(Option<String>, ResumeKind)> {
-    let events = queue.run_events(&run.id)?;
+    let events = queue.run_events(run.id())?;
     let parked = events.iter().rev().find(|e| {
         matches!(
             e.kind.as_str(),
@@ -3925,7 +3957,7 @@ fn resume_reason(queue: &SqliteQueue, run: &TaskRun) -> Result<(Option<String>, 
     let reason = parked
         .and_then(|e| e.payload.get(key).and_then(Value::as_str))
         .map(str::to_owned)
-        .or_else(|| run.last_error.clone());
+        .or_else(|| run.last_error().map(str::to_owned));
     let kind = match parked {
         Some(e) if e.kind == "evidence_missing" || e.payload.get("checks").is_some() => {
             ResumeKind::EvidenceMissing
@@ -3949,7 +3981,7 @@ fn landed_since(
     main: &CommitSha,
 ) -> Result<Vec<PredecessorSummary>> {
     let mut landed = Vec::new();
-    for task_id in repository.landed_task_ids(run.base_commit.as_str(), main.as_str())? {
+    for task_id in repository.landed_task_ids(run.base_commit().as_str(), main.as_str())? {
         let Ok(detail) = queue.show(task_id) else {
             continue;
         };
@@ -3957,7 +3989,7 @@ fn landed_since(
             .runs
             .iter()
             .rev()
-            .find(|r| r.status == RunStatus::Integrated)
+            .find(|r| r.status() == RunStatus::Integrated)
             .cloned();
         landed.push(PredecessorSummary::from_predecessor(&Predecessor {
             task: detail.task,
@@ -3977,44 +4009,45 @@ fn resume_request(
     request: &ResumeRequest,
     landed: &[PredecessorSummary],
 ) -> Result<String> {
-    let receipt = run.receipt_path.as_ref().context("missing receipt path")?;
+    let receipt = run.receipt_path().context("missing receipt path")?;
     let mut lines = vec![match request.kind {
         ResumeKind::EvidenceMissing => format!(
             "dagq: the supervisor's validation of run {} (task {}) found required evidence missing from the receipt, so the run is needs_session.",
-            run.id,
+            run.id(),
             task.id()
         ),
         ResumeKind::SentBack => format!(
             "dagq: the supervisor's review of run {} (task {}) raised findings a person sent back to you, so the run is needs_session.",
-            run.id,
+            run.id(),
             task.id()
         ),
         ResumeKind::ScopeViolation => format!(
             "dagq: run {} (task {}) changes paths outside the task's --paths ({}), so the run is needs_session.",
-            run.id,
+            run.id(),
             task.id(),
             task.paths().join(", ")
         ),
         ResumeKind::Landing => format!(
             "dagq: integrate could not land run {} (task {}) and returned needs_session.",
-            run.id,
+            run.id(),
             task.id()
         ),
         ResumeKind::Precheck => format!(
             "dagq: the supervisor's review of run {} (task {}) passed, but integrate would conflict with main, so the run was not landed.",
-            run.id,
+            run.id(),
             task.id()
         ),
         ResumeKind::Triage => format!(
             "dagq: run {} (task {}) failed or was interrupted, and the supervisor's triage sent it back to this session to finish, so the run is needs_session.",
-            run.id,
+            run.id(),
             task.id()
         ),
     }];
     lines.push(format!("Reason: {}", request.reason));
     lines.push(format!(
         "main is now {} (your base commit was {}).",
-        request.main, run.base_commit
+        request.main,
+        run.base_commit()
     ));
     if landed.is_empty() {
         lines.push("Tasks landed on main since your base: none.".to_owned());
@@ -4151,7 +4184,7 @@ impl ResumeWatch {
     /// otherwise: a resolved receipt must name a clean head.
     fn verdict(&self, run: &TaskRun, head: Option<&CommitSha>) -> ResumeOutcome {
         match self.rewritten_receipt() {
-            Some(receipt) if receipt.run_id != run.id.as_str() => ResumeOutcome::Unresolved,
+            Some(receipt) if receipt.run_id != *run.id().as_str() => ResumeOutcome::Unresolved,
             Some(receipt) if receipt.result == ReceiptResult::Failed => ResumeOutcome::Failed(
                 format!("session reported the run as failed: {}", receipt.summary),
             ),
@@ -4175,7 +4208,7 @@ impl ResumeWatch {
         run: &TaskRun,
         log: &SupervisorLog,
     ) -> Result<Option<ResumeVerdict>> {
-        let processes = queue.processes(&run.id)?;
+        let processes = queue.processes(run.id())?;
         let Some(wrapper) = processes.iter().find(|p| p.role == "wrapper") else {
             let timeout = cmux.registration_timeout();
             ensure!(
@@ -4185,7 +4218,7 @@ impl ResumeWatch {
             );
             return Ok(None);
         };
-        let worktree = Path::new(run.worktree_path.as_ref().context("missing worktree")?);
+        let worktree = Path::new(run.worktree_path().context("missing worktree")?);
         if wrapper.exited_at.is_some() {
             match cmux.capture(&self.workspace) {
                 Ok(screen) => fs::write(
@@ -4194,7 +4227,7 @@ impl ResumeWatch {
                     screen,
                 )?,
                 Err(error) => queue.record_runtime_event(
-                    &run.id,
+                    run.id(),
                     "screen_capture_failed",
                     json!({"error": format!("{error:#}")}),
                 )?,
@@ -4222,7 +4255,8 @@ impl ResumeWatch {
                     self.message_sent = Some((Instant::now(), SystemTime::now()));
                     log.note(&format!(
                         "resolution request sent to run {} in workspace {}",
-                        run.id, self.workspace
+                        run.id(),
+                        self.workspace
                     ));
                 }
             }
@@ -4257,7 +4291,7 @@ impl ResumeWatch {
                 {
                     log.note(&format!(
                         "resumed session of {} rewrote its receipt and went idle (head {head}); validating with the session open",
-                        run.id
+                        run.id()
                     ));
                     return Ok(Some(ResumeVerdict {
                         kind: ResumeOutcome::Resolved,
@@ -4284,7 +4318,7 @@ impl ResumeWatch {
                     cmux.send_exit(&self.workspace)?;
                     log.note(&format!(
                         "resumed session of {} {why} (head {head}); exit requested",
-                        run.id
+                        run.id()
                     ));
                     self.exit_requested = Some(Instant::now());
                 }
@@ -4293,7 +4327,7 @@ impl ResumeWatch {
                 // /exit is not resent (it could pick a dialog's option).
                 log.note(&format!(
                     "resumed session of {} did not exit within {}s of the exit request; letting it go as unresolved (its workspace {} is kept)",
-                    run.id,
+                    run.id(),
                     cmux.exit_timeout().as_secs(),
                     self.workspace
                 ));
@@ -4311,7 +4345,7 @@ impl ResumeWatch {
                 {
                     log.note(&format!(
                         "stuck_exit ask for {} could not be opened: {error:#}",
-                        run.id
+                        run.id()
                     ));
                 }
                 return Ok(Some(ResumeVerdict {
@@ -4528,7 +4562,7 @@ impl ReviseWatch {
         repository: &GitRepository,
         run: &TaskRun,
     ) -> Result<Option<ReviseOutcome>> {
-        let processes = queue.processes(&run.id)?;
+        let processes = queue.processes(run.id())?;
         let Some(wrapper) = processes
             .iter()
             .find(|p| p.role == "wrapper" && p.exited_at.is_none())
@@ -4541,7 +4575,7 @@ impl ReviseWatch {
             unix_time() - wrapper.heartbeat_at <= HEARTBEAT_TIMEOUT_SECS,
             "wrapper heartbeat expired; session may still be alive"
         );
-        let receipt = Path::new(run.receipt_path.as_ref().context("missing receipt path")?);
+        let receipt = Path::new(run.receipt_path().context("missing receipt path")?);
         // The idle marker is read before the receipt: a receipt rewritten
         // after this read is judged at the next poll, never as idle without
         // it.
@@ -4554,7 +4588,7 @@ impl ReviseWatch {
             _ => false,
         };
         if idle_after_receipt {
-            let worktree = Path::new(run.worktree_path.as_ref().context("missing worktree")?);
+            let worktree = Path::new(run.worktree_path().context("missing worktree")?);
             let head = repository.head(worktree)?;
             let clean = repository.status(worktree)?.trim().is_empty();
             let parsed = fs::read_to_string(receipt)
@@ -4643,7 +4677,7 @@ impl ExitWatch {
         };
         format!(
             "The run stays {} under the supervisor after its validation and review, and {next} once the session exits",
-            run.status.as_str()
+            run.status().as_str()
         )
     }
 
@@ -4660,7 +4694,7 @@ impl ExitWatch {
         let Some(session) = &self.session else {
             return Ok(true);
         };
-        let processes = queue.processes(&run.id)?;
+        let processes = queue.processes(run.id())?;
         let wrapper = processes.iter().find(|p| p.role == "wrapper");
         let Some(wrapper) = wrapper.filter(|w| w.exited_at.is_none()) else {
             if self.requested.is_some() {
@@ -4668,21 +4702,22 @@ impl ExitWatch {
                     Some(attempt) => format!("terminal-resume-{attempt}.txt"),
                     None => "terminal-final.txt".to_owned(),
                 };
-                let run_dir = Path::new(run.run_dir.as_ref().context("missing run directory")?);
+                let run_dir = Path::new(run.run_dir().context("missing run directory")?);
                 match cmux.capture(&session.workspace) {
                     Ok(screen) => fs::write(run_dir.join(name), screen)?,
                     Err(error) => queue.record_runtime_event(
-                        &run.id,
+                        run.id(),
                         "screen_capture_failed",
                         json!({"error": format!("{error:#}")}),
                     )?,
                 }
             }
             // Nobody needs to send /exit to a session that exited.
-            for ask in queue.close_stuck_exit_asks(&run.id, STUCK_EXIT_CLOSED)? {
+            for ask in queue.close_stuck_exit_asks(run.id(), STUCK_EXIT_CLOSED)? {
                 log.note(&format!(
                     "session of {} exited; closed its stuck_exit ask {}",
-                    run.id, ask.id
+                    run.id(),
+                    ask.id
                 ));
             }
             return Ok(true);
@@ -4702,7 +4737,7 @@ impl ExitWatch {
                     self.background_noted = true;
                     log.note(&format!(
                         "session of {} has background work running; /exit waits for it",
-                        run.id
+                        run.id()
                     ));
                 }
             }
@@ -4711,7 +4746,7 @@ impl ExitWatch {
                 // wrapper record `session_exited`, before the send returns.
                 let timeout = cmux.exit_timeout();
                 queue.record_runtime_event(
-                    &run.id,
+                    run.id(),
                     "exit_requested",
                     json!({"workspace_id": session.workspace, "timeout_secs": timeout.as_secs()}),
                 )?;
@@ -4719,20 +4754,20 @@ impl ExitWatch {
                 cmux.send_exit(&session.workspace)?;
                 log.note(&format!(
                     "exit requested for {}; waiting for session exit",
-                    run.id
+                    run.id()
                 ));
                 self.requested = Some(Instant::now());
             }
             Some(requested) if !self.timed_out && requested.elapsed() >= cmux.exit_timeout() => {
                 let timeout = cmux.exit_timeout();
                 queue.record_runtime_event(
-                    &run.id,
+                    run.id(),
                     "exit_request_timed_out",
                     json!({"workspace_id": session.workspace, "timeout_secs": timeout.as_secs()}),
                 )?;
                 log.note(&format!(
                     "session for {} did not exit within {}s of the exit request; keeping the run and asking the inbox to send /exit in workspace {}",
-                    run.id,
+                    run.id(),
                     timeout.as_secs(),
                     session.workspace
                 ));
@@ -4760,11 +4795,11 @@ impl ExitWatch {
 /// The fixed request the supervisor types into the live session when the
 /// receipt it rewrote for a revise or a conflict request does not name its clean worktree HEAD.
 fn revise_mismatch_request(run: &TaskRun, label: &str, why: &str) -> Result<String> {
-    let receipt = run.receipt_path.as_ref().context("missing receipt path")?;
+    let receipt = run.receipt_path().context("missing receipt path")?;
     Ok([
         format!(
             "dagq: the receipt you rewrote for {label} of run {} cannot be accepted: {why}.",
-            run.id
+            run.id()
         ),
         "Steps:".to_owned(),
         "1. Commit every change you meant to make, so the worktree is clean.".to_owned(),
@@ -4793,7 +4828,7 @@ pub fn review_prompt(task: &Task, run: &TaskRun, review_path: &str) -> String {
          Answer with one JSON object and nothing else, matching this schema:\n\
          {{\"verdict\": \"pass\" | \"revise\" | \"concern\", \"reasons\": [string], \"summary\": string}}\n\
          reasons lists each finding (empty for pass); summary is one or two sentences.\n",
-        run_id = run.id,
+        run_id = run.id(),
         task_id = task.id(),
         title = task.title(),
         acceptance = or_none(task.acceptance()),
@@ -4827,7 +4862,7 @@ pub fn triage_prompt(
     let failures = detail
         .runs
         .iter()
-        .filter(|r| matches!(r.status, RunStatus::Failed | RunStatus::Interrupted))
+        .filter(|r| matches!(r.status(), RunStatus::Failed | RunStatus::Interrupted))
         .count();
     let read = |path: &Path| {
         fs::read(path)
@@ -4835,10 +4870,10 @@ pub fn triage_prompt(
             .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
     };
     let mut material = String::new();
-    let receipt = run.receipt_path.as_deref().map(Path::new).and_then(read);
+    let receipt = run.receipt_path().map(Path::new).and_then(read);
     material.push_str(&format!(
         "Receipt ({}):\n{}\n",
-        run.receipt_path.as_deref().unwrap_or("none"),
+        run.receipt_path().unwrap_or("none"),
         fenced(
             "json",
             or_none(tail(
@@ -4889,7 +4924,7 @@ pub fn triage_prompt(
     let events: Vec<Value> = detail
         .events
         .iter()
-        .filter(|e| e.run_id.as_ref() == Some(&run.id))
+        .filter(|e| e.run_id.as_ref() == Some(run.id()))
         .map(crate::watch::compact_event)
         .collect();
     let events = &events[events.len().saturating_sub(40)..];
@@ -4908,19 +4943,19 @@ pub fn triage_prompt(
     let earlier: Vec<String> = detail
         .runs
         .iter()
-        .filter(|r| r.id != run.id)
+        .filter(|r| *r.id() != *run.id())
         .map(|r| {
             let verdicts: Vec<String> = detail
                 .events
                 .iter()
-                .filter(|e| e.run_id.as_ref() == Some(&r.id) && e.kind == "triage_finished")
+                .filter(|e| e.run_id.as_ref() == Some(r.id()) && e.kind == "triage_finished")
                 .map(|e| format!("{}", e.payload.get("action").unwrap_or(&Value::Null)))
                 .collect();
             format!(
                 "- run {} {}: {}{}",
-                r.id,
-                r.status.as_str(),
-                or_none(tail(r.last_error.as_deref().unwrap_or_default(), 300)),
+                r.id(),
+                r.status().as_str(),
+                or_none(tail(r.last_error().unwrap_or_default(), 300)),
                 if verdicts.is_empty() {
                     String::new()
                 } else {
@@ -4961,15 +4996,15 @@ pub fn triage_prompt(
          Answer with one JSON object and nothing else, matching this schema:\n\
          {{\"verdict\": \"retry\" | \"resume\" | \"ask\", \"reason\": string, \"instruction\": string}}\n\
          reason is one or two sentences on why; instruction may be empty for retry.\n",
-        run_id = run.id,
+        run_id = run.id(),
         task_id = task.id(),
         title = task.title(),
-        status = run.status.as_str(),
+        status = run.status().as_str(),
         dir = dir.display(),
-        worktree = run.worktree_path.as_deref().unwrap_or("none"),
+        worktree = run.worktree_path().unwrap_or("none"),
         description = or_none(task.description()),
         acceptance = or_none(task.acceptance()),
-        last_error = or_none(run.last_error.as_deref().unwrap_or_default()),
+        last_error = or_none(run.last_error().unwrap_or_default()),
         earlier = if earlier.is_empty() {
             "none".to_owned()
         } else {
@@ -4987,11 +5022,11 @@ fn revise_request(
     attempt: usize,
     reasons: &[String],
 ) -> Result<String> {
-    let receipt = run.receipt_path.as_ref().context("missing receipt path")?;
+    let receipt = run.receipt_path().context("missing receipt path")?;
     let verify = serde_json::to_string(task.verification_commands())?;
     let mut lines = vec![format!(
         "dagq: the supervisor's review of run {} (task {}) asks for changes (revise {attempt} of {MAX_REVISE_ATTEMPTS}).",
-        run.id,
+        run.id(),
         task.id()
     )];
     lines.push("Findings:".to_owned());
@@ -5133,7 +5168,7 @@ fn spawn_validation(
 ) -> thread::JoinHandle<Result<Validation>> {
     thread::spawn(move || {
         let mut queue = SqliteQueue::open(&db)?;
-        let task = queue.show(run.task_id)?.task;
+        let task = queue.show(run.task_id())?.task;
         let checked = check_receipt(&repository, &task, &run)?;
         Ok(match checked {
             Ok((receipt, commit)) => Validation {
@@ -5146,7 +5181,7 @@ fn spawn_validation(
                 allowed_paths: Vec::new(),
             },
             Err(rejection) => {
-                log.note(&format!("run {} rejected: {}", run.id, rejection.reason));
+                log.note(&format!("run {} rejected: {}", run.id(), rejection.reason));
                 Validation {
                     accepted: false,
                     result_commit: rejection.commit,
@@ -5179,13 +5214,13 @@ fn close_workspace(
     run: &TaskRun,
     log: &SupervisorLog,
 ) -> Result<TaskRun> {
-    let workspace = run.workspace_id.as_ref().context("missing workspace")?;
+    let workspace = run.workspace_id().context("missing workspace")?;
     match cmux.close(workspace) {
-        Ok(()) => queue.workspace_closed(&run.id, token),
+        Ok(()) => queue.workspace_closed(run.id(), token),
         Err(error) => {
             let message = format!("workspace {workspace} could not be closed: {error:#}");
-            log.note(&format!("run {}: {message}", run.id));
-            queue.cleanup_failed(&run.id, token, &message)
+            log.note(&format!("run {}: {message}", run.id()));
+            queue.cleanup_failed(run.id(), token, &message)
         }
     }
 }
@@ -5216,7 +5251,7 @@ fn check_receipt(
             scope_violation: Vec::new(),
         }))
     };
-    let receipt_path = Path::new(run.receipt_path.as_ref().context("missing receipt path")?);
+    let receipt_path = Path::new(run.receipt_path().context("missing receipt path")?);
     let text = match fs::read_to_string(receipt_path) {
         Ok(text) => text,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -5232,13 +5267,13 @@ fn check_receipt(
         Ok(receipt) => receipt,
         Err(error) => return reject(format!("{error:#}"), None, None),
     };
-    if let Err(error) = receipt.check_requiring(&run.id, task.required_evidence()) {
+    if let Err(error) = receipt.check_requiring(run.id(), task.required_evidence()) {
         return reject(format!("{error:#}"), None, Some(receipt));
     }
     // The commit must be the head of the run branch, checked out in the worktree,
     // and new work on top of the base commit.
-    let worktree = Path::new(run.worktree_path.as_ref().context("missing worktree")?);
-    let branch = run.branch.as_ref().context("missing branch")?;
+    let worktree = Path::new(run.worktree_path().context("missing worktree")?);
+    let branch = run.branch().context("missing branch")?;
     let expected_ref = format!("refs/heads/{branch}");
     match repository.current_branch(worktree)? {
         Some(current) if current == expected_ref => (),
@@ -5265,18 +5300,18 @@ fn check_receipt(
         );
     }
     let commit = head;
-    if commit == run.base_commit {
+    if commit == *run.base_commit() {
         return reject(
-            format!("no commit was made on top of base {}", run.base_commit),
+            format!("no commit was made on top of base {}", run.base_commit()),
             Some(commit),
             Some(receipt),
         );
     }
-    if !repository.is_ancestor(run.base_commit.as_str(), commit.as_str())? {
+    if !repository.is_ancestor(run.base_commit().as_str(), commit.as_str())? {
         return reject(
             format!(
                 "commit {commit} does not descend from base {}",
-                run.base_commit
+                run.base_commit()
             ),
             Some(commit),
             Some(receipt),
@@ -5379,11 +5414,11 @@ pub fn integrate(
             if let Some(busy) = detail
                 .runs
                 .iter()
-                .find(|r| r.status == RunStatus::Integrating)
+                .find(|r| r.status() == RunStatus::Integrating)
             {
                 bail!(
                     "run {} of task {task_id} is already integrating (see doctor if it is stuck)",
-                    busy.id
+                    busy.id()
                 );
             }
             detail
@@ -5391,7 +5426,7 @@ pub fn integrate(
                 .iter()
                 .find(|r| {
                     matches!(
-                        r.status,
+                        r.status(),
                         RunStatus::AwaitingIntegration | RunStatus::NeedsSession
                     )
                 })
@@ -5410,28 +5445,28 @@ pub fn integrate(
     };
     // A run the supervisor holds (its review, ADR-0027, or its resume) is
     // not approved by a call that cannot land it.
-    if let Some(lease) = queue.run_lease(&run.id)?
+    if let Some(lease) = queue.run_lease(run.id())?
         && !lease_is_stale(&lease, unix_time())
     {
         bail!(
             "run {} is held by the supervisor (its review or resume is in progress); see show for its review_finished / resume_finished events",
-            run.id
+            run.id()
         );
     }
     // The call is the approval to land (ADR-0016 decision 5): a run it
     // parks as `needs_session` is landed by the supervisor once a resumed
     // session resolved it (ADR-0019 decision 1).
-    if !queue.has_run_event(&run.id, "integration_approved")? {
+    if !queue.has_run_event(run.id(), "integration_approved")? {
         queue.record_runtime_event(
-            &run.id,
+            run.id(),
             "integration_approved",
-            json!({"status": run.status.as_str(), "pid": std::process::id(), "push": remote.is_some()}),
+            json!({"status": run.status().as_str(), "pid": std::process::id(), "push": remote.is_some()}),
         )?;
     }
-    let previous = run.status;
+    let previous = run.status();
     let token = Uuid::new_v4().to_string();
     let main = repository.main_head()?;
-    let run = queue.begin_integration(&run.id, &token, &main)?;
+    let run = queue.begin_integration(run.id(), &token, &main)?;
     let heartbeat = Heartbeat::start(db.clone(), token.clone());
     let outcome = land_integrating(
         &mut queue,
@@ -5464,10 +5499,11 @@ fn land_integrating(
     common_dir: &str,
     remote: Option<&dyn MainRemote>,
 ) -> Result<IntegrationOutcome> {
-    let task = queue.show(run.task_id)?.task;
+    let task = queue.show(run.task_id())?.task;
     eprintln!(
         "run {} integrating task {} onto main {main}",
-        run.id, run.task_id
+        run.id(),
+        run.task_id()
     );
     let verdict = match land(queue, db, repository, &task, run, main) {
         Ok(verdict) => verdict,
@@ -5475,33 +5511,37 @@ fn land_integrating(
             // Nothing reached main: give the slot back and keep the run where it was.
             let message = format!("integration stopped before main moved: {error:#}");
             if let Err(record) =
-                queue.abort_integration(&run.id, token, previous.as_str(), &message)
+                queue.abort_integration(run.id(), token, previous.as_str(), &message)
             {
-                eprintln!("run {}: could not record the error: {record:#}", run.id);
+                eprintln!("run {}: could not record the error: {record:#}", run.id());
             }
-            return Err(error.context(format!("run {} returned to {}", run.id, previous.as_str())));
+            return Err(error.context(format!(
+                "run {} returned to {}",
+                run.id(),
+                previous.as_str()
+            )));
         }
     };
     Ok(match verdict {
         Verdict::Landed(landing, proposed) => {
             let verification_skipped = landing.verification_skipped;
             let (task, run) = queue
-                .finish_integration(&run.id, token, &landing, common_dir)
+                .finish_integration(run.id(), token, &landing, common_dir)
                 .with_context(|| {
                     format!(
                         "main advanced to {} but run {} could not be completed; inspect show and doctor",
-                        landing.commit, run.id
+                        landing.commit, run.id()
                     )
                 })?;
             eprintln!(
                 "task {} landed as {} on main; run {} integrated",
                 task.id(),
                 landing.commit,
-                run.id
+                run.id()
             );
             remove_landed_worktree(queue, repository, &run);
-            let push = push_main(queue, remote, &run.id, &landing.commit);
-            let follow_ups = register_follow_ups(queue, &task, &run.id, proposed.as_ref());
+            let push = push_main(queue, remote, run.id(), &landing.commit);
+            let follow_ups = register_follow_ups(queue, &task, run.id(), proposed.as_ref());
             IntegrationOutcome::Integrated {
                 task: Box::new(task),
                 run: Box::new(run),
@@ -5511,12 +5551,12 @@ fn land_integrating(
             }
         }
         Verdict::Deferred { reason, mut detail } => {
-            eprintln!("run {} needs a session: {reason}", run.id);
+            eprintln!("run {} needs a session: {reason}", run.id());
             // How many more times the supervisor resumes it (ADR-0019); the
             // event is a person's only once none are left (as an ask).
             detail["resumes_left"] =
-                json!(MAX_RESUME_ATTEMPTS.saturating_sub(resume_attempts(queue, &run.id)));
-            let run = queue.defer_integration(&run.id, token, &reason, detail)?;
+                json!(MAX_RESUME_ATTEMPTS.saturating_sub(resume_attempts(queue, run.id())));
+            let run = queue.defer_integration(run.id(), token, &reason, detail)?;
             IntegrationOutcome::NeedsSession {
                 run: Box::new(run),
                 main: main.clone(),
@@ -5524,8 +5564,8 @@ fn land_integrating(
             }
         }
         Verdict::ReceiptFailed { reason, receipt } => {
-            eprintln!("run {} failed: {reason}", run.id);
-            let run = queue.fail_integration(&run.id, token, &reason, receipt)?;
+            eprintln!("run {} failed: {reason}", run.id());
+            let run = queue.fail_integration(run.id(), token, &reason, receipt)?;
             IntegrationOutcome::Failed {
                 run: Box::new(run),
                 reason,
@@ -5737,7 +5777,7 @@ fn land(
     main: &CommitSha,
 ) -> Result<Verdict> {
     let defer = |reason: String, detail: Value| Ok(Verdict::Deferred { reason, detail });
-    let worktree = Path::new(run.worktree_path.as_ref().context("missing worktree")?);
+    let worktree = Path::new(run.worktree_path().context("missing worktree")?);
     ensure!(
         worktree.is_dir(),
         "worktree {} is missing",
@@ -5747,13 +5787,13 @@ fn land(
     // `.git` file, but the repository's record of it points at the old path
     // until repaired, and removing it after landing would fail (ADR-0017).
     repository.repair_worktree(worktree)?;
-    let branch = run.branch.as_ref().context("missing branch")?;
-    let run_dir = Path::new(run.run_dir.as_ref().context("missing run directory")?);
+    let branch = run.branch().context("missing branch")?;
+    let run_dir = Path::new(run.run_dir().context("missing run directory")?);
     // A rebase left behind by a crashed landing or an unfinished session is undone first.
     if repository.rebase_in_progress(worktree)? {
         repository.rebase_abort(worktree)?;
         queue.record_runtime_event(
-            &run.id,
+            run.id(),
             "integration_rebase_aborted",
             json!({"reason": "a rebase was left in progress"}),
         )?;
@@ -5775,7 +5815,7 @@ fn land(
     // The receipt must describe this head: the validated one for a fresh run,
     // the one the session rewrote after resolving otherwise. A stale receipt
     // means the session is not done.
-    let receipt_path = Path::new(run.receipt_path.as_ref().context("missing receipt path")?);
+    let receipt_path = Path::new(run.receipt_path().context("missing receipt path")?);
     let receipt = match fs::read_to_string(receipt_path) {
         Ok(text) => match Receipt::parse(&text) {
             Ok(receipt) => receipt,
@@ -5795,7 +5835,7 @@ fn land(
             receipt: serde_json::to_value(&receipt)?,
         });
     }
-    if let Err(error) = receipt.check_requiring(&run.id, task.required_evidence()) {
+    if let Err(error) = receipt.check_requiring(run.id(), task.required_evidence()) {
         return defer(format!("{error:#}"), json!({}));
     }
     // A resumed session may have come back without the evidence it was
@@ -5811,7 +5851,7 @@ fn land(
     // rewrote after resolving), so it is recorded whatever happens next: the
     // DB otherwise keeps only the receipt seen at validation time.
     queue.record_runtime_event(
-        &run.id,
+        run.id(),
         "integration_receipt",
         json!({
             "main": main,
@@ -5861,7 +5901,7 @@ fn land(
     }
     let rebased = repository.head(worktree)?;
     queue.record_runtime_event(
-        &run.id,
+        run.id(),
         "integration_rebased",
         json!({"main": main, "head_before": head, "head_after": rebased}),
     )?;
@@ -5917,7 +5957,7 @@ fn land(
         let exit_code = status.code().unwrap_or(128);
         let output = fs::read_to_string(&log).unwrap_or_default();
         queue.record_runtime_event(
-            &run.id,
+            run.id(),
             "verification_command",
             json!({
                 "phase": "integration",
@@ -5943,7 +5983,7 @@ fn land(
     let paragraphs = commit_message(task, run, &receipt);
     let tree = repository.tree_of(rebased.as_str())?;
     let commit = repository.commit_tree(&tree, main.as_str(), &paragraphs)?;
-    let history_ref = format!("refs/dagq/runs/{}", run.id);
+    let history_ref = format!("refs/dagq/runs/{}", run.id());
     repository.update_ref(&history_ref, rebased.as_str())?;
     repository.advance_main(main.as_str(), commit.as_str())?;
     Ok(Verdict::Landed(
@@ -5967,30 +6007,30 @@ fn commit_message(task: &Task, run: &TaskRun, receipt: &Receipt) -> Vec<String> 
     if !summary.is_empty() {
         paragraphs.push(summary.to_owned());
     }
-    paragraphs.push(format!("Dagq-Task: {}\nDagq-Run: {}", task.id(), run.id));
+    paragraphs.push(format!("Dagq-Task: {}\nDagq-Run: {}", task.id(), run.id()));
     paragraphs
 }
 
 /// Drop the landed run's worktree and branch. The result is already on
 /// `main` and under the history ref, so a failure here is only recorded.
 fn remove_landed_worktree(queue: &mut SqliteQueue, repository: &GitRepository, run: &TaskRun) {
-    let (Some(worktree), Some(branch)) = (&run.worktree_path, &run.branch) else {
+    let (Some(worktree), Some(branch)) = (&run.worktree_path(), &run.branch()) else {
         return;
     };
     let recorded = match repository.remove_worktree_and_branch(Path::new(worktree), branch) {
         Ok(()) => queue.record_runtime_event(
-            &run.id,
+            run.id(),
             "worktree_removed",
             json!({"path": worktree, "branch": branch}),
         ),
         Err(error) => {
             let message = format!("landed worktree {worktree} could not be removed: {error:#}");
-            eprintln!("run {}: {message}", run.id);
-            queue.record_cleanup_failure(&run.id, &message)
+            eprintln!("run {}: {message}", run.id());
+            queue.record_cleanup_failure(run.id(), &message)
         }
     };
     if let Err(error) = recorded {
-        eprintln!("run {}: could not record the cleanup: {error:#}", run.id);
+        eprintln!("run {}: could not record the cleanup: {error:#}", run.id());
     }
 }
 
@@ -6011,7 +6051,7 @@ pub fn review(db: &Path, task_id: TaskId) -> Result<Value> {
         .iter()
         .find(|r| {
             matches!(
-                r.status,
+                r.status(),
                 RunStatus::AwaitingIntegration | RunStatus::NeedsSession
             )
         })
@@ -6027,24 +6067,23 @@ pub fn review(db: &Path, task_id: TaskId) -> Result<Value> {
         Some(goal_id) => Some(queue.show_goal(goal_id)?.goal),
         None => None,
     };
-    let run_dir = Path::new(run.run_dir.as_ref().context("missing run directory")?);
-    let receipt_path = Path::new(run.receipt_path.as_ref().context("missing receipt path")?);
+    let run_dir = Path::new(run.run_dir().context("missing run directory")?);
+    let receipt_path = Path::new(run.receipt_path().context("missing receipt path")?);
     let receipt = Receipt::parse(
         &fs::read_to_string(receipt_path)
             .with_context(|| format!("read receipt {}", receipt_path.display()))?,
     )?;
     let checkout = run
-        .repo_path
-        .as_ref()
-        .or(run.worktree_path.as_ref())
+        .repo_path()
+        .or(run.worktree_path())
         .context("run has no repository path")?;
     let repository = GitRepository::inspect(Path::new(checkout))?;
     let head = receipt.commit.to_ascii_lowercase();
     let main = repository.main_head()?;
-    let base = if main != run.base_commit && repository.is_ancestor(main.as_str(), &head)? {
+    let base = if main != *run.base_commit() && repository.is_ancestor(main.as_str(), &head)? {
         main.into_string()
     } else {
-        run.base_commit.to_string()
+        run.base_commit().to_string()
     };
     let log = repository.log_oneline(&base, &head)?;
     let stat = repository.diff_stat(&base, &head)?;
@@ -6072,7 +6111,7 @@ pub fn review(db: &Path, task_id: TaskId) -> Result<Value> {
         return Err(error);
     }
     Ok(json!({
-        "run_id": run.id,
+        "run_id": run.id(),
         "task_id": task.id(),
         "path": path_text(&path)?,
         "base": base,
@@ -6183,12 +6222,12 @@ fn review_markdown(
          ### Verification commands\n\n{verify}\n",
         id = task.id(),
         title = task.title(),
-        run_id = run.id,
-        status = run.status.as_str(),
-        run_base = run.base_commit,
-        branch = run.branch.as_deref().unwrap_or("(none)"),
-        worktree = run.worktree_path.as_deref().unwrap_or("(none)"),
-        run_dir = run.run_dir.as_deref().unwrap_or("(none)"),
+        run_id = run.id(),
+        status = run.status().as_str(),
+        run_base = run.base_commit(),
+        branch = run.branch().unwrap_or("(none)"),
+        worktree = run.worktree_path().unwrap_or("(none)"),
+        run_dir = run.run_dir().unwrap_or("(none)"),
         description = or_none(task.description()),
         acceptance = or_none(task.acceptance()),
         verify = fenced("sh", &task.verification_commands().join("\n")),
@@ -6276,11 +6315,9 @@ impl PredecessorSummary {
         let run = predecessor.integrated_run.as_ref();
         let summary = run
             .and_then(|run| {
-                run.receipt_path.as_deref().map(PathBuf::from).or_else(|| {
-                    run.run_dir
-                        .as_deref()
-                        .map(|dir| Path::new(dir).join("receipt.json"))
-                })
+                run.receipt_path()
+                    .map(PathBuf::from)
+                    .or_else(|| run.run_dir().map(|dir| Path::new(dir).join("receipt.json")))
             })
             .and_then(|path| fs::read_to_string(path).ok())
             .and_then(|text| Receipt::parse(&text).ok())
@@ -6303,7 +6340,7 @@ impl PredecessorSummary {
             task_id: predecessor.task.id(),
             title: predecessor.task.title().to_owned(),
             result_commit: run
-                .and_then(|run| run.result_commit.as_ref())
+                .and_then(|run| run.result_commit())
                 .map_or_else(|| "(not landed)".to_owned(), CommitSha::to_string),
             summary,
         }
@@ -6346,7 +6383,7 @@ pub fn prompt(
     predecessors: &[PredecessorSummary],
     siblings: &[Task],
 ) -> Result<String> {
-    let receipt = run.receipt_path.as_ref().context("missing receipt path")?;
+    let receipt = run.receipt_path().context("missing receipt path")?;
     let goal = match goal {
         None => "Goal: none, this task stands alone\n".to_owned(),
         Some(goal) => format!(
@@ -6446,7 +6483,7 @@ pub fn prompt(
          {stop_background}\n\
          After submitting, report the outcome briefly and stop; do not run /exit yourself. Once you are idle the supervisor ends the session, and a person can still send /exit. A receipt does not itself end the session.\n",
         task_id = task.id(),
-        run_id = run.id,
+        run_id = run.id(),
         reading = WORKER_READING,
         stop_background = STOP_BACKGROUND,
         title = task.title(),
@@ -6691,14 +6728,14 @@ pub fn status_for(db: &Path, role: Option<crate::domain::SessionRole>) -> Result
         .map(|run| {
             let lease = leases
                 .iter()
-                .find(|l| l.run_id == run.id)
+                .find(|l| l.run_id == *run.id())
                 .map(|l| lease_health(l, now));
             json!({
-                "run_id": run.id,
-                "task_id": run.task_id,
-                "status": run.status,
-                "workspace_id": run.workspace_id,
-                "worktree_path": run.worktree_path,
+                "run_id": run.id(),
+                "task_id": run.task_id(),
+                "status": run.status(),
+                "workspace_id": run.workspace_id(),
+                "worktree_path": run.worktree_path(),
                 "lease": lease,
             })
         })
@@ -6755,7 +6792,7 @@ pub fn stats(db: &Path, query: &crate::domain::stats::StatsQuery) -> Result<Valu
     let executing = queue
         .active_runs()?
         .iter()
-        .filter(|run| run.status != RunStatus::Integrating)
+        .filter(|run| run.status() != RunStatus::Integrating)
         .count();
     let ready = queue
         .list(&crate::application::TaskQuery {
@@ -6797,10 +6834,10 @@ pub fn doctor(db: &Path, full: bool) -> Result<Value> {
         .active_runs()?
         .into_iter()
         .map(|run| {
-            let processes = queue.processes(&run.id)?;
+            let processes = queue.processes(run.id())?;
             let lease = leases
                 .iter()
-                .find(|l| l.run_id == run.id)
+                .find(|l| l.run_id == *run.id())
                 .map(|l| lease_health(l, now));
             Ok(run_health(&run, &processes, lease, now))
         })
@@ -6830,7 +6867,7 @@ pub fn recover(db: &Path, id: &RunId) -> Result<Value> {
     let run = queue.run(id)?;
     ensure!(
         matches!(
-            run.status,
+            run.status(),
             RunStatus::Claimed
                 | RunStatus::Starting
                 | RunStatus::Running
@@ -6838,11 +6875,11 @@ pub fn recover(db: &Path, id: &RunId) -> Result<Value> {
                 | RunStatus::Integrating
         ),
         "run {id} is {}; only unfinished runs can be recovered",
-        run.status.as_str()
+        run.status().as_str()
     );
     let now = unix_time();
     let lease = queue.run_lease(id)?.map(|l| lease_health(&l, now));
-    let processes = queue.processes(&run.id)?;
+    let processes = queue.processes(run.id())?;
     let health = run_health(&run, &processes, lease, now);
     ensure!(
         health.recoverable,
@@ -6850,7 +6887,7 @@ pub fn recover(db: &Path, id: &RunId) -> Result<Value> {
         health.blockers.join("; ")
     );
     let report = json!({"run": health});
-    let run = queue.recover_run(&run.id, processes.len(), report)?;
+    let run = queue.recover_run(run.id(), processes.len(), report)?;
     Ok(json!({"outcome": "recovered", "run": run}))
 }
 
@@ -6887,13 +6924,13 @@ pub fn rebind(db: &Path, repo: &Path) -> Result<Value> {
         .find(|run| {
             leases
                 .iter()
-                .any(|lease| lease.run_id == run.id && process_alive(lease.pid))
+                .any(|lease| lease.run_id == *run.id() && process_alive(lease.pid))
         })
     {
         bail!(
             "refusing to rebind while run {} of task {} is integrating",
-            run.id,
-            run.task_id
+            run.id(),
+            run.task_id()
         );
     }
     let previous = queue.rebind_repository(&common_dir)?;
@@ -6925,7 +6962,10 @@ pub fn rebind(db: &Path, repo: &Path) -> Result<Value> {
     let worktrees = queue
         .all_runs()?
         .into_iter()
-        .filter_map(|run| run.worktree_path.map(|path| (run.id, PathBuf::from(path))))
+        .filter_map(|run| {
+            let path = PathBuf::from(run.worktree_path()?);
+            Some((run.id().clone(), path))
+        })
         .filter(|(_, path)| path.is_dir())
         .map(|(run_id, path)| {
             let error = repository.repair_worktree(&path).err();
@@ -7073,18 +7113,18 @@ fn run_health(
             blockers.push(format!("supervisor pid {} is alive", lease.pid));
         }
     }
-    let exists = |path: &Option<String>| path.as_deref().map(|p| Path::new(p).exists());
+    let exists = |path: Option<&str>| path.map(|p| Path::new(p).exists());
     RunHealth {
-        run_id: run.id.clone(),
-        task_id: run.task_id,
-        status: run.status,
-        workspace_id: run.workspace_id.clone(),
-        worktree_path: run.worktree_path.clone(),
-        worktree_exists: exists(&run.worktree_path),
-        run_dir: run.run_dir.clone(),
-        run_dir_exists: exists(&run.run_dir),
-        receipt_exists: exists(&run.receipt_path),
-        last_error: run.last_error.clone(),
+        run_id: run.id().clone(),
+        task_id: run.task_id(),
+        status: run.status(),
+        workspace_id: run.workspace_id().map(str::to_owned),
+        worktree_path: run.worktree_path().map(str::to_owned),
+        worktree_exists: exists(run.worktree_path()),
+        run_dir: run.run_dir().map(str::to_owned),
+        run_dir_exists: exists(run.run_dir()),
+        receipt_exists: exists(run.receipt_path()),
+        last_error: run.last_error().map(str::to_owned),
         lease,
         processes,
         recoverable: blockers.is_empty(),
@@ -7138,7 +7178,7 @@ fn run_session(
     // supervisor. A resumed run keeps the workspace of its first session.
     let run = loop {
         let run = queue.run(id)?;
-        if run.workspace_id.is_some() {
+        if run.workspace_id().is_some() {
             break run;
         }
         ensure!(
@@ -7189,15 +7229,15 @@ fn drive_agent(
         provider.resume_command(run)?
     } else {
         let prompt_path =
-            Path::new(run.run_dir.as_ref().context("missing run directory")?).join("prompt.txt");
+            Path::new(run.run_dir().context("missing run directory")?).join("prompt.txt");
         provider.command(run, &fs::read_to_string(prompt_path)?)?
     };
     let mut child = command.spawn().context("launch agent")?;
     *child_may_be_alive = true;
     let registered = if resume {
-        queue.register_resume_agent(&run.id, pid, child.id())
+        queue.register_resume_agent(run.id(), pid, child.id())
     } else {
-        queue.register_agent(&run.id, pid, child.id())
+        queue.register_agent(run.id(), pid, child.id())
     };
     if let Err(error) = registered {
         let _ = child.kill();
@@ -7211,7 +7251,7 @@ fn drive_agent(
             *child_may_be_alive = false;
             return Ok(status.code().unwrap_or(128));
         }
-        if let Err(error) = queue.heartbeat_wrapper(&run.id, pid) {
+        if let Err(error) = queue.heartbeat_wrapper(run.id(), pid) {
             // Keep owning/waiting on the existing child even during a DB outage.
             eprintln!("wrapper heartbeat failed: {error:#}");
         }

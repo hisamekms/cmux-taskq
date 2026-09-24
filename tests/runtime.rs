@@ -188,12 +188,12 @@ struct TestProvider {
 }
 impl AgentProvider for TestProvider {
     fn resume_command(&self, run: &TaskRun) -> Result<Command> {
-        let run_dir = run.run_dir.as_ref().unwrap();
+        let run_dir = run.run_dir().unwrap();
         let mut command = Command::new("/bin/sh");
         command
-            .current_dir(run.worktree_path.as_ref().unwrap())
-            .env("RUN_ID", run.id.as_str())
-            .env("RECEIPT", run.receipt_path.as_ref().unwrap())
+            .current_dir(run.worktree_path().unwrap())
+            .env("RUN_ID", run.id().as_str())
+            .env("RECEIPT", run.receipt_path().unwrap())
             .env("IDLE", run.idle_marker_path().unwrap())
             .env("EXIT", exit_request_path(run_dir))
             .env("MESSAGE", resume_message_path(run_dir))
@@ -223,23 +223,20 @@ impl AgentProvider for TestProvider {
         // A question goes to the queue as an ask, not to the terminal.
         assert!(prompt.contains(&format!(
             "`dagq ask --run {} --kind worker_question --question '...'`",
-            run.id
+            run.id()
         )));
         // Background work is stopped before the receipt, or /exit stalls.
         assert!(prompt.contains(runtime::STOP_BACKGROUND), "{prompt}");
         let mut command = Command::new("/bin/sh");
         command
-            .current_dir(run.worktree_path.as_ref().unwrap())
-            .env("RUN_ID", run.id.as_str())
-            .env("RECEIPT", run.receipt_path.as_ref().unwrap())
-            .env("LOG", run.log_path.as_ref().unwrap())
-            .env("BASE", run.base_commit.as_str())
+            .current_dir(run.worktree_path().unwrap())
+            .env("RUN_ID", run.id().as_str())
+            .env("RECEIPT", run.receipt_path().unwrap())
+            .env("LOG", run.log_path().unwrap())
+            .env("BASE", run.base_commit().as_str())
             .env("IDLE", run.idle_marker_path().unwrap())
-            .env("EXIT", exit_request_path(run.run_dir.as_ref().unwrap()))
-            .env(
-                "MESSAGE",
-                resume_message_path(run.run_dir.as_ref().unwrap()),
-            )
+            .env("EXIT", exit_request_path(run.run_dir().unwrap()))
+            .env("MESSAGE", resume_message_path(run.run_dir().unwrap()))
             .env("DAGQ", env!("CARGO_BIN_EXE_dagq"))
             .env("DB", &self.db)
             .arg("-c")
@@ -401,10 +398,10 @@ impl WorkspaceBackend for TestWorkspace {
         command: &str,
         tags: &WorkspaceTags,
     ) -> Result<String> {
-        assert_eq!(task.id(), run.task_id);
+        assert_eq!(task.id(), run.task_id());
         self.tags.lock().unwrap().push(tags.clone());
         assert!(
-            Path::new(run.worktree_path.as_ref().unwrap())
+            Path::new(run.worktree_path().unwrap())
                 .join("seed.txt")
                 .exists()
         );
@@ -414,16 +411,16 @@ impl WorkspaceBackend for TestWorkspace {
         }
         let token: String = Connection::open(&self.db)?.query_row(
             "SELECT token FROM run_leases WHERE run_id=?1",
-            [&run.id],
+            [&run.id()],
             |r| r.get(0),
         )?;
         let db = self.db.clone();
-        let id = run.id.clone();
+        let id = run.id().clone();
         let script = self
             .scripts
             .lock()
             .unwrap()
-            .get(&run.task_id)
+            .get(&run.task_id())
             .cloned()
             .unwrap_or_else(|| self.script.clone());
         let mut sessions = self.sessions.lock().unwrap();
@@ -432,8 +429,8 @@ impl WorkspaceBackend for TestWorkspace {
             sessions.push((
                 workspace.clone(),
                 TestSession {
-                    run_id: run.id.clone(),
-                    run_dir: run.run_dir.clone().unwrap(),
+                    run_id: run.id().clone(),
+                    run_dir: run.run_dir().unwrap().to_owned(),
                     worker: None,
                 },
             ));
@@ -449,8 +446,8 @@ impl WorkspaceBackend for TestWorkspace {
         sessions.push((
             workspace.clone(),
             TestSession {
-                run_id: run.id.clone(),
-                run_dir: run.run_dir.clone().unwrap(),
+                run_id: run.id().clone(),
+                run_dir: run.run_dir().unwrap().to_owned(),
                 worker: Some(worker),
             },
         ));
@@ -463,7 +460,7 @@ impl WorkspaceBackend for TestWorkspace {
         command: &str,
         tags: &WorkspaceTags,
     ) -> Result<String> {
-        assert_eq!(task.id(), run.task_id);
+        assert_eq!(task.id(), run.task_id());
         assert!(command.ends_with(" '--resume'"), "{command}");
         // The worker's env (ADR-0026) and `run <run-id> resume` (ADR-0028).
         assert!(
@@ -476,21 +473,21 @@ impl WorkspaceBackend for TestWorkspace {
         assert!(tags.env.iter().any(|(k, _)| k == "DAGQ_QUEUE"));
         assert_eq!(
             tags.description.as_deref(),
-            Some(format!("run {} resume", run.id).as_str())
+            Some(format!("run {} resume", run.id()).as_str())
         );
         let script = self
             .resume_scripts
             .lock()
             .unwrap()
-            .get(&run.task_id)
+            .get(&run.task_id())
             .cloned()
-            .ok_or_else(|| anyhow::anyhow!("no resume script for task {}", run.task_id))?;
+            .ok_or_else(|| anyhow::anyhow!("no resume script for task {}", run.task_id()))?;
         let token: String = Connection::open(&self.db)?.query_row(
             "SELECT token FROM run_leases WHERE run_id=?1",
-            [&run.id],
+            [&run.id()],
             |r| r.get(0),
         )?;
-        let run_dir = run.run_dir.clone().unwrap();
+        let run_dir = run.run_dir().unwrap().to_owned();
         // The worker's session left its exit request and any earlier
         // resume its message behind.
         let _ = fs::remove_file(exit_request_path(&run_dir));
@@ -500,7 +497,7 @@ impl WorkspaceBackend for TestWorkspace {
             command.into(),
         ));
         let db = self.db.clone();
-        let id = run.id.clone();
+        let id = run.id().clone();
         let mut sessions = self.sessions.lock().unwrap();
         let workspace = workspace_id(sessions.len());
         let worker = thread::spawn(move || {
@@ -513,7 +510,7 @@ impl WorkspaceBackend for TestWorkspace {
         sessions.push((
             workspace.clone(),
             TestSession {
-                run_id: run.id.clone(),
+                run_id: run.id().clone(),
                 run_dir,
                 worker: Some(worker),
             },
@@ -719,29 +716,29 @@ fn run_agent_with(script: &str, close_fail: bool) -> (TempDir, PathBuf, dagq::do
     let detail = queue.show(TaskId::new(1)).unwrap();
     assert_eq!(detail.task.status(), TaskStatus::InProgress);
     let run = &detail.runs[0];
-    assert_eq!(outcome["runs"][0]["id"], json!(run.id));
+    assert_eq!(outcome["runs"][0]["id"], json!(run.id()));
     // Runs live in `runs/` next to the (canonicalized) database, worktree inside.
     let run_dir = db
         .canonicalize()
         .unwrap()
         .with_file_name("runs")
-        .join(run.id.as_str());
-    assert_eq!(Path::new(run.run_dir.as_ref().unwrap()), run_dir);
+        .join(run.id().as_str());
+    assert_eq!(Path::new(run.run_dir().unwrap()), run_dir);
     assert_eq!(
-        Path::new(run.worktree_path.as_ref().unwrap()),
+        Path::new(run.worktree_path().unwrap()),
         run_dir.join("worktree")
     );
     // Every outcome keeps the worktree; only an accepted run closes its workspace.
-    assert!(Path::new(run.worktree_path.as_ref().unwrap()).exists());
-    assert_eq!(run.workspace_id.as_deref(), Some(WORKSPACE_ID));
+    assert!(Path::new(run.worktree_path().unwrap()).exists());
+    assert_eq!(run.workspace_id(), Some(WORKSPACE_ID));
     let kinds: Vec<&str> = detail.events.iter().map(|e| e.kind.as_str()).collect();
-    if run.status == RunStatus::AwaitingIntegration && !close_fail {
+    if run.status() == RunStatus::AwaitingIntegration && !close_fail {
         assert_eq!(backend.closed(), vec![WORKSPACE_ID.to_owned()]);
-        assert!(run.workspace_closed_at.is_some());
+        assert!(run.workspace_closed_at().is_some());
         assert!(kinds.contains(&"workspace_closed"));
     } else {
         assert!(backend.closed().is_empty());
-        assert!(run.workspace_closed_at.is_none());
+        assert!(run.workspace_closed_at().is_none());
         assert!(!kinds.contains(&"workspace_closed"));
     }
     assert_eq!(kinds.contains(&"cleanup_failed"), close_fail);
@@ -760,7 +757,8 @@ fn run_agent_with(script: &str, close_fail: bool) -> (TempDir, PathBuf, dagq::do
             ],
             description: Some(format!(
                 "dagq role=worker queue={hash} run={} task={}",
-                run.id, run.task_id
+                run.id(),
+                run.task_id()
             )),
             group: Some(format!("group-{hash}")),
         }]
@@ -775,12 +773,12 @@ fn run_agent_with(script: &str, close_fail: bool) -> (TempDir, PathBuf, dagq::do
 }
 /// The prompt the run's agent was started with, as `provision` wrote it.
 fn read_prompt(run: &TaskRun) -> String {
-    fs::read_to_string(Path::new(run.run_dir.as_ref().unwrap()).join("prompt.txt")).unwrap()
+    fs::read_to_string(Path::new(run.run_dir().unwrap()).join("prompt.txt")).unwrap()
 }
 
 fn rejection_reason(detail: &dagq::domain::TaskDetail) -> String {
     let run = &detail.runs[0];
-    assert_eq!(run.status, RunStatus::Failed);
+    assert_eq!(run.status(), RunStatus::Failed);
     let event = detail
         .events
         .iter()
@@ -789,7 +787,7 @@ fn rejection_reason(detail: &dagq::domain::TaskDetail) -> String {
     assert_eq!(event.payload["status"], "failed");
     assert_eq!(event.payload["accepted"], false);
     let reason = event.payload["reason"].as_str().unwrap().to_owned();
-    assert_eq!(run.last_error.as_deref(), Some(reason.as_str()));
+    assert_eq!(run.last_error(), Some(reason.as_str()));
     reason
 }
 
@@ -797,26 +795,22 @@ fn rejection_reason(detail: &dagq::domain::TaskDetail) -> String {
 fn valid_receipt_is_verified_and_awaits_integration() {
     let (_dir, db, detail) = run_agent(VALID_AGENT);
     let run = &detail.runs[0];
-    assert_eq!(run.status, RunStatus::AwaitingIntegration);
-    assert!(run.last_error.is_none());
-    let commit = run.result_commit.as_ref().unwrap();
-    assert_ne!(commit, &run.base_commit);
+    assert_eq!(run.status(), RunStatus::AwaitingIntegration);
+    assert!(run.last_error().is_none());
+    let commit = run.result_commit().unwrap();
+    assert_ne!(commit, run.base_commit());
     let head = Command::new("git")
         .arg("-C")
-        .arg(run.worktree_path.as_ref().unwrap())
+        .arg(run.worktree_path().unwrap())
         .args(["rev-parse", "HEAD"])
         .output()
         .unwrap();
     assert_eq!(String::from_utf8(head.stdout).unwrap().trim(), commit);
     assert_eq!(
-        fs::read_to_string(run.log_path.as_ref().unwrap()).unwrap(),
+        fs::read_to_string(run.log_path().unwrap()).unwrap(),
         "fixture log\n"
     );
-    assert!(
-        Path::new(run.run_dir.as_ref().unwrap())
-            .join("runner")
-            .exists()
-    );
+    assert!(Path::new(run.run_dir().unwrap()).join("runner").exists());
     assert_eq!(detail.processes.len(), 2);
     assert!(
         detail
@@ -843,7 +837,7 @@ fn valid_receipt_is_verified_and_awaits_integration() {
     // for integrate's rebase (ADR-0023 decision 1).
     assert!(!kinds.contains(&"verification_command"), "{kinds:?}");
     assert!(
-        !Path::new(run.run_dir.as_ref().unwrap())
+        !Path::new(run.run_dir().unwrap())
             .join("verify-1.log")
             .exists()
     );
@@ -868,17 +862,17 @@ fn valid_receipt_is_verified_and_awaits_integration() {
     assert_eq!(closed.payload["workspace_id"], WORKSPACE_ID);
     assert_eq!(
         closed.payload["closed_at"],
-        json!(run.workspace_closed_at.unwrap())
+        json!(run.workspace_closed_at().unwrap())
     );
     let branch = Command::new("git")
         .arg("-C")
-        .arg(run.worktree_path.as_ref().unwrap())
+        .arg(run.worktree_path().unwrap())
         .args(["symbolic-ref", "HEAD"])
         .output()
         .unwrap();
     assert_eq!(
         String::from_utf8(branch.stdout).unwrap().trim(),
-        format!("refs/heads/{}", run.branch.as_ref().unwrap())
+        format!("refs/heads/{}", run.branch().unwrap())
     );
     // The task still owns its slot until integration; no second run starts.
     let mut queue = SqliteQueue::open(&db).unwrap();
@@ -890,9 +884,9 @@ fn valid_receipt_is_verified_and_awaits_integration() {
 fn failed_workspace_close_is_recorded_without_changing_run_status() {
     let (_dir, _db, detail) = run_agent_with(VALID_AGENT, true);
     let run = &detail.runs[0];
-    assert_eq!(run.status, RunStatus::AwaitingIntegration);
-    assert!(run.result_commit.is_some());
-    let error = run.last_error.as_ref().unwrap();
+    assert_eq!(run.status(), RunStatus::AwaitingIntegration);
+    assert!(run.result_commit().is_some());
+    let error = run.last_error().unwrap();
     assert!(
         error.contains("injected workspace close failure"),
         "{error}"
@@ -919,7 +913,7 @@ fn failed_workspace_close_is_recorded_without_changing_run_status() {
 fn missing_receipt_fails_validation() {
     let (_dir, _db, detail) = run_agent("commit work");
     assert!(rejection_reason(&detail).contains("receipt was not submitted"));
-    assert!(detail.runs[0].result_commit.is_none());
+    assert!(detail.runs[0].result_commit().is_none());
     assert!(
         !detail
             .events
@@ -932,7 +926,7 @@ fn missing_receipt_fails_validation() {
 fn run_id_mismatch_fails_validation() {
     let (_dir, _db, detail) = run_agent("commit work; receipt \"$(git rev-parse HEAD)\" other-run");
     assert!(rejection_reason(&detail).contains("run_id other-run does not match"));
-    assert!(detail.runs[0].result_commit.is_none());
+    assert!(detail.runs[0].result_commit().is_none());
 }
 
 #[test]
@@ -956,7 +950,7 @@ fn dirty_worktree_fails_validation() {
     assert!(reason.contains("worktree is not clean"));
     assert!(reason.contains("untracked.txt"));
     // The verified commit is still recorded for inspection.
-    assert!(detail.runs[0].result_commit.is_some());
+    assert!(detail.runs[0].result_commit().is_some());
 }
 
 /// Validation does not run the verification commands, so a commit that
@@ -968,7 +962,7 @@ fn failing_verification_command_passes_validation_and_needs_a_session_at_integra
         "git rm -q seed.txt && git commit -q -m 'drop seed'; receipt \"$(git rev-parse HEAD)\"",
     );
     let run = detail.runs[0].clone();
-    assert_eq!(run.status, RunStatus::AwaitingIntegration);
+    assert_eq!(run.status(), RunStatus::AwaitingIntegration);
     assert!(!event_kinds(&detail).contains(&"verification_command"));
     let repo = Path::new(&db).parent().unwrap().join("repo's directory");
     let main = git_out(&repo, &["rev-parse", "main"]);
@@ -984,7 +978,7 @@ fn failing_verification_command_passes_validation_and_needs_a_session_at_integra
         .unwrap()
         .show(TaskId::new(1))
         .unwrap();
-    assert_eq!(detail.runs[0].status, RunStatus::NeedsSession);
+    assert_eq!(detail.runs[0].status(), RunStatus::NeedsSession);
     let verifications = integration_verifications(&detail);
     assert_eq!(verifications.len(), 1, "{verifications:?}");
     assert_eq!(verifications[0]["exit_code"], 1);
@@ -1093,7 +1087,7 @@ fn idle_marker_after_receipt_triggers_exit_request_and_run_finishes() {
     let mut queue = SqliteQueue::open(&db).unwrap();
     let detail = queue.show(TaskId::new(1)).unwrap();
     let run = &detail.runs[0];
-    assert_eq!(run.status, RunStatus::AwaitingIntegration);
+    assert_eq!(run.status(), RunStatus::AwaitingIntegration);
     assert!(queue.run_leases().unwrap().is_empty());
     let kinds = event_kinds(&detail);
     let position = |kind: &str| kinds.iter().position(|k| *k == kind).unwrap();
@@ -1108,7 +1102,7 @@ fn idle_marker_after_receipt_triggers_exit_request_and_run_finishes() {
         .find(|e| e.kind == "session_idle_observed")
         .unwrap();
     assert_eq!(idle.payload["hook_event_name"], "Stop");
-    assert_eq!(idle.payload["session_id"], json!(run.id));
+    assert_eq!(idle.payload["session_id"], json!(run.id()));
     assert_eq!(
         idle.payload["marker_path"],
         json!(run.idle_marker_path().unwrap())
@@ -1227,14 +1221,14 @@ fn the_first_commit_is_observed_once_while_the_session_works() {
     wait_until(&db, Duration::from_secs(30), |queue| observed(queue) == 1);
     let mut queue = SqliteQueue::open(&db).unwrap();
     let run = queue.show(TaskId::new(1)).unwrap().runs[0].clone();
-    let worktree = PathBuf::from(run.worktree_path.as_ref().unwrap());
+    let worktree = PathBuf::from(run.worktree_path().unwrap());
     let first = git_out(&worktree, &["rev-parse", "HEAD"]);
-    assert_ne!(first, run.base_commit);
+    assert_ne!(first, *run.base_commit());
     let detail = queue.show(TaskId::new(1)).unwrap();
     assert!(!event_kinds(&detail).contains(&"receipt_observed"));
 
     fs::write(
-        exit_request_path(run.run_dir.as_ref().unwrap()).with_extension("go"),
+        exit_request_path(run.run_dir().unwrap()).with_extension("go"),
         "",
     )
     .unwrap();
@@ -1249,12 +1243,12 @@ fn the_first_commit_is_observed_once_while_the_session_works() {
     let position = |kind: &str| kinds.iter().position(|k| *k == kind).unwrap();
     assert!(position("agent_started") < position("first_commit_observed"));
     assert!(position("first_commit_observed") < position("receipt_observed"));
-    let payload = events_of(&db, &run.id, "first_commit_observed").remove(0);
+    let payload = events_of(&db, run.id(), "first_commit_observed").remove(0);
     assert_eq!(payload["commit"], first.as_str());
-    assert_eq!(payload["base_commit"], run.base_commit.as_str());
+    assert_eq!(payload["base_commit"], run.base_commit().as_str());
     let head = queue.show(TaskId::new(1)).unwrap().runs[0]
-        .result_commit
-        .clone()
+        .result_commit()
+        .cloned()
         .unwrap();
     assert_ne!(head, first, "the second commit is the result");
 }
@@ -1290,7 +1284,7 @@ fn a_dialog_on_the_screen_is_asked_once_and_cleared() {
     let mut queue = SqliteQueue::open(&db).unwrap();
     assert_eq!(prompts(&mut queue, "prompt_waiting"), 0);
     let run = queue.show(TaskId::new(1)).unwrap().runs[0].clone();
-    assert!(run_attention_of(&runtime::status(&db).unwrap(), &run.id).is_none());
+    assert!(run_attention_of(&runtime::status(&db).unwrap(), run.id()).is_none());
 
     *backend.screen.lock().unwrap() = DIALOG_SCREEN.into();
     wait_until(&db, Duration::from_secs(30), |queue| {
@@ -1327,8 +1321,8 @@ fn a_dialog_on_the_screen_is_asked_once_and_cleared() {
     assert_eq!(asks.len(), 1, "{asks:?}");
     let ask = &asks[0];
     assert_eq!(ask.kind, dagq::domain::AskKind::AnswerPrompt);
-    assert_eq!(ask.run_id.as_ref(), Some(&run.id));
-    assert_eq!(ask.task_id, Some(run.task_id));
+    assert_eq!(ask.run_id.as_ref(), Some(run.id()));
+    assert_eq!(ask.task_id, Some(run.task_id()));
     assert_eq!(ask.asked_by, "supervisor");
     assert!(ask.options.is_empty());
     assert!(
@@ -1345,7 +1339,7 @@ fn a_dialog_on_the_screen_is_asked_once_and_cleared() {
         ask.question
     );
     let status = runtime::status_for(&db, Some(dagq::domain::SessionRole::Inbox)).unwrap();
-    assert!(run_attention_of(&status, &run.id).is_none(), "{status}");
+    assert!(run_attention_of(&status, run.id()).is_none(), "{status}");
     assert!(
         status["attention"]
             .as_array()
@@ -1369,7 +1363,7 @@ fn a_dialog_on_the_screen_is_asked_once_and_cleared() {
     wait_until(&db, Duration::from_secs(30), |queue| {
         prompts(queue, "prompt_cleared") == 1
     });
-    assert!(run_attention_of(&runtime::status(&db).unwrap(), &run.id).is_none());
+    assert!(run_attention_of(&runtime::status(&db).unwrap(), run.id()).is_none());
     assert_eq!(backend.exits_sent.load(Ordering::SeqCst), 0);
     // The runtime closed the ask: it is no attention, and its answer says why.
     let closed = queue.read_ask(ask.id).unwrap();
@@ -1387,7 +1381,7 @@ fn a_dialog_on_the_screen_is_asked_once_and_cleared() {
     );
 
     fs::write(
-        exit_request_path(run.run_dir.as_ref().unwrap()).with_extension("go"),
+        exit_request_path(run.run_dir().unwrap()).with_extension("go"),
         "",
     )
     .unwrap();
@@ -1454,7 +1448,7 @@ fn an_answered_worker_question_is_typed_into_the_idle_worker_and_closed() {
     let ask = queue.asks(Default::default()).unwrap().remove(0);
     let run = queue.show(TaskId::new(1)).unwrap().runs[0].clone();
     assert_eq!(ask.kind.as_str(), "worker_question");
-    assert_eq!(ask.run_id.as_ref(), Some(&run.id));
+    assert_eq!(ask.run_id.as_ref(), Some(run.id()));
     let status = runtime::status(&db).unwrap();
     assert_eq!(status["asks"][0]["id"], ask.id, "{status}");
     assert_eq!(
@@ -1504,7 +1498,7 @@ fn an_answered_worker_question_is_typed_into_the_idle_worker_and_closed() {
     );
 
     fs::write(
-        exit_request_path(run.run_dir.as_ref().unwrap()).with_extension("idle"),
+        exit_request_path(run.run_dir().unwrap()).with_extension("idle"),
         "",
     )
     .unwrap();
@@ -1523,7 +1517,7 @@ fn an_answered_worker_question_is_typed_into_the_idle_worker_and_closed() {
             format!("answer to ask {}: use blue", ask.id)
         )]
     );
-    let worktree = Path::new(run.worktree_path.as_ref().unwrap());
+    let worktree = Path::new(run.worktree_path().unwrap());
     assert_eq!(
         fs::read_to_string(worktree.join("answer.txt")).unwrap(),
         format!("answer to ask {}: use blue", ask.id)
@@ -1601,7 +1595,7 @@ fn a_failed_answer_delivery_is_left_to_the_inbox() {
     );
 
     let run = detail.runs[0].clone();
-    release_held_session(run.run_dir.as_ref().unwrap());
+    release_held_session(run.run_dir().unwrap());
     let outcome = supervisor.join().unwrap().unwrap();
     backend.join();
     assert_eq!(outcome["runs"][0]["status"], "awaiting_integration");
@@ -1625,7 +1619,7 @@ fn a_failed_answer_delivery_is_left_to_the_inbox() {
         .ask(dagq::domain::NewAsk {
             kind: "worker_question".parse().unwrap(),
             task_id: None,
-            run_id: Some(run.id.clone()),
+            run_id: Some(run.id().clone()),
             question: "Late?".into(),
             options: vec![],
             asked_by: "worker".into(),
@@ -1686,9 +1680,9 @@ fn unanswered_exit_request_times_out_and_keeps_the_run() {
     let mut queue = SqliteQueue::open(&db).unwrap();
     let detail = queue.show(TaskId::new(1)).unwrap();
     let run = detail.runs[0].clone();
-    assert_eq!(run.status, RunStatus::AwaitingIntegration);
-    assert!(run.last_error.is_none());
-    assert!(queue.run_lease(&run.id).unwrap().is_some());
+    assert_eq!(run.status(), RunStatus::AwaitingIntegration);
+    assert!(run.last_error().is_none());
+    assert!(queue.run_lease(run.id()).unwrap().is_some());
     let kinds = event_kinds(&detail);
     assert_eq!(
         kinds
@@ -1716,12 +1710,12 @@ fn unanswered_exit_request_times_out_and_keeps_the_run() {
     assert_eq!(asks.len(), 1, "{asks:?}");
     let ask = &asks[0];
     assert_eq!(ask.kind, AskKind::StuckExit);
-    assert_eq!(ask.run_id.as_ref(), Some(&run.id));
+    assert_eq!(ask.run_id.as_ref(), Some(run.id()));
     assert_eq!(ask.task_id, Some(TaskId::new(1)));
     assert_eq!(ask.asked_by, "supervisor");
     assert_eq!(ask.options, ["exit", "wait"]);
     assert!(ask.is_open());
-    assert!(ask.question.contains(run.id.as_str()), "{}", ask.question);
+    assert!(ask.question.contains(run.id().as_str()), "{}", ask.question);
     assert!(ask.question.contains("task 1"), "{}", ask.question);
     assert!(ask.question.contains(WORKSPACE_ID), "{}", ask.question);
     assert!(ask.question.contains("line 8\n"), "{}", ask.question);
@@ -1753,14 +1747,14 @@ fn unanswered_exit_request_times_out_and_keeps_the_run() {
         assert!(
             notifications[0]
                 .1
-                .ends_with(&format!("task 1 run {}", run.id))
+                .ends_with(&format!("task 1 run {}", run.id()))
         );
         assert_eq!(notifications[0].2.as_deref(), Some("inbox-ws"));
     }
     // The ask is the attention, for the inbox; nobody is told to send
     // /exit, and recovery is refused while the supervisor holds the lease.
     let status = runtime::status(&db).unwrap();
-    assert!(run_attention_of(&status, &run.id).is_none(), "{status}");
+    assert!(run_attention_of(&status, run.id()).is_none(), "{status}");
     let attention = status["attention"].as_array().unwrap();
     assert!(
         attention.iter().all(|a| a["next"] != "send /exit"),
@@ -1775,16 +1769,16 @@ fn unanswered_exit_request_times_out_and_keeps_the_run() {
     let events = dagq::watch::events(&db, 0, 100, false).unwrap();
     let events = events["events"].as_array().unwrap();
     assert!(events.iter().all(|e| e["next"] != "send /exit"));
-    assert!(runtime::recover(&db, &run.id).is_err());
+    assert!(runtime::recover(&db, run.id()).is_err());
 
-    release_held_session(run.run_dir.as_ref().unwrap());
+    release_held_session(run.run_dir().unwrap());
     let outcome = supervisor.join().unwrap().unwrap();
     backend.join();
     assert_eq!(outcome["errors"], json!([]), "{outcome}");
     assert_eq!(outcome["runs"][0]["status"], "awaiting_integration");
     assert_eq!(backend.exits_sent.load(Ordering::SeqCst), 1);
     let detail = queue.show(TaskId::new(1)).unwrap();
-    assert_eq!(detail.runs[0].status, RunStatus::AwaitingIntegration);
+    assert_eq!(detail.runs[0].status(), RunStatus::AwaitingIntegration);
     assert!(queue.run_leases().unwrap().is_empty());
     let kinds = event_kinds(&detail);
     let position = |kind: &str| kinds.iter().position(|k| *k == kind).unwrap();
@@ -1825,7 +1819,7 @@ fn unanswered_exit_request_times_out_and_keeps_the_run() {
     // The session exited, so the attention is the failed review now.
     let status = runtime::status(&db).unwrap();
     assert_eq!(
-        run_attention_of(&status, &run.id).unwrap()["next"],
+        run_attention_of(&status, run.id()).unwrap()["next"],
         "review by hand"
     );
 }
@@ -1836,7 +1830,7 @@ fn claude_stop_hook_settings_publish_the_idle_marker() {
     let dir = tempfile::tempdir().unwrap();
     let run_dir = dir.path().join("run's dir");
     fs::create_dir(&run_dir).unwrap();
-    let run = TaskRun {
+    let run = TaskRun::restore(dagq::domain::RunRecord {
         id: RunId::new("11111111-2222-4333-8444-555555555555").unwrap(),
         task_id: TaskId::new(1),
         status: RunStatus::Starting,
@@ -1854,7 +1848,8 @@ fn claude_stop_hook_settings_publish_the_idle_marker() {
         last_error: None,
         workspace_closed_at: None,
         created_at: String::new(),
-    };
+    })
+    .unwrap();
     let command = ClaudeCode {
         executable: "claude".into(),
     }
@@ -1926,10 +1921,10 @@ fn failed_agent_retains_worktree_and_does_not_complete_task() {
     let detail = queue.show(TaskId::new(1)).unwrap();
     assert_eq!(detail.task.status(), TaskStatus::InProgress);
     assert_eq!(
-        detail.runs[0].last_error.as_deref(),
+        detail.runs[0].last_error(),
         Some("session exited with code 7")
     );
-    assert!(Path::new(detail.runs[0].worktree_path.as_ref().unwrap()).exists());
+    assert!(Path::new(detail.runs[0].worktree_path().unwrap()).exists());
     assert!(queue.run_leases().unwrap().is_empty());
     assert!(queue.candidates().unwrap().is_empty());
     // A failed run does not free the task automatically, but a person may give up on it.
@@ -1954,14 +1949,9 @@ fn provisioning_failure_retains_the_run_and_stops_claiming_other_tasks() {
     assert!(error.contains("claiming stopped"), "{error}");
     let detail = queue.show(TaskId::new(1)).unwrap();
     let run = &detail.runs[0];
-    assert_eq!(run.status, RunStatus::Starting);
-    assert!(
-        run.last_error
-            .as_ref()
-            .unwrap()
-            .contains("injected workspace")
-    );
-    assert!(Path::new(run.worktree_path.as_ref().unwrap()).exists());
+    assert_eq!(run.status(), RunStatus::Starting);
+    assert!(run.last_error().unwrap().contains("injected workspace"));
+    assert!(Path::new(run.worktree_path().unwrap()).exists());
     // The environment is suspect: the second candidate was left alone.
     assert!(queue.show(TaskId::new(2)).unwrap().runs.is_empty());
     assert_eq!(queue.candidates().unwrap()[0].id(), TaskId::new(2));
@@ -1973,7 +1963,7 @@ fn provisioning_failure_retains_the_run_and_stops_claiming_other_tasks() {
     assert_eq!(report["supervisors"], json!([]));
     assert_eq!(report["runs"][0]["recoverable"], true);
     assert_eq!(
-        runtime::recover(&db, &run.id).unwrap()["run"]["status"],
+        runtime::recover(&db, run.id()).unwrap()["run"]["status"],
         "interrupted"
     );
     assert_eq!(queue.show(TaskId::new(1)).unwrap().runs.len(), 1);
@@ -2034,7 +2024,7 @@ fn failed_backend_calls_are_recorded_with_the_load_and_counted_by_stats() {
         "create",
         None,
         "injected workspace creation failure",
-        &run.id,
+        run.id(),
     );
     let abandoned = detail
         .events
@@ -2053,7 +2043,7 @@ fn failed_backend_calls_are_recorded_with_the_load_and_counted_by_stats() {
         "close",
         Some(WORKSPACE_ID),
         "injected workspace close failure",
-        &run.id,
+        run.id(),
     );
     let cleanup = detail
         .events
@@ -2108,7 +2098,7 @@ fn failed_backend_calls_are_recorded_with_the_load_and_counted_by_stats() {
         "send_exit",
         Some(WORKSPACE_ID),
         "did not finish within 30s",
-        &run.id,
+        run.id(),
     );
     let abandoned = detail
         .events
@@ -2156,7 +2146,7 @@ fn a_workspace_group_cmux_cannot_make_is_a_logged_warning() {
     backend.join();
     assert_eq!(outcome["errors"], json!([]), "{outcome}");
     assert_eq!(
-        queue.show(TaskId::new(1)).unwrap().runs[0].status,
+        queue.show(TaskId::new(1)).unwrap().runs[0].status(),
         RunStatus::AwaitingIntegration
     );
     assert_eq!(backend.tags.lock().unwrap()[0].group, None);
@@ -2245,7 +2235,7 @@ fn claim_creates_a_lease_that_only_its_owner_can_use_or_release() {
         queue.claim_for_supervisor(&sha(base), "first").unwrap(),
         ClaimOutcome::NoReadyTask
     ));
-    let lease = queue.run_lease(&run.id).unwrap().unwrap();
+    let lease = queue.run_lease(run.id()).unwrap().unwrap();
     assert_eq!(lease.pid, std::process::id());
     assert_eq!(queue.run_leases().unwrap().len(), 1);
     // An idle supervisor heartbeats nothing; the owner heartbeats its runs.
@@ -2259,23 +2249,23 @@ fn claim_creates_a_lease_that_only_its_owner_can_use_or_release() {
         receipt_path: "/run/receipt.json".into(),
         log_path: "/run/log".into(),
     };
-    assert!(queue.plan_run(&run.id, "second", &plan).is_err());
+    assert!(queue.plan_run(run.id(), "second", &plan).is_err());
     let raw = Connection::open(&db).unwrap();
     raw.execute("UPDATE run_leases SET heartbeat_at=0", [])
         .unwrap();
-    assert!(queue.plan_run(&run.id, "first", &plan).is_err()); // Stale.
-    assert!(queue.release_lease(&run.id, "second").is_err());
-    assert_eq!(queue.run_lease(&run.id).unwrap().unwrap().heartbeat_at, 0);
+    assert!(queue.plan_run(run.id(), "first", &plan).is_err()); // Stale.
+    assert!(queue.release_lease(run.id(), "second").is_err());
+    assert_eq!(queue.run_lease(run.id()).unwrap().unwrap().heartbeat_at, 0);
     queue.heartbeat_leases("first").unwrap();
-    queue.plan_run(&run.id, "first", &plan).unwrap();
-    queue.release_lease(&run.id, "first").unwrap();
-    assert!(queue.run_lease(&run.id).unwrap().is_none());
-    assert!(queue.release_lease(&run.id, "first").is_err());
+    queue.plan_run(run.id(), "first", &plan).unwrap();
+    queue.release_lease(run.id(), "first").unwrap();
+    assert!(queue.run_lease(run.id()).unwrap().is_none());
+    assert!(queue.release_lease(run.id(), "first").is_err());
     // The token stays on the run as a record of who executed it.
     let raw_token: String = raw
         .query_row(
             "SELECT supervisor_token FROM task_runs WHERE id=?1",
-            [&run.id],
+            [&run.id()],
             |r| r.get(0),
         )
         .unwrap();
@@ -2333,7 +2323,7 @@ fn wrapper_registration_is_one_shot_and_rejects_stale_owners() {
     };
     queue
         .plan_run(
-            &run.id,
+            run.id(),
             "owner",
             &RunPlan {
                 repo_path: "/test".into(),
@@ -2345,25 +2335,28 @@ fn wrapper_registration_is_one_shot_and_rejects_stale_owners() {
             },
         )
         .unwrap();
-    assert!(queue.register_wrapper(&run.id, "owner", 10).is_err()); // Workspace not attached yet.
+    assert!(queue.register_wrapper(run.id(), "owner", 10).is_err()); // Workspace not attached yet.
     queue
-        .workspace_created(&run.id, "owner", "workspace")
+        .workspace_created(run.id(), "owner", "workspace")
         .unwrap();
-    assert!(queue.register_wrapper(&run.id, "other-owner", 10).is_err());
+    assert!(queue.register_wrapper(run.id(), "other-owner", 10).is_err());
     let raw = Connection::open(&db).unwrap();
     raw.execute("UPDATE run_leases SET heartbeat_at=0", [])
         .unwrap();
-    assert!(queue.register_wrapper(&run.id, "owner", 10).is_err());
+    assert!(queue.register_wrapper(run.id(), "owner", 10).is_err());
     queue.heartbeat_leases("owner").unwrap();
-    queue.register_wrapper(&run.id, "owner", 10).unwrap();
-    assert!(queue.register_wrapper(&run.id, "owner", 11).is_err());
-    assert!(queue.register_agent(&run.id, 11, 12).is_err());
-    queue.register_agent(&run.id, 10, 12).unwrap();
-    assert!(queue.finish_supervision(&run.id, "owner").is_err()); // Still live.
-    queue.wrapper_exited(&run.id, 10, 0).unwrap();
-    assert!(queue.heartbeat_wrapper(&run.id, 10).is_err());
+    queue.register_wrapper(run.id(), "owner", 10).unwrap();
+    assert!(queue.register_wrapper(run.id(), "owner", 11).is_err());
+    assert!(queue.register_agent(run.id(), 11, 12).is_err());
+    queue.register_agent(run.id(), 10, 12).unwrap();
+    assert!(queue.finish_supervision(run.id(), "owner").is_err()); // Still live.
+    queue.wrapper_exited(run.id(), 10, 0).unwrap();
+    assert!(queue.heartbeat_wrapper(run.id(), 10).is_err());
     assert_eq!(
-        queue.finish_supervision(&run.id, "owner").unwrap().status,
+        queue
+            .finish_supervision(run.id(), "owner")
+            .unwrap()
+            .status(),
         RunStatus::Validating
     );
     let validation = Validation {
@@ -2377,25 +2370,22 @@ fn wrapper_registration_is_one_shot_and_rejects_stale_owners() {
     };
     assert!(
         queue
-            .finish_validation(&run.id, "other-owner", &validation)
+            .finish_validation(run.id(), "other-owner", &validation)
             .is_err()
     );
     let failed = queue
-        .finish_validation(&run.id, "owner", &validation)
+        .finish_validation(run.id(), "owner", &validation)
         .unwrap();
-    assert_eq!(failed.status, RunStatus::Failed);
-    assert_eq!(
-        failed.last_error.as_deref(),
-        Some("receipt was not submitted")
-    );
+    assert_eq!(failed.status(), RunStatus::Failed);
+    assert_eq!(failed.last_error(), Some("receipt was not submitted"));
     assert!(
         queue
-            .finish_validation(&run.id, "owner", &validation)
+            .finish_validation(run.id(), "owner", &validation)
             .is_err()
     ); // Terminal.
     // A failed run never records a workspace close or cleanup failure.
-    assert!(queue.workspace_closed(&run.id, "owner").is_err());
-    assert!(queue.cleanup_failed(&run.id, "owner", "late").is_err());
+    assert!(queue.workspace_closed(run.id(), "owner").is_err());
+    assert!(queue.cleanup_failed(run.id(), "owner", "late").is_err());
 }
 
 #[test]
@@ -2414,7 +2404,7 @@ fn workspace_close_is_recorded_once_and_only_for_accepted_runs() {
     };
     queue
         .plan_run(
-            &run.id,
+            run.id(),
             "owner",
             &RunPlan {
                 repo_path: "/test".into(),
@@ -2427,18 +2417,18 @@ fn workspace_close_is_recorded_once_and_only_for_accepted_runs() {
         )
         .unwrap();
     queue
-        .workspace_created(&run.id, "owner", WORKSPACE_ID)
+        .workspace_created(run.id(), "owner", WORKSPACE_ID)
         .unwrap();
-    queue.register_wrapper(&run.id, "owner", 10).unwrap();
-    queue.register_agent(&run.id, 10, 12).unwrap();
+    queue.register_wrapper(run.id(), "owner", 10).unwrap();
+    queue.register_agent(run.id(), 10, 12).unwrap();
     // Still running: neither close nor cleanup failure may be recorded.
-    assert!(queue.workspace_closed(&run.id, "owner").is_err());
-    assert!(queue.cleanup_failed(&run.id, "owner", "early").is_err());
-    queue.wrapper_exited(&run.id, 10, 0).unwrap();
-    queue.finish_supervision(&run.id, "owner").unwrap();
+    assert!(queue.workspace_closed(run.id(), "owner").is_err());
+    assert!(queue.cleanup_failed(run.id(), "owner", "early").is_err());
+    queue.wrapper_exited(run.id(), 10, 0).unwrap();
+    queue.finish_supervision(run.id(), "owner").unwrap();
     let accepted = queue
         .finish_validation(
-            &run.id,
+            run.id(),
             "owner",
             &Validation {
                 accepted: true,
@@ -2451,19 +2441,21 @@ fn workspace_close_is_recorded_once_and_only_for_accepted_runs() {
             },
         )
         .unwrap();
-    assert_eq!(accepted.status, RunStatus::AwaitingIntegration);
-    assert!(accepted.workspace_closed_at.is_none());
-    assert!(queue.workspace_closed(&run.id, "other-owner").is_err());
-    let failed = queue.cleanup_failed(&run.id, "owner", "cmux down").unwrap();
-    assert_eq!(failed.status, RunStatus::AwaitingIntegration);
-    assert_eq!(failed.last_error.as_deref(), Some("cmux down"));
-    assert!(failed.workspace_closed_at.is_none());
+    assert_eq!(accepted.status(), RunStatus::AwaitingIntegration);
+    assert!(accepted.workspace_closed_at().is_none());
+    assert!(queue.workspace_closed(run.id(), "other-owner").is_err());
+    let failed = queue
+        .cleanup_failed(run.id(), "owner", "cmux down")
+        .unwrap();
+    assert_eq!(failed.status(), RunStatus::AwaitingIntegration);
+    assert_eq!(failed.last_error(), Some("cmux down"));
+    assert!(failed.workspace_closed_at().is_none());
     // A later successful close clears nothing but records the close once.
-    let closed = queue.workspace_closed(&run.id, "owner").unwrap();
-    assert!(closed.workspace_closed_at.is_some());
-    assert_eq!(closed.status, RunStatus::AwaitingIntegration);
-    assert!(queue.workspace_closed(&run.id, "owner").is_err());
-    assert!(queue.cleanup_failed(&run.id, "owner", "late").is_err());
+    let closed = queue.workspace_closed(run.id(), "owner").unwrap();
+    assert!(closed.workspace_closed_at().is_some());
+    assert_eq!(closed.status(), RunStatus::AwaitingIntegration);
+    assert!(queue.workspace_closed(run.id(), "owner").is_err());
+    assert!(queue.cleanup_failed(run.id(), "owner", "late").is_err());
     let kinds: Vec<String> = queue
         .show(TaskId::new(1))
         .unwrap()
@@ -2615,7 +2607,7 @@ fn supervise_log_dir_records_each_start_in_its_own_file() {
         .unwrap()
         .query_row(
             "SELECT supervisor_token FROM task_runs WHERE id=?1",
-            [&run.id],
+            [&run.id()],
             |r| r.get(0),
         )
         .unwrap();
@@ -2629,10 +2621,10 @@ fn supervise_log_dir_records_each_start_in_its_own_file() {
     );
     assert!(text.contains(&format!(
         "task 1 running in workspace {WORKSPACE_ID}; run {}",
-        run.id
+        run.id()
     )));
-    assert!(text.contains(&format!("receipt received for {}", run.id)));
-    assert!(text.contains(&format!("run {} is awaiting_integration", run.id)));
+    assert!(text.contains(&format!("receipt received for {}", run.id())));
+    assert!(text.contains(&format!("run {} is awaiting_integration", run.id())));
     assert!(text.contains(&format!(
         "] supervisor {token} exiting: {{\"errors\":[],\"outcome\":\"finished\""
     )));
@@ -2738,7 +2730,7 @@ fn killed_supervisor_registration_is_reported_stale_and_never_deleted() {
     assert_eq!(supervisors[2]["pid"], json!(std::process::id()));
     assert_eq!(supervisors[2]["alive"], true);
     assert_eq!(supervisors[2]["stale"], false);
-    assert_eq!(supervisors[2]["run_ids"], json!([orphan.id]));
+    assert_eq!(supervisors[2]["run_ids"], json!([orphan.id()]));
     assert_eq!(status["runs"][0]["lease"]["pid"], json!(std::process::id()));
     // A registered supervisor's leases join it by token rather than by pid.
     queue
@@ -2749,19 +2741,19 @@ fn killed_supervisor_registration_is_reported_stale_and_never_deleted() {
     assert_eq!(supervisors.len(), 3);
     assert_eq!(supervisors[2]["registered"], true);
     assert_eq!(supervisors[2]["parallel"], 2);
-    assert_eq!(supervisors[2]["run_ids"], json!([orphan.id]));
+    assert_eq!(supervisors[2]["run_ids"], json!([orphan.id()]));
 
     // Recovery of the run and a later supervisor's own registration and
     // deregistration leave the stale rows alone.
     queue
-        .wrapper_exited(&orphan.id, std::process::id(), 0)
+        .wrapper_exited(orphan.id(), std::process::id(), 0)
         .unwrap();
     Connection::open(&db)
         .unwrap()
         .execute("DELETE FROM run_leases", [])
         .unwrap();
     assert_eq!(
-        runtime::recover(&db, &orphan.id).unwrap()["run"]["status"],
+        runtime::recover(&db, orphan.id()).unwrap()["run"]["status"],
         "interrupted"
     );
     let backend = TestWorkspace::new(&db, true, VALID_AGENT);
@@ -2815,31 +2807,31 @@ fn orphan_run(repo: &Path, db: &Path, token: &str, wrapper: u32, agent: u32) -> 
     else {
         panic!()
     };
-    let run_dir = dagq::infrastructure::location::runs_dir(db).join(run.id.as_str());
+    let run_dir = dagq::infrastructure::location::runs_dir(db).join(run.id().as_str());
     fs::create_dir_all(&run_dir).unwrap();
     queue
         .plan_run(
-            &run.id,
+            run.id(),
             token,
             &RunPlan {
                 repo_path: path_text(&repository.root).unwrap(),
                 run_dir: path_text(&run_dir).unwrap(),
-                branch: format!("dagq/{}", run.id),
+                branch: format!("dagq/{}", run.id()),
                 worktree_path: path_text(&run_dir.join("worktree")).unwrap(),
                 receipt_path: path_text(&run_dir.join("receipt.json")).unwrap(),
                 log_path: path_text(&run_dir.join("claude.debug.log")).unwrap(),
             },
         )
         .unwrap();
-    let run = queue.run(&run.id).unwrap();
+    let run = queue.run(run.id()).unwrap();
     repository.create_worktree(&run).unwrap();
     queue
-        .workspace_created(&run.id, token, &format!("ws-{}", run.task_id))
+        .workspace_created(run.id(), token, &format!("ws-{}", run.task_id()))
         .unwrap();
-    queue.register_wrapper(&run.id, token, wrapper).unwrap();
-    queue.register_agent(&run.id, wrapper, agent).unwrap();
-    let run = queue.run(&run.id).unwrap();
-    assert_eq!(run.status, RunStatus::Running);
+    queue.register_wrapper(run.id(), token, wrapper).unwrap();
+    queue.register_agent(run.id(), wrapper, agent).unwrap();
+    let run = queue.run(run.id()).unwrap();
+    assert_eq!(run.status(), RunStatus::Running);
     run
 }
 
@@ -2856,9 +2848,9 @@ fn recover_requires_dead_processes_and_stale_lease_then_allows_a_new_run() {
     assert_eq!(report["supervisors"][0]["pid"], json!(std::process::id()));
     assert_eq!(report["supervisors"][0]["stale"], false);
     assert_eq!(report["supervisors"][0]["alive"], true);
-    assert_eq!(report["supervisors"][0]["run_ids"], json!([run.id]));
+    assert_eq!(report["supervisors"][0]["run_ids"], json!([run.id()]));
     let health = &report["runs"][0];
-    assert_eq!(health["run_id"], json!(run.id));
+    assert_eq!(health["run_id"], json!(run.id()));
     assert_eq!(health["status"], "running");
     assert_eq!(health["workspace_id"], "ws-1");
     assert_eq!(health["lease"]["stale"], false);
@@ -2870,7 +2862,7 @@ fn recover_requires_dead_processes_and_stale_lease_then_allows_a_new_run() {
     let processes = health["processes"].as_array().unwrap();
     assert_eq!(processes.len(), 2);
     assert!(processes.iter().all(|p| p["alive"] == true));
-    let error = format!("{:#}", runtime::recover(&db, &run.id).unwrap_err());
+    let error = format!("{:#}", runtime::recover(&db, run.id()).unwrap_err());
     assert!(
         error.contains("wrapper pid") && error.contains("lease heartbeat"),
         "{error}"
@@ -2888,13 +2880,13 @@ fn recover_requires_dead_processes_and_stale_lease_then_allows_a_new_run() {
     assert_eq!(report["supervisors"][0]["alive"], false);
     assert_eq!(report["runs"][0]["lease"]["stale"], true);
     assert_eq!(report["runs"][0]["processes"][0]["heartbeat_stale"], true);
-    let error = format!("{:#}", runtime::recover(&db, &run.id).unwrap_err());
+    let error = format!("{:#}", runtime::recover(&db, run.id()).unwrap_err());
     assert!(
         error.contains("agent pid") && !error.contains("supervisor"),
         "{error}"
     );
-    assert_eq!(queue.run(&run.id).unwrap().status, RunStatus::Running);
-    assert!(queue.run_lease(&run.id).unwrap().is_some());
+    assert_eq!(queue.run(run.id()).unwrap().status(), RunStatus::Running);
+    assert!(queue.run_lease(run.id()).unwrap().is_some());
 
     // The session processes are gone too: recovery is allowed and explicit.
     agent.kill().unwrap();
@@ -2904,12 +2896,12 @@ fn recover_requires_dead_processes_and_stale_lease_then_allows_a_new_run() {
     let report = runtime::doctor(&db, true).unwrap();
     assert_eq!(report["runs"][0]["recoverable"], true);
     assert_eq!(report["runs"][0]["blockers"], json!([]));
-    let outcome = runtime::recover(&db, &run.id).unwrap();
+    let outcome = runtime::recover(&db, run.id()).unwrap();
     assert_eq!(outcome["outcome"], "recovered");
     assert_eq!(outcome["run"]["status"], "interrupted");
     let detail = queue.show(TaskId::new(1)).unwrap();
     assert_eq!(detail.task.status(), TaskStatus::InProgress);
-    assert_eq!(detail.runs[0].status, RunStatus::Interrupted);
+    assert_eq!(detail.runs[0].status(), RunStatus::Interrupted);
     assert!(queue.run_leases().unwrap().is_empty());
     let recovered = detail
         .events
@@ -2922,8 +2914,8 @@ fn recover_requires_dead_processes_and_stale_lease_then_allows_a_new_run() {
     assert_eq!(recovered.payload["run"]["lease"]["stale"], true);
     // Registrations and resources are left as observed.
     assert!(detail.processes.iter().all(|p| p.exited_at.is_none()));
-    assert!(Path::new(run.worktree_path.as_ref().unwrap()).exists());
-    assert!(runtime::recover(&db, &run.id).is_err()); // No longer unfinished.
+    assert!(Path::new(run.worktree_path().unwrap()).exists());
+    assert!(runtime::recover(&db, run.id()).is_err()); // No longer unfinished.
     assert_eq!(runtime::doctor(&db, true).unwrap()["runs"], json!([]));
     assert!(queue.candidates().unwrap().is_empty());
 
@@ -2936,10 +2928,10 @@ fn recover_requires_dead_processes_and_stale_lease_then_allows_a_new_run() {
     assert_eq!(outcome["runs"][0]["status"], "awaiting_integration");
     let detail = queue.show(TaskId::new(1)).unwrap();
     assert_eq!(detail.runs.len(), 2);
-    assert_eq!(detail.runs[0].status, RunStatus::Interrupted);
-    assert_eq!(detail.runs[0].worktree_path, run.worktree_path);
-    assert!(Path::new(run.worktree_path.as_ref().unwrap()).exists());
-    assert_ne!(detail.runs[1].worktree_path, run.worktree_path);
+    assert_eq!(detail.runs[0].status(), RunStatus::Interrupted);
+    assert_eq!(detail.runs[0].worktree_path(), run.worktree_path());
+    assert!(Path::new(run.worktree_path().unwrap()).exists());
+    assert_ne!(detail.runs[1].worktree_path(), run.worktree_path());
     assert!(queue.transition(TaskId::new(1), TaskAction::Ready).is_err()); // Awaiting integration still owns the task.
 }
 
@@ -2951,8 +2943,8 @@ fn recover_ignores_exited_processes_and_tolerates_a_missing_lease() {
     let pid = std::process::id();
     let run = orphan_run(&repo, &db, "owner", pid, pid);
     let mut queue = SqliteQueue::open(&db).unwrap();
-    queue.wrapper_exited(&run.id, pid, 0).unwrap();
-    let error = format!("{:#}", runtime::recover(&db, &run.id).unwrap_err());
+    queue.wrapper_exited(run.id(), pid, 0).unwrap();
+    let error = format!("{:#}", runtime::recover(&db, run.id()).unwrap_err());
     assert!(
         error.contains("supervisor pid") && !error.contains("wrapper pid"),
         "{error}"
@@ -2973,7 +2965,7 @@ fn recover_ignores_exited_processes_and_tolerates_a_missing_lease() {
         runtime::doctor(&db, true).unwrap()["supervisors"],
         json!([])
     );
-    let outcome = runtime::recover(&db, &run.id).unwrap();
+    let outcome = runtime::recover(&db, run.id()).unwrap();
     assert_eq!(outcome["run"]["status"], "interrupted");
     let detail = queue.show(TaskId::new(1)).unwrap();
     let recovered = detail
@@ -3080,11 +3072,11 @@ fn integrate_pushes_the_landed_main_to_origin() {
     assert_eq!(*remote.pushes.lock().unwrap(), ["origin"]);
     let landed = git_out(&repo, &["rev-parse", "main"]);
     assert_eq!(
-        events_of(&db, &run.id, "push_finished"),
+        events_of(&db, run.id(), "push_finished"),
         [json!({"remote": "origin", "commit": landed})]
     );
     let status = runtime::status(&db).unwrap();
-    assert!(run_attention_of(&status, &run.id).is_none(), "{status}");
+    assert!(run_attention_of(&status, run.id()).is_none(), "{status}");
 }
 
 #[test]
@@ -3103,7 +3095,7 @@ fn a_failed_push_keeps_the_landing_and_waits_as_attention() {
     assert_eq!(outcome["push"]["error"], "rejected: fetch first");
     let landed = git_out(&repo, &["rev-parse", "main"]);
     assert_eq!(
-        events_of(&db, &run.id, "push_failed"),
+        events_of(&db, run.id(), "push_failed"),
         [json!({"remote": "origin", "commit": landed, "error": "rejected: fetch first"})]
     );
     let mut queue = SqliteQueue::open(&db).unwrap();
@@ -3117,9 +3109,9 @@ fn a_failed_push_keeps_the_landing_and_waits_as_attention() {
     // reports the push_failed event with its next.
     let status = runtime::status(&db).unwrap();
     assert_eq!(
-        run_attention_of(&status, &run.id).unwrap(),
+        run_attention_of(&status, run.id()).unwrap(),
         &json!({
-            "run_id": run.id, "task_id": 1, "status": "integrated",
+            "run_id": run.id(), "task_id": 1, "status": "integrated",
             "kind": "push_failed", "last_error": "rejected: fetch first", "next": "push main",
         })
     );
@@ -3136,10 +3128,10 @@ fn a_failed_push_keeps_the_landing_and_waits_as_attention() {
     // A later successful push carries this landing too and clears it.
     SqliteQueue::open(&db)
         .unwrap()
-        .record_runtime_event(&run.id, "push_finished", json!({"remote": "origin"}))
+        .record_runtime_event(run.id(), "push_finished", json!({"remote": "origin"}))
         .unwrap();
     let status = runtime::status(&db).unwrap();
-    assert!(run_attention_of(&status, &run.id).is_none(), "{status}");
+    assert!(run_attention_of(&status, run.id()).is_none(), "{status}");
 }
 
 #[test]
@@ -3153,7 +3145,7 @@ fn no_push_and_a_missing_origin_skip_the_push() {
         json!({"outcome": "skipped", "remote": "origin", "error": null, "reason": "--no-push"})
     );
     assert!(remote.pushes.lock().unwrap().is_empty());
-    let skipped = events_of(&db, &run.id, "push_skipped");
+    let skipped = events_of(&db, run.id(), "push_skipped");
     assert_eq!(skipped.len(), 1);
     assert_eq!(skipped[0]["reason"], "--no-push");
 
@@ -3169,7 +3161,7 @@ fn no_push_and_a_missing_origin_skip_the_push() {
         "the repository has no remote origin"
     );
     assert!(remote.pushes.lock().unwrap().is_empty());
-    assert_eq!(events_of(&db, &run.id, "push_skipped").len(), 1);
+    assert_eq!(events_of(&db, run.id(), "push_skipped").len(), 1);
 }
 
 /// The real Git adapter pushes main to a bare origin, and reports Git's
@@ -3194,7 +3186,7 @@ fn git_adapter_pushes_main_to_a_bare_origin() {
         git_out(&origin, &["rev-parse", "main"]),
         git_out(&repo, &["rev-parse", "main"])
     );
-    assert_eq!(events_of(&db, &run.id, "push_finished").len(), 1);
+    assert_eq!(events_of(&db, run.id(), "push_finished").len(), 1);
 
     // An origin that is not a repository fails the push with Git's message.
     let adapter = GitRepository::inspect(&repo).unwrap();
@@ -3249,7 +3241,7 @@ fn write_receipt(run: &TaskRun, commit: &str, result: &str, summary: &str) {
 /// A session's receipt for `commit`, with the evidence it would give.
 fn session_receipt(run: &TaskRun, commit: &str, result: &str, summary: &str) -> Value {
     json!({
-        "run_id": run.id, "result": result, "commit": commit,
+        "run_id": run.id(), "result": result, "commit": commit,
         "tests": {"status": "passed", "evidence_or_reason": "reran"},
         "e2e": {"status": "not_applicable", "evidence_or_reason": "none"},
         "subagent_review": {"status": "not_applicable", "evidence_or_reason": "session"},
@@ -3258,7 +3250,7 @@ fn session_receipt(run: &TaskRun, commit: &str, result: &str, summary: &str) -> 
 }
 
 fn write_receipt_json(run: &TaskRun, receipt: Value) {
-    let path = Path::new(run.receipt_path.as_ref().unwrap());
+    let path = Path::new(run.receipt_path().unwrap());
     fs::write(path.with_extension("tmp"), receipt.to_string()).unwrap();
     fs::rename(path.with_extension("tmp"), path).unwrap();
 }
@@ -3289,9 +3281,9 @@ fn integration_receipts(detail: &dagq::domain::TaskDetail) -> Vec<&Value> {
 /// its head carries the landing of `run` with the same tree as `source`.
 fn assert_landed(repo: &Path, run: &TaskRun, task_title: &str, expected_parent: &str) {
     let main = git_out(repo, &["rev-parse", "main"]);
-    assert_eq!(run.status, RunStatus::Integrated);
+    assert_eq!(run.status(), RunStatus::Integrated);
     assert_eq!(
-        run.result_commit.as_ref().map(CommitSha::as_str),
+        run.result_commit().map(CommitSha::as_str),
         Some(main.as_str())
     );
     assert_eq!(git_out(repo, &["rev-parse", "main^"]), expected_parent);
@@ -3301,7 +3293,7 @@ fn assert_landed(repo: &Path, run: &TaskRun, task_title: &str, expected_parent: 
             .count(),
         2
     );
-    let history = format!("refs/dagq/runs/{}", run.id);
+    let history = format!("refs/dagq/runs/{}", run.id());
     let source = git_out(repo, &["rev-parse", &history]);
     assert_eq!(
         git_out(repo, &["rev-parse", "main^{tree}"]),
@@ -3311,21 +3303,19 @@ fn assert_landed(repo: &Path, run: &TaskRun, task_title: &str, expected_parent: 
     assert!(message.starts_with(task_title), "{message}");
     assert!(message.contains("\n\nDagq-Task: "), "{message}");
     assert!(
-        message.ends_with(&format!("Dagq-Run: {}", run.id)),
+        message.ends_with(&format!("Dagq-Run: {}", run.id())),
         "{message}"
     );
     // Worktree and branch are gone; the run's history stays under the ref.
-    assert!(!Path::new(run.worktree_path.as_ref().unwrap()).exists());
-    assert!(
-        !git_out(repo, &["branch", "--list", run.branch.as_deref().unwrap()]).contains("dagq/")
-    );
+    assert!(!Path::new(run.worktree_path().unwrap()).exists());
+    assert!(!git_out(repo, &["branch", "--list", run.branch().unwrap()]).contains("dagq/"));
 }
 
 /// A validated run plus a ready dependent task, before any landing.
 fn awaiting_run() -> (TempDir, PathBuf, PathBuf, TaskRun) {
     let (dir, db, detail) = run_agent(VALID_AGENT);
     let run = detail.runs[0].clone();
-    assert_eq!(run.status, RunStatus::AwaitingIntegration);
+    assert_eq!(run.status(), RunStatus::AwaitingIntegration);
     let mut queue = SqliteQueue::open(&db).unwrap();
     let dependent = queue
         .add(NewTask {
@@ -3371,21 +3361,21 @@ fn review_writes_the_run_material_to_review_md_and_returns_only_its_size() {
     supervise(&db, &repo, &backend).unwrap();
     backend.join();
     let run = queue.show(TaskId::new(1)).unwrap().runs[0].clone();
-    assert_eq!(run.status, RunStatus::AwaitingIntegration);
-    let head = run.result_commit.clone().unwrap();
+    assert_eq!(run.status(), RunStatus::AwaitingIntegration);
+    let head = run.result_commit().cloned().unwrap();
     let mut receipt = session_receipt(&run, head.as_str(), "succeeded", "summary of the change");
     receipt["follow_ups"] = json!([{"title": "later work", "description": "outside the task"}]);
     write_receipt_json(&run, receipt);
 
     let outcome = runtime::review(&db, TaskId::new(1)).unwrap();
-    let path = Path::new(run.run_dir.as_ref().unwrap()).join("review.md");
+    let path = Path::new(run.run_dir().unwrap()).join("review.md");
     assert_eq!(
         outcome,
         json!({
-            "run_id": run.id,
+            "run_id": run.id(),
             "task_id": 1,
             "path": path.to_str().unwrap(),
-            "base": run.base_commit,
+            "base": run.base_commit(),
             "head": head,
             "files_changed": 1,
             "insertions": 1,
@@ -3431,7 +3421,7 @@ fn review_writes_the_run_material_to_review_md_and_returns_only_its_size() {
         diff.contains("```diff\ndiff --git a/change.txt b/change.txt"),
         "{diff}"
     );
-    assert!(diff.contains(&format!("+change by {}", run.id)), "{diff}");
+    assert!(diff.contains(&format!("+change by {}", run.id())), "{diff}");
     assert!(diff.ends_with("\n```\n"), "{diff}");
 
     // A landed run is no longer reviewable.
@@ -3449,11 +3439,11 @@ fn review_writes_a_non_utf8_diff_as_raw_bytes() {
         r#"printf 'caf\351 ````\n' > latin1.txt && git add latin1.txt && git commit -q -m "$(printf 'caf\351')"; receipt "$(git rev-parse HEAD)""#,
     );
     let run = detail.runs[0].clone();
-    assert_eq!(run.status, RunStatus::AwaitingIntegration);
+    assert_eq!(run.status(), RunStatus::AwaitingIntegration);
     let outcome = runtime::review(&db, TaskId::new(1)).unwrap();
     assert_eq!(outcome["files_changed"], 1, "{outcome}");
     assert_eq!(outcome["insertions"], 1, "{outcome}");
-    let run_dir = Path::new(run.run_dir.as_ref().unwrap());
+    let run_dir = Path::new(run.run_dir().unwrap());
     let bytes = fs::read(run_dir.join("review.md")).unwrap();
     assert!(String::from_utf8(bytes.clone()).is_err());
     let text = String::from_utf8_lossy(&bytes);
@@ -3485,8 +3475,8 @@ fn review_writes_a_non_utf8_diff_as_raw_bytes() {
 fn conflict_free_run_lands_as_one_squash_commit_and_releases_dependents() {
     let (dir, repo, db, run) = awaiting_run();
     let seed = git_out(&repo, &["rev-parse", "main"]);
-    assert_eq!(seed, run.base_commit);
-    let source = run.result_commit.clone().unwrap();
+    assert_eq!(seed, *run.base_commit());
+    let source = run.result_commit().cloned().unwrap();
     // Another repository is refused even though it also has a main branch.
     let other = dir.path().join("other");
     fs::create_dir(&other).unwrap();
@@ -3500,7 +3490,7 @@ fn conflict_free_run_lands_as_one_squash_commit_and_releases_dependents() {
 
     // Landing from the run's own worktree resolves the same repository,
     // and the push that follows the worktree's removal still reaches Git.
-    let worktree = PathBuf::from(run.worktree_path.as_ref().unwrap());
+    let worktree = PathBuf::from(run.worktree_path().unwrap());
     let outcome = integrate(&db, 1, &worktree).unwrap();
     assert_eq!(outcome["outcome"], "integrated", "{outcome}");
     assert_eq!(outcome["push"]["outcome"], "skipped", "{outcome}");
@@ -3514,11 +3504,14 @@ fn conflict_free_run_lands_as_one_squash_commit_and_releases_dependents() {
     assert_eq!(detail.task.status(), TaskStatus::Completed);
     let landed = detail.runs[0].clone();
     assert_landed(&repo, &landed, "test task", &seed);
-    assert!(landed.last_error.is_none());
+    assert!(landed.last_error().is_none());
     // No rebase was needed: the landed tree is the validated tree, and the
     // history ref points at the validated commit.
     assert_eq!(
-        git_out(&repo, &["rev-parse", &format!("refs/dagq/runs/{}", run.id)]),
+        git_out(
+            &repo,
+            &["rev-parse", &format!("refs/dagq/runs/{}", run.id())]
+        ),
         source
     );
     assert_eq!(
@@ -3528,17 +3521,17 @@ fn conflict_free_run_lands_as_one_squash_commit_and_releases_dependents() {
     let message = git_out(&repo, &["log", "-1", "--format=%B", "main"]);
     assert_eq!(
         message,
-        format!("test task\n\ndone\n\nDagq-Task: 1\nDagq-Run: {}", run.id)
+        format!("test task\n\ndone\n\nDagq-Task: 1\nDagq-Run: {}", run.id())
     );
     // The main checkout moved with the ref.
     assert_eq!(
         git_out(&repo, &["rev-parse", "HEAD"]),
-        landed.result_commit.clone().unwrap()
+        landed.result_commit().cloned().unwrap()
     );
     assert_eq!(git_out(&repo, &["status", "--porcelain"]), "");
     assert_eq!(
         fs::read_to_string(repo.join("change.txt")).unwrap(),
-        format!("change by {}\n", run.id)
+        format!("change by {}\n", run.id())
     );
     let kinds = event_kinds(&detail);
     let position = |kind: &str| kinds.iter().rposition(|k| *k == kind).unwrap();
@@ -3559,16 +3552,16 @@ fn conflict_free_run_lands_as_one_squash_commit_and_releases_dependents() {
         .iter()
         .find(|e| e.kind == "run_integrated")
         .unwrap();
-    assert_eq!(integrated.run_id.as_ref(), Some(&run.id));
+    assert_eq!(integrated.run_id.as_ref(), Some(run.id()));
     assert_eq!(
         integrated.payload["result_commit"],
-        json!(landed.result_commit)
+        json!(landed.result_commit())
     );
     assert_eq!(integrated.payload["source_commit"], json!(source));
     assert_eq!(integrated.payload["main_before"], json!(seed));
     assert_eq!(
         integrated.payload["history_ref"],
-        json!(format!("refs/dagq/runs/{}", run.id))
+        json!(format!("refs/dagq/runs/{}", run.id()))
     );
     assert_eq!(integrated.payload["verification_skipped"], json!(false));
     let verifications = integration_verifications(&detail);
@@ -3583,7 +3576,7 @@ fn conflict_free_run_lands_as_one_squash_commit_and_releases_dependents() {
         "{:?}",
         event_kinds(&detail)
     );
-    let run_dir = Path::new(run.run_dir.as_ref().unwrap());
+    let run_dir = Path::new(run.run_dir().unwrap());
     assert!(run_dir.join("integrate-verify-1.log").exists());
     assert!(!run_dir.join("verify-1.log").exists());
     let changed = detail
@@ -3591,7 +3584,7 @@ fn conflict_free_run_lands_as_one_squash_commit_and_releases_dependents() {
         .iter()
         .find(|e| e.kind == "task_status_changed" && e.payload["to"] == "completed")
         .unwrap();
-    assert_eq!(changed.run_id.as_ref(), Some(&run.id));
+    assert_eq!(changed.run_id.as_ref(), Some(run.id()));
     assert!(queue.run_leases().unwrap().is_empty());
     assert_eq!(
         queue
@@ -3606,7 +3599,7 @@ fn conflict_free_run_lands_as_one_squash_commit_and_releases_dependents() {
     // Integration is one-shot, at every layer.
     let error = format!("{:#}", integrate(&db, 1, &repo).unwrap_err());
     assert!(error.contains("no run awaiting integration"), "{error}");
-    assert!(queue.begin_integration(&run.id, "x", &sha(&seed)).is_err());
+    assert!(queue.begin_integration(run.id(), "x", &sha(&seed)).is_err());
     let error = format!("{:#}", integrate(&db, 2, &repo).unwrap_err());
     assert!(error.contains("task 2 (ready) has no run"), "{error}");
     assert!(integrate(&db, 99, &repo).is_err());
@@ -3616,7 +3609,7 @@ fn conflict_free_run_lands_as_one_squash_commit_and_releases_dependents() {
         raw.execute(
             "INSERT INTO task_runs(id,task_id,status,requested_provider,actual_provider,base_commit)
              VALUES ('again',1,'integrated','claude','claude',?1)",
-            [&run.base_commit],
+            [&run.base_commit()],
         )
         .is_err()
     );
@@ -3649,7 +3642,7 @@ fn moved_queue_directory_resolves_run_paths_and_lands_awaiting_runs() {
         add_ready_task(&mut queue, "unfinished", &[])
     };
     let unfinished = orphan_run(&repo, &db, "old-supervisor", dead_pid(), dead_pid());
-    assert_eq!(unfinished.task_id, other);
+    assert_eq!(unfinished.task_id(), other);
 
     let moved = dir.path().join("moved queue");
     let db = move_queue(&db, &repo, &moved);
@@ -3661,11 +3654,11 @@ fn moved_queue_directory_resolves_run_paths_and_lands_awaiting_runs() {
     let stored: String = raw
         .query_row(
             "SELECT worktree_path FROM task_runs WHERE id=?1",
-            [&run.id],
+            [&run.id()],
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(stored, run.worktree_path.clone().unwrap());
+    assert_eq!(stored, run.worktree_path().unwrap().to_owned());
     assert!(stored.starts_with(old_runs.to_str().unwrap()), "{stored}");
     // Git still records the worktrees at their old paths.
     assert!(git_out(&repo, &["worktree", "list"]).contains("prunable"));
@@ -3674,33 +3667,36 @@ fn moved_queue_directory_resolves_run_paths_and_lands_awaiting_runs() {
     let expected = |id: &RunId| dagq::domain::RunPaths::new(&runs, id);
     let mut queue = SqliteQueue::open(&db).unwrap();
     let shown = queue.show(TaskId::new(1)).unwrap().runs[0].clone();
-    let paths = expected(&run.id);
-    assert_eq!(shown.run_dir, text(paths.run_dir.clone()));
-    assert_eq!(shown.worktree_path, text(paths.worktree.clone()));
-    assert_eq!(shown.receipt_path, text(paths.receipt.clone()));
-    assert_eq!(shown.log_path, text(paths.log.clone()));
-    assert_eq!(shown.repo_path, run.repo_path);
+    let paths = expected(run.id());
+    assert_eq!(shown.run_dir(), text(paths.run_dir.clone()).as_deref());
+    assert_eq!(
+        shown.worktree_path(),
+        text(paths.worktree.clone()).as_deref()
+    );
+    assert_eq!(shown.receipt_path(), text(paths.receipt.clone()).as_deref());
+    assert_eq!(shown.log_path(), text(paths.log.clone()).as_deref());
+    assert_eq!(shown.repo_path(), run.repo_path());
     assert!(paths.worktree.is_dir() && paths.receipt.is_file());
 
     let status = runtime::status(&db).unwrap();
     let entry = &status["runs"].as_array().unwrap()[0];
-    assert_eq!(entry["run_id"], json!(unfinished.id), "{status}");
+    assert_eq!(entry["run_id"], json!(unfinished.id()), "{status}");
     assert_eq!(
         entry["worktree_path"],
-        json!(text(expected(&unfinished.id).worktree)),
+        json!(text(expected(unfinished.id()).worktree)),
         "{status}"
     );
     let doctor = runtime::doctor(&db, true).unwrap();
     let health = &doctor["runs"].as_array().unwrap()[0];
-    assert_eq!(health["run_id"], json!(unfinished.id), "{doctor}");
+    assert_eq!(health["run_id"], json!(unfinished.id()), "{doctor}");
     assert_eq!(
         health["worktree_path"],
-        json!(text(expected(&unfinished.id).worktree))
+        json!(text(expected(unfinished.id()).worktree))
     );
     assert_eq!(health["worktree_exists"], json!(true), "{doctor}");
     assert_eq!(
         health["run_dir"],
-        json!(text(expected(&unfinished.id).run_dir))
+        json!(text(expected(unfinished.id()).run_dir))
     );
     assert_eq!(health["run_dir_exists"], json!(true), "{doctor}");
 
@@ -3717,7 +3713,7 @@ fn moved_queue_directory_resolves_run_paths_and_lands_awaiting_runs() {
     assert!(kinds.contains(&"worktree_removed".to_owned()), "{kinds:?}");
     assert!(!kinds.contains(&"cleanup_failed".to_owned()), "{kinds:?}");
     let listing = git_out(&repo, &["worktree", "list", "--porcelain"]);
-    assert!(!listing.contains(run.id.as_str()), "{listing}");
+    assert!(!listing.contains(run.id().as_str()), "{listing}");
 }
 
 /// A dependent's prompt names each predecessor with the commit `integrate`
@@ -3729,11 +3725,11 @@ fn prompt_describes_landed_predecessors_and_sibling_tasks_in_progress() {
     assert_eq!(integrate(&db, 1, &repo).unwrap()["outcome"], "integrated");
     let mut queue = SqliteQueue::open(&db).unwrap();
     let landed = queue.show(TaskId::new(1)).unwrap().runs[0].clone();
-    assert_eq!(landed.status, RunStatus::Integrated);
-    let landed_commit = landed.result_commit.clone().unwrap();
+    assert_eq!(landed.status(), RunStatus::Integrated);
+    let landed_commit = landed.result_commit().cloned().unwrap();
     assert_eq!(landed_commit, git_out(&repo, &["rev-parse", "main"]));
     // The squash commit, not the run's validated head, is what the prompt names.
-    assert_ne!(landed_commit, run.result_commit.unwrap());
+    assert_ne!(landed_commit, *run.result_commit().unwrap());
     add_ready_task(&mut queue, "independent", &[]);
 
     // The queue's read-only view the prompt is built from.
@@ -3742,9 +3738,9 @@ fn prompt_describes_landed_predecessors_and_sibling_tasks_in_progress() {
     assert_eq!(predecessors[0].task.id(), TaskId::new(1));
     assert_eq!(predecessors[0].task.title(), "test task");
     let integrated = predecessors[0].integrated_run.as_ref().unwrap();
-    assert_eq!(integrated.id, run.id);
+    assert_eq!(integrated.id(), run.id());
     assert_eq!(
-        integrated.result_commit.as_ref().map(CommitSha::as_str),
+        integrated.result_commit().map(CommitSha::as_str),
         Some(landed_commit.as_str())
     );
     assert!(queue.predecessors(TaskId::new(3)).unwrap().is_empty());
@@ -3759,8 +3755,8 @@ fn prompt_describes_landed_predecessors_and_sibling_tasks_in_progress() {
     assert_eq!(outcome["runs"].as_array().unwrap().len(), 2);
 
     let dependent = queue.show(TaskId::new(2)).unwrap().runs[0].clone();
-    assert_eq!(dependent.status, RunStatus::AwaitingIntegration);
-    assert_eq!(dependent.base_commit, landed_commit);
+    assert_eq!(dependent.status(), RunStatus::AwaitingIntegration);
+    assert_eq!(*dependent.base_commit(), landed_commit);
     let prompt = read_prompt(&dependent);
     assert!(
         prompt.contains(&format!(
@@ -3778,7 +3774,7 @@ fn prompt_describes_landed_predecessors_and_sibling_tasks_in_progress() {
     assert!(!prompt.contains("- task 2: dependent"), "{prompt}");
 
     let independent = queue.show(TaskId::new(3)).unwrap().runs[0].clone();
-    assert_eq!(independent.status, RunStatus::AwaitingIntegration);
+    assert_eq!(independent.status(), RunStatus::AwaitingIntegration);
     let prompt = read_prompt(&independent);
     assert!(prompt.contains("Predecessor tasks: none\n"), "{prompt}");
     assert!(
@@ -4093,10 +4089,10 @@ fn prompt_snapshots_the_goal_at_claim_time() {
 fn successor_starts_when_the_predecessor_receipt_is_unavailable() {
     let (_dir, repo, db, run) = awaiting_run();
     assert_eq!(integrate(&db, 1, &repo).unwrap()["outcome"], "integrated");
-    let receipt = Path::new(run.receipt_path.as_ref().unwrap());
+    let receipt = Path::new(run.receipt_path().unwrap());
     assert_eq!(
         receipt,
-        Path::new(run.run_dir.as_ref().unwrap()).join("receipt.json")
+        Path::new(run.run_dir().unwrap()).join("receipt.json")
     );
     fs::remove_file(receipt).unwrap();
 
@@ -4108,12 +4104,12 @@ fn successor_starts_when_the_predecessor_receipt_is_unavailable() {
     let mut queue = SqliteQueue::open(&db).unwrap();
     let detail = queue.show(TaskId::new(2)).unwrap();
     let dependent = &detail.runs[0];
-    assert_eq!(dependent.status, RunStatus::AwaitingIntegration);
+    assert_eq!(dependent.status(), RunStatus::AwaitingIntegration);
     let kinds = event_kinds(&detail);
     assert!(kinds.contains(&"agent_started"), "{kinds:?}");
     let landed_commit = queue.show(TaskId::new(1)).unwrap().runs[0]
-        .result_commit
-        .clone()
+        .result_commit()
+        .cloned()
         .unwrap();
     let prompt = read_prompt(dependent);
     assert!(
@@ -4176,7 +4172,7 @@ fn runs_land_fifo_by_validation_time_and_later_ones_are_rebased() {
     // FIFO is by validation time, not task id.
     let mut validated_at = |run: &TaskRun| {
         queue
-            .show(run.task_id)
+            .show(run.task_id())
             .unwrap()
             .events
             .iter()
@@ -4190,34 +4186,34 @@ fn runs_land_fifo_by_validation_time_and_later_ones_are_rebased() {
         (run_b.clone(), run_a.clone())
     };
     assert_eq!(
-        queue.next_awaiting_integration().unwrap().unwrap().id,
-        first.id
+        queue.next_awaiting_integration().unwrap().unwrap().id(),
+        first.id()
     );
 
     let outcome = integrate_next(&db, &repo);
     assert_eq!(outcome["outcome"], "integrated", "{outcome}");
-    assert_eq!(outcome["run"]["id"], json!(first.id));
+    assert_eq!(outcome["run"]["id"], json!(first.id()));
     let first_landed = git_out(&repo, &["rev-parse", "main"]);
     assert_eq!(
-        queue.next_awaiting_integration().unwrap().unwrap().id,
-        second.id
+        queue.next_awaiting_integration().unwrap().unwrap().id(),
+        second.id()
     );
 
     // No checkout has main now: the ref is updated directly.
     git(&repo, &["checkout", "-q", "--detach"]);
     let outcome = integrate_next(&db, &repo);
     assert_eq!(outcome["outcome"], "integrated", "{outcome}");
-    assert_eq!(outcome["run"]["id"], json!(second.id));
+    assert_eq!(outcome["run"]["id"], json!(second.id()));
     assert_eq!(integrate_next(&db, &repo)["outcome"], "no_run_awaiting");
     let second_landed = git_out(&repo, &["rev-parse", "main"]);
     assert_eq!(git_out(&repo, &["rev-parse", "HEAD"]), first_landed); // Detached HEAD untouched.
     git(&repo, &["checkout", "-q", "main"]);
 
-    let landed_second = queue.show(second.task_id).unwrap().runs[0].clone();
+    let landed_second = queue.show(second.task_id()).unwrap().runs[0].clone();
     assert_landed(&repo, &landed_second, "task ", &first_landed);
-    let landed_first = queue.show(first.task_id).unwrap().runs[0].clone();
+    let landed_first = queue.show(first.task_id()).unwrap().runs[0].clone();
     assert_eq!(
-        landed_first.result_commit.as_ref().map(CommitSha::as_str),
+        landed_first.result_commit().map(CommitSha::as_str),
         Some(first_landed.as_str())
     );
     // Linear: seed → first → second, one commit per task, both files present.
@@ -4231,22 +4227,25 @@ fn runs_land_fifo_by_validation_time_and_later_ones_are_rebased() {
     // The second run was rebased: its history ref sits on the first landing.
     let history = git_out(
         &repo,
-        &["rev-parse", &format!("refs/dagq/runs/{}", second.id)],
+        &["rev-parse", &format!("refs/dagq/runs/{}", second.id())],
     );
-    assert_ne!(history, second.result_commit.clone().unwrap());
+    assert_ne!(history, second.result_commit().cloned().unwrap());
     assert_eq!(
         git_out(&repo, &["rev-parse", &format!("{history}^")]),
         first_landed
     );
     let rebased = queue
-        .show(second.task_id)
+        .show(second.task_id())
         .unwrap()
         .events
         .into_iter()
         .find(|e| e.kind == "integration_rebased")
         .unwrap();
     assert_eq!(rebased.payload["main"], json!(first_landed));
-    assert_eq!(rebased.payload["head_before"], json!(second.result_commit));
+    assert_eq!(
+        rebased.payload["head_before"],
+        json!(second.result_commit())
+    );
     assert_eq!(rebased.payload["head_after"], json!(history));
     for task in [a, b] {
         assert_eq!(
@@ -4273,8 +4272,8 @@ fn conflicting_run_needs_a_session_and_lands_after_the_session_resolves_it() {
     let first_landed = git_out(&repo, &["rev-parse", "main"]);
 
     let run = queue.show(TaskId::new(2)).unwrap().runs[0].clone();
-    let source = run.result_commit.clone().unwrap();
-    let worktree = PathBuf::from(run.worktree_path.as_ref().unwrap());
+    let source = run.result_commit().cloned().unwrap();
+    let worktree = PathBuf::from(run.worktree_path().unwrap());
     let outcome = integrate(&db, 2, &repo).unwrap();
     assert_eq!(outcome["outcome"], "needs_session", "{outcome}");
     assert_eq!(outcome["main"], json!(first_landed));
@@ -4285,10 +4284,10 @@ fn conflicting_run_needs_a_session_and_lands_after_the_session_resolves_it() {
         "{reason}"
     );
     let parked = queue.show(TaskId::new(2)).unwrap().runs[0].clone();
-    assert_eq!(parked.status, RunStatus::NeedsSession);
-    assert_eq!(parked.last_error.as_deref(), Some(reason));
+    assert_eq!(parked.status(), RunStatus::NeedsSession);
+    assert_eq!(parked.last_error(), Some(reason));
     assert_eq!(
-        parked.result_commit.as_ref().map(CommitSha::as_str),
+        parked.result_commit().map(CommitSha::as_str),
         Some(source.as_str())
     );
     // A parked run is reviewable against its own base.
@@ -4430,7 +4429,10 @@ fn conflicting_run_needs_a_session_and_lands_after_the_session_resolves_it() {
     assert_eq!(validated.payload["receipt"]["commit"], json!(source));
     assert!(validated.payload["receipt"].get("follow_ups").is_none());
     assert_eq!(
-        git_out(&repo, &["rev-parse", &format!("refs/dagq/runs/{}", run.id)]),
+        git_out(
+            &repo,
+            &["rev-parse", &format!("refs/dagq/runs/{}", run.id())]
+        ),
         resolved
     );
     assert_eq!(
@@ -4452,7 +4454,7 @@ fn conflicting_run_needs_a_session_and_lands_after_the_session_resolves_it() {
         TaskStatus::Completed
     );
     // The parked attempts were before the landing; the reason is cleared.
-    assert!(landed.last_error.is_none());
+    assert!(landed.last_error().is_none());
     let detail = queue.show(TaskId::new(2)).unwrap();
     let kinds = event_kinds(&detail);
     assert_eq!(
@@ -4485,7 +4487,7 @@ fn parked_conflict(repo: &Path, db: &Path, backend: &TestWorkspace) -> (TaskRun,
     let parked = integrate(db, 2, repo).unwrap();
     assert_eq!(parked["outcome"], "needs_session", "{parked}");
     let run = queue.show(TaskId::new(2)).unwrap().runs[0].clone();
-    assert_eq!(run.status, RunStatus::NeedsSession);
+    assert_eq!(run.status(), RunStatus::NeedsSession);
     (run, first_landed)
 }
 
@@ -4511,7 +4513,7 @@ fn approved_needs_session_run_is_resumed_until_the_runtime_lands_it() {
     let backend = TestWorkspace::new(&db, false, VALID_AGENT);
     let (run, first_landed) = parked_conflict(&repo, &db, &backend);
     let mut queue = SqliteQueue::open(&db).unwrap();
-    let reason = run.last_error.clone().unwrap();
+    let reason = run.last_error().unwrap().to_owned();
     let detail = queue.show(TaskId::new(2)).unwrap();
     assert_eq!(
         payloads(&detail, "integration_approved"),
@@ -4520,7 +4522,7 @@ fn approved_needs_session_run_is_resumed_until_the_runtime_lands_it() {
     // The inbox is told the runtime takes it from here.
     let status = runtime::status(&db).unwrap();
     assert_eq!(
-        run_attention_of(&status, &run.id).unwrap()["next"],
+        run_attention_of(&status, run.id()).unwrap()["next"],
         "resuming (runtime)"
     );
 
@@ -4564,12 +4566,12 @@ fn approved_needs_session_run_is_resumed_until_the_runtime_lands_it() {
         assert_eq!(payload["approved"], true);
         assert_eq!(payload["workspace_closed"], true);
     }
-    assert_eq!(finished[0]["head"], json!(run.result_commit));
+    assert_eq!(finished[0]["head"], json!(run.result_commit()));
     assert_eq!(
         finished[1]["head"],
         json!(git_out(
             &repo,
-            &["rev-parse", &format!("refs/dagq/runs/{}", run.id)]
+            &["rev-parse", &format!("refs/dagq/runs/{}", run.id())]
         ))
     );
     // Each resume ends before its landing starts; one landing conflicted.
@@ -4605,14 +4607,14 @@ fn approved_needs_session_run_is_resumed_until_the_runtime_lands_it() {
     // Same wrapper and runtime snapshot as the worker, under the resume name.
     let resumes = backend.resumes.lock().unwrap().clone();
     assert_eq!(resumes.len(), 2);
-    let run_dir = Path::new(run.run_dir.as_ref().unwrap());
+    let run_dir = Path::new(run.run_dir().unwrap());
     for (name, command) in &resumes {
         assert_eq!(name, "[repo's directory]worker#2 - second");
         assert!(
             command.contains(&shell_join(&[
                 "session".into(),
                 "--run".into(),
-                run.id.to_string()
+                run.id().to_string()
             ])),
             "{command}"
         );
@@ -4630,19 +4632,19 @@ fn approved_needs_session_run_is_resumed_until_the_runtime_lands_it() {
     for expected in [
         format!(
             "dagq: integrate could not land run {} (task 2) and returned needs_session.",
-            run.id
+            run.id()
         ),
         format!("Reason: {reason}"),
         format!(
             "main is now {first_landed} (your base commit was {}).",
-            run.base_commit
+            run.base_commit()
         ),
         "Tasks landed on main since your base:\n- task 1: test task; summary: done".to_owned(),
         format!("git rebase {first_landed}"),
         "[\"test -f seed.txt\"]".to_owned(),
         format!(
             "Rewrite the receipt at {} with the new head commit",
-            run.receipt_path.as_ref().unwrap()
+            run.receipt_path().unwrap()
         ),
         "result failed".to_owned(),
         format!("4. {}", runtime::STOP_BACKGROUND),
@@ -4668,7 +4670,7 @@ fn approved_needs_session_run_is_resumed_until_the_runtime_lands_it() {
         dagq::watch::events(&db, cursor, 100, false).unwrap()["events"],
         json!([])
     );
-    assert!(run_attention_of(&runtime::status(&db).unwrap(), &run.id).is_none());
+    assert!(run_attention_of(&runtime::status(&db).unwrap(), run.id()).is_none());
 }
 
 /// A `needs_session` run that no `integrate` approved (here standing in for
@@ -4687,12 +4689,12 @@ fn unapproved_resumed_run_is_validated_and_reviewed_with_its_session_open() {
         .unwrap()
         .execute(
             "DELETE FROM run_events WHERE run_id=?1 AND kind='integration_approved'",
-            [&run.id],
+            [&run.id()],
         )
         .unwrap();
     queue
         .record_runtime_event(
-            &run.id,
+            run.id(),
             "evidence_missing",
             json!({"status": "needs_session", "reason": "e2e has no evidence"}),
         )
@@ -4709,8 +4711,8 @@ fn unapproved_resumed_run_is_validated_and_reviewed_with_its_session_open() {
 
     let detail = queue.show(TaskId::new(2)).unwrap();
     let back = detail.runs[0].clone();
-    assert_eq!(back.status, RunStatus::AwaitingIntegration);
-    assert_eq!(back.result_commit, run.result_commit);
+    assert_eq!(back.status(), RunStatus::AwaitingIntegration);
+    assert_eq!(back.result_commit(), run.result_commit());
     assert!(queue.run_leases().unwrap().is_empty());
     assert_eq!(git_out(&repo, &["rev-parse", "main"]), first_landed);
     let finished = payloads(&detail, "resume_finished");
@@ -4778,7 +4780,7 @@ fn unapproved_resumed_run_is_validated_and_reviewed_with_its_session_open() {
     assert_eq!(events["events"][0]["kind"], "review_failed", "{events}");
     assert_eq!(events["events"][0]["next"], "review by hand");
     let status = runtime::status(&db).unwrap();
-    let attention = run_attention_of(&status, &run.id).unwrap();
+    let attention = run_attention_of(&status, run.id()).unwrap();
     assert_eq!(attention["kind"], "review_failed");
     assert_eq!(attention["next"], "review by hand");
     // Integrating it now is the approval.
@@ -4798,13 +4800,13 @@ fn unapproved_resumed_run_is_validated_and_reviewed_with_its_session_open() {
 fn unresolved_attempt(db: &Path, run: &TaskRun, main: &str) {
     let mut queue = SqliteQueue::open(db).unwrap();
     let (_, attempt) = queue
-        .begin_resume(&run.id, "earlier", &sha(main), None, 3)
+        .begin_resume(run.id(), "earlier", &sha(main), None, 3)
         .unwrap()
         .unwrap();
     assert_eq!(attempt, 1);
     queue
         .finish_resume(
-            &run.id,
+            run.id(),
             "earlier",
             None,
             None,
@@ -4817,7 +4819,7 @@ fn unresolved_attempt(db: &Path, run: &TaskRun, main: &str) {
 /// Resolve the parked conflict in the run's worktree on top of `main` as
 /// that session did, and return the new head.
 fn resolve_in_worktree(run: &TaskRun, main: &str) -> String {
-    let worktree = Path::new(run.worktree_path.as_ref().unwrap());
+    let worktree = Path::new(run.worktree_path().unwrap());
     let rebase = Command::new("git")
         .arg("-C")
         .arg(worktree)
@@ -4913,7 +4915,7 @@ fn an_unapproved_run_resolved_by_an_earlier_resume_is_validated_without_a_sessio
         .unwrap()
         .execute(
             "DELETE FROM run_events WHERE run_id=?1 AND kind='integration_approved'",
-            [&run.id],
+            [&run.id()],
         )
         .unwrap();
     unresolved_attempt(&db, &run, &first_landed);
@@ -4926,9 +4928,9 @@ fn an_unapproved_run_resolved_by_an_earlier_resume_is_validated_without_a_sessio
 
     let detail = queue.show(TaskId::new(2)).unwrap();
     let back = &detail.runs[0];
-    assert_eq!(back.status, RunStatus::AwaitingIntegration);
+    assert_eq!(back.status(), RunStatus::AwaitingIntegration);
     assert_eq!(
-        back.result_commit.as_ref().map(CommitSha::as_str),
+        back.result_commit().map(CommitSha::as_str),
         Some(resolved.as_str())
     );
     assert_eq!(git_out(&repo, &["rev-parse", "main"]), first_landed);
@@ -4992,7 +4994,7 @@ fn a_run_parked_again_after_a_skip_is_resumed_not_skipped() {
     assert_eq!(outcome["errors"].as_array().unwrap().len(), 2, "{outcome}");
     let mut queue = SqliteQueue::open(&db).unwrap();
     let detail = queue.show(TaskId::new(2)).unwrap();
-    assert_eq!(detail.runs[0].status, RunStatus::NeedsSession);
+    assert_eq!(detail.runs[0].status(), RunStatus::NeedsSession);
     assert_eq!(git_out(&repo, &["rev-parse", "main"]), first_landed);
     assert_eq!(payloads(&detail, "resume_skipped").len(), 1);
     let kinds = event_kinds(&detail);
@@ -5036,7 +5038,7 @@ fn a_skipped_run_whose_supervisor_died_is_adopted() {
         .unwrap()
         .execute(
             "DELETE FROM run_events WHERE run_id=?1 AND kind='integration_approved'",
-            [&run.id],
+            [&run.id()],
         )
         .unwrap();
     // The attempt clears the worker's process rows: no wrapper is left.
@@ -5044,17 +5046,23 @@ fn a_skipped_run_whose_supervisor_died_is_adopted() {
     let resolved = resolve_in_worktree(&run, &first_landed);
     write_receipt(&run, &resolved, "succeeded", "resolved");
     let mut queue = SqliteQueue::open(&db).unwrap();
-    assert!(queue.processes(&run.id).unwrap().is_empty());
+    assert!(queue.processes(run.id()).unwrap().is_empty());
     let skipped = queue
-        .skip_resume(&run.id, "dead", &sha(&resolved), &sha(&first_landed), false)
+        .skip_resume(
+            run.id(),
+            "dead",
+            &sha(&resolved),
+            &sha(&first_landed),
+            false,
+        )
         .unwrap()
         .unwrap();
-    assert_eq!(skipped.status, RunStatus::Validating);
+    assert_eq!(skipped.status(), RunStatus::Validating);
     // Taken already: a second skip or resume finds it leased.
     assert!(
         queue
             .skip_resume(
-                &run.id,
+                run.id(),
                 "other",
                 &sha(&resolved),
                 &sha(&first_landed),
@@ -5067,14 +5075,14 @@ fn a_skipped_run_whose_supervisor_died_is_adopted() {
         .unwrap()
         .execute(
             "UPDATE run_leases SET pid=?2 WHERE run_id=?1",
-            rusqlite::params![run.id, dead_pid()],
+            rusqlite::params![run.id(), dead_pid()],
         )
         .unwrap();
 
     let outcome = supervise(&db, &repo, &backend).unwrap();
     assert_eq!(outcome["errors"], json!([]), "{outcome}");
     let detail = queue.show(TaskId::new(2)).unwrap();
-    assert_eq!(detail.runs[0].status, RunStatus::AwaitingIntegration);
+    assert_eq!(detail.runs[0].status(), RunStatus::AwaitingIntegration);
     assert!(backend.resumes.lock().unwrap().is_empty());
     let adopted = payloads(&detail, "run_adopted");
     assert_eq!(adopted.len(), 1, "{:?}", event_kinds(&detail));
@@ -5102,13 +5110,13 @@ fn a_run_missing_any_condition_of_the_skip_is_resumed() {
         ("the receipt names the old head", |_, _, run, _| {
             write_receipt(
                 run,
-                run.result_commit.as_ref().unwrap().as_str(),
+                run.result_commit().unwrap().as_str(),
                 "succeeded",
                 "stale",
             );
         }),
         ("the worktree is dirty", |_, _, run, _| {
-            let worktree = Path::new(run.worktree_path.as_ref().unwrap());
+            let worktree = Path::new(run.worktree_path().unwrap());
             fs::write(worktree.join("stray.txt"), "left over\n").unwrap();
         }),
         ("main moved past the head", |repo, _, _, _| {
@@ -5127,7 +5135,7 @@ fn a_run_missing_any_condition_of_the_skip_is_resumed() {
                 .unwrap()
                 .execute(
                     "UPDATE tasks SET required_evidence='[\"e2e\"]' WHERE id=?1",
-                    [run.task_id],
+                    [run.task_id()],
                 )
                 .unwrap();
         }),
@@ -5140,7 +5148,7 @@ fn a_run_missing_any_condition_of_the_skip_is_resumed() {
             SqliteQueue::open(&db)
                 .unwrap()
                 .record_runtime_event(
-                    &run.id,
+                    run.id(),
                     "landing_decided",
                     json!({"status": "needs_session", "reason": "findings sent back"}),
                 )
@@ -5170,7 +5178,7 @@ fn a_run_missing_any_condition_of_the_skip_is_resumed() {
         assert_eq!(started.len(), usize::from(index != 0) + 1, "{case}");
         let finished = payloads(&detail, "resume_finished");
         assert_eq!(finished.last().unwrap()["outcome"], "error", "{case}");
-        assert_eq!(detail.runs[0].status, RunStatus::NeedsSession, "{case}");
+        assert_eq!(detail.runs[0].status(), RunStatus::NeedsSession, "{case}");
     }
 }
 
@@ -5190,7 +5198,7 @@ fn resuming_stops_after_three_attempts() {
     backend.resume_timeout = Duration::from_secs(1);
     let (run, _) = parked_conflict(&repo, &db, &backend);
     let mut queue = SqliteQueue::open(&db).unwrap();
-    let reason = run.last_error.clone().unwrap();
+    let reason = run.last_error().unwrap().to_owned();
 
     // No resume script: the workspace cannot be opened.
     let outcome = supervise(&db, &repo, &backend).unwrap();
@@ -5203,7 +5211,7 @@ fn resuming_stops_after_three_attempts() {
     // The failed cmux call itself is recorded on the run (task 109).
     let failures = backend_failures(&detail);
     assert_eq!(failures.len(), 1, "{:?}", event_kinds(&detail));
-    assert_eq!(failures[0].run_id.as_ref(), Some(&run.id));
+    assert_eq!(failures[0].run_id.as_ref(), Some(run.id()));
     assert_eq!(failures[0].payload["op"], "create_resume");
     assert!(
         finished[0]["error"]
@@ -5211,7 +5219,7 @@ fn resuming_stops_after_three_attempts() {
             .unwrap()
             .contains("no resume script")
     );
-    assert_eq!(detail.runs[0].last_error.as_deref(), Some(reason.as_str()));
+    assert_eq!(detail.runs[0].last_error(), Some(reason.as_str()));
     assert!(queue.run_leases().unwrap().is_empty());
 
     // The second attempt answers without resolving and goes idle; the third
@@ -5225,9 +5233,9 @@ fn resuming_stops_after_three_attempts() {
     backend.join();
     assert_eq!(outcome["errors"], json!([]), "{outcome}");
     let detail = queue.show(TaskId::new(2)).unwrap();
-    assert_eq!(detail.runs[0].status, RunStatus::Failed);
+    assert_eq!(detail.runs[0].status(), RunStatus::Failed);
     assert_eq!(
-        detail.runs[0].last_error.as_deref(),
+        detail.runs[0].last_error(),
         Some(format!("resumed 3 times (at most 3) and still needs a session: {reason}").as_str())
     );
     let started = payloads(&detail, "resume_started");
@@ -5255,7 +5263,7 @@ fn resuming_stops_after_three_attempts() {
     assert_eq!(asks.len(), 1, "{asks:?}");
     let ask = asks[0].clone();
     assert_eq!(ask.kind, AskKind::Decide);
-    assert_eq!(ask.run_id.as_ref(), Some(&run.id));
+    assert_eq!(ask.run_id.as_ref(), Some(run.id()));
     assert_eq!(ask.asked_by, "supervisor");
     assert_eq!(ask.options, ["retry", "cancel"]);
     assert!(
@@ -5280,7 +5288,7 @@ fn resuming_stops_after_three_attempts() {
     assert_eq!(listed[0]["kind"], "ask_opened");
     assert_eq!(listed[0]["next"], format!("answer ask {}", ask.id));
     let status = runtime::status(&db).unwrap();
-    assert!(run_attention_of(&status, &run.id).is_none(), "{status}");
+    assert!(run_attention_of(&status, run.id()).is_none(), "{status}");
     // No fourth attempt, no second ask.
     let outcome = supervise(&db, &repo, &backend).unwrap();
     assert_eq!(outcome["runs"], json!([]), "{outcome}");
@@ -5329,7 +5337,7 @@ fn a_resumed_session_that_ignores_exit_is_let_go() {
     let kept = finished[0]["workspace_id"].as_str().unwrap().to_owned();
     assert!(!backend.closed().contains(&kept));
     assert_eq!(
-        run_attention_of(&runtime::status(&db).unwrap(), &run.id).unwrap()["next"],
+        run_attention_of(&runtime::status(&db).unwrap(), run.id()).unwrap()["next"],
         "resuming (runtime)"
     );
     // Its dialog does not go away by itself: one stuck_exit ask goes to the
@@ -5338,7 +5346,7 @@ fn a_resumed_session_that_ignores_exit_is_let_go() {
     assert_eq!(asks.len(), 1, "{asks:?}");
     let ask = asks[0].clone();
     assert_eq!(ask.kind, AskKind::StuckExit);
-    assert_eq!(ask.run_id.as_ref(), Some(&run.id));
+    assert_eq!(ask.run_id.as_ref(), Some(run.id()));
     assert!(ask.question.contains(&kept), "{}", ask.question);
     assert!(
         ask.question.contains(
@@ -5355,10 +5363,10 @@ fn a_resumed_session_that_ignores_exit_is_let_go() {
     assert!(queue.read_ask(ask.id).unwrap().is_open());
 
     // Its session ends; the workspace it left no longer blocks the run.
-    release_held_session(run.run_dir.as_ref().unwrap());
+    release_held_session(run.run_dir().unwrap());
     backend.join();
     assert_eq!(
-        run_attention_of(&runtime::status(&db).unwrap(), &run.id).unwrap()["next"],
+        run_attention_of(&runtime::status(&db).unwrap(), run.id()).unwrap()["next"],
         "resuming (runtime)"
     );
     backend.resume_script_for(
@@ -5400,28 +5408,28 @@ fn a_session_nobody_watches_blocks_the_resume_until_it_ends() {
     // A supervisor started a resume, its session registered, and then the
     // supervisor died: its lease goes stale while the session lives on.
     let (_, attempt) = queue
-        .begin_resume(&run.id, "dead-supervisor", &sha(&first_landed), None, 3)
+        .begin_resume(run.id(), "dead-supervisor", &sha(&first_landed), None, 3)
         .unwrap()
         .unwrap();
     assert_eq!(attempt, 1);
     assert!(
         queue
-            .begin_resume(&run.id, "another", &sha(&first_landed), None, 3)
+            .begin_resume(run.id(), "another", &sha(&first_landed), None, 3)
             .unwrap()
             .is_none()
     );
     queue
-        .register_resume_wrapper(&run.id, "dead-supervisor", std::process::id())
+        .register_resume_wrapper(run.id(), "dead-supervisor", std::process::id())
         .unwrap();
     assert!(
         queue
-            .register_resume_wrapper(&run.id, "dead-supervisor", std::process::id())
+            .register_resume_wrapper(run.id(), "dead-supervisor", std::process::id())
             .is_err()
     );
     age_lease(&db, &run, 60);
     let status = runtime::status(&db).unwrap();
     assert_eq!(
-        run_attention_of(&status, &run.id).unwrap()["next"],
+        run_attention_of(&status, run.id()).unwrap()["next"],
         "resuming (runtime)"
     );
     let refused = integrate(&db, 2, &repo).unwrap_err();
@@ -5438,10 +5446,10 @@ fn a_session_nobody_watches_blocks_the_resume_until_it_ends() {
 
     // Its session ends; the next supervisor takes the stale lease over.
     queue
-        .wrapper_exited(&run.id, std::process::id(), 0)
+        .wrapper_exited(run.id(), std::process::id(), 0)
         .unwrap();
     assert_eq!(
-        run_attention_of(&runtime::status(&db).unwrap(), &run.id).unwrap()["next"],
+        run_attention_of(&runtime::status(&db).unwrap(), run.id()).unwrap()["next"],
         "resuming (runtime)"
     );
     backend.resume_script_for(
@@ -5490,16 +5498,16 @@ fn resumed_session_with_a_failed_receipt_fails_the_run() {
     assert_eq!(outcome["runs"][0]["status"], "failed", "{outcome}");
     let mut queue = SqliteQueue::open(&db).unwrap();
     let detail = queue.show(TaskId::new(2)).unwrap();
-    assert_eq!(detail.runs[0].status, RunStatus::Failed);
+    assert_eq!(detail.runs[0].status(), RunStatus::Failed);
     assert_eq!(
-        detail.runs[0].last_error.as_deref(),
+        detail.runs[0].last_error(),
         Some("session reported the run as failed: already on main")
     );
     let finished = payloads(&detail, "resume_finished");
     assert_eq!(finished[0]["outcome"], "failed");
     assert_eq!(finished[0]["status"], "failed");
     assert_eq!(git_out(&repo, &["rev-parse", "main"]), first_landed);
-    assert!(Path::new(run.worktree_path.as_ref().unwrap()).exists());
+    assert!(Path::new(run.worktree_path().unwrap()).exists());
     // The failed run goes to the triage; the stub `claude` prints no
     // verdict, so the triage fails and the run waits for a person.
     let failed = payloads(&detail, "triage_failed");
@@ -5513,7 +5521,7 @@ fn resumed_session_with_a_failed_receipt_fails_the_run() {
         failed[0]
     );
     assert_eq!(
-        run_attention_of(&runtime::status(&db).unwrap(), &run.id).unwrap()["next"],
+        run_attention_of(&runtime::status(&db).unwrap(), run.id()).unwrap()["next"],
         "triage by hand"
     );
 }
@@ -5538,7 +5546,7 @@ fn failed_receipt_from_a_session_ends_the_run_without_landing() {
     let run = queue.show(TaskId::new(2)).unwrap().runs[0].clone();
     write_receipt(
         &run,
-        run.result_commit.as_ref().map(CommitSha::as_str).unwrap(),
+        run.result_commit().map(CommitSha::as_str).unwrap(),
         "failed",
         "already covered by task 1",
     );
@@ -5547,9 +5555,9 @@ fn failed_receipt_from_a_session_ends_the_run_without_landing() {
     let reason = outcome["reason"].as_str().unwrap();
     assert!(reason.contains("already covered by task 1"), "{reason}");
     let failed = queue.show(TaskId::new(2)).unwrap().runs[0].clone();
-    assert_eq!(failed.status, RunStatus::Failed);
-    assert_eq!(failed.last_error.as_deref(), Some(reason));
-    assert!(Path::new(failed.worktree_path.as_ref().unwrap()).exists());
+    assert_eq!(failed.status(), RunStatus::Failed);
+    assert_eq!(failed.last_error(), Some(reason));
+    assert!(Path::new(failed.worktree_path().unwrap()).exists());
     assert_eq!(git_out(&repo, &["rev-parse", "main"]), main);
     assert!(
         git_out(&repo, &["for-each-ref", "refs/dagq/runs/"])
@@ -5574,7 +5582,7 @@ fn failed_receipt_from_a_session_ends_the_run_without_landing() {
         failed_event.payload["receipt"],
         session_receipt(
             &run,
-            run.result_commit.as_ref().map(CommitSha::as_str).unwrap(),
+            run.result_commit().map(CommitSha::as_str).unwrap(),
             "failed",
             "already covered by task 1"
         )
@@ -5641,18 +5649,18 @@ fn verification_failure_after_rebase_needs_a_session_and_keeps_the_rebased_tree(
         reason.contains("\"test -f seed.txt\" exited with 1 after the rebase"),
         "{reason}"
     );
-    let worktree = PathBuf::from(run.worktree_path.as_ref().unwrap());
+    let worktree = PathBuf::from(run.worktree_path().unwrap());
     let head = git_out(&worktree, &["rev-parse", "HEAD"]);
-    assert_ne!(head, run.result_commit.clone().unwrap());
+    assert_ne!(head, run.result_commit().cloned().unwrap());
     assert_eq!(git_out(&worktree, &["rev-parse", "HEAD^"]), main);
     assert_eq!(git_out(&worktree, &["status", "--porcelain"]), "");
     assert!(
-        Path::new(run.run_dir.as_ref().unwrap())
+        Path::new(run.run_dir().unwrap())
             .join("integrate-verify-1.log")
             .exists()
     );
     let parked = queue.show(victim).unwrap().runs[0].clone();
-    assert_eq!(parked.status, RunStatus::NeedsSession);
+    assert_eq!(parked.status(), RunStatus::NeedsSession);
     assert_eq!(git_out(&repo, &["rev-parse", "main"]), main);
     // The receipt was read and recorded before the verification failed.
     let detail = queue.show(victim).unwrap();
@@ -5660,14 +5668,14 @@ fn verification_failure_after_rebase_needs_a_session_and_keeps_the_rebased_tree(
     assert_eq!(recorded.len(), 1, "{recorded:?}");
     assert_eq!(
         recorded[0]["commit"],
-        json!(run.result_commit.clone().unwrap())
+        json!(run.result_commit().cloned().unwrap())
     );
     assert_eq!(recorded[0]["main"], json!(main));
-    assert_eq!(recorded[0]["receipt"]["run_id"], json!(run.id));
+    assert_eq!(recorded[0]["receipt"]["run_id"], json!(run.id()));
     assert_eq!(recorded[0]["receipt"]["result"], "succeeded");
     assert_eq!(
         recorded[0]["receipt"]["commit"],
-        json!(run.result_commit.clone().unwrap())
+        json!(run.result_commit().cloned().unwrap())
     );
     let kinds = event_kinds(&detail);
     let receipt_at = kinds
@@ -5703,7 +5711,7 @@ fn verification_failure_after_rebase_needs_a_session_and_keeps_the_rebased_tree(
         recorded[1]["commit"],
         json!(git_out(
             &repo,
-            &["rev-parse", &format!("refs/dagq/runs/{}", run.id)]
+            &["rev-parse", &format!("refs/dagq/runs/{}", run.id())]
         ))
     );
 }
@@ -5732,32 +5740,32 @@ fn integration_slot_is_exclusive_and_an_abandoned_landing_is_recoverable() {
 
     // Take the slot by hand, as a crashed `integrate` would have.
     let taken = queue
-        .begin_integration(&run.id, "crashed", &sha(&seed))
+        .begin_integration(run.id(), "crashed", &sha(&seed))
         .unwrap();
-    assert_eq!(taken.status, RunStatus::Integrating);
+    assert_eq!(taken.status(), RunStatus::Integrating);
     assert!(queue.transition(TaskId::new(1), TaskAction::Ready).is_err());
     let error = format!("{:#}", integrate(&db, other.as_i64(), &repo).unwrap_err());
     assert!(
-        error.contains(&format!("run {} is integrating", run.id)),
+        error.contains(&format!("run {} is integrating", run.id())),
         "{error}"
     );
     let error = format!("{:#}", integrate(&db, 1, &repo).unwrap_err());
     assert!(error.contains("is already integrating"), "{error}");
     assert!(
         queue
-            .begin_integration(&run.id, "again", &sha(&seed))
+            .begin_integration(run.id(), "again", &sha(&seed))
             .is_err()
     );
     assert_eq!(
-        queue.show(other).unwrap().runs[0].status,
+        queue.show(other).unwrap().runs[0].status(),
         RunStatus::AwaitingIntegration
     );
     // It is visible while alive, and recoverable once its process is gone.
     let report = runtime::doctor(&db, true).unwrap();
-    assert_eq!(report["runs"][0]["run_id"], json!(run.id));
+    assert_eq!(report["runs"][0]["run_id"], json!(run.id()));
     assert_eq!(report["runs"][0]["status"], "integrating");
     assert_eq!(report["runs"][0]["recoverable"], false);
-    assert!(runtime::recover(&db, &run.id).is_err());
+    assert!(runtime::recover(&db, run.id()).is_err());
     Connection::open(&db)
         .unwrap()
         .execute("UPDATE run_leases SET heartbeat_at=0, pid=?1", [dead_pid()])
@@ -5766,7 +5774,7 @@ fn integration_slot_is_exclusive_and_an_abandoned_landing_is_recoverable() {
         runtime::doctor(&db, true).unwrap()["runs"][0]["recoverable"],
         true
     );
-    let recovered = runtime::recover(&db, &run.id).unwrap();
+    let recovered = runtime::recover(&db, run.id()).unwrap();
     assert_eq!(recovered["run"]["status"], "awaiting_integration");
     let event = queue
         .show(TaskId::new(1))
@@ -5789,14 +5797,8 @@ fn integration_slot_is_exclusive_and_an_abandoned_landing_is_recoverable() {
         "{error}"
     );
     let returned = queue.show(TaskId::new(1)).unwrap().runs[0].clone();
-    assert_eq!(returned.status, RunStatus::AwaitingIntegration);
-    assert!(
-        returned
-            .last_error
-            .as_ref()
-            .unwrap()
-            .contains("before main moved")
-    );
+    assert_eq!(returned.status(), RunStatus::AwaitingIntegration);
+    assert!(returned.last_error().unwrap().contains("before main moved"));
     assert!(event_kinds(&queue.show(TaskId::new(1)).unwrap()).contains(&"integration_error"));
     assert_eq!(git_out(&repo, &["rev-parse", "main"]), seed);
     assert!(queue.run_leases().unwrap().is_empty());
@@ -5839,12 +5841,12 @@ fn independent_tasks_run_concurrently_and_a_dependent_starts_after_integration()
             .active_runs()
             .unwrap()
             .into_iter()
-            .filter(|r| r.status == RunStatus::Running)
+            .filter(|r| r.status() == RunStatus::Running)
             .collect();
         running.len() == 2
             && running
                 .iter()
-                .all(|r| queue.run_lease(&r.id).unwrap().is_some())
+                .all(|r| queue.run_lease(r.id()).unwrap().is_some())
     });
     assert!(queue.show(TaskId::new(3)).unwrap().runs.is_empty());
     let status = runtime::status(&db).unwrap();
@@ -5872,7 +5874,8 @@ fn independent_tasks_run_concurrently_and_a_dependent_starts_after_integration()
     // prints no verdict, so each waits for a review by hand).
     wait_until(&db, Duration::from_secs(30), |queue| {
         [1, 2].iter().all(|task| {
-            queue.show(TaskId::new(*task)).unwrap().runs[0].status == RunStatus::AwaitingIntegration
+            queue.show(TaskId::new(*task)).unwrap().runs[0].status()
+                == RunStatus::AwaitingIntegration
         }) && queue.run_leases().unwrap().is_empty()
     });
     // Awaiting integration does not satisfy the dependency; the loop idles.
@@ -5881,18 +5884,17 @@ fn independent_tasks_run_concurrently_and_a_dependent_starts_after_integration()
     assert!(queue.candidates().unwrap().is_empty());
     let first = queue.show(TaskId::new(1)).unwrap().runs[0].clone();
     let second = queue.show(TaskId::new(2)).unwrap().runs[0].clone();
-    assert_ne!(first.workspace_id, second.workspace_id);
-    assert_eq!(first.base_commit, second.base_commit);
+    assert_ne!(first.workspace_id(), second.workspace_id());
+    assert_eq!(first.base_commit(), second.base_commit());
     assert!(queue.run_leases().unwrap().is_empty());
 
     // Landing unblocks the dependent; the resident loop claims it from the landed main.
     assert_eq!(integrate(&db, 1, &repo).unwrap()["outcome"], "integrated");
     let landed = git_out(&repo, &["rev-parse", "main"]);
-    assert_ne!(landed, first.result_commit.clone().unwrap());
+    assert_ne!(landed, first.result_commit().cloned().unwrap());
     assert_eq!(
         queue.show(TaskId::new(1)).unwrap().runs[0]
-            .result_commit
-            .as_ref()
+            .result_commit()
             .map(CommitSha::as_str),
         Some(landed.as_str())
     );
@@ -5902,11 +5904,11 @@ fn independent_tasks_run_concurrently_and_a_dependent_starts_after_integration()
             .unwrap()
             .runs
             .first()
-            .is_some_and(|r| r.status == RunStatus::AwaitingIntegration)
+            .is_some_and(|r| r.status() == RunStatus::AwaitingIntegration)
     });
     let third = queue.show(TaskId::new(3)).unwrap().runs[0].clone();
-    assert_eq!(third.base_commit, landed);
-    assert_ne!(third.base_commit, second.base_commit);
+    assert_eq!(*third.base_commit(), landed);
+    assert_ne!(third.base_commit(), second.base_commit());
 
     // A graceful stop ends the loop once nothing is active.
     options.stop.store(true, Ordering::SeqCst);
@@ -5957,31 +5959,31 @@ fn a_timed_out_run_is_kept_while_the_other_run_is_accepted() {
                 .runs
                 .first()
                 .is_some_and(|r| {
-                    r.status == RunStatus::AwaitingIntegration
-                        && queue.run_lease(&r.id).unwrap().is_none()
+                    r.status() == RunStatus::AwaitingIntegration
+                        && queue.run_lease(r.id()).unwrap().is_none()
                 })
     });
     let stuck = queue.show(TaskId::new(1)).unwrap().runs[0].clone();
     let healthy = queue.show(TaskId::new(2)).unwrap().runs[0].clone();
-    assert!(healthy.last_error.is_none());
-    assert!(healthy.workspace_closed_at.is_some());
+    assert!(healthy.last_error().is_none());
+    assert!(healthy.workspace_closed_at().is_some());
     // The stuck session held back the /exit that followed its review, so
     // its run is already accepted and its supervisor still holds it.
-    assert_eq!(stuck.status, RunStatus::AwaitingIntegration);
-    assert!(stuck.last_error.is_none());
-    assert!(queue.run_lease(&stuck.id).unwrap().is_some());
+    assert_eq!(stuck.status(), RunStatus::AwaitingIntegration);
+    assert!(stuck.last_error().is_none());
+    assert!(queue.run_lease(stuck.id()).unwrap().is_some());
     // Its stuck_exit ask is the attention, not the run (task 104).
     wait_until(&db, Duration::from_secs(10), |queue| {
         queue.asks(AskQuery::default()).unwrap().iter().any(|a| {
             a.kind == AskKind::StuckExit
-                && a.run_id.as_ref().map(RunId::as_str) == Some(stuck.id.as_str())
+                && a.run_id.as_ref().map(RunId::as_str) == Some(stuck.id().as_str())
         })
     });
     let status = runtime::status(&db).unwrap();
-    assert!(run_attention_of(&status, &stuck.id).is_none(), "{status}");
-    assert!(runtime::recover(&db, &stuck.id).is_err());
+    assert!(run_attention_of(&status, stuck.id()).is_none(), "{status}");
+    assert!(runtime::recover(&db, stuck.id()).is_err());
 
-    release_held_session(stuck.run_dir.as_ref().unwrap());
+    release_held_session(stuck.run_dir().unwrap());
     let outcome = supervisor.join().unwrap().unwrap();
     backend.join();
     assert_eq!(outcome["outcome"], "finished");
@@ -5989,7 +5991,7 @@ fn a_timed_out_run_is_kept_while_the_other_run_is_accepted() {
     assert_eq!(outcome["runs"].as_array().unwrap().len(), 2);
     for task in [1, 2] {
         assert_eq!(
-            queue.show(TaskId::new(task)).unwrap().runs[0].status,
+            queue.show(TaskId::new(task)).unwrap().runs[0].status(),
             RunStatus::AwaitingIntegration
         );
     }
@@ -6032,8 +6034,7 @@ fn failed_runs_in_the_same_pass_do_not_affect_the_accepted_run() {
     );
     assert!(
         queue.show(TaskId::new(3)).unwrap().runs[0]
-            .last_error
-            .as_ref()
+            .last_error()
             .unwrap()
             .contains("receipt was not submitted")
     );
@@ -6067,7 +6068,7 @@ fn recovering_one_orphaned_run_leaves_the_other_running() {
     assert_eq!(report["supervisors"].as_array().unwrap().len(), 1);
     assert_eq!(
         report["supervisors"][0]["run_ids"],
-        json!([orphan.id, survivor.id])
+        json!([orphan.id(), survivor.id()])
     );
     assert_eq!(report["supervisors"][0]["stale"], true);
     assert_eq!(report["runs"].as_array().unwrap().len(), 2);
@@ -6086,26 +6087,29 @@ fn recovering_one_orphaned_run_leaves_the_other_running() {
     assert_eq!(report["runs"][0]["recoverable"], true);
     assert_eq!(report["runs"][1]["recoverable"], false);
     assert_eq!(
-        runtime::recover(&db, &orphan.id).unwrap()["run"]["status"],
+        runtime::recover(&db, orphan.id()).unwrap()["run"]["status"],
         "interrupted"
     );
     // The survivor keeps its lease, processes and status; only the orphan changed.
-    assert_eq!(queue.run(&survivor.id).unwrap().status, RunStatus::Running);
+    assert_eq!(
+        queue.run(survivor.id()).unwrap().status(),
+        RunStatus::Running
+    );
     let leases = queue.run_leases().unwrap();
     assert_eq!(leases.len(), 1);
-    assert_eq!(leases[0].run_id, survivor.id);
-    assert_eq!(queue.processes(&survivor.id).unwrap().len(), 2);
-    let error = format!("{:#}", runtime::recover(&db, &survivor.id).unwrap_err());
+    assert_eq!(leases[0].run_id, *survivor.id());
+    assert_eq!(queue.processes(survivor.id()).unwrap().len(), 2);
+    let error = format!("{:#}", runtime::recover(&db, survivor.id()).unwrap_err());
     assert!(error.contains("wrapper pid"), "{error}");
     let status = runtime::status(&db).unwrap();
     assert_eq!(status["runs"].as_array().unwrap().len(), 1);
-    assert_eq!(status["runs"][0]["run_id"], json!(survivor.id));
+    assert_eq!(status["runs"][0]["run_id"], json!(survivor.id()));
     for child in [&mut live_wrapper, &mut live_agent] {
         child.kill().unwrap();
         child.wait().unwrap();
     }
     assert_eq!(
-        runtime::recover(&db, &survivor.id).unwrap()["run"]["status"],
+        runtime::recover(&db, survivor.id()).unwrap()["run"]["status"],
         "interrupted"
     );
     assert!(queue.run_leases().unwrap().is_empty());
@@ -6141,15 +6145,15 @@ fn start_run_under_dead_supervisor(
     else {
         panic!("no candidate to claim")
     };
-    let run_dir = runs_dir(&db.canonicalize().unwrap()).join(run.id.as_str());
+    let run_dir = runs_dir(&db.canonicalize().unwrap()).join(run.id().as_str());
     queue
         .plan_run(
-            &run.id,
+            run.id(),
             token,
             &RunPlan {
                 repo_path: path_text(&repository.root).unwrap(),
                 run_dir: path_text(&run_dir).unwrap(),
-                branch: format!("dagq/{}", run.id),
+                branch: format!("dagq/{}", run.id()),
                 worktree_path: path_text(&run_dir.join("worktree")).unwrap(),
                 receipt_path: path_text(&run_dir.join("receipt.json")).unwrap(),
                 log_path: path_text(&run_dir.join("claude.debug.log")).unwrap(),
@@ -6157,8 +6161,8 @@ fn start_run_under_dead_supervisor(
         )
         .unwrap();
     fs::create_dir_all(&run_dir).unwrap();
-    let run = queue.run(&run.id).unwrap();
-    let task = queue.show(run.task_id).unwrap().task;
+    let run = queue.run(run.id()).unwrap();
+    let task = queue.show(run.task_id()).unwrap().task;
     fs::write(
         run_dir.join("prompt.txt"),
         runtime::prompt(&task, &run, None, &[], &[]).unwrap(),
@@ -6174,11 +6178,13 @@ fn start_run_under_dead_supervisor(
     let workspace = backend
         .create(&task, &run, &command, &WorkspaceTags::default())
         .unwrap();
-    queue.workspace_created(&run.id, token, &workspace).unwrap();
+    queue
+        .workspace_created(run.id(), token, &workspace)
+        .unwrap();
     wait_until(db, Duration::from_secs(10), |queue| {
-        queue.run(&run.id).unwrap().status == RunStatus::Running
+        queue.run(run.id()).unwrap().status() == RunStatus::Running
     });
-    queue.run(&run.id).unwrap()
+    queue.run(run.id()).unwrap()
 }
 
 /// Age the lease of `run` so it is stale by heartbeat while its pid (this
@@ -6188,7 +6194,7 @@ fn age_lease(db: &Path, run: &TaskRun, seconds: i64) {
         .unwrap()
         .execute(
             "UPDATE run_leases SET heartbeat_at=unixepoch()-?2 WHERE run_id=?1",
-            rusqlite::params![run.id, seconds],
+            rusqlite::params![run.id(), seconds],
         )
         .unwrap();
 }
@@ -6207,7 +6213,7 @@ fn supervisor_token_of(db: &Path, run: &TaskRun) -> String {
         .unwrap()
         .query_row(
             "SELECT supervisor_token FROM task_runs WHERE id=?1",
-            [&run.id],
+            [&run.id()],
             |r| r.get(0),
         )
         .unwrap()
@@ -6236,17 +6242,17 @@ fn stale_lease_of_a_live_wrapper_is_adopted_and_driven_to_awaiting_integration()
     backend.join();
     assert_eq!(outcome["outcome"], "finished", "{outcome}");
     assert_eq!(outcome["errors"], json!([]));
-    assert_eq!(outcome["runs"][0]["id"], json!(run.id));
+    assert_eq!(outcome["runs"][0]["id"], json!(run.id()));
     assert_eq!(outcome["runs"][0]["status"], "awaiting_integration");
     assert_eq!(backend.exits_sent.load(Ordering::SeqCst), 1);
     assert_eq!(backend.closed(), vec![WORKSPACE_ID.to_owned()]);
 
     let detail = queue.show(TaskId::new(1)).unwrap();
     let adopted_run = &detail.runs[0];
-    assert_eq!(adopted_run.status, RunStatus::AwaitingIntegration);
-    assert!(adopted_run.last_error.is_none());
-    assert!(adopted_run.result_commit.is_some());
-    assert!(adopted_run.workspace_closed_at.is_some());
+    assert_eq!(adopted_run.status(), RunStatus::AwaitingIntegration);
+    assert!(adopted_run.last_error().is_none());
+    assert!(adopted_run.result_commit().is_some());
+    assert!(adopted_run.workspace_closed_at().is_some());
     assert!(queue.run_leases().unwrap().is_empty());
     let adopted = adoption_events(&detail);
     assert_eq!(adopted.len(), 1, "{adopted:?}");
@@ -6289,7 +6295,7 @@ fn stale_lease_of_a_live_wrapper_is_adopted_and_driven_to_awaiting_integration()
         .iter()
         .find(|e| e.kind == "run_adopted")
         .unwrap();
-    assert_eq!(event.run_id.as_ref(), Some(&run.id));
+    assert_eq!(event.run_id.as_ref(), Some(run.id()));
 }
 
 /// The incident of task 15: the supervisor was killed a moment ago, so its
@@ -6304,7 +6310,7 @@ fn dead_supervisor_pid_with_a_fresh_heartbeat_is_adopted() {
         .unwrap()
         .execute(
             "UPDATE run_leases SET pid=?2, heartbeat_at=unixepoch() WHERE run_id=?1",
-            rusqlite::params![run.id, dead_pid()],
+            rusqlite::params![run.id(), dead_pid()],
         )
         .unwrap();
     let outcome = supervise(&db, &repo, &backend).unwrap();
@@ -6366,12 +6372,12 @@ fn fresh_leases_dead_wrappers_early_runs_leaseless_and_integrating_runs_are_not_
     .unwrap();
     raw.execute(
         "UPDATE run_processes SET heartbeat_at=unixepoch()-31 WHERE run_id IN (?1, ?2)",
-        [&dead_wrapper.id, &silent_wrapper.id],
+        [&dead_wrapper.id(), &silent_wrapper.id()],
     )
     .unwrap();
     // `starting` with a stale lease: register_wrapper needs the claimer's token.
     use dagq::{domain::ClaimOutcome, infrastructure::runtime_store::RunPlan};
-    let base = queue.run(&fresh.id).unwrap().base_commit;
+    let base = queue.run(fresh.id()).unwrap().base_commit().clone();
     let ClaimOutcome::Claimed { run: starting } =
         queue.claim_for_supervisor(&base, "gone-early").unwrap()
     else {
@@ -6379,7 +6385,7 @@ fn fresh_leases_dead_wrappers_early_runs_leaseless_and_integrating_runs_are_not_
     };
     queue
         .plan_run(
-            &starting.id,
+            starting.id(),
             "gone-early",
             &RunPlan {
                 repo_path: "/test".into(),
@@ -6391,14 +6397,14 @@ fn fresh_leases_dead_wrappers_early_runs_leaseless_and_integrating_runs_are_not_
             },
         )
         .unwrap();
-    let starting = queue.run(&starting.id).unwrap();
-    assert_eq!(starting.status, RunStatus::Starting);
+    let starting = queue.run(starting.id()).unwrap();
+    assert_eq!(starting.status(), RunStatus::Starting);
     // `running` without a lease: abandoned by a runtime error or recovered.
     let leaseless = orphan_run(&repo, &db, "abandoned", spawn(), spawn());
     queue
-        .abandon_run(&leaseless.id, "abandoned", "exit request timed out")
+        .abandon_run(leaseless.id(), "abandoned", "exit request timed out")
         .unwrap();
-    assert!(queue.run_lease(&leaseless.id).unwrap().is_none());
+    assert!(queue.run_lease(leaseless.id()).unwrap().is_none());
     // `claimed` with a stale lease.
     let ClaimOutcome::Claimed { run: claimed } =
         queue.claim_for_supervisor(&base, "gone-early").unwrap()
@@ -6417,7 +6423,7 @@ fn fresh_leases_dead_wrappers_early_runs_leaseless_and_integrating_runs_are_not_
             .as_array()
             .unwrap()
             .iter()
-            .find(|r| r["run_id"] == json!(run.id))
+            .find(|r| r["run_id"] == json!(run.id()))
             .cloned()
             .unwrap()
     };
@@ -6440,37 +6446,37 @@ fn fresh_leases_dead_wrappers_early_runs_leaseless_and_integrating_runs_are_not_
         &leaseless,
         &claimed,
     ] {
-        let detail = queue.show(run.task_id).unwrap();
+        let detail = queue.show(run.task_id()).unwrap();
         assert!(
             adoption_events(&detail).is_empty(),
             "run {} of task {} was adopted",
-            run.id,
-            run.task_id
+            run.id(),
+            run.task_id()
         );
-        assert_eq!(queue.run(&run.id).unwrap().status, run.status);
+        assert_eq!(queue.run(run.id()).unwrap().status(), run.status());
     }
     // Leases, tokens and doctor's verdicts are exactly as before the pass.
     assert_eq!(
-        queue.run_lease(&fresh.id).unwrap().unwrap().token,
+        queue.run_lease(fresh.id()).unwrap().unwrap().token,
         "fresh-owner"
     );
     assert_eq!(
-        queue.run_lease(&dead_wrapper.id).unwrap().unwrap().token,
+        queue.run_lease(dead_wrapper.id()).unwrap().unwrap().token,
         "gone"
     );
     assert_eq!(
-        queue.run_lease(&silent_wrapper.id).unwrap().unwrap().token,
+        queue.run_lease(silent_wrapper.id()).unwrap().unwrap().token,
         "gone"
     );
     assert_eq!(
-        queue.run_lease(&starting.id).unwrap().unwrap().token,
+        queue.run_lease(starting.id()).unwrap().unwrap().token,
         "gone-early"
     );
     assert_eq!(
-        queue.run_lease(&claimed.id).unwrap().unwrap().token,
+        queue.run_lease(claimed.id()).unwrap().unwrap().token,
         "gone-early"
     );
-    assert!(queue.run_lease(&leaseless.id).unwrap().is_none());
+    assert!(queue.run_lease(leaseless.id()).unwrap().is_none());
     let after = runtime::doctor(&db, true).unwrap();
     for run in [&fresh, &dead_wrapper, &silent_wrapper, &starting, &claimed] {
         assert_eq!(
@@ -6484,7 +6490,7 @@ fn fresh_leases_dead_wrappers_early_runs_leaseless_and_integrating_runs_are_not_
     }
     assert_eq!(health(&after, &dead_wrapper)["recoverable"], true);
     assert_eq!(
-        runtime::recover(&db, &dead_wrapper.id).unwrap()["run"]["status"],
+        runtime::recover(&db, dead_wrapper.id()).unwrap()["run"]["status"],
         "interrupted"
     );
     for child in &mut children {
@@ -6501,7 +6507,7 @@ fn integrating_run_with_a_stale_lease_is_not_adopted() {
     let mut queue = SqliteQueue::open(&db).unwrap();
     let main = git_out(&repo, &["rev-parse", "main"]);
     queue
-        .begin_integration(&run.id, "crashed", &sha(&main))
+        .begin_integration(run.id(), "crashed", &sha(&main))
         .unwrap();
     Connection::open(&db)
         .unwrap()
@@ -6512,11 +6518,14 @@ fn integrating_run_with_a_stale_lease_is_not_adopted() {
     let outcome = supervise(&db, &repo, &backend).unwrap();
     assert_eq!(outcome["runs"], json!([]), "{outcome}");
     assert_eq!(outcome["errors"], json!([]));
-    assert_eq!(queue.run(&run.id).unwrap().status, RunStatus::Integrating);
-    assert_eq!(queue.run_lease(&run.id).unwrap().unwrap().token, "crashed");
+    assert_eq!(
+        queue.run(run.id()).unwrap().status(),
+        RunStatus::Integrating
+    );
+    assert_eq!(queue.run_lease(run.id()).unwrap().unwrap().token, "crashed");
     assert!(adoption_events(&queue.show(TaskId::new(1)).unwrap()).is_empty());
     assert_eq!(
-        runtime::recover(&db, &run.id).unwrap()["run"]["status"],
+        runtime::recover(&db, run.id()).unwrap()["run"]["status"],
         "awaiting_integration"
     );
 }
@@ -6535,23 +6544,23 @@ fn adopter_does_not_repeat_an_exit_request_the_previous_supervisor_sent() {
         &format!("commit work; receipt \"$(git rev-parse HEAD)\"; idle; {HOLD}"),
     ));
     let run = start_run_under_dead_supervisor(&repo, &db, &backend, "dead-supervisor");
-    let receipt = PathBuf::from(run.receipt_path.as_ref().unwrap());
+    let receipt = PathBuf::from(run.receipt_path().unwrap());
     wait_until(&db, Duration::from_secs(10), |_| receipt.is_file());
     // What the previous supervisor recorded before it died.
     let mut queue = SqliteQueue::open(&db).unwrap();
     queue
         .record_runtime_event(
-            &run.id,
+            run.id(),
             "receipt_observed",
-            json!({"path": run.receipt_path, "validated": false}),
+            json!({"path": run.receipt_path(), "validated": false}),
         )
         .unwrap();
     queue
-        .record_runtime_event(&run.id, "session_idle_observed", json!({}))
+        .record_runtime_event(run.id(), "session_idle_observed", json!({}))
         .unwrap();
     queue
         .record_runtime_event(
-            &run.id,
+            run.id(),
             "exit_requested",
             json!({"workspace_id": WORKSPACE_ID, "timeout_secs": 120}),
         )
@@ -6566,7 +6575,7 @@ fn adopter_does_not_repeat_an_exit_request_the_previous_supervisor_sent() {
     });
     // Several passes over the idle session send nothing.
     thread::sleep(Duration::from_millis(500));
-    release_held_session(run.run_dir.as_ref().unwrap());
+    release_held_session(run.run_dir().unwrap());
     let outcome = supervisor.join().unwrap().unwrap();
     backend.join();
     assert_eq!(
@@ -6606,7 +6615,7 @@ fn adopted_exit_request_times_out_from_the_adoption() {
     let mut queue = SqliteQueue::open(&db).unwrap();
     queue
         .record_runtime_event(
-            &run.id,
+            run.id(),
             "exit_requested",
             json!({"workspace_id": WORKSPACE_ID, "timeout_secs": 120}),
         )
@@ -6619,11 +6628,11 @@ fn adopted_exit_request_times_out_from_the_adoption() {
     wait_until(&db, Duration::from_secs(30), |queue| {
         event_kinds(&queue.show(TaskId::new(1)).unwrap()).contains(&"exit_request_timed_out")
     });
-    assert_eq!(queue.run(&run.id).unwrap().status, RunStatus::Running);
-    let lease = queue.run_lease(&run.id).unwrap().unwrap();
+    assert_eq!(queue.run(run.id()).unwrap().status(), RunStatus::Running);
+    let lease = queue.run_lease(run.id()).unwrap().unwrap();
     assert_ne!(lease.token, "dead-supervisor");
     // Let the fake session out, the way a person answering it would.
-    fs::write(exit_request_path(run.run_dir.as_ref().unwrap()), "").unwrap();
+    fs::write(exit_request_path(run.run_dir().unwrap()), "").unwrap();
     let outcome = supervisor.join().unwrap().unwrap();
     backend.join();
     assert_eq!(outcome["errors"], json!([]), "{outcome}");
@@ -6658,7 +6667,7 @@ fn adopted_run_does_not_record_an_exit_timeout_twice() {
     for kind in ["exit_requested", "exit_request_timed_out"] {
         queue
             .record_runtime_event(
-                &run.id,
+                run.id(),
                 kind,
                 json!({"workspace_id": WORKSPACE_ID, "timeout_secs": 120}),
             )
@@ -6685,14 +6694,14 @@ fn adopted_run_does_not_record_an_exit_timeout_twice() {
             .count(),
         1
     );
-    assert!(queue.run_lease(&run.id).unwrap().is_some());
+    assert!(queue.run_lease(run.id()).unwrap().is_some());
     // The timeout the dead supervisor recorded without its ask gets one
     // stuck_exit ask from the adopter, once.
     let asks = queue.asks(AskQuery::default()).unwrap();
     assert_eq!(asks.len(), 1, "{asks:?}");
     assert_eq!(asks[0].kind, AskKind::StuckExit);
     assert_eq!(backend.notifications.lock().unwrap().len(), 1);
-    fs::write(exit_request_path(run.run_dir.as_ref().unwrap()), "").unwrap();
+    fs::write(exit_request_path(run.run_dir().unwrap()), "").unwrap();
     let outcome = supervisor.join().unwrap().unwrap();
     backend.join();
     assert_eq!(outcome["errors"], json!([]), "{outcome}");
@@ -6726,7 +6735,7 @@ fn adopted_run_does_not_ask_about_its_exit_twice() {
     for kind in ["exit_requested", "exit_request_timed_out"] {
         queue
             .record_runtime_event(
-                &run.id,
+                run.id(),
                 kind,
                 json!({"workspace_id": WORKSPACE_ID, "timeout_secs": 120}),
             )
@@ -6736,7 +6745,7 @@ fn adopted_run_does_not_ask_about_its_exit_twice() {
         .ask(NewAsk {
             kind: AskKind::StuckExit,
             task_id: None,
-            run_id: Some(run.id.clone()),
+            run_id: Some(run.id().clone()),
             question: "send /exit".into(),
             options: Vec::new(),
             asked_by: "supervisor".into(),
@@ -6763,7 +6772,7 @@ fn adopted_run_does_not_ask_about_its_exit_twice() {
             .len(),
         1
     );
-    fs::write(exit_request_path(run.run_dir.as_ref().unwrap()), "").unwrap();
+    fs::write(exit_request_path(run.run_dir().unwrap()), "").unwrap();
     let outcome = supervisor.join().unwrap().unwrap();
     backend.join();
     assert_eq!(outcome["errors"], json!([]), "{outcome}");
@@ -6798,12 +6807,12 @@ fn exited_wrapper_and_validating_runs_are_adopted_and_validated() {
     let validating = start_run_under_dead_supervisor(&repo, &db, &backend, "dead-b");
     backend.join(); // Both sessions end by themselves.
     for run in [&exited, &validating] {
-        assert!(event_kinds(&queue.show(run.task_id).unwrap()).contains(&"session_exited"));
-        assert_eq!(queue.run(&run.id).unwrap().status, RunStatus::Running);
+        assert!(event_kinds(&queue.show(run.task_id()).unwrap()).contains(&"session_exited"));
+        assert_eq!(queue.run(run.id()).unwrap().status(), RunStatus::Running);
     }
-    queue.finish_supervision(&validating.id, "dead-b").unwrap();
+    queue.finish_supervision(validating.id(), "dead-b").unwrap();
     assert_eq!(
-        queue.run(&validating.id).unwrap().status,
+        queue.run(validating.id()).unwrap().status(),
         RunStatus::Validating
     );
     age_lease(&db, &exited, 31);
@@ -6817,13 +6826,18 @@ fn exited_wrapper_and_validating_runs_are_adopted_and_validated() {
     closed.sort();
     assert_eq!(closed, [workspace_id(0), workspace_id(1)]);
     for run in [&exited, &validating] {
-        let detail = queue.show(run.task_id).unwrap();
+        let detail = queue.show(run.task_id()).unwrap();
         let after = &detail.runs[0];
-        assert_eq!(after.status, RunStatus::AwaitingIntegration, "{}", run.id);
-        assert!(after.last_error.is_none(), "{after:?}");
+        assert_eq!(
+            after.status(),
+            RunStatus::AwaitingIntegration,
+            "{}",
+            run.id()
+        );
+        assert!(after.last_error().is_none(), "{after:?}");
         assert!(!event_kinds(&detail).contains(&"exit_requested"));
-        assert!(after.result_commit.is_some());
-        assert!(after.workspace_closed_at.is_some());
+        assert!(after.result_commit().is_some());
+        assert!(after.workspace_closed_at().is_some());
         let adopted = adoption_events(&detail);
         assert_eq!(adopted.len(), 1);
         assert_eq!(adopted[0]["wrapper"]["alive"], Value::Null);
@@ -6846,12 +6860,12 @@ fn exited_wrapper_and_validating_runs_are_adopted_and_validated() {
         // Validation checks the receipt only; integrate runs the commands.
         assert!(!kinds.contains(&"verification_command"));
     }
-    let detail = queue.show(exited.task_id).unwrap();
+    let detail = queue.show(exited.task_id()).unwrap();
     let kinds = event_kinds(&detail);
     let position = |kind: &str| kinds.iter().position(|k| *k == kind).unwrap();
     assert!(position("session_exited") < position("run_adopted"));
     assert!(position("run_adopted") < position("supervision_finished"));
-    let detail = queue.show(validating.task_id).unwrap();
+    let detail = queue.show(validating.task_id()).unwrap();
     let kinds = event_kinds(&detail);
     let position = |kind: &str| kinds.iter().position(|k| *k == kind).unwrap();
     assert!(position("supervision_finished") < position("run_adopted"));
@@ -6892,7 +6906,7 @@ fn two_supervisors_racing_for_one_stale_lease_adopt_it_once() {
     let adopted = adoption_events(&detail);
     assert_eq!(adopted.len(), 1, "{adopted:?}");
     assert_eq!(supervisor_token_of(&db, &run), adopted[0]["token"]);
-    assert_eq!(detail.runs[0].status, RunStatus::AwaitingIntegration);
+    assert_eq!(detail.runs[0].status(), RunStatus::AwaitingIntegration);
 
     // The queue method itself: a second adoption under the old token, or
     // one against a fresh lease, takes nothing.
@@ -6901,39 +6915,46 @@ fn two_supervisors_racing_for_one_stale_lease_adopt_it_once() {
     let second = orphan_run(&repo, &db, "fresh", std::process::id(), std::process::id());
     assert!(
         queue
-            .adopt_run(&second.id, "fresh", "eager", 1, json!({}))
+            .adopt_run(second.id(), "fresh", "eager", 1, json!({}))
             .unwrap()
             .is_none()
     );
-    assert_eq!(queue.run_lease(&second.id).unwrap().unwrap().token, "fresh");
+    assert_eq!(
+        queue.run_lease(second.id()).unwrap().unwrap().token,
+        "fresh"
+    );
     age_lease(&db, &second, 31);
     let taken = queue
-        .adopt_run(&second.id, "fresh", "first", 1, json!({"pid": 1}))
+        .adopt_run(second.id(), "fresh", "first", 1, json!({"pid": 1}))
         .unwrap()
         .unwrap();
-    assert_eq!(taken.status, RunStatus::Running);
+    assert_eq!(taken.status(), RunStatus::Running);
     assert!(
         queue
-            .adopt_run(&second.id, "fresh", "second", 2, json!({}))
+            .adopt_run(second.id(), "fresh", "second", 2, json!({}))
             .unwrap()
             .is_none()
     );
-    let lease = queue.run_lease(&second.id).unwrap().unwrap();
+    let lease = queue.run_lease(second.id()).unwrap().unwrap();
     assert_eq!((lease.token.as_str(), lease.pid), ("first", 1));
     assert!(runtime::unix_time() - lease.heartbeat_at <= 5);
     assert_eq!(supervisor_token_of(&db, &second), "first");
-    assert!(queue.holds_lease(&second.id, "first").unwrap());
-    assert!(!queue.holds_lease(&second.id, "fresh").unwrap());
-    assert!(queue.has_run_event(&second.id, "run_adopted").unwrap());
-    assert!(!queue.has_run_event(&second.id, "receipt_observed").unwrap());
-    let payload = &adoption_events(&queue.show(second.task_id).unwrap())[0].clone();
+    assert!(queue.holds_lease(second.id(), "first").unwrap());
+    assert!(!queue.holds_lease(second.id(), "fresh").unwrap());
+    assert!(queue.has_run_event(second.id(), "run_adopted").unwrap());
+    assert!(
+        !queue
+            .has_run_event(second.id(), "receipt_observed")
+            .unwrap()
+    );
+    let payload = &adoption_events(&queue.show(second.task_id()).unwrap())[0].clone();
     assert_eq!(payload["wrapper"], json!({"pid": 1}));
     assert_eq!(payload["previous_token"], "fresh");
     assert_eq!(payload["previous_pid"], json!(std::process::id()));
     // A `starting` run is refused by the method too, stale or not.
     use dagq::domain::ClaimOutcome;
     let ClaimOutcome::Claimed { run: early } = queue
-        .claim_for_supervisor(&second.base_commit, "early")
+        .claim_for_supervisor(second.base_commit(), "early")
         .unwrap()
     else {
         panic!()
@@ -6941,7 +6962,7 @@ fn two_supervisors_racing_for_one_stale_lease_adopt_it_once() {
     age_lease(&db, &early, 31);
     assert!(
         queue
-            .adopt_run(&early.id, "early", "eager", 1, json!({}))
+            .adopt_run(early.id(), "early", "eager", 1, json!({}))
             .unwrap()
             .is_none()
     );
@@ -6951,7 +6972,12 @@ fn two_supervisors_racing_for_one_stale_lease_adopt_it_once() {
         .as_array()
         .unwrap()
         .iter()
-        .filter(|s| s["run_ids"].as_array().unwrap().contains(&json!(second.id)))
+        .filter(|s| {
+            s["run_ids"]
+                .as_array()
+                .unwrap()
+                .contains(&json!(second.id()))
+        })
         .collect();
     assert_eq!(holders.len(), 1);
     assert_eq!(holders[0]["pid"], 1);
@@ -6975,7 +7001,7 @@ fn a_supervisor_that_lost_its_lease_stops_touching_the_run() {
             .active_runs()
             .unwrap()
             .first()
-            .is_some_and(|r| r.status == RunStatus::Running)
+            .is_some_and(|r| r.status() == RunStatus::Running)
     });
     let mut queue = SqliteQueue::open(&db).unwrap();
     let run = queue.active_runs().unwrap().remove(0);
@@ -6988,14 +7014,14 @@ fn a_supervisor_that_lost_its_lease_stops_touching_the_run() {
         .unwrap()
         .execute(
             "UPDATE run_leases SET token='taken', heartbeat_at=unixepoch()-31 WHERE run_id=?1",
-            [&run.id],
+            [&run.id()],
         )
         .unwrap();
     // The original notices within a tick, drops the run and, draining with
     // nothing active, exits.
     let outcome = original.join().unwrap().unwrap();
-    assert_eq!(queue.run(&run.id).unwrap().status, RunStatus::Running);
-    assert_eq!(queue.run_lease(&run.id).unwrap().unwrap().token, "taken");
+    assert_eq!(queue.run(run.id()).unwrap().status(), RunStatus::Running);
+    assert_eq!(queue.run_lease(run.id()).unwrap().unwrap().token, "taken");
     let adopter = supervise(&db, &repo, &backend).unwrap();
     backend.join();
     assert_eq!(
@@ -7005,7 +7031,7 @@ fn a_supervisor_that_lost_its_lease_stops_touching_the_run() {
     assert_eq!(backend.exits_sent.load(Ordering::SeqCst), 1);
     assert_eq!(outcome["outcome"], "stopped");
     assert_eq!(outcome["runs"], json!([]));
-    assert_eq!(outcome["errors"][0]["run_id"], json!(run.id));
+    assert_eq!(outcome["errors"][0]["run_id"], json!(run.id()));
     assert!(
         outcome["errors"][0]["message"]
             .as_str()
@@ -7014,8 +7040,8 @@ fn a_supervisor_that_lost_its_lease_stops_touching_the_run() {
         "{outcome}"
     );
     let detail = queue.show(TaskId::new(1)).unwrap();
-    assert_eq!(detail.runs[0].status, RunStatus::AwaitingIntegration);
-    assert!(detail.runs[0].last_error.is_none());
+    assert_eq!(detail.runs[0].status(), RunStatus::AwaitingIntegration);
+    assert!(detail.runs[0].last_error().is_none());
     let kinds = event_kinds(&detail);
     assert!(!kinds.contains(&"runtime_error"), "{kinds:?}");
     assert_eq!(kinds.iter().filter(|k| **k == "exit_requested").count(), 1);
@@ -7155,7 +7181,7 @@ fn asks_of_a_run_are_attention_for_the_inbox_until_closed() {
     let new_ask = |question: &str| NewAsk {
         kind: AskKind::Decide,
         task_id: None,
-        run_id: Some(run.id.clone()),
+        run_id: Some(run.id().clone()),
         question: question.into(),
         options: vec!["land".into(), "send back".into()],
         asked_by: "worker".into(),
@@ -7175,11 +7201,11 @@ fn asks_of_a_run_are_attention_for_the_inbox_until_closed() {
     };
     let opened = queue.ask(new_ask(&"q".repeat(250))).unwrap();
     assert!(opened.created);
-    assert_eq!(opened.ask.task_id, Some(run.task_id));
+    assert_eq!(opened.ask.task_id, Some(run.task_id()));
     let woke = watcher.join().unwrap();
     assert_eq!(
         woke["events"],
-        json!([{"id": before + 1, "kind": "ask_opened", "task_id": 1, "run_id": run.id,
+        json!([{"id": before + 1, "kind": "ask_opened", "task_id": 1, "run_id": run.id(),
                 "ask_id": opened.ask.id, "next": format!("answer ask {}", opened.ask.id),
                 "created_at": woke["events"][0]["created_at"]}])
     );
@@ -7202,7 +7228,7 @@ fn asks_of_a_run_are_attention_for_the_inbox_until_closed() {
     assert_eq!(
         ask_attention,
         [
-            &json!({"run_id": run.id, "task_id": 1, "ask_id": opened.ask.id, "status": "open",
+            &json!({"run_id": run.id(), "task_id": 1, "ask_id": opened.ask.id, "status": "open",
                 "kind": "ask_opened", "last_error": null,
                 "next": format!("answer ask {}", opened.ask.id)})
         ]
@@ -7211,7 +7237,7 @@ fn asks_of_a_run_are_attention_for_the_inbox_until_closed() {
     assert_eq!(asks.len(), 1);
     assert_eq!(asks[0]["kind"], "decide");
     assert_eq!(asks[0]["asked_by"], "worker");
-    assert_eq!(asks[0]["run_id"], json!(run.id));
+    assert_eq!(asks[0]["run_id"], json!(run.id()));
     assert!(asks[0]["age_secs"].as_i64().unwrap() >= 0);
     assert_eq!(
         asks[0]["question"].as_str().unwrap().chars().count(),
@@ -7221,7 +7247,7 @@ fn asks_of_a_run_are_attention_for_the_inbox_until_closed() {
     // The run's own attention keeps the event that brought it there (the
     // stand-in `claude` printed no verdict, so its review failed).
     assert_eq!(
-        run_attention_of(&status, &run.id).unwrap()["kind"],
+        run_attention_of(&status, run.id()).unwrap()["kind"],
         "review_failed"
     );
     assert!(
@@ -7243,7 +7269,7 @@ fn asks_of_a_run_are_attention_for_the_inbox_until_closed() {
     // The answer is the inbox's attention until the ask is closed.
     let answered = queue.answer(opened.ask.id, "land").unwrap();
     assert_eq!(answered.answer.as_deref(), Some("land"));
-    let events = queue.run_events(&run.id).unwrap();
+    let events = queue.run_events(run.id()).unwrap();
     let last = events.last().unwrap();
     assert_eq!(last.kind, "ask_answered");
     assert_eq!(last.payload["ask_id"], json!(opened.ask.id));
@@ -7318,9 +7344,9 @@ fn attention_events_are_read_past_a_cursor_and_wake_watch() {
     let status = runtime::status(&db).unwrap();
     assert_eq!(status["cursor"], json!(latest));
     assert_eq!(
-        run_attention_of(&status, &run.id).unwrap(),
+        run_attention_of(&status, run.id()).unwrap(),
         &json!({
-            "run_id": run.id, "task_id": 1, "status": "awaiting_integration",
+            "run_id": run.id(), "task_id": 1, "status": "awaiting_integration",
             "kind": "review_failed", "last_error": null, "next": "review by hand",
         })
     );
@@ -7336,7 +7362,7 @@ fn attention_events_are_read_past_a_cursor_and_wake_watch() {
     assert_eq!(listed[0]["kind"], "review_failed");
     assert_eq!(listed[0]["status"], "awaiting_integration");
     assert_eq!(listed[0]["next"], "review by hand");
-    assert_eq!(listed[0]["run_id"], json!(run.id));
+    assert_eq!(listed[0]["run_id"], json!(run.id()));
     let all = dagq::watch::events(&db, 0, 1000, true).unwrap();
     let all_events = all["events"].as_array().unwrap();
     assert_eq!(all_events.len() as i64, latest);
@@ -7347,10 +7373,7 @@ fn attention_events_are_read_past_a_cursor_and_wake_watch() {
         .collect();
     assert!(ids.windows(2).all(|w| w[0] < w[1]), "oldest first");
     let text = all.to_string();
-    assert!(
-        !text.contains(run.worktree_path.as_deref().unwrap()),
-        "{text}"
-    );
+    assert!(!text.contains(run.worktree_path().unwrap()), "{text}");
     assert!(!text.contains("\"receipt\""), "{text}");
     // A limit leaves the cursor on the last event returned.
     let page = dagq::watch::events(&db, 0, 2, true).unwrap();
@@ -7382,7 +7405,7 @@ fn attention_events_are_read_past_a_cursor_and_wake_watch() {
 
     // A landing parked for a session the supervisor will resume wakes
     // nobody (ADR-0019) ...
-    fs::remove_file(run.receipt_path.as_ref().unwrap()).unwrap();
+    fs::remove_file(run.receipt_path().unwrap()).unwrap();
     let before = queue.latest_event_id().unwrap();
     assert_eq!(
         integrate(&db, 1, &repo).unwrap()["outcome"],
@@ -7397,11 +7420,11 @@ fn attention_events_are_read_past_a_cursor_and_wake_watch() {
     // Consequences), whose `ask_opened` is the attention.
     for attempt in 1..=3 {
         queue
-            .record_runtime_event(&run.id, "resume_started", json!({"attempt": attempt}))
+            .record_runtime_event(run.id(), "resume_started", json!({"attempt": attempt}))
             .unwrap();
         queue
             .record_runtime_event(
-                &run.id,
+                run.id(),
                 "resume_finished",
                 json!({"attempt": attempt, "outcome": "unresolved", "status": "needs_session", "exhausted": attempt == 3}),
             )
@@ -7428,7 +7451,7 @@ fn attention_events_are_read_past_a_cursor_and_wake_watch() {
     );
     let latest = queue.latest_event_id().unwrap();
     let status = runtime::status(&db).unwrap();
-    let parked = run_attention_of(&status, &run.id).unwrap();
+    let parked = run_attention_of(&status, run.id()).unwrap();
     assert_eq!(parked["status"], "needs_session");
     assert_eq!(parked["kind"], "integration_deferred");
     assert_eq!(parked["next"], "resuming (runtime)");
@@ -7445,7 +7468,7 @@ fn attention_events_are_read_past_a_cursor_and_wake_watch() {
         .unwrap()
         .execute("UPDATE tasks SET status='canceled' WHERE id=1", [])
         .unwrap();
-    assert!(run_attention_of(&runtime::status(&db).unwrap(), &run.id).is_none());
+    assert!(run_attention_of(&runtime::status(&db).unwrap(), run.id()).is_none());
 }
 
 #[test]
@@ -7453,7 +7476,7 @@ fn status_reports_failed_runs_and_unanswered_exit_requests() {
     let (_dir, db, detail) = run_agent("commit work; receipt \"$(git rev-parse HEAD)\"; exit 7");
     let run = &detail.runs[0];
     let status = runtime::status(&db).unwrap();
-    let failed = run_attention_of(&status, &run.id).unwrap();
+    let failed = run_attention_of(&status, run.id()).unwrap();
     assert_eq!(failed["status"], "failed");
     // The failed run itself is the supervisor's triage; its triage failed
     // (the stub `claude` prints no verdict), which is a person's.
@@ -7470,7 +7493,7 @@ fn status_reports_failed_runs_and_unanswered_exit_requests() {
         .execute("DELETE FROM run_events WHERE kind='triage_failed'", [])
         .unwrap();
     let status = runtime::status(&db).unwrap();
-    let pending = run_attention_of(&status, &run.id).unwrap();
+    let pending = run_attention_of(&status, run.id()).unwrap();
     assert_eq!(pending["kind"], "failed");
     assert_eq!(pending["next"], "triaging (runtime)");
 
@@ -7478,12 +7501,12 @@ fn status_reports_failed_runs_and_unanswered_exit_requests() {
     let (_dir, repo, db) = fixture();
     let pid = std::process::id();
     let orphan = orphan_run(&repo, &db, "owner", pid, pid);
-    assert!(run_attention_of(&runtime::status(&db).unwrap(), &orphan.id).is_none());
+    assert!(run_attention_of(&runtime::status(&db).unwrap(), orphan.id()).is_none());
     let mut queue = SqliteQueue::open(&db).unwrap();
     let watcher = spawn_watch(&db, None);
     queue
         .record_runtime_event(
-            &orphan.id,
+            orphan.id(),
             "exit_request_timed_out",
             json!({"workspace_id": "ws-1", "timeout_secs": 120}),
         )
@@ -7493,7 +7516,7 @@ fn status_reports_failed_runs_and_unanswered_exit_requests() {
         .ask(NewAsk {
             kind: AskKind::StuckExit,
             task_id: None,
-            run_id: Some(orphan.id.clone()),
+            run_id: Some(orphan.id().clone()),
             question: "send /exit".into(),
             options: Vec::new(),
             asked_by: "supervisor".into(),
@@ -7503,9 +7526,9 @@ fn status_reports_failed_runs_and_unanswered_exit_requests() {
     assert_eq!(woke["events"].as_array().unwrap().len(), 1, "{woke}");
     assert_eq!(woke["events"][0]["kind"], "ask_opened");
     let status = runtime::status(&db).unwrap();
-    assert!(run_attention_of(&status, &orphan.id).is_none(), "{status}");
-    queue.wrapper_exited(&orphan.id, pid, 0).unwrap();
-    assert!(run_attention_of(&runtime::status(&db).unwrap(), &orphan.id).is_none());
+    assert!(run_attention_of(&status, orphan.id()).is_none(), "{status}");
+    queue.wrapper_exited(orphan.id(), pid, 0).unwrap();
+    assert!(run_attention_of(&runtime::status(&db).unwrap(), orphan.id()).is_none());
 }
 
 /// A run the supervisor gives up (here: its wrapper never registers) keeps
@@ -7532,9 +7555,9 @@ fn an_abandoned_run_is_recovered_and_triaged_by_the_supervisor() {
         "{outcome}"
     );
     let run = queue.show(TaskId::new(1)).unwrap().runs[0].clone();
-    assert_eq!(run.status, RunStatus::Interrupted);
-    assert!(queue.run_lease(&run.id).unwrap().is_none());
-    let events = queue.run_events(&run.id).unwrap();
+    assert_eq!(run.status(), RunStatus::Interrupted);
+    assert!(queue.run_lease(run.id()).unwrap().is_none());
+    let events = queue.run_events(run.id()).unwrap();
     let kinds: Vec<&str> = events.iter().map(|e| e.kind.as_str()).collect();
     let error = position(&kinds, "runtime_error");
     assert_eq!(events[error].payload["lease_released"], true);
@@ -7544,12 +7567,16 @@ fn an_abandoned_run_is_recovered_and_triaged_by_the_supervisor() {
     assert_eq!(events[recovered].payload["previous_status"], "starting");
     assert_eq!(events[recovered].payload["run"]["blockers"], json!([]));
     assert!(recovered < position(&kinds, "triage_started"), "{kinds:?}");
-    assert_eq!(outcome["triaged"][0]["run_id"], json!(run.id), "{outcome}");
+    assert_eq!(
+        outcome["triaged"][0]["run_id"],
+        json!(run.id()),
+        "{outcome}"
+    );
     assert_eq!(outcome["triaged"][0]["status"], "interrupted");
 
     // The stub `claude` prints no verdict: a person triages the run.
     let status = runtime::status(&db).unwrap();
-    let waiting = run_attention_of(&status, &run.id).unwrap();
+    let waiting = run_attention_of(&status, run.id()).unwrap();
     assert_eq!(waiting["status"], "interrupted");
     assert_eq!(waiting["kind"], "triage_failed");
     assert_eq!(waiting["next"], "triage by hand");
@@ -7573,14 +7600,21 @@ fn an_abandoned_run_is_recovered_and_triaged_by_the_supervisor() {
     let abandoned = orphan_run(&repo, &db, "owner", pid, pid);
     Connection::open(&db)
         .unwrap()
-        .execute("DELETE FROM run_leases WHERE run_id=?1", [&abandoned.id])
+        .execute("DELETE FROM run_leases WHERE run_id=?1", [&abandoned.id()])
         .unwrap();
     let status = runtime::status(&db).unwrap();
-    let still = run_attention_of(&status, &abandoned.id).unwrap();
+    let still = run_attention_of(&status, abandoned.id()).unwrap();
     assert_eq!(still["next"], "recover run");
     supervise(&db, &repo, &backend).unwrap();
-    assert_eq!(queue.run(&abandoned.id).unwrap().status, RunStatus::Running);
-    assert!(!queue.has_run_event(&abandoned.id, "run_recovered").unwrap());
+    assert_eq!(
+        queue.run(abandoned.id()).unwrap().status(),
+        RunStatus::Running
+    );
+    assert!(
+        !queue
+            .has_run_event(abandoned.id(), "run_recovered")
+            .unwrap()
+    );
 
     // A runtime error recorded on a leased run is not an attention.
     add_ready_task(&mut queue, "noted", &[]);
@@ -7588,9 +7622,9 @@ fn an_abandoned_run_is_recovered_and_triaged_by_the_supervisor() {
     let noted = orphan_run(&repo, &db, "owner", pid, pid);
     let cursor = queue.latest_event_id().unwrap();
     queue
-        .record_runtime_error(&noted.id, "a passing error")
+        .record_runtime_error(noted.id(), "a passing error")
         .unwrap();
-    assert!(run_attention_of(&runtime::status(&db).unwrap(), &noted.id).is_none());
+    assert!(run_attention_of(&runtime::status(&db).unwrap(), noted.id()).is_none());
     assert_eq!(
         dagq::watch::events(&db, cursor, 100, false).unwrap()["events"],
         json!([])
@@ -7670,7 +7704,7 @@ fn rebind_follows_a_moved_repository_and_the_awaiting_run_lands() {
     let moved = dir.path().join("moved repo");
     fs::rename(&repo, &moved).unwrap();
     let new_common_dir = path_text(&GitRepository::inspect(&moved).unwrap().common_dir).unwrap();
-    let worktree = PathBuf::from(run.worktree_path.clone().unwrap());
+    let worktree = PathBuf::from(run.worktree_path().unwrap().to_owned());
     // The run worktree's `.git` file still points into the old repository.
     assert!(
         !Command::new("git")
@@ -7712,7 +7746,7 @@ fn rebind_follows_a_moved_repository_and_the_awaiting_run_lands() {
     assert_eq!(rebound["git_common_dir"], json!(new_common_dir));
     assert_eq!(
         rebound["worktrees"],
-        json!([{"run_id": run.id, "worktree_path": worktree, "repaired": true, "error": null}]),
+        json!([{"run_id": run.id(), "worktree_path": worktree, "repaired": true, "error": null}]),
         "{rebound}"
     );
     assert_eq!(
@@ -7772,7 +7806,7 @@ fn rebind_is_refused_while_a_run_is_integrating() {
     let main = git_out(&repo, &["rev-parse", "main"]);
     let mut queue = SqliteQueue::open(&db).unwrap();
     queue
-        .begin_integration(&run.id, "integrator", &sha(&main))
+        .begin_integration(run.id(), "integrator", &sha(&main))
         .unwrap();
     let other = dir.path().join("other");
     fs::create_dir(&other).unwrap();
@@ -7814,8 +7848,8 @@ fn integrate_registers_the_landed_follow_ups_as_draft_tasks_of_the_goal_once() {
     supervise(&db, &repo, &backend).unwrap();
     backend.join();
     let run = queue.show(TaskId::new(1)).unwrap().runs[0].clone();
-    assert_eq!(run.status, RunStatus::AwaitingIntegration);
-    let head = run.result_commit.clone().unwrap();
+    assert_eq!(run.status(), RunStatus::AwaitingIntegration);
+    let head = run.result_commit().cloned().unwrap();
     let follow_ups = json!([
         {"title": "later work", "description": "outside the task"},
         {"title": "  ", "description": "no title, not a task"},
@@ -7825,12 +7859,12 @@ fn integrate_registers_the_landed_follow_ups_as_draft_tasks_of_the_goal_once() {
 
     // A receipt that does not name the head parks the run: nothing landed,
     // so nothing is registered.
-    let mut stale = session_receipt(&run, run.base_commit.as_str(), "succeeded", "stale");
+    let mut stale = session_receipt(&run, run.base_commit().as_str(), "succeeded", "stale");
     stale["follow_ups"] = follow_ups.clone();
     write_receipt_json(&run, stale);
     let outcome = integrate(&db, 1, &repo).unwrap();
     assert_eq!(outcome["outcome"], "needs_session", "{outcome}");
-    assert!(events_of(&db, &run.id, "follow_up_registered").is_empty());
+    assert!(events_of(&db, run.id(), "follow_up_registered").is_empty());
     assert_eq!(
         queue.list(&Default::default()).unwrap().total,
         1,
@@ -7852,7 +7886,7 @@ fn integrate_registers_the_landed_follow_ups_as_draft_tasks_of_the_goal_once() {
     );
     let context = format!(
         "task 1（test task）の run {} の receipt が提案した follow_up",
-        run.id
+        run.id()
     );
     for (id, title, description) in [(2, "later work", "outside the task"), (3, "more work", "")] {
         let detail = queue.show(TaskId::new(id)).unwrap();
@@ -7866,7 +7900,7 @@ fn integrate_registers_the_landed_follow_ups_as_draft_tasks_of_the_goal_once() {
         assert!(detail.dependencies.is_empty());
     }
     assert_eq!(
-        events_of(&db, &run.id, "follow_up_registered"),
+        events_of(&db, run.id(), "follow_up_registered"),
         vec![
             json!({"task_id": 2, "title": "later work", "index": 0}),
             json!({
@@ -7889,9 +7923,11 @@ fn integrate_registers_the_landed_follow_ups_as_draft_tasks_of_the_goal_once() {
     // registering the same run's follow-ups again adds nothing.
     assert!(integrate(&db, 1, &repo).is_err());
     let task = queue.show(TaskId::new(1)).unwrap().task;
-    assert!(runtime::register_follow_ups(&mut queue, &task, &run.id, Some(&follow_ups)).is_empty());
+    assert!(
+        runtime::register_follow_ups(&mut queue, &task, run.id(), Some(&follow_ups)).is_empty()
+    );
     assert_eq!(queue.list(&Default::default()).unwrap().total, 2);
-    assert_eq!(events_of(&db, &run.id, "follow_up_registered").len(), 4);
+    assert_eq!(events_of(&db, run.id(), "follow_up_registered").len(), 4);
 
     // A closed goal takes no task: a new follow-up is registered without it.
     queue
@@ -7899,17 +7935,17 @@ fn integrate_registers_the_landed_follow_ups_as_draft_tasks_of_the_goal_once() {
         .unwrap();
     let mut extended = follow_ups.as_array().unwrap().clone();
     extended.push(json!({"title": "after the goal", "description": "d"}));
-    let added = runtime::register_follow_ups(&mut queue, &task, &run.id, Some(&json!(extended)));
+    let added = runtime::register_follow_ups(&mut queue, &task, run.id(), Some(&json!(extended)));
     assert_eq!(added.len(), 1);
     let detail = queue.show(added[0].task_id).unwrap();
     assert_eq!(detail.task.status(), TaskStatus::Draft);
     assert_eq!(detail.task.goal_id(), None);
     assert_eq!(
-        events_of(&db, &run.id, "follow_up_registered")[4],
+        events_of(&db, run.id(), "follow_up_registered")[4],
         json!({"task_id": added[0].task_id, "title": "after the goal", "index": 4, "goal_closed": true})
     );
     // Nothing to register without follow_ups.
-    assert!(runtime::register_follow_ups(&mut queue, &task, &run.id, None).is_empty());
+    assert!(runtime::register_follow_ups(&mut queue, &task, run.id(), None).is_empty());
 }
 
 #[test]
@@ -7953,10 +7989,10 @@ fn dagq_toml_run_env_reaches_the_workspace_and_the_verification_commands() {
         .unwrap()
         .runs[0]
         .clone();
-    assert_eq!(run.status, RunStatus::AwaitingIntegration);
+    assert_eq!(run.status(), RunStatus::AwaitingIntegration);
     let canonical = db.canonicalize().unwrap();
     let queue_dir = canonical.parent().unwrap().to_str().unwrap().to_owned();
-    let run_dir = run.run_dir.clone().unwrap();
+    let run_dir = run.run_dir().unwrap().to_owned();
     // The workspace gets the expanded table after the runtime's own names.
     assert_eq!(
         backend.tags.lock().unwrap()[0].env,
@@ -7979,7 +8015,7 @@ fn dagq_toml_run_env_reaches_the_workspace_and_the_verification_commands() {
     fs::write(repo.join("other.txt"), "main moved\n").unwrap();
     git(&repo, &["add", "other.txt"]);
     git(&repo, &["commit", "-m", "main moved"]);
-    let worktree = PathBuf::from(run.worktree_path.as_ref().unwrap());
+    let worktree = PathBuf::from(run.worktree_path().unwrap());
     let outcome = integrate(&db, task.id().as_i64(), &worktree).unwrap();
     assert_eq!(outcome["outcome"], "integrated", "{outcome}");
     let line = format!("{queue_dir}/target {run_dir}\n");
@@ -8089,7 +8125,7 @@ fn missing_required_evidence_parks_the_run_for_a_resumed_session() {
     let finished = payloads(&detail, "resume_finished");
     assert_eq!(finished.len(), 1);
     assert_eq!(finished[0]["outcome"], "resolved");
-    assert_eq!(run.status, RunStatus::AwaitingIntegration);
+    assert_eq!(run.status(), RunStatus::AwaitingIntegration);
     assert!(queue.run_leases().unwrap().is_empty());
     // It lands now that the receipt carries the evidence.
     let landed = integrate(&db, 2, &repo).unwrap();
@@ -8133,7 +8169,7 @@ fn a_required_check_reported_failed_parks_the_run_instead_of_failing_it() {
         payloads(&detail, "resume_finished")[0]["outcome"],
         "resolved"
     );
-    assert_eq!(detail.runs[0].status, RunStatus::AwaitingIntegration);
+    assert_eq!(detail.runs[0].status(), RunStatus::AwaitingIntegration);
 }
 
 /// With the required evidence in the first receipt, validation accepts the
@@ -8156,7 +8192,7 @@ fn required_evidence_present_in_the_receipt_awaits_integration() {
         .show(TaskId::new(2))
         .unwrap();
     let run = &detail.runs[0];
-    assert_eq!(run.status, RunStatus::AwaitingIntegration);
+    assert_eq!(run.status(), RunStatus::AwaitingIntegration);
     assert!(read_prompt(run).contains("Required evidence: e2e, tests ("));
     assert!(!event_kinds(&detail).contains(&"evidence_missing"));
     assert!(
@@ -8185,7 +8221,7 @@ fn a_resume_or_integrate_without_the_required_evidence_does_not_land() {
     assert_eq!(outcome["errors"], json!([]), "{outcome}");
     let mut queue = SqliteQueue::open(&db).unwrap();
     let detail = queue.show(TaskId::new(2)).unwrap();
-    assert_eq!(detail.runs[0].status, RunStatus::Failed);
+    assert_eq!(detail.runs[0].status(), RunStatus::Failed);
     let finished = payloads(&detail, "resume_finished");
     assert_eq!(finished.len(), 3);
     assert!(finished.iter().all(|f| f["outcome"] == "unresolved"));
@@ -8198,7 +8234,7 @@ fn a_resume_or_integrate_without_the_required_evidence_does_not_land() {
         .unwrap()
         .execute(
             "UPDATE task_runs SET status='needs_session' WHERE id=?1",
-            [&detail.runs[0].id],
+            [&detail.runs[0].id()],
         )
         .unwrap();
     let before = git_out(&repo, &["rev-parse", "main"]);
@@ -8207,8 +8243,8 @@ fn a_resume_or_integrate_without_the_required_evidence_does_not_land() {
     assert_eq!(git_out(&repo, &["rev-parse", "main"]), before);
     let detail = queue.show(TaskId::new(2)).unwrap();
     let run = &detail.runs[0];
-    assert_eq!(run.status, RunStatus::NeedsSession);
-    assert_eq!(run.last_error.as_deref(), Some("evidence missing: e2e"));
+    assert_eq!(run.status(), RunStatus::NeedsSession);
+    assert_eq!(run.last_error(), Some("evidence missing: e2e"));
     let parked = payloads(&detail, "integration_deferred");
     assert_eq!(parked.last().unwrap()["checks"], json!(["e2e"]));
 }
@@ -8295,7 +8331,7 @@ fn a_change_outside_the_declared_paths_parks_the_run_for_a_resumed_session() {
             .unwrap()
             .contains_key("scope_violation")
     );
-    assert_eq!(run.status, RunStatus::AwaitingIntegration);
+    assert_eq!(run.status(), RunStatus::AwaitingIntegration);
     let landed = integrate(&db, 2, &repo).unwrap();
     assert_eq!(landed["outcome"], "integrated", "{landed}");
     assert_eq!(
@@ -8317,7 +8353,7 @@ fn a_change_inside_the_declared_paths_awaits_integration_and_lands() {
         .unwrap()
         .show(TaskId::new(2))
         .unwrap();
-    assert_eq!(detail.runs[0].status, RunStatus::AwaitingIntegration);
+    assert_eq!(detail.runs[0].status(), RunStatus::AwaitingIntegration);
     assert!(!event_kinds(&detail).contains(&"scope_violation"));
     let landed = integrate(&db, 2, &repo).unwrap();
     assert_eq!(landed["outcome"], "integrated", "{landed}");
@@ -8344,7 +8380,7 @@ fn a_branch_rebased_onto_a_moved_main_is_held_only_to_its_own_changes() {
         .show(TaskId::new(2))
         .unwrap();
     assert!(!event_kinds(&detail).contains(&"scope_violation"));
-    assert_eq!(detail.runs[0].status, RunStatus::AwaitingIntegration);
+    assert_eq!(detail.runs[0].status(), RunStatus::AwaitingIntegration);
     let landed = integrate(&db, 2, &repo).unwrap();
     assert_eq!(landed["outcome"], "integrated", "{landed}");
     assert_eq!(
@@ -8366,14 +8402,14 @@ fn integrate_refuses_a_rebased_diff_outside_the_declared_paths() {
     backend.join();
     let mut queue = SqliteQueue::open(&db).unwrap();
     let run = queue.show(TaskId::new(2)).unwrap().runs[0].clone();
-    assert_eq!(run.status, RunStatus::AwaitingIntegration);
+    assert_eq!(run.status(), RunStatus::AwaitingIntegration);
     // main moves, so the landing rebases.
     fs::write(repo.join("other.txt"), "main moved\n").unwrap();
     git(&repo, &["add", "other.txt"]);
     git(&repo, &["commit", "-m", "main moved"]);
     let main = git_out(&repo, &["rev-parse", "main"]);
     // After validation the branch gains a path outside `*.txt`.
-    let worktree = PathBuf::from(run.worktree_path.as_ref().unwrap());
+    let worktree = PathBuf::from(run.worktree_path().unwrap());
     fs::create_dir_all(worktree.join("src")).unwrap();
     fs::write(worktree.join("src/lib.rs"), "// out of scope\n").unwrap();
     git(&worktree, &["add", "src"]);
@@ -8390,8 +8426,8 @@ fn integrate_refuses_a_rebased_diff_outside_the_declared_paths() {
     assert_eq!(git_out(&repo, &["rev-parse", "main"]), main);
     let detail = queue.show(TaskId::new(2)).unwrap();
     let parked = &detail.runs[0];
-    assert_eq!(parked.status, RunStatus::NeedsSession);
-    let reason = parked.last_error.as_deref().unwrap();
+    assert_eq!(parked.status(), RunStatus::NeedsSession);
+    let reason = parked.last_error().unwrap();
     assert!(
         reason.starts_with(&format!(
             "changed paths outside the task's --paths: src/lib.rs after the rebase onto main {}",
@@ -8846,7 +8882,7 @@ impl AgentProvider for TestReviewer {
         };
         let mut command = Command::new("/bin/sh");
         command
-            .current_dir(run.worktree_path.as_ref().unwrap())
+            .current_dir(run.worktree_path().unwrap())
             .arg("-c")
             .arg(script);
         Ok(command)
@@ -8966,7 +9002,7 @@ fn a_passing_review_exits_the_live_session_and_lands_it() {
     // and the verdicts.
     let prompts = reviewer.prompts();
     assert_eq!(prompts.len(), 1);
-    let run_dir = Path::new(run.run_dir.as_ref().unwrap());
+    let run_dir = Path::new(run.run_dir().unwrap());
     let review_md = run_dir.join("review.md");
     assert!(review_md.is_file());
     for expected in [
@@ -8989,7 +9025,7 @@ fn a_passing_review_exits_the_live_session_and_lands_it() {
     );
     assert!(run_dir.join("terminal-final.txt").is_file());
     // Nothing waits for anyone.
-    assert!(run_attention_of(&runtime::status(&db).unwrap(), &run.id).is_none());
+    assert!(run_attention_of(&runtime::status(&db).unwrap(), run.id()).is_none());
 }
 
 /// A `revise` verdict goes to the live session as a fixed request; once
@@ -9012,7 +9048,7 @@ fn a_revise_verdict_is_fixed_by_the_live_session_and_reviewed_again() {
     assert_landed(&repo, &run, "test task", &base);
     assert_eq!(
         fs::read_to_string(repo.join("change.txt")).unwrap(),
-        format!("change by {}\nfix 1\n", run.id)
+        format!("change by {}\nfix 1\n", run.id())
     );
     let requested = payloads(&detail, "revise_requested");
     assert_eq!(requested.len(), 1);
@@ -9020,7 +9056,10 @@ fn a_revise_verdict_is_fixed_by_the_live_session_and_reviewed_again() {
     assert_eq!(requested[0]["reasons"], json!(["add a line to change.txt"]));
     let revised = payloads(&detail, "revise_finished");
     assert_eq!(revised.len(), 1);
-    let head = git_out(&repo, &["rev-parse", &format!("refs/dagq/runs/{}", run.id)]);
+    let head = git_out(
+        &repo,
+        &["rev-parse", &format!("refs/dagq/runs/{}", run.id())],
+    );
     assert_eq!(revised[0], &json!({"attempt": 1, "head": head}));
     let verdicts: Vec<&Value> = payloads(&detail, "review_finished")
         .iter()
@@ -9040,20 +9079,20 @@ fn a_revise_verdict_is_fixed_by_the_live_session_and_reviewed_again() {
     for expected in [
         format!(
             "dagq: the supervisor's review of run {} (task 1) asks for changes (revise 1 of 2).",
-            run.id
+            run.id()
         ),
         "Findings:\n- add a line to change.txt".to_owned(),
         "[\"test -f seed.txt\"]".to_owned(),
         format!(
             "Rewrite the receipt at {} with the new head commit",
-            run.receipt_path.as_ref().unwrap()
+            run.receipt_path().unwrap()
         ),
         runtime::STOP_BACKGROUND.to_owned(),
         "Do not merge or push. When done, report briefly and stop; do not run /exit.".to_owned(),
     ] {
         assert!(text.contains(&expected), "{expected:?} not in {text}");
     }
-    let run_dir = Path::new(run.run_dir.as_ref().unwrap());
+    let run_dir = Path::new(run.run_dir().unwrap());
     assert_eq!(
         &fs::read_to_string(run_dir.join("revise-1.txt")).unwrap(),
         text
@@ -9087,7 +9126,7 @@ fn a_third_review_that_does_not_pass_asks_a_person_and_land_lands_it() {
     assert_eq!(asks.len(), 1);
     let ask = &asks[0];
     assert_eq!(ask.kind, dagq::domain::AskKind::ApproveLanding);
-    assert_eq!(ask.run_id.as_ref(), Some(&run.id));
+    assert_eq!(ask.run_id.as_ref(), Some(run.id()));
     assert_eq!(ask.options, ["land", "send_back", "cancel"]);
     assert_eq!(ask.asked_by, "supervisor");
     assert!(
@@ -9101,12 +9140,12 @@ fn a_third_review_that_does_not_pass_asks_a_person_and_land_lands_it() {
     // The ask is the attention, for the inbox; the run itself is not one.
     let status = runtime::status(&db).unwrap();
     assert!(
-        run_attention_of(&status, &run.id).is_none() || {
+        run_attention_of(&status, run.id()).is_none() || {
             let entries: Vec<&Value> = status["attention"]
                 .as_array()
                 .unwrap()
                 .iter()
-                .filter(|a| a["run_id"] == json!(run.id))
+                .filter(|a| a["run_id"] == json!(run.id()))
                 .collect();
             entries.iter().all(|a| a["ask_id"] == json!(ask.id))
         }
@@ -9170,7 +9209,7 @@ fn a_concern_sent_back_is_resumed_reviewed_again_and_landed() {
     let mut queue = SqliteQueue::open(&db).unwrap();
     let detail = queue.show(TaskId::new(1)).unwrap();
     let run = detail.runs[0].clone();
-    assert_eq!(run.status, RunStatus::AwaitingIntegration);
+    assert_eq!(run.status(), RunStatus::AwaitingIntegration);
     assert!(backend.texts().is_empty());
     assert_eq!(backend.exits_sent.load(Ordering::SeqCst), 1);
     let kinds = event_kinds(&detail);
@@ -9186,7 +9225,7 @@ fn a_concern_sent_back_is_resumed_reviewed_again_and_landed() {
     let notified = backend.notifications.lock().unwrap().clone();
     assert_eq!(notified.len(), 1, "{notified:?}");
     assert!(
-        notified[0].1.contains(&format!("run {}", run.id)),
+        notified[0].1.contains(&format!("run {}", run.id())),
         "{notified:?}"
     );
 
@@ -9281,9 +9320,9 @@ fn a_concern_canceled_fails_the_run_and_cancels_the_task() {
     supervise_reviewed(&db, &repo, &backend, &reviewer);
     let detail = queue.show(TaskId::new(1)).unwrap();
     assert_eq!(detail.task.status(), TaskStatus::Canceled);
-    assert_eq!(detail.runs[0].status, RunStatus::Failed);
+    assert_eq!(detail.runs[0].status(), RunStatus::Failed);
     assert_eq!(
-        detail.runs[0].last_error.as_deref(),
+        detail.runs[0].last_error(),
         Some(format!("canceled by ask {}", ask.id).as_str())
     );
     assert!(queue.read_ask(ask.id).unwrap().closed_at.is_some());
@@ -9330,7 +9369,7 @@ fn a_failed_review_closes_the_session_and_waits_for_a_review_by_hand() {
         let error = failed[0]["error"].as_str().unwrap();
         assert!(error.contains(expected), "{error}");
         let status = runtime::status(&db).unwrap();
-        let attention = run_attention_of(&status, &run.id).unwrap();
+        let attention = run_attention_of(&status, run.id()).unwrap();
         assert_eq!(attention["kind"], "review_failed");
         assert_eq!(attention["next"], "review by hand");
         let events = dagq::watch::events(&db, cursor, 100, false).unwrap();
@@ -9373,7 +9412,7 @@ fn a_revise_receipt_for_another_commit_is_sent_back_to_the_session_until_it_name
     assert_landed(&repo, &run, "test task", &base);
     assert_eq!(
         fs::read_to_string(repo.join("change.txt")).unwrap(),
-        format!("change by {}\nfix\n", run.id)
+        format!("change by {}\nfix\n", run.id())
     );
     let rejected = payloads(&detail, "revise_receipt_rejected");
     assert_eq!(rejected.len(), 1, "{:?}", event_kinds(&detail));
@@ -9398,7 +9437,7 @@ fn a_revise_receipt_for_another_commit_is_sent_back_to_the_session_until_it_name
     assert!(
         texts[1].1.contains(&format!(
             "dagq: the receipt you rewrote for revise 1 of run {} cannot be accepted",
-            run.id
+            run.id()
         )),
         "{}",
         texts[1].1
@@ -9421,7 +9460,7 @@ fn adopted_run_waiting_for_its_exit_after_a_pass_asks_once_and_lands() {
     let idle = run.idle_marker_path().unwrap();
     wait_until(&db, Duration::from_secs(20), |_| idle.is_file());
     let head = git_out(
-        Path::new(run.worktree_path.as_ref().unwrap()),
+        Path::new(run.worktree_path().unwrap()),
         &["rev-parse", "HEAD"],
     );
     // What the dead supervisor got through: validation, a passing review,
@@ -9430,7 +9469,7 @@ fn adopted_run_waiting_for_its_exit_after_a_pass_asks_once_and_lands() {
         .unwrap()
         .execute(
             "UPDATE task_runs SET status='awaiting_integration', result_commit=?2 WHERE id=?1",
-            rusqlite::params![run.id, head],
+            rusqlite::params![run.id(), head],
         )
         .unwrap();
     let mut queue = SqliteQueue::open(&db).unwrap();
@@ -9453,7 +9492,7 @@ fn adopted_run_waiting_for_its_exit_after_a_pass_asks_once_and_lands() {
             json!({"workspace_id": WORKSPACE_ID, "timeout_secs": 120}),
         ),
     ] {
-        queue.record_runtime_event(&run.id, kind, payload).unwrap();
+        queue.record_runtime_event(run.id(), kind, payload).unwrap();
     }
     age_lease(&db, &run, 31);
     let reviewer = Arc::new(TestReviewer::new(&[verdict("concern", &["x"], "never")]));
@@ -9488,7 +9527,7 @@ fn adopted_run_waiting_for_its_exit_after_a_pass_asks_once_and_lands() {
     );
     assert_eq!(backend.exits_sent.load(Ordering::SeqCst), 0);
     // The person's /exit reaches the session.
-    fs::write(exit_request_path(run.run_dir.as_ref().unwrap()), "").unwrap();
+    fs::write(exit_request_path(run.run_dir().unwrap()), "").unwrap();
     let outcome = supervisor.join().unwrap().unwrap();
     backend.join();
     assert_eq!(outcome["errors"], json!([]), "{outcome}");
@@ -9535,7 +9574,7 @@ fn wait_for_background(run: &TaskRun) {
 fn write_idle_marker(run: &TaskRun, background_tasks: Value) {
     let marker = run.idle_marker_path().unwrap();
     let hook = json!({
-        "session_id": run.id,
+        "session_id": run.id(),
         "hook_event_name": "Stop",
         "stop_hook_active": false,
         "background_tasks": background_tasks,
@@ -9573,14 +9612,14 @@ fn background_work_holds_the_first_session_until_it_ends() {
     wait_for_background(&run);
     thread::sleep(HOLD_PERIOD);
     let detail = queue.show(TaskId::new(1)).unwrap();
-    assert_eq!(detail.runs[0].status, RunStatus::Running);
+    assert_eq!(detail.runs[0].status(), RunStatus::Running);
     let kinds = event_kinds(&detail);
     assert!(!kinds.contains(&"session_idle_observed"), "{kinds:?}");
     assert!(!kinds.contains(&"exit_requested"), "{kinds:?}");
     assert_eq!(backend.exits_sent.load(Ordering::SeqCst), 0);
 
     fs::write(
-        exit_request_path(run.run_dir.as_ref().unwrap()).with_extension("go"),
+        exit_request_path(run.run_dir().unwrap()).with_extension("go"),
         "",
     )
     .unwrap();
@@ -9695,7 +9734,7 @@ fn background_work_holds_the_resumed_session_until_it_ends() {
     assert_eq!(backend.exits_sent.load(Ordering::SeqCst), sent_before);
 
     fs::write(
-        exit_request_path(run.run_dir.as_ref().unwrap()).with_extension("go"),
+        exit_request_path(run.run_dir().unwrap()).with_extension("go"),
         "",
     )
     .unwrap();
@@ -9749,7 +9788,7 @@ fn background_work_holds_the_revise_until_it_ends() {
     assert!(queue.asks(AskQuery::default()).unwrap().is_empty());
 
     fs::write(
-        exit_request_path(run.run_dir.as_ref().unwrap()).with_extension("go"),
+        exit_request_path(run.run_dir().unwrap()).with_extension("go"),
         "",
     )
     .unwrap();
@@ -9811,7 +9850,7 @@ fn a_revise_session_that_holds_exit_back_raises_a_stuck_exit_ask() {
     assert!(!kinds.contains(&"revise_finished"), "{kinds:?}");
     assert_eq!(backend.exits_sent.load(Ordering::SeqCst), 1);
 
-    release_held_session(run.run_dir.as_ref().unwrap());
+    release_held_session(run.run_dir().unwrap());
     let outcome = supervisor.join().unwrap();
     assert_eq!(outcome["errors"], json!([]), "{outcome}");
     assert_eq!(backend.exits_sent.load(Ordering::SeqCst), 1);
@@ -9921,7 +9960,10 @@ fn a_passed_run_that_conflicts_with_main_is_rebased_by_its_live_session_and_land
     assert_eq!(precheck["requested"], true);
     assert!(precheck["sent_at"].is_i64());
     let resolved = payloads(&detail, "conflict_resolved");
-    let head = git_out(&repo, &["rev-parse", &format!("refs/dagq/runs/{}", run.id)]);
+    let head = git_out(
+        &repo,
+        &["rev-parse", &format!("refs/dagq/runs/{}", run.id())],
+    );
     assert_eq!(resolved, [&json!({"attempt": 1, "head": head})]);
     assert_eq!(
         git_out(&repo, &["rev-parse", &format!("{head}~1")]),
@@ -9960,7 +10002,7 @@ fn a_passed_run_that_conflicts_with_main_is_rebased_by_its_live_session_and_land
     for expected in [
         format!(
             "dagq: the supervisor's review of run {} (task 1) passed, but integrate would conflict with main, so the run was not landed.",
-            run.id
+            run.id()
         ),
         format!(
             "Reason: git merge-tree finds that main {moved} conflicts with the run in change.txt"
@@ -9973,19 +10015,19 @@ fn a_passed_run_that_conflicts_with_main_is_rebased_by_its_live_session_and_land
         runtime::STOP_BACKGROUND.to_owned(),
         format!(
             "Rewrite the receipt at {} with the new head commit",
-            run.receipt_path.as_ref().unwrap()
+            run.receipt_path().unwrap()
         ),
         "Do not merge or push. When done, report briefly and stop; do not run /exit.".to_owned(),
     ] {
         assert!(text.contains(&expected), "{expected:?} not in {text}");
     }
-    let run_dir = Path::new(run.run_dir.as_ref().unwrap());
+    let run_dir = Path::new(run.run_dir().unwrap());
     assert_eq!(
         &fs::read_to_string(run_dir.join("conflict-1.txt")).unwrap(),
         text
     );
     assert!(queue.run_leases().unwrap().is_empty());
-    assert!(run_attention_of(&runtime::status(&db).unwrap(), &run.id).is_none());
+    assert!(run_attention_of(&runtime::status(&db).unwrap(), run.id()).is_none());
 }
 
 /// A passed run that merges cleanly with main is not sent anything: no
@@ -10057,7 +10099,7 @@ fn conflict_requests_past_the_limit_ask_a_person() {
     assert_eq!(asks.len(), 1);
     let ask = &asks[0];
     assert_eq!(ask.kind, dagq::domain::AskKind::ApproveLanding);
-    assert_eq!(ask.run_id.as_ref(), Some(&run.id));
+    assert_eq!(ask.run_id.as_ref(), Some(run.id()));
     assert!(
         ask.question.contains("returned pass (git merge-tree finds that main")
             && ask
@@ -10103,12 +10145,12 @@ fn a_failed_run_triaged_retry_runs_again_and_a_second_failure_is_asked() {
     assert_eq!(detail.task.status(), TaskStatus::InProgress);
     assert_eq!(detail.runs.len(), 2);
     let (first, second) = (&detail.runs[0], &detail.runs[1]);
-    assert_eq!(first.status, RunStatus::Failed);
-    assert_eq!(second.status, RunStatus::Failed);
+    assert_eq!(first.status(), RunStatus::Failed);
+    assert_eq!(second.status(), RunStatus::Failed);
     assert!(queue.run_leases().unwrap().is_empty());
 
     // The first triage: retry readied the task, then the workspace closed.
-    let first_events = queue.run_events(&first.id).unwrap();
+    let first_events = queue.run_events(first.id()).unwrap();
     let kinds: Vec<&str> = first_events.iter().map(|e| e.kind.as_str()).collect();
     let started = position(&kinds, "triage_started");
     assert_eq!(first_events[started].payload["status"], "failed");
@@ -10124,7 +10166,7 @@ fn a_failed_run_triaged_retry_runs_again_and_a_second_failure_is_asked() {
     assert_eq!(closed["workspace_id"], WORKSPACE_ID);
     assert_eq!(closed["by"], "triage");
     assert!(position(&kinds, "triage_finished") < position(&kinds, "workspace_closed"));
-    assert!(first.workspace_closed_at.is_some());
+    assert!(first.workspace_closed_at().is_some());
     assert!(backend.closed().contains(&WORKSPACE_ID.to_owned()));
     let readied = detail.events.iter().position(|e| {
         e.kind == "task_status_changed"
@@ -10134,7 +10176,7 @@ fn a_failed_run_triaged_retry_runs_again_and_a_second_failure_is_asked() {
     let second_claimed = detail
         .events
         .iter()
-        .position(|e| e.run_id.as_ref().map(RunId::as_str) == Some(second.id.as_str()))
+        .position(|e| e.run_id.as_ref().map(RunId::as_str) == Some(second.id().as_str()))
         .unwrap();
     assert!(readied.unwrap() < second_claimed);
 
@@ -10156,7 +10198,7 @@ fn a_failed_run_triaged_retry_runs_again_and_a_second_failure_is_asked() {
         .read_ask(finished[1]["ask_id"].as_i64().unwrap())
         .unwrap();
     assert_eq!(ask.kind, AskKind::Decide);
-    assert_eq!(ask.run_id.as_ref(), Some(&second.id));
+    assert_eq!(ask.run_id.as_ref(), Some(second.id()));
     assert_eq!(ask.asked_by, "supervisor");
     assert_eq!(ask.options, ["retry", "resume", "cancel"]);
     assert!(ask.is_open());
@@ -10173,7 +10215,7 @@ fn a_failed_run_triaged_retry_runs_again_and_a_second_failure_is_asked() {
     let prompts = reviewer.triage_prompts();
     assert_eq!(prompts.len(), 2);
     let (prompt, dir) = &prompts[0];
-    assert_eq!(dir, Path::new(first.run_dir.as_ref().unwrap()));
+    assert_eq!(dir, Path::new(first.run_dir().unwrap()));
     for expected in [
         "of dagq task 1 (test task), which ended failed",
         "Acceptance criteria:\nworks",
@@ -10198,14 +10240,14 @@ fn a_failed_run_triaged_retry_runs_again_and_a_second_failure_is_asked() {
     assert!(
         prompt.contains(&format!(
             "- run {} failed: session exited with code 7 (triaged: \"retry\")",
-            first.id
+            first.id()
         )),
         "{prompt}"
     );
 
     // Neither run is an attention: the ask is.
     let status = runtime::status(&db).unwrap();
-    assert!(run_attention_of(&status, &second.id).is_none(), "{status}");
+    assert!(run_attention_of(&status, second.id()).is_none(), "{status}");
     assert_eq!(
         ask_attention(&status, ask.id)[0]["next"],
         format!("answer ask {}", ask.id)
@@ -10281,7 +10323,7 @@ fn a_triage_ask_waits_for_a_person_and_the_supervisor_applies_the_answer() {
     let mut queue = SqliteQueue::open(&db).unwrap();
     let detail = queue.show(TaskId::new(1)).unwrap();
     let run = detail.runs[0].clone();
-    assert_eq!(run.status, RunStatus::Failed);
+    assert_eq!(run.status(), RunStatus::Failed);
     assert_eq!(detail.task.status(), TaskStatus::InProgress);
     let finished = payloads(&detail, "triage_finished");
     assert_eq!(finished[0]["action"], "ask");
@@ -10315,19 +10357,16 @@ fn a_triage_ask_waits_for_a_person_and_the_supervisor_applies_the_answer() {
             .unwrap()
             .contains("injected workspace close failure")
     );
-    assert!(run.workspace_closed_at.is_none());
+    assert!(run.workspace_closed_at().is_none());
     assert!(!event_kinds(&detail).contains(&"workspace_closed"));
-    assert_eq!(
-        run.last_error.as_deref(),
-        Some("session exited with code 7")
-    );
+    assert_eq!(run.last_error(), Some("session exited with code 7"));
     let status = runtime::status(&db).unwrap();
-    assert!(run_attention_of(&status, &run.id).is_none(), "{status}");
+    assert!(run_attention_of(&status, run.id()).is_none(), "{status}");
 
     // An answer the supervisor applies is its own, not a person's.
     queue.answer(ask.id, "cancel").unwrap();
     let answered = queue
-        .run_events(&run.id)
+        .run_events(run.id())
         .unwrap()
         .into_iter()
         .rfind(|e| e.kind == "ask_answered")
@@ -10341,7 +10380,7 @@ fn a_triage_ask_waits_for_a_person_and_the_supervisor_applies_the_answer() {
     assert_eq!(outcome["errors"], json!([]), "{outcome}");
     let detail = queue.show(TaskId::new(1)).unwrap();
     assert_eq!(detail.task.status(), TaskStatus::Canceled);
-    assert_eq!(detail.runs[0].status, RunStatus::Failed);
+    assert_eq!(detail.runs[0].status(), RunStatus::Failed);
     let decided = payloads(&detail, "triage_decided");
     assert_eq!(decided.len(), 1);
     assert_eq!(decided[0]["answer"], "cancel");
@@ -10364,7 +10403,7 @@ fn triage_answers_resume_the_run_or_ready_the_task() {
             .ask(NewAsk {
                 kind: AskKind::Decide,
                 task_id: None,
-                run_id: Some(run.id.clone()),
+                run_id: Some(run.id().clone()),
                 question: "what now?".into(),
                 options: vec!["retry".into(), "resume".into(), "cancel".into()],
                 asked_by: "supervisor".into(),
@@ -10375,17 +10414,21 @@ fn triage_answers_resume_the_run_or_ready_the_task() {
     let first = ask(&mut queue);
     queue.answer(first.id, "resume").unwrap();
     assert_eq!(queue.triage_answers().unwrap()[0].id, first.id);
-    assert!(queue.decide_triage(&run.id, first.id, "land", "x").is_err());
+    assert!(
+        queue
+            .decide_triage(run.id(), first.id, "land", "x")
+            .is_err()
+    );
     let parked = queue
-        .decide_triage(&run.id, first.id, "resume", "fix the test")
+        .decide_triage(run.id(), first.id, "resume", "fix the test")
         .unwrap();
-    assert_eq!(parked.status, RunStatus::NeedsSession);
-    assert_eq!(parked.last_error.as_deref(), Some("fix the test"));
+    assert_eq!(parked.status(), RunStatus::NeedsSession);
+    assert_eq!(parked.last_error(), Some("fix the test"));
     assert!(queue.read_ask(first.id).unwrap().closed_at.is_some());
     assert!(queue.triage_answers().unwrap().is_empty());
     assert!(
         queue
-            .decide_triage(&run.id, first.id, "retry", "x")
+            .decide_triage(run.id(), first.id, "retry", "x")
             .unwrap_err()
             .to_string()
             .contains("not failed or interrupted")
@@ -10395,14 +10438,14 @@ fn triage_answers_resume_the_run_or_ready_the_task() {
         .unwrap()
         .execute(
             "UPDATE task_runs SET status='failed' WHERE id=?1",
-            [&run.id],
+            [&run.id()],
         )
         .unwrap();
     // An ask already applied (closed) is not applied twice, by another
     // supervisor or later.
     assert!(
         queue
-            .decide_triage(&run.id, first.id, "retry", "x")
+            .decide_triage(run.id(), first.id, "retry", "x")
             .unwrap_err()
             .to_string()
             .contains("not an answered, unclosed ask")
@@ -10413,12 +10456,12 @@ fn triage_answers_resume_the_run_or_ready_the_task() {
         .unwrap()
         .execute(
             "INSERT INTO run_leases(run_id,token,pid) VALUES (?1,'other',?2)",
-            rusqlite::params![run.id, std::process::id()],
+            rusqlite::params![run.id(), std::process::id()],
         )
         .unwrap();
     assert!(
         queue
-            .decide_triage(&run.id, second.id, "retry", "x")
+            .decide_triage(run.id(), second.id, "retry", "x")
             .unwrap_err()
             .to_string()
             .contains("is leased")
@@ -10428,7 +10471,7 @@ fn triage_answers_resume_the_run_or_ready_the_task() {
         .execute("DELETE FROM run_leases", [])
         .unwrap();
     queue
-        .decide_triage(&run.id, second.id, "retry", "x")
+        .decide_triage(run.id(), second.id, "retry", "x")
         .unwrap();
     assert_eq!(
         queue.show(TaskId::new(1)).unwrap().task.status(),
@@ -10456,10 +10499,10 @@ fn a_dead_run_nobody_leases_is_recovered_triaged_and_retried() {
     let mut queue = SqliteQueue::open(&db).unwrap();
     let detail = queue.show(TaskId::new(1)).unwrap();
     assert_eq!(detail.runs.len(), 2);
-    assert_eq!(detail.runs[0].id, orphan.id);
-    assert_eq!(detail.runs[0].status, RunStatus::Interrupted);
+    assert_eq!(detail.runs[0].id(), orphan.id());
+    assert_eq!(detail.runs[0].status(), RunStatus::Interrupted);
     assert_landed_run(&detail.runs[1], &repo, &base);
-    let events = queue.run_events(&orphan.id).unwrap();
+    let events = queue.run_events(orphan.id()).unwrap();
     let kinds: Vec<&str> = events.iter().map(|e| e.kind.as_str()).collect();
     let recovered = &events[position(&kinds, "run_recovered")].payload;
     assert_eq!(recovered["by"], "supervisor");

@@ -496,9 +496,9 @@ impl GitRepository {
                 .arg("-C")
                 .arg(&self.root)
                 .args(["worktree", "add", "-b"])
-                .arg(run.branch.as_ref().context("missing branch")?)
-                .arg(run.worktree_path.as_ref().context("missing worktree")?)
-                .arg(run.base_commit.as_str()),
+                .arg(run.branch().context("missing branch")?)
+                .arg(run.worktree_path().context("missing worktree")?)
+                .arg(run.base_commit().as_str()),
         )
     }
 
@@ -916,14 +916,13 @@ impl WorkspaceBackend for Cmux {
     ) -> Result<String> {
         let raw = self.create_workspace(
             &run_workspace_name(task, run)?,
-            Path::new(run.worktree_path.as_ref().context("missing worktree")?),
+            Path::new(run.worktree_path().context("missing worktree")?),
             command,
             tags,
         )?;
         // Persist the returned handle before resolving its stable UUID.
         fs::write(
-            Path::new(run.run_dir.as_ref().context("missing run directory")?)
-                .join("workspace-create.txt"),
+            Path::new(run.run_dir().context("missing run directory")?).join("workspace-create.txt"),
             &raw,
         )?;
         self.identify(workspace_handle(&raw)?)
@@ -938,7 +937,7 @@ impl WorkspaceBackend for Cmux {
     ) -> Result<String> {
         let raw = self.create_workspace(
             &run_workspace_name(task, run)?,
-            Path::new(run.worktree_path.as_ref().context("missing worktree")?),
+            Path::new(run.worktree_path().context("missing worktree")?),
             command,
             tags,
         )?;
@@ -1205,11 +1204,11 @@ pub fn created_group_id(reply: &Value) -> Result<&str> {
 /// Names are for people only: the runtime identifies workspaces by UUID
 /// (ADR-0026).
 pub fn run_workspace_name(task: &Task, run: &TaskRun) -> Result<String> {
-    let repo = Path::new(run.repo_path.as_ref().context("missing repository path")?);
+    let repo = Path::new(run.repo_path().context("missing repository path")?);
     Ok(format!(
         "[{}]worker#{} - {}",
         repository_name(repo),
-        run.task_id,
+        run.task_id(),
         task.title()
     ))
 }
@@ -1243,7 +1242,7 @@ pub fn workspace_group_name(repo_root: &Path) -> String {
 /// resumes a `needs_session` run's session in; its title is the worker's
 /// (`run_workspace_name`, ADR-0028).
 pub fn resume_workspace_description(run: &TaskRun) -> String {
-    format!("run {} resume", run.id)
+    format!("run {} resume", run.id())
 }
 
 /// `text` as one line for `cmux send`: line breaks and tabs become spaces
@@ -1325,17 +1324,17 @@ impl AgentProvider for ClaudeCode {
     }
 
     fn command(&self, run: &TaskRun, prompt: &str) -> Result<Command> {
-        let run_dir = Path::new(run.run_dir.as_ref().context("missing run directory")?);
+        let run_dir = Path::new(run.run_dir().context("missing run directory")?);
         let settings = run_dir.join("claude-settings.json");
         fs::write(&settings, stop_hook_settings(&run.idle_marker_path()?)?)
             .with_context(|| format!("write {}", settings.display()))?;
         let mut command = Command::new(&self.executable);
         command
-            .current_dir(run.worktree_path.as_ref().context("missing worktree")?)
+            .current_dir(run.worktree_path().context("missing worktree")?)
             .arg("--session-id")
-            .arg(run.id.as_str())
+            .arg(run.id().as_str())
             .arg("--debug-file")
-            .arg(run.log_path.as_ref().context("missing log path")?)
+            .arg(run.log_path().context("missing log path")?)
             .arg("--add-dir")
             .arg(run_dir)
             .arg("--settings")
@@ -1351,15 +1350,15 @@ impl AgentProvider for ClaudeCode {
     /// `claude --resume <run-id>` in the worktree with the run's settings
     /// (its `Stop` hook), so the resumed session opens like the worker did.
     fn resume_command(&self, run: &TaskRun) -> Result<Command> {
-        let run_dir = Path::new(run.run_dir.as_ref().context("missing run directory")?);
+        let run_dir = Path::new(run.run_dir().context("missing run directory")?);
         let settings = run_dir.join("claude-settings.json");
         fs::write(&settings, stop_hook_settings(&run.idle_marker_path()?)?)
             .with_context(|| format!("write {}", settings.display()))?;
         let mut command = Command::new(&self.executable);
         command
-            .current_dir(run.worktree_path.as_ref().context("missing worktree")?)
+            .current_dir(run.worktree_path().context("missing worktree")?)
             .arg("--resume")
-            .arg(run.id.as_str())
+            .arg(run.id().as_str())
             .arg("--debug-file")
             .arg(run_dir.join("claude-resume.log"))
             .arg("--add-dir")
@@ -1394,13 +1393,13 @@ impl AgentProvider for ClaudeCode {
     /// read (`Read`, `Grep`, `Glob` allowed; `Bash`, `Edit`, `Write`,
     /// `NotebookEdit` disallowed); `review.md` is in the run directory.
     fn review_command(&self, run: &TaskRun, prompt: &str) -> Result<Command> {
-        let run_dir = Path::new(run.run_dir.as_ref().context("missing run directory")?);
+        let run_dir = Path::new(run.run_dir().context("missing run directory")?);
         let settings = run_dir.join("claude-review-settings.json");
         fs::write(&settings, review_settings()?)
             .with_context(|| format!("write {}", settings.display()))?;
         let mut command = Command::new(&self.executable);
         command
-            .current_dir(run.worktree_path.as_ref().context("missing worktree")?)
+            .current_dir(run.worktree_path().context("missing worktree")?)
             .arg("-p")
             .arg("--debug-file")
             .arg(run_dir.join("claude-review.log"))
@@ -1545,7 +1544,11 @@ mod tests {
     }
 
     fn run(repo_path: Option<&str>) -> TaskRun {
-        TaskRun {
+        TaskRun::restore(record(repo_path)).unwrap()
+    }
+
+    fn record(repo_path: Option<&str>) -> crate::domain::RunRecord {
+        crate::domain::RunRecord {
             id: RunId::new("0d8e3f1a-7c1b-4e35-9a11-3f6d2c9b8e47").unwrap(),
             task_id: TaskId::new(15),
             status: RunStatus::Claimed,
@@ -1758,9 +1761,11 @@ esac
         fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
         let run_dir = dir.path().join("run");
         fs::create_dir(&run_dir).unwrap();
-        let mut run = run(Some("/home/u/ghq/dagq"));
-        run.worktree_path = Some(dir.path().display().to_string());
-        run.run_dir = Some(run_dir.display().to_string());
+        let mut record = record(Some("/home/u/ghq/dagq"));
+        record.status = RunStatus::Starting;
+        record.worktree_path = Some(dir.path().display().to_string());
+        record.run_dir = Some(run_dir.display().to_string());
+        let run = TaskRun::restore(record).unwrap();
         let cmux = Cmux { executable };
         let tags = WorkspaceTags {
             env: vec![

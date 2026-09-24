@@ -46,8 +46,8 @@ related:
 ## Current operations
 
 - `add`でdraftを作り、`draft → ready`、`ready → draft`、`draft/ready → canceled`を手動操作できる。
-- `claim`だけが`ready → in_progress`へ遷移させる。同じトランザクションでclaimed状態のTaskRunとイベントを作り、supervisorからのclaimはそのrunの`RunLease`も作る。キュー全体の実行枠はなく、依存が解けたtaskは`supervise --parallel N`の上限まで同時に実行される。
-- supervisorはrunを`claimed → starting`（path計画）→ `running`（agent起動）→ `validating`または`failed`（wrapper終了）→ `awaiting_integration`または`failed`（receipt検証）へ進め、`awaiting_integration`のworkspaceを閉じて`workspace_closed_at`を記録し、休止したrunの`RunLease`を解放する。各遷移はそのrunのleaseまたはwrapperの所有を要求する。runtime errorではsupervisorがそのrunだけを手放す（statusは変えず、`last_error`を書き、leaseを消す）。
+- `claim`だけが`ready → in_progress`へ遷移させる（`task::claim`。readyでなければ`TaskNotClaimable`）。同じトランザクションで`TaskRun::new`がclaimed状態のTaskRunを作り、イベントを記録し、supervisorからのclaimはそのrunの`RunLease`も作る。キュー全体の実行枠はなく、依存が解けたtaskは`supervise --parallel N`の上限まで同時に実行される。
+- supervisorはrunを（遷移の判断は[集約: TaskRun](#集約-taskrun)のコマンド）`claimed → starting`（path計画）→ `running`（agent起動）→ `validating`または`failed`（wrapper終了）→ `awaiting_integration`または`failed`（receipt検証）へ進め、`awaiting_integration`のworkspaceを閉じて`workspace_closed_at`を記録し、休止したrunの`RunLease`を解放する。各遷移はそのrunのleaseまたはwrapperの所有を要求する。runtime errorではsupervisorがそのrunだけを手放す（statusは変えず、`last_error`を書き、leaseを消す）。
 - `integrate`だけが`awaiting_integration | needs_session → integrating`と、そこからの`→ integrated`（Taskは`in_progress → completed`、`result_commit`は`main`に積んだsquash commit）、`→ needs_session`（rebaseの衝突、再検証の失敗）、`→ failed`（セッションが書き直したreceiptが`failed`）、`→ 元のstatus`（mainを進める前のerror）を行う。`integrating`はqueue全体で1件。結果は`IntegrationOutcome`（`integrated` / `needs_session` / `failed` / `no_run_awaiting`）で返す。`integrate --next`は`awaiting_integration`のrunを検証完了の古い順に取り、`needs_session`は`integrate ID`で明示的に再開する。
 - `in_progress`のTaskは、未完了run（claimed/starting/running/validating/awaiting_integration/integrating/needs_session）がある間は手動変更できない。すべてのrunが`failed`または`interrupted`になった`in_progress`は`ready`/`draft`/`canceled`へ手動で戻せる。再試行は新しいTaskRunになる。終端状態は変更できない。依存の追加・削除はdraft/readyだけに許可する。
 - `recover`は未完了runを、そのrunの登録プロセスとleaseの所有者が停止していることを確認してから`interrupted`にする（`integrating`なら`awaiting_integration`へ戻す）。他のrunには触れない。Taskは`in_progress`のままで、`ready`への復帰は別操作。
@@ -96,9 +96,9 @@ IDとcommitはドメインプリミティブのnewtype（`src/domain/ids.rs`、`
 | `ids.rs` | `TaskId`・`GoalId`・`RunId`・`CommitSha` |
 | `task.rs` | 集約`Task`、`TaskAction`、`TaskStatus`の遷移規則、taskのコマンドとクエリ |
 | `goal.rs` | 集約`Goal`、`GoalVerdict::allows`、goalのコマンドとクエリ |
-| `input.rs` | 入力型`NewTask`・`NewGoal`・`GoalEdit`と、復元用の`TaskRecord`・`GoalRecord`（公開フィールドのplain data） |
-| `run.rs` | `TaskRun`と`RunPaths`（カプセル化は次のタスク。今は移動だけ） |
-| `views.rs` | 集約でない読み取り用の型（`TaskDetail`、`GoalSummary`、`GoalDetail`、`GoalTask`、`Predecessor`、`RunEvent`、`RunProcess`、`RunLease`、`SupervisorRegistration`、`TaskStatusCounts`）、`ClaimOutcome`・`IntegrationOutcome`・`RegisteredFollowUp`、`Receipt` |
+| `input.rs` | 入力型`NewTask`・`NewGoal`・`GoalEdit`・`RunPlan`と、復元用の`TaskRecord`・`GoalRecord`・`RunRecord`（公開フィールドのplain data） |
+| `run.rs` | 集約`TaskRun`とrunのコマンドとクエリ（[集約: TaskRun](#集約-taskrun)） |
+| `views.rs` | 集約でない読み取り用の型（`TaskDetail`、`GoalSummary`、`GoalDetail`、`GoalTask`、`Predecessor`、`RunEvent`、`RunProcess`、`RunLease`、`SupervisorRegistration`、`TaskStatusCounts`）、`ClaimOutcome`・`IntegrationOutcome`・`RegisteredFollowUp`、`Receipt`、runのファイル配置`RunPaths` |
 | `scope.rs`、`stats.rs` | pathのglob、`stats`の集計（従来どおり） |
 
 `Task`と`Goal`のフィールドは非公開で、`task.rs` / `goal.rs`の外からは下の関数でしか作れず、変えられない。
@@ -110,6 +110,65 @@ IDとcommitはドメインプリミティブのnewtype（`src/domain/ids.rs`、`
 - goalのコマンド: `goal::edit(goal, GoalEdit)`、`goal::ready(goal)`、`goal::close(goal, verdict, &counts, closed_at)`（閉じたgoalは閉じられない、verdictが所属taskのstatusを許すか。成功すると`closed_at`・`verdict`・`updated_at`を設定する）。クエリは`goal::check_accepts_tasks(&goal)`、`Goal::is_closed` / `is_draft`。
 - 値の取り出しは`Task`・`Goal`のメソッド（`id()`、`title()`、`status()`、`goal_id()`、`paths()`、`verdict()`など。文字列と配列は借用で返す）と`task::dependencies_editable(&task)`。`into_title()`はtitleだけを所有権ごと取り出す。
 - `updated_at`はDBの`strftime(...,'now')`が更新のたびに書き（schemaの一部）、storeは保存後に読み直して返す。`goal::close`だけは`closed_at`と`updated_at`を同じ値にするため時刻を引数に取る。
+
+## 集約: TaskRun
+
+`TaskRun`（`src/domain/run.rs`）のフィールドは非公開で、`run.rs`の外からは下の関数でしか作れず、変えられない。状態遷移の判断（どのstatusからどのstatusへ移れるか）は全部ここにあり、`runtime_store.rs`と`sqlite.rs`のSQLは判断をしない。
+
+- 新規作成: `TaskRun::new(id, &task, &base_commit, provider, claimed_at)`はclaimの初期状態を作る。`task`は`task::claim`で`in_progress`にしたtaskで、そうでなければ`RunOfUnclaimedTask`。statusは`claimed`、`requested_provider`と`actual_provider`は`provider`、`base_commit`は小文字にし、path・workspace・結果・`last_error`はnull、`created_at`は`claimed_at`。run IDとclaim時刻はstoreが渡す（IDは`Uuid::new_v4`、時刻はDBの`strftime`。注入は次のタスク）。
+- 復元: `TaskRun::restore(RunRecord)`は保存済みの行をそのまま再現する。古いversionのqueueには今の規則では生じない行（workspaceの無いclose時刻など）が残るので、検証するのはどのversionでも守られてきたことだけ: `integrated`のrunは`result_commit`を持つ（外れれば`RunInconsistent`）。infrastructureの`stored_run_row`がrowからrecordを組み、復元の拒否は`rusqlite`の変換エラーの原因として包む。読み出しの`run_row`はその後に`relocated`でpathを今の`runs/`から解決し直す。
+- `Serialize`は残し、フィールド名と順序は従来と同じなのでCLIのJSON出力は変わらない。`Deserialize`は外した（`ClaimOutcome`も`TaskRun`を含むので外した）。
+- 値の取り出しは`id()`、`task_id()`、`status()`、`base_commit()`、`branch()`・`worktree_path()`・`run_dir()`・`last_error()`など（文字列は`Option<&str>`、commitは`Option<&CommitSha>`で借用して返す）、`relocated(runs_dir)`、`idle_marker_path()`。
+
+コマンドは`fn command(run: TaskRun, ...) -> Result<TaskRun, DomainError>`の形で、許されない遷移は`RunTransitionNotAllowed { status, operation }`（見つけたstatusと操作名）で拒否する。
+
+| コマンド | 許すstatus | 結果 |
+| --- | --- | --- |
+| `start_provisioning(run, &RunPlan)` | `claimed` | `starting`。`repo_path`・`run_dir`・`branch`・`worktree_path`・`receipt_path`・`log_path`を設定 |
+| `attach_workspace(run, workspace_id)` | `starting`でworkspace未設定 | `workspace_id`を設定 |
+| `mark_running(run)` | `starting` | `running` |
+| `finish_session(run, exit_code)` | `starting` / `running` | 0か`None`（sessionを開いたまま、ADR-0027）なら`validating`、非0なら`failed`と`session exited with code N` |
+| `accept(run, result_commit)` | `validating` | `awaiting_integration`と`result_commit` |
+| `reject(run, result_commit, reason, resumable)` | `validating` | `resumable`（evidence不足かscope違反だけ）なら`needs_session`、ほかは`failed`。`result_commit`は検証済みのcommitかnull、`reason`があれば`last_error` |
+| `restart_validation(run)` | `awaiting_integration` | `validating`（`revise`の後、ADR-0027） |
+| `decide_landing(run, to, reason)` | `awaiting_integration`、`to`は`needs_session` / `failed` | `to`と`last_error` |
+| `abandon(run, message)` | どれでも | `last_error`だけ（runtime error。statusは変えない） |
+| `interrupt(run)` | `claimed` / `starting` / `running` / `validating` / `integrating`（`run::UNFINISHED`） | `interrupted`。`integrating`は`awaiting_integration` |
+| `begin_integration(run)` | `awaiting_integration` / `needs_session` | `integrating` |
+| `defer_integration(run, reason)` | `integrating` | `needs_session`と`last_error` |
+| `fail_integration(run, reason)` | `integrating` | `failed`と`last_error` |
+| `abort_integration(run, revert_to, message)` | `integrating`、`revert_to`は`awaiting_integration` / `needs_session` | `revert_to`と`last_error` |
+| `finish_integration(run, commit)` | `integrating` | `integrated`、`result_commit`、`last_error`はnull |
+| `skip_resume(run, approved)` | `needs_session` | 承認済みはそのまま、ほかは`validating` |
+| `finish_resume(run, to, reason)` | `needs_session`、`to`は`validating` / `awaiting_integration` / `failed` | `to`、`reason`があれば`last_error` |
+| `exhaust_resumes(run, reason)` | `needs_session` | `failed`と`last_error`（ADR-0024） |
+| `resume_after_triage(run, instruction)` | `failed` / `interrupted` | `needs_session`と`last_error` |
+| `workspace_closed(run, closed_at)` | `awaiting_integration` / `needs_session`で、workspaceがあり未close | `workspace_closed_at` |
+| `triage_closed_workspace(run, workspace_id, closed_at)` | どれでも | runのworkspaceで未closeのときだけ`workspace_closed_at` |
+| `record_close_failure(run, message)` | `awaiting_integration` / `needs_session`で未close | `last_error`（close失敗） |
+| `record_cleanup_failure(run, message)` | どれでも | `last_error`（着地後のworktree / branch削除の失敗） |
+
+クエリは`run::check_ready_for_wrapper(&run)`（`starting`でworkspaceあり）、`run::check_resumable(&run)`（`needs_session`）、`run::check_triageable(&run)`（`failed` / `interrupted`）。
+
+```text
+claimed ──start_provisioning──▶ starting ──mark_running──▶ running
+   │                               │ finish_session            │ finish_session
+   │                               ▼                           ▼
+   │                           validating ◀──────────────────────
+   │                  accept │    │ reject            ▲ restart_validation / skip_resume / finish_resume
+   │                         ▼    ▼                   │
+   │        awaiting_integration  failed / needs_session
+   │           │  ▲   decide_landing ─▶ needs_session / failed
+   │ begin_    │  │ interrupt / abort_integration
+   │ integration▼ │
+   │         integrating ──finish_integration──▶ integrated
+   │               ├──defer_integration──▶ needs_session ──begin_integration──▶ integrating
+   │               └──fail_integration───▶ failed
+   └──interrupt（claimed / starting / running / validating）──▶ interrupted
+failed / interrupted ──resume_after_triage──▶ needs_session ──exhaust_resumes──▶ failed
+```
+
+storeの保存は「`stored_run`で読む → domainのコマンド → `save_run`で書く」の形で、[persistence](persistence.md#集約の読み書き)にある。
 
 ## DomainError
 
@@ -138,9 +197,13 @@ domainの関数は業務上の拒否を`DomainError`（`src/domain/error.rs`）�
 | `TaskNotEditable` | `task::set_goal`、`task::set_paths`、`task::check_dependencies_editable` | 変える対象（`the goal`、`the paths`、`dependencies`） | `<what> can only be changed for draft or ready tasks` |
 | `SelfDependency` | `task::check_not_self` | なし | `a task cannot depend on itself` |
 | `DependencyCycle` | `task::check_acyclic` | task ID、predecessor ID | `dependency <task> -> <predecessor> would create a cycle` |
+| `TaskNotClaimable` | `task::claim` | task ID、status | `task <id> is <status>, not ready` |
+| `RunOfUnclaimedTask` | `TaskRun::new` | task ID、status | `task <id> is <status>; a run starts only for a claimed task` |
+| `RunTransitionNotAllowed` | `run`のコマンドとクエリ | 見つけたstatus、操作名 | `cannot <operation> a run in <status> state` |
+| `RunInconsistent` | `TaskRun::restore` | run ID、理由 | `run <id> <reason>` |
 | `InvalidNoteKind` | `NewNote::validate` | kind | `note kind "<kind>" must be a slug of lowercase letters, digits, '-' and '_'` |
 
-`goal close`の判断（閉じたgoalは閉じられない、verdictが所属taskのstatusを許すか）は`goal::close`が持ち、`SqliteQueue::close_goal`はgoalとstatus別件数を読んで渡し、返ったgoalを書くだけである。taskの手動遷移、goalの付け替え、pathsと依存の変更、閉じたgoalへの追加も同じく、`sqlite.rs`は読んでdomainの関数に渡し、その結果を保存する（`ensure!`で業務上の拒否を決める箇所は残っていない）。各エラー文はdomainの単体テストで固定している。DBに保存された文字列が既知のenum値でないときは、`enum_col`が`UnknownValue`を`rusqlite`の変換エラーの原因として包む。
+`goal close`の判断（閉じたgoalは閉じられない、verdictが所属taskのstatusを許すか）は`goal::close`が持ち、`SqliteQueue::close_goal`はgoalとstatus別件数を読んで渡し、返ったgoalを書くだけである。taskの手動遷移、goalの付け替え、pathsと依存の変更、閉じたgoalへの追加も同じく、`sqlite.rs`は読んでdomainの関数に渡し、その結果を保存する（`ensure!`で業務上の拒否を決める箇所は残っていない）。runの遷移も同じく`runtime_store.rs`は読んで`run`のコマンドに渡し、その結果を保存する。ただしrunのコマンドの拒否（`RunTransitionNotAllowed`）はCLIの`{"error"}`と`last_error`に出る文を変えないため、storeが操作ごとの従来の文（`run is not owned by this supervisor`、`run <id> is not integrating`など）に置き換えて返す。各エラー文はdomainの単体テストで固定している。DBに保存された文字列が既知のenum値でないときは、`enum_col`が`UnknownValue`を`rusqlite`の変換エラーの原因として包む。
 
 ## Invariants
 

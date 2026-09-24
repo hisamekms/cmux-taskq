@@ -443,7 +443,7 @@ fn claim_a_run(fixture: &Fixture, queue: &mut SqliteQueue, token: &str) -> Strin
         .claim_for_supervisor(&repository.base_commit, token)
         .unwrap()
     {
-        dagq::domain::ClaimOutcome::Claimed { run } => run.id.into_string(),
+        dagq::domain::ClaimOutcome::Claimed { run } => run.id().to_string(),
         outcome => panic!("expected a claim, got {outcome:?}"),
     }
 }
@@ -1009,7 +1009,7 @@ fn the_cmux_adapter_sends_one_line_and_names_the_resume_workspace() {
         "send\n--workspace\nWS\n--\nline one line two/n\nsend-key\n--workspace\nWS\n--\nenter\n"
     );
     fs::remove_file(&dump).unwrap();
-    let run = TaskRun {
+    let run = TaskRun::restore(dagq::domain::RunRecord {
         id: dagq::domain::RunId::new("run-1").unwrap(),
         task_id: dagq::domain::TaskId::new(3),
         status: dagq::domain::RunStatus::NeedsSession,
@@ -1027,7 +1027,8 @@ fn the_cmux_adapter_sends_one_line_and_names_the_resume_workspace() {
         last_error: None,
         workspace_closed_at: None,
         created_at: String::new(),
-    };
+    })
+    .unwrap();
     assert_eq!(
         cmux.create_resume(
             &Task::restore(dagq::domain::TaskRecord {
@@ -1298,24 +1299,24 @@ fn up_reports_runs_that_wait_for_a_person_or_the_supervisor() {
     let raw = Connection::open(&fixture.location.db).unwrap();
     raw.execute(
         "UPDATE task_runs SET status='awaiting_integration' WHERE id=?1",
-        [&awaiting.id],
+        [&awaiting.id()],
     )
     .unwrap();
     raw.execute(
         "UPDATE task_runs SET status='needs_session', last_error='rebase conflicted' WHERE id=?1",
-        [&parked.id],
+        [&parked.id()],
     )
     .unwrap();
     raw.execute(
         "DELETE FROM run_leases WHERE run_id IN (?1, ?2)",
-        [&awaiting.id, &parked.id],
+        [&awaiting.id(), &parked.id()],
     )
     .unwrap();
     // The orphan keeps a lease whose owner is dead.
     let dead = dead_pid();
     raw.execute(
         "UPDATE run_leases SET pid=?2 WHERE run_id=?1",
-        rusqlite::params![orphan.id, dead],
+        rusqlite::params![orphan.id(), dead],
     )
     .unwrap();
     drop(raw);
@@ -1330,15 +1331,15 @@ fn up_reports_runs_that_wait_for_a_person_or_the_supervisor() {
     );
     assert_eq!(
         report["doctor"]["awaiting_integration"],
-        json!([{"run_id": awaiting.id, "task_id": awaiting.task_id, "last_error": null}])
+        json!([{"run_id": awaiting.id(), "task_id": awaiting.task_id(), "last_error": null}])
     );
     assert_eq!(
         report["doctor"]["needs_session"],
-        json!([{"run_id": parked.id, "task_id": parked.task_id, "last_error": "rebase conflicted"}])
+        json!([{"run_id": parked.id(), "task_id": parked.task_id(), "last_error": "rebase conflicted"}])
     );
     assert_eq!(
         report["doctor"]["unfinished_runs"],
-        json!([{"run_id": orphan.id, "task_id": orphan.task_id, "status": "claimed", "lease_stale": true}])
+        json!([{"run_id": orphan.id(), "task_id": orphan.task_id(), "status": "claimed", "lease_stale": true}])
     );
 }
 

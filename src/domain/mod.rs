@@ -253,7 +253,7 @@ mod error;
 pub mod goal;
 pub mod ids;
 mod input;
-mod run;
+pub mod run;
 pub mod scope;
 pub mod stats;
 pub mod task;
@@ -263,13 +263,13 @@ pub use error::DomainError;
 use error::require;
 pub use goal::Goal;
 pub use ids::{CommitSha, GoalId, RunId, TaskId};
-pub use input::{GoalEdit, GoalRecord, NewGoal, NewTask, TaskRecord};
-pub use run::{RunPaths, TaskRun};
+pub use input::{GoalEdit, GoalRecord, NewGoal, NewTask, RunPlan, RunRecord, TaskRecord};
+pub use run::TaskRun;
 pub use task::{Task, TaskAction};
 pub use views::{
     ClaimOutcome, GoalDetail, GoalSummary, GoalTask, IntegrationOutcome, Predecessor, Receipt,
-    ReceiptCheck, RegisteredFollowUp, RunEvent, RunLease, RunProcess, SupervisorRegistration,
-    TaskDetail, TaskStatusCounts, evidence_missing_reason,
+    ReceiptCheck, RegisteredFollowUp, RunEvent, RunLease, RunPaths, RunProcess,
+    SupervisorRegistration, TaskDetail, TaskStatusCounts, evidence_missing_reason,
 };
 
 /// A question for a person (ADR-0022): about a task, or one of its runs when

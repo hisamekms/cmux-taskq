@@ -140,7 +140,7 @@ pub struct SupervisorRegistration {
     pub binary_version: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(tag = "outcome", rename_all = "snake_case")]
 pub enum ClaimOutcome {
     Claimed { run: Box<TaskRun> },
@@ -310,4 +310,28 @@ impl Receipt {
 pub fn evidence_missing_reason(missing: &[EvidenceCheck]) -> String {
     let names: Vec<&str> = missing.iter().map(|c| c.as_str()).collect();
     format!("evidence missing: {}", names.join(", "))
+}
+
+/// Where a run's files live: `<runs dir>/<run id>/` holds the worktree, the
+/// receipt and the provider log. The layout is fixed, so these paths are
+/// derived from the run ID and the queue's current `runs/` directory rather
+/// than trusted from the database (ADR-0017).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunPaths {
+    pub run_dir: std::path::PathBuf,
+    pub worktree: std::path::PathBuf,
+    pub receipt: std::path::PathBuf,
+    pub log: std::path::PathBuf,
+}
+
+impl RunPaths {
+    pub fn new(runs_dir: &std::path::Path, run_id: &RunId) -> Self {
+        let run_dir = runs_dir.join(run_id.as_str());
+        Self {
+            worktree: run_dir.join("worktree"),
+            receipt: run_dir.join("receipt.json"),
+            log: run_dir.join("claude.debug.log"),
+            run_dir,
+        }
+    }
 }

@@ -61,9 +61,9 @@ fn tasks_dependencies_runs_and_events_survive_reopen() {
     let ClaimOutcome::Claimed { run } = queue.claim(&base()).unwrap() else {
         panic!()
     };
-    assert_eq!(run.status, RunStatus::Claimed);
-    assert_eq!(run.requested_provider, Provider::Claude);
-    assert_eq!(run.actual_provider, Provider::Claude);
+    assert_eq!(run.status(), RunStatus::Claimed);
+    assert_eq!(run.requested_provider(), Provider::Claude);
+    assert_eq!(run.actual_provider(), Provider::Claude);
     drop(queue);
 
     let mut reopened = SqliteQueue::open(dir.path().join("queue.db")).unwrap();
@@ -71,9 +71,9 @@ fn tasks_dependencies_runs_and_events_survive_reopen() {
     assert_eq!(detail.task.title(), a.title());
     assert_eq!(detail.task.status(), TaskStatus::InProgress);
     assert_eq!(detail.task.verification_commands(), vec!["cargo test"]);
-    assert_eq!(detail.runs[0].id, run.id);
-    assert_eq!(detail.runs[0].base_commit.as_str(), BASE);
-    assert!(detail.runs[0].workspace_id.is_none());
+    assert_eq!(detail.runs[0].id(), run.id());
+    assert_eq!(detail.runs[0].base_commit().as_str(), BASE);
+    assert!(detail.runs[0].workspace_id().is_none());
     assert_eq!(
         detail
             .events
@@ -84,7 +84,7 @@ fn tasks_dependencies_runs_and_events_survive_reopen() {
     );
     assert_eq!(
         detail.events[2].run_id.as_ref().map(RunId::as_str),
-        Some(run.id.as_str())
+        Some(run.id().as_str())
     );
     let second = reopened.show(b.id()).unwrap();
     assert_eq!(second.dependencies, vec![a.id()]);
@@ -181,7 +181,7 @@ fn candidates_require_every_predecessor_to_be_completed() {
     let ClaimOutcome::Claimed { run } = queue.claim(&base()).unwrap() else {
         panic!()
     };
-    assert_eq!(run.task_id, c);
+    assert_eq!(run.task_id(), c);
 }
 
 /// The read-only views the worker prompt is built from: direct predecessors
@@ -214,7 +214,7 @@ fn predecessors_carry_the_integrated_run_and_in_progress_tasks_are_listed() {
     let raw = Connection::open(dir.path().join("queue.db")).unwrap();
     raw.execute(
         "UPDATE task_runs SET status='integrated', result_commit=?2, run_dir='/nowhere' WHERE id=?1",
-        rusqlite::params![run.id, BASE],
+        rusqlite::params![run.id(), BASE],
     )
     .unwrap();
     raw.execute(
@@ -234,12 +234,9 @@ fn predecessors_carry_the_integrated_run_and_in_progress_tasks_are_listed() {
         vec![(a, "a"), (b, "b")]
     );
     let landed = predecessors[0].integrated_run.as_ref().unwrap();
-    assert_eq!(landed.id, run.id);
-    assert_eq!(landed.status, RunStatus::Integrated);
-    assert_eq!(
-        landed.result_commit.as_ref().map(CommitSha::as_str),
-        Some(BASE)
-    );
+    assert_eq!(landed.id(), run.id());
+    assert_eq!(landed.status(), RunStatus::Integrated);
+    assert_eq!(landed.result_commit().map(CommitSha::as_str), Some(BASE));
     // The stored path is not trusted: the run directory is resolved under the
     // queue's own `runs/` (ADR-0017).
     let run_dir = dir
@@ -247,8 +244,8 @@ fn predecessors_carry_the_integrated_run_and_in_progress_tasks_are_listed() {
         .canonicalize()
         .unwrap()
         .join("runs")
-        .join(run.id.as_str());
-    assert_eq!(landed.run_dir.as_deref(), run_dir.to_str());
+        .join(run.id().as_str());
+    assert_eq!(landed.run_dir(), run_dir.to_str());
     assert!(predecessors[1].integrated_run.is_none());
     // A task that does not exist has no predecessors rather than an error.
     assert!(queue.predecessors(TaskId::new(99)).unwrap().is_empty());
@@ -304,7 +301,7 @@ fn concurrent_connections_claim_each_ready_task_once() {
         })
         .collect();
     // No queue-wide slot: both tasks are claimed, each exactly once.
-    let mut claimed: Vec<i64> = runs.iter().map(|r| r.task_id.as_i64()).collect();
+    let mut claimed: Vec<i64> = runs.iter().map(|r| r.task_id().as_i64()).collect();
     claimed.sort();
     assert_eq!(claimed, [1, 2]);
     assert_eq!(
@@ -391,30 +388,30 @@ fn awaiting_integration_keeps_dependents_blocked_but_frees_execution_slot() {
         "UPDATE task_runs SET status='awaiting_integration', branch='dagq/a',
         worktree_path='/tmp/a', workspace_id='ws-a', receipt_path='/tmp/receipt.json',
         log_path='/tmp/run.log', result_commit=?1 WHERE id=?2",
-        rusqlite::params![BASE, run.id],
+        rusqlite::params![BASE, run.id()],
     )
     .unwrap();
     drop(queue);
     let mut queue = SqliteQueue::open(dir.path().join("queue.db")).unwrap();
     let detail = queue.show(a).unwrap();
     assert_eq!(detail.task.status(), TaskStatus::InProgress);
-    assert_eq!(detail.runs[0].status, RunStatus::AwaitingIntegration);
+    assert_eq!(detail.runs[0].status(), RunStatus::AwaitingIntegration);
     // Stored paths are resolved again under the queue's `runs/<run-id>/`.
     let run_dir = dir
         .path()
         .canonicalize()
         .unwrap()
         .join("runs")
-        .join(run.id.as_str());
+        .join(run.id().as_str());
     assert_eq!(
-        detail.runs[0].worktree_path.as_deref(),
+        detail.runs[0].worktree_path(),
         run_dir.join("worktree").to_str()
     );
     assert_eq!(
-        detail.runs[0].receipt_path.as_deref(),
+        detail.runs[0].receipt_path(),
         run_dir.join("receipt.json").to_str()
     );
-    assert!(detail.runs[0].run_dir.is_none());
+    assert!(detail.runs[0].run_dir().is_none());
     assert_eq!(
         queue
             .candidates()
@@ -427,7 +424,7 @@ fn awaiting_integration_keeps_dependents_blocked_but_frees_execution_slot() {
     let ClaimOutcome::Claimed { run } = queue.claim(&base()).unwrap() else {
         panic!()
     };
-    assert_eq!(run.task_id, c);
+    assert_eq!(run.task_id(), c);
 }
 
 #[test]
@@ -607,13 +604,13 @@ fn migration_to_v5_rebuilds_runs_moves_the_lease_and_keeps_foreign_keys() {
         detail
             .runs
             .iter()
-            .map(|r| r.id.as_str())
+            .map(|r| r.id().as_str())
             .collect::<Vec<_>>(),
         ["run-failed", "run-awaiting"]
     );
-    assert_eq!(detail.runs[0].last_error.as_deref(), Some("rejected"));
-    assert_eq!(detail.runs[1].status, RunStatus::AwaitingIntegration);
-    assert_eq!(detail.runs[1].workspace_closed_at, Some(1700000000));
+    assert_eq!(detail.runs[0].last_error(), Some("rejected"));
+    assert_eq!(detail.runs[1].status(), RunStatus::AwaitingIntegration);
+    assert_eq!(detail.runs[1].workspace_closed_at(), Some(1700000000));
     assert_eq!(
         detail.events[0].run_id.as_ref().map(RunId::as_str),
         Some("run-failed")
@@ -681,11 +678,11 @@ fn migration_to_v6_adds_the_integration_statuses_and_the_single_slot() {
     let mut queue = SqliteQueue::open(&path).unwrap();
     assert_eq!(queue.schema_version().unwrap(), SqliteQueue::SCHEMA_VERSION);
     assert_eq!(
-        queue.show(TaskId::new(1)).unwrap().runs[0].status,
+        queue.show(TaskId::new(1)).unwrap().runs[0].status(),
         RunStatus::AwaitingIntegration
     );
     assert_eq!(
-        queue.show(TaskId::new(2)).unwrap().runs[0].status,
+        queue.show(TaskId::new(2)).unwrap().runs[0].status(),
         RunStatus::Running
     );
     let leases = queue.run_leases().unwrap();
@@ -696,7 +693,7 @@ fn migration_to_v6_adds_the_integration_statuses_and_the_single_slot() {
             .next_awaiting_integration()
             .unwrap()
             .unwrap()
-            .id
+            .id()
             .as_str(),
         "run-awaiting"
     );
@@ -800,7 +797,7 @@ fn migration_to_v7_adds_the_supervisor_registry_and_keeps_leases() {
     assert_eq!(leases[0].pid, 4242);
     assert_eq!(leases[0].heartbeat_at, 1700000000);
     assert_eq!(
-        queue.show(TaskId::new(1)).unwrap().runs[0].status,
+        queue.show(TaskId::new(1)).unwrap().runs[0].status(),
         RunStatus::Running
     );
 
@@ -945,7 +942,7 @@ fn migration_from_v6_adds_goals_and_keeps_tasks_runs_and_events() {
     assert!(landed.task.paths().is_empty());
     assert_eq!(landed.task.status(), TaskStatus::Completed);
     assert_eq!(landed.runs.len(), 1);
-    assert_eq!(landed.runs[0].status, RunStatus::Integrated);
+    assert_eq!(landed.runs[0].status(), RunStatus::Integrated);
     // Events keep their IDs, order and run reference across the rebuild.
     assert_eq!(
         landed
@@ -1125,7 +1122,7 @@ fn draft_goal_tasks_are_not_candidates_until_the_goal_is_ready() {
     assert_eq!(graph.tasks[1].goal_status, None);
     // The supervisor's claim skips the draft goal's task as well.
     let claimed = match queue.claim(&base()).unwrap() {
-        ClaimOutcome::Claimed { run } => run.task_id,
+        ClaimOutcome::Claimed { run } => run.task_id(),
         ClaimOutcome::NoReadyTask => panic!("plain task is claimable"),
     };
     assert_eq!(claimed, plain.id());
@@ -1196,13 +1193,13 @@ fn notes_attach_to_tasks_runs_and_goals_and_page_by_cursor() {
     let on_run = queue
         .add_note(NewNote {
             kind: Some("slow".into()),
-            ..note(NoteTarget::Run(run.id.clone()), "run note")
+            ..note(NoteTarget::Run(run.id().clone()), "run note")
         })
         .unwrap();
     assert_eq!(on_run.task_id, Some(task.id()));
     assert_eq!(
         on_run.run_id.as_ref().map(RunId::as_str),
-        Some(run.id.as_str())
+        Some(run.id().as_str())
     );
     let on_other = queue
         .add_note(note(NoteTarget::Task(other.id()), "other note"))
@@ -1598,7 +1595,7 @@ fn list_defaults_to_unfinished_tasks_newest_first_with_compact_items() {
                 {"id": d, "status": "ready", "title": "waiting", "goal_id": null,
                  "dependencies": [], "latest_run": null},
                 {"id": c, "status": "in_progress", "title": "claimed", "goal_id": goal,
-                 "dependencies": [a], "latest_run": {"id": run.id, "status": "claimed"}},
+                 "dependencies": [a], "latest_run": {"id": run.id(), "status": "claimed"}},
             ],
             "next": null,
             "total": 2,

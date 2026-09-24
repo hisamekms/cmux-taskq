@@ -523,7 +523,7 @@ to finish",
             in_flight.len(),
             in_flight
                 .iter()
-                .map(|run| run.id.as_str())
+                .map(|run| run.id().as_str())
                 .collect::<Vec<_>>()
                 .join(", "),
         );
@@ -935,13 +935,13 @@ fn open_work(queue: &SqliteQueue, processes: &dyn ProcessControl) -> Result<Valu
         .active_runs()?
         .into_iter()
         .map(|run| {
-            let lease_stale = leases.iter().find(|l| l.run_id == run.id).map(|lease| {
+            let lease_stale = leases.iter().find(|l| l.run_id == *run.id()).map(|lease| {
                 !processes.alive(lease.pid) || now - lease.heartbeat_at > HEARTBEAT_TIMEOUT_SECS
             });
             json!({
-                "run_id": run.id,
-                "task_id": run.task_id,
-                "status": run.status,
+                "run_id": run.id(),
+                "task_id": run.task_id(),
+                "status": run.status(),
                 "lease_stale": lease_stale,
             })
         })
@@ -951,7 +951,7 @@ fn open_work(queue: &SqliteQueue, processes: &dyn ProcessControl) -> Result<Valu
             .runs_with_status(status)?
             .into_iter()
             .map(|run| {
-                json!({"run_id": run.id, "task_id": run.task_id, "last_error": run.last_error})
+                json!({"run_id": run.id(), "task_id": run.task_id(), "last_error": run.last_error()})
             })
             .collect())
     };
