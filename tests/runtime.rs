@@ -14,6 +14,7 @@ use dagq::{
         asks::AskQuery,
         clock::SystemClock,
         location::QueueLocation,
+        run_files::LocalRunFiles,
         sqlite::SqliteQueue,
     },
     runtime::{self, IntegrateTarget, SuperviseOptions},
@@ -4355,7 +4356,7 @@ fn successor_starts_when_the_predecessor_receipt_is_unavailable() {
     // A corrupt receipt is described the same way.
     let corrupt = queue.predecessors(TaskId::new(2)).unwrap();
     fs::write(receipt, "not json").unwrap();
-    let summary = runtime::PredecessorSummary::from_predecessor(&corrupt[0]);
+    let summary = runtime::PredecessorSummary::from_predecessor(&LocalRunFiles, &corrupt[0]);
     assert_eq!(summary.summary, "(receipt unavailable)");
     assert_eq!(summary.result_commit, landed_commit);
     assert_eq!(
@@ -4367,7 +4368,7 @@ fn successor_starts_when_the_predecessor_receipt_is_unavailable() {
         task: corrupt[0].task.clone(),
         integrated_run: None,
     };
-    let summary = runtime::PredecessorSummary::from_predecessor(&by_hand);
+    let summary = runtime::PredecessorSummary::from_predecessor(&LocalRunFiles, &by_hand);
     assert_eq!(summary.result_commit, "(not landed)");
     assert_eq!(summary.summary, "(receipt unavailable)");
 }

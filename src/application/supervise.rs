@@ -1179,6 +1179,7 @@ impl Supervisor<'_> {
         let remote = self.remote.clone();
         let verifier = self.verifier.clone();
         let processes = self.processes.clone();
+        let files = self.files.clone();
         let pid = self.layout.pid;
         let token = self.token.clone();
         let common_dir = path_text(&self.layout.common_dir)?;
@@ -1197,6 +1198,7 @@ impl Supervisor<'_> {
                     repository: &*repository,
                     verifier: &*verifier,
                     remote: push.then_some(&*remote as &dyn MainRemote),
+                    files: &*files,
                     common_dir: &common_dir,
                     clock: &*generators.clock,
                     ids: &*generators.ids,
@@ -1465,7 +1467,13 @@ impl Supervisor<'_> {
         let sent = match &live {
             Some(live) => {
                 let task = self.queue.show(run.task_id())?.task;
-                let landed = landed_since(&mut *self.queue, &*self.repository, run, &main)?;
+                let landed = landed_since(
+                    &mut *self.queue,
+                    &*self.repository,
+                    &*self.files,
+                    run,
+                    &main,
+                )?;
                 let request = ResumeRequest {
                     main: main.clone(),
                     reason: why.clone(),
@@ -2468,7 +2476,13 @@ impl Supervisor<'_> {
             worktree.display()
         );
         let task = self.queue.show(run.task_id())?.task;
-        let landed = landed_since(&mut *self.queue, &*self.repository, run, &request.main)?;
+        let landed = landed_since(
+            &mut *self.queue,
+            &*self.repository,
+            &*self.files,
+            run,
+            &request.main,
+        )?;
         let message = resume_request(&task, run, request, &landed)?;
         self.files.write(
             &run_dir.join(format!("resume-{attempt}.txt")),
@@ -2976,6 +2990,7 @@ impl Supervisor<'_> {
         spawn_validation(
             self.queues.clone(),
             self.repository.clone(),
+            self.files.clone(),
             run,
             self.log.clone(),
         )
@@ -3028,7 +3043,7 @@ so the run workspace opens outside it: {error:#}",
             .queue
             .predecessors(task.id())?
             .iter()
-            .map(PredecessorSummary::from_predecessor)
+            .map(|predecessor| PredecessorSummary::from_predecessor(&*self.files, predecessor))
             .collect();
         let goal = match task.goal_id() {
             Some(goal_id) => Some(self.queue.show_goal(goal_id)?.goal),
@@ -3881,6 +3896,7 @@ fn resume_reason(queue: &dyn Queue, run: &TaskRun) -> Result<(Option<String>, Re
 fn landed_since(
     queue: &mut dyn Queue,
     repository: &dyn Repository,
+    files: &dyn RunFiles,
     run: &TaskRun,
     main: &CommitSha,
 ) -> Result<Vec<PredecessorSummary>> {
@@ -3895,10 +3911,13 @@ fn landed_since(
             .rev()
             .find(|r| r.status() == RunStatus::Integrated)
             .cloned();
-        landed.push(PredecessorSummary::from_predecessor(&Predecessor {
-            task: detail.task,
-            integrated_run,
-        }));
+        landed.push(PredecessorSummary::from_predecessor(
+            files,
+            &Predecessor {
+                task: detail.task,
+                integrated_run,
+            },
+        ));
     }
     Ok(landed)
 }
@@ -4829,10 +4848,10 @@ pub fn triage_prompt(
             ))
         )
     ));
-    let (latest, earlier) = integrate_logs(dir);
+    let (latest, earlier) = integrate_logs(files, dir);
     let mut logs = latest;
     // `verify-N.log` is what validation wrote before ADR-0023.
-    let mut validation: Vec<PathBuf> = log_names(dir)
+    let mut validation: Vec<PathBuf> = log_names(files, dir)
         .into_iter()
         .filter(|(name, _)| name.starts_with("verify-") && name.ends_with(".log"))
         .map(|(_, path)| path)
@@ -5084,13 +5103,14 @@ fn background_running(files: &dyn RunFiles, marker: &Path) -> Result<bool> {
 fn spawn_validation(
     queues: Arc<dyn QueueOpener>,
     repository: Arc<dyn Repository + Send + Sync>,
+    files: Arc<dyn RunFiles>,
     run: TaskRun,
     log: Arc<dyn NoteLog>,
 ) -> thread::JoinHandle<Result<Validation>> {
     thread::spawn(move || {
         let mut queue = queues.open()?;
         let task = queue.show(run.task_id())?.task;
-        let checked = check_receipt(&*repository, &task, &run)?;
+        let checked = check_receipt(&*repository, &*files, &task, &run)?;
         Ok(match checked {
             Ok((receipt, commit)) => Validation {
                 accepted: true,
@@ -5259,86 +5279,7 @@ mod prompt_tests {
 #[cfg(test)]
 mod idle_tests {
     use super::*;
-    use std::{collections::HashMap, io, sync::Mutex};
-
-    /// Run files in memory, each with the time it was written.
-    #[derive(Default)]
-    struct MemoryFiles {
-        files: Mutex<HashMap<PathBuf, (SystemTime, Vec<u8>)>>,
-    }
-
-    impl MemoryFiles {
-        fn put(&self, path: &Path, modified: SystemTime, contents: &str) {
-            self.files
-                .lock()
-                .unwrap()
-                .insert(path.to_owned(), (modified, contents.as_bytes().to_vec()));
-        }
-    }
-
-    fn missing() -> io::Error {
-        io::Error::from(io::ErrorKind::NotFound)
-    }
-
-    impl RunFiles for MemoryFiles {
-        fn create_dir_all(&self, _: &Path) -> io::Result<()> {
-            Ok(())
-        }
-        fn create_new_dir(&self, _: &Path) -> io::Result<()> {
-            Ok(())
-        }
-        fn write(&self, path: &Path, contents: &[u8]) -> io::Result<()> {
-            self.put(path, self.now(), &String::from_utf8_lossy(contents));
-            Ok(())
-        }
-        fn copy(&self, _: &Path, _: &Path) -> io::Result<()> {
-            Ok(())
-        }
-        fn read(&self, path: &Path) -> io::Result<Vec<u8>> {
-            let files = self.files.lock().unwrap();
-            files
-                .get(path)
-                .map(|(_, bytes)| bytes.clone())
-                .ok_or_else(missing)
-        }
-        fn read_to_string(&self, path: &Path) -> io::Result<String> {
-            Ok(String::from_utf8_lossy(&self.read(path)?).into_owned())
-        }
-        fn modified(&self, path: &Path) -> io::Result<SystemTime> {
-            let files = self.files.lock().unwrap();
-            files.get(path).map(|(at, _)| *at).ok_or_else(missing)
-        }
-        fn read_stamped(&self, path: &Path) -> Result<Option<(SystemTime, Vec<u8>)>> {
-            Ok(self.files.lock().unwrap().get(path).cloned())
-        }
-        fn is_file(&self, path: &Path) -> bool {
-            self.exists(path)
-        }
-        fn is_dir(&self, _: &Path) -> bool {
-            false
-        }
-        fn exists(&self, path: &Path) -> bool {
-            self.files.lock().unwrap().contains_key(path)
-        }
-        fn rename(&self, _: &Path, _: &Path) -> io::Result<()> {
-            unimplemented!("the supervisor renames no run file")
-        }
-        fn remove_file(&self, _: &Path) -> io::Result<()> {
-            unimplemented!("the supervisor removes no run file")
-        }
-        fn append_line(&self, _: &Path, _: &str) -> io::Result<()> {
-            unimplemented!("the supervisor appends to no run file")
-        }
-        fn canonicalize(&self, _: &Path) -> io::Result<PathBuf> {
-            unimplemented!("the supervisor resolves no run file")
-        }
-        fn write_fenced(&self, _: &Path, _: &str, _: &str, _: &Path) -> Result<()> {
-            unimplemented!("the supervisor writes no review")
-        }
-        fn now(&self) -> SystemTime {
-            UNIX_EPOCH + Duration::from_secs(1_000_000)
-        }
-    }
+    use crate::application::memory_files::MemoryFiles;
 
     fn idle_after_receipt(files: &MemoryFiles, receipt: &Path, marker: &Path) -> Option<Value> {
         IdleMarker::read(files, marker)

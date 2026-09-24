@@ -7,14 +7,11 @@
 
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Value, json};
-use std::{
-    fs,
-    path::{Path, PathBuf},
-};
+use std::path::{Path, PathBuf};
 
 use super::{
-    Clock, IdGenerator, Landing, MainRemote, ProcessControl, Queue, Repository, RunStore, Verifier,
-    path_text, tail,
+    Clock, IdGenerator, Landing, MainRemote, ProcessControl, Queue, Repository, RunFiles, RunStore,
+    Verifier, path_text, tail,
 };
 use crate::domain::{
     CommitSha, EvidenceCheck, IntegrationOutcome, MAX_RESUME_ATTEMPTS, NewTask, PUSH_REMOTE,
@@ -43,6 +40,7 @@ pub struct Rejection {
 /// a verdict on the run; `Err` a failure of the checks themselves.
 pub fn check_receipt(
     repository: &dyn Repository,
+    files: &dyn RunFiles,
     task: &Task,
     run: &TaskRun,
 ) -> Result<std::result::Result<(Receipt, CommitSha), Rejection>> {
@@ -56,7 +54,7 @@ pub fn check_receipt(
         }))
     };
     let receipt_path = Path::new(run.receipt_path().context("missing receipt path")?);
-    let text = match fs::read_to_string(receipt_path) {
+    let text = match files.read_to_string(receipt_path) {
         Ok(text) => text,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return reject(
@@ -181,13 +179,15 @@ pub enum IntegrateTarget {
 /// What `integrate` needs besides the run: the queue, the repository the
 /// queue is bound to (`common_dir` is its Git common directory as text),
 /// how the verification commands run, the remote `main` is pushed to
-/// (`None` is `--no-push`), the time and IDs, and process liveness for the
+/// (`None` is `--no-push`), the run files (the worktree, the receipt and
+/// the verification logs), the time and IDs, and process liveness for the
 /// lease check.
 pub struct Integration<'a> {
     pub queue: &'a mut dyn Queue,
     pub repository: &'a dyn Repository,
     pub verifier: &'a dyn Verifier,
     pub remote: Option<&'a dyn MainRemote>,
+    pub files: &'a dyn RunFiles,
     pub common_dir: &'a str,
     pub clock: &'a dyn Clock,
     pub ids: &'a dyn IdGenerator,
@@ -316,7 +316,7 @@ pub fn land_integrating(
         run.id(),
         run.task_id()
     );
-    let verdict = match land(queue, repository, ctx.verifier, &task, run, main) {
+    let verdict = match land(queue, repository, ctx.verifier, ctx.files, &task, run, main) {
         Ok(verdict) => verdict,
         Err(error) => {
             // Nothing reached main: give the slot back and keep the run where it was.
@@ -583,6 +583,7 @@ fn land(
     queue: &mut dyn Queue,
     repository: &dyn Repository,
     verifier: &dyn Verifier,
+    files: &dyn RunFiles,
     task: &Task,
     run: &TaskRun,
     main: &CommitSha,
@@ -590,7 +591,7 @@ fn land(
     let defer = |reason: String, detail: Value| Ok(Verdict::Deferred { reason, detail });
     let worktree = Path::new(run.worktree_path().context("missing worktree")?);
     ensure!(
-        worktree.is_dir(),
+        files.is_dir(worktree),
         "worktree {} is missing",
         worktree.display()
     );
@@ -627,7 +628,7 @@ fn land(
     // the one the session rewrote after resolving otherwise. A stale receipt
     // means the session is not done.
     let receipt_path = Path::new(run.receipt_path().context("missing receipt path")?);
-    let receipt = match fs::read_to_string(receipt_path) {
+    let receipt = match files.read_to_string(receipt_path) {
         Ok(text) => match Receipt::parse(&text) {
             Ok(receipt) => receipt,
             Err(error) => return defer(format!("{error:#}"), json!({})),
@@ -764,12 +765,12 @@ fn land(
     };
     // Each attempt keeps its own logs, so a second integrate of the run does
     // not overwrite why the first one failed.
-    let attempt = next_integrate_attempt(run_dir);
+    let attempt = next_integrate_attempt(files, run_dir);
     for (index, command) in commands.iter().enumerate() {
         let log = integrate_verify_log(run_dir, attempt, index + 1);
         let status = verifier.run_to_log(command, worktree, &run_env, &log)?;
         let exit_code = status.code.unwrap_or(128);
-        let output = fs::read_to_string(&log).unwrap_or_default();
+        let output = files.read_to_string(&log).unwrap_or_default();
         queue.record_runtime_event(
             run.id(),
             "verification_command",
@@ -833,12 +834,13 @@ fn integrate_log_key(name: &str) -> Option<(u32, usize)> {
     Some((attempt.parse().ok()?, index.parse().ok()?))
 }
 
-/// The files of `dir` with their names.
-pub fn log_names(dir: &Path) -> Vec<(String, PathBuf)> {
-    fs::read_dir(dir)
+/// The files of `dir` with their names; none when it cannot be read.
+pub fn log_names(files: &dyn RunFiles, dir: &Path) -> Vec<(String, PathBuf)> {
+    files
+        .read_dir(dir)
         .map(|entries| {
             entries
-                .filter_map(|entry| entry.ok().map(|e| e.path()))
+                .into_iter()
                 .filter_map(|path| {
                     let name = path.file_name()?.to_str()?.to_owned();
                     Some((name, path))
@@ -850,8 +852,8 @@ pub fn log_names(dir: &Path) -> Vec<(String, PathBuf)> {
 
 /// The attempt integrate's next run of the verification commands writes
 /// its logs under: one past the highest attempt in `run_dir` (1 when none).
-pub fn next_integrate_attempt(run_dir: &Path) -> u32 {
-    log_names(run_dir)
+pub fn next_integrate_attempt(files: &dyn RunFiles, run_dir: &Path) -> u32 {
+    log_names(files, run_dir)
         .iter()
         .filter_map(|(name, _)| integrate_log_key(name))
         .map(|(attempt, _)| attempt)
@@ -861,8 +863,8 @@ pub fn next_integrate_attempt(run_dir: &Path) -> u32 {
 
 /// Integrate's verification logs in `run_dir`: those of the latest attempt
 /// in command order, and those of the earlier attempts, oldest first.
-pub fn integrate_logs(run_dir: &Path) -> (Vec<PathBuf>, Vec<PathBuf>) {
-    let mut keyed: Vec<((u32, usize), PathBuf)> = log_names(run_dir)
+pub fn integrate_logs(files: &dyn RunFiles, run_dir: &Path) -> (Vec<PathBuf>, Vec<PathBuf>) {
+    let mut keyed: Vec<((u32, usize), PathBuf)> = log_names(files, run_dir)
         .into_iter()
         .filter_map(|(name, path)| Some((integrate_log_key(&name)?, path)))
         .collect();
@@ -926,6 +928,7 @@ pub fn resume_attempts<Q: RunStore + ?Sized>(queue: &Q, id: &RunId) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::application::memory_files::MemoryFiles;
     use crate::domain::{Provider, RunRecord, TaskRecord, TaskStatus};
     use std::cell::RefCell;
 
@@ -1078,7 +1081,10 @@ mod tests {
         .unwrap()
     }
 
-    fn write_receipt(dir: &Path, tests: &str) {
+    /// Where the run's files are in [`MemoryFiles`].
+    const DIR: &str = "/runs/run";
+
+    fn write_receipt(files: &MemoryFiles, dir: &Path, tests: &str) {
         let receipt = json!({
             "run_id": RUN,
             "result": "succeeded",
@@ -1088,15 +1094,17 @@ mod tests {
             "subagent_review": {"status": "not_applicable", "evidence_or_reason": "small"},
             "summary": "  squash it  ",
         });
-        fs::write(dir.join("receipt.json"), receipt.to_string()).unwrap();
+        files
+            .write(&dir.join("receipt.json"), receipt.to_string().as_bytes())
+            .unwrap();
     }
 
     #[test]
     fn a_sound_receipt_is_accepted_through_the_repository_port() {
-        let dir = tempfile::tempdir().unwrap();
-        write_receipt(dir.path(), "passed");
+        let (files, dir) = (MemoryFiles::default(), Path::new(DIR));
+        write_receipt(&files, dir, "passed");
         let repository = FakeRepository::sound();
-        let (receipt, commit) = check_receipt(&repository, &task(&[]), &run(dir.path()))
+        let (receipt, commit) = check_receipt(&repository, &files, &task(&[]), &run(dir))
             .unwrap()
             .unwrap_or_else(|rejection| panic!("{}", rejection.reason));
         assert_eq!(commit, sha(HEAD));
@@ -1105,7 +1113,7 @@ mod tests {
             [format!("is_ancestor {BASE} {HEAD}")]
         );
         assert_eq!(
-            commit_message(&task(&[]), &run(dir.path()), &receipt),
+            commit_message(&task(&[]), &run(dir), &receipt),
             [
                 "land the change".to_owned(),
                 "squash it".to_owned(),
@@ -1116,11 +1124,12 @@ mod tests {
 
     #[test]
     fn check_receipt_rejects_what_git_does_not_back() {
-        let dir = tempfile::tempdir().unwrap();
+        let (files, dir) = (MemoryFiles::default(), Path::new(DIR));
         let reason = |repository: &FakeRepository, task: &Task| match check_receipt(
             repository,
+            &files,
             task,
-            &run(dir.path()),
+            &run(dir),
         )
         .unwrap()
         {
@@ -1131,7 +1140,7 @@ mod tests {
         assert!(missing.reason.starts_with("receipt was not submitted at "));
         assert!(missing.receipt.is_none());
 
-        write_receipt(dir.path(), "passed");
+        write_receipt(&files, dir, "passed");
         let detached = FakeRepository {
             branch: None,
             ..FakeRepository::sound()
@@ -1150,9 +1159,37 @@ mod tests {
         let outside = reason(&FakeRepository::sound(), &task(&["docs/**"]));
         assert_eq!(outside.scope_violation, ["src/lib.rs"]);
 
-        write_receipt(dir.path(), "not_applicable");
+        write_receipt(&files, dir, "not_applicable");
         let evidence = reason(&FakeRepository::sound(), &task(&[]));
         assert_eq!(evidence.evidence_missing, [EvidenceCheck::Tests]);
+    }
+
+    #[test]
+    fn integrate_logs_are_read_through_the_run_files_port() {
+        let (files, dir) = (MemoryFiles::default(), Path::new(DIR));
+        assert_eq!(next_integrate_attempt(&files, dir), 1);
+        for name in [
+            "integrate-verify-1.log",
+            "integrate-2-verify-2.log",
+            "integrate-2-verify-1.log",
+            "verify-1.log",
+        ] {
+            files.write(&dir.join(name), b"").unwrap();
+        }
+        files
+            .write(Path::new("/elsewhere/integrate-9-verify-1.log"), b"")
+            .unwrap();
+        assert_eq!(next_integrate_attempt(&files, dir), 3);
+        assert_eq!(
+            integrate_logs(&files, dir),
+            (
+                vec![
+                    dir.join("integrate-2-verify-1.log"),
+                    dir.join("integrate-2-verify-2.log")
+                ],
+                vec![dir.join("integrate-verify-1.log")]
+            )
+        );
     }
 
     #[test]

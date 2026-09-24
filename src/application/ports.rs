@@ -209,6 +209,8 @@ pub trait RunFiles: Send + Sync {
     fn is_file(&self, path: &Path) -> bool;
     fn is_dir(&self, path: &Path) -> bool;
     fn exists(&self, path: &Path) -> bool;
+    /// The paths of the entries of `dir`, in no particular order.
+    fn read_dir(&self, dir: &Path) -> io::Result<Vec<PathBuf>>;
     fn rename(&self, from: &Path, to: &Path) -> io::Result<()>;
     fn remove_file(&self, path: &Path) -> io::Result<()>;
     /// Append `line` and a newline to `path`, creating it if missing.

@@ -6,11 +6,9 @@
 
 use anyhow::{Context, Result};
 use serde::Serialize;
-use std::{
-    fs,
-    path::{Path, PathBuf},
-};
+use std::path::{Path, PathBuf};
 
+use super::RunFiles;
 use crate::domain::{CommitSha, Goal, Predecessor, Receipt, Task, TaskId, TaskRun};
 
 /// What the prompt says about one direct predecessor: the task, the squash
@@ -30,7 +28,7 @@ impl PredecessorSummary {
     /// The receipt is read where the run left it after landing (its planned
     /// `receipt_path`, else `<run_dir>/receipt.json`); a missing or
     /// unreadable one is described, never an error, so the successor still starts.
-    pub fn from_predecessor(predecessor: &Predecessor) -> Self {
+    pub fn from_predecessor(files: &dyn RunFiles, predecessor: &Predecessor) -> Self {
         let run = predecessor.integrated_run.as_ref();
         let summary = run
             .and_then(|run| {
@@ -38,7 +36,7 @@ impl PredecessorSummary {
                     .map(PathBuf::from)
                     .or_else(|| run.run_dir().map(|dir| Path::new(dir).join("receipt.json")))
             })
-            .and_then(|path| fs::read_to_string(path).ok())
+            .and_then(|path| files.read_to_string(&path).ok())
             .and_then(|text| Receipt::parse(&text).ok())
             .map(|receipt| {
                 receipt

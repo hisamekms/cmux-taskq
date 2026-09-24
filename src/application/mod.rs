@@ -10,6 +10,8 @@ pub mod ask;
 pub mod health;
 pub mod integrate;
 pub mod lifecycle;
+#[cfg(test)]
+mod memory_files;
 pub mod naming;
 mod ports;
 pub mod prompt;

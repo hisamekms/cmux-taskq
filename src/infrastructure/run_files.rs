@@ -58,6 +58,11 @@ impl RunFiles for LocalRunFiles {
     fn exists(&self, path: &Path) -> bool {
         path.exists()
     }
+    fn read_dir(&self, dir: &Path) -> io::Result<Vec<PathBuf>> {
+        Ok(fs::read_dir(dir)?
+            .filter_map(|entry| entry.ok().map(|e| e.path()))
+            .collect())
+    }
     fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
         fs::rename(from, to)
     }

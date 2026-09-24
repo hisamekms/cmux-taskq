@@ -256,6 +256,7 @@ pub fn integrate(
         repository: &repository,
         verifier: &verifier,
         remote,
+        files: &LocalRunFiles,
         common_dir: &common_dir,
         clock: &*generators.clock,
         ids: &*generators.ids,

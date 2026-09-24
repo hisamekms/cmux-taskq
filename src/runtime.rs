@@ -1,20 +1,17 @@
 //! The names the runtime's use cases had before they moved to
 //! `application` (ADR-0013), kept for the tests and the CLI: the entry
 //! points are [`crate::compose`], the use cases and their types are in
-//! `application`, and the supervisor log is in `infrastructure`.
+//! `application`, and the supervisor log is in `infrastructure`. The
+//! run-directory helpers read the local file system.
 pub use crate::application::{
     health::{DoctorReport, LeaseHealth, ProcessHealth, RunHealth, SupervisorHealth},
-    integrate::{
-        IntegrateTarget, integrate_logs, integrate_verify_log, next_integrate_attempt,
-        register_follow_ups,
-    },
+    integrate::{IntegrateTarget, integrate_verify_log, register_follow_ups},
     prompt::{
         PredecessorSummary, STOP_BACKGROUND, WORKER_READING, inbox_prompt, planner_prompt, prompt,
         siblings_in_progress,
     },
     rebind::REBIND_LOG,
     recording::{BACKEND_ERROR_CHARS, RecordingBackend, backend_failure_payload},
-    review::review_logs_hint,
     supervise::{PromptKind, RunError, TRIAGE_TOOLS, detect_prompt, review_prompt},
 };
 pub use crate::compose::{
@@ -23,3 +20,25 @@ pub use crate::compose::{
     supervise_with_reviewer, triage_prompt,
 };
 pub use crate::infrastructure::run_files::SupervisorLog;
+
+use std::path::{Path, PathBuf};
+
+use crate::{
+    application::{integrate, review},
+    infrastructure::run_files::LocalRunFiles,
+};
+
+/// [`integrate::integrate_logs`] on the local file system.
+pub fn integrate_logs(run_dir: &Path) -> (Vec<PathBuf>, Vec<PathBuf>) {
+    integrate::integrate_logs(&LocalRunFiles, run_dir)
+}
+
+/// [`integrate::next_integrate_attempt`] on the local file system.
+pub fn next_integrate_attempt(run_dir: &Path) -> u32 {
+    integrate::next_integrate_attempt(&LocalRunFiles, run_dir)
+}
+
+/// [`review::review_logs_hint`] on the local file system.
+pub fn review_logs_hint(run_dir: Option<&str>) -> String {
+    review::review_logs_hint(&LocalRunFiles, run_dir)
+}

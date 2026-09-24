@@ -82,6 +82,7 @@ pub fn review(ports: Review<'_>, task_id: TaskId) -> Result<Value> {
     let stat = repository.diff_stat(&base, &head)?;
     let numbers = repository.diff_numbers(&base, &head)?;
     let text = review_markdown(
+        files,
         &task,
         &run,
         goal.as_ref(),
@@ -137,14 +138,14 @@ fn write_review(
 /// Where review.md says the verification logs are: integrate writes
 /// `integrate-<attempt>-verify-N.log` per attempt, and the latest attempt's
 /// logs are named when one ran.
-pub fn review_logs_hint(run_dir: Option<&str>) -> String {
+pub fn review_logs_hint(files: &dyn RunFiles, run_dir: Option<&str>) -> String {
     let Some(run_dir) = run_dir else {
         return "(no run directory)".to_owned();
     };
     let pattern = format!(
         "{run_dir}/integrate-<attempt>-verify-N.log (one set per integrate attempt, written when integrate runs the verification commands after its rebase)"
     );
-    let (latest, _) = integrate_logs(Path::new(run_dir));
+    let (latest, _) = integrate_logs(files, Path::new(run_dir));
     if latest.is_empty() {
         return format!("{pattern}; none yet");
     }
@@ -157,6 +158,7 @@ pub fn review_logs_hint(run_dir: Option<&str>) -> String {
 /// what they hold, so a diff of Markdown cannot close them early.
 #[allow(clippy::too_many_arguments)]
 fn review_markdown(
+    files: &dyn RunFiles,
     task: &Task,
     run: &TaskRun,
     goal: Option<&Goal>,
@@ -185,7 +187,7 @@ fn review_markdown(
         run_base = run.base_commit(),
         branch = run.branch().unwrap_or("(none)"),
         worktree = run.worktree_path().unwrap_or("(none)"),
-        logs = review_logs_hint(run.run_dir()),
+        logs = review_logs_hint(files, run.run_dir()),
         description = or_none(task.description()),
         acceptance = or_none(task.acceptance()),
         verify = fenced("sh", &task.verification_commands().join("\n")),
