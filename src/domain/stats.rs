@@ -9,7 +9,7 @@ use serde::Serialize;
 use serde_json::Value;
 
 use super::{
-    GoalId, RunEvent, RunId, TaskId,
+    EventId, GoalId, RunEvent, RunId, TaskId,
     reason::{REPEATED_CODE_KINDS, event_code},
 };
 
@@ -32,7 +32,7 @@ pub const BACKEND_FAILURES: i64 = 2;
 #[derive(Debug, Clone, Default)]
 pub struct StatsQuery {
     /// Only runs that finished after this event id (`--since`).
-    pub since: Option<i64>,
+    pub since: Option<EventId>,
     /// Only runs of tasks in this goal (`--goal`).
     pub goal_id: Option<GoalId>,
     /// Every finished run instead of [`DEFAULT_RUNS`] (`--full`).
@@ -59,7 +59,7 @@ pub struct RunStats {
     /// status recorded for one still in flight.
     pub status: Option<String>,
     /// The event that finished the run; `--since` compares against it.
-    pub finished_event_id: Option<i64>,
+    pub finished_event_id: Option<EventId>,
     /// `run_claimed` → first `receipt_observed`.
     pub work: Option<i64>,
     /// First `receipt_observed` → first `validation_finished`.
@@ -152,7 +152,7 @@ pub struct Stats {
     /// The reason codes recorded in the same window as `backend_failures`.
     pub reason_codes: ReasonCodes,
     /// Pass it to `--since` to read only runs that finish later.
-    pub next_cursor: i64,
+    pub next_cursor: EventId,
 }
 
 /// Aggregate `events` (every `run_events` row, ascending id). `goals` maps a
@@ -165,14 +165,14 @@ pub fn stats(
     slots: SlotSnapshot,
     query: &StatsQuery,
 ) -> Stats {
-    let latest = events.iter().map(|e| e.id).max().unwrap_or(0);
+    let latest = events.iter().map(|e| e.id).max().unwrap_or(EventId::new(0));
     let in_goal = |task_id: TaskId| {
         query
             .goal_id
             .is_none_or(|goal| goals.get(&task_id).copied().flatten() == Some(goal))
     };
     let tracks = runs(events, goals);
-    let mut first_event: HashMap<&str, i64> = HashMap::new();
+    let mut first_event: HashMap<&str, EventId> = HashMap::new();
     for event in events {
         if let Some(run_id) = &event.run_id {
             first_event.entry(run_id.as_str()).or_insert(event.id);
@@ -308,12 +308,12 @@ pub fn stats(
     }
     let window_start = match query.since {
         Some(since) => since,
-        None if query.full => 0,
+        None if query.full => EventId::new(0),
         None => finished
             .iter()
             .filter_map(|track| first_event.get(track.stats.run_id.as_str()))
             .min()
-            .map_or(0, |id| id - 1),
+            .map_or(EventId::new(0), |id| EventId::new(id.as_i64() - 1)),
     };
     let counts = |task_id: Option<TaskId>| query.goal_id.is_none() || task_id.is_some_and(in_goal);
     let backend_failures = backend_failures(events, window_start, next_cursor, counts);
@@ -352,8 +352,8 @@ pub fn stats(
 /// task `counts` accepts.
 fn reason_codes(
     events: &[RunEvent],
-    after: i64,
-    upto: i64,
+    after: EventId,
+    upto: EventId,
     counts: impl Fn(Option<TaskId>) -> bool,
 ) -> ReasonCodes {
     let mut codes = ReasonCodes::default();
@@ -382,8 +382,8 @@ fn reason_codes(
 /// whose task `counts` accepts.
 fn backend_failures(
     events: &[RunEvent],
-    after: i64,
-    upto: i64,
+    after: EventId,
+    upto: EventId,
     counts: impl Fn(Option<TaskId>) -> bool,
 ) -> BackendFailures {
     let mut failures = BackendFailures::default();
@@ -642,7 +642,7 @@ mod tests {
 
     fn event(id: i64, task_id: i64, kind: &str, payload: Value) -> RunEvent {
         RunEvent {
-            id,
+            id: EventId::new(id),
             task_id: Some(TaskId::new(task_id)),
             goal_id: None,
             run_id: None,
@@ -698,7 +698,7 @@ mod tests {
                 json!({"code": "backend_failed"}),
             ),
         ];
-        let codes = reason_codes(&events, 0, 5, |_| true);
+        let codes = reason_codes(&events, EventId::new(0), EventId::new(5), |_| true);
         assert_eq!(codes.count, 3);
         assert_eq!(
             codes.by_code,
@@ -712,8 +712,13 @@ mod tests {
             codes.by_kind["integration_deferred"],
             BTreeMap::from([("rebase_conflict".to_owned(), 1)])
         );
-        assert_eq!(reason_codes(&events, 5, 7, |_| true).count, 1);
-        let task_two = reason_codes(&events, 0, 6, |task| task == Some(TaskId::new(2)));
+        assert_eq!(
+            reason_codes(&events, EventId::new(5), EventId::new(7), |_| true).count,
+            1
+        );
+        let task_two = reason_codes(&events, EventId::new(0), EventId::new(6), |task| {
+            task == Some(TaskId::new(2))
+        });
         assert_eq!(task_two.count, 1);
     }
 }

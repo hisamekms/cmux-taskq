@@ -12,10 +12,11 @@ use std::path::Path;
 
 use super::{AskQuery, Clock, ProcessControl, Queue, RunFiles, TRIAGE_ASKER};
 use crate::domain::{
-    ASK_EVENT_KINDS, AskKind, Attention, AttentionNext, HEARTBEAT_TIMEOUT_SECS, LANDING_OPTIONS,
-    ReasonCode, RunEvent, RunId, RunLease, RunProcess, RunStatus, SessionRole, SupervisorMode,
-    SupervisorPulse, SupervisorRegistration, TRIAGE_OPTIONS, TaskId, TaskRun, TriageState,
-    event_attention, heartbeat_stale, reason, run_attention, supervisor_attention, triage_state,
+    ASK_EVENT_KINDS, AskId, AskKind, Attention, AttentionNext, HEARTBEAT_TIMEOUT_SECS,
+    LANDING_OPTIONS, ReasonCode, RunEvent, RunId, RunLease, RunProcess, RunStatus, SessionRole,
+    SupervisorMode, SupervisorPulse, SupervisorRegistration, TRIAGE_OPTIONS, TaskId, TaskRun,
+    TriageState, event_attention, heartbeat_stale, reason, run_attention, supervisor_attention,
+    triage_state,
 };
 
 /// Health of one run's lease as `status` and `doctor` report it.
@@ -634,7 +635,11 @@ pub fn attention(
             // running or one nobody supervises leaves it to the inbox.
             let failed = queue.run_events(run_id)?.iter().any(|e| {
                 e.kind == "ask_delivery_failed"
-                    && e.payload.get("ask_id").and_then(Value::as_i64) == Some(ask.id)
+                    && e.payload
+                        .get("ask_id")
+                        .and_then(Value::as_i64)
+                        .map(AskId::new)
+                        == Some(ask.id)
             });
             if failed {
                 (

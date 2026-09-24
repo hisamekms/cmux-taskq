@@ -5,8 +5,9 @@
 use serde::{Deserialize, Serialize};
 
 use super::{
-    CheckStatus, CommitSha, DomainError, EvidenceCheck, Goal, GoalId, GoalStatus, GoalVerdict,
-    PushReport, ReceiptResult, RunId, SupervisorMode, Task, TaskId, TaskRun, TaskStatus, require,
+    CheckStatus, CommitSha, DomainError, EventId, EvidenceCheck, Goal, GoalId, GoalStatus,
+    GoalVerdict, PushReport, ReceiptResult, RunId, SupervisorMode, Task, TaskId, TaskRun,
+    TaskStatus, require,
 };
 
 /// Number of a goal's tasks in each status; progress is derived from these.
@@ -72,7 +73,7 @@ pub struct Predecessor {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunEvent {
-    pub id: i64,
+    pub id: EventId,
     /// Absent only for goal-level events (`goal_created`, `goal_updated`, `goal_closed`).
     pub task_id: Option<TaskId>,
     pub goal_id: Option<GoalId>,

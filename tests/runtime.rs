@@ -6,8 +6,9 @@ use dagq::{
         SupervisorEnvironment, TaskStore, WorkspaceBackend, WorkspaceTags,
     },
     domain::{
-        AskKind, CommitSha, EvidenceCheck, GoalEdit, GoalId, NewAsk, NewGoal, NewTask, ReasonCode,
-        RunId, RunStatus, SessionRole, Task, TaskAction, TaskId, TaskRun, TaskStatus,
+        AskId, AskKind, CommitSha, EventId, EvidenceCheck, GoalEdit, GoalId, NewAsk, NewGoal,
+        NewTask, ReasonCode, RunId, RunStatus, SessionRole, Task, TaskAction, TaskId, TaskRun,
+        TaskStatus,
     },
     infrastructure::{
         adapters::{GitRepository, shell_join, workspace_handle},
@@ -1523,9 +1524,9 @@ fn a_dialog_on_the_screen_is_asked_once_and_cleared() {
             .as_array()
             .unwrap()
             .iter()
-            .any(|a| a["kind"] == "ask_opened" && a["ask_id"] == ask.id)
+            .any(|a| a["kind"] == "ask_opened" && a["ask_id"] == ask.id.as_i64())
     );
-    let events = dagq::watch::events(&db, 0, 100, false).unwrap();
+    let events = dagq::watch::events(&db, EventId::new(0), 100, false).unwrap();
     assert!(
         events["events"]
             .as_array()
@@ -1594,12 +1595,12 @@ await_exit
 "#;
 
 /// The attention entries of `status` for one ask.
-fn ask_attention(status: &Value, ask_id: i64) -> Vec<Value> {
+fn ask_attention(status: &Value, ask_id: AskId) -> Vec<Value> {
     status["attention"]
         .as_array()
         .unwrap()
         .iter()
-        .filter(|a| a["ask_id"] == ask_id)
+        .filter(|a| a["ask_id"] == ask_id.as_i64())
         .cloned()
         .collect()
 }
@@ -1628,7 +1629,7 @@ fn an_answered_worker_question_is_typed_into_the_idle_worker_and_closed() {
     assert_eq!(ask.kind.as_str(), "worker_question");
     assert_eq!(ask.run_id.as_ref(), Some(run.id()));
     let status = runtime::status(&db).unwrap();
-    assert_eq!(status["asks"][0]["id"], ask.id, "{status}");
+    assert_eq!(status["asks"][0]["id"], ask.id.as_i64(), "{status}");
     assert_eq!(
         ask_attention(&status, ask.id)[0]["next"],
         format!("answer ask {}", ask.id)
@@ -1665,7 +1666,7 @@ fn an_answered_worker_question_is_typed_into_the_idle_worker_and_closed() {
         format!("delivering the answer of ask {} (runtime)", ask.id)
     );
     // The answer of a worker_question does not wake the inbox.
-    let events = dagq::watch::events(&db, 0, 100, false).unwrap();
+    let events = dagq::watch::events(&db, EventId::new(0), 100, false).unwrap();
     assert!(
         events["events"]
             .as_array()
@@ -1743,7 +1744,7 @@ fn a_failed_answer_delivery_is_left_to_the_inbox() {
     let detail = queue.show(TaskId::new(1)).unwrap();
     let failed = payloads(&detail, "ask_delivery_failed");
     assert_eq!(failed.len(), 1);
-    assert_eq!(failed[0]["ask_id"], ask.id);
+    assert_eq!(failed[0]["ask_id"], ask.id.as_i64());
     assert!(
         failed[0]["error"]
             .as_str()
@@ -1762,7 +1763,7 @@ fn a_failed_answer_delivery_is_left_to_the_inbox() {
             ask.id
         )
     );
-    let events = dagq::watch::events(&db, 0, 100, false).unwrap();
+    let events = dagq::watch::events(&db, EventId::new(0), 100, false).unwrap();
     assert!(
         events["events"]
             .as_array()
@@ -1792,7 +1793,7 @@ fn a_failed_answer_delivery_is_left_to_the_inbox() {
 
     // Answered after the run stopped running: nobody types it, so its
     // `ask_answered` wakes the inbox.
-    let cursor = queue.latest_event_id().unwrap();
+    let cursor = queue.latest_event_id().unwrap().as_i64();
     let late = queue
         .ask(dagq::domain::NewAsk {
             kind: "worker_question".parse().unwrap(),
@@ -1805,7 +1806,7 @@ fn a_failed_answer_delivery_is_left_to_the_inbox() {
         .unwrap()
         .ask;
     queue.answer(late.id, "yes").unwrap();
-    let events = dagq::watch::events(&db, cursor, 100, false).unwrap();
+    let events = dagq::watch::events(&db, EventId::new(cursor), 100, false).unwrap();
     let answered: Vec<&Value> = events["events"]
         .as_array()
         .unwrap()
@@ -1944,7 +1945,7 @@ fn unanswered_exit_request_times_out_and_keeps_the_run() {
             .any(|a| a["kind"] == "ask_opened" && a["next"] == format!("answer ask {}", ask.id)),
         "{status}"
     );
-    let events = dagq::watch::events(&db, 0, 100, false).unwrap();
+    let events = dagq::watch::events(&db, EventId::new(0), 100, false).unwrap();
     let events = events["events"].as_array().unwrap();
     assert!(events.iter().all(|e| e["next"] != "send /exit"));
     assert!(runtime::recover(&db, run.id()).is_err());
@@ -1985,7 +1986,7 @@ fn unanswered_exit_request_times_out_and_keeps_the_run() {
     assert!(position("ask_answered") < position("review_failed"));
     assert!(queue.asks(AskQuery::default()).unwrap().is_empty());
     assert_eq!(backend.notifications.lock().unwrap().len(), 1);
-    let events = dagq::watch::events(&db, 0, 100, false).unwrap();
+    let events = dagq::watch::events(&db, EventId::new(0), 100, false).unwrap();
     assert!(
         events["events"]
             .as_array()
@@ -2316,7 +2317,7 @@ fn failed_backend_calls_are_recorded_with_the_load_and_counted_by_stats() {
     let stats = runtime::stats(
         &db,
         &dagq::domain::stats::StatsQuery {
-            since: Some(cursor),
+            since: Some(EventId::new(cursor)),
             ..Default::default()
         },
     )
@@ -3417,7 +3418,7 @@ fn a_failed_push_keeps_the_landing_and_waits_as_attention() {
             "last_error_code": "push_failed", "next": "push main",
         })
     );
-    let events = dagq::watch::events(&db, 0, 100, false).unwrap();
+    let events = dagq::watch::events(&db, EventId::new(0), 100, false).unwrap();
     let failed = events["events"]
         .as_array()
         .unwrap()
@@ -4833,7 +4834,7 @@ fn approved_needs_session_run_is_resumed_until_the_runtime_lands_it() {
         2,
         "await_message; mark=\"$(dirname \"$RECEIPT\")/attempted\"; if [ -f \"$mark\" ]; then resolve; else : > \"$mark\"; fi; receipt \"$(git rev-parse HEAD)\"; idle; await_exit",
     );
-    let cursor = queue.latest_event_id().unwrap();
+    let cursor = queue.latest_event_id().unwrap().as_i64();
     let outcome = supervise(&db, &repo, &backend).unwrap();
     backend.join();
     assert_eq!(outcome["errors"], json!([]), "{outcome}");
@@ -4970,7 +4971,7 @@ fn approved_needs_session_run_is_resumed_until_the_runtime_lands_it() {
     );
     // Nothing waits for a person: the watch sees no attention.
     assert_eq!(
-        dagq::watch::events(&db, cursor, 100, false).unwrap()["events"],
+        dagq::watch::events(&db, EventId::new(cursor), 100, false).unwrap()["events"],
         json!([])
     );
     assert!(run_attention_of(&runtime::status(&db).unwrap(), run.id()).is_none());
@@ -5006,7 +5007,7 @@ fn unapproved_resumed_run_is_validated_and_reviewed_with_its_session_open() {
         2,
         "await_message; receipt \"$(git rev-parse HEAD)\"; idle; await_exit",
     );
-    let cursor = queue.latest_event_id().unwrap();
+    let cursor = queue.latest_event_id().unwrap().as_i64();
     let outcome = supervise(&db, &repo, &backend).unwrap();
     backend.join();
     assert_eq!(outcome["errors"], json!([]), "{outcome}");
@@ -5078,7 +5079,7 @@ fn unapproved_resumed_run_is_validated_and_reviewed_with_its_session_open() {
     assert!(!text.contains("git rebase"), "{text}");
     assert!(text.contains(runtime::STOP_BACKGROUND), "{text}");
     // The inbox is woken only by the failed review.
-    let events = dagq::watch::events(&db, cursor, 100, false).unwrap();
+    let events = dagq::watch::events(&db, EventId::new(cursor), 100, false).unwrap();
     assert_eq!(events["events"].as_array().unwrap().len(), 1, "{events}");
     assert_eq!(events["events"][0]["kind"], "review_failed", "{events}");
     assert_eq!(events["events"][0]["next"], "review by hand");
@@ -5158,7 +5159,7 @@ fn an_approved_run_resolved_by_an_earlier_resume_lands_without_a_session() {
     write_receipt(&run, &resolved, "succeeded", "resolved");
 
     let mut queue = SqliteQueue::open(&db).unwrap();
-    let cursor = queue.latest_event_id().unwrap();
+    let cursor = queue.latest_event_id().unwrap().as_i64();
     let outcome = supervise(&db, &repo, &backend).unwrap();
     assert_eq!(outcome["errors"], json!([]), "{outcome}");
 
@@ -5201,7 +5202,7 @@ fn an_approved_run_resolved_by_an_earlier_resume_lands_without_a_session() {
     );
     assert!(queue.run_leases().unwrap().is_empty());
     assert_eq!(
-        dagq::watch::events(&db, cursor, 100, false).unwrap()["events"],
+        dagq::watch::events(&db, EventId::new(cursor), 100, false).unwrap()["events"],
         json!([])
     );
 }
@@ -5531,7 +5532,7 @@ fn resuming_stops_after_three_attempts() {
         2,
         "await_message; mark=\"$(dirname \"$RECEIPT\")/went-idle\"; if [ ! -f \"$mark\" ]; then : > \"$mark\"; idle; fi; await_exit",
     );
-    let cursor = queue.latest_event_id().unwrap();
+    let cursor = queue.latest_event_id().unwrap().as_i64();
     let outcome = supervise(&db, &repo, &backend).unwrap();
     backend.join();
     assert_eq!(outcome["errors"], json!([]), "{outcome}");
@@ -5585,7 +5586,7 @@ fn resuming_stops_after_three_attempts() {
     assert_eq!(finished[0]["status"], "failed");
     assert!(payloads(&detail, "triage_started").is_empty());
     // The ask is the one attention; the exhausted resume is none.
-    let events = dagq::watch::events(&db, cursor, 100, false).unwrap();
+    let events = dagq::watch::events(&db, EventId::new(cursor), 100, false).unwrap();
     let listed = events["events"].as_array().unwrap();
     assert_eq!(listed.len(), 1, "{events}");
     assert_eq!(listed[0]["kind"], "ask_opened");
@@ -7369,7 +7370,7 @@ fn watch_role(
     watch(
         db,
         &WatchOptions {
-            after,
+            after: after.map(EventId::new),
             timeout,
             interval: Duration::from_millis(50),
             role: Some(role),
@@ -7483,7 +7484,7 @@ fn asks_of_a_run_are_attention_for_the_inbox_until_closed() {
     use dagq::domain::{AskKind, NewAsk, SessionRole};
     let (_dir, _repo, db, run) = awaiting_run();
     let mut queue = SqliteQueue::open(&db).unwrap();
-    let before = queue.latest_event_id().unwrap();
+    let before = queue.latest_event_id().unwrap().as_i64();
     // A `decide` ask: the supervisor applies an `approve_landing` answer
     // itself (see a_third_review_that_does_not_pass_asks_a_person_and_land_lands_it).
     let new_ask = |question: &str| NewAsk {
@@ -7522,7 +7523,7 @@ fn asks_of_a_run_are_attention_for_the_inbox_until_closed() {
     let again = queue.ask(new_ask("other")).unwrap();
     assert!(!again.created);
     assert_eq!(again.ask.id, opened.ask.id);
-    assert_eq!(queue.latest_event_id().unwrap(), before + 1);
+    assert_eq!(queue.latest_event_id().unwrap().as_i64(), before + 1);
 
     // status lists the open ask; all attention is the inbox's
     // (ADR-0024 decision 6).
@@ -7595,7 +7596,9 @@ fn asks_of_a_run_are_attention_for_the_inbox_until_closed() {
     let status = runtime::status_for(&db, None).unwrap();
     assert_eq!(status["asks"], json!([]));
     assert!(status["attention"].as_array().unwrap().iter().any(|a| {
-        a["kind"] == "ask_answered" && a["status"] == "answered" && a["ask_id"] == opened.ask.id
+        a["kind"] == "ask_answered"
+            && a["status"] == "answered"
+            && a["ask_id"] == opened.ask.id.as_i64()
     }));
     queue.close_ask(opened.ask.id).unwrap();
     assert!(
@@ -7614,7 +7617,7 @@ fn watch_for(db: &Path, after: Option<i64>, timeout: Duration) -> Value {
     watch(
         db,
         &WatchOptions {
-            after,
+            after: after.map(EventId::new),
             timeout,
             interval: Duration::from_millis(50),
             role: None,
@@ -7644,7 +7647,7 @@ fn run_attention_of<'a>(status: &'a Value, run_id: &RunId) -> Option<&'a Value> 
 fn attention_events_are_read_past_a_cursor_and_wake_watch() {
     let (_dir, repo, db, run) = awaiting_run();
     let queue = SqliteQueue::open(&db).unwrap();
-    let latest = queue.latest_event_id().unwrap();
+    let latest = queue.latest_event_id().unwrap().as_i64();
 
     // `status` derives the attention from the queue as it is now. The
     // accepted run is the supervisor's to review; the stand-in `claude`
@@ -7663,7 +7666,7 @@ fn attention_events_are_read_past_a_cursor_and_wake_watch() {
     assert_eq!(status["attention"][0]["next"], "restart supervisor");
 
     // `events` defaults to attention, compact and without paths.
-    let events = dagq::watch::events(&db, 0, 100, false).unwrap();
+    let events = dagq::watch::events(&db, EventId::new(0), 100, false).unwrap();
     assert_eq!(events["cursor"], json!(latest));
     let listed = events["events"].as_array().unwrap();
     assert_eq!(listed.len(), 1, "{events}");
@@ -7671,7 +7674,7 @@ fn attention_events_are_read_past_a_cursor_and_wake_watch() {
     assert_eq!(listed[0]["status"], "awaiting_integration");
     assert_eq!(listed[0]["next"], "review by hand");
     assert_eq!(listed[0]["run_id"], json!(run.id()));
-    let all = dagq::watch::events(&db, 0, 1000, true).unwrap();
+    let all = dagq::watch::events(&db, EventId::new(0), 1000, true).unwrap();
     let all_events = all["events"].as_array().unwrap();
     assert_eq!(all_events.len() as i64, latest);
     assert_eq!(all["cursor"], json!(latest));
@@ -7684,13 +7687,13 @@ fn attention_events_are_read_past_a_cursor_and_wake_watch() {
     assert!(!text.contains(run.worktree_path().unwrap()), "{text}");
     assert!(!text.contains("\"receipt\""), "{text}");
     // A limit leaves the cursor on the last event returned.
-    let page = dagq::watch::events(&db, 0, 2, true).unwrap();
+    let page = dagq::watch::events(&db, EventId::new(0), 2, true).unwrap();
     assert_eq!(page["events"].as_array().unwrap().len(), 2);
     assert_eq!(page["cursor"], json!(ids[1]));
-    let rest = dagq::watch::events(&db, ids[1], 1000, true).unwrap();
+    let rest = dagq::watch::events(&db, EventId::new(ids[1]), 1000, true).unwrap();
     assert_eq!(rest["events"][0]["id"], json!(ids[2]));
     assert_eq!(
-        dagq::watch::events(&db, latest, 100, false).unwrap(),
+        dagq::watch::events(&db, EventId::new(latest), 100, false).unwrap(),
         json!({"events": [], "cursor": latest})
     );
 
@@ -7714,13 +7717,13 @@ fn attention_events_are_read_past_a_cursor_and_wake_watch() {
     // A landing parked for a session the supervisor will resume wakes
     // nobody (ADR-0019) ...
     fs::remove_file(run.receipt_path().unwrap()).unwrap();
-    let before = queue.latest_event_id().unwrap();
+    let before = queue.latest_event_id().unwrap().as_i64();
     assert_eq!(
         integrate(&db, 1, &repo).unwrap()["outcome"],
         "needs_session"
     );
     assert_eq!(
-        dagq::watch::events(&db, before, 100, false).unwrap()["events"],
+        dagq::watch::events(&db, EventId::new(before), 100, false).unwrap()["events"],
         json!([])
     );
     // ... and neither does one whose resumes are used up: the supervisor
@@ -7738,12 +7741,12 @@ fn attention_events_are_read_past_a_cursor_and_wake_watch() {
             )
             .unwrap();
     }
-    let before = queue.latest_event_id().unwrap();
+    let before = queue.latest_event_id().unwrap().as_i64();
     assert_eq!(
         integrate(&db, 1, &repo).unwrap()["outcome"],
         "needs_session"
     );
-    let deferred = dagq::watch::events(&db, before, 100, true).unwrap();
+    let deferred = dagq::watch::events(&db, EventId::new(before), 100, true).unwrap();
     let deferred = deferred["events"]
         .as_array()
         .unwrap()
@@ -7754,10 +7757,10 @@ fn attention_events_are_read_past_a_cursor_and_wake_watch() {
     assert_eq!(deferred["status"], "needs_session");
     assert_eq!(deferred.get("next"), None, "{deferred}");
     assert_eq!(
-        dagq::watch::events(&db, before, 100, false).unwrap()["events"],
+        dagq::watch::events(&db, EventId::new(before), 100, false).unwrap()["events"],
         json!([])
     );
-    let latest = queue.latest_event_id().unwrap();
+    let latest = queue.latest_event_id().unwrap().as_i64();
     let status = runtime::status(&db).unwrap();
     let parked = run_attention_of(&status, run.id()).unwrap();
     assert_eq!(parked["status"], "needs_session");
@@ -7819,7 +7822,7 @@ fn a_session_killed_by_a_signal_is_classified_in_status_show_and_stats() {
         json!({"session_killed": 1})
     );
     // `watch` / `events` keep the code in their compact form.
-    let events = dagq::watch::events(&db, 0, 1000, true).unwrap();
+    let events = dagq::watch::events(&db, EventId::new(0), 1000, true).unwrap();
     assert!(
         events["events"]
             .as_array()
@@ -7843,7 +7846,7 @@ fn status_reports_failed_runs_and_unanswered_exit_requests() {
     assert_eq!(failed["last_error"], "session exited with code 7");
     assert_eq!(failed["last_error_code"], "session_exit_code");
     assert_eq!(failed["next"], "triage by hand");
-    let events = dagq::watch::events(&db, 0, 100, false).unwrap();
+    let events = dagq::watch::events(&db, EventId::new(0), 100, false).unwrap();
     assert_eq!(events["events"].as_array().unwrap().len(), 1, "{events}");
     assert_eq!(events["events"][0]["kind"], "triage_failed");
     assert_eq!(events["events"][0]["next"], "triage by hand");
@@ -7900,7 +7903,7 @@ fn status_reports_failed_runs_and_unanswered_exit_requests() {
 fn an_abandoned_run_is_recovered_and_triaged_by_the_supervisor() {
     let (_dir, repo, db) = fixture();
     let mut queue = SqliteQueue::open(&db).unwrap();
-    let cursor = queue.latest_event_id().unwrap();
+    let cursor = queue.latest_event_id().unwrap().as_i64();
     let mut backend = TestWorkspace::new(&db, false, VALID_AGENT);
     backend.no_session = true;
     backend.registration_timeout = Duration::from_secs(1);
@@ -7980,13 +7983,13 @@ fn an_abandoned_run_is_recovered_and_triaged_by_the_supervisor() {
     add_ready_task(&mut queue, "noted", &[]);
     let pid = std::process::id();
     let noted = orphan_run(&repo, &db, "owner", pid, pid);
-    let cursor = queue.latest_event_id().unwrap();
+    let cursor = queue.latest_event_id().unwrap().as_i64();
     queue
         .record_runtime_error(noted.id(), "a passing error", &ReasonCode::Other.into())
         .unwrap();
     assert!(run_attention_of(&runtime::status(&db).unwrap(), noted.id()).is_none());
     assert_eq!(
-        dagq::watch::events(&db, cursor, 100, false).unwrap()["events"],
+        dagq::watch::events(&db, EventId::new(cursor), 100, false).unwrap()["events"],
         json!([])
     );
     let quiet = watch_for(&db, Some(cursor), Duration::from_millis(300));
@@ -7997,7 +8000,7 @@ fn an_abandoned_run_is_recovered_and_triaged_by_the_supervisor() {
 fn watch_returns_when_supervisor_registrations_or_health_change() {
     let (_dir, _repo, db) = fixture();
     let mut queue = SqliteQueue::open(&db).unwrap();
-    let cursor = queue.latest_event_id().unwrap();
+    let cursor = queue.latest_event_id().unwrap().as_i64();
     let pid = std::process::id();
 
     // A supervisor registers.
@@ -8916,7 +8919,7 @@ echo 'wrote 1 note, 1 ask, 1 draft goal'
     assert_eq!(first["since"], Value::Null);
     let cursor = first["cursor"].as_i64().unwrap();
     assert!(cursor >= 0);
-    assert_eq!(read_cursor(&db).unwrap(), Some(cursor));
+    assert_eq!(read_cursor(&db).unwrap(), Some(EventId::new(cursor)));
     let dir = PathBuf::from(first["dir"].as_str().unwrap());
     assert_eq!(
         dir.parent().unwrap(),
@@ -8977,7 +8980,7 @@ echo 'wrote 1 note, 1 ask, 1 draft goal'
     assert_eq!(second["outcome"], "failed");
     assert_eq!(second["exit_code"], 7);
     assert_eq!(second["cursor_saved"], false);
-    assert_eq!(read_cursor(&db).unwrap(), Some(cursor));
+    assert_eq!(read_cursor(&db).unwrap(), Some(EventId::new(cursor)));
 
     // A dry run only returns the prompt.
     let dry = observe(
@@ -8985,7 +8988,7 @@ echo 'wrote 1 note, 1 ask, 1 draft goal'
         &failing,
         &dagq::observer::ObserveOptions {
             dry_run: true,
-            since: Some(0),
+            since: Some(EventId::new(0)),
             ..observe_options(ObserveMode::Daily)
         },
     )
@@ -9022,7 +9025,7 @@ echo 'wrote 1 note, 1 ask, 1 draft goal'
     );
     // The daily one reads the last 24 hours and leaves the cursor alone.
     assert_eq!(broken["since"], 0);
-    assert_eq!(read_cursor(&db).unwrap(), Some(cursor));
+    assert_eq!(read_cursor(&db).unwrap(), Some(EventId::new(cursor)));
 }
 
 #[test]
@@ -9546,7 +9549,7 @@ fn a_third_review_that_does_not_pass_asks_a_person_and_land_lands_it() {
     assert!(queue.read_ask(ask.id).unwrap().closed_at.is_some());
     let approved = payloads(&detail, "integration_approved");
     assert_eq!(approved.len(), 1);
-    assert_eq!(approved[0]["ask_id"], ask.id);
+    assert_eq!(approved[0]["ask_id"], ask.id.as_i64());
     // No fourth review.
     assert_eq!(reviewer.prompts().len(), 3);
 }
@@ -9719,7 +9722,11 @@ fn a_failed_review_closes_the_session_and_waits_for_a_review_by_hand() {
         let backend = TestWorkspace::new(&db, false, IDLE_AGENT);
         let mut reviewer = TestReviewer::new(&[script.to_owned()]);
         reviewer.timeout = Duration::from_secs(timeout);
-        let cursor = SqliteQueue::open(&db).unwrap().latest_event_id().unwrap();
+        let cursor = SqliteQueue::open(&db)
+            .unwrap()
+            .latest_event_id()
+            .unwrap()
+            .as_i64();
         let outcome = supervise_reviewed(&db, &repo, &backend, &reviewer);
         assert_eq!(outcome["errors"], json!([]), "{outcome}");
         assert_eq!(outcome["runs"][0]["status"], "awaiting_integration");
@@ -9740,7 +9747,7 @@ fn a_failed_review_closes_the_session_and_waits_for_a_review_by_hand() {
         let attention = run_attention_of(&status, run.id()).unwrap();
         assert_eq!(attention["kind"], "review_failed");
         assert_eq!(attention["next"], "review by hand");
-        let events = dagq::watch::events(&db, cursor, 100, false).unwrap();
+        let events = dagq::watch::events(&db, EventId::new(cursor), 100, false).unwrap();
         let events = events["events"].as_array().unwrap();
         assert_eq!(events.len(), 1, "{events:?}");
         assert_eq!(events[0]["kind"], "review_failed");
@@ -10563,7 +10570,7 @@ fn a_failed_run_triaged_retry_runs_again_and_a_second_failure_is_asked() {
         finished[1]
     );
     let ask = queue
-        .read_ask(finished[1]["ask_id"].as_i64().unwrap())
+        .read_ask(AskId::new(finished[1]["ask_id"].as_i64().unwrap()))
         .unwrap();
     assert_eq!(ask.kind, AskKind::Decide);
     assert_eq!(ask.run_id.as_ref(), Some(second.id()));
@@ -10697,7 +10704,7 @@ fn a_triage_ask_waits_for_a_person_and_the_supervisor_applies_the_answer() {
     assert_eq!(finished[0]["action"], "ask");
     assert_eq!(finished[0]["status"], "failed");
     let ask = queue
-        .read_ask(finished[0]["ask_id"].as_i64().unwrap())
+        .read_ask(AskId::new(finished[0]["ask_id"].as_i64().unwrap()))
         .unwrap();
     assert!(
         ask.question
@@ -10752,7 +10759,7 @@ fn a_triage_ask_waits_for_a_person_and_the_supervisor_applies_the_answer() {
     let decided = payloads(&detail, "triage_decided");
     assert_eq!(decided.len(), 1);
     assert_eq!(decided[0]["answer"], "cancel");
-    assert_eq!(decided[0]["ask_id"], ask.id);
+    assert_eq!(decided[0]["ask_id"], ask.id.as_i64());
     assert!(queue.read_ask(ask.id).unwrap().closed_at.is_some());
     assert!(ask_attention(&runtime::status(&db).unwrap(), ask.id).is_empty());
 }
@@ -11372,7 +11379,7 @@ fn status_and_doctor_measure_to_the_injected_clock() {
     });
     let status = one_shot.status_for(&db, None).unwrap();
     assert_eq!(status["checked_at"], 1_042, "{status}");
-    assert_eq!(status["asks"][0]["id"], ask.id, "{status}");
+    assert_eq!(status["asks"][0]["id"], ask.id.as_i64(), "{status}");
     assert_eq!(status["asks"][0]["age_secs"], 42, "{status}");
     let doctor = one_shot.doctor(&db, false).unwrap();
     assert_eq!(doctor["checked_at"], 1_042, "{doctor}");

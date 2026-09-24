@@ -16,9 +16,9 @@ use super::{
 };
 use crate::application::{AskStore, Generators, RunStore, timestamp, unix_seconds};
 use crate::domain::{
-    ClaimOutcome, CommitSha, DomainError, GoalId, Reason, ReasonCode, RunEvent, RunId, RunLease,
-    RunPaths, RunProcess, RunStatus, SessionRole, SupervisorMode, SupervisorRegistration, Task,
-    TaskAction, TaskId, TaskRun, run,
+    AskId, ClaimOutcome, CommitSha, DomainError, EventId, GoalId, Reason, ReasonCode, RunEvent,
+    RunId, RunLease, RunPaths, RunProcess, RunStatus, SessionRole, SupervisorMode,
+    SupervisorRegistration, Task, TaskAction, TaskId, TaskRun, run,
 };
 
 pub use crate::application::{
@@ -615,17 +615,17 @@ impl SqliteQueue {
 
     /// Record an event of the queue itself, on no task, goal or run (the
     /// observer's `observe_started` / `observe_finished`); returns its id.
-    pub fn record_queue_event(&self, kind: &str, payload: serde_json::Value) -> Result<i64> {
+    pub fn record_queue_event(&self, kind: &str, payload: serde_json::Value) -> Result<EventId> {
         self.conn.execute(
             "INSERT INTO run_events(kind,payload) VALUES (?1,?2)",
             params![kind, serde_json::to_string(&payload)?],
         )?;
-        Ok(self.conn.last_insert_rowid())
+        Ok(EventId::new(self.conn.last_insert_rowid()))
     }
 
     /// The id of the last event recorded before `unix` (seconds), 0 when
     /// there is none: a cursor that reads everything from that time on.
-    pub fn event_id_before(&self, unix: i64) -> Result<i64> {
+    pub fn event_id_before(&self, unix: i64) -> Result<EventId> {
         Ok(self.conn.query_row(
             "SELECT ifnull(max(id),0) FROM run_events
              WHERE CAST(strftime('%s',created_at) AS INTEGER) < ?1",
@@ -647,7 +647,7 @@ impl SqliteQueue {
 
     /// The highest ask id and goal id now, 0 when none exists: where the
     /// observer's own asks and goals start.
-    pub fn ask_and_goal_high_water(&self) -> Result<(i64, i64)> {
+    pub fn ask_and_goal_high_water(&self) -> Result<(AskId, GoalId)> {
         Ok(self.conn.query_row(
             "SELECT (SELECT ifnull(max(id),0) FROM asks), (SELECT ifnull(max(id),0) FROM goals)",
             [],
@@ -661,9 +661,9 @@ impl SqliteQueue {
     pub fn written_by(
         &self,
         role: &str,
-        event_id: i64,
-        ask_id: i64,
-        goal_id: i64,
+        event_id: EventId,
+        ask_id: AskId,
+        goal_id: GoalId,
     ) -> Result<(i64, i64, i64)> {
         Ok(self.conn.query_row(
             "SELECT
@@ -1104,7 +1104,7 @@ impl SqliteQueue {
 
     /// The newest `run_events` id, 0 for an empty queue: the cursor that
     /// `status` hands out and `watch` starts from.
-    pub fn latest_event_id(&self) -> Result<i64> {
+    pub fn latest_event_id(&self) -> Result<EventId> {
         Ok(self
             .conn
             .query_row("SELECT COALESCE(MAX(id),0) FROM run_events", [], |r| {
@@ -1134,8 +1134,8 @@ impl SqliteQueue {
     /// `kinds` narrows them to those kinds. A pure read.
     pub fn events_between(
         &self,
-        after: i64,
-        upto: i64,
+        after: EventId,
+        upto: EventId,
         kinds: Option<&[&str]>,
         limit: usize,
     ) -> Result<Vec<RunEvent>> {
@@ -1856,7 +1856,7 @@ impl SqliteQueue {
         &mut self,
         id: &RunId,
         max_attempts: usize,
-        ask_id: i64,
+        ask_id: AskId,
         reason: &str,
     ) -> Result<Option<TaskRun>> {
         let tx = self
@@ -1948,7 +1948,7 @@ impl SqliteQueue {
     pub fn decide_triage(
         &mut self,
         id: &RunId,
-        ask_id: i64,
+        ask_id: AskId,
         answer: &str,
         reason: &str,
     ) -> Result<TaskRun> {
@@ -2567,7 +2567,7 @@ impl RunStore for SqliteQueue {
     fn decide_triage(
         &mut self,
         id: &RunId,
-        ask_id: i64,
+        ask_id: AskId,
         answer: &str,
         reason: &str,
     ) -> Result<TaskRun> {
@@ -2611,7 +2611,7 @@ impl RunStore for SqliteQueue {
         &mut self,
         id: &RunId,
         max_attempts: usize,
-        ask_id: i64,
+        ask_id: AskId,
         reason: &str,
     ) -> Result<Option<TaskRun>> {
         SqliteQueue::exhaust_resumes(self, id, max_attempts, ask_id, reason)
@@ -2639,7 +2639,7 @@ impl RunStore for SqliteQueue {
     ) -> Result<()> {
         SqliteQueue::set_supervisor_mode(self, token, mode, workspace_id)
     }
-    fn latest_event_id(&self) -> Result<i64> {
+    fn latest_event_id(&self) -> Result<EventId> {
         SqliteQueue::latest_event_id(self)
     }
     fn latest_runs_in_progress(&self) -> Result<Vec<TaskRun>> {
@@ -2696,10 +2696,10 @@ impl AskStore for SqliteQueue {
     fn ask(&mut self, ask: crate::domain::NewAsk) -> Result<crate::domain::AskOutcome> {
         SqliteQueue::ask(self, ask)
     }
-    fn answer(&mut self, id: i64, text: &str) -> Result<crate::domain::Ask> {
+    fn answer(&mut self, id: AskId, text: &str) -> Result<crate::domain::Ask> {
         SqliteQueue::answer(self, id, text)
     }
-    fn close_ask(&mut self, id: i64) -> Result<crate::domain::Ask> {
+    fn close_ask(&mut self, id: AskId) -> Result<crate::domain::Ask> {
         SqliteQueue::close_ask(self, id)
     }
     fn landing_answers(&self) -> Result<Vec<crate::domain::Ask>> {
@@ -2711,7 +2711,7 @@ impl AskStore for SqliteQueue {
     fn undelivered_answers(&self, run_id: &RunId) -> Result<Vec<crate::domain::Ask>> {
         SqliteQueue::undelivered_answers(self, run_id)
     }
-    fn ask_delivered(&mut self, id: i64, workspace_id: &str) -> Result<crate::domain::Ask> {
+    fn ask_delivered(&mut self, id: AskId, workspace_id: &str) -> Result<crate::domain::Ask> {
         SqliteQueue::ask_delivered(self, id, workspace_id)
     }
     fn has_stuck_exit_ask(&self, run_id: &RunId) -> Result<bool> {

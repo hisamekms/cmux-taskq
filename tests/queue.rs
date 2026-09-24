@@ -7,9 +7,9 @@ use dagq::{
     VERSION,
     application::{Clock, Generators, IdGenerator, StatusFilter, TaskQuery, TaskStore, timestamp},
     domain::{
-        ClaimOutcome, CommitSha, GoalEdit, GoalId, GoalStatus, GoalVerdict, NewGoal, NewNote,
-        NewTask, NotePage, NoteQuery, NoteTarget, Provider, RunId, RunStatus, SupervisorMode,
-        TaskAction, TaskId, TaskStatus,
+        ClaimOutcome, CommitSha, EventId, GoalEdit, GoalId, GoalStatus, GoalVerdict, NewGoal,
+        NewNote, NewTask, NotePage, NoteQuery, NoteTarget, Provider, RunId, RunStatus,
+        SupervisorMode, TaskAction, TaskId, TaskStatus,
     },
     infrastructure::sqlite::SqliteQueue,
 };
@@ -952,7 +952,7 @@ fn migration_from_v6_adds_goals_and_keeps_tasks_runs_and_events() {
             .events
             .iter()
             .map(|e| (
-                e.id,
+                e.id.as_i64(),
                 e.task_id.map(TaskId::as_i64),
                 e.run_id.as_ref().map(RunId::as_str)
             ))
@@ -963,13 +963,16 @@ fn migration_from_v6_adds_goals_and_keeps_tasks_runs_and_events() {
     assert_eq!(waiting.task.goal_id(), None);
     assert_eq!(waiting.task.context(), "");
     assert_eq!(waiting.dependencies, [TaskId::new(1)]);
-    assert_eq!(waiting.events[0].id, 3);
+    assert_eq!(waiting.events[0].id, EventId::new(3));
     assert_eq!(queue.candidates().unwrap()[0].id(), TaskId::new(2));
     assert!(queue.list_goals().unwrap().is_empty());
     // New goals and events continue the sequences; foreign keys are enforced.
     let goal = queue.add_goal(new_goal("after")).unwrap();
     assert_eq!(goal.id(), GoalId::new(1));
-    assert_eq!(queue.show_goal(goal.id()).unwrap().events[0].id, 4);
+    assert_eq!(
+        queue.show_goal(goal.id()).unwrap().events[0].id,
+        EventId::new(4)
+    );
     let raw = Connection::open(&path).unwrap();
     raw.pragma_update(None, "foreign_keys", true).unwrap();
     assert!(

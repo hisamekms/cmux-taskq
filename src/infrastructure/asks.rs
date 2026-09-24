@@ -7,7 +7,8 @@ use serde_json::json;
 
 use super::sqlite::{SqliteQueue, enum_col, json_col};
 use crate::domain::{
-    Ask, AskKind, AskOutcome, LANDING_OPTIONS, NewAsk, RunId, RunStatus, TRIAGE_OPTIONS, TaskId,
+    Ask, AskId, AskKind, AskOutcome, LANDING_OPTIONS, NewAsk, RunId, RunStatus, TRIAGE_OPTIONS,
+    TaskId,
 };
 
 pub use crate::application::AskQuery;
@@ -69,7 +70,7 @@ impl SqliteQueue {
                 ask.asked_by
             ],
         )?;
-        let id = tx.last_insert_rowid();
+        let id = AskId::new(tx.last_insert_rowid());
         ask_event(
             &tx,
             task_id,
@@ -87,7 +88,7 @@ impl SqliteQueue {
 
     /// Write the answer of an open ask and record `ask_answered` (with the
     /// run when the ask has one).
-    pub fn answer(&mut self, id: i64, text: &str) -> Result<Ask> {
+    pub fn answer(&mut self, id: AskId, text: &str) -> Result<Ask> {
         ensure!(!text.trim().is_empty(), "answer must not be blank");
         let tx = self
             .conn
@@ -158,7 +159,7 @@ impl SqliteQueue {
     /// open ask cannot be closed: `ask_answered` is the one event that ends
     /// an ask in `run_events` (what `stats` pairs with `ask_opened`), so an
     /// ask is withdrawn by answering it.
-    pub fn close_ask(&mut self, id: i64) -> Result<Ask> {
+    pub fn close_ask(&mut self, id: AskId) -> Result<Ask> {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -239,7 +240,7 @@ impl SqliteQueue {
     /// Close an answered `worker_question` whose answer was typed into the
     /// worker's terminal, and record `ask_delivered` in the same transaction.
     /// An ask someone closed meanwhile is left as it is.
-    pub fn ask_delivered(&mut self, id: i64, workspace_id: &str) -> Result<Ask> {
+    pub fn ask_delivered(&mut self, id: AskId, workspace_id: &str) -> Result<Ask> {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -332,7 +333,7 @@ impl SqliteQueue {
         Ok(closed)
     }
 
-    pub fn read_ask(&self, id: i64) -> Result<Ask> {
+    pub fn read_ask(&self, id: AskId) -> Result<Ask> {
         read_ask(&self.conn, id)
     }
 }
@@ -353,7 +354,7 @@ fn ask_event(
     Ok(())
 }
 
-fn read_ask(conn: &Connection, id: i64) -> Result<Ask> {
+fn read_ask(conn: &Connection, id: AskId) -> Result<Ask> {
     conn.query_row("SELECT * FROM asks WHERE id=?1", [id], ask_row)
         .optional()?
         .with_context(|| format!("ask {id} does not exist"))

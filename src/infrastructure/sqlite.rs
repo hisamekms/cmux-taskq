@@ -18,11 +18,11 @@ use crate::{
         TaskPage, TaskQuery, TaskStore, timestamp,
     },
     domain::{
-        ClaimOutcome, CommitSha, DomainError, Goal, GoalDetail, GoalEdit, GoalId, GoalRecord,
-        GoalSummary, GoalTask, GoalVerdict, NewGoal, NewNote, NewTask, NotePage, NoteQuery,
-        NoteTarget, OBSERVATION_KIND, Predecessor, Provider, RunEvent, RunId, RunRecord, Task,
-        TaskAction, TaskDetail, TaskId, TaskRecord, TaskRun, TaskStatus, TaskStatusCounts, goal,
-        scope::validate_path_globs, task,
+        ClaimOutcome, CommitSha, DomainError, EventId, Goal, GoalDetail, GoalEdit, GoalId,
+        GoalRecord, GoalSummary, GoalTask, GoalVerdict, NewGoal, NewNote, NewTask, NotePage,
+        NoteQuery, NoteTarget, OBSERVATION_KIND, Predecessor, Provider, RunEvent, RunId, RunRecord,
+        Task, TaskAction, TaskDetail, TaskId, TaskRecord, TaskRun, TaskStatus, TaskStatusCounts,
+        goal, scope::validate_path_globs, task,
     },
     infrastructure::{clock, location::runs_dir},
 };
@@ -716,7 +716,7 @@ impl TaskStore for SqliteQueue {
         // the latest `limit` notes. Either way it is printed oldest first.
         let order = if let Some(since) = query.since {
             filters.push("id > ?".into());
-            values.push(Value::from(since));
+            values.push(Value::from(since.as_i64()));
             "ASC"
         } else {
             "DESC"
@@ -735,7 +735,7 @@ impl TaskStore for SqliteQueue {
             .last()
             .map(|note| note.id)
             .or(query.since)
-            .unwrap_or(0);
+            .unwrap_or(EventId::new(0));
         Ok(NotePage { notes, cursor })
     }
 

@@ -350,7 +350,7 @@ impl Supervisor<'_> {
 /// pass a conflict precheck followed.
 pub(super) fn passed_before(
     events: &[crate::domain::RunEvent],
-    before: i64,
+    before: EventId,
 ) -> Option<ReviewVerdict> {
     events
         .iter()

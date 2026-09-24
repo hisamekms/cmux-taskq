@@ -17,8 +17,8 @@ use serde_json::{Value, json};
 use dagq::{
     application::{StatusFilter, TaskQuery, TaskStore, dependency_graph},
     domain::{
-        AskKind, GoalEdit, GoalId, GoalVerdict, NewAsk, NewGoal, NewNote, NewTask, NoteQuery,
-        NoteTarget, RunId, SessionRole, TaskAction, TaskId, TaskStatus,
+        AskId, AskKind, EventId, GoalEdit, GoalId, GoalVerdict, NewAsk, NewGoal, NewNote, NewTask,
+        NoteQuery, NoteTarget, RunId, SessionRole, TaskAction, TaskId, TaskStatus,
     },
     infrastructure::{adapters::path_text, location::QueueLocation, sqlite::SqliteQueue},
 };
@@ -804,7 +804,7 @@ fn execute(cli: Cli) -> Result<Value> {
         } => serde_json::to_value(queue.notes(&NoteQuery {
             goal_id: goal_id.map(GoalId::new),
             task_id: task_id.map(TaskId::new),
-            since,
+            since: since.map(EventId::new),
             limit: usize::try_from(limit)?,
         })?)?,
         Command::Candidates => serde_json::to_value(queue.candidates()?)?,
@@ -816,7 +816,7 @@ fn execute(cli: Cli) -> Result<Value> {
         Command::Ask {
             command: Some(AskCommand::Close { id }),
             ..
-        } => serde_json::to_value(queue.close_ask(id)?)?,
+        } => serde_json::to_value(queue.close_ask(AskId::new(id))?)?,
         Command::Ask {
             command: None,
             kind,
@@ -845,7 +845,7 @@ fn execute(cli: Cli) -> Result<Value> {
                 },
             )?
         }
-        Command::Answer { id, text } => serde_json::to_value(queue.answer(id, &text)?)?,
+        Command::Answer { id, text } => serde_json::to_value(queue.answer(AskId::new(id), &text)?)?,
         Command::Asks { open, role: r, all } => {
             json!({"asks": queue.asks(dagq::application::AskQuery {
             all,
@@ -854,7 +854,7 @@ fn execute(cli: Cli) -> Result<Value> {
         })?})
         }
         Command::Events { after, limit, all } => {
-            dagq::watch::events(&db, after, limit as usize, all)?
+            dagq::watch::events(&db, EventId::new(after), limit as usize, all)?
         }
         Command::Watch {
             after,
@@ -864,7 +864,7 @@ fn execute(cli: Cli) -> Result<Value> {
         } => dagq::watch::watch(
             &db,
             &dagq::watch::WatchOptions {
-                after,
+                after: after.map(EventId::new),
                 timeout: Duration::from_secs(timeout),
                 interval: Duration::from_secs(interval),
                 role: parse_role(r)?,
@@ -1014,7 +1014,7 @@ fn execute(cli: Cli) -> Result<Value> {
         } => one_shot.stats(
             &db,
             &dagq::domain::stats::StatsQuery {
-                since,
+                since: since.map(EventId::new),
                 goal_id: goal_id.map(GoalId::new),
                 full,
             },
@@ -1043,7 +1043,7 @@ fn execute(cli: Cli) -> Result<Value> {
                     } else {
                         ObserveMode::Hourly
                     },
-                    since,
+                    since: since.map(EventId::new),
                     dry_run,
                     timeout: Duration::from_secs(timeout),
                     dagq: env::current_exe()?,

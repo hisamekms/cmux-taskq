@@ -17,7 +17,7 @@ use serde_json::{Value, json};
 
 use crate::{
     application::{AgentProvider, TaskStore, dependency_graph},
-    domain::{NoteQuery, stats::StatsQuery},
+    domain::{EventId, NoteQuery, stats::StatsQuery},
     infrastructure::{adapters::shell_join, asks::AskQuery, sqlite::SqliteQueue},
     lifecycle::{OBSERVER_ROLE, QUEUE_ENV, ROLE_ENV},
 };
@@ -38,7 +38,7 @@ pub struct ObserveOptions {
     pub mode: ObserveMode,
     /// The cursor to read `stats` past; by default the hourly observation's
     /// saved cursor, or for the daily one the last event 24 hours ago.
-    pub since: Option<i64>,
+    pub since: Option<EventId>,
     /// Build and return the prompt without starting the agent.
     pub dry_run: bool,
     pub timeout: Duration,
@@ -52,18 +52,18 @@ pub fn observer_dir(db: &Path) -> PathBuf {
 }
 
 /// The hourly observation's cursor, if one was saved.
-pub fn read_cursor(db: &Path) -> Result<Option<i64>> {
+pub fn read_cursor(db: &Path) -> Result<Option<EventId>> {
     let path = observer_dir(db).join("cursor");
     match fs::read_to_string(&path) {
-        Ok(text) => Ok(Some(text.trim().parse().with_context(|| {
-            format!("parse the observer cursor in {}", path.display())
-        })?)),
+        Ok(text) => Ok(Some(EventId::new(text.trim().parse().with_context(
+            || format!("parse the observer cursor in {}", path.display()),
+        )?))),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error).with_context(|| format!("read {}", path.display())),
     }
 }
 
-fn write_cursor(db: &Path, cursor: i64) -> Result<()> {
+fn write_cursor(db: &Path, cursor: EventId) -> Result<()> {
     let dir = observer_dir(db);
     fs::create_dir_all(&dir)?;
     let temporary = dir.join(format!(".cursor.{}.tmp", std::process::id()));
@@ -93,7 +93,7 @@ pub fn observe(db: &Path, provider: &dyn AgentProvider, options: &ObserveOptions
             ..StatsQuery::default()
         },
     )?;
-    let cursor = stats["next_cursor"].as_i64().unwrap_or_default();
+    let cursor = EventId::new(stats["next_cursor"].as_i64().unwrap_or_default());
     let notes = queue.notes(&NoteQuery {
         goal_id: None,
         task_id: None,
@@ -139,7 +139,7 @@ pub fn observe(db: &Path, provider: &dyn AgentProvider, options: &ObserveOptions
     )?;
     tracing::info!(
         mode = options.mode.as_str(),
-        since,
+        since = since.map(EventId::as_i64),
         "observer ({}) started",
         options.mode.as_str()
     );
@@ -257,7 +257,7 @@ fn run_agent(
 pub fn observer_prompt(
     mode: ObserveMode,
     dagq: &str,
-    since: Option<i64>,
+    since: Option<EventId>,
     input: &Value,
 ) -> Result<String> {
     let window = match (mode, since) {

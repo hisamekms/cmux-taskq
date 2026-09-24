@@ -178,8 +178,8 @@ pub fn goal_detail(detail: &GoalDetail) -> Value {
 mod tests {
     use super::*;
     use crate::domain::{
-        CommitSha, Goal, GoalId, GoalTask, Provider, RunId, RunProcess, RunStatus, Task, TaskId,
-        TaskRun, TaskStatus,
+        CommitSha, EventId, Goal, GoalId, GoalTask, Provider, RunId, RunProcess, RunStatus, Task,
+        TaskId, TaskRun, TaskStatus,
     };
 
     fn task(description: &str) -> Task {
@@ -225,7 +225,7 @@ mod tests {
 
     fn event(id: i64, payload: Value) -> RunEvent {
         RunEvent {
-            id,
+            id: EventId::new(id),
             task_id: Some(TaskId::new(1)),
             goal_id: None,
             run_id: Some(RunId::new("b").unwrap()),

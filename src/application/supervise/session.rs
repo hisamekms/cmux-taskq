@@ -448,12 +448,13 @@ impl SessionWatch {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
             Err(error) => return Err(error).context("inspect idle marker"),
         };
-        let failed: Vec<i64> = sv
+        let failed: Vec<AskId> = sv
             .queue
             .run_events(run.id())?
             .iter()
             .filter(|e| e.kind == "ask_delivery_failed")
             .filter_map(|e| e.payload.get("ask_id").and_then(Value::as_i64))
+            .map(AskId::new)
             .collect();
         for ask in answers {
             if failed.contains(&ask.id) || idle_at < ask.created_at {

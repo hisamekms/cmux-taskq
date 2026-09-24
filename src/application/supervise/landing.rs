@@ -386,7 +386,7 @@ impl Supervisor<'_> {
         reasons: &[String],
         summary: &str,
         why: Option<&str>,
-    ) -> Result<i64> {
+    ) -> Result<AskId> {
         let mut question = format!(
             "The supervisor's review of run {} (task {}) returned {}{}: {summary}",
             run.id(),
@@ -417,7 +417,10 @@ impl Supervisor<'_> {
             },
             self.cmux,
         )?;
-        outcome["id"].as_i64().context("ask returned no id")
+        outcome["id"]
+            .as_i64()
+            .map(AskId::new)
+            .context("ask returned no id")
     }
     /// Apply the answered `approve_landing` asks of runs awaiting
     /// integration that nobody leases (ADR-0027): `land` lands the run in
@@ -457,7 +460,7 @@ impl Supervisor<'_> {
     pub(super) fn apply_landing_answer(
         &mut self,
         run: &TaskRun,
-        ask_id: i64,
+        ask_id: AskId,
         answer: &str,
     ) -> Result<()> {
         let payload = json!({"ask_id": ask_id, "answer": answer});

@@ -267,7 +267,7 @@ impl Supervisor<'_> {
         attempt: usize,
         verdict: &TriageVerdict,
         overridden: Option<&str>,
-    ) -> Result<i64> {
+    ) -> Result<AskId> {
         let asked = match (verdict.verdict, overridden) {
             (TriageDecision::Ask, _) if !verdict.instruction.trim().is_empty() => {
                 verdict.instruction.clone()
@@ -308,7 +308,10 @@ impl Supervisor<'_> {
             },
             self.cmux,
         )?;
-        outcome["id"].as_i64().context("ask returned no id")
+        outcome["id"]
+            .as_i64()
+            .map(AskId::new)
+            .context("ask returned no id")
     }
     /// Close the workspaces a triaged run left open: its worker workspace
     /// (unless the runtime closed it) and the resume workspaces its

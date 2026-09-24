@@ -263,7 +263,7 @@ mod views;
 pub use error::DomainError;
 use error::require;
 pub use goal::Goal;
-pub use ids::{CommitSha, GoalId, RunId, TaskId};
+pub use ids::{AskId, CommitSha, EventId, GoalId, RunId, TaskId};
 pub use input::{GoalEdit, GoalRecord, NewGoal, NewTask, RunPlan, RunRecord, TaskRecord};
 pub use reason::{Reason, ReasonCode};
 pub use run::TaskRun;
@@ -281,7 +281,7 @@ pub use views::{
 /// the answer, to close it (or for the runtime to apply it). Times are unix seconds.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Ask {
-    pub id: i64,
+    pub id: AskId,
     pub kind: AskKind,
     pub task_id: Option<TaskId>,
     pub run_id: Option<RunId>,
@@ -411,7 +411,7 @@ impl NewNote {
 pub struct NoteQuery {
     pub goal_id: Option<GoalId>,
     pub task_id: Option<TaskId>,
-    pub since: Option<i64>,
+    pub since: Option<EventId>,
     pub limit: usize,
 }
 
@@ -420,7 +420,7 @@ pub struct NoteQuery {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NotePage {
     pub notes: Vec<RunEvent>,
-    pub cursor: i64,
+    pub cursor: EventId,
 }
 /// The remote `integrate` pushes the landed `main` to (ADR-0019 decision 3).
 pub const PUSH_REMOTE: &str = "origin";
@@ -644,20 +644,20 @@ pub enum AttentionNext {
     /// person as an ask once its resumes are used up.
     Resuming,
     AnswerAsk {
-        ask_id: i64,
+        ask_id: AskId,
     },
     ReadAnswer {
-        ask_id: i64,
+        ask_id: AskId,
     },
     /// Not a person's to act on: the supervisor types the answer of a
     /// `worker_question` into the worker's terminal once the worker is idle.
     DeliveringAnswer {
-        ask_id: i64,
+        ask_id: AskId,
     },
     /// The supervisor could not type the answer of a `worker_question` into
     /// the worker's terminal (it tries once), or the worker's session is gone.
     DeliverAnswer {
-        ask_id: i64,
+        ask_id: AskId,
     },
     /// Not a person's to act on: the supervisor holds the accepted run
     /// for its headless review and what follows from the verdict (ADR-0027).
@@ -668,7 +668,7 @@ pub enum AttentionNext {
     /// Not a person's to act on: the supervisor lands, sends back or
     /// cancels the run as the answer of its `approve_landing` ask says.
     ApplyingAnswer {
-        ask_id: i64,
+        ask_id: AskId,
     },
     /// Not a person's to act on: the supervisor triages the `failed`
     /// or `interrupted` run and acts on the verdict (ADR-0024 decision 3).
@@ -844,8 +844,11 @@ pub fn event_attention(kind: &str, payload: &serde_json::Value) -> Option<Attent
     }
 }
 
-fn ask_id(payload: &serde_json::Value) -> Option<i64> {
-    payload.get("ask_id").and_then(serde_json::Value::as_i64)
+fn ask_id(payload: &serde_json::Value) -> Option<AskId> {
+    payload
+        .get("ask_id")
+        .and_then(serde_json::Value::as_i64)
+        .map(AskId::new)
 }
 
 /// The session role attention is addressed to: every attention, the
@@ -923,7 +926,7 @@ pub struct Attention {
     pub pid: Option<u32>,
     /// The ask of an `ask_opened` / `ask_answered` attention.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub ask_id: Option<i64>,
+    pub ask_id: Option<AskId>,
     pub status: String,
     pub kind: String,
     pub last_error: Option<String>,
@@ -995,7 +998,7 @@ mod attention_tests {
     #[test]
     fn asks_wait_for_the_inbox_until_closed() {
         let mut ask = Ask {
-            id: 1,
+            id: AskId::new(1),
             kind: AskKind::Decide,
             task_id: Some(TaskId::new(1)),
             run_id: None,
@@ -1017,7 +1020,10 @@ mod attention_tests {
         assert_eq!(ask.waits_for(), None);
         assert_eq!(ATTENTION_ROLE, SessionRole::Inbox);
         assert_eq!(
-            AttentionNext::ReadAnswer { ask_id: 4 }.to_string(),
+            AttentionNext::ReadAnswer {
+                ask_id: AskId::new(4)
+            }
+            .to_string(),
             "read the answer of ask 4 and close it"
         );
     }
@@ -1111,7 +1117,9 @@ mod attention_tests {
             (
                 "ask_answered",
                 json!({"ask_id": 6, "kind": "decide", "runtime_delivers": false}),
-                Some(ReadAnswer { ask_id: 6 }),
+                Some(ReadAnswer {
+                    ask_id: AskId::new(6),
+                }),
             ),
             ("review_started", json!({"attempt": 1}), None),
             (
@@ -1148,7 +1156,9 @@ mod attention_tests {
             (
                 "ask_answered",
                 json!({"ask_id": 5, "kind": "approve_landing", "runtime_delivers": false}),
-                Some(ReadAnswer { ask_id: 5 }),
+                Some(ReadAnswer {
+                    ask_id: AskId::new(5),
+                }),
             ),
             (
                 "validation_finished",
@@ -1198,7 +1208,9 @@ mod attention_tests {
             (
                 "ask_answered",
                 json!({"ask_id": 5, "kind": "stuck_exit"}),
-                Some(ReadAnswer { ask_id: 5 }),
+                Some(ReadAnswer {
+                    ask_id: AskId::new(5),
+                }),
             ),
             (
                 "push_failed",
@@ -1280,12 +1292,16 @@ mod attention_tests {
             (
                 "ask_opened",
                 json!({"ask_id": 3, "kind": "decide"}),
-                Some(AnswerAsk { ask_id: 3 }),
+                Some(AnswerAsk {
+                    ask_id: AskId::new(3),
+                }),
             ),
             (
                 "ask_answered",
                 json!({"ask_id": 3, "kind": "decide"}),
-                Some(ReadAnswer { ask_id: 3 }),
+                Some(ReadAnswer {
+                    ask_id: AskId::new(3),
+                }),
             ),
             ("ask_opened", json!({}), None),
             (
@@ -1296,13 +1312,17 @@ mod attention_tests {
             (
                 "ask_answered",
                 json!({"ask_id": 4, "kind": "worker_question", "runtime_delivers": false}),
-                Some(DeliverAnswer { ask_id: 4 }),
+                Some(DeliverAnswer {
+                    ask_id: AskId::new(4),
+                }),
             ),
             ("ask_delivered", json!({"ask_id": 4}), None),
             (
                 "ask_delivery_failed",
                 json!({"ask_id": 4, "error": "x"}),
-                Some(DeliverAnswer { ask_id: 4 }),
+                Some(DeliverAnswer {
+                    ask_id: AskId::new(4),
+                }),
             ),
             ("validation_finished", json!({}), None),
         ];
@@ -1319,17 +1339,26 @@ mod attention_tests {
         assert_eq!(Reviewing.to_string(), "reviewing (runtime)");
         assert_eq!(ReviewByHand.to_string(), "review by hand");
         assert_eq!(
-            ApplyingAnswer { ask_id: 7 }.to_string(),
+            ApplyingAnswer {
+                ask_id: AskId::new(7)
+            }
+            .to_string(),
             "applying the answer of ask 7 (runtime)"
         );
         assert_eq!(RecoverRun.to_string(), "recover run");
         assert_eq!(PushMain.to_string(), "push main");
         assert_eq!(
-            DeliveringAnswer { ask_id: 2 }.to_string(),
+            DeliveringAnswer {
+                ask_id: AskId::new(2)
+            }
+            .to_string(),
             "delivering the answer of ask 2 (runtime)"
         );
         assert_eq!(
-            DeliverAnswer { ask_id: 2 }.to_string(),
+            DeliverAnswer {
+                ask_id: AskId::new(2)
+            }
+            .to_string(),
             "send the answer of ask 2 to the worker and close it"
         );
         assert_eq!(
@@ -1491,7 +1520,7 @@ mod attention_tests {
     #[test]
     fn triage_state_follows_the_latest_triage_or_resume() {
         let event = |id: i64, kind: &str| RunEvent {
-            id,
+            id: EventId::new(id),
             task_id: Some(TaskId::new(1)),
             goal_id: None,
             run_id: Some(RunId::new("r").unwrap()),

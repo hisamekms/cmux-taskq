@@ -15,11 +15,11 @@ use std::{
 
 use super::{GraphInput, TaskPage, TaskQuery, timestamp, unix_seconds};
 use crate::domain::{
-    Ask, AskKind, AskOutcome, ClaimOutcome, CommitSha, EvidenceCheck, Goal, GoalDetail, GoalEdit,
-    GoalId, GoalSummary, GoalVerdict, NewAsk, NewGoal, NewNote, NewTask, NotePage, NoteQuery,
-    Predecessor, Reason, ReasonCode, RunEvent, RunId, RunLease, RunPlan, RunProcess, RunStatus,
-    SessionRole, SupervisorMode, SupervisorRegistration, Task, TaskAction, TaskDetail, TaskId,
-    TaskRun,
+    Ask, AskId, AskKind, AskOutcome, ClaimOutcome, CommitSha, EventId, EvidenceCheck, Goal,
+    GoalDetail, GoalEdit, GoalId, GoalSummary, GoalVerdict, NewAsk, NewGoal, NewNote, NewTask,
+    NotePage, NoteQuery, Predecessor, Reason, ReasonCode, RunEvent, RunId, RunLease, RunPlan,
+    RunProcess, RunStatus, SessionRole, SupervisorMode, SupervisorRegistration, Task, TaskAction,
+    TaskDetail, TaskId, TaskRun,
 };
 
 pub trait TaskStore {
@@ -608,7 +608,7 @@ pub enum TriageAction {
     /// and the supervisor resumes it (ADR-0019 decision 1).
     Resume { instruction: String },
     /// The run stays; the `decide` ask `ask_id` waits for a person.
-    Ask { ask_id: i64 },
+    Ask { ask_id: AskId },
 }
 
 impl TriageAction {
@@ -806,7 +806,7 @@ pub trait RunStore {
     fn decide_triage(
         &mut self,
         id: &RunId,
-        ask_id: i64,
+        ask_id: AskId,
         answer: &str,
         reason: &str,
     ) -> Result<TaskRun>;
@@ -843,7 +843,7 @@ pub trait RunStore {
         &mut self,
         id: &RunId,
         max_attempts: usize,
-        ask_id: i64,
+        ask_id: AskId,
         reason: &str,
     ) -> Result<Option<TaskRun>>;
     /// When an observation of `mode` last started or finished.
@@ -865,7 +865,7 @@ pub trait RunStore {
         workspace_id: Option<&str>,
     ) -> Result<()>;
     /// The newest `run_events` id, 0 for an empty queue.
-    fn latest_event_id(&self) -> Result<i64>;
+    fn latest_event_id(&self) -> Result<EventId>;
     /// The latest run of every `in_progress` task, oldest first.
     fn latest_runs_in_progress(&self) -> Result<Vec<TaskRun>>;
     /// The `integrated` runs whose push of `main` failed after the latest
@@ -896,15 +896,15 @@ pub trait AskStore {
     fn has_unclosed_ask(&self, run_id: &RunId, kind: AskKind) -> Result<bool>;
     /// Register an ask, or return the open one it repeats.
     fn ask(&mut self, ask: NewAsk) -> Result<AskOutcome>;
-    fn answer(&mut self, id: i64, text: &str) -> Result<Ask>;
-    fn close_ask(&mut self, id: i64) -> Result<Ask>;
+    fn answer(&mut self, id: AskId, text: &str) -> Result<Ask>;
+    fn close_ask(&mut self, id: AskId) -> Result<Ask>;
     /// Answered `approve_landing` asks nobody closed.
     fn landing_answers(&self) -> Result<Vec<Ask>>;
     /// Answered `decide` asks of the triage nobody closed.
     fn triage_answers(&self) -> Result<Vec<Ask>>;
     /// Answered `worker_question` asks of the run not yet delivered.
     fn undelivered_answers(&self, run_id: &RunId) -> Result<Vec<Ask>>;
-    fn ask_delivered(&mut self, id: i64, workspace_id: &str) -> Result<Ask>;
+    fn ask_delivered(&mut self, id: AskId, workspace_id: &str) -> Result<Ask>;
     fn has_stuck_exit_ask(&self, run_id: &RunId) -> Result<bool>;
     fn has_unclosed_worker_question(&self, run_id: &RunId) -> Result<bool>;
     /// Close the run's `stuck_exit` asks nobody closed, with `answer`.

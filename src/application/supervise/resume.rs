@@ -255,7 +255,7 @@ impl Supervisor<'_> {
             },
             self.cmux,
         )?;
-        let ask_id = outcome["id"].as_i64().context("ask returned no id")?;
+        let ask_id = AskId::new(outcome["id"].as_i64().context("ask returned no id")?);
         let Some(failed) =
             self.queue
                 .exhaust_resumes(run.id(), MAX_RESUME_ATTEMPTS, ask_id, &reason)?

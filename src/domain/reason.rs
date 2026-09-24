@@ -249,11 +249,12 @@ pub const REPEATED_CODE_KINDS: [&str; 3] =
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::EventId;
     use serde_json::json;
 
     fn event(kind: &str, payload: Value) -> RunEvent {
         RunEvent {
-            id: 1,
+            id: EventId::new(1),
             task_id: None,
             goal_id: None,
             run_id: None,

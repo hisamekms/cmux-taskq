@@ -1044,7 +1044,7 @@ mod stats {
     use std::collections::HashMap;
 
     use dagq::domain::{
-        GoalId, RunEvent, RunId, TaskId,
+        EventId, GoalId, RunEvent, RunId, TaskId,
         stats::{SlotSnapshot, StatsQuery, stats, timestamp_millis},
     };
     use serde_json::{Value, json};
@@ -1058,7 +1058,7 @@ mod stats {
     impl Events {
         fn push(&mut self, task: i64, run: Option<&str>, kind: &str, minute: i64, payload: Value) {
             self.0.push(RunEvent {
-                id: i64::try_from(self.0.len()).unwrap() + 1,
+                id: EventId::new(i64::try_from(self.0.len()).unwrap() + 1),
                 task_id: Some(TaskId::new(task)),
                 goal_id: None,
                 run_id: run.map(|run| RunId::new(run).unwrap()),
@@ -1081,7 +1081,7 @@ mod stats {
         }
 
         fn last_id(&self) -> i64 {
-            self.0.last().unwrap().id
+            self.0.last().unwrap().id.as_i64()
         }
     }
 
@@ -1280,7 +1280,7 @@ mod stats {
             at(120),
             SlotSnapshot::default(),
             &StatsQuery {
-                since: Some(runs[1]["finished_event_id"].as_i64().unwrap()),
+                since: Some(EventId::new(runs[1]["finished_event_id"].as_i64().unwrap())),
                 ..Default::default()
             },
         ));
@@ -1300,7 +1300,9 @@ mod stats {
             at(120),
             SlotSnapshot::default(),
             &StatsQuery {
-                since: Some(since["runs"][0]["finished_event_id"].as_i64().unwrap()),
+                since: Some(EventId::new(
+                    since["runs"][0]["finished_event_id"].as_i64().unwrap(),
+                )),
                 ..Default::default()
             },
         ));
@@ -1375,7 +1377,7 @@ mod stats {
 
         // Past the cursor: three failures, the close is before it.
         let since = run(StatsQuery {
-            since: Some(cursor),
+            since: Some(EventId::new(cursor)),
             ..Default::default()
         });
         assert_eq!(since["backend_failures"]["count"], 3);
@@ -1391,7 +1393,7 @@ mod stats {
         // --goal keeps only the failures of its runs; one is no alert.
         let goal = run(StatsQuery {
             goal_id: Some(GoalId::new(5)),
-            since: Some(cursor),
+            since: Some(EventId::new(cursor)),
             ..Default::default()
         });
         assert_eq!(goal["backend_failures"]["count"], 2);
@@ -1407,7 +1409,7 @@ mod stats {
 
         // Nothing past the last event: an empty window.
         let empty = run(StatsQuery {
-            since: Some(events.last_id()),
+            since: Some(EventId::new(events.last_id())),
             ..Default::default()
         });
         assert_eq!(empty["backend_failures"]["count"], 0);
@@ -1484,14 +1486,14 @@ mod stats {
             60
         );
         let first = run(StatsQuery {
-            since: Some(0),
+            since: Some(EventId::new(0)),
             ..Default::default()
         });
         assert_eq!(first["runs"].as_array().unwrap().len(), 50);
         assert_eq!(first["runs"][49]["run_id"], "r50");
         assert_eq!(first["next_cursor"], 100);
         let rest = run(StatsQuery {
-            since: Some(100),
+            since: Some(EventId::new(100)),
             ..Default::default()
         });
         assert_eq!(rest["runs"].as_array().unwrap().len(), 10);
@@ -1499,7 +1501,7 @@ mod stats {
         assert_eq!(rest["next_cursor"], events.last_id());
         assert_eq!(
             run(StatsQuery {
-                since: Some(events.last_id()),
+                since: Some(EventId::new(events.last_id())),
                 ..Default::default()
             })["runs"],
             json!([])

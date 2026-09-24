@@ -60,12 +60,12 @@ use super::{
     tail, unix_seconds,
 };
 use crate::domain::{
-    AskKind, ClaimOutcome, CommitSha, EvidenceCheck, HEARTBEAT_TIMEOUT_SECS, IntegrationOutcome,
-    LANDING_OPTIONS, MAX_RESUME_ATTEMPTS, MAX_REVISE_ATTEMPTS, NewAsk, Predecessor, Reason,
-    ReasonCode, Receipt, ReceiptResult, ReviewDecision, ReviewVerdict, RunId, RunLease, RunPaths,
-    RunPlan, RunProcess, RunStatus, SessionRole, TRIAGE_OPTIONS, TRIAGE_RETRY_FAILURES, TaskAction,
-    TaskId, TaskRun, TaskStatus, TriageDecision, TriageState, TriageVerdict, heartbeat_stale,
-    triage_state,
+    AskId, AskKind, ClaimOutcome, CommitSha, EventId, EvidenceCheck, HEARTBEAT_TIMEOUT_SECS,
+    IntegrationOutcome, LANDING_OPTIONS, MAX_RESUME_ATTEMPTS, MAX_REVISE_ATTEMPTS, NewAsk,
+    Predecessor, Reason, ReasonCode, Receipt, ReceiptResult, ReviewDecision, ReviewVerdict, RunId,
+    RunLease, RunPaths, RunPlan, RunProcess, RunStatus, SessionRole, TRIAGE_OPTIONS,
+    TRIAGE_RETRY_FAILURES, TaskAction, TaskId, TaskRun, TaskStatus, TriageDecision, TriageState,
+    TriageVerdict, heartbeat_stale, triage_state,
 };
 
 mod adopt;

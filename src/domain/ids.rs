@@ -99,6 +99,52 @@ impl fmt::Display for GoalId {
     }
 }
 
+/// The ID of an ask: the `asks.id` rowid, as `answer`, `close` and
+/// `deliver` take it. Distinct from [`TaskId`] and [`EventId`] so an ask's
+/// ID cannot be passed where another rowid is meant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct AskId(i64);
+
+impl AskId {
+    pub const fn new(id: i64) -> Self {
+        Self(id)
+    }
+
+    pub const fn as_i64(self) -> i64 {
+        self.0
+    }
+}
+
+impl fmt::Display for AskId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+/// The ID of a `run_events` row, which is also the cursor `status` hands out
+/// and `watch` and `stats` read past: events are numbered in the order they
+/// were recorded, and 0 is the cursor before the first one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct EventId(i64);
+
+impl EventId {
+    pub const fn new(id: i64) -> Self {
+        Self(id)
+    }
+
+    pub const fn as_i64(self) -> i64 {
+        self.0
+    }
+}
+
+impl fmt::Display for EventId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
 /// The ID of a run: a UUID the runtime generates at claim time, also the
 /// name of the run's directory and of its branch `dagq/<run id>`. It is never
 /// blank.
@@ -291,10 +337,25 @@ mod tests {
     }
 
     #[test]
-    fn task_and_goal_ids_order_by_value() {
+    fn integer_ids_order_by_value() {
         assert!(TaskId::new(1) < TaskId::new(2));
         assert!(GoalId::new(2) > GoalId::new(1));
+        assert!(AskId::new(1) < AskId::new(2));
+        assert!(EventId::new(0) < EventId::new(1));
         assert_eq!(serde_json::from_str::<TaskId>("5").unwrap(), TaskId::new(5));
         assert_eq!(serde_json::from_str::<GoalId>("5").unwrap(), GoalId::new(5));
+        assert_eq!(serde_json::from_str::<AskId>("5").unwrap(), AskId::new(5));
+        assert_eq!(
+            serde_json::from_str::<EventId>("5").unwrap(),
+            EventId::new(5)
+        );
+        assert_eq!(AskId::new(4).to_string(), "4");
+        assert_eq!(EventId::new(9).to_string(), "9");
+        assert_eq!(AskId::new(4).as_i64(), 4);
+        assert_eq!(EventId::new(9).as_i64(), 9);
+        assert_eq!(
+            serde_json::to_string(&(AskId::new(4), EventId::new(9))).unwrap(),
+            "[4,9]"
+        );
     }
 }

@@ -8,7 +8,7 @@
 pub use crate::application::health::compact_event;
 use crate::{
     application::health::{for_role, pulses, supervisors},
-    domain::{ATTENTION_KINDS, SessionRole, event_attention},
+    domain::{ATTENTION_KINDS, EventId, SessionRole, event_attention},
     infrastructure::{adapters::SystemProcesses, sqlite::SqliteQueue},
 };
 use anyhow::Result;
@@ -28,12 +28,12 @@ const WATCH_LIMIT: usize = 100;
 /// event returned when the limit was reached, `upto` otherwise.
 fn read_events(
     queue: &SqliteQueue,
-    after: i64,
-    upto: i64,
+    after: EventId,
+    upto: EventId,
     limit: usize,
     all: bool,
     role: Option<SessionRole>,
-) -> Result<(Vec<Value>, i64)> {
+) -> Result<(Vec<Value>, EventId)> {
     let kinds = (!all).then_some(ATTENTION_KINDS);
     let mut events = Vec::new();
     let mut cursor = after;
@@ -57,7 +57,7 @@ fn read_events(
 }
 
 /// `events --after`: the events after `after`, oldest first.
-pub fn events(db: &Path, after: i64, limit: usize, all: bool) -> Result<Value> {
+pub fn events(db: &Path, after: EventId, limit: usize, all: bool) -> Result<Value> {
     let queue = SqliteQueue::open(db)?;
     let upto = queue.latest_event_id()?;
     let (events, cursor) = read_events(&queue, after, upto, limit.max(1), all, None)?;
@@ -67,7 +67,7 @@ pub fn events(db: &Path, after: i64, limit: usize, all: bool) -> Result<Value> {
 #[derive(Debug, Clone)]
 pub struct WatchOptions {
     /// Cursor to wait past; `None` is the newest event when `watch` starts.
-    pub after: Option<i64>,
+    pub after: Option<EventId>,
     pub timeout: Duration,
     pub interval: Duration,
     /// Only the attention addressed to this role (ADR-0022); `None` is all.
