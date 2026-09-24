@@ -572,6 +572,40 @@ impl GitRepository {
         Ok(numbers)
     }
 
+    /// `git merge-base <a> <b>`: the newest commit both descend from.
+    pub fn merge_base(&self, a: &str, b: &str) -> Result<String> {
+        Ok(output(
+            Command::new(&self.git)
+                .arg("-C")
+                .arg(&self.root)
+                .args(["merge-base", a, b]),
+        )?
+        .trim()
+        .to_owned())
+    }
+
+    /// The paths whose content differs between the trees of `from` and
+    /// `to` (`git diff --name-only --no-renames`): both sides of a rename,
+    /// never quoted.
+    pub fn changed_paths(&self, from: &str, to: &str) -> Result<Vec<String>> {
+        let names = output(Command::new(&self.git).arg("-C").arg(&self.root).args([
+            "diff",
+            "--name-only",
+            "-z",
+            "--no-renames",
+            "--no-ext-diff",
+            "--no-textconv",
+            from,
+            to,
+            "--",
+        ]))?;
+        Ok(names
+            .split('\0')
+            .filter(|name| !name.is_empty())
+            .map(str::to_owned)
+            .collect())
+    }
+
     pub fn tree_of(&self, commit: &str) -> Result<String> {
         Ok(
             output(Command::new(&self.git).arg("-C").arg(&self.root).args([
@@ -1417,6 +1451,34 @@ mod tests {
     use crate::domain::{Provider, RunStatus};
 
     #[test]
+    fn system_processes_signal_a_child_and_see_it_gone() {
+        let processes = SystemProcesses;
+        for send in [
+            SystemProcesses::terminate,
+            SystemProcesses::interrupt,
+            SystemProcesses::kill,
+        ] {
+            let mut child = Command::new("/bin/sleep").arg("30").spawn().unwrap();
+            assert!(processes.alive(child.id()));
+            send(&processes, child.id()).unwrap();
+            assert!(!child.wait().unwrap().success());
+            assert!(!processes.alive(child.id()));
+            let error = send(&processes, child.id()).unwrap_err().to_string();
+            assert!(error.contains(&format!("pid {}", child.id())), "{error}");
+        }
+        assert!(!process_alive(u32::MAX));
+        assert!(processes.kill(u32::MAX).is_err());
+    }
+
+    #[test]
+    fn a_default_push_report_is_skipped_for_origin() {
+        let report = crate::domain::PushReport::default();
+        assert_eq!(report.outcome, crate::domain::PushResult::Skipped);
+        assert_eq!(report.remote, "origin");
+        assert!(report.error.is_none() && report.reason.is_none());
+    }
+
+    #[test]
     fn claude_headless_command_prints_with_only_the_allowed_tools() {
         let claude = ClaudeCode {
             executable: "/bin/claude".into(),
@@ -1466,6 +1528,7 @@ mod tests {
             acceptance: String::new(),
             verification_commands: Vec::new(),
             required_evidence: Vec::new(),
+            paths: Vec::new(),
             status: crate::domain::TaskStatus::InProgress,
             goal_id: None,
             context: String::new(),

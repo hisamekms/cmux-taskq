@@ -16,6 +16,7 @@ use crate::{
         ReviewVerdict, RunLease, RunPaths, RunProcess, RunStatus, SessionRole, SupervisorMode,
         SupervisorRegistration, Task, TaskAction, TaskRun, evidence_missing_reason,
         heartbeat_stale,
+        scope::{out_of_scope, scope_violation_reason},
     },
     infrastructure::{
         adapters::{
@@ -2859,21 +2860,29 @@ enum ResumeKind {
     /// A person sent a review's concern back (`landing_decided`): fix
     /// the findings.
     SentBack,
+    /// The diff changes paths outside the task's `paths` (validation's
+    /// `scope_violation`, or a landing deferred for it): take them out.
+    ScopeViolation,
 }
 
 /// Why the run waits for a session: the reason of its latest
 /// `integration_deferred` / `integration_error` / `evidence_missing` /
-/// `landing_decided` event (a runtime error since, such as a failed resume,
-/// may have replaced `last_error`), else `last_error`; and what kind of
-/// request that makes: `evidence_missing` (or a landing deferred for missing
-/// evidence, whose payload names the `checks`), a review sent back, or a
-/// landing.
+/// `scope_violation` / `landing_decided` event (a runtime error since, such
+/// as a failed resume, may have replaced `last_error`), else `last_error`;
+/// and what kind of request that makes: `evidence_missing` (or a landing
+/// deferred for missing evidence, whose payload names the `checks`),
+/// `scope_violation` (or a landing deferred for it, whose payload names the
+/// paths), a review sent back, or a landing.
 fn resume_reason(queue: &SqliteQueue, run: &TaskRun) -> Result<(Option<String>, ResumeKind)> {
     let events = queue.run_events(&run.id)?;
     let parked = events.iter().rev().find(|e| {
         matches!(
             e.kind.as_str(),
-            "integration_deferred" | "integration_error" | "evidence_missing" | "landing_decided"
+            "integration_deferred"
+                | "integration_error"
+                | "evidence_missing"
+                | "scope_violation"
+                | "landing_decided"
         )
     });
     let reason = parked
@@ -2883,6 +2892,9 @@ fn resume_reason(queue: &SqliteQueue, run: &TaskRun) -> Result<(Option<String>, 
     let kind = match parked {
         Some(e) if e.kind == "evidence_missing" || e.payload.get("checks").is_some() => {
             ResumeKind::EvidenceMissing
+        }
+        Some(e) if e.kind == "scope_violation" || e.payload.get("scope_violation").is_some() => {
+            ResumeKind::ScopeViolation
         }
         Some(e) if e.kind == "landing_decided" => ResumeKind::SentBack,
         _ => ResumeKind::Landing,
@@ -2936,6 +2948,12 @@ fn resume_request(
             "dagq: the supervisor's review of run {} (task {}) raised findings a person sent back to you, so the run is needs_session.",
             run.id, task.id
         ),
+        ResumeKind::ScopeViolation => format!(
+            "dagq: run {} (task {}) changes paths outside the task's --paths ({}), so the run is needs_session.",
+            run.id,
+            task.id,
+            task.paths.join(", ")
+        ),
         ResumeKind::Landing => format!(
             "dagq: integrate could not land run {} (task {}) and returned needs_session.",
             run.id, task.id
@@ -2967,6 +2985,12 @@ fn resume_request(
         lines.push(format!(
             "2. If that changes files, commit them and rerun the verification commands {verify}."
         ));
+    } else if request.kind == ResumeKind::ScopeViolation {
+        lines.push(format!(
+            "1. Take the changes to the paths the reason names out of the run branch: restore each to its state at git merge-base HEAD {} (delete the ones that did not exist there) and commit; if the task cannot be done without them, write the receipt with result failed and say which paths it needs.",
+            request.main
+        ));
+        lines.push(format!("2. Rerun the verification commands {verify}."));
     } else if request.kind == ResumeKind::SentBack {
         lines.push(format!(
             "1. Fix the findings in the reason and commit; if main moved, git rebase {} first.",
@@ -3674,6 +3698,8 @@ fn spawn_validation(
                 reason: None,
                 receipt: serde_json::to_value(receipt)?,
                 evidence_missing: Vec::new(),
+                scope_violation: Vec::new(),
+                allowed_paths: Vec::new(),
             },
             Err(rejection) => {
                 log.note(&format!("run {} rejected: {}", run.id, rejection.reason));
@@ -3687,6 +3713,12 @@ fn spawn_validation(
                         .transpose()?
                         .unwrap_or(Value::Null),
                     evidence_missing: rejection.evidence_missing,
+                    allowed_paths: if rejection.scope_violation.is_empty() {
+                        Vec::new()
+                    } else {
+                        task.paths.clone()
+                    },
+                    scope_violation: rejection.scope_violation,
                 }
             }
         })
@@ -3721,6 +3753,9 @@ struct Rejection {
     /// The task's required checks the receipt does not back, when that is
     /// all that is wrong: the run waits for a session instead of failing.
     evidence_missing: Vec<EvidenceCheck>,
+    /// The changed paths outside the task's `paths` (ADR-0029), when the
+    /// run is otherwise sound: it waits for a session to take them out.
+    scope_violation: Vec<String>,
 }
 
 fn check_receipt(
@@ -3734,6 +3769,7 @@ fn check_receipt(
             commit,
             receipt,
             evidence_missing: Vec::new(),
+            scope_violation: Vec::new(),
         }))
     };
     let receipt_path = Path::new(run.receipt_path.as_ref().context("missing receipt path")?);
@@ -3810,8 +3846,28 @@ fn check_receipt(
             Some(receipt),
         );
     }
-    // Checked last: only a run that is otherwise sound waits for a session
-    // to add the evidence (ADR-0019 decision 5).
+    // Checked last, like the evidence below: only a run that is otherwise
+    // sound waits for a session to take out what it changed outside the
+    // task's paths (ADR-0029). The diff starts where the branch forked from
+    // the current main, not at the base commit: a resumed session that
+    // rebased carries what other tasks landed since, which is not its change.
+    let outside = if task.paths.is_empty() {
+        Vec::new()
+    } else {
+        let fork = repository.merge_base(&repository.main_head()?, &commit)?;
+        out_of_scope(&task.paths, &repository.changed_paths(&fork, &commit)?)
+    };
+    if !outside.is_empty() {
+        return Ok(Err(Rejection {
+            reason: scope_violation_reason(&outside),
+            commit: Some(commit),
+            receipt: Some(receipt),
+            evidence_missing: Vec::new(),
+            scope_violation: outside,
+        }));
+    }
+    // Only a run that is otherwise sound waits for a session to add the
+    // evidence (ADR-0019 decision 5).
     let missing = receipt.missing_evidence(&task.required_evidence);
     if !missing.is_empty() {
         return Ok(Err(Rejection {
@@ -3819,6 +3875,7 @@ fn check_receipt(
             commit: Some(commit),
             receipt: Some(receipt),
             evidence_missing: missing,
+            scope_violation: Vec::new(),
         }));
     }
     Ok(Ok((receipt, commit)))
@@ -4170,6 +4227,7 @@ pub fn register_follow_ups(
             acceptance: String::new(),
             verification_commands: Vec::new(),
             required_evidence: Vec::new(),
+            paths: Vec::new(),
             dependencies: Vec::new(),
             goal_id: task.goal_id.filter(|_| !goal_closed),
             context: format!(
@@ -4373,6 +4431,19 @@ fn land(
                 status.trim_end()
             ),
             json!({"main": main, "head": rebased}),
+        );
+    }
+    // What lands is the squash of main..rebased, so that is the diff held to
+    // the task's paths (ADR-0029): the rebase may have changed it since
+    // validation, and a resumed session may have committed more.
+    let outside = out_of_scope(&task.paths, &repository.changed_paths(main, &rebased)?);
+    if !outside.is_empty() {
+        return defer(
+            format!(
+                "{} after the rebase onto main {main}; take them out of the run branch (or ask for the task's --paths to be widened), commit, and rewrite the receipt with the new head",
+                scope_violation_reason(&outside)
+            ),
+            json!({"main": main, "head": rebased, "scope_violation": outside, "allowed": task.paths}),
         );
     }
     // The task's verification commands run here, once per commit, on the
@@ -4885,6 +4956,15 @@ pub fn prompt(
             names.join(", ")
         )
     };
+    // The declared scope (ADR-0029): changing anything else parks the run.
+    let paths = if task.paths.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "Paths you may change (globs from the repository root; `*` stays in one directory, `**` spans any depth): {}. A commit that changes any other path is not accepted: the run waits for a session to take it out. If the task needs another path, ask instead of changing it.\n",
+            task.paths.join(", ")
+        )
+    };
     Ok(format!(
         "You are executing dagq task {task_id}, run {run_id}.\n\
          Work only in the assigned Git worktree.\n\
@@ -4894,7 +4974,7 @@ pub fn prompt(
          Perform applicable unit tests, E2E, and subagent review. Record evidence or an explicit reason when not applicable.\n\
          Task title: {title}\nDescription:\n{description}\nAcceptance criteria:\n{acceptance}\n\
          Verification commands (run in the worktree):\n{verification}\n\
-         {evidence}{goal}{context}{predecessors}{siblings}\
+         {evidence}{paths}{goal}{context}{predecessors}{siblings}\
          Your assignment is this task only. Do not change what a sibling task owns; if you find work outside this task, record it in the receipt as follow_ups instead of doing it.\n\
          Write a completion receipt to {receipt} using a temporary file in the same directory and atomic rename.\n\
          Receipt JSON: {{\"run_id\":\"{run_id}\",\"result\":\"succeeded or failed\",\"commit\":\"full Git SHA of the branch head\",\"tests\":{{\"status\":\"passed, failed or not_applicable\",\"evidence_or_reason\":\"...\"}},\"e2e\":{{\"status\":\"...\",\"evidence_or_reason\":\"...\"}},\"subagent_review\":{{\"status\":\"...\",\"evidence_or_reason\":\"...\"}},\"summary\":\"...\",\"follow_ups\":[{{\"title\":\"...\",\"description\":\"...\"}}]}}\n\

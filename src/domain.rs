@@ -257,6 +257,11 @@ pub enum DomainError {
     AskWithoutTarget {
         kind: AskKind,
     },
+    /// A `--paths` glob a task may not declare.
+    InvalidPathGlob {
+        glob: String,
+        reason: &'static str,
+    },
 }
 
 impl fmt::Display for DomainError {
@@ -273,6 +278,9 @@ impl fmt::Display for DomainError {
                 status.as_str()
             ),
             Self::Blank { field } => write!(f, "{field} must not be blank"),
+            Self::InvalidPathGlob { glob, reason } => {
+                write!(f, "invalid --paths glob {glob:?}: {reason}")
+            }
             Self::AskWithoutTarget { kind } => write!(
                 f,
                 "a {} ask needs a task or a run; only a blocked ask may have neither",
@@ -430,6 +438,9 @@ pub struct NewTask {
     /// Receipt checks validation requires to be `passed` with evidence.
     #[serde(default)]
     pub required_evidence: Vec<EvidenceCheck>,
+    /// Globs of the paths the task may change (ADR-0029); empty: no limit.
+    #[serde(default)]
+    pub paths: Vec<String>,
 }
 
 impl NewTask {
@@ -463,7 +474,8 @@ impl NewTask {
         })?;
         require(self.goal_id.is_none_or(|id| id > 0), || {
             DomainError::NonPositiveId { field: "goal ID" }
-        })
+        })?;
+        scope::validate_path_globs(&self.paths)
     }
 }
 
@@ -478,6 +490,10 @@ pub struct Task {
     /// (ADR-0019 decision 5); a receipt without them parks the run as
     /// `needs_session`.
     pub required_evidence: Vec<EvidenceCheck>,
+    /// Globs of the paths a run may change (ADR-0029): validation and
+    /// `integrate` refuse a diff with a path none of them matches. Empty:
+    /// no limit.
+    pub paths: Vec<String>,
     pub status: TaskStatus,
     pub goal_id: Option<i64>,
     pub context: String,
@@ -727,6 +743,7 @@ pub struct Predecessor {
     pub integrated_run: Option<TaskRun>,
 }
 
+pub mod scope;
 pub mod stats;
 
 /// A question for a person (ADR-0022): about a task, or one of its runs when
@@ -1277,6 +1294,7 @@ mod tests {
             acceptance: String::new(),
             verification_commands: vec![],
             required_evidence: Vec::new(),
+            paths: Vec::new(),
             dependencies: vec![0],
             goal_id: None,
             context: String::new(),
@@ -1360,6 +1378,7 @@ mod tests {
             acceptance: String::new(),
             verification_commands: Vec::new(),
             required_evidence: vec![EvidenceCheck::E2e, EvidenceCheck::Tests, EvidenceCheck::E2e],
+            paths: Vec::new(),
             dependencies: Vec::new(),
             goal_id: None,
             context: String::new(),

@@ -4,8 +4,8 @@ type: design
 title: Domain model
 status: current
 created: 2026-09-21
-updated: 2026-09-23
-last_verified: 2026-09-23
+updated: 2026-09-24
+last_verified: 2026-09-24
 scope: domain
 related:
   - adr-0003
@@ -17,6 +17,7 @@ related:
   - adr-0019
   - adr-0023
   - adr-0024
+  - adr-0029
   - design-persistence
 ---
 
@@ -40,7 +41,7 @@ related:
 - `RunEvent`: 実行中に発生した永続イベント。
 - `Receipt`: agentが提出する完了レシート。run ID、結果、commit、tests/e2e/subagent_reviewの状態と証跡または理由、要約と、任意の`follow_ups`（workerが提案する後続task。`{"title", "description"}`の配列）を持つ。構造の整合性は`Receipt::check`、Gitと検証コマンドの確認はsupervisorが行う。`follow_ups`は配列であることだけを確認し、検証には使わない。`integrate`が着地後に各項目（titleのあるもの）を元のtaskと同じgoalのdraft taskとして登録し（goalが閉じていればgoalなし）、runに`follow_up_registered`を記録する（[ADR-0019](../adr/0019-move-routine-maintainer-work-into-the-runtime.md)の決定4）。`ready`にするかは人が決める。`IntegrationOutcome`の`integrated`は登録したtaskを`follow_ups`（`RegisteredFollowUp`: `task_id`、`title`の配列）に持つ。
 
-`Task.id`と`Goal.id`はSQLiteの整数ID、`TaskRun.id`はUUID。Taskはtitle、description、acceptance、verification_commands、required_evidence、goal_id、contextを保持する。`required_evidence`はvalidationがreceiptに要求するcheckの配列（`EvidenceCheck`: `tests` | `e2e` | `subagent_review`。receiptのcheck名と同じ）で、`add --evidence`で与え、`NewTask::required_evidence()`が与えた順に重複を除いて保存する。無ければ空配列で、従来どおり何も要求しない。`Receipt::missing_evidence(required)`は要求されたcheckのうち`status`が`passed`でないか`evidence_or_reason`が空白のものを要求の順に返し、`evidence_missing_reason`がそれを`evidence missing: e2e`（複数は`, `区切り）の形にする。TaskRunはprovider、base commitと、branch/worktree/workspace/receipt/log/result commitの任意参照を持ち、idle marker `idle.json`のpathは`run_dir`から導出する。`run_dir`・worktree・receipt・logの配置は`RunPaths`（`<runs dir>/<run-id>/`の`worktree/`、`receipt.json`、`claude.debug.log`）が決め、storeは読み出しのたびに`TaskRun::relocated`でqueueの今の`runs/`から解決し直す（[ADR-0017](../adr/0017-resolve-run-paths-from-the-queue-directory.md)）。claim時のproviderは`claude`のみで、リソース参照は作成前のためnullになる。
+`Task.id`と`Goal.id`はSQLiteの整数ID、`TaskRun.id`はUUID。Taskはtitle、description、acceptance、verification_commands、required_evidence、paths、goal_id、contextを保持する。`paths`はrunが変えてよいパスのglobの配列（[ADR-0029](../adr/0029-task-declares-paths-and-verification-follows-the-kind-of-change.md)）で、`add --paths`で与え、draft / readyの間は`set-paths TASK --paths GLOB... | --none`で置き換える（変化があったときだけ`task_paths_changed`（`from`、`to`）を記録する）。空なら制限しない。globの規則と判定は`domain::scope`が持つ: repository root起点のパス全体に合わせ、`*`と`?`は1つのsegmentの中、segment全体が`**`なら0個以上のsegmentに合い、ほかは字義どおり。`validate_path_globs`が空・`/`始まり・`.` / `..` / 空のsegmentを拒否し（`DomainError::InvalidPathGlob`）、`out_of_scope(globs, changed)`がどのglobにも合わない変更パスを返し、`scope_violation_reason`が`changed paths outside the task's --paths: <paths>`の形にする。`required_evidence`はvalidationがreceiptに要求するcheckの配列（`EvidenceCheck`: `tests` | `e2e` | `subagent_review`。receiptのcheck名と同じ）で、`add --evidence`で与え、`NewTask::required_evidence()`が与えた順に重複を除いて保存する。無ければ空配列で、従来どおり何も要求しない。`Receipt::missing_evidence(required)`は要求されたcheckのうち`status`が`passed`でないか`evidence_or_reason`が空白のものを要求の順に返し、`evidence_missing_reason`がそれを`evidence missing: e2e`（複数は`, `区切り）の形にする。TaskRunはprovider、base commitと、branch/worktree/workspace/receipt/log/result commitの任意参照を持ち、idle marker `idle.json`のpathは`run_dir`から導出する。`run_dir`・worktree・receipt・logの配置は`RunPaths`（`<runs dir>/<run-id>/`の`worktree/`、`receipt.json`、`claude.debug.log`）が決め、storeは読み出しのたびに`TaskRun::relocated`でqueueの今の`runs/`から解決し直す（[ADR-0017](../adr/0017-resolve-run-paths-from-the-queue-directory.md)）。claim時のproviderは`claude`のみで、リソース参照は作成前のためnullになる。
 
 ## Current operations
 

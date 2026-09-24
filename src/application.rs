@@ -89,6 +89,7 @@ pub struct TaskListDetails {
     pub acceptance: String,
     pub verification_commands: Vec<String>,
     pub required_evidence: Vec<EvidenceCheck>,
+    pub paths: Vec<String>,
     pub context: String,
     pub created_at: String,
     pub updated_at: String,
@@ -106,6 +107,7 @@ impl TaskListItem {
             acceptance: task.acceptance,
             verification_commands: task.verification_commands,
             required_evidence: task.required_evidence,
+            paths: task.paths,
             context: task.context,
             created_at: task.created_at,
             updated_at: task.updated_at,
@@ -298,6 +300,9 @@ pub trait TaskStore {
     fn close_goal(&mut self, goal_id: i64, verdict: GoalVerdict) -> Result<Goal>;
     /// Move a draft or ready task to an open goal, or to none.
     fn set_goal(&mut self, task_id: i64, goal_id: Option<i64>) -> Result<Task>;
+    /// Replace the globs of the paths a draft or ready task may change
+    /// (ADR-0029); an empty list removes the limit.
+    fn set_paths(&mut self, task_id: i64, paths: Vec<String>) -> Result<Task>;
     /// Open a draft goal so its tasks become candidates (ADR-0024 decision 5).
     fn ready_goal(&mut self, goal_id: i64) -> Result<Goal>;
     /// Record a note as an `observation` run event on its task, run or goal.

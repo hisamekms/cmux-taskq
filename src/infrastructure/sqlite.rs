@@ -22,6 +22,7 @@ use crate::{
         ClaimOutcome, DomainError, Goal, GoalDetail, GoalEdit, GoalStatus, GoalSummary, GoalTask,
         GoalVerdict, NewGoal, NewNote, NewTask, NotePage, NoteQuery, NoteTarget, OBSERVATION_KIND,
         Predecessor, RunEvent, Task, TaskAction, TaskDetail, TaskRun, TaskStatus, TaskStatusCounts,
+        scope::{dedup_globs, validate_path_globs},
         validate_base_commit,
     },
     infrastructure::location::runs_dir,
@@ -46,6 +47,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../../migrations/0015_task_required_evidence.sql"),
     include_str!("../../migrations/0016_observer.sql"),
     include_str!("../../migrations/0017_stuck_exit_ask.sql"),
+    include_str!("../../migrations/0018_task_paths.sql"),
 ];
 /// Ready tasks whose predecessors are completed, that own no unfinished run
 /// and whose goal, if any, is not a draft (ADR-0024 decision 5).
@@ -179,10 +181,11 @@ impl TaskStore for SqliteQueue {
             ensure_goal_open(&tx, goal_id)?;
         }
         tx.execute(
-            "INSERT INTO tasks(title, description, acceptance, verification_commands, goal_id, context, required_evidence)
-             VALUES (?1,?2,?3,?4,?5,?6,?7)",
+            "INSERT INTO tasks(title, description, acceptance, verification_commands, goal_id, context, required_evidence, paths)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
             params![task.title, task.description, task.acceptance, serde_json::to_string(&task.verification_commands)?,
-                task.goal_id, task.context, serde_json::to_string(&task.required_evidence())?],
+                task.goal_id, task.context, serde_json::to_string(&task.required_evidence())?,
+                serde_json::to_string(&dedup_globs(&task.paths))?],
         )?;
         let id = tx.last_insert_rowid();
         event(
@@ -729,6 +732,35 @@ impl TaskStore for SqliteQueue {
         tx.commit()?;
         Ok(result)
     }
+
+    fn set_paths(&mut self, task_id: i64, paths: Vec<String>) -> Result<Task> {
+        validate_path_globs(&paths)?;
+        let paths = dedup_globs(&paths);
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let task = read_task(&tx, task_id)?;
+        ensure!(
+            task.status.dependencies_editable(),
+            "the paths can only be changed for draft or ready tasks"
+        );
+        if task.paths != paths {
+            tx.execute(
+                "UPDATE tasks SET paths=?1, updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?2",
+                params![serde_json::to_string(&paths)?, task_id],
+            )?;
+            event(
+                &tx,
+                task_id,
+                None,
+                "task_paths_changed",
+                json!({"from": task.paths, "to": paths}),
+            )?;
+        }
+        let result = read_task(&tx, task_id)?;
+        tx.commit()?;
+        Ok(result)
+    }
 }
 
 fn read_goal(conn: &Connection, goal_id: i64) -> Result<Goal> {
@@ -933,6 +965,7 @@ fn task_row(row: &Row<'_>) -> rusqlite::Result<Task> {
         acceptance: row.get("acceptance")?,
         verification_commands: json_col(row, "verification_commands")?,
         required_evidence: json_col(row, "required_evidence")?,
+        paths: json_col(row, "paths")?,
         status: enum_col(row, "status")?,
         goal_id: row.get("goal_id")?,
         context: row.get("context")?,

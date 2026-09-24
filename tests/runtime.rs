@@ -71,6 +71,7 @@ fn add_ready_task(queue: &mut SqliteQueue, title: &str, dependencies: &[i64]) ->
             acceptance: "works".into(),
             verification_commands: vec!["test -f seed.txt".into()],
             required_evidence: Vec::new(),
+            paths: Vec::new(),
             dependencies: dependencies.to_vec(),
             goal_id: None,
             context: String::new(),
@@ -2273,6 +2274,8 @@ fn wrapper_registration_is_one_shot_and_rejects_stale_owners() {
         reason: Some("receipt was not submitted".into()),
         receipt: Value::Null,
         evidence_missing: Vec::new(),
+        scope_violation: Vec::new(),
+        allowed_paths: Vec::new(),
     };
     assert!(
         queue
@@ -2345,6 +2348,8 @@ fn workspace_close_is_recorded_once_and_only_for_accepted_runs() {
                 reason: None,
                 receipt: Value::Null,
                 evidence_missing: Vec::new(),
+                scope_violation: Vec::new(),
+                allowed_paths: Vec::new(),
             },
         )
         .unwrap();
@@ -3112,6 +3117,7 @@ fn add_file_task(
             acceptance: "works".into(),
             verification_commands: verify.iter().map(|v| (*v).to_owned()).collect(),
             required_evidence: Vec::new(),
+            paths: Vec::new(),
             dependencies: vec![],
             goal_id: None,
             context: String::new(),
@@ -3217,6 +3223,7 @@ fn awaiting_run() -> (TempDir, PathBuf, PathBuf, TaskRun) {
             acceptance: String::new(),
             verification_commands: vec![],
             required_evidence: Vec::new(),
+            paths: Vec::new(),
             dependencies: vec![1],
             goal_id: None,
             context: String::new(),
@@ -3694,6 +3701,7 @@ fn add_ready_task_in(
             acceptance: "works".into(),
             verification_commands: vec!["test -f seed.txt".into()],
             required_evidence: Vec::new(),
+            paths: Vec::new(),
             dependencies: vec![],
             goal_id,
             context: context.into(),
@@ -4978,6 +4986,7 @@ fn verification_failure_after_rebase_needs_a_session_and_keeps_the_rebased_tree(
             acceptance: String::new(),
             verification_commands: vec!["true".into()],
             required_evidence: Vec::new(),
+            paths: Vec::new(),
             dependencies: vec![],
             goal_id: None,
             context: String::new(),
@@ -7259,6 +7268,7 @@ fn dagq_toml_run_env_reaches_the_workspace_and_the_verification_commands() {
                 r#"printf '%s %s\n' "$SHARED" "$RUN_TMP" >> "$RUN_TMP/verify-env.txt""#.into(),
             ],
             required_evidence: Vec::new(),
+            paths: Vec::new(),
             dependencies: vec![],
             goal_id: None,
             context: String::new(),
@@ -7328,6 +7338,7 @@ fn evidence_fixture(evidence: &[EvidenceCheck]) -> (TempDir, PathBuf, PathBuf) {
             acceptance: "works".into(),
             verification_commands: vec!["test -f seed.txt".into()],
             required_evidence: evidence.to_vec(),
+            paths: Vec::new(),
             dependencies: Vec::new(),
             goal_id: None,
             context: String::new(),
@@ -7508,6 +7519,217 @@ fn a_resume_or_integrate_without_the_required_evidence_does_not_land() {
     assert_eq!(run.last_error.as_deref(), Some("evidence missing: e2e"));
     let parked = payloads(&detail, "integration_deferred");
     assert_eq!(parked.last().unwrap()["checks"], json!(["e2e"]));
+}
+
+/// A fixture whose only ready task declares `paths` (ADR-0029).
+fn scope_fixture(paths: &[&str]) -> (TempDir, PathBuf, PathBuf) {
+    let (dir, repo, db) = fixture();
+    let mut queue = SqliteQueue::open(&db).unwrap();
+    queue.transition(1, TaskAction::Cancel).unwrap();
+    let task = queue
+        .add(NewTask {
+            title: "scoped".into(),
+            description: "small change".into(),
+            acceptance: "works".into(),
+            verification_commands: vec!["test -f seed.txt".into()],
+            required_evidence: Vec::new(),
+            paths: paths.iter().map(|p| (*p).to_owned()).collect(),
+            dependencies: Vec::new(),
+            goal_id: None,
+            context: String::new(),
+        })
+        .unwrap();
+    assert_eq!(task.id, 2);
+    queue.transition(task.id, TaskAction::Ready).unwrap();
+    (dir, repo, db)
+}
+
+/// A run of a task declaring `docs/**` that changes `change.txt` is parked
+/// by validation as `needs_session` (`scope_violation`, with the paths),
+/// not accepted; the supervisor resumes the session with a request to take
+/// the path out, and the resolved run is validated again and lands.
+#[test]
+fn a_change_outside_the_declared_paths_parks_the_run_for_a_resumed_session() {
+    let (_dir, repo, db) = scope_fixture(&["docs/**", "*.md"]);
+    let backend = TestWorkspace::new(&db, false, VALID_AGENT);
+    backend.resume_script_for(
+        2,
+        "await_message; unlocked git rm -q change.txt && mkdir -p docs && printf 'doc\\n' > docs/a.md && unlocked git add docs && unlocked git commit -q -m 'keep to docs'; receipt \"$(git rev-parse HEAD)\"; idle; await_exit",
+    );
+    let outcome = supervise(&db, &repo, &backend).unwrap();
+    backend.join();
+    assert_eq!(outcome["errors"], json!([]), "{outcome}");
+
+    let mut queue = SqliteQueue::open(&db).unwrap();
+    let detail = queue.show(2).unwrap();
+    let run = &detail.runs[0];
+    let prompt = read_prompt(run);
+    assert!(
+        prompt.contains("Paths you may change (globs from the repository root; `*` stays in one directory, `**` spans any depth): docs/**, *.md."),
+        "{prompt}"
+    );
+    let reason = "changed paths outside the task's --paths: change.txt";
+    let validated = payloads(&detail, "validation_finished");
+    assert_eq!(validated.len(), 2);
+    assert_eq!(validated[0]["status"], "needs_session");
+    assert_eq!(validated[0]["accepted"], false);
+    assert_eq!(validated[0]["reason"], reason);
+    assert_eq!(validated[0]["scope_violation"], json!(["change.txt"]));
+    assert_eq!(validated[0]["allowed_paths"], json!(["docs/**", "*.md"]));
+    assert!(validated[0]["result_commit"].is_string());
+    assert_eq!(
+        payloads(&detail, "scope_violation"),
+        [&json!({"paths": ["change.txt"], "allowed": ["docs/**", "*.md"], "reason": reason})]
+    );
+    assert!(!event_kinds(&detail).contains(&"evidence_missing"));
+    // The resume asked to take the path out, not for a rebase or evidence.
+    let text = &backend.texts()[0].1;
+    assert!(
+        text.contains("changes paths outside the task's --paths (docs/**, *.md)"),
+        "{text}"
+    );
+    assert!(text.contains(&format!("Reason: {reason}")), "{text}");
+    assert!(text.contains("Take the changes to the paths"), "{text}");
+    assert_eq!(
+        payloads(&detail, "resume_finished")[0]["outcome"],
+        "resolved"
+    );
+    assert_eq!(validated[1]["status"], "awaiting_integration");
+    assert!(
+        !validated[1]
+            .as_object()
+            .unwrap()
+            .contains_key("scope_violation")
+    );
+    assert_eq!(run.status, RunStatus::AwaitingIntegration);
+    let landed = integrate(&db, 2, &repo).unwrap();
+    assert_eq!(landed["outcome"], "integrated", "{landed}");
+    assert_eq!(
+        git_out(&repo, &["show", "--name-only", "--format=", "main"]).trim(),
+        "docs/a.md"
+    );
+}
+
+/// A run that changes only declared paths is validated and landed as if
+/// the task declared none.
+#[test]
+fn a_change_inside_the_declared_paths_awaits_integration_and_lands() {
+    let (_dir, repo, db) = scope_fixture(&["*.txt"]);
+    let backend = TestWorkspace::new(&db, false, VALID_AGENT);
+    let outcome = supervise(&db, &repo, &backend).unwrap();
+    backend.join();
+    assert_eq!(outcome["errors"], json!([]), "{outcome}");
+    let detail = SqliteQueue::open(&db).unwrap().show(2).unwrap();
+    assert_eq!(detail.runs[0].status, RunStatus::AwaitingIntegration);
+    assert!(!event_kinds(&detail).contains(&"scope_violation"));
+    let landed = integrate(&db, 2, &repo).unwrap();
+    assert_eq!(landed["outcome"], "integrated", "{landed}");
+}
+
+/// Validation diffs from where the branch forked from the current main,
+/// not from the base commit: a branch rebased onto a main that gained
+/// `src/lib.rs` from another task changes only `change.txt` itself.
+#[test]
+fn a_branch_rebased_onto_a_moved_main_is_held_only_to_its_own_changes() {
+    let (_dir, repo, db) = scope_fixture(&["*.txt"]);
+    // Another task lands src/lib.rs on main while the worker runs, and the
+    // worker rebases onto it before its receipt.
+    let backend = TestWorkspace::new(
+        &db,
+        false,
+        "git switch -q -c side main && mkdir -p src && printf 'x\\n' > src/lib.rs && git add src && git commit -q -m other && git update-ref refs/heads/main HEAD && git switch -q - && git branch -q -D side && commit work && git rebase -q main; receipt \"$(git rev-parse HEAD)\"",
+    );
+    let outcome = supervise(&db, &repo, &backend).unwrap();
+    backend.join();
+    assert_eq!(outcome["errors"], json!([]), "{outcome}");
+    let detail = SqliteQueue::open(&db).unwrap().show(2).unwrap();
+    assert!(!event_kinds(&detail).contains(&"scope_violation"));
+    assert_eq!(detail.runs[0].status, RunStatus::AwaitingIntegration);
+    let landed = integrate(&db, 2, &repo).unwrap();
+    assert_eq!(landed["outcome"], "integrated", "{landed}");
+    assert_eq!(
+        git_out(&repo, &["show", "--name-only", "--format=", "main"]).trim(),
+        "change.txt"
+    );
+}
+
+/// `integrate` holds the diff it squashes (main..rebased head) to the
+/// task's paths after its rebase: a commit outside them that a session
+/// added after validation defers the run to `needs_session` without moving
+/// main or running the verification commands, and the supervisor's resume
+/// asks to take it out and then lands the approved run.
+#[test]
+fn integrate_refuses_a_rebased_diff_outside_the_declared_paths() {
+    let (_dir, repo, db) = scope_fixture(&["*.txt"]);
+    let backend = TestWorkspace::new(&db, false, VALID_AGENT);
+    supervise(&db, &repo, &backend).unwrap();
+    backend.join();
+    let mut queue = SqliteQueue::open(&db).unwrap();
+    let run = queue.show(2).unwrap().runs[0].clone();
+    assert_eq!(run.status, RunStatus::AwaitingIntegration);
+    // main moves, so the landing rebases.
+    fs::write(repo.join("other.txt"), "main moved\n").unwrap();
+    git(&repo, &["add", "other.txt"]);
+    git(&repo, &["commit", "-m", "main moved"]);
+    let main = git_out(&repo, &["rev-parse", "main"]);
+    // After validation the branch gains a path outside `*.txt`.
+    let worktree = PathBuf::from(run.worktree_path.as_ref().unwrap());
+    fs::create_dir_all(worktree.join("src")).unwrap();
+    fs::write(worktree.join("src/lib.rs"), "// out of scope\n").unwrap();
+    git(&worktree, &["add", "src"]);
+    git(&worktree, &["commit", "-m", "outside"]);
+    write_receipt(
+        &run,
+        &git_out(&worktree, &["rev-parse", "HEAD"]),
+        "succeeded",
+        "more",
+    );
+
+    let deferred = integrate(&db, 2, &repo).unwrap();
+    assert_eq!(deferred["outcome"], "needs_session", "{deferred}");
+    assert_eq!(git_out(&repo, &["rev-parse", "main"]), main);
+    let detail = queue.show(2).unwrap();
+    let parked = &detail.runs[0];
+    assert_eq!(parked.status, RunStatus::NeedsSession);
+    let reason = parked.last_error.as_deref().unwrap();
+    assert!(
+        reason.starts_with(&format!(
+            "changed paths outside the task's --paths: src/lib.rs after the rebase onto main {}",
+            main.trim()
+        )),
+        "{reason}"
+    );
+    assert!(event_kinds(&detail).contains(&"integration_rebased"));
+    let payload = payloads(&detail, "integration_deferred")[0];
+    assert_eq!(payload["scope_violation"], json!(["src/lib.rs"]));
+    assert_eq!(payload["allowed"], json!(["*.txt"]));
+    assert!(integration_verifications(&detail).is_empty());
+
+    // The supervisor resumes it with the scope request and lands it.
+    let backend = TestWorkspace::new(&db, false, VALID_AGENT);
+    backend.resume_script_for(
+        2,
+        "await_message; unlocked git rm -q -r src && unlocked git commit -q -m 'back to scope'; receipt \"$(git rev-parse HEAD)\"; idle; await_exit",
+    );
+    let outcome = supervise(&db, &repo, &backend).unwrap();
+    backend.join();
+    assert_eq!(outcome["errors"], json!([]), "{outcome}");
+    let text = &backend.texts()[0].1;
+    assert!(
+        text.contains("changes paths outside the task's --paths (*.txt)"),
+        "{text}"
+    );
+    let detail = queue.show(2).unwrap();
+    assert_eq!(
+        detail.task.status,
+        TaskStatus::Completed,
+        "{:?}",
+        event_kinds(&detail)
+    );
+    assert_eq!(
+        git_out(&repo, &["show", "--name-only", "--format=", "main"]).trim(),
+        "change.txt"
+    );
 }
 
 /// The observer's provider double: the headless job is a shell script in the

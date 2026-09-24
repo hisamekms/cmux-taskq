@@ -1556,6 +1556,45 @@ mod stats {
     }
 }
 
+/// `add --paths` stores the globs (ADR-0029), `show` and `list --full`
+/// print them, and `set-paths` replaces them or removes them with --none.
+#[test]
+fn add_paths_is_stored_shown_and_replaced() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("queue.db");
+    ok(&db, &["init"]);
+    let added = ok(
+        &db,
+        &[
+            "add",
+            "docs change",
+            "--paths",
+            "docs/**",
+            "--paths",
+            "*.md",
+        ],
+    );
+    let expected = serde_json::json!(["docs/**", "*.md"]);
+    assert_eq!(added["paths"], expected);
+    let id = added["id"].to_string();
+    assert_eq!(ok(&db, &["show", &id])["task"]["paths"], expected);
+    assert_eq!(ok(&db, &["list", "--full"])["tasks"][0]["paths"], expected);
+    assert!(ok(&db, &["list"])["tasks"][0].get("paths").is_none());
+    let replaced = ok(&db, &["set-paths", &id, "--paths", "src/**"]);
+    assert_eq!(replaced["paths"], serde_json::json!(["src/**"]));
+    let cleared = ok(&db, &["set-paths", &id, "--none"]);
+    assert_eq!(cleared["paths"], serde_json::json!([]));
+    // Without --paths nothing is limited.
+    assert_eq!(ok(&db, &["add", "any"])["paths"], serde_json::json!([]));
+    for args in [
+        &["add", "bad", "--paths", "/abs"][..],
+        &["set-paths", &id][..],
+        &["set-paths", &id, "--paths", "x", "--none"][..],
+    ] {
+        assert!(!invoke(&db, args).status.success(), "{args:?}");
+    }
+}
+
 #[test]
 fn add_evidence_is_stored_and_shown() {
     let dir = tempfile::tempdir().unwrap();

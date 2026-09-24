@@ -37,7 +37,9 @@ pub struct LeasedRun {
 /// rejection too when the commit itself was verified, so inspection can start there.
 /// A rejection for nothing but `evidence_missing` (the task's required checks
 /// the receipt does not back, ADR-0019 decision 5) parks the run as
-/// `needs_session` instead of failing it.
+/// `needs_session` instead of failing it, and so does one for a diff that
+/// changes `scope_violation`, paths none of the task's `allowed_paths`
+/// match (ADR-0029).
 #[derive(Debug, Serialize)]
 pub struct Validation {
     pub accepted: bool,
@@ -46,6 +48,10 @@ pub struct Validation {
     pub receipt: serde_json::Value,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub evidence_missing: Vec<EvidenceCheck>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub scope_violation: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub allowed_paths: Vec<String>,
 }
 
 /// What `integrate` put on `main`: the squash `commit` whose tree is that of
@@ -1091,7 +1097,8 @@ impl SqliteQueue {
         assert_lease(&tx, id, token)?;
         let status = if validation.accepted {
             "awaiting_integration"
-        } else if !validation.evidence_missing.is_empty() {
+        } else if !validation.evidence_missing.is_empty() || !validation.scope_violation.is_empty()
+        {
             "needs_session"
         } else {
             "failed"
@@ -1113,9 +1120,20 @@ impl SqliteQueue {
         let mut payload = serde_json::to_value(validation)?;
         payload["status"] = json!(status);
         run_event(&tx, id, "validation_finished", payload)?;
-        if status == "needs_session" {
-            // No `status` in the payload: `validation_finished` already
-            // reports the park, and `stats` counts it once.
+        // No `status` in the payloads: `validation_finished` already
+        // reports the park, and `stats` counts it once.
+        if status == "needs_session" && !validation.scope_violation.is_empty() {
+            run_event(
+                &tx,
+                id,
+                "scope_violation",
+                json!({
+                    "paths": validation.scope_violation,
+                    "allowed": validation.allowed_paths,
+                    "reason": validation.reason,
+                }),
+            )?;
+        } else if status == "needs_session" {
             run_event(
                 &tx,
                 id,

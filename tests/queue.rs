@@ -21,6 +21,7 @@ fn new_task(title: &str) -> NewTask {
         acceptance: "The regression test passes".into(),
         verification_commands: vec!["cargo test".into()],
         required_evidence: Vec::new(),
+        paths: Vec::new(),
         dependencies: vec![],
         goal_id: None,
         context: String::new(),
@@ -892,9 +893,10 @@ fn migration_from_v6_adds_goals_and_keeps_tasks_runs_and_events() {
     // (supervisor binary version), 0011 (session workspaces), 0012
     // (queue-level backend failures), 0013 (goal draft), 0014 (asks) and
     // 0015 (required evidence), 0016 (observer events and task-less
-    // blocked asks) and 0017 (the stuck_exit ask) are applied together.
-    assert_eq!(SqliteQueue::SCHEMA_VERSION, 17);
-    assert_eq!(queue.schema_version().unwrap(), 17);
+    // blocked asks), 0017 (the stuck_exit ask) and 0018 (task paths) are
+    // applied together.
+    assert_eq!(SqliteQueue::SCHEMA_VERSION, 18);
+    assert_eq!(queue.schema_version().unwrap(), 18);
     assert_eq!(
         queue
             .session_workspace(dagq::domain::SessionRole::Maintainer)
@@ -906,6 +908,7 @@ fn migration_from_v6_adds_goals_and_keeps_tasks_runs_and_events() {
     assert_eq!(landed.task.description, "why");
     assert_eq!(landed.task.goal_id, None);
     assert_eq!(landed.task.context, "");
+    assert!(landed.task.paths.is_empty());
     assert_eq!(landed.task.status, TaskStatus::Completed);
     assert_eq!(landed.runs.len(), 1);
     assert_eq!(landed.runs[0].status, RunStatus::Integrated);
@@ -1345,6 +1348,76 @@ fn set_goal_and_add_with_goal_follow_the_dependency_rules() {
         [(task, "movable", TaskStatus::InProgress)]
     );
     assert_eq!(queue.list_goals().unwrap()[0].tasks.in_progress, 1);
+}
+
+/// `add --paths` stores the globs once each; `set_paths` replaces them on a
+/// draft or ready task only, records `task_paths_changed` when they change,
+/// and an invalid glob is refused either way (ADR-0029).
+#[test]
+fn paths_are_stored_and_replaced_while_the_task_is_editable() {
+    let (_dir, mut queue) = fixture();
+    let globs = |values: &[&str]| values.iter().map(|v| (*v).to_owned()).collect::<Vec<_>>();
+    let mut spec = new_task("absolute");
+    spec.paths = globs(&["/docs/**"]);
+    let error = queue.add(spec).unwrap_err().to_string();
+    assert!(
+        error.contains("invalid --paths glob \"/docs/**\""),
+        "{error}"
+    );
+    let mut spec = new_task("docs only");
+    spec.paths = globs(&["docs/**", "*.md", "docs/**"]);
+    let task = queue.add(spec).unwrap();
+    assert_eq!(task.paths, globs(&["docs/**", "*.md"]));
+    assert_eq!(queue.show(task.id).unwrap().task.paths, task.paths);
+    // No change, no event.
+    queue
+        .set_paths(task.id, globs(&["docs/**", "*.md"]))
+        .unwrap();
+    assert!(queue.set_paths(task.id, globs(&["../x"])).is_err());
+    queue.transition(task.id, TaskAction::Ready).unwrap();
+    let widened = queue
+        .set_paths(task.id, globs(&["docs/**", "src/**"]))
+        .unwrap();
+    assert_eq!(widened.paths, globs(&["docs/**", "src/**"]));
+    assert!(
+        queue
+            .set_paths(task.id, Vec::new())
+            .unwrap()
+            .paths
+            .is_empty()
+    );
+    let changes: Vec<_> = queue
+        .show(task.id)
+        .unwrap()
+        .events
+        .into_iter()
+        .filter(|e| e.kind == "task_paths_changed")
+        .map(|e| (e.run_id, e.payload))
+        .collect();
+    assert_eq!(
+        changes,
+        [
+            (
+                None,
+                serde_json::json!({"from": ["docs/**", "*.md"], "to": ["docs/**", "src/**"]})
+            ),
+            (
+                None,
+                serde_json::json!({"from": ["docs/**", "src/**"], "to": []})
+            ),
+        ]
+    );
+    // Once claimed, the run keeps the scope it started with.
+    queue.claim(BASE).unwrap();
+    let error = queue
+        .set_paths(task.id, globs(&["docs/**"]))
+        .unwrap_err()
+        .to_string();
+    assert_eq!(
+        error,
+        "the paths can only be changed for draft or ready tasks"
+    );
+    assert!(queue.set_paths(99, Vec::new()).is_err());
 }
 
 #[test]

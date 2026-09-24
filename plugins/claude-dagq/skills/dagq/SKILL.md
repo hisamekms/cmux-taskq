@@ -27,7 +27,7 @@ The queue is one per repository, resolved from the current directory, so run the
 
 ## 2. Register a goal and decompose it into tasks
 
-Hear the problem → register it as a goal with `goal add` → decompose it into tasks and register each with `add --goal` → make them `ready`. Every task of a goal is shown the goal's description, acceptance and constraints, its dependencies' receipt summaries and landed commits, and its siblings in progress, so sibling tasks make the same naming and boundary decisions.
+Hear the problem → register a goal (`goal add`) → decompose it into tasks, each registered with `add --goal` → make them `ready`. Every task of a goal is shown the goal's description, acceptance and constraints, its dependencies' receipt summaries and landed commits, and its siblings in progress, so sibling tasks make the same naming and boundary decisions.
 
 Skip the goal only for a one-shot task that finishes the problem by itself (a typo fix, a clippy warning, a version bump). If a second task will exist, or a later task needs to know what this one decided (a name, a boundary, a format), register a goal. When unsure, register it.
 
@@ -43,7 +43,7 @@ A goal has no verification commands; a goal-level check belongs in a final task 
 
 ### Register the tasks
 
-Split the goal into tasks one session can finish in one worktree. Collect per task: title (one line), description (what to change and where), acceptance (how a reviewer decides it is done), verification commands (run by `integrate` after its rebase; repeat `--verify`), dependencies (tasks that must be `completed` first; repeat `--depends-on`, may cross goals), `--context` (why it exists and what to read first, when the goal does not say it), and `--evidence` (receipt checks the run must report as `passed` with evidence: `tests`, `e2e` or `subagent_review`; repeatable). A run whose receipt lacks a required check is not failed: validation parks it as `needs_session` (`evidence_missing`) and the supervisor resumes the session to run the check and rewrite the receipt. Follow the repository instructions on when to require it (for example `--evidence e2e` for runtime changes).
+Split the goal into tasks one session can finish in one worktree. Collect per task: title (one line), description (what to change and where), acceptance (how a reviewer decides it is done), verification commands (run by `integrate` after its rebase; repeat `--verify`), dependencies (tasks that must be `completed` first; repeat `--depends-on`, may cross goals), `--context` (why it exists and what to read first, when the goal does not say it), and `--evidence` (receipt checks the run must report as `passed` with evidence: `tests`, `e2e` or `subagent_review`; repeatable). A receipt lacking a required check parks the run as `needs_session` (`evidence_missing`) for a resumed session. `--paths GLOB` (repeatable) limits what the task may change: a run changing more parks (`scope_violation`) and never lands. Pick `--verify`, `--paths` and `--evidence` by kind of change (docs: `--paths 'docs/**' --paths '*.md' --verify 'cargo fmt --all --check'`) per `reference/scope.md`.
 
 ```sh
 "$DAGQ" add "TITLE" --goal 1 \
@@ -55,7 +55,7 @@ Split the goal into tasks one session can finish in one worktree. Collect per ta
 "$DAGQ" candidates
 ```
 
-A one-shot task omits `--goal`. `add` registers a `draft`; `ready` makes it runnable; `candidates` lists ready tasks whose dependencies are all `completed`. A ready task missing from `candidates` is blocked: show the blocking IDs from `show ID`'s `dependencies`. `draft ID` takes a task back for editing, `cancel ID` drops it, `dependency add|remove TASK PREDECESSOR` changes prerequisites of a draft or ready task (cycles are rejected). Moving a task between goals (`set-goal`) and editing a goal (`goal edit`) are in `reference/inspect.md`.
+A one-shot task omits `--goal`. `add` registers a `draft`, `ready` makes it runnable, `candidates` lists ready tasks whose dependencies are all `completed`. A ready task missing from `candidates` is blocked: show the blocking IDs from `show ID`'s `dependencies`. `draft ID` takes a task back for editing, `cancel ID` drops it, `dependency add|remove TASK PREDECESSOR` changes prerequisites of a draft or ready task (cycles are rejected). `set-goal` and `goal edit` are in `reference/inspect.md`, `set-paths` in `reference/scope.md`.
 
 ## 3. Inspect
 
@@ -71,6 +71,6 @@ A one-shot task omits `--goal`. `add` registers a `draft`; `ready` makes it runn
 
 ## 4. Report results
 
-Judge completion only from `show`: the run's `status`, `result_commit`, `last_error`, and the `validation_finished` event. A Stop hook, an idle session or a receipt file is not success; the supervisor validates the receipt against Git before a run becomes `awaiting_integration`; `integrate` runs the verification commands. Summarize: task status, latest run status, branch and commit, and the next step.
+Judge completion only from `show`: the run's `status`, `result_commit`, `last_error`, and the `validation_finished` event. A Stop hook, an idle session or a receipt file is not success: the supervisor checks the receipt against Git, and `integrate` runs the verification. Summarize: task status, latest run status, branch and commit, and the next step.
 
 A goal is closed once, by the planner, after every task is `completed` or `canceled`, the draft tasks `integrate` registered from receipts' `follow_ups` were made ready or canceled by the user, and the receipts' `summary` was compared with the goal's acceptance; gaps become new tasks on the same goal first. Read `reference/goal-close.md` before running `goal close`.

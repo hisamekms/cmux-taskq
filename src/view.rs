@@ -180,6 +180,7 @@ mod tests {
             acceptance: "short".into(),
             verification_commands: vec!["true".into()],
             required_evidence: Vec::new(),
+            paths: Vec::new(),
             status: TaskStatus::InProgress,
             goal_id: None,
             context: String::new(),

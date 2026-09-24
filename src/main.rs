@@ -64,6 +64,12 @@ enum Command {
         /// A receipt without it parks the run as needs_session (evidence_missing).
         #[arg(long = "evidence", value_parser = ["tests", "e2e", "subagent_review"])]
         required_evidence: Vec<String>,
+        /// Glob of the paths the task may change, from the repository root; repeatable.
+        /// `*` and `?` stay inside one segment, a `**` segment spans any depth. Validation
+        /// parks a run changing anything else as needs_session (scope_violation) and
+        /// integrate refuses to land it. Omitted: no limit.
+        #[arg(long = "paths")]
+        paths: Vec<String>,
     },
     /// List one page of tasks, newest first: unfinished ones unless --status or --all says otherwise.
     /// Prints {"tasks", "next", "total"}; pass `next` to --before for the following page (null: none).
@@ -122,6 +128,21 @@ enum Command {
         #[arg(required_unless_present = "none", conflicts_with = "none")]
         goal: Option<i64>,
         /// Remove the task from its goal.
+        #[arg(long)]
+        none: bool,
+    },
+    /// Replace the paths a draft or ready task may change (`add --paths`), or remove the limit with --none.
+    SetPaths {
+        /// Draft or ready task.
+        task: i64,
+        /// Glob of a path the task may change; repeatable. Replaces every glob it had.
+        #[arg(
+            long = "paths",
+            required_unless_present = "none",
+            conflicts_with = "none"
+        )]
+        paths: Vec<String>,
+        /// Declare no paths: runs may change anything.
         #[arg(long)]
         none: bool,
     },
@@ -619,6 +640,7 @@ fn execute(cli: Cli) -> Result<Value> {
             goal_id,
             context,
             required_evidence,
+            paths,
         } => serde_json::to_value(
             queue.add(NewTask {
                 title,
@@ -632,6 +654,7 @@ fn execute(cli: Cli) -> Result<Value> {
                     .iter()
                     .map(|name| name.parse())
                     .collect::<Result<_, _>>()?,
+                paths,
             })?,
         )?,
         Command::List {
@@ -738,6 +761,11 @@ fn execute(cli: Cli) -> Result<Value> {
             goal,
             none: _,
         } => serde_json::to_value(queue.set_goal(task, goal)?)?,
+        Command::SetPaths {
+            task,
+            paths,
+            none: _,
+        } => serde_json::to_value(queue.set_paths(task, paths)?)?,
         Command::Note {
             task,
             run,
