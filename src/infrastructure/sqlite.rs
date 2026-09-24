@@ -14,15 +14,15 @@ use serde_json::json;
 
 use crate::{
     application::{
-        Generators, GraphInput, GraphTask, IdGenerator, LatestRun, StatusFilter, TaskListItem,
-        TaskPage, TaskQuery, TaskStore, timestamp,
+        Generators, GraphGoalDependency, GraphInput, GraphTask, IdGenerator, LatestRun,
+        StatusFilter, TaskListItem, TaskPage, TaskQuery, TaskStore, timestamp,
     },
     domain::{
         ClaimOutcome, CommitSha, DomainError, EventId, Goal, GoalDetail, GoalEdit, GoalId,
-        GoalRecord, GoalSummary, GoalTask, GoalVerdict, NewGoal, NewNote, NewTask, NotePage,
-        NoteQuery, NoteTarget, OBSERVATION_KIND, Predecessor, Provider, RunEvent, RunId, RunRecord,
-        Task, TaskAction, TaskDetail, TaskId, TaskRecord, TaskRun, TaskStatus, TaskStatusCounts,
-        goal, scope::validate_path_globs, task,
+        GoalPredecessor, GoalRecord, GoalSummary, GoalTask, GoalVerdict, NewGoal, NewNote, NewTask,
+        NotePage, NoteQuery, NoteTarget, OBSERVATION_KIND, Predecessor, Provider, RunEvent, RunId,
+        RunRecord, Task, TaskAction, TaskDetail, TaskId, TaskRecord, TaskRun, TaskStatus,
+        TaskStatusCounts, goal, scope::validate_path_globs, task,
     },
     infrastructure::{clock, location::runs_dir},
 };
@@ -47,9 +47,11 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../../migrations/0016_observer.sql"),
     include_str!("../../migrations/0017_stuck_exit_ask.sql"),
     include_str!("../../migrations/0018_task_paths.sql"),
+    include_str!("../../migrations/0019_task_goal_dependencies.sql"),
 ];
-/// Ready tasks whose predecessors are completed, that own no unfinished run
-/// and whose goal, if any, is not a draft (ADR-0024 decision 5).
+/// Ready tasks whose predecessors are completed, whose goal dependencies
+/// are all closed as achieved (ADR-0038), that own no unfinished run and
+/// whose goal, if any, is not a draft (ADR-0024 decision 5).
 const READY_QUERY: &str = "
     SELECT t.* FROM tasks t
     WHERE t.status = 'ready'
@@ -59,6 +61,11 @@ const READY_QUERY: &str = "
       AND NOT EXISTS (
         SELECT 1 FROM task_dependencies d JOIN tasks p ON p.id = d.predecessor_id
         WHERE d.task_id = t.id AND p.status <> 'completed'
+      )
+      AND NOT EXISTS (
+        SELECT 1 FROM task_goal_dependencies gd JOIN goals g ON g.id = gd.goal_id
+        WHERE gd.task_id = t.id
+          AND NOT (g.closed_at IS NOT NULL AND g.verdict = 'achieved')
       )
       AND NOT EXISTS (
         SELECT 1 FROM task_runs r WHERE r.task_id = t.id
@@ -194,6 +201,7 @@ impl TaskStore for SqliteQueue {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let now = self.generators.clock.timestamp();
         let dependencies = new.dependencies.clone();
+        let goal_dependencies = new.goal_dependencies.clone();
         let task = Task::new(TaskId::new(next_id(&tx, "tasks")?), new, now.clone())?;
         if let Some(goal_id) = task.goal_id() {
             goal::check_accepts_tasks(&read_goal(&tx, goal_id)?)?;
@@ -215,8 +223,13 @@ impl TaskStore for SqliteQueue {
             "task_created",
             json!({"goal_id": task.goal_id()}),
         )?;
+        // Inserted after the task, which is in its goal already, so the
+        // cycle checks see the goal's wait for it (ADR-0038).
         for predecessor in dependencies {
             insert_dependency(&tx, id, predecessor, &now)?;
+        }
+        for goal_id in goal_dependencies {
+            insert_goal_dependency(&tx, id, goal_id, &now)?;
         }
         let result = read_task(&tx, id)?;
         tx.commit()?;
@@ -289,6 +302,7 @@ impl TaskStore for SqliteQueue {
         let mut dependencies = tx.prepare(
             "SELECT predecessor_id FROM task_dependencies WHERE task_id=?1 ORDER BY predecessor_id",
         )?;
+        let mut goal_dependencies = tx.prepare(GOAL_DEPENDENCIES_QUERY)?;
         let mut latest_run = tx.prepare(
             "SELECT id, status FROM task_runs WHERE task_id=?1 ORDER BY rowid DESC LIMIT 1",
         )?;
@@ -296,6 +310,9 @@ impl TaskStore for SqliteQueue {
             .into_iter()
             .map(|task| {
                 let dependencies = dependencies
+                    .query_map([task.id()], |r| r.get(0))?
+                    .collect::<rusqlite::Result<_>>()?;
+                let goal_dependencies = goal_dependencies
                     .query_map([task.id()], |r| r.get(0))?
                     .collect::<rusqlite::Result<_>>()?;
                 let latest_run = latest_run
@@ -309,6 +326,7 @@ impl TaskStore for SqliteQueue {
                 Ok(TaskListItem::new(
                     task,
                     dependencies,
+                    goal_dependencies,
                     latest_run,
                     query.full,
                 ))
@@ -328,6 +346,10 @@ impl TaskStore for SqliteQueue {
         let dependencies = tx.prepare(
             "SELECT predecessor_id FROM task_dependencies WHERE task_id=?1 ORDER BY predecessor_id"
         )?.query_map([task_id], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
+        let goal_dependencies = tx
+            .prepare(GOAL_DEPENDENCIES_QUERY)?
+            .query_map([task_id], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
         let runs = tx
             .prepare("SELECT * FROM task_runs WHERE task_id=?1 ORDER BY rowid")?
             .query_map([task_id], run_row(&self.runs_dir))?
@@ -341,6 +363,7 @@ impl TaskStore for SqliteQueue {
         Ok(TaskDetail {
             task,
             dependencies,
+            goal_dependencies,
             runs,
             events,
             processes,
@@ -395,6 +418,40 @@ impl TaskStore for SqliteQueue {
         Ok(())
     }
 
+    fn add_goal_dependency(&mut self, task_id: TaskId, goal_id: GoalId) -> Result<()> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        insert_goal_dependency(&tx, task_id, goal_id, &self.generators.clock.timestamp())?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn remove_goal_dependency(&mut self, task_id: TaskId, goal_id: GoalId) -> Result<()> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        task::check_dependencies_editable(&read_task(&tx, task_id)?)?;
+        let changed = tx.execute(
+            "DELETE FROM task_goal_dependencies WHERE task_id=?1 AND goal_id=?2",
+            params![task_id, goal_id],
+        )?;
+        ensure!(
+            changed == 1,
+            "dependency {task_id} -> goal {goal_id} does not exist"
+        );
+        touch(&tx, task_id, &self.generators.clock.timestamp())?;
+        event(
+            &tx,
+            task_id,
+            None,
+            "goal_dependency_removed",
+            json!({"goal_id": goal_id}),
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
     fn candidates(&self) -> Result<Vec<Task>> {
         Ok(self
             .conn
@@ -414,6 +471,10 @@ impl TaskStore for SqliteQueue {
         let mut dependencies = tx.prepare(
             "SELECT predecessor_id FROM task_dependencies WHERE task_id=?1 ORDER BY predecessor_id",
         )?;
+        let mut goal_dependencies = tx.prepare(
+            "SELECT g.* FROM task_goal_dependencies d JOIN goals g ON g.id = d.goal_id
+             WHERE d.task_id=?1 ORDER BY g.id",
+        )?;
         let tasks = tasks
             .into_iter()
             .map(|task| {
@@ -424,6 +485,15 @@ impl TaskStore for SqliteQueue {
                 Ok(GraphTask {
                     depends_on: dependencies
                         .query_map([task.id()], |r| r.get(0))?
+                        .collect::<rusqlite::Result<_>>()?,
+                    goal_dependencies: goal_dependencies
+                        .query_map([task.id()], goal_row)?
+                        .map(|goal| {
+                            goal.map(|goal| GraphGoalDependency {
+                                goal_id: goal.id(),
+                                verdict: goal.verdict(),
+                            })
+                        })
                         .collect::<rusqlite::Result<_>>()?,
                     goal_status,
                     id: task.id(),
@@ -457,30 +527,34 @@ impl TaskStore for SqliteQueue {
     }
 
     fn predecessors(&self, task_id: TaskId) -> Result<Vec<Predecessor>> {
-        let tasks: Vec<Task> = self
+        landed_tasks(
+            &self.conn,
+            &self.runs_dir,
+            "SELECT p.* FROM task_dependencies d JOIN tasks p ON p.id = d.predecessor_id
+             WHERE d.task_id = ?1 ORDER BY p.id",
+            task_id.as_i64(),
+        )
+    }
+
+    fn goal_predecessors(&self, task_id: TaskId) -> Result<Vec<GoalPredecessor>> {
+        let goals: Vec<Goal> = self
             .conn
             .prepare(
-                "SELECT p.* FROM task_dependencies d JOIN tasks p ON p.id = d.predecessor_id
-                 WHERE d.task_id = ?1 ORDER BY p.id",
+                "SELECT g.* FROM task_goal_dependencies d JOIN goals g ON g.id = d.goal_id
+                 WHERE d.task_id = ?1 ORDER BY g.id",
             )?
-            .query_map([task_id], task_row)?
+            .query_map([task_id], goal_row)?
             .collect::<rusqlite::Result<_>>()?;
-        tasks
+        goals
             .into_iter()
-            .map(|task| {
-                // At most one run per task is integrated (`one_integrated_run_per_task`).
-                let integrated_run = self
-                    .conn
-                    .query_row(
-                        "SELECT * FROM task_runs WHERE task_id = ?1 AND status = 'integrated'",
-                        [task.id()],
-                        run_row(&self.runs_dir),
-                    )
-                    .optional()?;
-                Ok(Predecessor {
-                    task,
-                    integrated_run,
-                })
+            .map(|goal| {
+                let tasks = landed_tasks(
+                    &self.conn,
+                    &self.runs_dir,
+                    "SELECT * FROM tasks WHERE goal_id = ?1 AND status = 'completed' ORDER BY id",
+                    goal.id().as_i64(),
+                )?;
+                Ok(GoalPredecessor { goal, tasks })
             })
             .collect()
     }
@@ -553,13 +627,15 @@ impl TaskStore for SqliteQueue {
         let goal = read_goal(&tx, goal_id)?;
         let tasks = tx
             .prepare("SELECT id, title, status FROM tasks WHERE goal_id=?1 ORDER BY id")?
-            .query_map([goal_id], |row| {
-                Ok(GoalTask {
-                    id: row.get("id")?,
-                    title: row.get("title")?,
-                    status: enum_col(row, "status")?,
-                })
-            })?
+            .query_map([goal_id], goal_task_row)?
+            .collect::<rusqlite::Result<_>>()?;
+        let dependents = tx
+            .prepare(
+                "SELECT t.id, t.title, t.status FROM task_goal_dependencies d
+                 JOIN tasks t ON t.id = d.task_id
+                 WHERE d.goal_id=?1 AND t.status NOT IN ('completed','canceled') ORDER BY t.id",
+            )?
+            .query_map([goal_id], goal_task_row)?
             .collect::<rusqlite::Result<_>>()?;
         let events = tx
             .prepare("SELECT * FROM run_events WHERE goal_id=?1 ORDER BY id")?
@@ -570,6 +646,7 @@ impl TaskStore for SqliteQueue {
             closed: goal.is_closed(),
             goal,
             tasks,
+            dependents,
             events,
         })
     }
@@ -748,6 +825,18 @@ impl TaskStore for SqliteQueue {
         let task = task::set_goal(task, goal_id)?;
         if let Some(goal_id) = task.goal_id() {
             goal::check_accepts_tasks(&read_goal(&tx, goal_id)?)?;
+            if from != Some(goal_id) {
+                // The goal would wait for the task: the task must not wait
+                // for the goal (ADR-0038).
+                let direct: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM task_goal_dependencies
+                     WHERE task_id=?1 AND goal_id=?2)",
+                    params![task_id, goal_id],
+                    |r| r.get(0),
+                )?;
+                let cycle = waits_for(&tx, Node::Task(task_id), Node::Goal(goal_id))?;
+                task::check_membership_acyclic(&task, goal_id, direct, cycle)?;
+            }
         }
         if from != task.goal_id() {
             tx.execute(
@@ -803,6 +892,93 @@ fn read_goal(conn: &Connection, goal_id: GoalId) -> Result<Goal> {
     conn.query_row("SELECT * FROM goals WHERE id=?1", [goal_id], goal_row)
         .optional()?
         .with_context(|| format!("goal {goal_id} does not exist"))
+}
+
+/// The goals a task depends on, ascending.
+const GOAL_DEPENDENCIES_QUERY: &str =
+    "SELECT goal_id FROM task_goal_dependencies WHERE task_id=?1 ORDER BY goal_id";
+
+fn goal_task_row(row: &Row<'_>) -> rusqlite::Result<GoalTask> {
+    Ok(GoalTask {
+        id: row.get("id")?,
+        title: row.get("title")?,
+        status: enum_col(row, "status")?,
+    })
+}
+
+/// The tasks `query` selects by `key`, each with the run that landed it.
+fn landed_tasks(
+    conn: &Connection,
+    runs_dir: &Path,
+    query: &str,
+    key: i64,
+) -> Result<Vec<Predecessor>> {
+    let tasks: Vec<Task> = conn
+        .prepare(query)?
+        .query_map([key], task_row)?
+        .collect::<rusqlite::Result<_>>()?;
+    tasks
+        .into_iter()
+        .map(|task| {
+            // At most one run per task is integrated (`one_integrated_run_per_task`).
+            let integrated_run = conn
+                .query_row(
+                    "SELECT * FROM task_runs WHERE task_id = ?1 AND status = 'integrated'",
+                    [task.id()],
+                    run_row(runs_dir),
+                )
+                .optional()?;
+            Ok(Predecessor {
+                task,
+                integrated_run,
+            })
+        })
+        .collect()
+}
+
+/// A vertex of the wait graph (ADR-0038): a task waits for its predecessor
+/// tasks and the goals it depends on, and a goal waits for its tasks.
+#[derive(Debug, Clone, Copy)]
+enum Node {
+    Task(TaskId),
+    Goal(GoalId),
+}
+
+impl Node {
+    fn key(self) -> (&'static str, i64) {
+        match self {
+            Self::Task(id) => ("task", id.as_i64()),
+            Self::Goal(id) => ("goal", id.as_i64()),
+        }
+    }
+}
+
+/// Whether `from` already waits for `to`, directly or not, over every task
+/// and goal: the edge `to -> from` would close a cycle. Found in SQL
+/// because it needs the whole graph; whether that rejects the edge is the
+/// domain's rule (ADR-0013).
+fn waits_for(conn: &Connection, from: Node, to: Node) -> Result<bool> {
+    let (from_kind, from_id) = from.key();
+    let (to_kind, to_id) = to.key();
+    Ok(conn.query_row(
+        "WITH RECURSIVE
+           edges(from_kind, from_id, to_kind, to_id) AS (
+             SELECT 'task', task_id, 'task', predecessor_id FROM task_dependencies
+             UNION ALL
+             SELECT 'task', task_id, 'goal', goal_id FROM task_goal_dependencies
+             UNION ALL
+             SELECT 'goal', goal_id, 'task', id FROM tasks WHERE goal_id IS NOT NULL
+           ),
+           reached(kind, id) AS (
+             SELECT ?1, ?2
+             UNION
+             SELECT e.to_kind, e.to_id FROM edges e
+               JOIN reached r ON e.from_kind = r.kind AND e.from_id = r.id
+           )
+         SELECT EXISTS(SELECT 1 FROM reached WHERE kind = ?3 AND id = ?4)",
+        params![from_kind, from_id, to_kind, to_id],
+        |r| r.get(0),
+    )?)
 }
 
 /// The ID an `AUTOINCREMENT` insert into `table` would take now: one past
@@ -966,16 +1142,9 @@ fn insert_dependency(
     task::check_not_self(task_id, predecessor_id)?;
     task::check_dependencies_editable(&read_task(conn, task_id)?)?;
     read_task(conn, predecessor_id)?;
-    let cycle: bool = conn.query_row(
-        "WITH RECURSIVE ancestors(id) AS (
-            SELECT ?1 UNION
-            SELECT d.predecessor_id FROM task_dependencies d JOIN ancestors a ON d.task_id=a.id
-         ) SELECT EXISTS(SELECT 1 FROM ancestors WHERE id=?2)",
-        params![predecessor_id, task_id],
-        |r| r.get(0),
-    )?;
-    // The cycle is found in SQL because it needs the whole dependency
-    // graph; whether it rejects the edge is the domain's rule.
+    // Through goals too: the predecessor may wait for a goal that waits
+    // for the task (ADR-0038).
+    let cycle = waits_for(conn, Node::Task(predecessor_id), Node::Task(task_id))?;
     task::check_acyclic(task_id, predecessor_id, cycle)?;
     let inserted = conn.execute(
         "INSERT INTO task_dependencies(task_id, predecessor_id) VALUES (?1,?2)
@@ -990,6 +1159,36 @@ fn insert_dependency(
             None,
             "dependency_added",
             json!({"predecessor_id": predecessor_id}),
+        )?;
+    }
+    Ok(())
+}
+
+fn insert_goal_dependency(
+    conn: &Connection,
+    task_id: TaskId,
+    goal_id: GoalId,
+    now: &str,
+) -> Result<()> {
+    let task = read_task(conn, task_id)?;
+    task::check_dependencies_editable(&task)?;
+    read_goal(conn, goal_id)?;
+    task::check_not_own_goal(&task, goal_id)?;
+    let cycle = waits_for(conn, Node::Goal(goal_id), Node::Task(task_id))?;
+    task::check_goal_acyclic(task_id, goal_id, cycle)?;
+    let inserted = conn.execute(
+        "INSERT INTO task_goal_dependencies(task_id, goal_id) VALUES (?1,?2)
+         ON CONFLICT(task_id, goal_id) DO NOTHING",
+        params![task_id, goal_id],
+    )?;
+    if inserted != 0 {
+        touch(conn, task_id, now)?;
+        event(
+            conn,
+            task_id,
+            None,
+            "goal_dependency_added",
+            json!({"goal_id": goal_id}),
         )?;
     }
     Ok(())

@@ -1,5 +1,5 @@
 //! The worker's prompt (`prompt.txt`): the task, its goal, the summaries
-//! of its landed predecessors, the tasks running alongside it and what the
+//! of its landed predecessors and of the goals it waited for, the tasks running alongside it and what the
 //! receipt must hold. Built from what the queue returned at claim time.
 //! Also the initial prompts of the inbox and the planner sessions `up`
 //! opens, and what the supervisor asks of an agent: the headless review and
@@ -17,8 +17,8 @@ use super::{
     or_none, tail,
 };
 use crate::domain::{
-    CommitSha, Goal, MAX_RESUME_ATTEMPTS, MAX_REVISE_ATTEMPTS, Predecessor, Receipt, RunStatus,
-    TRIAGE_RETRY_FAILURES, Task, TaskDetail, TaskId, TaskRun,
+    CommitSha, Goal, GoalId, GoalPredecessor, MAX_RESUME_ATTEMPTS, MAX_REVISE_ATTEMPTS,
+    Predecessor, Receipt, RunStatus, TRIAGE_RETRY_FAILURES, Task, TaskDetail, TaskId, TaskRun,
 };
 
 /// What the prompt says about one direct predecessor: the task, the squash
@@ -74,6 +74,43 @@ impl PredecessorSummary {
     }
 }
 
+/// Characters of a receipt summary the prompt keeps for each task of a goal
+/// the task depended on: a goal may hold many tasks, so each is a hint of
+/// what landed, not the whole account.
+pub const GOAL_TASK_SUMMARY_CHARS: usize = 200;
+
+/// What the prompt says about one goal the task depended on (ADR-0038):
+/// its title and its completed tasks, each summarized like a predecessor
+/// with the summary cut to [`GOAL_TASK_SUMMARY_CHARS`].
+#[derive(Debug, Clone, Serialize)]
+pub struct GoalPredecessorSummary {
+    pub goal_id: GoalId,
+    pub title: String,
+    pub tasks: Vec<PredecessorSummary>,
+}
+
+impl GoalPredecessorSummary {
+    pub fn from_goal_predecessor(files: &dyn RunFiles, predecessor: &GoalPredecessor) -> Self {
+        Self {
+            goal_id: predecessor.goal.id(),
+            title: predecessor.goal.title().to_owned(),
+            tasks: predecessor
+                .tasks
+                .iter()
+                .map(|task| {
+                    let mut summary = PredecessorSummary::from_predecessor(files, task);
+                    if let Some(cut) =
+                        super::health::truncate(&summary.summary, GOAL_TASK_SUMMARY_CHARS)
+                    {
+                        summary.summary = cut;
+                    }
+                    summary
+                })
+                .collect(),
+        }
+    }
+}
+
 /// The other tasks a worker is told are executing alongside it: of the
 /// `in_progress` tasks (ID order), those sharing the task's goal, or all of
 /// them when the task has no goal; the task itself is never listed.
@@ -98,7 +135,8 @@ pub const WORKER_READING: &str = "Read first, and only: the worker section of th
 Do not run `dagq list` or `dagq show`, and skip the rest of the docs tree; open other files only when the task needs them.\n";
 
 /// Text of `prompt.txt`. `goal` is the task's goal as it reads at claim
-/// time, `predecessors` the task's direct dependencies and `siblings` the
+/// time, `predecessors` the task's direct dependencies, `goal_predecessors`
+/// the goals it depends on (in the Predecessor section) and `siblings` the
 /// other tasks executing at claim time (`siblings_in_progress`). The Goal,
 /// Context, Predecessor and Sibling sections are always present, `none`
 /// when empty, so the prompt keeps one shape whether or not a task has a
@@ -108,6 +146,7 @@ pub fn prompt(
     run: &TaskRun,
     goal: Option<&Goal>,
     predecessors: &[PredecessorSummary],
+    goal_predecessors: &[GoalPredecessorSummary],
     siblings: &[Task],
 ) -> Result<String> {
     let receipt = run.receipt_path().context("missing receipt path")?;
@@ -139,7 +178,7 @@ pub fn prompt(
             task.context()
         )
     };
-    let predecessors = if predecessors.is_empty() {
+    let predecessors = if predecessors.is_empty() && goal_predecessors.is_empty() {
         "Predecessor tasks: none\n".to_owned()
     } else {
         let mut text =
@@ -152,6 +191,21 @@ pub fn prompt(
                 predecessor.result_commit,
                 predecessor.summary
             ));
+        }
+        for goal in goal_predecessors {
+            text.push_str(&format!(
+                "- goal {} (closed as achieved): {}; its completed tasks:\n",
+                goal.goal_id, goal.title
+            ));
+            if goal.tasks.is_empty() {
+                text.push_str("  - none\n");
+            }
+            for task in &goal.tasks {
+                text.push_str(&format!(
+                    "  - task {}: {}; result commit {}; summary: {}\n",
+                    task.task_id, task.title, task.result_commit, task.summary
+                ));
+            }
         }
         text
     };
@@ -652,4 +706,127 @@ pub(crate) fn revise_request(
         "6. Do not merge or push. When done, report briefly and stop; do not run /exit.".to_owned(),
     );
     Ok(lines.join("\n"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::application::memory_files::MemoryFiles;
+    use crate::domain::{
+        GoalRecord, GoalStatus, GoalVerdict, Provider, RunId, RunRecord, TaskRecord, TaskStatus,
+    };
+    use serde_json::json;
+    use std::time::UNIX_EPOCH;
+
+    const SHA: &str = "1111111111111111111111111111111111111111";
+    const RUN: &str = "00000000-0000-4000-8000-000000000001";
+
+    fn task(id: i64, title: &str, status: TaskStatus) -> Task {
+        Task::restore(TaskRecord {
+            id: TaskId::new(id),
+            title: title.into(),
+            description: String::new(),
+            acceptance: String::new(),
+            verification_commands: Vec::new(),
+            required_evidence: Vec::new(),
+            paths: Vec::new(),
+            status,
+            goal_id: None,
+            context: String::new(),
+            created_at: String::new(),
+            updated_at: String::new(),
+        })
+        .unwrap()
+    }
+
+    fn run(task_id: i64, status: RunStatus, result_commit: Option<&str>) -> TaskRun {
+        TaskRun::restore(RunRecord {
+            id: RunId::new(RUN).unwrap(),
+            task_id: TaskId::new(task_id),
+            status,
+            requested_provider: Provider::Claude,
+            actual_provider: Provider::Claude,
+            base_commit: CommitSha::try_from(SHA).unwrap(),
+            branch: Some(format!("dagq/{RUN}")),
+            worktree_path: Some("/runs/run/worktree".into()),
+            workspace_id: None,
+            receipt_path: Some("/runs/run/receipt.json".into()),
+            log_path: None,
+            result_commit: result_commit.map(|sha| CommitSha::try_from(sha).unwrap()),
+            repo_path: None,
+            run_dir: Some("/runs/run".into()),
+            last_error: None,
+            workspace_closed_at: None,
+            created_at: String::new(),
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn goal_dependencies_share_the_predecessor_section_with_short_summaries() {
+        let files = MemoryFiles::default();
+        let receipt = json!({
+            "run_id": RUN,
+            "result": "succeeded",
+            "commit": SHA,
+            "tests": {"status": "passed", "evidence_or_reason": "cargo test"},
+            "e2e": {"status": "not_applicable", "evidence_or_reason": "none"},
+            "subagent_review": {"status": "not_applicable", "evidence_or_reason": "small"},
+            "summary": "word ".repeat(100),
+        });
+        files.put(
+            Path::new("/runs/run/receipt.json"),
+            UNIX_EPOCH,
+            &receipt.to_string(),
+        );
+        let goal = Goal::restore(GoalRecord {
+            id: GoalId::new(4),
+            title: "upstream goal".into(),
+            description: String::new(),
+            acceptance: String::new(),
+            constraints: String::new(),
+            doc: None,
+            status: GoalStatus::Open,
+            closed_at: Some("2026-09-25T00:00:00Z".into()),
+            verdict: Some(GoalVerdict::Achieved),
+            created_at: String::new(),
+            updated_at: String::new(),
+        })
+        .unwrap();
+        let landed = GoalPredecessorSummary::from_goal_predecessor(
+            &files,
+            &GoalPredecessor {
+                goal: goal.clone(),
+                tasks: vec![Predecessor {
+                    task: task(2, "upstream work", TaskStatus::Completed),
+                    integrated_run: Some(run(2, RunStatus::Integrated, Some(SHA))),
+                }],
+            },
+        );
+        let summary = landed.tasks[0].summary.clone();
+        assert_eq!(summary.chars().count(), GOAL_TASK_SUMMARY_CHARS + 1);
+        assert!(summary.ends_with('…'));
+        let empty = GoalPredecessorSummary::from_goal_predecessor(
+            &files,
+            &GoalPredecessor {
+                goal,
+                tasks: Vec::new(),
+            },
+        );
+
+        let waiting = task(9, "downstream", TaskStatus::InProgress);
+        let own_run = run(9, RunStatus::Claimed, None);
+        let text = prompt(&waiting, &own_run, None, &[], &[landed, empty], &[]).unwrap();
+        assert!(
+            text.contains(&format!(
+                "Predecessor tasks (their changes are already in your base commit):\n\
+                 - goal 4 (closed as achieved): upstream goal; its completed tasks:\n  \
+                 - task 2: upstream work; result commit {SHA}; summary: {summary}\n\
+                 - goal 4 (closed as achieved): upstream goal; its completed tasks:\n  - none\n"
+            )),
+            "{text}"
+        );
+        let alone = prompt(&waiting, &own_run, None, &[], &[], &[]).unwrap();
+        assert!(alone.contains("Predecessor tasks: none\n"));
+    }
 }

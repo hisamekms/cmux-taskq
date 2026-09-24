@@ -7,8 +7,8 @@ pub use crate::application::{
     health::{DoctorReport, LeaseHealth, ProcessHealth, RunHealth, SupervisorHealth},
     integrate::{IntegrateTarget, integrate_verify_log, register_follow_ups},
     prompt::{
-        PredecessorSummary, STOP_BACKGROUND, TRIAGE_TOOLS, WORKER_READING, inbox_prompt,
-        planner_prompt, prompt, review_prompt, siblings_in_progress,
+        GoalPredecessorSummary, PredecessorSummary, STOP_BACKGROUND, TRIAGE_TOOLS, WORKER_READING,
+        inbox_prompt, planner_prompt, prompt, review_prompt, siblings_in_progress,
     },
     rebind::REBIND_LOG,
     recording::{BACKEND_ERROR_CHARS, RecordingBackend, backend_failure_payload},

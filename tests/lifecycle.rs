@@ -468,6 +468,7 @@ fn claim_a_run(fixture: &Fixture, queue: &mut SqliteQueue, token: &str) -> Strin
             required_evidence: Vec::new(),
             paths: Vec::new(),
             dependencies: vec![],
+            goal_dependencies: Vec::new(),
             goal_id: None,
             context: String::new(),
         })
@@ -1244,6 +1245,7 @@ fn up_prunes_dead_registrations_and_keeps_live_ones_and_leases() {
             required_evidence: Vec::new(),
             paths: Vec::new(),
             dependencies: vec![],
+            goal_dependencies: Vec::new(),
             goal_id: None,
             context: String::new(),
         })
@@ -1315,6 +1317,7 @@ fn up_reports_runs_that_wait_for_a_person_or_the_supervisor() {
                 required_evidence: Vec::new(),
                 paths: Vec::new(),
                 dependencies: vec![],
+                goal_dependencies: Vec::new(),
                 goal_id: None,
                 context: String::new(),
             })

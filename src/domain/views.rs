@@ -58,6 +58,8 @@ pub struct GoalDetail {
     pub goal: Goal,
     pub closed: bool,
     pub tasks: Vec<GoalTask>,
+    /// Unfinished tasks that depend on this goal (ADR-0038), ascending.
+    pub dependents: Vec<GoalTask>,
     pub events: Vec<RunEvent>,
 }
 
@@ -69,6 +71,15 @@ pub struct GoalDetail {
 pub struct Predecessor {
     pub task: Task,
     pub integrated_run: Option<TaskRun>,
+}
+
+/// A goal a task depends on (ADR-0038) as the worker's prompt describes it:
+/// the goal and its completed tasks in ID order, each with the run that
+/// landed it. A claimed task's goal dependencies are all closed as achieved.
+#[derive(Debug, Clone, Serialize)]
+pub struct GoalPredecessor {
+    pub goal: Goal,
+    pub tasks: Vec<Predecessor>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -87,6 +98,8 @@ pub struct RunEvent {
 pub struct TaskDetail {
     pub task: Task,
     pub dependencies: Vec<TaskId>,
+    /// Goals the task depends on (ADR-0038), ascending.
+    pub goal_dependencies: Vec<GoalId>,
     pub runs: Vec<TaskRun>,
     pub events: Vec<RunEvent>,
     pub processes: Vec<RunProcess>,

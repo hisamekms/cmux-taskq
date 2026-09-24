@@ -31,6 +31,7 @@ fn new_task(title: &str) -> NewTask {
         required_evidence: Vec::new(),
         paths: Vec::new(),
         dependencies: vec![],
+        goal_dependencies: Vec::new(),
         goal_id: None,
         context: String::new(),
     }
@@ -252,6 +253,92 @@ fn predecessors_carry_the_integrated_run_and_in_progress_tasks_are_listed() {
     assert!(predecessors[1].integrated_run.is_none());
     // A task that does not exist has no predecessors rather than an error.
     assert!(queue.predecessors(TaskId::new(99)).unwrap().is_empty());
+}
+
+/// A goal dependency holds the claim until the goal is closed as achieved,
+/// and the prompt's view of the goal lists its completed tasks (ADR-0038).
+#[test]
+fn a_goal_dependency_holds_the_claim_until_the_goal_is_achieved() {
+    let (dir, mut queue) = fixture();
+    let goal = queue.add_goal(new_goal("upstream")).unwrap().id();
+    let mut spec = new_task("upstream work");
+    spec.goal_id = Some(goal);
+    let member = queue.add(spec).unwrap().id();
+    let mut spec = new_task("follow-up draft");
+    spec.goal_id = Some(goal);
+    let follow_up = queue.add(spec).unwrap().id();
+    let mut spec = new_task("downstream");
+    spec.goal_dependencies = vec![goal, goal];
+    let waiting = queue.add(spec).unwrap().id();
+    assert_eq!(queue.show(waiting).unwrap().goal_dependencies, [goal]);
+    // Adding the same edge again changes nothing.
+    queue.add_goal_dependency(waiting, goal).unwrap();
+    assert!(queue.add_goal_dependency(waiting, GoalId::new(99)).is_err());
+    assert!(queue.add_goal_dependency(TaskId::new(99), goal).is_err());
+    queue.transition(waiting, TaskAction::Ready).unwrap();
+    queue.transition(member, TaskAction::Ready).unwrap();
+
+    let ClaimOutcome::Claimed { run } = queue.claim(&base()).unwrap() else {
+        panic!()
+    };
+    assert_eq!(run.task_id(), member);
+    let raw = Connection::open(dir.path().join("queue.db")).unwrap();
+    raw.execute(
+        "UPDATE task_runs SET status='integrated', result_commit=?2 WHERE id=?1",
+        rusqlite::params![run.id(), BASE],
+    )
+    .unwrap();
+    raw.execute("UPDATE tasks SET status='completed' WHERE id=?1", [member])
+        .unwrap();
+    // Every task of the open goal but a draft follow-up is done: still held.
+    assert!(queue.candidates().unwrap().is_empty());
+    assert!(matches!(
+        queue.claim(&base()).unwrap(),
+        ClaimOutcome::NoReadyTask
+    ));
+    queue.transition(follow_up, TaskAction::Cancel).unwrap();
+    assert!(queue.candidates().unwrap().is_empty());
+    queue.close_goal(goal, GoalVerdict::Achieved).unwrap();
+    let ClaimOutcome::Claimed { run } = queue.claim(&base()).unwrap() else {
+        panic!()
+    };
+    assert_eq!(run.task_id(), waiting);
+
+    let goals = queue.goal_predecessors(waiting).unwrap();
+    assert_eq!(goals.len(), 1);
+    assert_eq!(goals[0].goal.title(), "upstream");
+    assert_eq!(
+        goals[0]
+            .tasks
+            .iter()
+            .map(|p| p.task.id())
+            .collect::<Vec<_>>(),
+        [member]
+    );
+    assert_eq!(
+        goals[0].tasks[0]
+            .integrated_run
+            .as_ref()
+            .and_then(|run| run.result_commit())
+            .map(CommitSha::as_str),
+        Some(BASE)
+    );
+    assert!(queue.goal_predecessors(member).unwrap().is_empty());
+    // A claimed task's goal dependencies are fixed; it is a dependent of
+    // the goal until it finishes.
+    assert!(queue.add_goal_dependency(waiting, goal).is_err());
+    assert!(queue.remove_goal_dependency(waiting, goal).is_err());
+    let dependents = queue.show_goal(goal).unwrap().dependents;
+    assert_eq!(
+        dependents
+            .iter()
+            .map(|t| (t.id, t.status))
+            .collect::<Vec<_>>(),
+        [(waiting, TaskStatus::InProgress)]
+    );
+    raw.execute("UPDATE tasks SET status='completed' WHERE id=?1", [waiting])
+        .unwrap();
+    assert!(queue.show_goal(goal).unwrap().dependents.is_empty());
 }
 
 #[test]
@@ -927,10 +1014,10 @@ fn migration_from_v6_adds_goals_and_keeps_tasks_runs_and_events() {
     // (supervisor binary version), 0011 (session workspaces), 0012
     // (queue-level backend failures), 0013 (goal draft), 0014 (asks) and
     // 0015 (required evidence), 0016 (observer events and task-less
-    // blocked asks), 0017 (the stuck_exit ask) and 0018 (task paths) are
-    // applied together.
-    assert_eq!(SqliteQueue::SCHEMA_VERSION, 18);
-    assert_eq!(queue.schema_version().unwrap(), 18);
+    // blocked asks), 0017 (the stuck_exit ask), 0018 (task paths) and 0019
+    // (goal dependencies) are applied together.
+    assert_eq!(SqliteQueue::SCHEMA_VERSION, 19);
+    assert_eq!(queue.schema_version().unwrap(), 19);
     assert_eq!(
         queue
             .session_workspace(dagq::domain::SessionRole::Inbox)
@@ -962,7 +1049,9 @@ fn migration_from_v6_adds_goals_and_keeps_tasks_runs_and_events() {
     let waiting = queue.show(TaskId::new(2)).unwrap();
     assert_eq!(waiting.task.goal_id(), None);
     assert_eq!(waiting.task.context(), "");
+    // The task dependency survives every migration; no goal dependency appears.
     assert_eq!(waiting.dependencies, [TaskId::new(1)]);
+    assert!(waiting.goal_dependencies.is_empty());
     assert_eq!(waiting.events[0].id, EventId::new(3));
     assert_eq!(queue.candidates().unwrap()[0].id(), TaskId::new(2));
     assert!(queue.list_goals().unwrap().is_empty());
@@ -1599,9 +1688,10 @@ fn list_defaults_to_unfinished_tasks_newest_first_with_compact_items() {
         serde_json::json!({
             "tasks": [
                 {"id": d, "status": "ready", "title": "waiting", "goal_id": null,
-                 "dependencies": [], "latest_run": null},
+                 "dependencies": [], "goal_dependencies": [], "latest_run": null},
                 {"id": c, "status": "in_progress", "title": "claimed", "goal_id": goal,
-                 "dependencies": [a], "latest_run": {"id": run.id(), "status": "claimed"}},
+                 "dependencies": [a], "goal_dependencies": [],
+                 "latest_run": {"id": run.id(), "status": "claimed"}},
             ],
             "next": null,
             "total": 2,
@@ -1647,6 +1737,7 @@ fn list_full_items_carry_every_task_field() {
     let item = serde_json::to_value(&queue.list(&full).unwrap().tasks[0]).unwrap();
     let mut expected = serde_json::to_value(&task).unwrap();
     expected["dependencies"] = serde_json::json!([]);
+    expected["goal_dependencies"] = serde_json::json!([]);
     expected["latest_run"] = serde_json::Value::Null;
     assert_eq!(item, expected);
 }

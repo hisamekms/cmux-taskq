@@ -8,6 +8,7 @@ updated: 2026-09-25
 last_verified: 2026-09-25
 scope: runtime
 related:
+  - adr-0038
   - adr-0002
   - adr-0003
   - adr-0006
@@ -224,11 +225,11 @@ repository rootの`dagq.toml`の`[run.env]`（[ADR-0023](../adr/0023-verify-once
 
 ### Prompt
 
-`prompt.txt`は`src/application/prompt.rs`の`prompt(task, run, goal, predecessors, siblings)`（`runtime::prompt`として再公開）が生成するclaim時点のスナップショットで、run中にqueueが変わっても書き換えない。goalの`goal edit`も、兄弟taskの状態変化も、走行中のrunには届かず、次のclaimのpromptから反映される。task単体の情報（ID、run ID、title、description、acceptance、verification_commands）、receiptの契約（pathとJSONの形）に加えて、[ADR-0009](../adr/0009-goal-groups-tasks.md)の次の4節をこの順で検証コマンドとreceiptの契約の間に載せる。どれも常に書き、該当がなければ`none`にして、promptの節構成をgoal・context・依存・並列の有無で変えない。
+`prompt.txt`は`src/application/prompt.rs`の`prompt(task, run, goal, predecessors, goal_predecessors, siblings)`（`runtime::prompt`として再公開）が生成するclaim時点のスナップショットで、run中にqueueが変わっても書き換えない。goalの`goal edit`も、兄弟taskの状態変化も、走行中のrunには届かず、次のclaimのpromptから反映される。task単体の情報（ID、run ID、title、description、acceptance、verification_commands）、receiptの契約（pathとJSONの形）に加えて、[ADR-0009](../adr/0009-goal-groups-tasks.md)の次の4節をこの順で検証コマンドとreceiptの契約の間に載せる。どれも常に書き、該当がなければ`none`にして、promptの節構成をgoal・context・依存・並列の有無で変えない。
 
 - **Goal**: taskに`goal_id`があれば、claim時点の`TaskStore::show_goal()`のgoalを`Goal ID` / `Goal title` / `Goal description` / `Goal acceptance` / `Goal constraints` / `Goal doc`の行で載せる。`doc`はrepository内のpathをそのまま書き、内容は読まない（なければ`Goal doc: none`）。goalのないtaskは`Goal: none, this task stands alone`。
 - **Context**: taskの`context`が空白でなければ本文をそのまま載せ、空なら`Context: none`。
-- **Predecessor tasks**: taskの直接の依存元（`task_dependencies`のpredecessor）ごとに1行、`- task <ID>: <title>; result commit <sha>; summary: <text>`。`result commit`は依存元の`integrated` runの`result_commit`（`integrate`がmainに積んだsquash commit）、`summary`はそのrunのreceipt（`receipt_path`。なければ`<run-dir>/receipt.json`）の`summary`（空白を1つに畳む。空なら`(no summary)`）。receiptが読めない・parseできない・pathが不明なら`(receipt unavailable)`、integrated runがなければ（手で`completed`にしたなど）`result commit (not landed)`と書き、いずれもprovisionを止めない。取得はqueueの読み取り専用操作`TaskStore::predecessors(task_id)`（ID順。依存元の`Task`と`integrated` runの`Option<TaskRun>`）で、summaryの読み取りはapplication側（`application::prompt::PredecessorSummary::from_predecessor`）が`RunFiles`越しに行う。依存元がなければ`Predecessor tasks: none`。
+- **Predecessor tasks**: taskの直接の依存元（`task_dependencies`のpredecessor）ごとに1行、`- task <ID>: <title>; result commit <sha>; summary: <text>`。`result commit`は依存元の`integrated` runの`result_commit`（`integrate`がmainに積んだsquash commit）、`summary`はそのrunのreceipt（`receipt_path`。なければ`<run-dir>/receipt.json`）の`summary`（空白を1つに畳む。空なら`(no summary)`）。receiptが読めない・parseできない・pathが不明なら`(receipt unavailable)`、integrated runがなければ（手で`completed`にしたなど）`result commit (not landed)`と書き、いずれもprovisionを止めない。取得はqueueの読み取り専用操作`TaskStore::predecessors(task_id)`（ID順。依存元の`Task`と`integrated` runの`Option<TaskRun>`）で、summaryの読み取りはapplication側（`application::prompt::PredecessorSummary::from_predecessor`）が`RunFiles`越しに行う。task依存の行に続けて、taskのgoal依存（[ADR-0038](../adr/0038-task-depends-on-a-goal-until-it-is-achieved.md)。claim時点ではすべて`achieved`で閉じている）ごとに`- goal <ID> (closed as achieved): <title>; its completed tasks:`を書き、その下にgoalの`completed`のtaskを1行ずつ`  - task <ID>: <title>; result commit <sha>; summary: <text>`で並べる（無ければ`  - none`）。行の作り方はtask依存と同じだが、goalはtaskが多くなりうるのでsummaryを`GOAL_TASK_SUMMARY_CHARS`（200文字）で切って`…`を付ける。取得は`TaskStore::goal_predecessors(task_id)`（goal ID順の`GoalPredecessor`: goalと、その`completed`のtaskの`Predecessor`のID順）、組み立ては`GoalPredecessorSummary::from_goal_predecessor`。依存元もgoal依存もなければ`Predecessor tasks: none`。
 - **Sibling tasks in progress**: `TaskStore::tasks_in_progress()`が返す`in_progress`のtask（ID順）から自分のtaskを除き、taskにgoalがあれば同じ`goal_id`のtaskに限定したものを`- task <ID>: <title>`で並べる（`siblings_in_progress`）。goalのないtaskはgoalの有無を問わず全`in_progress` taskを見る。claimは`fill_slots`で1件ずつ順に行うので、同じpassで後にclaimされたtaskのpromptには先にclaimされたtaskが載り、その逆は載らない。`awaiting_integration`や`needs_session`のrunを持つtaskも`in_progress`なので載る。なければ`Sibling tasks in progress: none`。
 
 冒頭（worktreeだけで作業する指示の直後）に、最初に読むものを`WORKER_READING`の一文に限定する: repository instructions（AGENTS.md）のworker節、この下のtask context（とそれが名指す文書）、goal doc、依存元のsummaryだけを読み、`dagq list` / `dagq show`は打たず、docs全体は読まず、他のファイルはtaskが必要とするときだけ開く（goal 11の決定4。runに要る情報はpromptに載っていて、queueの一覧やdocs全体を読むのは最初のcommitを遅らせるだけ）。

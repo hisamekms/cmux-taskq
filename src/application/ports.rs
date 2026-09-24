@@ -16,10 +16,10 @@ use std::{
 use super::{GraphInput, TaskPage, TaskQuery, timestamp, unix_seconds};
 use crate::domain::{
     Ask, AskId, AskKind, AskOutcome, ClaimOutcome, CommitSha, EventId, EvidenceCheck, Goal,
-    GoalDetail, GoalEdit, GoalId, GoalSummary, GoalVerdict, NewAsk, NewGoal, NewNote, NewTask,
-    NotePage, NoteQuery, Predecessor, Reason, ReasonCode, RunEvent, RunId, RunLease, RunPlan,
-    RunProcess, RunStatus, SessionRole, SupervisorMode, SupervisorRegistration, Task, TaskAction,
-    TaskDetail, TaskId, TaskRun,
+    GoalDetail, GoalEdit, GoalId, GoalPredecessor, GoalSummary, GoalVerdict, NewAsk, NewGoal,
+    NewNote, NewTask, NotePage, NoteQuery, Predecessor, Reason, ReasonCode, RunEvent, RunId,
+    RunLease, RunPlan, RunProcess, RunStatus, SessionRole, SupervisorMode, SupervisorRegistration,
+    Task, TaskAction, TaskDetail, TaskId, TaskRun,
 };
 
 pub trait TaskStore {
@@ -30,6 +30,10 @@ pub trait TaskStore {
     fn transition(&mut self, task_id: TaskId, action: TaskAction) -> Result<Task>;
     fn add_dependency(&mut self, task_id: TaskId, predecessor_id: TaskId) -> Result<()>;
     fn remove_dependency(&mut self, task_id: TaskId, predecessor_id: TaskId) -> Result<()>;
+    /// Make a draft or ready task wait until `goal_id` is closed as achieved
+    /// (ADR-0038); never its own goal, never a cycle.
+    fn add_goal_dependency(&mut self, task_id: TaskId, goal_id: GoalId) -> Result<()>;
+    fn remove_goal_dependency(&mut self, task_id: TaskId, goal_id: GoalId) -> Result<()>;
     /// Dependency-ready tasks; each task is limited to one unfinished run.
     fn candidates(&self) -> Result<Vec<Task>>;
     /// The unfinished tasks with their direct predecessors and the IDs of
@@ -39,6 +43,9 @@ pub trait TaskStore {
     fn claim(&mut self, base_commit: &CommitSha) -> Result<ClaimOutcome>;
     /// Direct predecessors of a task, each with the run that landed it, in ID order.
     fn predecessors(&self, task_id: TaskId) -> Result<Vec<Predecessor>>;
+    /// Goals a task depends on, in ID order, each with its completed tasks
+    /// and the runs that landed them.
+    fn goal_predecessors(&self, task_id: TaskId) -> Result<Vec<GoalPredecessor>>;
     /// Tasks that are `in_progress` right now, in ID order.
     fn tasks_in_progress(&self) -> Result<Vec<Task>>;
     fn add_goal(&mut self, goal: NewGoal) -> Result<Goal>;

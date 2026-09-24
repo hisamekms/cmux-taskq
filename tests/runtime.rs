@@ -82,6 +82,7 @@ fn add_ready_task(queue: &mut SqliteQueue, title: &str, dependencies: &[TaskId])
             required_evidence: Vec::new(),
             paths: Vec::new(),
             dependencies: dependencies.to_vec(),
+            goal_dependencies: Vec::new(),
             goal_id: None,
             context: String::new(),
         })
@@ -3522,6 +3523,7 @@ fn add_file_task(
             required_evidence: Vec::new(),
             paths: Vec::new(),
             dependencies: vec![],
+            goal_dependencies: Vec::new(),
             goal_id: None,
             context: String::new(),
         })
@@ -3629,6 +3631,7 @@ fn awaiting_run() -> (TempDir, PathBuf, PathBuf, TaskRun) {
             required_evidence: Vec::new(),
             paths: Vec::new(),
             dependencies: vec![TaskId::new(1)],
+            goal_dependencies: Vec::new(),
             goal_id: None,
             context: String::new(),
         })
@@ -4113,6 +4116,7 @@ fn add_ready_task_in(
             required_evidence: Vec::new(),
             paths: Vec::new(),
             dependencies: vec![],
+            goal_dependencies: Vec::new(),
             goal_id,
             context: context.into(),
         })
@@ -5918,6 +5922,7 @@ fn verification_failure_after_rebase_needs_a_session_and_keeps_the_rebased_tree(
             required_evidence: Vec::new(),
             paths: Vec::new(),
             dependencies: vec![],
+            goal_dependencies: Vec::new(),
             goal_id: None,
             context: String::new(),
         })
@@ -6469,7 +6474,7 @@ fn start_run_under_dead_supervisor(
     let task = queue.show(run.task_id()).unwrap().task;
     fs::write(
         run_dir.join("prompt.txt"),
-        runtime::prompt(&task, &run, None, &[], &[]).unwrap(),
+        runtime::prompt(&task, &run, None, &[], &[], &[]).unwrap(),
     )
     .unwrap();
     repository.create_worktree(&run).unwrap();
@@ -8333,6 +8338,7 @@ fn dagq_toml_run_env_reaches_the_workspace_and_the_verification_commands() {
             required_evidence: Vec::new(),
             paths: Vec::new(),
             dependencies: vec![],
+            goal_dependencies: Vec::new(),
             goal_id: None,
             context: String::new(),
         })
@@ -8412,6 +8418,7 @@ fn evidence_fixture(evidence: &[EvidenceCheck]) -> (TempDir, PathBuf, PathBuf) {
             required_evidence: evidence.to_vec(),
             paths: Vec::new(),
             dependencies: Vec::new(),
+            goal_dependencies: Vec::new(),
             goal_id: None,
             context: String::new(),
         })
@@ -8634,6 +8641,7 @@ fn scope_fixture(paths: &[&str]) -> (TempDir, PathBuf, PathBuf) {
             required_evidence: Vec::new(),
             paths: paths.iter().map(|p| (*p).to_owned()).collect(),
             dependencies: Vec::new(),
+            goal_dependencies: Vec::new(),
             goal_id: None,
             context: String::new(),
         })

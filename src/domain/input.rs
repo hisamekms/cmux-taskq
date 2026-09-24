@@ -17,6 +17,10 @@ pub struct NewTask {
     pub acceptance: String,
     pub verification_commands: Vec<String>,
     pub dependencies: Vec<TaskId>,
+    /// Goals the task waits for until each is closed as achieved
+    /// (ADR-0038); never its own goal.
+    #[serde(default)]
+    pub goal_dependencies: Vec<GoalId>,
     /// Goal the task belongs to; must be open at registration.
     pub goal_id: Option<GoalId>,
     /// Why the task exists and what to read first; carried into the prompt.
@@ -61,6 +65,17 @@ impl NewTask {
         require(self.goal_id.is_none_or(|id| id.as_i64() > 0), || {
             DomainError::NonPositiveId { field: "goal ID" }
         })?;
+        require(
+            self.goal_dependencies.iter().all(|id| id.as_i64() > 0),
+            || DomainError::NonPositiveId {
+                field: "goal dependency IDs",
+            },
+        )?;
+        if let Some(goal_id) = self.goal_id
+            && self.goal_dependencies.contains(&goal_id)
+        {
+            return Err(DomainError::OwnGoalDependency { goal_id });
+        }
         scope::validate_path_globs(&self.paths)
     }
 }

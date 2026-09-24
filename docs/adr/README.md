@@ -70,6 +70,7 @@ ADRは、将来の実装や運用に大きな影響を与える決定の理由�
 | [ADR-0035](0035-adr-is-superseded-whole-with-dates-and-banner.md) | ADRは丸ごと置き換え、置き換え・廃止の日付とstatusをfrontmatterと本文冒頭の注記に残す | 2026-09-24 |
 | [ADR-0036](0036-delete-frozen-work-records.md) | 凍結済みのdocs/journal/を削除し、今も効く手順と観測事実だけをdesign文書へ移す | 2026-09-25 |
 | [ADR-0037](0037-follow-up-triage-job-decides-follow-up-drafts.md) | follow_upのdraft taskの採否をsupervisorが起動するheadlessのfollow-up triage jobが決め、判断がつかないものだけinboxで人に聞く |  |
+| [ADR-0038](0038-task-depends-on-a-goal-until-it-is-achieved.md) | taskがgoalに依存でき、依存先のgoalがachievedで閉じるまでclaimされない | 2026-09-25 |
 
 ## 置き換え・廃止されたADR
 

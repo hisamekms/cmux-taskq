@@ -52,9 +52,9 @@ use super::{
     },
     or_none, path_text,
     prompt::{
-        PredecessorSummary, ResumeKind, ResumeRequest, TRIAGE_TOOLS, prompt, resume_request,
-        review_prompt, revise_mismatch_request, revise_request, siblings_in_progress,
-        triage_prompt,
+        GoalPredecessorSummary, PredecessorSummary, ResumeKind, ResumeRequest, TRIAGE_TOOLS,
+        prompt, resume_request, review_prompt, revise_mismatch_request, revise_request,
+        siblings_in_progress, triage_prompt,
     },
     recording::{RecordingBackend, reason_of_error},
     tail, unix_seconds,

@@ -59,6 +59,12 @@ so the run workspace opens outside it: {error:#}", self.layout.queue_hash);
             .iter()
             .map(|predecessor| PredecessorSummary::from_predecessor(&*self.files, predecessor))
             .collect();
+        let goal_predecessors: Vec<GoalPredecessorSummary> = self
+            .queue
+            .goal_predecessors(task.id())?
+            .iter()
+            .map(|goal| GoalPredecessorSummary::from_goal_predecessor(&*self.files, goal))
+            .collect();
         let goal = match task.goal_id() {
             Some(goal_id) => Some(self.queue.show_goal(goal_id)?.goal),
             None => None,
@@ -66,7 +72,15 @@ so the run workspace opens outside it: {error:#}", self.layout.queue_hash);
         let siblings = siblings_in_progress(&task, self.queue.tasks_in_progress()?);
         self.files.write(
             &run_dir.join("prompt.txt"),
-            prompt(&task, &run, goal.as_ref(), &predecessors, &siblings)?.as_bytes(),
+            prompt(
+                &task,
+                &run,
+                goal.as_ref(),
+                &predecessors,
+                &goal_predecessors,
+                &siblings,
+            )?
+            .as_bytes(),
         )?;
         // A running wrapper must not change when the development binary is rebuilt.
         self.files

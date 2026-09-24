@@ -644,6 +644,7 @@ mod tests {
                 acceptance: String::new(),
                 verification_commands: Vec::new(),
                 dependencies: Vec::new(),
+                goal_dependencies: Vec::new(),
                 goal_id: None,
                 context: String::new(),
                 required_evidence: Vec::new(),

@@ -95,6 +95,7 @@ pub fn task_detail(detail: &TaskDetail, events: usize) -> Value {
     json!({
         "task": task,
         "dependencies": detail.dependencies,
+        "goal_dependencies": detail.goal_dependencies,
         "runs": runs,
         "runs_total": detail.runs.len(),
         "events": events,
@@ -153,7 +154,8 @@ fn event_gist(event: &RunEvent) -> Value {
 }
 
 /// `goal show` without `--full`: the goal with long texts truncated, every
-/// task's id, status and title, and the kind and time of the latest events.
+/// task's id, status and title, the unfinished tasks waiting for the goal
+/// (`dependents`), and the kind and time of the latest events.
 pub fn goal_detail(detail: &GoalDetail) -> Value {
     let mut goal = object(&detail.goal);
     truncate_fields(
@@ -168,6 +170,7 @@ pub fn goal_detail(detail: &GoalDetail) -> Value {
         "goal": goal,
         "closed": detail.closed,
         "tasks": detail.tasks,
+        "dependents": detail.dependents,
         "events": events,
         "events_total": detail.events.len(),
         "observations": observations(&detail.events),
@@ -258,6 +261,7 @@ mod tests {
         let detail = TaskDetail {
             task: task(&"d".repeat(TEXT_LIMIT + 5)),
             dependencies: vec![TaskId::new(3)],
+            goal_dependencies: vec![GoalId::new(4)],
             runs: vec![run("a"), run("b")],
             events: (1..=12)
                 .map(|id| {
@@ -281,6 +285,7 @@ mod tests {
         assert_eq!(view["task"]["acceptance"], "short");
         assert_eq!(view["task"]["verification_commands"], json!(["true"]));
         assert_eq!(view["runs_total"], 2);
+        assert_eq!(view["goal_dependencies"], json!([4]));
         let runs = view["runs"].as_array().unwrap();
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0]["id"], "b");
@@ -311,6 +316,7 @@ mod tests {
         let detail = TaskDetail {
             task: task("short"),
             dependencies: vec![],
+            goal_dependencies: vec![],
             runs: vec![],
             events: vec![],
             processes: vec![],
@@ -344,6 +350,11 @@ mod tests {
                 title: "t".into(),
                 status: TaskStatus::Ready,
             }],
+            dependents: vec![GoalTask {
+                id: TaskId::new(5),
+                title: "waits".into(),
+                status: TaskStatus::Draft,
+            }],
             events: (1..=11).map(|id| event(id, json!({"goal": {}}))).collect(),
         };
         let view = goal_detail(&detail);
@@ -353,6 +364,10 @@ mod tests {
         assert_eq!(
             view["tasks"],
             json!([{"id": 2, "title": "t", "status": "ready"}])
+        );
+        assert_eq!(
+            view["dependents"],
+            json!([{"id": 5, "title": "waits", "status": "draft"}])
         );
         assert_eq!(view["events_total"], 11);
         let events = view["events"].as_array().unwrap();
@@ -375,6 +390,7 @@ mod tests {
         let detail = TaskDetail {
             task: task("short"),
             dependencies: vec![],
+            goal_dependencies: vec![],
             runs: vec![],
             events,
             processes: vec![],

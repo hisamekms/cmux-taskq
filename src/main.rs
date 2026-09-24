@@ -54,6 +54,10 @@ enum Command {
         verification_commands: Vec<String>,
         #[arg(long = "depends-on")]
         dependencies: Vec<i64>,
+        /// Goal the task waits for until it is closed as achieved; repeatable. Never the
+        /// task's own goal.
+        #[arg(long = "depends-on-goal")]
+        goal_dependencies: Vec<i64>,
         /// Open goal the task belongs to.
         #[arg(long = "goal")]
         goal_id: Option<i64>,
@@ -110,7 +114,8 @@ enum Command {
     Draft { id: i64 },
     /// Cancel a draft or ready task. Does not satisfy its dependents.
     Cancel { id: i64 },
-    /// Manage prerequisites; TASK depends on PREDECESSOR.
+    /// Manage prerequisites; TASK depends on PREDECESSOR, or with --goal on a goal
+    /// that must be closed as achieved first.
     Dependency {
         #[command(subcommand)]
         command: DependencyCommand,
@@ -176,11 +181,14 @@ enum Command {
         #[arg(long, default_value_t = 20, value_parser = clap::value_parser!(u32).range(1..))]
         limit: u32,
     },
-    /// List ready tasks whose prerequisites are all completed and whose goal is not a draft; does not claim.
+    /// List ready tasks whose prerequisites are all completed, whose goal dependencies are all
+    /// closed as achieved and whose goal is not a draft; does not claim.
     Candidates,
     /// Show the unfinished tasks' dependencies: per task its direct predecessors (`depends_on`),
-    /// the unfinished ones (`ready_after`), the tasks it blocks directly and how many it
-    /// releases transitively (`unblocks`); `candidates` in claim order and the `critical` chain.
+    /// its goal dependencies (`goal_dependencies`), what it still waits for (`ready_after`: unfinished
+    /// predecessors, then `{"goal": ID}` for goals not closed as achieved), the tasks it blocks
+    /// directly (including those waiting for its open goal) and how many it releases transitively
+    /// (`unblocks`); `candidates` in claim order and the `critical` chain.
     Graph {
         /// Only this goal's tasks and candidates; counts still span every goal.
         #[arg(long = "goal")]
@@ -439,8 +447,22 @@ enum AskCommand {
 
 #[derive(Subcommand)]
 enum DependencyCommand {
-    Add { task: i64, predecessor: i64 },
-    Remove { task: i64, predecessor: i64 },
+    Add {
+        task: i64,
+        #[arg(required_unless_present = "goal")]
+        predecessor: Option<i64>,
+        /// A goal instead of a predecessor task: TASK waits until it is closed as achieved.
+        #[arg(long, conflicts_with = "predecessor")]
+        goal: Option<i64>,
+    },
+    Remove {
+        task: i64,
+        #[arg(required_unless_present = "goal")]
+        predecessor: Option<i64>,
+        /// Remove the dependency on this goal instead of a predecessor task.
+        #[arg(long, conflicts_with = "predecessor")]
+        goal: Option<i64>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -642,6 +664,7 @@ fn execute(cli: Cli) -> Result<Value> {
             acceptance,
             verification_commands,
             dependencies,
+            goal_dependencies,
             goal_id,
             context,
             required_evidence,
@@ -653,6 +676,7 @@ fn execute(cli: Cli) -> Result<Value> {
                 acceptance,
                 verification_commands,
                 dependencies: dependencies.into_iter().map(TaskId::new).collect(),
+                goal_dependencies: goal_dependencies.into_iter().map(GoalId::new).collect(),
                 goal_id: goal_id.map(GoalId::new),
                 context,
                 required_evidence: required_evidence
@@ -708,16 +732,39 @@ fn execute(cli: Cli) -> Result<Value> {
             serde_json::to_value(queue.transition(TaskId::new(id), TaskAction::Cancel)?)?
         }
         Command::Dependency { command } => {
-            let id = match command {
-                DependencyCommand::Add { task, predecessor } => {
-                    queue.add_dependency(TaskId::new(task), TaskId::new(predecessor))?;
-                    task
-                }
-                DependencyCommand::Remove { task, predecessor } => {
-                    queue.remove_dependency(TaskId::new(task), TaskId::new(predecessor))?;
-                    task
-                }
-            };
+            let id =
+                match command {
+                    DependencyCommand::Add {
+                        task,
+                        predecessor,
+                        goal,
+                    } => {
+                        match (predecessor, goal) {
+                            (_, Some(goal)) => {
+                                queue.add_goal_dependency(TaskId::new(task), GoalId::new(goal))?
+                            }
+                            (Some(predecessor), None) => {
+                                queue.add_dependency(TaskId::new(task), TaskId::new(predecessor))?
+                            }
+                            (None, None) => unreachable!("clap requires a predecessor or --goal"),
+                        }
+                        task
+                    }
+                    DependencyCommand::Remove {
+                        task,
+                        predecessor,
+                        goal,
+                    } => {
+                        match (predecessor, goal) {
+                            (_, Some(goal)) => queue
+                                .remove_goal_dependency(TaskId::new(task), GoalId::new(goal))?,
+                            (Some(predecessor), None) => queue
+                                .remove_dependency(TaskId::new(task), TaskId::new(predecessor))?,
+                            (None, None) => unreachable!("clap requires a predecessor or --goal"),
+                        }
+                        task
+                    }
+                };
             serde_json::to_value(queue.show(TaskId::new(id))?)?
         }
         Command::Goal { command } => match command {

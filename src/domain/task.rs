@@ -250,7 +250,9 @@ pub fn check_dependencies_editable(task: &Task) -> Result<(), DomainError> {
 }
 
 /// `creates_cycle` is whether `predecessor_id` already depends on `task_id`,
-/// directly or not; the store finds it over the whole dependency graph.
+/// directly or not; the store finds it over the whole dependency graph,
+/// where a task also waits for the goals it depends on and a goal for its
+/// tasks (ADR-0038).
 pub fn check_acyclic(
     task_id: TaskId,
     predecessor_id: TaskId,
@@ -259,6 +261,47 @@ pub fn check_acyclic(
     require(!creates_cycle, || DomainError::DependencyCycle {
         task_id,
         predecessor_id,
+    })
+}
+
+/// A task never depends on the goal it belongs to: the goal already waits
+/// for it.
+pub fn check_not_own_goal(task: &Task, goal_id: GoalId) -> Result<(), DomainError> {
+    require(task.goal_id != Some(goal_id), || {
+        DomainError::OwnGoalDependency { goal_id }
+    })
+}
+
+/// `creates_cycle` is whether `goal_id` already waits for `task_id`,
+/// directly or not, over the same graph as [`check_acyclic`].
+pub fn check_goal_acyclic(
+    task_id: TaskId,
+    goal_id: GoalId,
+    creates_cycle: bool,
+) -> Result<(), DomainError> {
+    require(!creates_cycle, || DomainError::GoalDependencyCycle {
+        task_id,
+        goal_id,
+    })
+}
+
+/// Whether `task`, moved to `goal_id`, keeps the graph acyclic:
+/// `depends_on_goal` is whether it depends on that goal directly, and
+/// `creates_cycle` whether it waits for the goal at all (the store finds it
+/// over the whole graph). A direct dependency is a dependency on its own
+/// goal; an indirect one a cycle through the goal's membership.
+pub fn check_membership_acyclic(
+    task: &Task,
+    goal_id: GoalId,
+    depends_on_goal: bool,
+    creates_cycle: bool,
+) -> Result<(), DomainError> {
+    require(!depends_on_goal, || DomainError::OwnGoalDependency {
+        goal_id,
+    })?;
+    require(!creates_cycle, || DomainError::GoalMembershipCycle {
+        task_id: task.id,
+        goal_id,
     })
 }
 
@@ -275,6 +318,7 @@ mod tests {
             required_evidence: vec![EvidenceCheck::E2e, EvidenceCheck::E2e],
             paths: vec!["docs/**".into(), "docs/**".into()],
             dependencies: vec![TaskId::new(1)],
+            goal_dependencies: Vec::new(),
             goal_id: Some(GoalId::new(2)),
             context: "c".into(),
         }
@@ -461,6 +505,55 @@ mod tests {
                 .unwrap_err()
                 .to_string(),
             "dependency 1 -> 2 would create a cycle"
+        );
+    }
+
+    #[test]
+    fn a_goal_dependency_is_neither_on_the_own_goal_nor_a_cycle() {
+        let in_goal = Task::restore(TaskRecord {
+            goal_id: Some(GoalId::new(4)),
+            ..record(TaskStatus::Ready)
+        })
+        .unwrap();
+        check_not_own_goal(&in_goal, GoalId::new(3)).unwrap();
+        assert_eq!(
+            check_not_own_goal(&in_goal, GoalId::new(4))
+                .unwrap_err()
+                .to_string(),
+            "a task cannot depend on its own goal 4; the goal already waits for it"
+        );
+        check_goal_acyclic(TaskId::new(5), GoalId::new(3), false).unwrap();
+        assert_eq!(
+            check_goal_acyclic(TaskId::new(5), GoalId::new(3), true)
+                .unwrap_err()
+                .to_string(),
+            "dependency 5 -> goal 3 would create a cycle"
+        );
+        check_membership_acyclic(&in_goal, GoalId::new(3), false, false).unwrap();
+        assert_eq!(
+            check_membership_acyclic(&in_goal, GoalId::new(3), true, true).unwrap_err(),
+            DomainError::OwnGoalDependency {
+                goal_id: GoalId::new(3)
+            }
+        );
+        assert_eq!(
+            check_membership_acyclic(&in_goal, GoalId::new(3), false, true)
+                .unwrap_err()
+                .to_string(),
+            "moving task 5 to goal 3 would create a cycle: the task already waits for the goal"
+        );
+        let mut own = new_task();
+        own.goal_dependencies = vec![GoalId::new(2)];
+        assert_eq!(
+            own.validate().unwrap_err(),
+            DomainError::OwnGoalDependency {
+                goal_id: GoalId::new(2)
+            }
+        );
+        own.goal_dependencies = vec![GoalId::new(0)];
+        assert_eq!(
+            own.validate().unwrap_err().to_string(),
+            "goal dependency IDs must be positive"
         );
     }
 }

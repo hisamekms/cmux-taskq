@@ -41,10 +41,28 @@ pub enum DomainError {
     },
     /// A dependency of a task on itself.
     SelfDependency,
-    /// The predecessor already depends on the task, directly or not.
+    /// The predecessor already depends on the task, directly or not, where
+    /// a task also waits for the goals it depends on and a goal for its
+    /// tasks (ADR-0038).
     DependencyCycle {
         task_id: TaskId,
         predecessor_id: TaskId,
+    },
+    /// A dependency of a task on the goal it belongs to: the goal waits for
+    /// the task, so it is a dependency on itself (ADR-0038).
+    OwnGoalDependency {
+        goal_id: GoalId,
+    },
+    /// The goal already waits for the task, directly or not.
+    GoalDependencyCycle {
+        task_id: TaskId,
+        goal_id: GoalId,
+    },
+    /// Moving the task into the goal would make the goal wait for a task
+    /// that already waits for the goal, directly or not.
+    GoalMembershipCycle {
+        task_id: TaskId,
+        goal_id: GoalId,
     },
     /// A required text field is blank.
     Blank {
@@ -166,6 +184,18 @@ impl fmt::Display for DomainError {
             } => write!(
                 f,
                 "dependency {task_id} -> {predecessor_id} would create a cycle"
+            ),
+            Self::OwnGoalDependency { goal_id } => write!(
+                f,
+                "a task cannot depend on its own goal {goal_id}; the goal already waits for it"
+            ),
+            Self::GoalDependencyCycle { task_id, goal_id } => write!(
+                f,
+                "dependency {task_id} -> goal {goal_id} would create a cycle"
+            ),
+            Self::GoalMembershipCycle { task_id, goal_id } => write!(
+                f,
+                "moving task {task_id} to goal {goal_id} would create a cycle: the task already waits for the goal"
             ),
             Self::Blank { field } => write!(f, "{field} must not be blank"),
             Self::InvalidPathGlob { glob, reason } => {

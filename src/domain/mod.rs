@@ -269,9 +269,9 @@ pub use reason::{Reason, ReasonCode};
 pub use run::TaskRun;
 pub use task::{Task, TaskAction};
 pub use views::{
-    ClaimOutcome, GoalDetail, GoalSummary, GoalTask, IntegrationOutcome, Predecessor, Receipt,
-    ReceiptCheck, RegisteredFollowUp, RunEvent, RunLease, RunPaths, RunProcess,
-    SupervisorRegistration, TaskDetail, TaskStatusCounts, evidence_missing_reason,
+    ClaimOutcome, GoalDetail, GoalPredecessor, GoalSummary, GoalTask, IntegrationOutcome,
+    Predecessor, Receipt, ReceiptCheck, RegisteredFollowUp, RunEvent, RunLease, RunPaths,
+    RunProcess, SupervisorRegistration, TaskDetail, TaskStatusCounts, evidence_missing_reason,
 };
 
 /// A question for a person (ADR-0022): about a task, or one of its runs when
@@ -529,6 +529,7 @@ mod tests {
             required_evidence: Vec::new(),
             paths: Vec::new(),
             dependencies: vec![TaskId::new(0)],
+            goal_dependencies: Vec::new(),
             goal_id: None,
             context: String::new(),
         };
@@ -614,6 +615,7 @@ mod tests {
             required_evidence: vec![EvidenceCheck::E2e, EvidenceCheck::Tests, EvidenceCheck::E2e],
             paths: Vec::new(),
             dependencies: Vec::new(),
+            goal_dependencies: Vec::new(),
             goal_id: None,
             context: String::new(),
         };

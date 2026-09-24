@@ -619,6 +619,7 @@ pub fn register_follow_ups<Q: Queue + ?Sized>(
             required_evidence: Vec::new(),
             paths: Vec::new(),
             dependencies: Vec::new(),
+            goal_dependencies: Vec::new(),
             goal_id: task.goal_id().filter(|_| !goal_closed),
             context: format!(
                 "task {}（{}）の run {run_id} の receipt が提案した follow_up",

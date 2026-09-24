@@ -28,7 +28,7 @@ pub use recording::reason_of_error;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::domain::{
-    EvidenceCheck, GoalId, GoalStatus, RunId, RunStatus, Task, TaskId, TaskStatus,
+    EvidenceCheck, GoalId, GoalStatus, GoalVerdict, RunId, RunStatus, Task, TaskId, TaskStatus,
 };
 
 /// Which task statuses `list` returns.
@@ -94,6 +94,8 @@ pub struct TaskListItem {
     pub goal_id: Option<GoalId>,
     /// IDs of the direct predecessors, ascending.
     pub dependencies: Vec<TaskId>,
+    /// IDs of the goals the task depends on (ADR-0038), ascending.
+    pub goal_dependencies: Vec<GoalId>,
     /// The most recently created run, if any.
     pub latest_run: Option<LatestRun>,
     #[serde(flatten)]
@@ -122,6 +124,7 @@ impl TaskListItem {
     pub fn new(
         task: Task,
         dependencies: Vec<TaskId>,
+        goal_dependencies: Vec<GoalId>,
         latest_run: Option<LatestRun>,
         full: bool,
     ) -> Self {
@@ -141,6 +144,7 @@ impl TaskListItem {
             title: task.title().to_owned(),
             goal_id: task.goal_id(),
             dependencies,
+            goal_dependencies,
             latest_run,
             details,
         }
@@ -159,6 +163,33 @@ pub struct GraphTask {
     pub goal_status: Option<GoalStatus>,
     /// IDs of the direct predecessors, ascending.
     pub depends_on: Vec<TaskId>,
+    /// The goals the task depends on (ADR-0038), ascending.
+    pub goal_dependencies: Vec<GraphGoalDependency>,
+}
+
+/// A goal a task depends on, as `graph` reads it: the goal and its verdict,
+/// absent while the goal is not closed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GraphGoalDependency {
+    pub goal_id: GoalId,
+    pub verdict: Option<GoalVerdict>,
+}
+
+impl GraphGoalDependency {
+    /// Only a goal closed as achieved releases the tasks that wait for it.
+    pub fn is_met(&self) -> bool {
+        self.verdict == Some(GoalVerdict::Achieved)
+    }
+}
+
+/// What an unfinished task still waits for: an unfinished predecessor,
+/// printed as its bare ID, or a goal not closed as achieved, printed as
+/// `{"goal": ID}` (ADR-0038).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(untagged)]
+pub enum WaitFor {
+    Task(TaskId),
+    Goal { goal: GoalId },
 }
 
 /// One read of the queue for `graph`: the unfinished tasks in ID order and
@@ -181,13 +212,18 @@ pub struct GraphNode {
     pub goal_status: Option<GoalStatus>,
     /// Every direct predecessor, ascending.
     pub depends_on: Vec<TaskId>,
-    /// Unfinished tasks that depend on this one directly, ascending.
+    /// Every goal the task depends on, ascending.
+    pub goal_dependencies: Vec<GoalId>,
+    /// Unfinished tasks that depend on this one directly, or on a goal
+    /// this one belongs to that is not closed, ascending.
     pub blocks: Vec<TaskId>,
     /// How many unfinished tasks depend on this one directly or transitively:
     /// the tasks its completion moves closer to running.
     pub unblocks: usize,
-    /// The direct predecessors that are still unfinished, ascending.
-    pub ready_after: Vec<TaskId>,
+    /// The direct predecessors that are still unfinished, ascending, then
+    /// the goals not closed as achieved, ascending: an abandoned goal stays
+    /// here, since it never releases the task.
+    pub ready_after: Vec<WaitFor>,
 }
 
 /// The dependency view of the unfinished tasks.
@@ -207,17 +243,35 @@ pub struct DependencyGraph {
 
 /// Compute the dependency view. Counts always span every unfinished task;
 /// `goal_id` only narrows `tasks`, `candidates` and where `critical` starts
-/// (the chain may then leave the goal). The queue rejects cycles, so the
-/// dependencies form a DAG; a predecessor that is not in `input.tasks` is
-/// finished.
+/// (the chain may then leave the goal). A task that depends on a goal that
+/// is not closed counts as blocked by each unfinished task of that goal.
+/// The queue rejects cycles over tasks and goals, so the dependencies form a
+/// DAG; a predecessor that is not in `input.tasks` is finished.
 pub fn dependency_graph(input: GraphInput, goal_id: Option<GoalId>) -> DependencyGraph {
     use std::collections::{BTreeMap, BTreeSet};
     let open: BTreeSet<TaskId> = input.tasks.iter().map(|task| task.id).collect();
     let mut blocks: BTreeMap<TaskId, Vec<TaskId>> = BTreeMap::new();
+    let mut members: BTreeMap<GoalId, Vec<TaskId>> = BTreeMap::new();
+    for task in &input.tasks {
+        if let Some(goal_id) = task.goal_id {
+            members.entry(goal_id).or_default().push(task.id);
+        }
+    }
     for task in &input.tasks {
         for predecessor in &task.depends_on {
             if open.contains(predecessor) {
                 blocks.entry(*predecessor).or_default().push(task.id);
+            }
+        }
+        // A closed goal no longer waits for its tasks: achieved releases
+        // the task, abandoned never does.
+        for dependency in task
+            .goal_dependencies
+            .iter()
+            .filter(|d| d.verdict.is_none())
+        {
+            for member in members.get(&dependency.goal_id).into_iter().flatten() {
+                blocks.entry(*member).or_default().push(task.id);
             }
         }
     }
@@ -277,6 +331,20 @@ pub fn dependency_graph(input: GraphInput, goal_id: Option<GoalId>) -> Dependenc
                 .iter()
                 .copied()
                 .filter(|id| open.contains(id))
+                .map(WaitFor::Task)
+                .chain(
+                    task.goal_dependencies
+                        .iter()
+                        .filter(|dependency| !dependency.is_met())
+                        .map(|dependency| WaitFor::Goal {
+                            goal: dependency.goal_id,
+                        }),
+                )
+                .collect(),
+            goal_dependencies: task
+                .goal_dependencies
+                .iter()
+                .map(|dependency| dependency.goal_id)
                 .collect(),
             id: task.id,
             status: task.status,
@@ -313,7 +381,14 @@ mod tests {
             goal_id: goal_id.map(GoalId::new),
             goal_status: goal_id.map(|_| GoalStatus::Open),
             depends_on: ids(depends_on),
+            goal_dependencies: Vec::new(),
         }
+    }
+
+    fn waits(ids: &[i64]) -> Vec<WaitFor> {
+        ids.iter()
+            .map(|&id| WaitFor::Task(TaskId::new(id)))
+            .collect()
     }
 
     /// 2 -> {3, 4} -> 5, 1 -> 6 (goal 1), and 7 waits only on the finished 9.
@@ -346,7 +421,7 @@ mod tests {
         );
         assert_eq!(graph.tasks[1].blocks, ids(&[3, 4]));
         assert_eq!(graph.tasks[4].depends_on, ids(&[3, 4]));
-        assert_eq!(graph.tasks[4].ready_after, ids(&[3, 4]));
+        assert_eq!(graph.tasks[4].ready_after, waits(&[3, 4]));
         assert_eq!(graph.tasks[6].depends_on, ids(&[9]));
         assert!(graph.tasks[6].ready_after.is_empty());
         assert_eq!(graph.candidates, ids(&[2, 1, 7]));
@@ -360,6 +435,61 @@ mod tests {
         assert_eq!(tasks, ids(&[1, 6]));
         assert_eq!(graph.candidates, ids(&[1]));
         assert_eq!(graph.critical, ids(&[1, 6]));
+    }
+
+    #[test]
+    fn a_goal_dependency_waits_on_the_goal_and_counts_its_tasks_as_blockers() {
+        let depend = |id: i64, goal: i64, verdict: Option<GoalVerdict>| GraphTask {
+            goal_dependencies: vec![GraphGoalDependency {
+                goal_id: GoalId::new(goal),
+                verdict,
+            }],
+            status: TaskStatus::Ready,
+            ..task(id, None, &[])
+        };
+        // Goal 1 holds 1 and 6 (open); 8 waits for goal 1, 9 for the
+        // abandoned goal 2 (holding 10), 11 for the achieved goal 3.
+        let mut input = input();
+        input.tasks.push(depend(8, 1, None));
+        input.tasks.push(depend(9, 2, Some(GoalVerdict::Abandoned)));
+        input.tasks.push(task(10, Some(2), &[]));
+        input.tasks.push(depend(11, 3, Some(GoalVerdict::Achieved)));
+        input.candidates = ids(&[1, 2, 7, 10, 11]);
+        let graph = dependency_graph(input, None);
+        let node = |id: i64| graph.tasks.iter().find(|t| t.id.as_i64() == id).unwrap();
+        assert_eq!(node(1).blocks, ids(&[6, 8]));
+        assert_eq!(node(1).unblocks, 2);
+        assert_eq!(node(6).blocks, ids(&[8]));
+        assert_eq!(node(8).goal_dependencies, [GoalId::new(1)]);
+        assert_eq!(
+            node(8).ready_after,
+            [WaitFor::Goal {
+                goal: GoalId::new(1)
+            }]
+        );
+        assert_eq!(
+            serde_json::to_value(&node(8).ready_after).unwrap(),
+            serde_json::json!([{"goal": 1}])
+        );
+        // The abandoned goal never releases 9 and no longer waits for 10.
+        assert_eq!(
+            node(9).ready_after,
+            [WaitFor::Goal {
+                goal: GoalId::new(2)
+            }]
+        );
+        assert!(node(10).blocks.is_empty());
+        assert!(node(11).ready_after.is_empty());
+        assert_eq!(graph.candidates, ids(&[2, 1, 7, 10, 11]));
+        assert_eq!(graph.critical, ids(&[2, 3, 5]));
+        let in_goal = dependency_graph(
+            GraphInput {
+                tasks: vec![task(1, Some(1), &[]), depend(8, 1, None)],
+                candidates: ids(&[1]),
+            },
+            Some(GoalId::new(1)),
+        );
+        assert_eq!(in_goal.critical, ids(&[1, 8]));
     }
 
     #[test]
