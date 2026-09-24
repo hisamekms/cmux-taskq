@@ -369,6 +369,8 @@ git push origin v0.4.0
 
 Trusted Publishing can only be configured for a crate that exists, so the first publish is done once by hand, as ADR-0030 describes: verify your email address in crates.io Account Settings (an unverified account cannot publish), create a short-lived crates.io API token with the `publish-new` scope, `cargo login` with it and `cargo publish --locked` from a clean checkout of `main`, revoke the token and `cargo logout`; then in the crate's Settings → Trusted Publishing on crates.io add a GitHub publisher with owner `hisamekms`, repository `dagq`, workflow `release.yml` and no environment. From the next tag on, crates.io gets the new version automatically.
 
+The step-by-step procedure for a release, including how to confirm the first automatic crates.io publish, is the repository's release skill [`.claude/skills/release/SKILL.md`](.claude/skills/release/SKILL.md).
+
 ## Documentation
 
 - [Documentation guide](docs/README.md)
