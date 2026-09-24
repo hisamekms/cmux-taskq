@@ -4,33 +4,39 @@
 //! supervisor; the loop multiplexes independent slots and isolates failures.
 //! A run whose supervisor died while its session lives on is adopted by a
 //! supervisor with a free slot instead of being rerun (ADR-0012).
+pub use crate::application::{
+    integrate::{
+        IntegrateTarget, integrate_logs, integrate_verify_log, next_integrate_attempt,
+        register_follow_ups,
+    },
+    prompt::{PredecessorSummary, STOP_BACKGROUND, WORKER_READING, prompt, siblings_in_progress},
+};
 use crate::{
     application::{
         AgentProvider, Clock, Generators, MainRemote, SupervisorEnvironment, TaskStore,
         WorkspaceBackend, WorkspaceTags, dependency_graph,
+        integrate::{self as integration, Integration, check_receipt, log_names, resume_attempts},
+        tail,
     },
     domain::{
         AskKind, ClaimOutcome, CommitSha, EvidenceCheck, Goal, IntegrationOutcome, LANDING_OPTIONS,
-        MAX_RESUME_ATTEMPTS, MAX_REVISE_ATTEMPTS, NewAsk, NewTask, PUSH_REMOTE, Predecessor,
-        PushReport, PushResult, Receipt, ReceiptResult, RegisteredFollowUp, ReviewDecision,
-        ReviewVerdict, RunId, RunLease, RunPaths, RunProcess, RunStatus, SessionRole,
-        SupervisorMode, SupervisorRegistration, TRIAGE_OPTIONS, TRIAGE_RETRY_FAILURES, Task,
-        TaskAction, TaskDetail, TaskId, TaskRun, TaskStatus, TriageDecision, TriageState,
-        TriageVerdict, evidence_missing_reason, heartbeat_stale,
-        scope::{out_of_scope, scope_violation_reason},
-        triage_state,
+        MAX_RESUME_ATTEMPTS, MAX_REVISE_ATTEMPTS, NewAsk, Predecessor, Receipt, ReceiptResult,
+        ReviewDecision, ReviewVerdict, RunId, RunLease, RunPaths, RunProcess, RunStatus,
+        SessionRole, SupervisorMode, SupervisorRegistration, TRIAGE_OPTIONS, TRIAGE_RETRY_FAILURES,
+        Task, TaskAction, TaskDetail, TaskId, TaskRun, TaskStatus, TriageDecision, TriageState,
+        TriageVerdict, heartbeat_stale, triage_state,
     },
     infrastructure::{
         adapters::{
-            ClaudeCode, GitRepository, ask_notification_title, load_average, path_text,
-            process_alive, resume_workspace_description, run_shell_to_log, shell_join,
+            ClaudeCode, GitRepository, SystemProcesses, ask_notification_title, load_average,
+            path_text, process_alive, resume_workspace_description, shell_join,
             workspace_description, workspace_group_name,
         },
         clock::{self, SystemClock},
         location::{QueueLocation, runs_dir},
-        run_env::load_run_env,
+        run_env::{ShellVerifier, load_run_env},
         runtime_store::{
-            HEARTBEAT_TIMEOUT_SECS, Landing, LeasedRun, ResumeCandidate, RunPlan, TRIAGE_ASKER,
+            HEARTBEAT_TIMEOUT_SECS, LeasedRun, ResumeCandidate, RunPlan, TRIAGE_ASKER,
             TriageAction, Validation, lease_is_stale,
         },
         sqlite::SqliteQueue,
@@ -1414,17 +1420,26 @@ impl Supervisor<'_> {
             .is_none_or(|e| e.payload.get("push") != Some(&json!(false)));
         let generators = self.generators.clone();
         Ok(thread::spawn(move || {
-            let mut queue = SqliteQueue::open(&db)?.with_generators(generators);
-            land_integrating(
-                &mut queue,
-                &db,
-                &repository,
+            let mut queue = SqliteQueue::open(&db)?.with_generators(generators.clone());
+            let verifier = ShellVerifier {
+                checkout: main_checkout(&repository),
+                db,
+            };
+            integration::land_integrating(
+                &mut Integration {
+                    queue: &mut queue,
+                    repository: &repository,
+                    verifier: &verifier,
+                    remote: push.then_some(&repository as &dyn MainRemote),
+                    common_dir: &common_dir,
+                    clock: &*generators.clock,
+                    ids: &*generators.ids,
+                    processes: &SystemProcesses,
+                },
                 &run,
                 previous,
                 &main,
                 &token,
-                &common_dir,
-                push.then_some(&repository as &dyn MainRemote),
             )
         }))
     }
@@ -4027,15 +4042,6 @@ fn screen_tail(screen: &str, count: usize) -> String {
     lines[lines.len().saturating_sub(count)..].join("\n")
 }
 
-/// How many resumes of the run were started, for a resume error recorded
-/// outside the resume watch; unreadable counts as the last attempt.
-fn resume_attempts(queue: &SqliteQueue, id: &RunId) -> usize {
-    queue
-        .run_events(id)
-        .map(|events| events.iter().filter(|e| e.kind == "resume_started").count())
-        .unwrap_or(MAX_RESUME_ATTEMPTS)
-}
-
 /// What the resolution request tells a resumed session.
 struct ResumeRequest {
     /// The `main` head the session rebases onto.
@@ -5423,155 +5429,6 @@ fn close_workspace(
     }
 }
 
-struct Rejection {
-    reason: String,
-    commit: Option<CommitSha>,
-    receipt: Option<Receipt>,
-    /// The task's required checks the receipt does not back, when that is
-    /// all that is wrong: the run waits for a session instead of failing.
-    evidence_missing: Vec<EvidenceCheck>,
-    /// The changed paths outside the task's `paths` (ADR-0029), when the
-    /// run is otherwise sound: it waits for a session to take them out.
-    scope_violation: Vec<String>,
-}
-
-fn check_receipt(
-    repository: &GitRepository,
-    task: &Task,
-    run: &TaskRun,
-) -> Result<std::result::Result<(Receipt, CommitSha), Rejection>> {
-    let reject = |reason: String, commit: Option<CommitSha>, receipt: Option<Receipt>| {
-        Ok(Err(Rejection {
-            reason,
-            commit,
-            receipt,
-            evidence_missing: Vec::new(),
-            scope_violation: Vec::new(),
-        }))
-    };
-    let receipt_path = Path::new(run.receipt_path().context("missing receipt path")?);
-    let text = match fs::read_to_string(receipt_path) {
-        Ok(text) => text,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return reject(
-                format!("receipt was not submitted at {}", receipt_path.display()),
-                None,
-                None,
-            );
-        }
-        Err(error) => return Err(error).context("read receipt"),
-    };
-    let receipt = match Receipt::parse(&text) {
-        Ok(receipt) => receipt,
-        Err(error) => return reject(format!("{error:#}"), None, None),
-    };
-    if let Err(error) = receipt.check_requiring(run.id(), task.required_evidence()) {
-        return reject(format!("{error:#}"), None, Some(receipt));
-    }
-    // The commit must be the head of the run branch, checked out in the worktree,
-    // and new work on top of the base commit.
-    let worktree = Path::new(run.worktree_path().context("missing worktree")?);
-    let branch = run.branch().context("missing branch")?;
-    let expected_ref = format!("refs/heads/{branch}");
-    match repository.current_branch(worktree)? {
-        Some(current) if current == expected_ref => (),
-        current => {
-            return reject(
-                format!(
-                    "worktree is on {} instead of {expected_ref}",
-                    current.as_deref().unwrap_or("a detached HEAD")
-                ),
-                None,
-                Some(receipt),
-            );
-        }
-    }
-    let head = repository.head(worktree)?;
-    if head.as_str() != receipt.commit.to_ascii_lowercase() {
-        return reject(
-            format!(
-                "receipt commit {} is not the head of {branch} ({head})",
-                receipt.commit
-            ),
-            None,
-            Some(receipt),
-        );
-    }
-    let commit = head;
-    if commit == *run.base_commit() {
-        return reject(
-            format!("no commit was made on top of base {}", run.base_commit()),
-            Some(commit),
-            Some(receipt),
-        );
-    }
-    if !repository.is_ancestor(run.base_commit().as_str(), commit.as_str())? {
-        return reject(
-            format!(
-                "commit {commit} does not descend from base {}",
-                run.base_commit()
-            ),
-            Some(commit),
-            Some(receipt),
-        );
-    }
-    let status = repository.status(worktree)?;
-    if !status.trim().is_empty() {
-        return reject(
-            format!("worktree is not clean:\n{}", status.trim_end()),
-            Some(commit),
-            Some(receipt),
-        );
-    }
-    // Checked last, like the evidence below: only a run that is otherwise
-    // sound waits for a session to take out what it changed outside the
-    // task's paths (ADR-0029). The diff starts where the branch forked from
-    // the current main, not at the base commit: a resumed session that
-    // rebased carries what other tasks landed since, which is not its change.
-    let outside = if task.paths().is_empty() {
-        Vec::new()
-    } else {
-        let fork = repository
-            .merge_base(repository.main_head()?.as_str(), commit.as_str())?
-            .context("the run branch shares no history with main")?;
-        out_of_scope(
-            task.paths(),
-            &repository.changed_paths(fork.as_str(), commit.as_str())?,
-        )
-    };
-    if !outside.is_empty() {
-        return Ok(Err(Rejection {
-            reason: scope_violation_reason(&outside),
-            commit: Some(commit),
-            receipt: Some(receipt),
-            evidence_missing: Vec::new(),
-            scope_violation: outside,
-        }));
-    }
-    // Only a run that is otherwise sound waits for a session to add the
-    // evidence (ADR-0019 decision 5).
-    let missing = receipt.missing_evidence(task.required_evidence());
-    if !missing.is_empty() {
-        return Ok(Err(Rejection {
-            reason: evidence_missing_reason(&missing),
-            commit: Some(commit),
-            receipt: Some(receipt),
-            evidence_missing: missing,
-            scope_violation: Vec::new(),
-        }));
-    }
-    Ok(Ok((receipt, commit)))
-}
-
-/// Which run `integrate` lands.
-#[derive(Debug, Clone, Copy)]
-pub enum IntegrateTarget {
-    /// The task's run that awaits integration or comes back from a session.
-    Task(TaskId),
-    /// The oldest run awaiting integration by validation time (FIFO).
-    Next,
-}
-
 /// Land one validated run on `main`: take the single integration slot,
 /// rebase the run worktree onto the current `refs/heads/main`, re-validate
 /// (receipt, descent from main, clean tree) and run the verification
@@ -5586,6 +5443,10 @@ pub enum IntegrateTarget {
 /// never changes the landing: its outcome is an event and the `push` of the
 /// result. The landed receipt's `follow_ups` become draft tasks
 /// (ADR-0019 decision 4), listed as the result's `follow_ups`.
+///
+/// The use case is [`integration::begin`] and
+/// [`integration::land_integrating`]; this entry point opens the queue and
+/// the repository and keeps the lease alive in between.
 pub fn integrate(
     db: &Path,
     target: IntegrateTarget,
@@ -5598,707 +5459,34 @@ pub fn integrate(
     let mut queue = SqliteQueue::open(&db)?;
     let repository = GitRepository::inspect(repo)?;
     let common_dir = path_text(&repository.common_dir)?;
-    let bound = queue
-        .repository_binding()?
-        .context("queue is not bound to a repository; no run was supervised")?;
-    ensure!(
-        bound == common_dir,
-        "{} belongs to {common_dir}, but the queue is bound to {bound}",
-        repo.display()
-    );
-    let run = match target {
-        IntegrateTarget::Task(task_id) => {
-            let detail = queue.show(task_id)?;
-            if let Some(busy) = detail
-                .runs
-                .iter()
-                .find(|r| r.status() == RunStatus::Integrating)
-            {
-                bail!(
-                    "run {} of task {task_id} is already integrating (see doctor if it is stuck)",
-                    busy.id()
-                );
-            }
-            detail
-                .runs
-                .iter()
-                .find(|r| {
-                    matches!(
-                        r.status(),
-                        RunStatus::AwaitingIntegration | RunStatus::NeedsSession
-                    )
-                })
-                .cloned()
-                .with_context(|| {
-                    format!(
-                        "task {task_id} ({}) has no run awaiting integration or a session",
-                        detail.task.status().as_str()
-                    )
-                })?
-        }
-        IntegrateTarget::Next => match queue.next_awaiting_integration()? {
-            Some(run) => run,
-            None => return Ok(serde_json::to_value(IntegrationOutcome::NoRunAwaiting)?),
-        },
+    let generators = queue.generators().clone();
+    let verifier = ShellVerifier {
+        checkout: main_checkout(&repository),
+        db: db.clone(),
     };
-    // A run the supervisor holds (its review, ADR-0027, or its resume) is
-    // not approved by a call that cannot land it.
-    if let Some(lease) = queue.run_lease(run.id())?
-        && !lease_is_stale(&lease, queue.generators().clock.now())
-    {
-        bail!(
-            "run {} is held by the supervisor (its review or resume is in progress); see show for its review_finished / resume_finished events",
-            run.id()
-        );
-    }
-    // The call is the approval to land (ADR-0016 decision 5): a run it
-    // parks as `needs_session` is landed by the supervisor once a resumed
-    // session resolved it (ADR-0019 decision 1).
-    if !queue.has_run_event(run.id(), "integration_approved")? {
-        queue.record_runtime_event(
-            run.id(),
-            "integration_approved",
-            json!({"status": run.status().as_str(), "pid": std::process::id(), "push": remote.is_some()}),
-        )?;
-    }
-    let previous = run.status();
-    let token = queue.generators().ids.uuid();
-    let main = repository.main_head()?;
-    let run = queue.begin_integration(run.id(), &token, &main)?;
-    let heartbeat = Heartbeat::start(db.clone(), token.clone(), queue.generators().clone());
-    let outcome = land_integrating(
-        &mut queue,
-        &db,
-        &repository,
-        &run,
-        previous,
-        &main,
-        &token,
-        &common_dir,
+    let mut integration = Integration {
+        queue: &mut queue,
+        repository: &repository,
+        verifier: &verifier,
         remote,
+        common_dir: &common_dir,
+        clock: &*generators.clock,
+        ids: &*generators.ids,
+        processes: &SystemProcesses,
+    };
+    let Some(begun) = integration::begin(&mut integration, target, repo)? else {
+        return Ok(serde_json::to_value(IntegrationOutcome::NoRunAwaiting)?);
+    };
+    let heartbeat = Heartbeat::start(db.clone(), begun.token.clone(), generators.clone());
+    let outcome = integration::land_integrating(
+        &mut integration,
+        &begun.run,
+        begun.previous,
+        &begun.main,
+        &begun.token,
     )?;
     drop(heartbeat); // Stops the lease heartbeat before this process reports.
     Ok(serde_json::to_value(outcome)?)
-}
-
-/// Land a run that holds the integration slot under `token` (see
-/// [`integrate`]) and record the outcome; shared by `integrate` and by the
-/// supervisor landing an approved run it resumed. An error before `main`
-/// moved gives the slot back and returns the run to `previous`.
-#[allow(clippy::too_many_arguments)]
-fn land_integrating(
-    queue: &mut SqliteQueue,
-    db: &Path,
-    repository: &GitRepository,
-    run: &TaskRun,
-    previous: RunStatus,
-    main: &CommitSha,
-    token: &str,
-    common_dir: &str,
-    remote: Option<&dyn MainRemote>,
-) -> Result<IntegrationOutcome> {
-    let task = queue.show(run.task_id())?.task;
-    eprintln!(
-        "run {} integrating task {} onto main {main}",
-        run.id(),
-        run.task_id()
-    );
-    let verdict = match land(queue, db, repository, &task, run, main) {
-        Ok(verdict) => verdict,
-        Err(error) => {
-            // Nothing reached main: give the slot back and keep the run where it was.
-            let message = format!("integration stopped before main moved: {error:#}");
-            if let Err(record) =
-                queue.abort_integration(run.id(), token, previous.as_str(), &message)
-            {
-                eprintln!("run {}: could not record the error: {record:#}", run.id());
-            }
-            return Err(error.context(format!(
-                "run {} returned to {}",
-                run.id(),
-                previous.as_str()
-            )));
-        }
-    };
-    Ok(match verdict {
-        Verdict::Landed(landing, proposed) => {
-            let verification_skipped = landing.verification_skipped;
-            let (task, run) = queue
-                .finish_integration(run.id(), token, &landing, common_dir)
-                .with_context(|| {
-                    format!(
-                        "main advanced to {} but run {} could not be completed; inspect show and doctor",
-                        landing.commit, run.id()
-                    )
-                })?;
-            eprintln!(
-                "task {} landed as {} on main; run {} integrated",
-                task.id(),
-                landing.commit,
-                run.id()
-            );
-            remove_landed_worktree(queue, repository, &run);
-            let push = push_main(queue, remote, run.id(), &landing.commit);
-            let follow_ups = register_follow_ups(queue, &task, run.id(), proposed.as_ref());
-            IntegrationOutcome::Integrated {
-                task: Box::new(task),
-                run: Box::new(run),
-                verification_skipped,
-                push: Box::new(push),
-                follow_ups,
-            }
-        }
-        Verdict::Deferred { reason, mut detail } => {
-            eprintln!("run {} needs a session: {reason}", run.id());
-            // How many more times the supervisor resumes it (ADR-0019); the
-            // event is a person's only once none are left (as an ask).
-            detail["resumes_left"] =
-                json!(MAX_RESUME_ATTEMPTS.saturating_sub(resume_attempts(queue, run.id())));
-            let run = queue.defer_integration(run.id(), token, &reason, detail)?;
-            IntegrationOutcome::NeedsSession {
-                run: Box::new(run),
-                main: main.clone(),
-                reason,
-            }
-        }
-        Verdict::ReceiptFailed { reason, receipt } => {
-            eprintln!("run {} failed: {reason}", run.id());
-            let run = queue.fail_integration(run.id(), token, &reason, receipt)?;
-            IntegrationOutcome::Failed {
-                run: Box::new(run),
-                reason,
-            }
-        }
-    })
-}
-
-/// Push the landed `main` to [`PUSH_REMOTE`] and record the outcome as
-/// `push_finished`, `push_skipped` or `push_failed` on the landed run. A
-/// failure to record is only reported: the landing stands either way.
-fn push_main(
-    queue: &SqliteQueue,
-    remote: Option<&dyn MainRemote>,
-    run_id: &RunId,
-    commit: &CommitSha,
-) -> PushReport {
-    let skipped = |reason: &str| PushReport {
-        outcome: PushResult::Skipped,
-        remote: PUSH_REMOTE.to_owned(),
-        error: None,
-        reason: Some(reason.to_owned()),
-    };
-    let report = match remote {
-        None => skipped("--no-push"),
-        Some(remote) => match remote.has_remote(PUSH_REMOTE) {
-            Ok(false) => skipped(&format!("the repository has no remote {PUSH_REMOTE}")),
-            Ok(true) => match remote.push_main(PUSH_REMOTE) {
-                Ok(()) => PushReport {
-                    outcome: PushResult::Pushed,
-                    remote: PUSH_REMOTE.to_owned(),
-                    error: None,
-                    reason: None,
-                },
-                Err(error) => failed_push(&error),
-            },
-            Err(error) => failed_push(&error),
-        },
-    };
-    let (kind, payload) = match report.outcome {
-        PushResult::Pushed => (
-            "push_finished",
-            json!({"remote": report.remote, "commit": commit}),
-        ),
-        PushResult::Skipped => (
-            "push_skipped",
-            json!({"remote": report.remote, "commit": commit, "reason": report.reason}),
-        ),
-        PushResult::Failed => (
-            "push_failed",
-            json!({"remote": report.remote, "commit": commit, "error": report.error}),
-        ),
-    };
-    match &report.error {
-        Some(error) => eprintln!("run {run_id}: push of main failed: {error}"),
-        None => eprintln!("run {run_id}: {kind} ({PUSH_REMOTE})"),
-    }
-    if let Err(error) = queue.record_runtime_event(run_id, kind, payload) {
-        eprintln!("run {run_id}: could not record {kind}: {error:#}");
-    }
-    report
-}
-
-fn failed_push(error: &anyhow::Error) -> PushReport {
-    PushReport {
-        outcome: PushResult::Failed,
-        remote: PUSH_REMOTE.to_owned(),
-        error: Some(format!("{error:#}")),
-        reason: None,
-    }
-}
-
-/// Register the landed receipt's `follow_ups` of `task`'s run `run_id` as
-/// draft tasks of the task's goal (ADR-0019 decision 4): the title and
-/// description as proposed, no acceptance, verification commands or
-/// dependencies, and a context naming where they came from. A closed goal
-/// takes no task, so the follow-up is registered without a goal and its
-/// `follow_up_registered` says `goal_closed: true`. An entry whose `title`
-/// is not a non-blank string or whose `description` is not a string is not
-/// registered: its `follow_up_registered` has `task_id: null`, the `skipped`
-/// reason and the entry itself as `follow_up`. Every event carries the
-/// entry's `index`, and an entry already recorded is not looked at again, so
-/// a second call for the same run adds nothing (the task and its event are
-/// written one after the other, so only a failure to record between them
-/// could let a later call register it twice). A registration that fails is
-/// only reported: the landing stands either way. Returns what this call
-/// registered.
-pub fn register_follow_ups(
-    queue: &mut SqliteQueue,
-    task: &Task,
-    run_id: &RunId,
-    follow_ups: Option<&Value>,
-) -> Vec<RegisteredFollowUp> {
-    let Some(entries) = follow_ups.and_then(Value::as_array) else {
-        return Vec::new();
-    };
-    let registered: Vec<u64> = match queue.run_events(run_id) {
-        Ok(events) => events
-            .iter()
-            .filter(|e| e.kind == "follow_up_registered")
-            .filter_map(|e| e.payload["index"].as_u64())
-            .collect(),
-        Err(error) => {
-            eprintln!("run {run_id}: follow_ups not registered: {error:#}");
-            return Vec::new();
-        }
-    };
-    let goal_closed = match task.goal_id() {
-        Some(goal_id) => match queue.show_goal(goal_id) {
-            Ok(detail) => detail.closed,
-            Err(error) => {
-                eprintln!("run {run_id}: follow_ups not registered: {error:#}");
-                return Vec::new();
-            }
-        },
-        None => false,
-    };
-    let mut added = Vec::new();
-    for (index, entry) in entries.iter().enumerate() {
-        if registered.contains(&(index as u64)) {
-            continue;
-        }
-        let title = entry["title"].as_str().map(str::trim).unwrap_or_default();
-        let description = entry["description"].as_str();
-        let skipped = if title.is_empty() {
-            Some("title is not a non-blank string")
-        } else if description.is_none() {
-            Some("description is not a string")
-        } else {
-            None
-        };
-        if let Some(reason) = skipped {
-            eprintln!("run {run_id}: follow_up {index} was not registered: {reason}");
-            let payload = json!({
-                "task_id": null,
-                "title": entry["title"],
-                "index": index,
-                "skipped": reason,
-                "follow_up": entry,
-            });
-            if let Err(error) = queue.record_runtime_event(run_id, "follow_up_registered", payload)
-            {
-                eprintln!("run {run_id}: could not record follow_up_registered: {error:#}");
-            }
-            continue;
-        }
-        let new = NewTask {
-            title: title.to_owned(),
-            description: description.unwrap_or_default().to_owned(),
-            acceptance: String::new(),
-            verification_commands: Vec::new(),
-            required_evidence: Vec::new(),
-            paths: Vec::new(),
-            dependencies: Vec::new(),
-            goal_id: task.goal_id().filter(|_| !goal_closed),
-            context: format!(
-                "task {}（{}）の run {run_id} の receipt が提案した follow_up",
-                task.id(),
-                task.title()
-            ),
-        };
-        let created = match queue.add(new) {
-            Ok(created) => created,
-            Err(error) => {
-                eprintln!("run {run_id}: follow_up {title:?} was not registered: {error:#}");
-                continue;
-            }
-        };
-        let mut payload =
-            json!({"task_id": created.id(), "title": created.title(), "index": index});
-        if goal_closed {
-            payload["goal_closed"] = json!(true);
-        }
-        if let Err(error) = queue.record_runtime_event(run_id, "follow_up_registered", payload) {
-            eprintln!("run {run_id}: could not record follow_up_registered: {error:#}");
-        }
-        eprintln!(
-            "run {run_id}: follow_up {:?} registered as draft task {}",
-            created.title(),
-            created.id()
-        );
-        added.push(RegisteredFollowUp {
-            task_id: created.id(),
-            title: created.title().to_owned(),
-        });
-    }
-    added
-}
-
-enum Verdict {
-    /// Landed with the receipt's `follow_ups`.
-    Landed(Landing, Option<Value>),
-    /// Re-validation did not pass; the worktree is left for a session.
-    Deferred { reason: String, detail: Value },
-    /// The session's rewritten receipt reports `failed`; `receipt` is its
-    /// JSON, kept with the `integration_failed` event.
-    ReceiptFailed { reason: String, receipt: Value },
-}
-
-/// Rebase, re-validate and land one run. `Ok(Deferred)` and
-/// `Ok(ReceiptFailed)` are verdicts on the run; `Err` is a failure of the
-/// landing itself (Git, files) before `main` moved.
-fn land(
-    queue: &mut SqliteQueue,
-    db: &Path,
-    repository: &GitRepository,
-    task: &Task,
-    run: &TaskRun,
-    main: &CommitSha,
-) -> Result<Verdict> {
-    let defer = |reason: String, detail: Value| Ok(Verdict::Deferred { reason, detail });
-    let worktree = Path::new(run.worktree_path().context("missing worktree")?);
-    ensure!(
-        worktree.is_dir(),
-        "worktree {} is missing",
-        worktree.display()
-    );
-    // A worktree whose queue directory moved is still found through its own
-    // `.git` file, but the repository's record of it points at the old path
-    // until repaired, and removing it after landing would fail (ADR-0017).
-    repository.repair_worktree(worktree)?;
-    let branch = run.branch().context("missing branch")?;
-    let run_dir = Path::new(run.run_dir().context("missing run directory")?);
-    // A rebase left behind by a crashed landing or an unfinished session is undone first.
-    if repository.rebase_in_progress(worktree)? {
-        repository.rebase_abort(worktree)?;
-        queue.record_runtime_event(
-            run.id(),
-            "integration_rebase_aborted",
-            json!({"reason": "a rebase was left in progress"}),
-        )?;
-    }
-    let expected_ref = format!("refs/heads/{branch}");
-    match repository.current_branch(worktree)? {
-        Some(current) if current == expected_ref => (),
-        current => {
-            return defer(
-                format!(
-                    "worktree is on {} instead of {expected_ref}",
-                    current.as_deref().unwrap_or("a detached HEAD")
-                ),
-                json!({}),
-            );
-        }
-    }
-    let head = repository.head(worktree)?;
-    // The receipt must describe this head: the validated one for a fresh run,
-    // the one the session rewrote after resolving otherwise. A stale receipt
-    // means the session is not done.
-    let receipt_path = Path::new(run.receipt_path().context("missing receipt path")?);
-    let receipt = match fs::read_to_string(receipt_path) {
-        Ok(text) => match Receipt::parse(&text) {
-            Ok(receipt) => receipt,
-            Err(error) => return defer(format!("{error:#}"), json!({})),
-        },
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return defer(
-                format!("receipt is missing at {}", receipt_path.display()),
-                json!({}),
-            );
-        }
-        Err(error) => return Err(error).context("read receipt"),
-    };
-    if receipt.result == ReceiptResult::Failed {
-        return Ok(Verdict::ReceiptFailed {
-            reason: format!("session reported the run as failed: {}", receipt.summary),
-            receipt: serde_json::to_value(&receipt)?,
-        });
-    }
-    if let Err(error) = receipt.check_requiring(run.id(), task.required_evidence()) {
-        return defer(format!("{error:#}"), json!({}));
-    }
-    // A resumed session may have come back without the evidence it was
-    // asked for; `checks` tells the next resume to ask for it again.
-    let missing = receipt.missing_evidence(task.required_evidence());
-    if !missing.is_empty() {
-        return defer(
-            evidence_missing_reason(&missing),
-            json!({"checks": missing}),
-        );
-    }
-    // The receipt read here is the one that lands (or the one a session
-    // rewrote after resolving), so it is recorded whatever happens next: the
-    // DB otherwise keeps only the receipt seen at validation time.
-    queue.record_runtime_event(
-        run.id(),
-        "integration_receipt",
-        json!({
-            "main": main,
-            "commit": receipt.commit,
-            "receipt": serde_json::to_value(&receipt)?,
-        }),
-    )?;
-    if head.as_str() != receipt.commit.to_ascii_lowercase() {
-        return defer(
-            format!(
-                "receipt commit {} is not the head of {branch} ({head}); rerun the verification commands and rewrite the receipt for the current head",
-                receipt.commit
-            ),
-            json!({"head": head}),
-        );
-    }
-    let status = repository.status(worktree)?;
-    if !status.trim().is_empty() {
-        return defer(
-            format!("worktree is not clean:\n{}", status.trim_end()),
-            json!({"head": head}),
-        );
-    }
-    // Onto the current main. A no-op when the run already sits on it.
-    if let Err(output) = repository.rebase(worktree, main.as_str())? {
-        let conflicts = repository.conflicted_files(worktree).unwrap_or_default();
-        if repository.rebase_in_progress(worktree)? {
-            repository.rebase_abort(worktree)?;
-        }
-        return defer(
-            format!(
-                "rebase onto main {main} conflicted in {}; resolve it in the worktree (git rebase {main}), rerun the verification commands, and rewrite the receipt with the new head",
-                if conflicts.is_empty() {
-                    "the run branch".to_owned()
-                } else {
-                    conflicts.join(", ")
-                }
-            ),
-            json!({
-                "main": main,
-                "head": head,
-                "conflicts": conflicts,
-                "output_tail": tail(&output, 2000),
-                "aborted": true,
-            }),
-        );
-    }
-    let rebased = repository.head(worktree)?;
-    queue.record_runtime_event(
-        run.id(),
-        "integration_rebased",
-        json!({"main": main, "head_before": head, "head_after": rebased}),
-    )?;
-    if rebased == *main {
-        return defer(
-            format!(
-                "no commit remains on top of main {main} after the rebase; if the change is no longer needed, write a failed receipt with the reason"
-            ),
-            json!({"main": main, "head": rebased}),
-        );
-    }
-    ensure!(
-        repository.is_ancestor(main.as_str(), rebased.as_str())?,
-        "rebased head {rebased} does not descend from main {main}"
-    );
-    let status = repository.status(worktree)?;
-    if !status.trim().is_empty() {
-        return defer(
-            format!(
-                "worktree is not clean after the rebase:\n{}",
-                status.trim_end()
-            ),
-            json!({"main": main, "head": rebased}),
-        );
-    }
-    // What lands is the squash of main..rebased, so that is the diff held to
-    // the task's paths (ADR-0029): the rebase may have changed it since
-    // validation, and a resumed session may have committed more.
-    let outside = out_of_scope(
-        task.paths(),
-        &repository.changed_paths(main.as_str(), rebased.as_str())?,
-    );
-    if !outside.is_empty() {
-        return defer(
-            format!(
-                "{} after the rebase onto main {main}; take them out of the run branch (or ask for the task's --paths to be widened), commit, and rewrite the receipt with the new head",
-                scope_violation_reason(&outside)
-            ),
-            json!({"main": main, "head": rebased, "scope_violation": outside, "allowed": task.paths()}),
-        );
-    }
-    // The task's verification commands run here, once per commit, on the
-    // rebased tree: validation only checks the receipt (ADR-0023 decision 1).
-    let commands = task.verification_commands();
-    let run_env = if commands.is_empty() {
-        Vec::new()
-    } else {
-        run_env(repository, db, run_dir)?
-    };
-    // Each attempt keeps its own logs, so a second integrate of the run does
-    // not overwrite why the first one failed.
-    let attempt = next_integrate_attempt(run_dir);
-    for (index, command) in commands.iter().enumerate() {
-        let log = integrate_verify_log(run_dir, attempt, index + 1);
-        let status = run_shell_to_log(command, worktree, &run_env, &log)?;
-        let exit_code = status.code().unwrap_or(128);
-        let output = fs::read_to_string(&log).unwrap_or_default();
-        queue.record_runtime_event(
-            run.id(),
-            "verification_command",
-            json!({
-                "phase": "integration",
-                "attempt": attempt,
-                "index": index + 1,
-                "command": command,
-                "exit_code": exit_code,
-                "log_path": path_text(&log)?,
-                "output_tail": tail(&output, 2000),
-            }),
-        )?;
-        if exit_code != 0 {
-            return defer(
-                format!(
-                    "verification command {command:?} exited with {exit_code} after the rebase onto {main}; see {}",
-                    log.display()
-                ),
-                json!({"main": main, "head": rebased, "command": command, "exit_code": exit_code}),
-            );
-        }
-    }
-    // One commit on main with the rebased tree; the run's own history stays
-    // reachable under refs/dagq/runs/<run-id>.
-    let paragraphs = commit_message(task, run, &receipt);
-    let tree = repository.tree_of(rebased.as_str())?;
-    let commit = repository.commit_tree(&tree, main.as_str(), &paragraphs)?;
-    let history_ref = format!("refs/dagq/runs/{}", run.id());
-    repository.update_ref(&history_ref, rebased.as_str())?;
-    repository.advance_main(main.as_str(), commit.as_str())?;
-    Ok(Verdict::Landed(
-        Landing {
-            commit,
-            source_commit: rebased,
-            main_before: main.clone(),
-            history_ref,
-            message: paragraphs.join("\n\n"),
-            verification_skipped: false,
-        },
-        receipt.follow_ups,
-    ))
-}
-
-/// Where integrate's attempt `attempt` writes the log of its `index`th
-/// verification command (both from 1): `integrate-<attempt>-verify-<index>.log`.
-pub fn integrate_verify_log(run_dir: &Path, attempt: u32, index: usize) -> PathBuf {
-    run_dir.join(format!("integrate-{attempt}-verify-{index}.log"))
-}
-
-/// The attempt and command index of an integrate verification log's file
-/// name. The name used before attempts were counted,
-/// `integrate-verify-<index>.log`, is attempt 0: it came before any
-/// numbered one.
-fn integrate_log_key(name: &str) -> Option<(u32, usize)> {
-    let stem = name.strip_prefix("integrate-")?.strip_suffix(".log")?;
-    if let Some(index) = stem.strip_prefix("verify-") {
-        return Some((0, index.parse().ok()?));
-    }
-    let (attempt, index) = stem.split_once("-verify-")?;
-    Some((attempt.parse().ok()?, index.parse().ok()?))
-}
-
-/// The files of `dir` with their names.
-fn log_names(dir: &Path) -> Vec<(String, PathBuf)> {
-    fs::read_dir(dir)
-        .map(|entries| {
-            entries
-                .filter_map(|entry| entry.ok().map(|e| e.path()))
-                .filter_map(|path| {
-                    let name = path.file_name()?.to_str()?.to_owned();
-                    Some((name, path))
-                })
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-/// The attempt integrate's next run of the verification commands writes
-/// its logs under: one past the highest attempt in `run_dir` (1 when none).
-pub fn next_integrate_attempt(run_dir: &Path) -> u32 {
-    log_names(run_dir)
-        .iter()
-        .filter_map(|(name, _)| integrate_log_key(name))
-        .map(|(attempt, _)| attempt)
-        .max()
-        .map_or(1, |attempt| attempt + 1)
-}
-
-/// Integrate's verification logs in `run_dir`: those of the latest attempt
-/// in command order, and those of the earlier attempts, oldest first.
-pub fn integrate_logs(run_dir: &Path) -> (Vec<PathBuf>, Vec<PathBuf>) {
-    let mut keyed: Vec<((u32, usize), PathBuf)> = log_names(run_dir)
-        .into_iter()
-        .filter_map(|(name, path)| Some((integrate_log_key(&name)?, path)))
-        .collect();
-    keyed.sort();
-    let Some(&((latest, _), _)) = keyed.last() else {
-        return (Vec::new(), Vec::new());
-    };
-    let (current, earlier): (Vec<_>, Vec<_>) = keyed
-        .into_iter()
-        .partition(|((attempt, _), _)| *attempt == latest);
-    (
-        current.into_iter().map(|(_, path)| path).collect(),
-        earlier.into_iter().map(|(_, path)| path).collect(),
-    )
-}
-
-/// Title, the receipt's summary, and the trailers that tie the commit to
-/// the queue, as paragraphs.
-fn commit_message(task: &Task, run: &TaskRun, receipt: &Receipt) -> Vec<String> {
-    let mut paragraphs = vec![task.title().trim().to_owned()];
-    let summary = receipt.summary.trim();
-    if !summary.is_empty() {
-        paragraphs.push(summary.to_owned());
-    }
-    paragraphs.push(format!("Dagq-Task: {}\nDagq-Run: {}", task.id(), run.id()));
-    paragraphs
-}
-
-/// Drop the landed run's worktree and branch. The result is already on
-/// `main` and under the history ref, so a failure here is only recorded.
-fn remove_landed_worktree(queue: &mut SqliteQueue, repository: &GitRepository, run: &TaskRun) {
-    let (Some(worktree), Some(branch)) = (&run.worktree_path(), &run.branch()) else {
-        return;
-    };
-    let recorded = match repository.remove_worktree_and_branch(Path::new(worktree), branch) {
-        Ok(()) => queue.record_runtime_event(
-            run.id(),
-            "worktree_removed",
-            json!({"path": worktree, "branch": branch}),
-        ),
-        Err(error) => {
-            let message = format!("landed worktree {worktree} could not be removed: {error:#}");
-            eprintln!("run {}: {message}", run.id());
-            queue.record_cleanup_failure(run.id(), &message)
-        }
-    };
-    if let Err(error) = recorded {
-        eprintln!("run {}: could not record the cleanup: {error:#}", run.id());
-    }
 }
 
 /// Write the review material of the task's run that awaits integration or a
@@ -6566,216 +5754,6 @@ fn review_markdown(
         stat = fenced("", stat),
     ));
     out
-}
-
-fn tail(text: &str, max_bytes: usize) -> &str {
-    if text.len() <= max_bytes {
-        return text;
-    }
-    let mut start = text.len() - max_bytes;
-    while !text.is_char_boundary(start) {
-        start += 1;
-    }
-    &text[start..]
-}
-
-/// What the prompt says about one direct predecessor: the task, the squash
-/// commit `integrate` put on `main` for it, and the summary its agent wrote.
-#[derive(Debug, Clone, Serialize)]
-pub struct PredecessorSummary {
-    pub task_id: TaskId,
-    pub title: String,
-    /// `result_commit` of the integrated run; `(not landed)` without one.
-    pub result_commit: String,
-    /// `summary` of the integrated run's receipt, whitespace collapsed;
-    /// `(receipt unavailable)` when the receipt cannot be read or parsed.
-    pub summary: String,
-}
-
-impl PredecessorSummary {
-    /// The receipt is read where the run left it after landing (its planned
-    /// `receipt_path`, else `<run_dir>/receipt.json`); a missing or
-    /// unreadable one is described, never an error, so the successor still starts.
-    pub fn from_predecessor(predecessor: &Predecessor) -> Self {
-        let run = predecessor.integrated_run.as_ref();
-        let summary = run
-            .and_then(|run| {
-                run.receipt_path()
-                    .map(PathBuf::from)
-                    .or_else(|| run.run_dir().map(|dir| Path::new(dir).join("receipt.json")))
-            })
-            .and_then(|path| fs::read_to_string(path).ok())
-            .and_then(|text| Receipt::parse(&text).ok())
-            .map(|receipt| {
-                receipt
-                    .summary
-                    .split_whitespace()
-                    .collect::<Vec<_>>()
-                    .join(" ")
-            })
-            .map(|summary| {
-                if summary.is_empty() {
-                    "(no summary)".to_owned()
-                } else {
-                    summary
-                }
-            })
-            .unwrap_or_else(|| "(receipt unavailable)".to_owned());
-        Self {
-            task_id: predecessor.task.id(),
-            title: predecessor.task.title().to_owned(),
-            result_commit: run
-                .and_then(|run| run.result_commit())
-                .map_or_else(|| "(not landed)".to_owned(), CommitSha::to_string),
-            summary,
-        }
-    }
-}
-
-/// The other tasks a worker is told are executing alongside it: of the
-/// `in_progress` tasks (ID order), those sharing the task's goal, or all of
-/// them when the task has no goal; the task itself is never listed.
-pub fn siblings_in_progress(task: &Task, in_progress: Vec<Task>) -> Vec<Task> {
-    in_progress
-        .into_iter()
-        .filter(|other| other.id() != task.id())
-        .filter(|other| task.goal_id().is_none() || other.goal_id() == task.goal_id())
-        .collect()
-}
-
-/// The line in the worker prompt and the resume request that asks the
-/// session to stop its own background work before the receipt: a leftover
-/// background shell makes Claude Code answer the supervisor's `/exit` with a
-/// confirmation screen, and the exit request times out.
-pub const STOP_BACKGROUND: &str = "Before writing the receipt, stop every background process you started (run_in_background shells, wait loops, watches); if any is left, /exit stops at a confirmation screen.";
-
-/// What a worker reads before it starts, and nothing more: everything else
-/// about its run is in the prompt, and reading the queue or the whole docs
-/// tree only delays the first commit (goal 11, decision 4).
-pub const WORKER_READING: &str = "Read first, and only: the worker section of the repository instructions (AGENTS.md), the task context below and the documents it names, the goal doc if there is one, and the predecessor summaries below. \
-Do not run `dagq list` or `dagq show`, and skip the rest of the docs tree; open other files only when the task needs them.\n";
-
-/// Text of `prompt.txt`. `goal` is the task's goal as it reads at claim
-/// time, `predecessors` the task's direct dependencies and `siblings` the
-/// other tasks executing at claim time (`siblings_in_progress`). The Goal,
-/// Context, Predecessor and Sibling sections are always present, `none`
-/// when empty, so the prompt keeps one shape whether or not a task has a
-/// goal, a context, dependencies or company.
-pub fn prompt(
-    task: &Task,
-    run: &TaskRun,
-    goal: Option<&Goal>,
-    predecessors: &[PredecessorSummary],
-    siblings: &[Task],
-) -> Result<String> {
-    let receipt = run.receipt_path().context("missing receipt path")?;
-    let goal = match goal {
-        None => "Goal: none, this task stands alone\n".to_owned(),
-        Some(goal) => format!(
-            "Goal (the higher-level problem this task and its sibling tasks solve together):\n\
-             Goal ID: {id}\nGoal title: {title}\nGoal description:\n{description}\n\
-             Goal acceptance:\n{acceptance}\nGoal constraints:\n{constraints}\n\
-             Goal doc: {doc}\n",
-            id = goal.id(),
-            title = goal.title(),
-            description = goal.description(),
-            acceptance = goal.acceptance(),
-            constraints = goal.constraints(),
-            doc = goal
-                .doc()
-                .map(|doc| format!(
-                    "{doc} (a path in the repository; read it for the full picture)"
-                ))
-                .unwrap_or_else(|| "none".to_owned()),
-        ),
-    };
-    let context = if task.context().trim().is_empty() {
-        "Context: none\n".to_owned()
-    } else {
-        format!(
-            "Context (why this task exists and what to read first):\n{}\n",
-            task.context()
-        )
-    };
-    let predecessors = if predecessors.is_empty() {
-        "Predecessor tasks: none\n".to_owned()
-    } else {
-        let mut text =
-            "Predecessor tasks (their changes are already in your base commit):\n".to_owned();
-        for predecessor in predecessors {
-            text.push_str(&format!(
-                "- task {}: {}; result commit {}; summary: {}\n",
-                predecessor.task_id,
-                predecessor.title,
-                predecessor.result_commit,
-                predecessor.summary
-            ));
-        }
-        text
-    };
-    let siblings = if siblings.is_empty() {
-        "Sibling tasks in progress: none\n".to_owned()
-    } else {
-        let mut text =
-            "Sibling tasks in progress (other tasks executing now, each owning its own scope):\n"
-                .to_owned();
-        for other in siblings {
-            text.push_str(&format!("- task {}: {}\n", other.id(), other.title()));
-        }
-        text
-    };
-    // Known up front, so the receipt carries it (ADR-0019 decision 5).
-    let evidence = if task.required_evidence().is_empty() {
-        String::new()
-    } else {
-        let names: Vec<&str> = task
-            .required_evidence()
-            .iter()
-            .map(|c| c.as_str())
-            .collect();
-        format!(
-            "Required evidence: {} (each must be passed with evidence in the receipt, or the run waits for a session to add it)\n",
-            names.join(", ")
-        )
-    };
-    // The declared scope (ADR-0029): changing anything else parks the run.
-    let paths = if task.paths().is_empty() {
-        String::new()
-    } else {
-        format!(
-            "Paths you may change (globs from the repository root; `*` stays in one directory, `**` spans any depth): {}. A commit that changes any other path is not accepted: the run waits for a session to take it out. If the task needs another path, ask instead of changing it.\n",
-            task.paths().join(", ")
-        )
-    };
-    Ok(format!(
-        "You are executing dagq task {task_id}, run {run_id}.\n\
-         Work only in the assigned Git worktree.\n\
-         {reading}\
-         Implement the task, run the required verification commands, and commit the result.\n\
-         Do not merge, push, close the workspace, or modify the queue/runtime files.\n\
-         Perform applicable unit tests, E2E, and subagent review. Record evidence or an explicit reason when not applicable.\n\
-         Task title: {title}\nDescription:\n{description}\nAcceptance criteria:\n{acceptance}\n\
-         Verification commands (run in the worktree):\n{verification}\n\
-         {evidence}{paths}{goal}{context}{predecessors}{siblings}\
-         Your assignment is this task only. Do not change what a sibling task owns; if you find work outside this task, record it in the receipt as follow_ups instead of doing it.\n\
-         Write a completion receipt to {receipt} using a temporary file in the same directory and atomic rename.\n\
-         Receipt JSON: {{\"run_id\":\"{run_id}\",\"result\":\"succeeded or failed\",\"commit\":\"full Git SHA of the branch head\",\"tests\":{{\"status\":\"passed, failed or not_applicable\",\"evidence_or_reason\":\"...\"}},\"e2e\":{{\"status\":\"...\",\"evidence_or_reason\":\"...\"}},\"subagent_review\":{{\"status\":\"...\",\"evidence_or_reason\":\"...\"}},\"summary\":\"...\",\"follow_ups\":[{{\"title\":\"...\",\"description\":\"...\"}}]}}\n\
-         Each of tests, e2e and subagent_review needs evidence when passed and a reason when not_applicable.\n\
-         follow_ups is optional: an array of work you found outside this task, each with a title and a description, for the planner to decide on; omit it when there is none.\n\
-         You may write this receipt outside the worktree. Keep the worktree clean after committing.\n\
-         The supervisor rejects the run unless the commit is the clean head of your branch on top of the base commit, and integrate reruns the verification commands itself after rebasing onto main.\n\
-         When you need a decision you cannot make from the task and the repository, do not write the question to the terminal and wait: run `dagq ask --run {run_id} --kind worker_question --question '...'` in the worktree (one ask at a time, with everything you need decided in its question), report briefly that you asked, and stop. The answer arrives in this terminal as `answer to ask <id>: ...`; continue from it.\n\
-         {stop_background}\n\
-         After submitting, report the outcome briefly and stop; do not run /exit yourself. Once you are idle the supervisor ends the session, and a person can still send /exit. A receipt does not itself end the session.\n",
-        task_id = task.id(),
-        run_id = run.id(),
-        reading = WORKER_READING,
-        stop_background = STOP_BACKGROUND,
-        title = task.title(),
-        description = task.description(),
-        acceptance = task.acceptance(),
-        verification = serde_json::to_string_pretty(&task.verification_commands())?,
-    ))
 }
 
 /// The initial prompt of the inbox session that `up` opens in the

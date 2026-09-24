@@ -5,7 +5,13 @@
 //! parsed by hand: the format is one table of `KEY = "value"` lines, a subset
 //! of TOML that needs no parser crate.
 use anyhow::{Context, Result, bail, ensure};
-use std::{fs, path::Path};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    process::ExitStatus,
+};
+
+use crate::application::Verifier;
 
 pub const CONFIG_FILE_NAME: &str = "dagq.toml";
 pub const QUEUE_DIR_VAR: &str = "DAGQ_QUEUE_DIR";
@@ -156,6 +162,35 @@ fn parse_string(text: &str) -> Result<String> {
         "unexpected text after the string: {rest}"
     );
     Ok(value)
+}
+
+/// The verification port for `integrate`: `[run.env]` from the `dagq.toml`
+/// of `checkout` (the main checkout, since `integrate` may be called from
+/// any worktree of the repository) with the directory of the queue `db`,
+/// and each command in `/bin/sh` with its output in the log.
+pub struct ShellVerifier {
+    pub checkout: PathBuf,
+    pub db: PathBuf,
+}
+
+impl Verifier for ShellVerifier {
+    fn run_env(&self, run_dir: &Path) -> Result<Vec<(String, String)>> {
+        let queue_dir = self
+            .db
+            .parent()
+            .context("queue database has no directory")?;
+        load_run_env(&self.checkout, queue_dir, run_dir)
+    }
+
+    fn run_to_log(
+        &self,
+        command: &str,
+        cwd: &Path,
+        env: &[(String, String)],
+        log: &Path,
+    ) -> Result<ExitStatus> {
+        super::adapters::run_shell_to_log(command, cwd, env, log)
+    }
 }
 
 #[cfg(test)]

@@ -1,7 +1,7 @@
 use crate::{
     application::{
-        AgentProvider, DetachedRefusal, MainRemote, ProcessControl, SupervisorEnvironment,
-        WorkspaceBackend, WorkspaceTags,
+        AgentProvider, DetachedRefusal, MainRemote, ProcessControl, Repository,
+        SupervisorEnvironment, WorkspaceBackend, WorkspaceTags,
     },
     domain::{Ask, CommitSha, RunId, SessionRole, Task, TaskId, TaskRun},
 };
@@ -33,11 +33,7 @@ pub fn shell_quote(arg: &str) -> String {
     format!("'{}'", arg.replace('\'', "'\"'\"'"))
 }
 
-pub fn path_text(path: &Path) -> Result<String> {
-    path.to_str()
-        .map(str::to_owned)
-        .context("runtime paths must be valid UTF-8")
-}
+pub use crate::application::path_text;
 
 pub fn executable(path: &Path) -> Result<PathBuf> {
     let candidate = if path.components().count() > 1 || path.is_absolute() {
@@ -818,6 +814,65 @@ impl GitRepository {
 
 /// How long `integrate` waits for `git push` before counting it as failed.
 const PUSH_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// The Git port over the inherent methods above, which callers that hold a
+/// `GitRepository` keep using directly.
+impl Repository for GitRepository {
+    fn main_head(&self) -> Result<CommitSha> {
+        GitRepository::main_head(self)
+    }
+    fn current_branch(&self, worktree: &Path) -> Result<Option<String>> {
+        GitRepository::current_branch(self, worktree)
+    }
+    fn head(&self, worktree: &Path) -> Result<CommitSha> {
+        GitRepository::head(self, worktree)
+    }
+    fn is_ancestor(&self, ancestor: &str, descendant: &str) -> Result<bool> {
+        GitRepository::is_ancestor(self, ancestor, descendant)
+    }
+    fn merge_base(&self, a: &str, b: &str) -> Result<Option<CommitSha>> {
+        GitRepository::merge_base(self, a, b)
+    }
+    fn status(&self, worktree: &Path) -> Result<String> {
+        GitRepository::status(self, worktree)
+    }
+    fn rebase_in_progress(&self, worktree: &Path) -> Result<bool> {
+        GitRepository::rebase_in_progress(self, worktree)
+    }
+    fn rebase_abort(&self, worktree: &Path) -> Result<()> {
+        GitRepository::rebase_abort(self, worktree)
+    }
+    fn rebase(&self, worktree: &Path, onto: &str) -> Result<std::result::Result<(), String>> {
+        GitRepository::rebase(self, worktree, onto)
+    }
+    fn conflicted_files(&self, worktree: &Path) -> Result<Vec<String>> {
+        GitRepository::conflicted_files(self, worktree)
+    }
+    fn changed_paths(&self, from: &str, to: &str) -> Result<Vec<String>> {
+        GitRepository::changed_paths(self, from, to)
+    }
+    fn tree_of(&self, commit: &str) -> Result<String> {
+        GitRepository::tree_of(self, commit)
+    }
+    fn commit_tree(&self, tree: &str, parent: &str, paragraphs: &[String]) -> Result<CommitSha> {
+        GitRepository::commit_tree(self, tree, parent, paragraphs)
+    }
+    fn update_ref(&self, name: &str, value: &str) -> Result<()> {
+        GitRepository::update_ref(self, name, value)
+    }
+    fn advance_main(&self, from: &str, to: &str) -> Result<()> {
+        GitRepository::advance_main(self, from, to)
+    }
+    fn repair_worktree(&self, worktree: &Path) -> Result<()> {
+        GitRepository::repair_worktree(self, worktree)
+    }
+    fn remove_worktree_and_branch(&self, worktree: &Path, branch: &str) -> Result<()> {
+        GitRepository::remove_worktree_and_branch(self, worktree, branch)
+    }
+    fn main_checkout(&self) -> Result<Option<PathBuf>> {
+        GitRepository::main_checkout(self)
+    }
+}
 
 /// Run against (and from) the common directory, since `root`, or the
 /// working directory, may be a run worktree that the landing removed

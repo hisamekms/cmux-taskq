@@ -12,13 +12,14 @@ use super::{
         SqliteQueue, claim_task, enum_col, event, event_row, read_task, run_row, stored_run_row,
     },
 };
-use crate::application::{timestamp, unix_seconds};
+use crate::application::{RunStore, timestamp, unix_seconds};
 use crate::domain::{
     ClaimOutcome, CommitSha, DomainError, EvidenceCheck, GoalId, RunEvent, RunId, RunLease,
     RunProcess, RunStatus, SessionRole, SupervisorMode, SupervisorRegistration, Task, TaskAction,
     TaskId, TaskRun, run,
 };
 
+pub use crate::application::{Landing, LeasedRun};
 pub use crate::domain::{HEARTBEAT_TIMEOUT_SECS, RunPlan};
 
 /// Whether a lease no longer has a working process behind it: its pid is
@@ -26,15 +27,6 @@ pub use crate::domain::{HEARTBEAT_TIMEOUT_SECS, RunPlan};
 /// `status` / `doctor` report as `stale` and the one adoption re-checks.
 pub fn lease_is_stale(lease: &RunLease, now: i64) -> bool {
     !process_alive(lease.pid) || now - lease.heartbeat_at > HEARTBEAT_TIMEOUT_SECS
-}
-
-/// A run some other process leases, with its wrapper registration: what a
-/// supervisor with a free slot judges for adoption (ADR-0012).
-#[derive(Debug, Clone)]
-pub struct LeasedRun {
-    pub run: TaskRun,
-    pub lease: RunLease,
-    pub wrapper: Option<RunProcess>,
 }
 
 /// Outcome of supervisor-side receipt validation. `result_commit` is kept on
@@ -56,21 +48,6 @@ pub struct Validation {
     pub scope_violation: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub allowed_paths: Vec<String>,
-}
-
-/// What `integrate` put on `main`: the squash `commit` whose tree is that of
-/// `source_commit` (the rebased run head kept under `history_ref`), on top of
-/// `main_before`. `verification_skipped` is always false: every landing
-/// runs the verification commands (ADR-0023 decision 1); the field keeps the
-/// `run_integrated` payload's shape.
-#[derive(Debug, Serialize)]
-pub struct Landing {
-    pub commit: CommitSha,
-    pub source_commit: CommitSha,
-    pub main_before: CommitSha,
-    pub history_ref: String,
-    pub message: String,
-    pub verification_skipped: bool,
 }
 
 /// A `needs_session` run as the supervisor judges it for a resume.
@@ -2276,4 +2253,153 @@ fn process_row(r: &Row<'_>) -> rusqlite::Result<RunProcess> {
 pub(super) fn processes_for_task(conn: &Connection, task_id: TaskId) -> Result<Vec<RunProcess>> {
     Ok(conn.prepare("SELECT p.* FROM run_processes p JOIN task_runs r ON r.id=p.run_id WHERE r.task_id=?1 ORDER BY r.rowid,p.role")?
         .query_map([task_id], process_row)?.collect::<rusqlite::Result<_>>()?)
+}
+
+/// The run store port over the inherent methods above, which callers that
+/// hold a `SqliteQueue` keep using directly.
+impl RunStore for SqliteQueue {
+    fn claim_for_supervisor(
+        &mut self,
+        base_commit: &CommitSha,
+        token: &str,
+    ) -> Result<ClaimOutcome> {
+        SqliteQueue::claim_for_supervisor(self, base_commit, token)
+    }
+    fn heartbeat_leases(&self, token: &str) -> Result<usize> {
+        SqliteQueue::heartbeat_leases(self, token)
+    }
+    fn register_supervisor(
+        &mut self,
+        token: &str,
+        pid: u32,
+        parallel: u32,
+        binary_version: &str,
+    ) -> Result<SupervisorRegistration> {
+        SqliteQueue::register_supervisor(self, token, pid, parallel, binary_version)
+    }
+    fn deregister_supervisor(&self, token: &str) -> Result<bool> {
+        SqliteQueue::deregister_supervisor(self, token)
+    }
+    fn supervisors(&self) -> Result<Vec<SupervisorRegistration>> {
+        SqliteQueue::supervisors(self)
+    }
+    fn release_lease(&mut self, id: &RunId, token: &str) -> Result<()> {
+        SqliteQueue::release_lease(self, id, token)
+    }
+    fn runs_leased_by_others(&self, token: &str) -> Result<Vec<LeasedRun>> {
+        SqliteQueue::runs_leased_by_others(self, token)
+    }
+    fn adopt_run(
+        &mut self,
+        id: &RunId,
+        previous_token: &str,
+        token: &str,
+        pid: u32,
+        wrapper: serde_json::Value,
+    ) -> Result<Option<TaskRun>> {
+        SqliteQueue::adopt_run(self, id, previous_token, token, pid, wrapper)
+    }
+    fn holds_lease(&self, id: &RunId, token: &str) -> Result<bool> {
+        SqliteQueue::holds_lease(self, id, token)
+    }
+    fn abandon_run(&mut self, id: &RunId, token: &str, message: &str) -> Result<TaskRun> {
+        SqliteQueue::abandon_run(self, id, token, message)
+    }
+    fn run_leases(&self) -> Result<Vec<RunLease>> {
+        SqliteQueue::run_leases(self)
+    }
+    fn run_lease(&self, id: &RunId) -> Result<Option<RunLease>> {
+        SqliteQueue::run_lease(self, id)
+    }
+    fn active_runs(&self) -> Result<Vec<TaskRun>> {
+        SqliteQueue::active_runs(self)
+    }
+    fn recover_run(
+        &mut self,
+        id: &RunId,
+        checked_processes: usize,
+        report: serde_json::Value,
+    ) -> Result<TaskRun> {
+        SqliteQueue::recover_run(self, id, checked_processes, report)
+    }
+    fn run(&self, id: &RunId) -> Result<TaskRun> {
+        SqliteQueue::run(self, id)
+    }
+    fn runs_with_status(&self, status: RunStatus) -> Result<Vec<TaskRun>> {
+        SqliteQueue::runs_with_status(self, status)
+    }
+    fn next_awaiting_integration(&self) -> Result<Option<TaskRun>> {
+        SqliteQueue::next_awaiting_integration(self)
+    }
+    fn run_events(&self, id: &RunId) -> Result<Vec<RunEvent>> {
+        SqliteQueue::run_events(self, id)
+    }
+    fn has_run_event(&self, id: &RunId, kind: &str) -> Result<bool> {
+        SqliteQueue::has_run_event(self, id, kind)
+    }
+    fn record_runtime_event(
+        &self,
+        id: &RunId,
+        kind: &str,
+        payload: serde_json::Value,
+    ) -> Result<()> {
+        SqliteQueue::record_runtime_event(self, id, kind, payload)
+    }
+    fn begin_integration(&mut self, id: &RunId, token: &str, main: &CommitSha) -> Result<TaskRun> {
+        SqliteQueue::begin_integration(self, id, token, main)
+    }
+    fn defer_integration(
+        &mut self,
+        id: &RunId,
+        token: &str,
+        reason: &str,
+        detail: serde_json::Value,
+    ) -> Result<TaskRun> {
+        SqliteQueue::defer_integration(self, id, token, reason, detail)
+    }
+    fn fail_integration(
+        &mut self,
+        id: &RunId,
+        token: &str,
+        reason: &str,
+        receipt: serde_json::Value,
+    ) -> Result<TaskRun> {
+        SqliteQueue::fail_integration(self, id, token, reason, receipt)
+    }
+    fn abort_integration(
+        &mut self,
+        id: &RunId,
+        token: &str,
+        revert_to: &str,
+        message: &str,
+    ) -> Result<TaskRun> {
+        SqliteQueue::abort_integration(self, id, token, revert_to, message)
+    }
+    fn finish_integration(
+        &mut self,
+        id: &RunId,
+        token: &str,
+        landing: &Landing,
+        common_dir: &str,
+    ) -> Result<(Task, TaskRun)> {
+        SqliteQueue::finish_integration(self, id, token, landing, common_dir)
+    }
+    fn record_cleanup_failure(&mut self, id: &RunId, message: &str) -> Result<()> {
+        SqliteQueue::record_cleanup_failure(self, id, message)
+    }
+    fn workspace_closed(&mut self, id: &RunId, token: &str) -> Result<TaskRun> {
+        SqliteQueue::workspace_closed(self, id, token)
+    }
+    fn cleanup_failed(&mut self, id: &RunId, token: &str, message: &str) -> Result<TaskRun> {
+        SqliteQueue::cleanup_failed(self, id, token, message)
+    }
+    fn repository_binding(&self) -> Result<Option<String>> {
+        SqliteQueue::repository_binding(self)
+    }
+    fn bind_repository(&mut self, common_dir: &str) -> Result<()> {
+        SqliteQueue::bind_repository(self, common_dir)
+    }
+    fn assert_repository(&self, common_dir: &str) -> Result<()> {
+        SqliteQueue::assert_repository(self, common_dir)
+    }
 }
