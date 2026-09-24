@@ -64,12 +64,13 @@ string_enum!(SupervisorMode {
 });
 
 // The part a cmux workspace plays for a queue, carried in its `DAGQ_ROLE`
-// environment variable and its description (ADR-0026). `Planner` and `Inbox`
-// are named here for the sessions `up` is to open later; no workspace of
-// theirs exists yet. `Observer` is the periodic job of ADR-0024: it has no
-// workspace, and the CLI refuses queue changes from its environment.
+// environment variable and its description (ADR-0026). The five roles of
+// ADR-0024 decision 1 are the supervisor, the worker, the planner, the
+// inbox and the observer; `up` opens the planner's and the inbox's
+// workspaces. `Observer` is the periodic job: it has no workspace, and the
+// CLI refuses queue changes from its environment. `Reviewer` is the
+// environment of the supervisor's headless review and triage jobs.
 string_enum!(SessionRole {
-    Maintainer => "maintainer",
     Supervisor => "supervisor",
     Worker => "worker",
     Planner => "planner",
@@ -822,8 +823,8 @@ pub mod stats;
 /// A question for a person (ADR-0022): about a task, or one of its runs when
 /// `run_id` is set; a `blocked` ask of the observer may be about neither
 /// (ADR-0024 decision 4). It is open while `answered_at` and `closed_at` are
-/// unset; once answered it waits for the maintainer to read the answer and
-/// close it. Times are unix seconds.
+/// unset; once answered it waits for the inbox, where the person acts on
+/// the answer, to close it (or for the runtime to apply it). Times are unix seconds.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Ask {
     pub id: i64,
@@ -846,15 +847,11 @@ impl Ask {
         self.answered_at.is_none() && self.closed_at.is_none()
     }
 
-    /// The session role that acts on it now: the inbox answers an open ask,
-    /// the maintainer reads an answer nobody closed. A closed ask waits for
-    /// nobody.
+    /// The session role that acts on it now: the inbox, both to answer an
+    /// open ask and to read an answer nobody closed (ADR-0024 decision 6).
+    /// A closed ask waits for nobody.
     pub fn waits_for(&self) -> Option<SessionRole> {
-        match (self.answered_at, self.closed_at) {
-            (_, Some(_)) => None,
-            (None, None) => Some(SessionRole::Inbox),
-            (Some(_), None) => Some(SessionRole::Maintainer),
-        }
+        self.closed_at.is_none().then_some(SessionRole::Inbox)
     }
 }
 
@@ -1019,7 +1016,7 @@ pub struct RunLease {
 /// A resident `supervise` process as it registered itself, whether or not it
 /// holds any lease. The row is heartbeated with the leases and deleted on a
 /// graceful exit; a row left by a killed supervisor stays until `up` prunes
-/// it or the maintainer deals with it. `mode`, `workspace_id` and
+/// it or a person deals with it (`down --force`). `mode`, `workspace_id` and
 /// `binary_version` describe the process itself, so they share the row's
 /// lifetime.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1502,22 +1499,20 @@ mod tests {
 /// it, whatever its PID says: the rule for leases, wrappers and supervisors.
 pub const HEARTBEAT_TIMEOUT_SECS: i64 = 30;
 
-/// What the maintainer (or the user) does about an attention (ADR-0016). The
+/// What a person (through the inbox) does about an attention (ADR-0016). The
 /// values are short fixed phrases, part of the public contract of `status`,
-/// `events` and `watch`; only `answer the prompt in workspace <id>` carries
-/// the workspace the dialog is open in (ADR-0019).
+/// `events` and `watch`. A `needs_session` run the supervisor stopped
+/// resuming and a dialog a session waits at are asks now (ADR-0024's
+/// Consequences), so neither has a value of its own.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AttentionNext {
     ReviewAndIntegrate,
-    ResumeSession,
     RestartSupervisor,
     PushMain,
     RecoverRun,
-    AnswerPrompt {
-        workspace_id: String,
-    },
-    /// Not the maintainer's to act on: the supervisor resumes the
-    /// `needs_session` run itself (ADR-0019 decision 1).
+    /// Not a person's to act on: the supervisor resumes the
+    /// `needs_session` run itself (ADR-0019 decision 1), or hands it to a
+    /// person as an ask once its resumes are used up.
     Resuming,
     AnswerAsk {
         ask_id: i64,
@@ -1525,7 +1520,7 @@ pub enum AttentionNext {
     ReadAnswer {
         ask_id: i64,
     },
-    /// Not the maintainer's to act on: the supervisor types the answer of a
+    /// Not a person's to act on: the supervisor types the answer of a
     /// `worker_question` into the worker's terminal once the worker is idle.
     DeliveringAnswer {
         ask_id: i64,
@@ -1535,18 +1530,18 @@ pub enum AttentionNext {
     DeliverAnswer {
         ask_id: i64,
     },
-    /// Not the maintainer's to act on: the supervisor holds the accepted run
+    /// Not a person's to act on: the supervisor holds the accepted run
     /// for its headless review and what follows from the verdict (ADR-0027).
     Reviewing,
-    /// The headless review failed (`review_failed`): a person or the
-    /// maintainer reviews the run and calls `integrate` by hand.
+    /// The headless review failed (`review_failed`): a person reviews the
+    /// run and calls `integrate` by hand.
     ReviewByHand,
-    /// Not the maintainer's to act on: the supervisor lands, sends back or
+    /// Not a person's to act on: the supervisor lands, sends back or
     /// cancels the run as the answer of its `approve_landing` ask says.
     ApplyingAnswer {
         ask_id: i64,
     },
-    /// Not the maintainer's to act on: the supervisor triages the `failed`
+    /// Not a person's to act on: the supervisor triages the `failed`
     /// or `interrupted` run and acts on the verdict (ADR-0024 decision 3).
     Triaging,
     /// The headless triage failed (`triage_failed`): a person decides
@@ -1562,13 +1557,9 @@ impl fmt::Display for AttentionNext {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::ReviewAndIntegrate => f.write_str("review and integrate"),
-            Self::ResumeSession => f.write_str("resume session"),
             Self::RestartSupervisor => f.write_str("restart supervisor"),
             Self::PushMain => f.write_str("push main"),
             Self::RecoverRun => f.write_str("recover run"),
-            Self::AnswerPrompt { workspace_id } => {
-                write!(f, "answer the prompt in workspace {workspace_id}")
-            }
             Self::Resuming => f.write_str("resuming (runtime)"),
             Self::AnswerAsk { ask_id } => write!(f, "answer ask {ask_id}"),
             Self::ReadAnswer { ask_id } => {
@@ -1611,7 +1602,6 @@ pub const ATTENTION_KINDS: &[&str] = &[
     "integration_error",
     "push_failed",
     "runtime_error",
-    "prompt_waiting",
     "resume_finished",
     "review_failed",
     "triage_failed",
@@ -1629,8 +1619,8 @@ pub const ASK_EVENT_KINDS: &[&str] = &[
     "ask_delivery_failed",
 ];
 
-/// Whether a run event is a transition that stops at the maintainer's or the
-/// user's judgment, and what to do about it. The run comes to rest in
+/// Whether a run event is a transition that stops at a person's judgment,
+/// and what to do about it. The run comes to rest in
 /// `status` (`awaiting_integration`, `needs_session`, `failed`), or the
 /// session did not answer `/exit`. `integration_error` back to
 /// `awaiting_integration` is not one: the `integrate` caller got the error.
@@ -1643,23 +1633,25 @@ pub const ASK_EVENT_KINDS: &[&str] = &[
 /// supervisor released the run's lease with it (`lease_released: true`, the
 /// abandon): nothing moves the run on until it is recovered. A
 /// `runtime_error` recorded without releasing the lease is a note.
-/// `prompt_waiting` is one: the session waits at a dialog in the payload's
-/// `workspace_id`. An `integration_deferred` with `resumes_left` above zero
-/// is not: the supervisor resumes that run. `resume_finished` is one when the
-/// resume put the run where a person decides (`awaiting_integration` for an
-/// unapproved run), or when it was the last attempt and the run stays
-/// `needs_session` (`exhausted`); a resolved run the supervisor goes on to
-/// land is not. A run that became `failed` (by validation, the session's
+/// `prompt_waiting` is not one: the supervisor raises the dialog as an
+/// `answer_prompt` ask, whose `ask_opened` is the attention. An
+/// `integration_deferred` or `integration_error` into `needs_session` is
+/// not one, and neither is the last `resume_finished` that leaves the run
+/// `needs_session` (`exhausted`): the supervisor resumes the run, and once
+/// its resumes are used up hands it to a person with a `decide` ask
+/// (ADR-0024's Consequences). `resume_finished` is one when the resume put
+/// the run where a person decides (`awaiting_integration` for an unapproved
+/// run); a resolved run the supervisor goes on to land is not. A run that became `failed` (by validation, the session's
 /// exit, a landing or a resume) is no attention either: the supervisor
 /// triages it (ADR-0024 decision 3), and only `triage_failed` is one.
 /// `validation_finished` into `awaiting_integration` is not one: the
 /// supervisor reviews the run (ADR-0027); `review_failed` is, since the
 /// run then waits for a review by hand.
 /// `ask_opened` waits for the inbox's answer and
-/// `ask_answered` for the maintainer to read it, see [`attention_role`],
+/// `ask_answered` for the person to act on it through the inbox,
 /// except the answer of a `worker_question`, which the supervisor types into
 /// the worker's terminal itself (`runtime_delivers: true`); its answer to a
-/// run no longer running and its `ask_delivery_failed` are the maintainer's.
+/// run no longer running and its `ask_delivery_failed` are the inbox's.
 /// The answer of an `approve_landing` ask the supervisor applies
 /// (`runtime_delivers: true`: one of [`LANDING_OPTIONS`] for a run awaiting
 /// integration) is not one either, nor that of a triage's `decide` ask
@@ -1678,37 +1670,14 @@ pub fn event_attention(kind: &str, payload: &serde_json::Value) -> Option<Attent
         // The supervisor triages a failed run and acts on the verdict
         // (ADR-0024 decision 3); only a triage that failed is a person's.
         ("triage_failed", _) => Some(AttentionNext::TriageByHand),
-        // The supervisor resumes a deferred run while it has attempts left
-        // (`resumes_left`, absent before ADR-0019); only then is it a person's.
-        ("integration_deferred", Some(RunStatus::NeedsSession))
-            if payload
-                .get("resumes_left")
-                .and_then(serde_json::Value::as_u64)
-                .is_some_and(|left| left > 0) =>
-        {
-            None
-        }
-        ("integration_deferred" | "integration_error", Some(RunStatus::NeedsSession)) => {
-            Some(AttentionNext::ResumeSession)
-        }
         ("push_failed", _) => Some(AttentionNext::PushMain),
         ("runtime_error", _)
             if payload.get("lease_released") == Some(&serde_json::Value::Bool(true)) =>
         {
             Some(AttentionNext::RecoverRun)
         }
-        ("prompt_waiting", _) => Some(answer_prompt(
-            payload
-                .get("workspace_id")
-                .and_then(serde_json::Value::as_str),
-        )),
         ("resume_finished", Some(RunStatus::AwaitingIntegration)) => {
             Some(AttentionNext::ReviewAndIntegrate)
-        }
-        ("resume_finished", Some(RunStatus::NeedsSession))
-            if payload.get("exhausted") == Some(&serde_json::Value::Bool(true)) =>
-        {
-            Some(AttentionNext::ResumeSession)
         }
         ("ask_opened", _) => ask_id(payload).map(|ask_id| AttentionNext::AnswerAsk { ask_id }),
         ("ask_answered", _)
@@ -1750,24 +1719,13 @@ fn ask_id(payload: &serde_json::Value) -> Option<i64> {
     payload.get("ask_id").and_then(serde_json::Value::as_i64)
 }
 
-/// The session role an attention kind is addressed to (ADR-0022): an
-/// `ask_opened` to the inbox, everything else, `ask_answered` included, to
-/// the maintainer. No attention is the planner's.
-pub fn attention_role(kind: &str) -> SessionRole {
-    match kind {
-        "ask_opened" => SessionRole::Inbox,
-        _ => SessionRole::Maintainer,
-    }
-}
+/// The session role attention is addressed to: every attention, the
+/// supervisors' health included, is the inbox's, where a person sees it
+/// (ADR-0024 decision 6). No attention is the planner's.
+pub const ATTENTION_ROLE: SessionRole = SessionRole::Inbox;
 
-fn answer_prompt(workspace_id: Option<&str>) -> AttentionNext {
-    AttentionNext::AnswerPrompt {
-        workspace_id: workspace_id.unwrap_or("?").to_owned(),
-    }
-}
-
-/// Whether a run in `status` waits for the maintainer now. `exit_pending` is
-/// a run whose `/exit` request timed out with no session exit since: a
+/// Whether a run in `status` waits for a person or the supervisor now.
+/// `exit_pending` is a run whose `/exit` request timed out with no session exit since: a
 /// `running` one, or one the supervisor still holds after its validation
 /// or review (ADR-0027). It is no attention of the run's, since its
 /// `stuck_exit` ask is (and a dialog seen before the timeout is part of
@@ -1777,12 +1735,13 @@ fn answer_prompt(workspace_id: Option<&str>) -> AttentionNext {
 /// unfinished run without one was given up by its owner (the supervisor's
 /// abandon), and neither adoption, which takes only stale leases, nor
 /// anything else moves it on until it is recovered. A stale lease is the
-/// supervisor's attention, not the run's. `prompt_waiting` is the workspace
-/// of a `running` run whose latest `prompt_waiting` has no `prompt_cleared`
-/// or `receipt_observed` after it (`Some("?")` when the payload named none).
-/// `resuming` is a `needs_session` run the supervisor is resuming or will
-/// resume (a resume in progress, or attempts left): the maintainer must not
-/// open a session of its own for it. An `awaiting_integration` run with a
+/// supervisor's attention, not the run's. A dialog a `running` run waits at
+/// is no attention of the run's either: its `answer_prompt` ask is.
+/// A `needs_session` run is the supervisor's in every case (ADR-0019
+/// decision 1, ADR-0024's Consequences): it resumes the run, waits for a
+/// session still alive to end first, or, with the resumes used up, hands
+/// the run to a person as a `decide` ask. Nobody opens a session of their
+/// own for it. An `awaiting_integration` run with a
 /// lease is the supervisor's review (ADR-0027); without one it waits for a
 /// person (a failed review, or a run validated before the review existed). The caller passes only the latest run of an `in_progress` task, so a
 /// failed run stops counting once the task is retried or canceled.
@@ -1791,8 +1750,6 @@ pub fn run_attention(
     exit_pending: bool,
     push_pending: bool,
     leased: bool,
-    prompt_waiting: Option<&str>,
-    resuming: bool,
 ) -> Option<AttentionNext> {
     match status {
         RunStatus::Integrated if push_pending => Some(AttentionNext::PushMain),
@@ -1815,19 +1772,16 @@ pub fn run_attention(
         }
         RunStatus::AwaitingIntegration if leased => Some(AttentionNext::Reviewing),
         RunStatus::AwaitingIntegration => Some(AttentionNext::ReviewAndIntegrate),
-        RunStatus::NeedsSession if resuming => Some(AttentionNext::Resuming),
-        RunStatus::NeedsSession => Some(AttentionNext::ResumeSession),
+        RunStatus::NeedsSession => Some(AttentionNext::Resuming),
         // The caller tells a triage that failed or finished apart by the
         // run's events ([`triage_state`]); by the status alone, the
         // supervisor triages the run.
         RunStatus::Failed | RunStatus::Interrupted => Some(AttentionNext::Triaging),
-        RunStatus::Running if exit_pending => None,
-        RunStatus::Running if prompt_waiting.is_some() => Some(answer_prompt(prompt_waiting)),
         _ => None,
     }
 }
 
-/// One thing that waits for the maintainer or the user: a run (`run_id`,
+/// One thing that waits for a person: a run (`run_id`,
 /// `task_id`) or a supervisor (`pid`, or neither when none is registered).
 /// `kind` is the run event that brought the run there, or
 /// `supervisor_stale` / `supervisor_stopped`, which are derived from the
@@ -1854,7 +1808,7 @@ pub fn heartbeat_stale(alive: bool, heartbeat_age_secs: i64) -> bool {
 }
 
 /// The health of one registered supervisor that `watch` compares: a change
-/// in the set of tokens, a PID, `alive` or `stale` wakes the maintainer.
+/// in the set of tokens, a PID, `alive` or `stale` wakes the inbox.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SupervisorPulse {
     pub token: String,
@@ -1906,7 +1860,7 @@ mod attention_tests {
     use serde_json::json;
 
     #[test]
-    fn asks_wait_for_the_inbox_then_the_maintainer() {
+    fn asks_wait_for_the_inbox_until_closed() {
         let mut ask = Ask {
             id: 1,
             kind: AskKind::Decide,
@@ -1915,7 +1869,7 @@ mod attention_tests {
             question: "q".into(),
             options: vec![],
             answer: None,
-            asked_by: "maintainer".into(),
+            asked_by: "supervisor".into(),
             created_at: 0,
             answered_at: None,
             closed_at: None,
@@ -1925,16 +1879,10 @@ mod attention_tests {
         ask.answer = Some("a".into());
         ask.answered_at = Some(1);
         assert!(!ask.is_open());
-        assert_eq!(ask.waits_for(), Some(SessionRole::Maintainer));
+        assert_eq!(ask.waits_for(), Some(SessionRole::Inbox));
         ask.closed_at = Some(2);
         assert_eq!(ask.waits_for(), None);
-        assert_eq!(attention_role("ask_opened"), SessionRole::Inbox);
-        assert_eq!(attention_role("ask_answered"), SessionRole::Maintainer);
-        assert_eq!(attention_role("push_failed"), SessionRole::Maintainer);
-        // The resume kinds of ADR-0019 decision 1 are the maintainer's.
-        for kind in ["resume_finished", "resume_started", "integration_approved"] {
-            assert_eq!(attention_role(kind), SessionRole::Maintainer, "{kind}");
-        }
+        assert_eq!(ATTENTION_ROLE, SessionRole::Inbox);
         assert_eq!(
             AttentionNext::ReadAnswer { ask_id: 4 }.to_string(),
             "read the answer of ask 4 and close it"
@@ -2087,7 +2035,7 @@ mod attention_tests {
             (
                 "integration_deferred",
                 json!({"status": "needs_session", "reason": "x"}),
-                Some(ResumeSession),
+                None,
             ),
             (
                 "integration_failed",
@@ -2097,7 +2045,7 @@ mod attention_tests {
             (
                 "integration_error",
                 json!({"status": "needs_session", "reason": "x"}),
-                Some(ResumeSession),
+                None,
             ),
             (
                 "integration_error",
@@ -2148,9 +2096,7 @@ mod attention_tests {
             (
                 "prompt_waiting",
                 json!({"workspace_id": "w", "excerpt": "x", "screen_hash": "h"}),
-                Some(AnswerPrompt {
-                    workspace_id: "w".into(),
-                }),
+                None,
             ),
             ("prompt_cleared", json!({"workspace_id": "w"}), None),
             (
@@ -2161,7 +2107,7 @@ mod attention_tests {
             (
                 "integration_deferred",
                 json!({"status": "needs_session", "reason": "x", "resumes_left": 0}),
-                Some(ResumeSession),
+                None,
             ),
             (
                 "resume_finished",
@@ -2176,7 +2122,7 @@ mod attention_tests {
             (
                 "resume_finished",
                 json!({"status": "needs_session", "outcome": "unresolved", "exhausted": true}),
-                Some(ResumeSession),
+                None,
             ),
             (
                 "resume_finished",
@@ -2257,19 +2203,8 @@ mod attention_tests {
             serde_json::to_value(RestartSupervisor).unwrap(),
             json!("restart supervisor")
         );
-        assert_eq!(
-            serde_json::to_value(AnswerPrompt {
-                workspace_id: "w".into()
-            })
-            .unwrap(),
-            json!("answer the prompt in workspace w")
-        );
-        assert_eq!(
-            event_attention("prompt_waiting", &json!({})),
-            Some(AnswerPrompt {
-                workspace_id: "?".into()
-            })
-        );
+        // A dialog and a used-up resume are asks, not attention (ADR-0024).
+        assert_eq!(event_attention("prompt_waiting", &json!({})), None);
     }
 
     #[test]
@@ -2302,85 +2237,45 @@ mod attention_tests {
     fn run_attention_follows_the_resting_status() {
         use AttentionNext::*;
         assert_eq!(
-            run_attention(
-                RunStatus::AwaitingIntegration,
-                false,
-                false,
-                false,
-                None,
-                false
-            ),
+            run_attention(RunStatus::AwaitingIntegration, false, false, false),
             Some(ReviewAndIntegrate)
         );
         // Leased, it is the supervisor's review (ADR-0027); a session that
         // held back the /exit after the verdict is its stuck_exit ask's.
         assert_eq!(
-            run_attention(
-                RunStatus::AwaitingIntegration,
-                true,
-                false,
-                true,
-                None,
-                false
-            ),
+            run_attention(RunStatus::AwaitingIntegration, true, false, true),
             None
         );
+        assert_eq!(run_attention(RunStatus::Failed, true, false, true), None);
         assert_eq!(
-            run_attention(RunStatus::Failed, true, false, true, None, false),
-            None
-        );
-        assert_eq!(
-            run_attention(
-                RunStatus::AwaitingIntegration,
-                false,
-                false,
-                true,
-                None,
-                false
-            ),
+            run_attention(RunStatus::AwaitingIntegration, false, false, true),
             Some(Reviewing)
         );
-        assert_eq!(
-            run_attention(RunStatus::NeedsSession, false, false, false, None, false),
-            Some(ResumeSession)
-        );
-        assert_eq!(
-            run_attention(RunStatus::NeedsSession, false, false, true, None, true),
-            Some(Resuming)
-        );
+        // Resuming, blocked by a live session or out of resumes: the
+        // supervisor's either way.
+        for leased in [false, true] {
+            assert_eq!(
+                run_attention(RunStatus::NeedsSession, false, false, leased),
+                Some(Resuming)
+            );
+        }
         assert_eq!(Resuming.to_string(), "resuming (runtime)");
         assert_eq!(
-            run_attention(RunStatus::Failed, false, false, false, None, false),
+            run_attention(RunStatus::Failed, false, false, false),
             Some(Triaging)
         );
         assert_eq!(
-            run_attention(RunStatus::Interrupted, false, false, false, None, false),
+            run_attention(RunStatus::Interrupted, false, false, false),
             Some(Triaging)
         );
         assert_eq!(Triaging.to_string(), "triaging (runtime)");
         assert_eq!(TriageByHand.to_string(), "triage by hand");
         // The stuck_exit ask is the attention of a session holding `/exit`.
+        assert_eq!(run_attention(RunStatus::Running, true, false, true), None);
+        assert_eq!(run_attention(RunStatus::Running, false, false, true), None);
+        // An abandoned run is recovered.
         assert_eq!(
-            run_attention(RunStatus::Running, true, false, true, None, false),
-            None
-        );
-        assert_eq!(
-            run_attention(RunStatus::Running, false, false, true, None, false),
-            None
-        );
-        assert_eq!(
-            run_attention(RunStatus::Running, false, false, true, Some("w"), false),
-            Some(AnswerPrompt {
-                workspace_id: "w".into()
-            })
-        );
-        assert_eq!(
-            run_attention(RunStatus::Running, true, false, true, Some("w"), false),
-            None
-        );
-        // An abandoned run is recovered before any dialog is answered.
-        assert_eq!(
-            run_attention(RunStatus::Running, false, false, false, Some("w"), false),
+            run_attention(RunStatus::Running, false, false, false),
             Some(RecoverRun)
         );
         for status in [
@@ -2392,18 +2287,18 @@ mod attention_tests {
             RunStatus::Succeeded,
         ] {
             assert_eq!(
-                run_attention(status, true, false, true, Some("w"), false),
+                run_attention(status, true, false, true),
                 None,
                 "{}",
                 status.as_str()
             );
         }
         assert_eq!(
-            run_attention(RunStatus::Integrated, false, true, false, None, false),
+            run_attention(RunStatus::Integrated, false, true, false),
             Some(PushMain)
         );
         assert_eq!(
-            run_attention(RunStatus::Succeeded, false, true, false, None, false),
+            run_attention(RunStatus::Succeeded, false, true, false),
             None
         );
     }
@@ -2419,7 +2314,7 @@ mod attention_tests {
             RunStatus::Integrating,
         ] {
             assert_eq!(
-                run_attention(status, false, false, false, None, false),
+                run_attention(status, false, false, false),
                 Some(RecoverRun),
                 "{}",
                 status.as_str()
@@ -2427,12 +2322,12 @@ mod attention_tests {
         }
         // Nothing moves an abandoned run, so `/exit` alone would not do.
         assert_eq!(
-            run_attention(RunStatus::Running, true, false, false, None, false),
+            run_attention(RunStatus::Running, true, false, false),
             Some(RecoverRun)
         );
         for status in [RunStatus::Integrated, RunStatus::Succeeded] {
             assert_eq!(
-                run_attention(status, false, false, false, None, false),
+                run_attention(status, false, false, false),
                 None,
                 "{}",
                 status.as_str()

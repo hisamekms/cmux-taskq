@@ -61,7 +61,7 @@ pub struct TaskPage {
     pub total: usize,
 }
 
-/// A task as `list` shows it: what the maintainer decides on, plus the
+/// A task as `list` shows it: what the planner decides on, plus the
 /// long fields only with `full`.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct TaskListItem {
@@ -447,14 +447,14 @@ pub trait WorkspaceBackend {
     fn capture(&self, workspace_id: &str) -> Result<String>;
     /// Close the workspace; the worktree and branch are not touched.
     fn close(&self, workspace_id: &str) -> Result<()>;
-    /// Ask the agent session to end the way the maintainer would, without killing it.
+    /// Ask the agent session to end the way a person would, without killing it.
     fn send_exit(&self, workspace_id: &str) -> Result<()>;
     /// Whether the workspace with this stable ID is still open. Workspaces
     /// are found by the ID the queue recorded, never by their title, which
     /// people may rename (ADR-0026).
     fn exists(&self, workspace_id: &str) -> Result<bool>;
-    /// Open a workspace that is not tied to a run (the maintainer session,
-    /// the in-cmux supervisor) and return its stable ID.
+    /// Open a workspace that is not tied to a run (the inbox and planner
+    /// sessions, the in-cmux supervisor) and return its stable ID.
     fn create_named(
         &self,
         name: &str,

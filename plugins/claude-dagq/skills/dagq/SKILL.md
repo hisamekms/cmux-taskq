@@ -7,7 +7,7 @@ description: Register and inspect dagq goals and tasks through the locally built
 
 dagq runs development tasks in cmux workspaces and isolated Git worktrees. This skill drives the `dagq` binary; every command prints JSON on stdout, and a runtime error prints `{"error": ...}` on stderr with exit status 1. Never read or modify the SQLite queue file directly (no `sqlite3`, no editing); the binary is the only interface.
 
-A goal is the problem several tasks solve together; a task is one unit of work a session executes in its own worktree. Registering and closing belong to the planner session (`dagq-planner`); asks go to the inbox (`dagq-inbox`); the maintainer runs the queue (`dagq-maintain`), lands runs (`dagq-land`), acts on sessions (`dagq-session`) and recovers stuck runs (`dagq-recover`).
+A goal is the problem several tasks solve together; a task is one unit of work a session executes in its own worktree. Registering and closing belong to the planner session (`dagq-planner`); the supervisor runs and lands the queue; its asks and attention go to the inbox (`dagq-inbox`); what a person does by hand (up / down, recovery, a review by hand) is `dagq-recover`.
 
 Reference files, read only when needed: `${CLAUDE_PLUGIN_ROOT}/skills/dagq/reference/locate.md` (install, version warnings, missing or moved queue), `reference/inspect.md` (every inspect command, its fields, task and run statuses, `graph`, goal editing) and `reference/goal-close.md` (closing a goal), all in the same directory.
 

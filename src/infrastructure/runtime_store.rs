@@ -214,7 +214,7 @@ impl SqliteQueue {
     /// Remove the registration on a graceful exit. Leases are untouched; a
     /// missing row (already removed, or never written) is not an error, so a
     /// crashed supervisor's row is only ever removed by `up`, `down --force`
-    /// or the maintainer.
+    /// or a person.
     pub fn deregister_supervisor(&self, token: &str) -> Result<bool> {
         Ok(self
             .conn
@@ -263,6 +263,21 @@ impl SqliteQueue {
             "DELETE FROM session_workspaces WHERE role=?1",
             [role.as_str()],
         )? == 1)
+    }
+
+    /// Forget the workspaces recorded for a role `up` no longer opens (the
+    /// resident session ADR-0024 retired): only the in-cmux supervisor's,
+    /// the inbox's and the planner's are kept. Returns how many were
+    /// forgotten; the workspaces themselves are a person's to close.
+    pub fn forget_retired_session_workspaces(&self) -> Result<usize> {
+        Ok(self.conn.execute(
+            "DELETE FROM session_workspaces WHERE role NOT IN (?1,?2,?3)",
+            params![
+                SessionRole::Supervisor.as_str(),
+                SessionRole::Inbox.as_str(),
+                SessionRole::Planner.as_str()
+            ],
+        )?)
     }
 
     /// Give up ownership of a run that came to rest (`awaiting_integration`
@@ -885,7 +900,7 @@ impl SqliteQueue {
             .collect::<rusqlite::Result<_>>()?)
     }
 
-    /// Maintainer recovery of an orphaned run. The caller has checked that the
+    /// Recovery of an orphaned run (the supervisor's, or `recover` by hand). The caller has checked that the
     /// registered processes are dead; `checked_processes` guards against a
     /// registration that happened in between, and a fresh lease is refused here
     /// again. Only this run's lease is deleted; other runs, their leases,
@@ -1245,7 +1260,7 @@ impl SqliteQueue {
     }
 
     /// Every run in one status, oldest first; `up` reports the runs that
-    /// wait for the maintainer (`awaiting_integration`, `needs_session`).
+    /// wait for a person or the supervisor (`awaiting_integration`, `needs_session`).
     pub fn runs_with_status(&self, status: crate::domain::RunStatus) -> Result<Vec<TaskRun>> {
         Ok(self
             .conn
@@ -1921,6 +1936,78 @@ impl SqliteQueue {
         run_event(&tx, id, "triage_finished", payload)?;
         tx.commit()?;
         Ok(result)
+    }
+
+    /// Hand a `needs_session` run whose resumes are used up to a person
+    /// (ADR-0024's Consequences, in place of ADR-0019's attention): in one
+    /// transaction, check that it is still `needs_session` with at least
+    /// `max_attempts` resumes started, the latest run of an `in_progress`
+    /// task, and not leased but stale; make it `failed` with `reason` as
+    /// `last_error`, and record `triage_finished` with the action `ask`
+    /// (`ask_id`, `by: runtime`), so the triage takes it as decided and the
+    /// ask's answer is applied as a triage's. `Ok(None)` means it changed.
+    pub fn exhaust_resumes(
+        &mut self,
+        id: &str,
+        max_attempts: usize,
+        ask_id: i64,
+        reason: &str,
+    ) -> Result<Option<TaskRun>> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let now: i64 = tx.query_row("SELECT unixepoch()", [], |r| r.get(0))?;
+        let run = tx
+            .query_row(
+                "SELECT r.* FROM task_runs r JOIN tasks t ON t.id=r.task_id
+                 WHERE r.id=?1 AND r.status='needs_session' AND t.status='in_progress'
+                 AND r.rowid=(SELECT MAX(rowid) FROM task_runs WHERE task_id=r.task_id)",
+                [id],
+                run_row(&self.runs_dir),
+            )
+            .optional()?;
+        let Some(run) = run else {
+            return Ok(None);
+        };
+        let resumes = resume_attempts(&tx, id)?;
+        let leased = tx
+            .query_row(
+                "SELECT run_id,token,pid,heartbeat_at FROM run_leases WHERE run_id=?1",
+                [id],
+                lease_row,
+            )
+            .optional()?
+            .is_some_and(|lease| !lease_is_stale(&lease, now));
+        if resumes < max_attempts || leased {
+            return Ok(None);
+        }
+        tx.execute("DELETE FROM run_leases WHERE run_id=?1", [id])?;
+        tx.execute(
+            "UPDATE task_runs SET status='failed',last_error=?2 WHERE id=?1",
+            params![id, reason],
+        )?;
+        run_event(
+            &tx,
+            id,
+            "triage_finished",
+            json!({
+                "by": "runtime",
+                "verdict": "ask",
+                "action": "ask",
+                "ask_id": ask_id,
+                "reason": reason,
+                "resumes": resumes,
+                "previous_status": run.status.as_str(),
+                "status": crate::domain::RunStatus::Failed.as_str(),
+            }),
+        )?;
+        let result = tx.query_row(
+            "SELECT * FROM task_runs WHERE id=?1",
+            [id],
+            run_row(&self.runs_dir),
+        )?;
+        tx.commit()?;
+        Ok(Some(result))
     }
 
     /// Record that the triage closed `workspace_id` of the run: the worker's

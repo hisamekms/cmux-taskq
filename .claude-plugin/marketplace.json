@@ -9,7 +9,7 @@
     {
       "name": "claude-dagq",
       "source": "./plugins/claude-dagq",
-      "description": "Register, run, inspect, integrate, and recover dagq tasks through the dagq binary. Skills plus a SessionStart hook that re-orients a maintainer session; the queue database is never touched directly.",
+      "description": "Register, run, inspect, integrate, and recover dagq tasks through the dagq binary. Skills plus a SessionStart hook that re-orients the inbox and planner sessions; the queue database is never touched directly.",
       "author": {
         "name": "hisamekms"
       },

@@ -1782,7 +1782,7 @@ impl Supervisor<'_> {
     /// the single slot (as an approved one), `send_back` makes it
     /// `needs_session` for a resume that names the review's reasons, and
     /// `cancel` fails the run and cancels its task. The ask is closed once
-    /// applied; any other answer is left to the maintainer. An error is
+    /// applied; any other answer is left to the inbox. An error is
     /// noted and the ask is tried again on a later pass.
     fn apply_landing_answers(&mut self, parallel: usize) -> Result<()> {
         for ask in self.queue.landing_answers()? {
@@ -1923,7 +1923,10 @@ impl Supervisor<'_> {
             };
             let answer = ask.answer.as_deref().unwrap_or_default().trim().to_owned();
             let run = self.queue.run(&run_id)?;
+            // Only an option the ask offered: a run whose resumes are used
+            // up is not offered `resume`.
             if !TRIAGE_OPTIONS.contains(&answer.as_str())
+                || !ask.options.contains(&answer)
                 || !matches!(run.status, RunStatus::Failed | RunStatus::Interrupted)
                 || self.queue.run_lease(&run_id)?.is_some()
             {
@@ -2249,6 +2252,10 @@ impl Supervisor<'_> {
             self.queue
                 .close_stuck_exit_asks(&run.id, "the triage closed the run's workspace")?;
         }
+        // Whatever path took the run out of `running`, no dialog of it waits
+        // for an answer any more.
+        self.queue
+            .close_answer_prompt_asks(&run.id, "the run was triaged; closed by the runtime")?;
         Ok(())
     }
 
@@ -2335,9 +2342,6 @@ impl Supervisor<'_> {
             }
         }
         for candidate in candidates {
-            if self.slots.len() >= parallel {
-                break;
-            }
             let ResumeCandidate {
                 run,
                 lease,
@@ -2350,11 +2354,21 @@ impl Supervisor<'_> {
                 .is_some_and(|w| w.exited_at.is_none() && process_alive(w.pid));
             // A previous session whose wrapper process lives on, however
             // silent, is never joined by a second one on the same worktree.
-            if attempts >= MAX_RESUME_ATTEMPTS
-                || lease.is_some_and(|lease| !lease_is_stale(&lease, now))
-                || session_alive
-            {
+            if lease.is_some_and(|lease| !lease_is_stale(&lease, now)) || session_alive {
                 continue;
+            }
+            // Out of attempts: a person decides, whether or not a slot is free.
+            if attempts >= MAX_RESUME_ATTEMPTS {
+                if let Err(error) = self.exhaust_resumes(&run, attempts) {
+                    self.log.note(&format!(
+                        "run {}: its used-up resumes could not be handed to a person: {error:#}",
+                        run.id
+                    ));
+                }
+                continue;
+            }
+            if self.slots.len() >= parallel {
+                break;
             }
             self.close_left_resume_workspaces(&run)?;
             let main = self.repository.main_head()?;
@@ -2502,6 +2516,78 @@ impl Supervisor<'_> {
             )
         };
         self.slots.push(Slot { run, phase });
+        Ok(())
+    }
+
+    /// Hand a `needs_session` run whose resumes are used up to a person
+    /// through the triage's `decide` ask (ADR-0024's Consequences): no
+    /// headless triage runs, since resuming is no longer an option and a
+    /// run that did not resolve in [`MAX_RESUME_ATTEMPTS`] sessions is not
+    /// retried without a person. The ask (options `retry` and `cancel`,
+    /// applied like a triage's answer) is opened first, then the run becomes
+    /// `failed` with `triage_finished` naming the ask, and the workspaces it
+    /// left open are closed as after a triage. A run of a task that moved
+    /// on is left alone.
+    fn exhaust_resumes(&mut self, run: &TaskRun, attempts: usize) -> Result<()> {
+        let detail = self.queue.show(run.task_id)?;
+        if detail.task.status != TaskStatus::InProgress
+            || detail.runs.last().is_some_and(|latest| latest.id != run.id)
+        {
+            return Ok(());
+        }
+        let last_error = run.last_error.clone().unwrap_or_default();
+        let reason = format!(
+            "resumed {attempts} times (at most {MAX_RESUME_ATTEMPTS}) and still needs a session: {}",
+            tail(&last_error, 500)
+        );
+        let mut question = format!(
+            "Run {} of task {} ({}) was resumed {attempts} times (at most {MAX_RESUME_ATTEMPTS}) and still needs a session, so the supervisor stops resuming it.\nLast error: {}",
+            run.id,
+            run.task_id,
+            detail.task.title,
+            or_none(tail(&last_error, 500))
+        );
+        if let Some(run_dir) = &run.run_dir {
+            question.push_str(&format!("\nRun directory: {run_dir}"));
+        }
+        question.push_str(
+            "\nretry: make the task ready for a new run. cancel: cancel the task. To change the task first, answer with what to change instead.",
+        );
+        let outcome = ask_in(
+            &mut self.queue,
+            &self.repository.root,
+            NewAsk {
+                kind: AskKind::Decide,
+                task_id: None,
+                run_id: Some(run.id.clone()),
+                question,
+                options: EXHAUSTED_OPTIONS.iter().map(|o| (*o).to_owned()).collect(),
+                asked_by: TRIAGE_ASKER.to_owned(),
+            },
+            self.cmux,
+        )?;
+        let ask_id = outcome["id"].as_i64().context("ask returned no id")?;
+        let Some(failed) =
+            self.queue
+                .exhaust_resumes(&run.id, MAX_RESUME_ATTEMPTS, ask_id, &reason)?
+        else {
+            // The run changed meanwhile (another supervisor took it): an ask
+            // this pass opened has nothing left to decide.
+            if outcome["created"] == true {
+                self.queue.answer(
+                    ask_id,
+                    "withdrawn: the run changed before it was handed over",
+                )?;
+                self.queue.close_ask(ask_id)?;
+            }
+            return Ok(());
+        };
+        self.log.note(&format!(
+            "run {} of task {} used up its resumes; it is failed and waits for ask {ask_id}",
+            failed.id, failed.task_id
+        ));
+        self.close_triaged_workspaces(&failed)?;
+        self.note_triaged(&failed);
         Ok(())
     }
 
@@ -3215,12 +3301,12 @@ impl SessionWatch {
                 json!({"path": path_text(&self.receipt_path)?, "validated": false}),
             )?;
             log.note(&format!(
-                "receipt received for {}; waiting for the session to go idle (or a maintainer /exit)",
+                "receipt received for {}; waiting for the session to go idle (or a person's /exit)",
                 run.id
             ));
         }
         let wrapper = processes.iter().find(|p| p.role == "wrapper");
-        // A session that already ended (on its own, by a maintainer's /exit,
+        // A session that already ended (on its own, by a person's /exit,
         // or before this supervisor adopted the run) is not asked to exit.
         let session_ended = wrapper.is_some_and(|w| w.exited_at.is_some());
         // Background work the session left running after its receipt is
@@ -3260,13 +3346,15 @@ impl SessionWatch {
                         json!({"error": format!("{error:#}")}),
                     )?,
                 }
-                // Nobody needs to send /exit to a session that exited.
+                // Nobody needs to send /exit to a session that exited, nor
+                // answer its dialog.
                 for ask in queue.close_stuck_exit_asks(&run.id, STUCK_EXIT_CLOSED)? {
                     log.note(&format!(
                         "session of {} exited; closed its stuck_exit ask {}",
                         run.id, ask.id
                     ));
                 }
+                close_answer_prompt_asks(queue, run, PROMPT_EXITED_CLOSED, log)?;
                 return queue.finish_supervision(&run.id, token).map(Some);
             }
             ensure!(
@@ -3277,7 +3365,7 @@ impl SessionWatch {
                 self.deliver_answers(queue, cmux, run, log)?;
             }
             if let Some(agent) = processes.iter().find(|p| p.role == "agent") {
-                self.watch_prompt(queue, cmux, run, agent, log)?;
+                self.watch_prompt(queue, cmux, repository, run, agent, log)?;
             }
         } else {
             let timeout = cmux.registration_timeout();
@@ -3367,11 +3455,15 @@ impl SessionWatch {
     /// Read the screen of a session that has run for `prompt_wait` with
     /// neither a receipt nor an idle marker, its wrapper and agent alive, and
     /// record a dialog found there as `prompt_waiting` (once per screen) and
-    /// its disappearance as `prompt_cleared`. No key is sent (ADR-0019).
+    /// its disappearance as `prompt_cleared`. No key is sent (ADR-0019). A
+    /// dialog is raised to the inbox as an `answer_prompt` ask with the
+    /// screen's excerpt (ADR-0024's Consequences), which the runtime closes
+    /// once the dialog is gone, the receipt arrives or the session exits.
     fn watch_prompt(
         &mut self,
         queue: &mut SqliteQueue,
         cmux: &dyn WorkspaceBackend,
+        repository: &GitRepository,
         run: &TaskRun,
         agent: &RunProcess,
         log: &SupervisorLog,
@@ -3379,8 +3471,10 @@ impl SessionWatch {
         let started = *self.agent_seen.get_or_insert_with(Instant::now);
         let wait = cmux.prompt_wait();
         if self.receipt_seen {
-            // `receipt_observed` ends the attention by itself.
-            self.prompt_hash = None;
+            // `receipt_observed` ends the dialog by itself.
+            if self.prompt_hash.take().is_some() {
+                close_answer_prompt_asks(queue, run, PROMPT_RECEIPT_CLOSED, log)?;
+            }
             return Ok(());
         }
         if self.idle_marker.exists()
@@ -3428,12 +3522,25 @@ impl SessionWatch {
                         }),
                     )?;
                     log.note(&format!(
-                        "run {} waits at a {} dialog; answer the prompt in workspace {}",
+                        "run {} waits at a {} dialog in workspace {}; asking the inbox",
                         run.id,
                         kind.as_str(),
                         self.workspace
                     ));
+                    // A changed screen under an open ask keeps that ask (the
+                    // open ask of the run is returned, and nobody is notified
+                    // again), so a ticking line cannot flood the inbox.
                     self.prompt_hash = Some(hash);
+                    ask_answer_prompt(
+                        queue,
+                        cmux,
+                        repository,
+                        run,
+                        &self.workspace,
+                        kind.as_str(),
+                        &excerpt,
+                        log,
+                    )?;
                 }
             }
             None => self.clear_prompt(queue, run, log)?,
@@ -3446,7 +3553,7 @@ impl SessionWatch {
     /// went idle after asking (its idle marker is no older than the ask, to
     /// the second), then close the ask and record `ask_delivered` (ADR-0022
     /// decision 2). Each answer is sent at most once: a failed send records
-    /// `ask_delivery_failed` and leaves the ask unclosed for the maintainer.
+    /// `ask_delivery_failed` and leaves the ask unclosed for the inbox.
     fn deliver_answers(
         &mut self,
         queue: &mut SqliteQueue,
@@ -3504,7 +3611,7 @@ impl SessionWatch {
                         }),
                     )?;
                     log.note(&format!(
-                        "answer of ask {} could not be sent to run {} in workspace {}: {error:#}; it is left to the maintainer",
+                        "answer of ask {} could not be sent to run {} in workspace {}: {error:#}; it is left to the inbox",
                         ask.id, run.id, self.workspace
                     ));
                 }
@@ -3527,10 +3634,74 @@ impl SessionWatch {
                 json!({"workspace_id": self.workspace}),
             )?;
             log.note(&format!("dialog of {} is gone", run.id));
+            close_answer_prompt_asks(queue, run, PROMPT_CLEARED_CLOSED, log)?;
         }
         Ok(())
     }
 }
+
+/// Raise a dialog a worker's session stopped at as an `answer_prompt` ask
+/// to the inbox (ADR-0024's Consequences, in place of the attention of
+/// ADR-0019 decision 6): the question names the run, the workspace and the
+/// kind of dialog and carries the screen's excerpt. An open ask of the run
+/// is not registered twice. The runtime sends no key: the person answers
+/// the dialog, and the ask closes itself once the dialog is gone.
+#[allow(clippy::too_many_arguments)]
+fn ask_answer_prompt(
+    queue: &mut SqliteQueue,
+    cmux: &dyn WorkspaceBackend,
+    repository: &GitRepository,
+    run: &TaskRun,
+    workspace: &str,
+    prompt: &str,
+    excerpt: &str,
+    log: &SupervisorLog,
+) -> Result<()> {
+    let question = format!(
+        "The session of run {run_id} (task {task_id}) waits at a {prompt} dialog in workspace {workspace}. Answer with the choice to send to it (or what to do instead); the dialog is answered in that workspace, and this ask closes itself once the dialog is gone.\n\nLast lines of the screen:\n{excerpt}",
+        run_id = run.id,
+        task_id = run.task_id,
+    );
+    let outcome = ask_in(
+        queue,
+        &repository.root,
+        NewAsk {
+            kind: AskKind::AnswerPrompt,
+            task_id: Some(run.task_id),
+            run_id: Some(run.id.clone()),
+            question,
+            options: Vec::new(),
+            asked_by: SessionRole::Supervisor.as_str().into(),
+        },
+        cmux,
+    )?;
+    log.note(&format!(
+        "answer_prompt ask {} for {} (notified: {})",
+        outcome["id"], run.id, outcome["notified"]
+    ));
+    Ok(())
+}
+
+/// Close the run's `answer_prompt` asks nobody closed, noting each.
+fn close_answer_prompt_asks(
+    queue: &mut SqliteQueue,
+    run: &TaskRun,
+    answer: &str,
+    log: &SupervisorLog,
+) -> Result<()> {
+    for ask in queue.close_answer_prompt_asks(&run.id, answer)? {
+        log.note(&format!(
+            "closed the answer_prompt ask {} of {}: {answer}",
+            ask.id, run.id
+        ));
+    }
+    Ok(())
+}
+
+/// The answers the runtime writes into an open `answer_prompt` ask it closes.
+const PROMPT_CLEARED_CLOSED: &str = "the dialog is gone; closed by the runtime";
+const PROMPT_RECEIPT_CLOSED: &str = "the receipt arrived; closed by the runtime";
+const PROMPT_EXITED_CLOSED: &str = "the session exited; closed by the runtime";
 
 /// Raise a session that held `/exit` back as a `stuck_exit` ask to the
 /// inbox, with the last lines of its screen, through the ask path that
@@ -3539,8 +3710,8 @@ impl SessionWatch {
 /// ask without an excerpt. `after` says where the run stands and what
 /// follows once the session exits: a `running` run goes on to validating,
 /// one the supervisor holds after its review (ADR-0027) to its landing, its
-/// ask or its rest. The inbox only shows the ask to the person; the
-/// maintainer acts on the answer (`dagq-session`).
+/// ask or its rest. The inbox shows the ask to the person, who acts on the
+/// answer through it (the `dagq-recover` skill).
 fn ask_stuck_exit(
     queue: &mut SqliteQueue,
     cmux: &dyn WorkspaceBackend,
@@ -3555,7 +3726,7 @@ fn ask_stuck_exit(
         Err(error) => format!("(the screen could not be read: {error:#})"),
     };
     let question = format!(
-        "The session of run {run_id} (task {task_id}) did not exit within {timeout}s of the supervisor's /exit (exit_request_timed_out): something on its screen, usually one of Claude Code's own dialogs such as \"Background work is running\", holds the exit back. {after}; this ask then closes itself. Answer `exit` to have the maintainer answer the dialog so that the session exits and send /exit in workspace {workspace}, or `wait` to leave the session as it is (or write what to do instead).\n\nLast lines of the screen:\n{screen}",
+        "The session of run {run_id} (task {task_id}) did not exit within {timeout}s of the supervisor's /exit (exit_request_timed_out): something on its screen, usually one of Claude Code's own dialogs such as \"Background work is running\", holds the exit back. {after}; this ask then closes itself. Answer `exit` to have the dialog answered so that the session exits and /exit sent in workspace {workspace}, or `wait` to leave the session as it is (or write what to do instead).\n\nLast lines of the screen:\n{screen}",
         run_id = run.id,
         task_id = run.task_id,
         timeout = cmux.exit_timeout().as_secs(),
@@ -3579,6 +3750,10 @@ fn ask_stuck_exit(
     ));
     Ok(())
 }
+
+/// The options of the `decide` ask of a run whose resumes are used up: a
+/// subset of [`TRIAGE_OPTIONS`], applied the same way.
+const EXHAUSTED_OPTIONS: &[&str] = &["retry", "cancel"];
 
 /// The answer the runtime writes into an open `stuck_exit` ask it closes.
 const STUCK_EXIT_CLOSED: &str = "the session exited; closed by the runtime";
@@ -4091,7 +4266,7 @@ impl ResumeWatch {
                         .then_some("did not finish within the resume timeout")
                 });
                 if let Some(why) = why {
-                    // Ask once, the way the maintainer would; never kill the session.
+                    // Ask once, the way a person would; never kill the session.
                     cmux.send_exit(&self.workspace)?;
                     log.note(&format!(
                         "resumed session of {} {why} (head {head}); exit requested",
@@ -4526,7 +4701,7 @@ impl ExitWatch {
                     "exit_requested",
                     json!({"workspace_id": session.workspace, "timeout_secs": timeout.as_secs()}),
                 )?;
-                // Ask once, the way the maintainer would; never kill the session.
+                // Ask once, the way a person would; never kill the session.
                 cmux.send_exit(&session.workspace)?;
                 log.note(&format!(
                     "exit requested for {}; waiting for session exit",
@@ -4874,7 +5049,7 @@ impl IdleMarker {
 
     /// Evidence that the agent went idle after publishing the receipt: the
     /// marker is no older than the receipt. Markers from earlier turns (for
-    /// example a question to the maintainer) do not count.
+    /// example a question to the inbox) do not count.
     fn idle_after_receipt(&self, receipt: &Path) -> Result<Option<Value>> {
         if self.background_running() {
             return Ok(None);
@@ -5320,7 +5495,7 @@ fn land_integrating(
         Verdict::Deferred { reason, mut detail } => {
             eprintln!("run {} needs a session: {reason}", run.id);
             // How many more times the supervisor resumes it (ADR-0019); the
-            // event is the maintainer's only once none are left.
+            // event is a person's only once none are left (as an ask).
             detail["resumes_left"] =
                 json!(MAX_RESUME_ATTEMPTS.saturating_sub(resume_attempts(queue, &run.id)));
             let run = queue.defer_integration(&run.id, token, &reason, detail)?;
@@ -5802,7 +5977,7 @@ fn remove_landed_worktree(queue: &mut SqliteQueue, repository: &GitRepository, r
 /// `<base>...<head>`, `base` being the run's base commit and `head` the
 /// receipt's commit. When a session already rebased `head` onto the current
 /// `main`, `base` is that `main` instead, so the review does not repeat
-/// what other tasks landed meanwhile. The diff itself is never returned, so the maintainer
+/// what other tasks landed meanwhile. The diff itself is never returned, so the caller
 /// hands the path to a subagent instead of reading it.
 pub fn review(db: &Path, task_id: i64) -> Result<Value> {
     let mut queue = SqliteQueue::open(db)?;
@@ -6237,12 +6412,12 @@ pub fn prompt(
          Write a completion receipt to {receipt} using a temporary file in the same directory and atomic rename.\n\
          Receipt JSON: {{\"run_id\":\"{run_id}\",\"result\":\"succeeded or failed\",\"commit\":\"full Git SHA of the branch head\",\"tests\":{{\"status\":\"passed, failed or not_applicable\",\"evidence_or_reason\":\"...\"}},\"e2e\":{{\"status\":\"...\",\"evidence_or_reason\":\"...\"}},\"subagent_review\":{{\"status\":\"...\",\"evidence_or_reason\":\"...\"}},\"summary\":\"...\",\"follow_ups\":[{{\"title\":\"...\",\"description\":\"...\"}}]}}\n\
          Each of tests, e2e and subagent_review needs evidence when passed and a reason when not_applicable.\n\
-         follow_ups is optional: an array of work you found outside this task, each with a title and a description, for the maintainer to register; omit it when there is none.\n\
+         follow_ups is optional: an array of work you found outside this task, each with a title and a description, for the planner to decide on; omit it when there is none.\n\
          You may write this receipt outside the worktree. Keep the worktree clean after committing.\n\
          The supervisor rejects the run unless the commit is the clean head of your branch on top of the base commit, and integrate reruns the verification commands itself after rebasing onto main.\n\
          When you need a decision you cannot make from the task and the repository, do not write the question to the terminal and wait: run `dagq ask --run {run_id} --kind worker_question --question '...'` in the worktree (one ask at a time, with everything you need decided in its question), report briefly that you asked, and stop. The answer arrives in this terminal as `answer to ask <id>: ...`; continue from it.\n\
          {stop_background}\n\
-         After submitting, report the outcome briefly and stop; do not run /exit yourself. Once you are idle the supervisor ends the session, and the maintainer can still send /exit. A receipt does not itself end the session.\n",
+         After submitting, report the outcome briefly and stop; do not run /exit yourself. Once you are idle the supervisor ends the session, and a person can still send /exit. A receipt does not itself end the session.\n",
         task_id = task.id,
         run_id = run.id,
         reading = WORKER_READING,
@@ -6254,33 +6429,16 @@ pub fn prompt(
     ))
 }
 
-/// The initial prompt of the maintainer session that `up` opens in the
-/// `[<repo>]maintainer` workspace (ADR-0016, ADR-0022). It names the queue
-/// and the supervisor's logs and points at `status --role maintainer`, the
-/// background `watch --role maintainer` and the plugin's `dagq-maintain`
-/// skill, which holds the procedure: land on a passing review, turn anything
-/// else it cannot decide into an ask, and leave registering to the planner
-/// and answering to the inbox; waking up again
-/// after compaction or `/clear` is the plugin's SessionStart hook's job.
-pub fn maintainer_prompt(db: &Path, log_dir: &Path) -> Result<String> {
-    Ok(format!(
-        "You are the maintainer of the dagq queue at {db}; the supervisor logs to {log_dir}.\n\
-         Start with `dagq status --role maintainer`, then follow the dagq-maintain skill of the dagq plugin: run `dagq watch --role maintainer --after <cursor>` in the background, wake when it returns and handle its attention.\n\
-         Land a run when its subagent review passes; register what you cannot decide as a `dagq ask` (on doubt about a landing, an approve_landing ask) and move on instead of waiting at the terminal. Never integrate because a watch returned.\n\
-         Registering goals and tasks is the planner's and answering asks the inbox's. Never open the queue database directly; use the dagq CLI only. If the dagq-maintain skill is missing, say so and wait.\n",
-        db = path_text(db)?,
-        log_dir = path_text(log_dir)?,
-    ))
-}
-
 /// The initial prompt of the inbox session that `up` opens in the
 /// `[<repo>]inbox` workspace (ADR-0022): it relays each open ask to a person
-/// and writes the person's answer back, deciding nothing itself.
+/// and writes the person's answer back, deciding nothing itself. Every
+/// other attention is the inbox's too (ADR-0024 decision 6): it reports it
+/// and does only what the person says.
 pub fn inbox_prompt(db: &Path) -> Result<String> {
     Ok(format!(
-        "You are the inbox of the dagq queue at {db}: you relay its asks to a person and never decide anything yourself.\n\
+        "You are the inbox of the dagq queue at {db}: you relay its asks and attention to a person and never decide anything yourself.\n\
          Start with `dagq status --role inbox` and follow the dagq-inbox skill of the dagq plugin: run `dagq watch --role inbox --after <cursor>` in the background, wake when it returns and watch again from the cursor it returns.\n\
-         On ask_opened, read the ask with `dagq asks --open --role inbox`, show the person its question and options (use AskUserQuestion when it is available), then write the person's answer with `dagq answer ID --text '<answer>'`.\n\
+         On ask_opened, read the ask with `dagq asks --open --role inbox`, show the person its question and options (use AskUserQuestion when it is available), then write the person's answer with `dagq answer ID --text '<answer>'`. Report any other attention (an answered ask, a stopped supervisor, a failed review or triage) to the person and do only what they say, as the skill describes.\n\
          Never open the queue database directly; use the dagq CLI only.\n",
         db = path_text(db)?,
     ))
@@ -6416,8 +6574,8 @@ pub struct DoctorReport {
 }
 
 /// Registered supervisors, lease holders and the unfinished runs with their
-/// leases, without inspecting the runs' processes, plus what waits for the
-/// maintainer (`attention`) and the newest event id (`cursor`) to `watch`
+/// leases, without inspecting the runs' processes, plus what waits for a
+/// person (`attention`) and the newest event id (`cursor`) to `watch`
 /// from (ADR-0016).
 pub fn status(db: &Path) -> Result<Value> {
     status_for(db, None)
@@ -6429,9 +6587,9 @@ const ASK_QUESTION_CHARS: usize = 200;
 /// `ask`: register an ask and, when it is new, tell a person with one
 /// `cmux notify` aimed at the inbox workspace `up` recorded (without a
 /// workspace when there is none). This is the runtime's only notification
-/// (ADR-0022 decision 5): the process that asks sends it, since asks come
-/// from the maintainer and workers, not the supervisor. A repeated ask
-/// notifies nobody. The ask stands whether or not the notification goes
+/// (ADR-0022 decision 5): the process that asks sends it, whether a
+/// worker, a job or the supervisor's own loop. A repeated ask notifies
+/// nobody. The ask stands whether or not the notification goes
 /// out; a failure is reported as `notify_error` next to `notified: false`.
 pub fn ask(
     db: &Path,
@@ -6543,7 +6701,7 @@ pub fn status_for(db: &Path, role: Option<crate::domain::SessionRole>) -> Result
         "runs": runs,
         "attention": crate::watch::attention(&queue, &registrations, now)?
             .into_iter()
-            .filter(|a| crate::watch::for_role(&a.kind, role))
+            .filter(|_| crate::watch::for_role(role))
             .collect::<Vec<_>>(),
         "asks": asks,
         "cursor": cursor,

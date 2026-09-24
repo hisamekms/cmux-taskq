@@ -1,15 +1,13 @@
 ---
 name: dagq-recover
-description: Diagnose and recover one dagq run that is stuck, that its supervisor gave up on, whose supervisor or integrate process died, or that stays claimed/starting/running/validating/integrating after its process ended, without disturbing the runs executing next to it, and decide on a failed or interrupted run whose triage failed. Use when status or watch shows an attention with next "recover run" or "triage by hand", when the user reports an orphaned run, a run with last_error and no lease, a stale supervisor in status or doctor, a run stuck in integrating, or asks to recover or retry a run. "triaging (runtime)" needs nothing.
+description: What a person does by hand in a dagq queue, from the inbox or planner session and only on the person's word. Recover a run when no supervisor serves the queue (or a dead supervisor's lease holds it); decide on a failed or interrupted run whose headless triage failed; review and integrate a run whose headless review failed, or push main after a failed push; carry out the answer of a stuck_exit or answer_prompt ask in a run's cmux workspace; and start, stop or update the runtime with up / down. Use when status or watch shows "recover run", "triage by hand", "review by hand", "review and integrate", "push main", "restart supervisor", "send the answer of ask <id> to the worker", an answered stuck_exit or answer_prompt ask, or when the person asks to start, stop, update or recover. Entries ending in "(runtime)" need nothing.
 ---
 
-# dagq: diagnose and recover a run
+# dagq: what a person does by hand
 
-Prerequisite: resolve the launcher as in the `dagq` skill (`DAGQ="${CLAUDE_PLUGIN_ROOT}/bin/dagq"`). Never touch the queue database directly; the binary refuses unsafe recoveries itself, so do not work around it.
+Prerequisite: resolve the launcher as in the `dagq` skill (`DAGQ="${CLAUDE_PLUGIN_ROOT}/bin/dagq"`). Never touch the queue database directly; the binary refuses unsafe recoveries itself, so do not work around it. Everything here is done from the inbox or planner session, when the person says so (ADR-0024 decision 6).
 
-The supervisor does most of this itself (ADR-0024 decision 3). A run without a lease whose session processes are all gone (none registered, exited, or dead) is recovered by the next supervisor pass (`run_recovered` with `by: supervisor`), and every `failed` or `interrupted` run goes to its headless triage (`next: triaging (runtime)`), which readies the task, resumes the run or opens a `decide` ask for the inbox, then closes the run's workspace. Do not recover, `ready` or close anything for such a run. You recover by hand only when no supervisor runs, or a dead supervisor's stale lease still holds the run; you decide only after a triage failed (section 4).
-
-An attention with `next` `recover run` in `status` or `watch` (its `kind` is `runtime_error`) is a run `claimed` / `starting` / `running` / `validating` / `integrating` with no lease, because its supervisor gave it up (the wrapper's heartbeat was lost, the wrapper did not register, a step or provisioning failed). Nothing adopts it; while a process of its session still lives it waits, and once they are gone a running supervisor recovers it. Without a supervisor, follow the steps below. The attention goes away once the run is recovered. A stale lease is not this case: a dead supervisor shows up as `restart supervisor`, and its runs are adopted or handled by these steps. `status` is authoritative: if `watch` reported `recover run` but `status` shows the run at rest (for example `awaiting_integration` after a failed workspace close), there is nothing to recover.
+The supervisor does most of the work itself (ADR-0024 decision 3). A run without a lease whose session processes are all gone is recovered by the next supervisor pass (`run_recovered` with `by: supervisor`); every `failed` or `interrupted` run goes to its headless triage (`next: triaging (runtime)`), which readies the task, resumes the run or opens a `decide` ask, then closes the run's workspace; a `needs_session` run is resumed (`resuming (runtime)`) and, after three resumes, handed to the person as a `decide` ask (`retry` / `cancel`). Do not recover, `ready` or close anything for such a run. `status` is authoritative over what a `watch` reported.
 
 ## 1. Diagnose without changing state
 
@@ -17,28 +15,41 @@ An attention with `next` `recover run` in `status` or `watch` (its `kind` is `ru
 "$DAGQ" doctor --full
 ```
 
-Plain `doctor` is the compact form, one line's worth per supervisor and per run (`run_id`, `task_id`, `status`, `lease_stale`, `recoverable`, `blocker_count`, `workspace_id`, `worktree_path`); diagnosing needs `--full`, which prints the lease, processes, paths and the `blockers` described below.
-
-- `supervisors`: one entry per registered `supervise` process (`registered: true`, with `pid`, `alive` (`kill -0`), `parallel`, `started_at`, `heartbeat_at`, `heartbeat_age_secs`, `run_ids`, and `stale` when the PID is dead or the heartbeat is older than 30 seconds), plus one per process that holds leases without a registration, such as a running `integrate` (`registered: false`). A resident supervisor is listed even with an empty `run_ids`; empty `supervisors` means no supervisor is registered and no run is owned by anyone. A stale registration is left by a killed or hung supervisor; the runtime never deletes it, so report it to the user rather than trying to remove it, and `recover` works on runs regardless of it.
-- `runs`: every run in `claimed`, `starting`, `running`, `validating`, or `integrating` with `task_id`, `workspace_id`, `worktree_exists`, `run_dir_exists`, `receipt_exists`, `last_error`, its own `lease` (`pid`, `alive`, heartbeat age, `stale`; `null` when no supervisor owns it), and each registered `wrapper` / `agent` process with `pid`, `alive`, heartbeat age, and `exit_code` (`alive` is null once an exit is recorded).
-- `blockers`: per run, what still prevents recovery. `recoverable: true` when empty. Only the run's own lease and processes count; other runs, healthy or not, never block it.
-
-Explain to the user what is still alive. Common cases: the supervisor gave the run up (`last_error` set, `lease` null, `runtime_error` event with `lease_released: true`, for example after the wrapper's heartbeat was lost) while its session may still be running, and the supervisor keeps serving other runs; the supervisor was killed (lease stale, PID dead) while the sessions are still running; the whole machine restarted (everything dead); the supervisor is alive but its heartbeat stopped (it must be stopped by the user); an `integrate` process died while landing a run (the run is `integrating` with a stale lease and no wrapper/agent processes).
-
-A `running` or `validating` run whose lease is stale while its wrapper is alive (heartbeat within 30 seconds) or has recorded its exit is not a case for `recover`: the next supervisor with a free slot adopts it (a `run_adopted` event, the lease and `supervisor_token` move to that supervisor) and finishes it, so do not send `/exit` or recover such a run; start or wait for a supervisor (`up` reuses a live one) and watch `show ID`. Likewise a `running` run with `exit_request_timed_out` and a live lease is not given up: its supervisor still watches it, and its `stuck_exit` ask, once answered, leads to `/exit` in its workspace (`dagq-session`, section 3), which is all it needs; it then goes on to `validating`. Only a run whose wrapper is dead or silent, a `claimed` / `starting` run, an `integrating` run, or a run without a lease needs `recover`.
+Explain to the person what is still alive: the supervisors, each unfinished run's lease and processes, and its `blockers` (`recoverable: true` when empty). `${CLAUDE_PLUGIN_ROOT}/skills/dagq-recover/reference/doctor.md` lists the fields and the common cases. A `running` or `validating` run whose wrapper is alive under a stale lease is adopted by the next supervisor: start one (`up`, section 5) instead of recovering it.
 
 ## 2. Stop what is still running
 
-Recovery is refused while any process registered for that run is alive, its lease heartbeat is fresh, or its lease PID is alive. Ask the user to end those first: send `/exit` in the task's cmux workspace (`cmux workspace list` shows it by `workspace_id`), and stop a hung supervisor process. Do not kill processes yourself unless the user asks. Runs owned by a live supervisor are not orphans; leave them to it.
+Recovery is refused while a process of that run is alive or its lease is fresh. The person ends them (`/exit` in the run's workspace, or stopping a hung supervisor); do not kill processes yourself.
 
-## 3. Recover
+## 3. Recover (only without a supervisor)
+
+Attention `recover run` (`kind` `runtime_error`): an unfinished run without a lease whose session may still live. With a supervisor running it recovers the run once the session is gone; without one:
 
 ```sh
 "$DAGQ" recover RUN_ID
 ```
 
-`RUN_ID` comes from `doctor` or `show ID`. On success it prints `{"outcome": "recovered", "run": ...}`: the run is `interrupted` (an `integrating` run goes back to `awaiting_integration` instead, because its validated result is intact; land it again with the `dagq-land` skill), a `run_recovered` event records what was checked, and that run's lease (if any) is deleted. Other runs, their leases and processes are untouched, so a supervisor running other tasks keeps going. The worktree, branch, cmux workspace, and run directory are kept, and the task stays `in_progress`. The next supervisor triages the `interrupted` run; start one (`up`) rather than deciding yourself.
+The run becomes `interrupted` (an `integrating` one `awaiting_integration`), other runs are untouched, and the worktree, workspace and run directory are kept. The next supervisor triages it; start one (`up`) rather than deciding yourself.
 
 ## 4. Triage by hand
 
-Attention `triage by hand` (`kind` `triage_failed`): the supervisor's headless triage of a `failed` / `interrupted` run could not start, timed out, printed no verdict, or its verdict could not be applied (`show ID` has the `triage_failed` event with `error`). The run stays as it is, its workspace open, and the supervisor does not triage it again. Read `last_error` and the run directory's `triage-prompt-N.txt` (the material it was given), `triage-N.out` and `triage-N.err`, and bring the choice to the person through the inbox (a `decide` ask on the run). Then act on the answer: `"$DAGQ" ready ID` runs the task again as a new run (or `draft ID` to edit it first, then `ready`), `cancel ID` drops it. Close the old workspace with `cmux workspace close <workspace_id>` once its screen is read. Removing the old worktree and branch is the user's manual cleanup; list them from the run's `worktree_path` and `branch` in `show ID`.
+Attention `triage by hand` (`kind` `triage_failed`): the supervisor's headless triage of a `failed` / `interrupted` run could not start, timed out, printed no verdict, or its verdict could not be applied (`show ID` has the `triage_failed` event with `error`). The run stays as it is and is not triaged again. Read `last_error` and the run directory's `triage-prompt-N.txt`, `triage-N.out` and `triage-N.err`, and bring the choice to the person. On their answer: `"$DAGQ" ready ID` runs the task again as a new run (a task to change goes to the planner), `cancel ID` drops it. Close the old workspace with `cmux workspace close <workspace_id>` once its screen is read. Removing the old worktree and branch is the person's manual cleanup (`worktree_path` and `branch` in `show ID`).
+
+## 5. Start, stop and update the runtime
+
+```sh
+"$DAGQ" up --plugin-dir "$CLAUDE_PLUGIN_ROOT"            # add --parallel N (default 4)
+"$DAGQ" up --in-cmux --plugin-dir "$CLAUDE_PLUGIN_ROOT"  # only when the preflight sends you there
+"$DAGQ" down            # stop claiming; the supervisor drains its runs and exits
+"$DAGQ" down --wait     # the same, and block until it is gone
+```
+
+`up` is idempotent: it keeps one supervisor resident and opens the inbox and planner workspaces (the one you run it from is `skipped`). `restart supervisor` (`supervisor_stopped`, `supervisor_stale`) is answered with `up`; an in-cmux supervisor is never restarted by anything else. Updating the fixed binary is: replace it, then `up`, which drains a supervisor of another version first. `down --force` kills the supervisor and loses its active runs: only on the person's explicit word. `${CLAUDE_PLUGIN_ROOT}/skills/dagq-recover/reference/up-down.md` has the outcomes, the in-cmux case, the binary update and the logs.
+
+## 6. Review by hand, and a failed push
+
+Attention `review by hand` (`review_failed`: the supervisor's headless review failed) or `review and integrate` (a run accepted without a review): review it in a subagent from the file `review ID` writes, and on the person's word `integrate` it; on doubt, register an `approve_landing` ask. `push main` (`push_failed`): fix the cause, then `git push origin main`. Follow `${CLAUDE_PLUGIN_ROOT}/skills/dagq-recover/reference/review-by-hand.md`.
+
+## 7. A run's session: dialogs, stuck exits, undelivered answers
+
+The answer of a `stuck_exit` ask (`exit`), of an `answer_prompt` ask, and `send the answer of ask <id> to the worker and close it` are carried out in the run's cmux workspace with keys and text, never by recovering the run. Follow `${CLAUDE_PLUGIN_ROOT}/skills/dagq-recover/reference/session.md` (and `${CLAUDE_PLUGIN_ROOT}/skills/dagq-recover/reference/stuck-exit.md` for `stuck_exit`). What the runtime's resume of a `needs_session` run sends and when it ends is in `${CLAUDE_PLUGIN_ROOT}/skills/dagq-recover/reference/resume.md`; never open a resume workspace yourself.

@@ -1,27 +1,27 @@
 ---
 name: dagq-inbox
-description: Be a dagq queue's inbox: start from status --role inbox, wait for ask_opened with watch --role inbox in the background, show each open ask (question and options) to the person, write their answer back with answer, and watch again. Relays only; never decides and never touches runs, tasks or goals. Use when the session starts or wakes up as a dagq inbox (DAGQ_ROLE=inbox), or when the person asks what the queue is waiting on them for. Registering work is dagq-planner; running and landing the queue is dagq-maintain.
+description: Be a dagq queue's inbox: start from status --role inbox, wait for its attention with watch --role inbox in the background, show each open ask (question and options) to the person and write their answer back with answer, report every other attention (an answered ask, a stopped supervisor, a failed review or triage, a failed push) to the person, and carry out only what the person says, through dagq-recover. Never decides by itself. Use when the session starts or wakes up as a dagq inbox (DAGQ_ROLE=inbox), or when the person asks what the queue is waiting on them for. Registering work is dagq-planner.
 ---
 
-# dagq: relay the queue's asks to the person
+# dagq: relay the queue's asks and attention to the person
 
 Prerequisite: `DAGQ="${CLAUDE_PLUGIN_ROOT}/bin/dagq"` resolved as in the `dagq` skill (`"$DAGQ" --resolve`). Never open or edit the queue database; go through the CLI only.
 
-An **ask** is a question the maintainer, a worker or the observer registered in the queue for the person, and then stopped or moved on from. This session is how it reaches the person: it shows the ask, and writes the person's answer back with `answer`; the maintainer acts on it, or the supervisor for a worker's question and for an `approve_landing` answered with one of its options. `dagq ask` also sends one `cmux notify` to this workspace, so the person knows to look here.
+Roles (ADR-0024): the **supervisor** (`dagq supervise`) claims, runs, validates, reviews, resumes, triages and lands runs; a **worker** is one run's Claude session; the **planner** registers goals and tasks with the person (`dagq-planner`); the **observer** is the supervisor's periodic job. This session, the **inbox**, is where everything that waits for the person reaches them: an **ask** (a question a worker, the supervisor, a job or the observer registered and then moved on from) and every other **attention**. `dagq ask` also sends one `cmux notify` to this workspace.
 
 This session holds no state of its own. After a restart, compaction or `/clear`, start again from step 1 (the plugin's SessionStart hook prints `status --role inbox` after compaction and `/clear`).
 
-## 1. Read what is open
+## 1. Read what waits
 
 ```sh
 "$DAGQ" status --role inbox
 ```
 
-`asks` lists the open asks (`id`, `kind`, `question` cut at 200 characters, `task_id`, `run_id`, `asked_by`, `age_secs`); `attention` has one `answer ask <id>` entry per open ask; `cursor` is where the next `watch` starts. When there are open asks, go to step 3 before watching.
+`asks` lists the open asks (`id`, `kind`, `question` cut at 200 characters, `task_id`, `run_id`, `asked_by`, `age_secs`); `attention` has everything that waits, each with a fixed `next`; `cursor` is where the next `watch` starts. Handle open asks first (step 3), then the rest (step 4). `${CLAUDE_PLUGIN_ROOT}/skills/dagq-inbox/reference/status.md` lists every field and `next`.
 
 ## 2. Watch in the background
 
-Run `"$DAGQ" watch --role inbox --after <cursor>` with the Bash tool's `run_in_background`. It returns when an `ask_opened` arrives (default `--timeout 600`; on a timeout `events` is empty and the cursor unchanged). Read the returned `events` and `cursor`, go to step 3 for any `ask_opened`, then watch again from the returned `cursor`. Keep exactly one watch running; never poll `status` in a loop.
+Run `"$DAGQ" watch --role inbox --after <cursor>` with the Bash tool's `run_in_background`. It returns when an attention event arrives or the supervisors' health changes (default `--timeout 600`; on a timeout `events` is empty and the cursor unchanged). Read the returned `events`, `supervisors_changed` and `cursor`, handle them (steps 3 and 4), then watch again from the returned `cursor`. Keep exactly one watch running; never poll `status` in a loop.
 
 ## 3. Show an ask and write the answer
 
@@ -38,19 +38,22 @@ It prints each open ask in full (`question`, `options`, `kind`, `task_id`, `run_
 "$DAGQ" answer <id> --text '<the answer>'
 ```
 
-3. `{"error": "ask <id> is not open"}` means someone answered it first (the maintainer answers a worker's question about its own worktree): tell the person and move on.
+3. `{"error": "ask <id> is not open"}` means the runtime closed it first (the dialog went away, the session exited): tell the person and move on.
 
-When the person wants more context before answering, read it for them with `"$DAGQ" show <task_id>` (and `--full` for a receipt), without changing anything. Leave an ask they do not want to answer yet open; it stays in `status` until answered.
+When the person wants more context before answering, read it for them with `"$DAGQ" show <task_id>` (and `--full` for a receipt), without changing anything. Leave an ask they do not want to answer yet open.
 
-## What the kinds mean to the person
+What the kinds mean: `approve_landing` (the supervisor's review doubted a landing: `land`, `send_back` or `cancel`, applied by the supervisor), `decide` (a triage's choice, `retry` / `resume` / `cancel`, or `retry` / `cancel` for a run that used up its resumes; applied by the supervisor), `worker_question` (a worker's own question; the supervisor types the answer into its terminal), `answer_prompt` (a worker's session stopped at a dialog; the question ends with its screen), `stuck_exit` (a session held the supervisor's `/exit` back: `exit` or `wait`), `blocked` (the observer saw a threshold crossed; when the answer is new work, tell the person the planner registers it).
 
-- `approve_landing`: the supervisor's review (or the maintainer's) found a doubt about landing the run; the question carries the reasons and where `review.md` is. Answer with exactly one of the options: `land` lands it as it is, `send_back` resumes the run's session to fix the review's reasons, `cancel` fails the run and drops the task. The supervisor applies the answer itself; any other text goes to the maintainer instead.
-- `answer_prompt`: a run's session stopped at a dialog; the answer is the choice to send to it.
-- `decide`: a choice the maintainer cannot make, often a worker's question passed on unchanged.
-- `worker_question`: a worker's own question. The maintainer may answer one about the run's own worktree first (step 3's error then); the answer reaches the worker's terminal.
-- `stuck_exit`: the supervisor's. A run's session did not exit after its `/exit`, usually because Claude Code's own dialog (such as "Background work is running") holds it; the question ends with the last lines of its screen. Show that excerpt with the question. `exit` has the maintainer answer the dialog and send `/exit` (it checks first that the work is committed), `wait` leaves the session to the person; write the person's words when they want something else. You never touch that workspace yourself. If the session exits first, the supervisor closes the ask and `answer` reports it is not open (step 3's error).
-- `blocked`: the observer saw a threshold crossed (a stall, a long wait, idle slots). When the person's answer is new work, write the answer, then tell them the planner session registers it.
+## 4. Report the other attention, act only on the person's word
+
+Report each to the person in one short list (task, status, `next`, gist of `last_error`), and do what they tell you with the `dagq-recover` skill. `(runtime)` entries need nothing.
+
+- `read the answer of ask <id> and close it` (`ask_answered`): an answer the runtime does not apply. `stuck_exit` `exit`, `answer_prompt`, or text the person wrote: carry it out as `${CLAUDE_PLUGIN_ROOT}/skills/dagq-recover/reference/session.md` says, then `"$DAGQ" ask close <id>`. `wait`, or an answer that needs nothing from this session: `ask close <id>`.
+- `send the answer of ask <id> to the worker and close it`: the supervisor could not type a worker's answer; `session.md` too.
+- `restart supervisor` (`supervisor_stopped`, `supervisor_stale`): tell the person; `up` once they say so (`dagq-recover`, section 5).
+- `review by hand`, `review and integrate`, `push main`: `${CLAUDE_PLUGIN_ROOT}/skills/dagq-recover/reference/review-by-hand.md`, with the person.
+- `recover run`, `triage by hand`: the `dagq-recover` skill.
 
 ## Where your authority ends
 
-Only `status`, `watch`, `asks`, `show` and `answer`. Never answer on the person's behalf, never pick a default, and never `ask close`, `integrate`, `review`, `ready`, `cancel`, `add` or type into another workspace: acting on an answer is the supervisor's or the maintainer's, and registering work is the planner's.
+Yourself: `status`, `watch`, `asks`, `show`, `answer` with the person's own words, and `ask close` after an answer was carried out. Only when the person says so: what `dagq-recover` describes (`up` / `down`, `integrate` after a review by hand, `recover`, `ready` / `cancel`, keys and `/exit` in a run's workspace). Never answer on the person's behalf, never pick a default, and never `add`, `goal add` or `goal close`: registering work is the planner's.

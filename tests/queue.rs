@@ -899,7 +899,7 @@ fn migration_from_v6_adds_goals_and_keeps_tasks_runs_and_events() {
     assert_eq!(queue.schema_version().unwrap(), 18);
     assert_eq!(
         queue
-            .session_workspace(dagq::domain::SessionRole::Maintainer)
+            .session_workspace(dagq::domain::SessionRole::Inbox)
             .unwrap(),
         None
     );

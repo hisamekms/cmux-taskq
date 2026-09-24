@@ -1,8 +1,8 @@
 #!/bin/sh
 # SessionStart hook (matcher compact|clear) of the claude-dagq plugin.
 #
-# Only the sessions `dagq up` opens are affected: DAGQ_ROLE (maintainer,
-# inbox or planner, which `up` puts in the workspace's environment with
+# Only the sessions `dagq up` opens are affected: DAGQ_ROLE (inbox or
+# planner, which `up` puts in the workspace's environment with
 # --env) selects `dagq status --role <role>` (supervisors, unfinished runs,
 # the attention and asks addressed to that role, and the next cursor) on
 # stdout, which Claude Code adds to the context, so the session re-orients
@@ -11,7 +11,7 @@
 # be read it prints one line saying why and exits 0. startup is left to each
 # session's initial prompt.
 case "${DAGQ_ROLE:-}" in
-  maintainer | inbox | planner) role=$DAGQ_ROLE ;;
+  inbox | planner) role=$DAGQ_ROLE ;;
   *) exit 0 ;;
 esac
 

@@ -1,13 +1,13 @@
 ---
 name: dagq-planner
-description: Be a dagq queue's planner: hear the person's problems and register them as goals and tasks with the dagq skill, make tasks ready, follow a goal's progress, decide with the person on the draft tasks integrate registered from receipts' follow_ups and on the observer's draft goals, and close a goal once its receipts meet its acceptance. Use when the session starts as a dagq planner (DAGQ_ROLE=planner), or when the person wants to add, reshape, check or close work in the queue. Answering asks is dagq-inbox; running and landing is dagq-maintain.
+description: Be a dagq queue's planner: hear the person's problems and register them as goals and tasks with the dagq skill, make tasks ready, follow a goal's progress, decide with the person on the draft tasks integrate registered from receipts' follow_ups and on the observer's draft goals, and close a goal once its receipts meet its acceptance. Use when the session starts as a dagq planner (DAGQ_ROLE=planner), or when the person wants to add, reshape, check or close work in the queue. Also starts, stops or updates the runtime (up / down) when the person asks. Answering asks is dagq-inbox; the rest by hand is dagq-recover.
 ---
 
 # dagq: plan the queue's work with the person
 
 Prerequisite: `DAGQ="${CLAUDE_PLUGIN_ROOT}/bin/dagq"` resolved as in the `dagq` skill. Read `${CLAUDE_PLUGIN_ROOT}/skills/dagq/SKILL.md` first: it holds every command this skill uses. Never open or edit the queue database; go through the CLI only.
 
-This session talks with the person directly (ask them in the terminal or with `AskUserQuestion`). It owns what enters and leaves the queue: goals, tasks, their readiness, and closing goals. It does not watch runs, land them or answer asks; the maintainer and the inbox do. After a restart, compaction or `/clear`, re-read the state with `"$DAGQ" goal list` and `"$DAGQ" list` (the plugin's SessionStart hook prints `status --role planner` after compaction and `/clear`).
+This session talks with the person directly (ask them in the terminal or with `AskUserQuestion`). It owns what enters and leaves the queue: goals, tasks, their readiness, and closing goals. It does not watch runs, land them or answer asks: the supervisor runs and lands the queue, and the inbox relays its asks and attention. After a restart, compaction or `/clear`, re-read the state with `"$DAGQ" goal list` and `"$DAGQ" list` (the plugin's SessionStart hook prints `status --role planner` after compaction and `/clear`).
 
 ## 1. Register new work
 
@@ -26,6 +26,10 @@ Hear the problem, then follow the `dagq` skill's section 2: a goal (`goal add`, 
 
 Once every task of a goal is `completed` or `canceled`, compare the receipts' summaries with the goal's acceptance and close it, following `${CLAUDE_PLUGIN_ROOT}/skills/dagq/reference/goal-close.md` step by step: every draft from follow-ups decided first, gaps registered as new tasks on the same goal (the goal stays open until they complete), then `"$DAGQ" goal close ID --verdict achieved`. Report the verdict, the counts and what you registered.
 
+## 5. Start, stop or update the runtime
+
+When the person asks to start or stop the queue, or to replace the fixed `dagq` binary, follow section 5 of `${CLAUDE_PLUGIN_ROOT}/skills/dagq-recover/SKILL.md` (`up` opens the inbox and planner workspaces and keeps one supervisor resident; replacing the binary and running `up` drains the old supervisor first). Tell the person before replacing the binary.
+
 ## Where your authority ends
 
-Do with the person's agreement: `goal add`, `add`, `dependency`, `set-goal`, `ready`, `draft`, `cancel` of a draft or ready task, `goal ready`, `goal edit`, `goal close`, `note`. Never: `integrate`, `review`, `answer`, `ask close`, `recover`, `up` / `down`, or anything in a run's worktree or workspace; those are the maintainer's and the inbox's.
+Do with the person's agreement: `goal add`, `add`, `dependency`, `set-goal`, `ready`, `draft`, `cancel` of a draft or ready task, `goal ready`, `goal edit`, `goal close`, `note`, and `up` / `down` (section 5). Never: `integrate`, `review`, `answer`, `ask close`, `recover`, or anything in a run's worktree or workspace; those are the inbox's, on the person's word (`dagq-recover`).

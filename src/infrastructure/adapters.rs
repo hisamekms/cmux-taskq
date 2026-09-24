@@ -973,7 +973,7 @@ impl WorkspaceBackend for Cmux {
         Ok(())
     }
 
-    /// Type `/exit` at Claude's prompt exactly as the maintainer would.
+    /// Type `/exit` at Claude's prompt exactly as a person would.
     fn send_exit(&self, workspace_id: &str) -> Result<()> {
         output(Command::new(&self.executable).args([
             "send",
@@ -1244,12 +1244,6 @@ pub fn single_line(text: &str) -> String {
         .replace('\\', "/")
 }
 
-/// `[<repo>]maintainer`: the one resident Claude session of a repository's
-/// queue (ADR-0028).
-pub fn maintainer_workspace_name(repo_root: &Path) -> String {
-    role_workspace_name(repo_root, SessionRole::Maintainer)
-}
-
 /// `[<repo>]supervisor`: the workspace `up --in-cmux` runs `supervise`
 /// in when launchd cannot reach cmux (ADR-0011). The launchd mode has no
 /// workspace at all.
@@ -1258,13 +1252,13 @@ pub fn supervisor_workspace_name(repo_root: &Path) -> String {
 }
 
 /// `[<repo>]planner`: the session that talks with a person to register goals
-/// and tasks, which `up` opens next to the maintainer's.
+/// and tasks, which `up` opens (ADR-0028).
 pub fn planner_workspace_name(repo_root: &Path) -> String {
     role_workspace_name(repo_root, SessionRole::Planner)
 }
 
-/// `[<repo>]inbox`: the session where a person answers the maintainer's
-/// asks, which `up` opens next to the maintainer's.
+/// `[<repo>]inbox`: the session where a person answers the queue's asks,
+/// which `up` opens next to the planner's.
 pub fn inbox_workspace_name(repo_root: &Path) -> String {
     role_workspace_name(repo_root, SessionRole::Inbox)
 }
@@ -1604,12 +1598,8 @@ mod tests {
                 .to_string()
                 .contains("missing repository path")
         );
-        assert_eq!(
-            maintainer_workspace_name(Path::new("/home/u/ghq/dagq")),
-            "[dagq]maintainer"
-        );
         // A root with no basename falls back to the path itself.
-        assert_eq!(maintainer_workspace_name(Path::new("/")), "[/]maintainer");
+        assert_eq!(planner_workspace_name(Path::new("/")), "[/]planner");
         assert_eq!(
             supervisor_workspace_name(Path::new("/home/u/ghq/dagq")),
             "[dagq]supervisor"
@@ -1638,8 +1628,8 @@ mod tests {
             "dagq role=worker queue=77067154921b9014 run=0d8e3f1a-7c1b-4e35-9a11-3f6d2c9b8e47 task=15"
         );
         assert_eq!(
-            workspace_description(SessionRole::Maintainer, "abc", None, None),
-            "dagq role=maintainer queue=abc"
+            workspace_description(SessionRole::Inbox, "abc", None, None),
+            "dagq role=inbox queue=abc"
         );
         assert_eq!(
             workspace_description(SessionRole::Supervisor, "abc", None, None),
@@ -1659,7 +1649,7 @@ mod tests {
         let listing = serde_json::json!({
             "window_id": "W",
             "workspaces": [
-                {"id": "4AC63CB7-3BE1-40A1-BCC4-CA0461685F01", "title": "[dagq]maintainer"},
+                {"id": "4AC63CB7-3BE1-40A1-BCC4-CA0461685F01", "title": "[dagq]inbox"},
                 {"title": "no id"}
             ]
         });
@@ -1671,7 +1661,7 @@ mod tests {
             &listing,
             "4ac63cb7-3be1-40a1-bcc4-ca0461685f01"
         ));
-        assert!(!workspace_listed(&listing, "[dagq]maintainer"));
+        assert!(!workspace_listed(&listing, "[dagq]inbox"));
         assert!(!workspace_listed(&serde_json::json!({}), "x"));
     }
 

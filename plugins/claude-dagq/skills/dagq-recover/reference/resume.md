@@ -9,6 +9,6 @@ The supervisor opens a workspace titled like the run's worker (`[<repo>]worker#<
 Once the session has rewritten the receipt for the new head and gone idle:
 
 - a run whose `integrate` was already called (`integration_approved`) gets `/exit` and is landed by the runtime;
-- any other run keeps the session open and goes through validation and the supervisor's review like the worker's (the `dagq-land` skill, section 0).
+- any other run keeps the session open and goes through validation and the supervisor's review like the worker's (`reference/review-by-hand.md`).
 
-A session that goes idle without resolving it, or runs past the resume timeout, gets `/exit` and its workspace is closed (the final screen is `terminal-resume-N.txt`). The attention `answer the prompt in workspace <id>` does not cover resumed sessions.
+A session that goes idle without resolving it, or runs past the resume timeout, gets `/exit` and its workspace is closed (the final screen is `terminal-resume-N.txt`). After the third attempt the supervisor stops: the run becomes `failed` (`last_error` says it was resumed three times, with the reason), a `decide` ask with the options `retry` and `cancel` goes to the inbox, recorded as the runtime's `triage_finished` (`by: runtime`, `action: ask`), and the workspaces the resumes left are closed. The supervisor applies the answer like a triage's: `retry` readies the task, `cancel` cancels it. A dialog a resumed session stops at is not raised as an `answer_prompt` ask; the resume's timeout ends that attempt.

@@ -495,18 +495,21 @@ fn ask_answer_asks_and_close_through_the_cli() {
     let status = ok(&db, &["status", "--role", "inbox"]);
     assert_eq!(status["asks"][0]["id"], id);
     assert_eq!(status["asks"][0]["question"], "Which ADR number?");
-    assert_eq!(status["attention"][0]["kind"], "ask_opened");
-    assert_eq!(status["attention"].as_array().unwrap().len(), 1);
-    let maintainer = ok(&db, &["status", "--role", "maintainer"]);
-    assert_eq!(maintainer["attention"][0]["kind"], "supervisor_stopped");
-    assert_eq!(maintainer["attention"].as_array().unwrap().len(), 1);
+    // All attention is the inbox's (ADR-0024 decision 6), the stopped
+    // supervisor included; none is the planner's.
+    assert_eq!(status["attention"][0]["kind"], "supervisor_stopped");
+    assert_eq!(status["attention"][1]["kind"], "ask_opened");
+    assert_eq!(status["attention"].as_array().unwrap().len(), 2);
+    let planner = ok(&db, &["status", "--role", "planner"]);
+    assert_eq!(planner["attention"], serde_json::json!([]));
+    assert_eq!(planner["asks"][0]["id"], id);
     assert_eq!(ok(&db, &["asks", "--open"])["asks"][0]["id"], id);
     assert_eq!(
-        ok(&db, &["asks", "--role", "maintainer"])["asks"],
+        ok(&db, &["asks", "--role", "planner"])["asks"],
         serde_json::json!([])
     );
 
-    // watch --role inbox wakes on ask_opened; the maintainer's times out.
+    // watch --role inbox wakes on ask_opened; the planner's times out.
     let after = cursor.to_string();
     let inbox = ok(&db, &["watch", "--after", &after, "--role", "inbox"]);
     assert_eq!(inbox["events"][0]["kind"], "ask_opened");
@@ -518,7 +521,7 @@ fn ask_answer_asks_and_close_through_the_cli() {
             "--after",
             &after,
             "--role",
-            "maintainer",
+            "planner",
             "--timeout",
             "0",
         ],
@@ -534,7 +537,7 @@ fn ask_answer_asks_and_close_through_the_cli() {
             .success()
     );
     let opened = inbox["cursor"].as_i64().unwrap().to_string();
-    let woke = ok(&db, &["watch", "--after", &opened, "--role", "maintainer"]);
+    let woke = ok(&db, &["watch", "--after", &opened, "--role", "inbox"]);
     assert_eq!(woke["events"][0]["kind"], "ask_answered");
     assert_eq!(
         woke["events"][0]["next"],
@@ -547,17 +550,14 @@ fn ask_answer_asks_and_close_through_the_cli() {
             "--after",
             &opened,
             "--role",
-            "inbox",
+            "planner",
             "--timeout",
             "0",
         ],
     );
     assert_eq!(quiet["events"], serde_json::json!([]));
     assert_eq!(ok(&db, &["status"])["asks"], serde_json::json!([]));
-    assert_eq!(
-        ok(&db, &["asks", "--role", "maintainer"])["asks"][0]["id"],
-        id
-    );
+    assert_eq!(ok(&db, &["asks", "--role", "inbox"])["asks"][0]["id"], id);
 
     let closed = ok(&db, &["ask", "close", &id_text]);
     assert!(closed["closed_at"].is_i64());

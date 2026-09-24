@@ -4,8 +4,8 @@ type: design
 title: Agent provider lifecycle
 status: current
 created: 2026-09-21
-updated: 2026-09-23
-last_verified: 2026-09-23
+updated: 2026-09-24
+last_verified: 2026-09-24
 scope: provider
 related:
   - adr-0004
@@ -89,9 +89,9 @@ B3 / D3 で `~/.claude.json` に残った `projects` の key は repository root
 
 ### 推奨する後続
 
-1. maintainer 手順として文書化する（runtime 変更なし、推奨）: ある repository で初めて `supervise` を流す前に、その repository の root で `claude` を一度起動して dialog を承認する（または `~/.claude.json` の `projects[<root>].hasTrustDialogAccepted` が真であることを確認する）。使い捨て repository のスモーク（journal 010 の手順）も root を先に信頼する。task 16 で `plugins/claude-dagq/skills/dagq-maintain/SKILL.md`（当時の名前は `taskq-run`）の「every run's worktree is a directory Claude Code has never seen」という誤った本文をこの条件に書き換えた
+1. 運用手順として文書化する（runtime 変更なし、推奨）: ある repository で初めて `supervise` を流す前に、その repository の root で `claude` を一度起動して dialog を承認する（または `~/.claude.json` の `projects[<root>].hasTrustDialogAccepted` が真であることを確認する）。使い捨て repository のスモーク（journal 010 の手順）も root を先に信頼する。task 16 で当時の plugin skill（名前は `taskq-run`、task 100 で退役した常駐 session 用の skill の前身）の「every run's worktree is a directory Claude Code has never seen」という誤った本文をこの条件に書き換えた
 2. ~~adapter の `preflight()` で `~/.claude.json` を読み、repository root が未信頼なら warning（event か stderr）を出す~~ → task 92 で `up` の preflight にした（warning ではなく error で止める。[起動時のダイアログ](#起動時のダイアログ)）。dialog を抑止する CLI flag は 2.1.278 / 2.1.280 にはないので adapter flag では解決できず、runtime が `hasTrustDialogAccepted` を書き込むのはユーザーの判断を代行することになるので採らない
-3. 未信頼の repository で `supervise` を始めてしまった場合の扱いは、task 16 で plugin の skill `dagq-maintain`（task 65 で `dagq-session` に分割、[ADR-0010](../adr/0010-maintainer-and-resident-supervisor.md) の T3）に入れた: 最初の承認より前に起動した session（最大 `--parallel` 件）はすべて dialog で止まるので、それぞれに `send-key down` + `enter` で応答する。承認後に起動した session には出ない
+3. 未信頼の repository で `supervise` を始めてしまった場合の扱いは、task 16 で plugin の skill に入れた（task 65 で run の session 用の skill に分割、task 100 で `dagq-recover` の `reference/session.md` に移した）: 最初の承認より前に起動した session（最大 `--parallel` 件）はすべて dialog で止まる。supervisor はそれぞれを `answer_prompt` の ask として inbox に上げ、人の指示で `send-key down` + `enter` を送る。承認後に起動した session には出ない
 
 ## 起動時のダイアログ
 

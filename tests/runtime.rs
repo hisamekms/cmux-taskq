@@ -701,7 +701,7 @@ fn run_agent_with(script: &str, close_fail: bool) -> (TempDir, PathBuf, dagq::do
     let mut backend = TestWorkspace::new(&db, false, script);
     backend.close_fail = close_fail;
     let outcome = supervise(&db, &repo, &backend).unwrap();
-    // These scripts exit on their own, like a maintainer's /exit; nothing was requested.
+    // These scripts exit on their own, like a person's /exit; nothing was requested.
     assert_eq!(backend.exits_sent.load(Ordering::SeqCst), 0);
     backend.join();
     assert_eq!(outcome["outcome"], "finished");
@@ -1137,7 +1137,7 @@ fn exit_requested_precedes_a_session_exit_that_beats_the_send() {
 #[test]
 fn missing_or_stale_idle_marker_does_not_request_exit() {
     // No marker at all, then a marker older than the receipt (an earlier turn).
-    // Both sessions end by themselves, as with a maintainer's /exit.
+    // Both sessions end by themselves, as with a person's /exit.
     for script in [
         "commit work; receipt \"$(git rev-parse HEAD)\"; sleep 1",
         "idle; touch -t 200001010000 \"$IDLE\"; commit work; receipt \"$(git rev-parse HEAD)\"; sleep 1",
@@ -1159,7 +1159,7 @@ fn missing_or_stale_idle_marker_does_not_request_exit() {
 
 /// Fake agent that ignores the supervisor's `/exit` (as when a dialog holds
 /// it back) and ends only once the test writes `$EXIT.held`, the way a person
-/// or maintainer would answer the dialog and exit.
+/// would answer the dialog and exit.
 /// Blocks a fake session until the test calls `release_held_session`.
 const HOLD: &str = "while [ ! -f \"$EXIT.held\" ]; do sleep 0.05; done";
 const HELD_AGENT: &str = "commit work; receipt \"$(git rev-parse HEAD)\"; idle; while [ ! -f \"$EXIT.held\" ]; do sleep 0.05; done";
@@ -1241,10 +1241,11 @@ fn the_first_commit_is_observed_once_while_the_session_works() {
 
 /// A session that runs past `prompt_wait` has its screen read: an ordinary
 /// screen records nothing, a dialog is recorded as `prompt_waiting` once and
-/// surfaces as `answer the prompt in workspace <id>`, and the screen going
-/// back to work records `prompt_cleared`. No key is sent.
+/// raised to the inbox as an `answer_prompt` ask with the screen's excerpt
+/// (ADR-0024's Consequences), and the screen going back to work records
+/// `prompt_cleared` and closes the ask. No key is sent.
 #[test]
-fn a_dialog_on_the_screen_is_recorded_once_and_cleared() {
+fn a_dialog_on_the_screen_is_asked_once_and_cleared() {
     let (_dir, repo, db) = fixture();
     let mut backend = TestWorkspace::new(&db, false, PROMPTED_AGENT);
     backend.prompt_wait = Duration::from_millis(300);
@@ -1296,13 +1297,41 @@ fn a_dialog_on_the_screen_is_recorded_once_and_cleared() {
         "Auto mode is available\n ❯ 1. Yes, turn on auto mode\n   2. No, keep asking\n Esc to cancel"
     );
     assert_eq!(waiting.payload["screen_hash"].as_str().unwrap().len(), 64);
-    let status = runtime::status(&db).unwrap();
-    let attention = run_attention_of(&status, &run.id).unwrap();
-    assert_eq!(attention["kind"], "prompt_waiting");
-    assert_eq!(attention["status"], "running");
-    assert_eq!(
-        attention["next"],
-        format!("answer the prompt in workspace {WORKSPACE_ID}")
+    // The dialog is an ask for the inbox, not an attention of the run.
+    let asks = queue
+        .asks(dagq::infrastructure::asks::AskQuery {
+            open: true,
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(asks.len(), 1, "{asks:?}");
+    let ask = &asks[0];
+    assert_eq!(ask.kind, dagq::domain::AskKind::AnswerPrompt);
+    assert_eq!(ask.run_id.as_deref(), Some(run.id.as_str()));
+    assert_eq!(ask.task_id, Some(run.task_id));
+    assert_eq!(ask.asked_by, "supervisor");
+    assert!(ask.options.is_empty());
+    assert!(
+        ask.question.contains(&format!(
+            "waits at a choice dialog in workspace {WORKSPACE_ID}"
+        )),
+        "{}",
+        ask.question
+    );
+    assert!(
+        ask.question
+            .ends_with("Auto mode is available\n ❯ 1. Yes, turn on auto mode\n   2. No, keep asking\n Esc to cancel"),
+        "{}",
+        ask.question
+    );
+    let status = runtime::status_for(&db, Some(dagq::domain::SessionRole::Inbox)).unwrap();
+    assert!(run_attention_of(&status, &run.id).is_none(), "{status}");
+    assert!(
+        status["attention"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|a| a["kind"] == "ask_opened" && a["ask_id"] == ask.id)
     );
     let events = dagq::watch::events(&db, 0, 100, false).unwrap();
     assert!(
@@ -1310,8 +1339,10 @@ fn a_dialog_on_the_screen_is_recorded_once_and_cleared() {
             .as_array()
             .unwrap()
             .iter()
-            .any(|e| e["kind"] == "prompt_waiting")
+            .all(|e| e["kind"] != "prompt_waiting")
     );
+    // The same dialog is not asked about twice.
+    assert_eq!(backend.notifications.lock().unwrap().len(), 1);
 
     // Someone answers the dialog: the screen goes back to work.
     *backend.screen.lock().unwrap() = WORK_SCREEN.into();
@@ -1320,6 +1351,20 @@ fn a_dialog_on_the_screen_is_recorded_once_and_cleared() {
     });
     assert!(run_attention_of(&runtime::status(&db).unwrap(), &run.id).is_none());
     assert_eq!(backend.exits_sent.load(Ordering::SeqCst), 0);
+    // The runtime closed the ask: it is no attention, and its answer says why.
+    let closed = queue.read_ask(ask.id).unwrap();
+    assert!(closed.closed_at.is_some());
+    assert_eq!(
+        closed.answer.as_deref(),
+        Some("the dialog is gone; closed by the runtime")
+    );
+    assert!(
+        runtime::status(&db).unwrap()["attention"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|a| a.get("ask_id").is_none())
+    );
 
     fs::write(
         exit_request_path(run.run_dir.as_ref().unwrap()).with_extension("go"),
@@ -1427,7 +1472,7 @@ fn an_answered_worker_question_is_typed_into_the_idle_worker_and_closed() {
         attention[0]["next"],
         format!("delivering the answer of ask {} (runtime)", ask.id)
     );
-    // The answer of a worker_question does not wake the maintainer.
+    // The answer of a worker_question does not wake the inbox.
     let events = dagq::watch::events(&db, 0, 100, false).unwrap();
     assert!(
         events["events"]
@@ -1474,9 +1519,9 @@ fn an_answered_worker_question_is_typed_into_the_idle_worker_and_closed() {
 }
 
 /// A send that fails is not retried: `ask_delivery_failed` is recorded
-/// once, the ask stays unclosed and surfaces for the maintainer to deliver.
+/// once, the ask stays unclosed and surfaces for the inbox to deliver.
 #[test]
-fn a_failed_answer_delivery_is_left_to_the_maintainer() {
+fn a_failed_answer_delivery_is_left_to_the_inbox() {
     let (_dir, repo, db) = fixture();
     let mut backend = TestWorkspace::new(
         &db,
@@ -1541,7 +1586,7 @@ fn a_failed_answer_delivery_is_left_to_the_maintainer() {
     backend.join();
     assert_eq!(outcome["runs"][0]["status"], "awaiting_integration");
     assert_eq!(backend.texts().len(), 1);
-    // The run is at rest: the maintainer delivers by hand, then closes it.
+    // The run is at rest: the inbox delivers by hand, then closes it.
     let status = runtime::status(&db).unwrap();
     assert_eq!(
         ask_attention(&status, ask.id)[0]["next"],
@@ -1554,7 +1599,7 @@ fn a_failed_answer_delivery_is_left_to_the_maintainer() {
     assert!(ask_attention(&runtime::status(&db).unwrap(), ask.id).is_empty());
 
     // Answered after the run stopped running: nobody types it, so its
-    // `ask_answered` wakes the maintainer.
+    // `ask_answered` wakes the inbox.
     let cursor = queue.latest_event_id().unwrap();
     let late = queue
         .ask(dagq::domain::NewAsk {
@@ -1867,7 +1912,7 @@ fn failed_agent_retains_worktree_and_does_not_complete_task() {
     assert!(Path::new(detail.runs[0].worktree_path.as_ref().unwrap()).exists());
     assert!(queue.run_leases().unwrap().is_empty());
     assert!(queue.candidates().unwrap().is_empty());
-    // A failed run does not free the task automatically, but the maintainer may give up on it.
+    // A failed run does not free the task automatically, but a person may give up on it.
     assert_eq!(runtime::doctor(&db, true).unwrap()["runs"], json!([]));
     queue.transition(1, TaskAction::Cancel).unwrap();
     assert_eq!(queue.show(1).unwrap().task.status, TaskStatus::Canceled);
@@ -2577,7 +2622,7 @@ fn supervise_log_dir_records_each_start_in_its_own_file() {
 }
 
 /// A registration whose process died, or whose heartbeat stopped, is
-/// reported as stale by `status` and `doctor` and left for the maintainer;
+/// reported as stale by `status` and `doctor` and left for a person;
 /// neither a later supervisor nor `recover` removes it, and an `integrate`
 /// or orphaned lease holder is listed next to it without a registration.
 #[test]
@@ -4348,7 +4393,7 @@ fn conflicting_run_needs_a_session_and_lands_after_the_session_resolves_it() {
     assert_eq!(kinds.iter().filter(|k| **k == "run_integrated").count(), 1);
 }
 
-/// Two tasks rewrite `change.txt`: the first lands, and the maintainer's
+/// Two tasks rewrite `change.txt`: the first lands, and a person's
 /// `integrate` of the second (its approval) conflicts and parks it as
 /// `needs_session`. Returns the parked run and the landed main.
 fn parked_conflict(repo: &Path, db: &Path, backend: &TestWorkspace) -> (TaskRun, String) {
@@ -4393,7 +4438,7 @@ fn approved_needs_session_run_is_resumed_until_the_runtime_lands_it() {
         payloads(&detail, "integration_approved"),
         [&json!({"status": "awaiting_integration", "pid": std::process::id(), "push": true})]
     );
-    // The maintainer is told the runtime takes it from here.
+    // The inbox is told the runtime takes it from here.
     let status = runtime::status(&db).unwrap();
     assert_eq!(
         run_attention_of(&status, &run.id).unwrap()["next"],
@@ -4539,7 +4584,7 @@ fn approved_needs_session_run_is_resumed_until_the_runtime_lands_it() {
             .iter()
             .all(|(workspace, _)| closed.contains(workspace))
     );
-    // Nothing waits for the maintainer: the watch sees no attention.
+    // Nothing waits for a person: the watch sees no attention.
     assert_eq!(
         dagq::watch::events(&db, cursor, 100, false).unwrap()["events"],
         json!([])
@@ -4632,7 +4677,7 @@ fn unapproved_resumed_run_is_validated_and_reviewed_with_its_session_open() {
     );
     assert!(
         !event_kinds(&detail).contains(&"integration_started") || {
-            // Only the maintainer's two landings before the resume.
+            // Only the two landings by hand before the resume.
             payloads(&detail, "integration_started").len() == 1
         }
     );
@@ -4648,7 +4693,7 @@ fn unapproved_resumed_run_is_validated_and_reviewed_with_its_session_open() {
     );
     assert!(!text.contains("git rebase"), "{text}");
     assert!(text.contains(runtime::STOP_BACKGROUND), "{text}");
-    // The maintainer is woken only by the failed review.
+    // The inbox is woken only by the failed review.
     let events = dagq::watch::events(&db, cursor, 100, false).unwrap();
     assert_eq!(events["events"].as_array().unwrap().len(), 1, "{events}");
     assert_eq!(events["events"][0]["kind"], "review_failed", "{events}");
@@ -5042,8 +5087,11 @@ fn a_run_missing_any_condition_of_the_skip_is_resumed() {
 }
 
 /// A resume that cannot start, or a session that cannot resolve the run,
-/// uses up an attempt; after the third the run stays `needs_session` and is
-/// the maintainer's (`resume session`). The sessions behave like Claude: they
+/// uses up an attempt; after the third the supervisor stops resuming it and
+/// hands it to a person (ADR-0024's Consequences): the run becomes `failed`
+/// with a `decide` ask for the inbox (`retry` or `cancel`), recorded as the
+/// runtime's `triage_finished` so no headless triage runs, and the answer is
+/// applied like a triage's. The sessions behave like Claude: they
 /// never exit by themselves, so the supervisor sends `/exit` once when one
 /// goes idle without a resolving receipt, or when one never goes idle within
 /// the resume timeout.
@@ -5089,8 +5137,11 @@ fn resuming_stops_after_three_attempts() {
     backend.join();
     assert_eq!(outcome["errors"], json!([]), "{outcome}");
     let detail = queue.show(2).unwrap();
-    assert_eq!(detail.runs[0].status, RunStatus::NeedsSession);
-    assert_eq!(detail.runs[0].last_error.as_deref(), Some(reason.as_str()));
+    assert_eq!(detail.runs[0].status, RunStatus::Failed);
+    assert_eq!(
+        detail.runs[0].last_error.as_deref(),
+        Some(format!("resumed 3 times (at most 3) and still needs a session: {reason}").as_str())
+    );
     let started = payloads(&detail, "resume_started");
     assert_eq!(
         started
@@ -5110,27 +5161,61 @@ fn resuming_stops_after_three_attempts() {
     assert!(queue.run_leases().unwrap().is_empty());
     assert_eq!(backend.exits_sent.load(Ordering::SeqCst), 2);
     assert_eq!(backend.closed().len(), 2 + 2); // two workers, two resumes
-    // The last attempt hands the run to a human.
+    // The used-up run goes to the inbox as the triage's `decide` ask, and
+    // no headless triage runs for it.
+    let asks = queue.asks(AskQuery::default()).unwrap();
+    assert_eq!(asks.len(), 1, "{asks:?}");
+    let ask = asks[0].clone();
+    assert_eq!(ask.kind, AskKind::Decide);
+    assert_eq!(ask.run_id.as_deref(), Some(run.id.as_str()));
+    assert_eq!(ask.asked_by, "supervisor");
+    assert_eq!(ask.options, ["retry", "cancel"]);
+    assert!(
+        ask.question
+            .contains("was resumed 3 times (at most 3) and still needs a session"),
+        "{}",
+        ask.question
+    );
+    assert!(ask.question.contains(&reason), "{}", ask.question);
+    let finished = payloads(&detail, "triage_finished");
+    assert_eq!(finished.len(), 1, "{:?}", event_kinds(&detail));
+    assert_eq!(finished[0]["by"], "runtime");
+    assert_eq!(finished[0]["action"], "ask");
+    assert_eq!(finished[0]["ask_id"], json!(ask.id));
+    assert_eq!(finished[0]["previous_status"], "needs_session");
+    assert_eq!(finished[0]["status"], "failed");
+    assert!(payloads(&detail, "triage_started").is_empty());
+    // The ask is the one attention; the exhausted resume is none.
     let events = dagq::watch::events(&db, cursor, 100, false).unwrap();
     let listed = events["events"].as_array().unwrap();
     assert_eq!(listed.len(), 1, "{events}");
-    assert_eq!(listed[0]["kind"], "resume_finished");
-    assert_eq!(listed[0]["next"], "resume session");
+    assert_eq!(listed[0]["kind"], "ask_opened");
+    assert_eq!(listed[0]["next"], format!("answer ask {}", ask.id));
     let status = runtime::status(&db).unwrap();
-    assert_eq!(
-        run_attention_of(&status, &run.id).unwrap()["next"],
-        "resume session"
-    );
-    // No fourth attempt.
+    assert!(run_attention_of(&status, &run.id).is_none(), "{status}");
+    // No fourth attempt, no second ask.
     let outcome = supervise(&db, &repo, &backend).unwrap();
     assert_eq!(outcome["runs"], json!([]), "{outcome}");
     assert_eq!(payloads(&queue.show(2).unwrap(), "resume_started").len(), 3);
+    assert_eq!(queue.asks(AskQuery::default()).unwrap().len(), 1);
+
+    // The person cancels the task; the supervisor applies it.
+    queue.answer(ask.id, "cancel").unwrap();
+    let outcome = supervise(&db, &repo, &backend).unwrap();
+    assert_eq!(outcome["errors"], json!([]), "{outcome}");
+    let detail = queue.show(2).unwrap();
+    assert_eq!(detail.task.status, TaskStatus::Canceled);
+    assert_eq!(
+        payloads(&detail, "triage_decided")[0]["answer"],
+        json!("cancel")
+    );
+    assert!(queue.read_ask(ask.id).unwrap().closed_at.is_some());
 }
 
 /// A resumed session that does not exit within the exit timeout of `/exit`
 /// is let go as `unresolved` (its lease released, its workspace kept), so the
 /// supervisor's slot and a drain are not held forever. While it runs, the run
-/// is the maintainer's (`resume session`) and is not resumed again; once it
+/// is the supervisor's (`resuming (runtime)`) and is not resumed again; once it
 /// ended, the next pass closes the workspace it left and resumes the run.
 #[test]
 fn a_resumed_session_that_ignores_exit_is_let_go() {
@@ -5154,7 +5239,7 @@ fn a_resumed_session_that_ignores_exit_is_let_go() {
     assert!(!backend.closed().contains(&kept));
     assert_eq!(
         run_attention_of(&runtime::status(&db).unwrap(), &run.id).unwrap()["next"],
-        "resume session"
+        "resuming (runtime)"
     );
     // Its dialog does not go away by itself: one stuck_exit ask goes to the
     // inbox (task 147), as for the worker's session.
@@ -5212,8 +5297,8 @@ fn a_resumed_session_that_ignores_exit_is_let_go() {
 }
 
 /// The supervisor never resumes a run next to the live session of a
-/// supervisor that died mid-resume: the run shows as `resume session`, keeps
-/// the maintainer's `integrate` out, and once that session exited the next
+/// supervisor that died mid-resume: the run shows as `resuming (runtime)`,
+/// keeps a person's `integrate` out, and once that session exited the next
 /// supervisor resumes and lands the run.
 #[test]
 fn a_session_nobody_watches_blocks_the_resume_until_it_ends() {
@@ -5246,7 +5331,7 @@ fn a_session_nobody_watches_blocks_the_resume_until_it_ends() {
     let status = runtime::status(&db).unwrap();
     assert_eq!(
         run_attention_of(&status, &run.id).unwrap()["next"],
-        "resume session"
+        "resuming (runtime)"
     );
     let refused = integrate(&db, 2, &repo).unwrap_err();
     assert!(
@@ -5263,7 +5348,7 @@ fn a_session_nobody_watches_blocks_the_resume_until_it_ends() {
         .unwrap();
     assert_eq!(
         run_attention_of(&runtime::status(&db).unwrap(), &run.id).unwrap()["next"],
-        "resume session"
+        "resuming (runtime)"
     );
     backend.resume_script_for(
         2,
@@ -5400,7 +5485,7 @@ fn failed_receipt_from_a_session_ends_the_run_without_landing() {
     // A failed receipt is not a receipt for a landing: only the first
     // (conflicting) attempt recorded one.
     assert_eq!(integration_receipts(&detail).len(), 1);
-    // Retry or give up is the maintainer's call, as after any failed run.
+    // Retry or give up is a person's call, as after any failed run.
     queue.transition(2, TaskAction::Cancel).unwrap();
 }
 
@@ -6590,7 +6675,7 @@ fn exited_wrapper_and_validating_runs_are_adopted_and_validated() {
     add_ready_task(&mut queue, "validating", &[]);
     let backend = TestWorkspace::new(&db, false, VALID_AGENT);
     // The first session goes idle after its receipt and then ends on its own
-    // (a maintainer's /exit by the old procedure): the adopter must not
+    // (a person's /exit by the old procedure): the adopter must not
     // send /exit to a session that already exited.
     backend.script_for(
         1,
@@ -6866,7 +6951,7 @@ fn only_a_new_ask_notifies_and_it_goes_to_the_inbox() {
         run_id: Some(run_id.clone()),
         question: question.into(),
         options: vec!["land".into()],
-        asked_by: "maintainer".into(),
+        asked_by: "worker".into(),
     };
     // Without an inbox the notification names no workspace; the bound
     // repository's main checkout names the queue.
@@ -6903,7 +6988,7 @@ fn only_a_new_ask_notifies_and_it_goes_to_the_inbox() {
             run_id: None,
             question: "which?".into(),
             options: Vec::new(),
-            asked_by: "maintainer".into(),
+            asked_by: "worker".into(),
         },
         &backend,
     )
@@ -6947,7 +7032,7 @@ fn only_a_new_ask_notifies_and_it_goes_to_the_inbox() {
 }
 
 #[test]
-fn asks_of_a_run_are_attention_for_the_inbox_then_the_maintainer() {
+fn asks_of_a_run_are_attention_for_the_inbox_until_closed() {
     use dagq::domain::{AskKind, NewAsk, SessionRole};
     let (_dir, _repo, db, run) = awaiting_run();
     let mut queue = SqliteQueue::open(&db).unwrap();
@@ -6960,7 +7045,7 @@ fn asks_of_a_run_are_attention_for_the_inbox_then_the_maintainer() {
         run_id: Some(run.id.clone()),
         question: question.into(),
         options: vec!["land".into(), "send back".into()],
-        asked_by: "maintainer".into(),
+        asked_by: "worker".into(),
     };
 
     // An inbox watch started before the ask wakes on ask_opened alone.
@@ -6992,18 +7077,27 @@ fn asks_of_a_run_are_attention_for_the_inbox_then_the_maintainer() {
     assert_eq!(again.ask.id, opened.ask.id);
     assert_eq!(queue.latest_event_id().unwrap(), before + 1);
 
-    // status lists the open ask and splits the attention by role.
+    // status lists the open ask; all attention is the inbox's
+    // (ADR-0024 decision 6).
     let status = runtime::status_for(&db, Some(SessionRole::Inbox)).unwrap();
+    let ask_attention: Vec<&Value> = status["attention"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|a| a.get("ask_id").is_some())
+        .collect();
     assert_eq!(
-        status["attention"],
-        json!([{"run_id": run.id, "task_id": 1, "ask_id": opened.ask.id, "status": "open",
+        ask_attention,
+        [
+            &json!({"run_id": run.id, "task_id": 1, "ask_id": opened.ask.id, "status": "open",
                 "kind": "ask_opened", "last_error": null,
-                "next": format!("answer ask {}", opened.ask.id)}])
+                "next": format!("answer ask {}", opened.ask.id)})
+        ]
     );
     let asks = status["asks"].as_array().unwrap();
     assert_eq!(asks.len(), 1);
     assert_eq!(asks[0]["kind"], "decide");
-    assert_eq!(asks[0]["asked_by"], "maintainer");
+    assert_eq!(asks[0]["asked_by"], "worker");
     assert_eq!(asks[0]["run_id"], json!(run.id));
     assert!(asks[0]["age_secs"].as_i64().unwrap() >= 0);
     assert_eq!(
@@ -7011,18 +7105,10 @@ fn asks_of_a_run_are_attention_for_the_inbox_then_the_maintainer() {
         201,
         "200 characters and the ellipsis"
     );
-    let maintainer = runtime::status_for(&db, Some(SessionRole::Maintainer)).unwrap();
-    assert!(
-        maintainer["attention"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .all(|a| a["kind"] != "ask_opened")
-    );
     // The run's own attention keeps the event that brought it there (the
     // stand-in `claude` printed no verdict, so its review failed).
     assert_eq!(
-        run_attention_of(&maintainer, &run.id).unwrap()["kind"],
+        run_attention_of(&status, &run.id).unwrap()["kind"],
         "review_failed"
     );
     assert!(
@@ -7031,17 +7117,17 @@ fn asks_of_a_run_are_attention_for_the_inbox_then_the_maintainer() {
             .unwrap()
             .is_empty()
     );
-    // The maintainer's watch does not wake for an ask_opened.
+    // The planner's watch never wakes.
     let quiet = watch_role(
         &db,
         Some(before),
         Duration::from_millis(200),
-        SessionRole::Maintainer,
+        SessionRole::Planner,
     );
     assert_eq!(quiet["events"], json!([]));
     assert_eq!(quiet["cursor"], json!(before));
 
-    // The answer is the maintainer's attention until the ask is closed.
+    // The answer is the inbox's attention until the ask is closed.
     let answered = queue.answer(opened.ask.id, "land").unwrap();
     assert_eq!(answered.answer.as_deref(), Some("land"));
     let events = queue.run_events(&run.id).unwrap();
@@ -7052,7 +7138,7 @@ fn asks_of_a_run_are_attention_for_the_inbox_then_the_maintainer() {
         &db,
         Some(before + 1),
         Duration::from_secs(20),
-        SessionRole::Maintainer,
+        SessionRole::Inbox,
     );
     assert_eq!(woke["events"][0]["kind"], "ask_answered");
     assert_eq!(
@@ -7193,8 +7279,9 @@ fn attention_events_are_read_past_a_cursor_and_wake_watch() {
         dagq::watch::events(&db, before, 100, false).unwrap()["events"],
         json!([])
     );
-    // ... but once its resumes are used up, one wakes a watch started
-    // before it, and the non-attention events around it do not.
+    // ... and neither does one whose resumes are used up: the supervisor
+    // hands that run to a person as a `decide` ask (ADR-0024's
+    // Consequences), whose `ask_opened` is the attention.
     for attempt in 1..=3 {
         queue
             .record_runtime_event(&run.id, "resume_started", json!({"attempt": attempt}))
@@ -7207,30 +7294,31 @@ fn attention_events_are_read_past_a_cursor_and_wake_watch() {
             )
             .unwrap();
     }
-    let watcher = spawn_watch(&db, None);
+    let before = queue.latest_event_id().unwrap();
     assert_eq!(
         integrate(&db, 1, &repo).unwrap()["outcome"],
         "needs_session"
     );
-    let woke = watcher.join().unwrap();
-    let woke_events = woke["events"].as_array().unwrap();
-    assert_eq!(woke_events.len(), 1, "{woke}");
-    assert_eq!(woke_events[0]["kind"], "integration_deferred");
-    assert_eq!(woke_events[0]["status"], "needs_session");
-    assert_eq!(woke_events[0]["next"], "resume session");
-    assert!(
-        woke_events[0]["reason"]
-            .as_str()
-            .unwrap()
-            .contains("receipt is missing")
+    let deferred = dagq::watch::events(&db, before, 100, true).unwrap();
+    let deferred = deferred["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["kind"] == "integration_deferred")
+        .unwrap()
+        .clone();
+    assert_eq!(deferred["status"], "needs_session");
+    assert_eq!(deferred.get("next"), None, "{deferred}");
+    assert_eq!(
+        dagq::watch::events(&db, before, 100, false).unwrap()["events"],
+        json!([])
     );
     let latest = queue.latest_event_id().unwrap();
-    assert_eq!(woke["cursor"], json!(latest));
     let status = runtime::status(&db).unwrap();
     let parked = run_attention_of(&status, &run.id).unwrap();
     assert_eq!(parked["status"], "needs_session");
     assert_eq!(parked["kind"], "integration_deferred");
-    assert_eq!(parked["next"], "resume session");
+    assert_eq!(parked["next"], "resuming (runtime)");
     assert!(
         parked["last_error"]
             .as_str()
@@ -7952,9 +8040,10 @@ fn required_evidence_present_in_the_receipt_awaits_integration() {
 }
 
 /// A resumed session that comes back without the evidence has not resolved
-/// the run: every attempt is `unresolved` and the run stays
-/// `needs_session`. An `integrate` of it does not land either: it defers
-/// the run with the missing `checks`.
+/// the run: every attempt is `unresolved`, and once the resumes are used up
+/// the run is `failed` and waits for a person's `decide` ask. An `integrate`
+/// of such a run does not land either: it defers the run with the missing
+/// `checks`.
 #[test]
 fn a_resume_or_integrate_without_the_required_evidence_does_not_land() {
     let (_dir, repo, db) = evidence_fixture(&[EvidenceCheck::E2e]);
@@ -7968,10 +8057,22 @@ fn a_resume_or_integrate_without_the_required_evidence_does_not_land() {
     assert_eq!(outcome["errors"], json!([]), "{outcome}");
     let mut queue = SqliteQueue::open(&db).unwrap();
     let detail = queue.show(2).unwrap();
-    assert_eq!(detail.runs[0].status, RunStatus::NeedsSession);
+    assert_eq!(detail.runs[0].status, RunStatus::Failed);
     let finished = payloads(&detail, "resume_finished");
-    assert!(!finished.is_empty());
+    assert_eq!(finished.len(), 3);
     assert!(finished.iter().all(|f| f["outcome"] == "unresolved"));
+    let asks = queue.asks(AskQuery::default()).unwrap();
+    assert_eq!(asks.len(), 1, "{asks:?}");
+    assert_eq!(asks[0].kind, AskKind::Decide);
+    // Parked for a session again (as an older runtime left it), the run is
+    // still not landed by `integrate`.
+    Connection::open(&db)
+        .unwrap()
+        .execute(
+            "UPDATE task_runs SET status='needs_session' WHERE id=?1",
+            [&detail.runs[0].id],
+        )
+        .unwrap();
     let before = git_out(&repo, &["rev-parse", "main"]);
     let deferred = integrate(&db, 2, &repo).unwrap();
     assert_eq!(deferred["outcome"], "needs_session", "{deferred}");

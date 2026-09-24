@@ -4,8 +4,8 @@ type: design
 title: System overview
 status: current
 created: 2026-09-21
-updated: 2026-09-23
-last_verified: 2026-09-23
+updated: 2026-09-24
+last_verified: 2026-09-24
 scope: system
 related:
   - adr-0001
@@ -17,6 +17,8 @@ related:
   - adr-0007
   - adr-0008
   - adr-0010
+  - adr-0022
+  - adr-0024
   - adr-0013
   - adr-0028
 ---
@@ -31,17 +33,19 @@ dagqは、依存関係を持つ開発タスクをSQLiteで管理し、着手可�
 
 ## 用語集
 
-役割は3つで、名前は[ADR-0010](../adr/0010-maintainer-and-resident-supervisor.md)で統一した。`up`がmaintainerと並べて開くplannerとinboxを加えた5つが`DAGQ_ROLE`の値で、cmux workspaceのtitleは`[<repo>]<role>`（workerは`[<repo>]worker#<task-id> - <task title>`、[ADR-0028](../adr/0028-workspace-titles-are-repo-and-role.md)）。
+役割は5つで、[ADR-0024](../adr/README.md)の決定1で確定した: supervisor、worker、planner、inbox、observer。このうち`DAGQ_ROLE`で名乗るworkspaceを持つのはsupervisor（in-cmux modeのとき）、worker、planner、inboxで、cmux workspaceのtitleは`[<repo>]<role>`（workerは`[<repo>]worker#<task-id> - <task title>`、[ADR-0028](../adr/0028-workspace-titles-are-repo-and-role.md)）。`up`が開くのはsupervisor（in-cmux mode）、inbox、plannerの3つだけ。observerとreview / triageのjobはworkspaceを持たないheadlessの`claude -p`で、`DAGQ_ROLE`はobserverが`observer`、review / triageのjobが`reviewer`。
 
 | 用語 | 指すもの | 旧称 |
 | --- | --- | --- |
-| **supervisor** | runtimeの`dagq supervise`プロセス。依存が解けたtaskをclaimし、runごとにworktreeとcmux workspaceを作ってworkerを起動し、receiptを検証してworkspaceを閉じる（[ADR-0003](../adr/0003-supervisor-owns-lifecycle.md)、[ADR-0007](../adr/0007-run-level-leases-parallel-execution.md)）。ADR-0010以降はlaunchdのLaunchAgentとして常駐する予定（T2で実装）。 | （変更なし） |
-| **maintainer** | 1 repositoryに1つ常駐する対話モードのClaude Code session。taskの登録、runの監視と権限確認・質問への応答、差分と証跡のレビュー、`integrate`の呼び出し、`doctor`/`recover`、`push_failed`のときの手動pushを行う（pushそのものは`integrate`が行う）。`needs_session`のrunはsupervisorがresumeして解消させ（[ADR-0019](../adr/0019-move-routine-maintainer-work-into-the-runtime.md)）、maintainerは3回で解消しなかったrunだけを人に返す。人が同じ操作をしてもよい。 | "SV"（supervisorの略。旧称）、operator（designとcodeでこの役割を指していたもの）、main session（[ADR-0003](../adr/0003-supervisor-owns-lifecycle.md)） |
-| **worker** | runごとにsupervisorが起動するClaude（将来はCodex）のsession。割り当てられたworktreeの中だけで作業し、commitしてreceiptを書く。 | agent session、run session |
-| **planner** | 人と対話してgoal / taskを登録するsession（[ADR-0022](../adr/0022-ask-answer-inbox-planner-and-landing-on-doubt.md)）。`up`が`[<repo>]planner`のworkspaceに`planner_prompt`付きで開く。 | （新設） |
-| **inbox** | 人がqueueのask（maintainerとworkerの質問）に答えるsession（[ADR-0022](../adr/0022-ask-answer-inbox-planner-and-landing-on-doubt.md)）。`up`が`[<repo>]inbox`のworkspaceに`inbox_prompt`付きで開く。 | （新設） |
+| **supervisor** | runtimeの`dagq supervise`プロセス。依存が解けたtaskをclaimし、runごとにworktreeとcmux workspaceを作ってworkerを起動し、receiptを検証し、runごとのheadlessのjob（review、triage）を起動してそのverdictで着地・差し戻し・resume・retryを行い、`needs_session`のrunをresumeし（3回で解消しなければ人へのaskにする）、後始末をする（[ADR-0003](../adr/0003-supervisor-owns-lifecycle.md)、[ADR-0007](../adr/0007-run-level-leases-parallel-execution.md)、[ADR-0023](../adr/0023-verify-once-review-in-supervisor-run-env-graph-and-stats.md)、[ADR-0027](../adr/0027-keep-worker-session-through-review-revise-verdict-and-merge-tree-precheck.md)、ADR-0024）。launchdのLaunchAgentとして、またはin-cmux modeで常駐する。 | "SV"（supervisorの略） |
+| **worker** | runごとにsupervisorが起動するClaude（将来はCodex）のsession。割り当てられたworktreeの中だけで作業し、commitしてreceiptを書く。判断が要るときは`worker_question`のaskを登録して止まる。 | agent session、run session |
+| **planner** | 人と対話してgoal / taskを登録し、follow_upのdraft taskとobserverのdraft goalの採否を人と決め、goalをcloseする常駐session（[ADR-0022](../adr/0022-ask-answer-inbox-planner-and-landing-on-doubt.md)）。`up`が`[<repo>]planner`のworkspaceに`planner_prompt`付きで開く。人の指示で`up` / `down`も打つ。 | （新設） |
+| **inbox** | 人に届くものすべての窓口になる常駐session（[ADR-0022](../adr/0022-ask-answer-inbox-planner-and-landing-on-doubt.md)、ADR-0024の決定6）。openなaskを人に見せてanswerを書き戻し、それ以外のattention（回答済みのask、止まったsupervisor、失敗したreview / triage、pushの失敗）を人に知らせ、人の指示があるときだけ`dagq-recover`の手順（`up` / `down`、手でのreviewと`integrate`、`recover`、run workspaceへのキー送信）を実行する。自分では判断しない。`up`が`[<repo>]inbox`のworkspaceに`inbox_prompt`付きで開く。 | （新設） |
+| **observer** | supervisorのtimerで定期起動するheadlessのjob（ADR-0024の決定4）。`stats`と直近のnoteを読み、note・`blocked`のask・draftのgoalだけを書く。状態は変えない。 | （新設） |
 
-既存のADR（0001〜0009）とjournalは書き換えないので、そこに残る旧称はこの表で読み替える。runtimeのCLI名（`supervise`）と`supervisors`表は変えない。
+**退役した役割。** ADR-0010からADR-0023までの記述とjournalに出てくる常駐のClaude Code session「メンテナー」（英字表記の役割名。`up`が`[<repo>]`＋その名のworkspaceを開き、`DAGQ_ROLE`にその名を持っていた）は、ADR-0024で退役した。既存のADRとjournalは書き換えないので、そこでのメンテナーの仕事は次のとおり読み替える: レビューと着地はsupervisorのreview job、失敗runの扱い（recoverしてready / cancel）はsupervisorのtriage job、3回resumeして解消しない`needs_session`と作業中のdialog（`prompt_waiting`）はinbox宛てのask、継続的な監視と改善提案はobserver、人への相談とanswerに従う操作・`up` / `down` / 固定バイナリの更新はinbox（またはplanner）のsessionから人の指示で行う。`up`はそのworkspaceを開かず、queueに記録されたそのworkspaceの行を忘れる（workspace自体は人が閉じる）。
+
+既存のADR（0001〜0009）とjournalに残る旧称もこの表で読み替える。runtimeのCLI名（`supervise`）と`supervisors`表は変えない。
 
 ```text
 CLI / Claude plugin / Codex plugin

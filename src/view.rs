@@ -1,4 +1,4 @@
-//! Compact views of `show` and `goal show` for the maintainer (ADR-0016):
+//! Compact views of `show` and `goal show` for the sessions (ADR-0016):
 //! a size bounded by the number of runs or tasks, not by their history.
 //! Keys keep the names of the full output; a view only omits keys or
 //! truncates strings. An object with a truncated string carries

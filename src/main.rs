@@ -239,7 +239,7 @@ enum Command {
         #[arg(long, default_value = "claude")]
         claude: PathBuf,
     },
-    /// Start the queue's runtime: a launchd-resident supervisor and the maintainer's cmux workspace. Idempotent; replaces a live supervisor of another version.
+    /// Start the queue's runtime: a launchd-resident supervisor and the inbox's and planner's cmux workspaces. Idempotent; replaces a live supervisor of another version.
     Up {
         /// Maximum number of runs the supervisor executes at once.
         #[arg(long, default_value_t = 4, value_parser = clap::value_parser!(u16).range(1..))]
@@ -253,7 +253,7 @@ enum Command {
         /// with an error instead when any run is still in flight.
         #[arg(long)]
         no_wait: bool,
-        /// Claude Code plugin directory the maintainer session loads (`claude --plugin-dir`).
+        /// Claude Code plugin directory the inbox and planner sessions load (`claude --plugin-dir`).
         #[arg(long)]
         plugin_dir: Option<PathBuf>,
         /// Checkout of the repository; defaults to the working directory.
@@ -266,7 +266,7 @@ enum Command {
         #[arg(long, default_value = "claude")]
         claude: PathBuf,
     },
-    /// Stop the queue's supervisor: unload its launchd agent so it drains and is not restarted, or signal and close the workspace of an in-cmux one. Leaves the maintainer workspace open.
+    /// Stop the queue's supervisor: unload its launchd agent so it drains and is not restarted, or signal and close the workspace of an in-cmux one. Leaves the inbox and planner workspaces open.
     Down {
         /// Wait until the supervisor's registration is gone or its process exited.
         #[arg(long)]
@@ -299,9 +299,9 @@ enum Command {
         /// Task whose run awaits integration or comes back from a session.
         id: i64,
     },
-    /// List supervisors, unfinished runs, what waits for the maintainer (attention), the open asks and the event cursor, without changing anything.
+    /// List supervisors, unfinished runs, what waits for a person (attention), the open asks and the event cursor, without changing anything.
     Status {
-        /// Only the attention addressed to this role: inbox gets ask_opened, maintainer the rest.
+        /// Only the attention addressed to this role: inbox gets all of it, planner none.
         #[arg(long, value_parser = ROLES)]
         role: Option<String>,
     },
@@ -329,7 +329,7 @@ enum Command {
         #[arg(long, default_value = "cmux")]
         cmux: PathBuf,
     },
-    /// Write the answer of an open ask; the maintainer then sees ask_answered.
+    /// Write the answer of an open ask; the inbox then sees ask_answered unless the runtime applies it.
     Answer {
         id: i64,
         #[arg(long)]
@@ -340,7 +340,7 @@ enum Command {
         /// Only the unanswered ones.
         #[arg(long)]
         open: bool,
-        /// Only the ones this role acts on: inbox answers open asks, maintainer reads answers.
+        /// Only the ones this role acts on: inbox answers open asks and reads the answers, planner none.
         #[arg(long, value_parser = ROLES)]
         role: Option<String>,
         /// Include closed asks.
@@ -370,8 +370,8 @@ enum Command {
         /// Seconds between reads of the queue.
         #[arg(long, default_value_t = 2, value_parser = clap::value_parser!(u64).range(1..))]
         interval: u64,
-        /// Wake only for the attention addressed to this role: inbox for ask_opened,
-        /// maintainer for the rest and the supervisors' health.
+        /// Wake only for the attention addressed to this role: inbox for all of it and the
+        /// supervisors' health, planner never.
         #[arg(long, value_parser = ROLES)]
         role: Option<String>,
     },
@@ -424,7 +424,7 @@ enum Command {
 }
 
 /// The session roles attention is addressed to.
-const ROLES: [&str; 3] = ["maintainer", "inbox", "planner"];
+const ROLES: [&str; 2] = ["inbox", "planner"];
 
 fn parse_role(value: Option<String>) -> Result<Option<SessionRole>> {
     Ok(value.map(|value| value.parse()).transpose()?)

@@ -80,15 +80,7 @@ fn every_skill_has_valid_frontmatter_and_uses_the_launcher() {
         .collect();
     assert_eq!(
         names,
-        [
-            "dagq",
-            "dagq-inbox",
-            "dagq-land",
-            "dagq-maintain",
-            "dagq-planner",
-            "dagq-recover",
-            "dagq-session"
-        ]
+        ["dagq", "dagq-inbox", "dagq-planner", "dagq-recover"]
     );
     for dir in &dirs {
         let skill = fs::read_to_string(dir.join("SKILL.md")).unwrap();
@@ -172,94 +164,82 @@ fn skills_point_at_their_reference_files() {
         }
     }
     with_reference.sort();
-    assert_eq!(
-        with_reference,
-        ["dagq", "dagq-land", "dagq-maintain", "dagq-session"]
-    );
+    assert_eq!(with_reference, ["dagq", "dagq-inbox", "dagq-recover"]);
     // The watch loop never lands a run on its own.
-    let maintain = fs::read_to_string(plugin_root().join("skills/dagq-maintain/SKILL.md")).unwrap();
-    assert!(maintain.contains("watch --after <cursor>"));
-    assert!(maintain.contains("run_in_background"));
-    assert!(maintain.contains("Never call `integrate` because a watch returned"));
-    assert!(maintain.contains("\"$DAGQ\" status --role maintainer"));
-    assert!(maintain.contains("watch --after <cursor> --role maintainer"));
-    let land = fs::read_to_string(plugin_root().join("skills/dagq-land/SKILL.md")).unwrap();
-    assert!(land.contains("\"$DAGQ\" review ID"));
-    assert!(land.contains("Land on a pass, ask only on doubt"));
-    assert!(land.contains("On `pass`, go straight to step 4: nobody is asked."));
-    assert!(land.contains("--option land --option send_back --option cancel"));
-    assert!(land.contains(
-        "Never run `integrate` on a run with a concern until its ask is answered `land`."
-    ));
+    let inbox = fs::read_to_string(plugin_root().join("skills/dagq-inbox/SKILL.md")).unwrap();
+    assert!(inbox.contains("\"$DAGQ\" watch --role inbox --after <cursor>"));
+    assert!(inbox.contains("run_in_background"));
+    assert!(!inbox.contains("\"$DAGQ\" integrate"));
+    let review =
+        fs::read_to_string(plugin_root().join("skills/dagq-recover/reference/review-by-hand.md"))
+            .unwrap();
+    assert!(review.contains("\"$DAGQ\" review ID"));
+    assert!(review.contains("On `pass` and their word, `\"$DAGQ\" integrate ID`"));
+    assert!(review.contains("--option land --option send_back --option cancel"));
+    assert!(review.contains("git push origin main"));
 }
 
-/// ADR-0022: landing asks the person only on doubt, through an
-/// `approve_landing` ask rather than the maintainer's terminal, and the
-/// ask's answers are acted on in the same skill.
+/// ADR-0024: the roles are the supervisor, the worker, the planner, the
+/// inbox and the observer. Every attention reaches the person through the
+/// inbox, which decides nothing and acts only on the person's word through
+/// `dagq-recover`; registering and closing goals and tasks is the planner's.
 #[test]
-fn dagq_land_asks_only_on_a_concern() {
-    let land = fs::read_to_string(plugin_root().join("skills/dagq-land/SKILL.md")).unwrap();
-    // One ask command, and it sits in the concern branch of step 3.
-    assert_eq!(land.matches("ask --kind approve_landing").count(), 1);
-    let step3 = &land[land.find("## 3.").unwrap()..land.find("## 4.").unwrap()];
-    assert!(step3.contains("ask --kind approve_landing"));
-    assert!(step3.find("On `pass`").unwrap() < step3.find("On `concern`").unwrap());
-    assert!(!land.contains("wait for their answer"), "{land}");
-    assert!(!land.contains("AskUserQuestion"));
-    let step5 = &land[land.find("## 5.").unwrap()..land.find("## 6.").unwrap()];
-    for answer in ["`land`", "`send_back`", "`cancel`"] {
-        assert!(step5.contains(answer), "{answer}");
-    }
-    assert!(step5.contains("\"$DAGQ\" asks --role maintainer"));
-    assert!(step5.contains("ask close <id>"));
-}
-
-/// ADR-0022: registering and closing goals and tasks is the planner's,
-/// answering asks the inbox's; the maintainer's skills neither register nor
-/// close, and turn what they cannot decide into asks.
-#[test]
-fn skills_split_the_roles_of_maintainer_inbox_and_planner() {
+fn skills_split_the_roles_of_inbox_planner_and_recover() {
     let read = |name: &str| {
         fs::read_to_string(plugin_root().join(format!("skills/{name}/SKILL.md"))).unwrap()
     };
-    for name in ["dagq-maintain", "dagq-session", "dagq-land"] {
+    for name in ["dagq-inbox", "dagq-recover"] {
         let skill = read(name);
         for forbidden in [
             "\"$DAGQ\" goal close",
             "\"$DAGQ\" goal add",
             "\"$DAGQ\" add ",
-            "follows the `dagq` skill once the user agrees",
         ] {
             assert!(!skill.contains(forbidden), "{name} mentions {forbidden}");
         }
+    }
+    for dir in skill_dirs() {
+        let skill = fs::read_to_string(dir.join("SKILL.md")).unwrap();
         assert!(
-            !skill.contains("AskUserQuestion") || name == "dagq-maintain",
-            "{name}"
+            !skill.to_lowercase().contains("maintain"),
+            "{}",
+            dir.display()
         );
     }
-    let maintain = read("dagq-maintain");
-    assert!(maintain.contains("are the planner's (`dagq-planner`)"));
-    assert!(maintain.contains("`decide` you forwarded from a worker's `worker_question`"));
-    assert!(maintain.contains("\"$DAGQ\" ask --kind <approve_landing|answer_prompt|decide>"));
-    let session = read("dagq-session");
-    assert!(session.contains("ask --kind answer_prompt"));
-    assert!(session.contains("a `decide` ask on the same run"));
 
     let inbox = read("dagq-inbox");
     assert!(inbox.contains("\"$DAGQ\" status --role inbox"));
-    assert!(inbox.contains("\"$DAGQ\" watch --role inbox --after <cursor>"));
-    assert!(inbox.contains("run_in_background"));
     assert!(inbox.contains("\"$DAGQ\" asks --open --role inbox"));
     assert!(inbox.contains("\"$DAGQ\" answer <id> --text"));
     assert!(inbox.contains("Add no recommendation of your own"));
-    assert!(inbox.contains("never `ask close`, `integrate`"));
-    // A stuck_exit ask is shown like any other; the maintainer acts on it.
-    assert!(inbox.contains("- `stuck_exit`: the supervisor's."));
-    assert!(inbox.contains("You never touch that workspace yourself"));
-    assert!(session.contains("## 3. Act on the answer of a `stuck_exit` ask"));
-    assert!(session.contains("skills/dagq-session/reference/stuck-exit.md"));
+    assert!(inbox.contains("Only when the person says so"));
+    for next in [
+        "`read the answer of ask <id> and close it`",
+        "`restart supervisor`",
+        "`review by hand`",
+        "`push main`",
+        "`triage by hand`",
+        "`send the answer of ask <id> to the worker and close it`",
+    ] {
+        assert!(inbox.contains(next), "dagq-inbox lacks {next}");
+    }
+    assert!(inbox.contains("skills/dagq-recover/reference/session.md"));
+    assert!(inbox.contains("reference/status.md"));
+
+    let recover = read("dagq-recover");
+    for section in [
+        "## 3. Recover (only without a supervisor)",
+        "## 4. Triage by hand",
+        "## 5. Start, stop and update the runtime",
+        "## 6. Review by hand, and a failed push",
+        "## 7. A run's session",
+    ] {
+        assert!(recover.contains(section), "dagq-recover lacks {section}");
+    }
+    assert!(recover.contains("\"$DAGQ\" up --plugin-dir \"$CLAUDE_PLUGIN_ROOT\""));
+    assert!(recover.contains("\"$DAGQ\" down --wait"));
     let stuck_exit =
-        fs::read_to_string(plugin_root().join("skills/dagq-session/reference/stuck-exit.md"))
+        fs::read_to_string(plugin_root().join("skills/dagq-recover/reference/stuck-exit.md"))
             .unwrap();
     for step in [
         "\"Background work is running\"",
@@ -267,15 +247,16 @@ fn skills_split_the_roles_of_maintainer_inbox_and_planner() {
         "`jq -r .commit <receipt_path>` equals `git -C <worktree_path> rev-parse HEAD`",
         "select \"Exit and stop tasks\"",
         "## Answer `wait`, or anything else",
+        "\"$DAGQ\" asks --role inbox",
     ] {
         assert!(stuck_exit.contains(step), "stuck-exit.md lacks {step}");
     }
-    assert!(read("dagq-maintain").contains("- `stuck_exit` (a session held the supervisor's"));
 
     let planner = read("dagq-planner");
     assert!(planner.contains("skills/dagq/SKILL.md"));
     assert!(planner.contains("skills/dagq/reference/goal-close.md"));
     assert!(planner.contains("skills/dagq/reference/observer.md"));
+    assert!(planner.contains("skills/dagq-recover/SKILL.md"));
     assert!(planner.contains("follow_ups"));
     assert!(planner.contains("\"$DAGQ\" goal close ID --verdict achieved"));
     assert!(planner.contains("Never: `integrate`, `review`, `answer`"));
@@ -284,9 +265,9 @@ fn skills_split_the_roles_of_maintainer_inbox_and_planner() {
 }
 
 /// The runtime resumes `needs_session` runs (ADR-0019): no skill or
-/// reference file tells the maintainer to open a resume session itself.
+/// reference file tells a session to open a resume session itself.
 #[test]
-fn no_skill_opens_a_resume_session_for_the_maintainer() {
+fn no_skill_opens_a_resume_session() {
     for dir in skill_dirs() {
         let mut files = vec![dir.join("SKILL.md")];
         if let Ok(entries) = fs::read_dir(dir.join("reference")) {
@@ -303,11 +284,9 @@ fn no_skill_opens_a_resume_session_for_the_maintainer() {
             }
         }
     }
-    let session = fs::read_to_string(plugin_root().join("skills/dagq-session/SKILL.md")).unwrap();
-    assert!(session.contains("The runtime resumes a `needs_session` run itself"));
-    assert!(session.contains("Never open a resume workspace"));
-    let maintain = fs::read_to_string(plugin_root().join("skills/dagq-maintain/SKILL.md")).unwrap();
-    assert!(maintain.contains("`resuming (runtime)`"));
+    let recover = fs::read_to_string(plugin_root().join("skills/dagq-recover/SKILL.md")).unwrap();
+    assert!(recover.contains("a `needs_session` run is resumed (`resuming (runtime)`)"));
+    assert!(recover.contains("never open a resume workspace yourself"));
 }
 
 fn hooks_manifest() -> Value {
@@ -322,7 +301,7 @@ fn hooks_json_runs_the_session_start_script_on_compact_and_clear_only() {
     assert_eq!(events.keys().collect::<Vec<_>>(), ["SessionStart"]);
     let groups = events["SessionStart"].as_array().unwrap();
     assert_eq!(groups.len(), 1);
-    // startup is the maintainer prompt's job; resume keeps its context.
+    // startup is the session prompt's job; resume keeps its context.
     let matcher = groups[0]["matcher"].as_str().unwrap();
     let mut sources: Vec<&str> = matcher.split('|').collect();
     sources.sort();
@@ -380,6 +359,7 @@ fn session_start_hook_prints_status_only_in_the_sessions_up_opens() {
         vec![("DAGQ_BIN", binary)],
         vec![("DAGQ_BIN", binary), ("DAGQ_ROLE", "worker")],
         vec![("DAGQ_BIN", binary), ("DAGQ_ROLE", "observer")],
+        vec![("DAGQ_BIN", binary), ("DAGQ_ROLE", "supervisor")],
         vec![("DAGQ_BIN", binary), ("DAGQ_ROLE", "inboxes")],
         vec![("DAGQ_ROLE", "")],
     ] {
@@ -389,16 +369,16 @@ fn session_start_hook_prints_status_only_in_the_sessions_up_opens() {
         assert_eq!(output.stderr, b"", "{env:?}");
     }
 
-    // The maintainer gets status, with its attention and cursor.
-    let maintainer = [("DAGQ_BIN", binary), ("DAGQ_ROLE", "maintainer")];
-    let status = stdout_json(&session_start(&maintainer, &data_home, &repo));
+    // The inbox gets status, with all the attention and the cursor.
+    let inbox_env = [("DAGQ_BIN", binary), ("DAGQ_ROLE", "inbox")];
+    let status = stdout_json(&session_start(&inbox_env, &data_home, &repo));
     assert!(status["supervisors"].is_array());
     assert!(status["attention"].is_array());
     assert_eq!(status["attention"][0]["kind"], "supervisor_stopped");
     assert!(status["cursor"].is_number());
 
-    // The inbox and the planner get the status of their role: an open ask is
-    // the inbox's attention, and the supervisors' health is the maintainer's.
+    // The inbox and the planner get the status of their role: every
+    // attention is the inbox's, none the planner's.
     stdout_json(&launcher(
         &[("DAGQ_BIN", binary), ("PATH", "/usr/bin:/bin")],
         &data_home,
@@ -426,7 +406,7 @@ fn session_start_hook_prints_status_only_in_the_sessions_up_opens() {
             .map(|entry| entry["kind"].as_str().unwrap().to_string())
             .collect()
     };
-    assert_eq!(kinds(&inbox), ["ask_opened"]);
+    assert_eq!(kinds(&inbox), ["supervisor_stopped", "ask_opened"]);
     assert_eq!(inbox["asks"][0]["question"], "stuck?");
     assert!(inbox["cursor"].is_number());
     let planner = stdout_json(&session_start(
@@ -436,8 +416,6 @@ fn session_start_hook_prints_status_only_in_the_sessions_up_opens() {
     ));
     assert!(kinds(&planner).is_empty(), "{planner}");
     assert!(planner["cursor"].is_number());
-    let maintainer_status = stdout_json(&session_start(&maintainer, &data_home, &repo));
-    assert!(!kinds(&maintainer_status).contains(&"ask_opened".to_string()));
 
     // `up` names the queue in DAGQ_QUEUE, which works outside the repository.
     let db = stdout_json(&launcher(
@@ -451,7 +429,7 @@ fn session_start_hook_prints_status_only_in_the_sessions_up_opens() {
         .to_string();
     let with_queue = [
         ("DAGQ_BIN", binary),
-        ("DAGQ_ROLE", "maintainer"),
+        ("DAGQ_ROLE", "planner"),
         ("DAGQ_QUEUE", db.as_str()),
     ];
     let status = stdout_json(&session_start(&with_queue, &data_home, dir.path()));
@@ -464,24 +442,20 @@ fn session_start_hook_prints_status_only_in_the_sessions_up_opens() {
         assert_eq!(text.lines().count(), 1, "{text}");
         text
     };
-    let missing = one_line(&session_start(
-        &[("DAGQ_ROLE", "maintainer")],
-        &data_home,
-        &repo,
-    ));
+    let missing = one_line(&session_start(&[("DAGQ_ROLE", "inbox")], &data_home, &repo));
     assert!(missing.contains("dagq was not found"), "{missing}");
     let bogus = dir.path().join("not-executable");
     fs::write(&bogus, "").unwrap();
     let bad = one_line(&session_start(
         &[
-            ("DAGQ_ROLE", "maintainer"),
+            ("DAGQ_ROLE", "inbox"),
             ("DAGQ_BIN", bogus.to_str().unwrap()),
         ],
         &data_home,
         &repo,
     ));
     assert!(bad.contains("not an executable"), "{bad}");
-    let outside = one_line(&session_start(&maintainer, &data_home, dir.path()));
+    let outside = one_line(&session_start(&inbox_env, &data_home, dir.path()));
     assert!(outside.starts_with("dagq status failed: "), "{outside}");
 }
 

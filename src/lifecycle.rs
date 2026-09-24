@@ -1,8 +1,7 @@
 //! `up` and `down`: the cold start and the stop of one queue's runtime. `up`
 //! makes sure a supervisor is resident (as a launchd LaunchAgent, restarted
-//! after any exit) and that the maintainer's, the inbox's and the planner's
-//! Claude sessions each have a cmux workspace, and reports what the
-//! maintainer should look at first. `down` unloads the agent so the
+//! after any exit) and that the inbox's and the planner's Claude sessions
+//! each have a cmux workspace, and reports the queue's open work. `down` unloads the agent so the
 //! supervisor drains and is not restarted. Both are idempotent: a second
 //! `up` reuses what the first one started.
 //!
@@ -29,16 +28,16 @@ use crate::{
     domain::{RunStatus, SessionRole, SupervisorMode, SupervisorRegistration},
     infrastructure::{
         adapters::{
-            ClaudeCode, GitRepository, claude_trusts_repository, inbox_workspace_name,
-            maintainer_workspace_name, path_text, planner_workspace_name, shell_join,
-            supervisor_workspace_name, workspace_description, workspace_group_name,
+            ClaudeCode, GitRepository, claude_trusts_repository, inbox_workspace_name, path_text,
+            planner_workspace_name, shell_join, supervisor_workspace_name, workspace_description,
+            workspace_group_name,
         },
         launchd::LaunchAgentSpec,
         location::QueueLocation,
         runtime_store::HEARTBEAT_TIMEOUT_SECS,
         sqlite::SqliteQueue,
     },
-    runtime::{RecordingBackend, inbox_prompt, maintainer_prompt, planner_prompt, unix_time},
+    runtime::{RecordingBackend, inbox_prompt, planner_prompt, unix_time},
 };
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Value, json};
@@ -52,20 +51,19 @@ use std::{
 
 /// Set in the environment of every workspace of a queue (`--env`, which
 /// every shell of the workspace inherits): the role the workspace plays, so
-/// that `up`, run from inside the maintainer session (the plugin skill calls
-/// it), does not open a second one, and the plugin's hook knows the session
+/// that `up`, run from inside the inbox or planner session (the plugin
+/// skill calls it), does not open a second one, and the plugin's hook knows the session
 /// however it was started (ADR-0026).
 pub const ROLE_ENV: &str = "DAGQ_ROLE";
 /// The queue database the workspace belongs to.
 pub const QUEUE_ENV: &str = "DAGQ_QUEUE";
-pub const MAINTAINER_ROLE: &str = SessionRole::Maintainer.as_str();
 /// `DAGQ_ROLE` of a run's workspace (and of the resume workspace of its run).
 pub const WORKER_ROLE: &str = SessionRole::Worker.as_str();
 /// `DAGQ_ROLE` of the session that talks with a person to register goals and
-/// tasks. `up` opens its workspace `[<repo>]planner` next to the maintainer's.
+/// tasks. `up` opens its workspace `[<repo>]planner`.
 pub const PLANNER_ROLE: &str = SessionRole::Planner.as_str();
 /// `DAGQ_ROLE` of the session where a person answers the queue's asks. `up`
-/// opens its workspace `[<repo>]inbox` next to the maintainer's.
+/// opens its workspace `[<repo>]inbox`.
 pub const INBOX_ROLE: &str = SessionRole::Inbox.as_str();
 /// `DAGQ_ROLE` of the periodic observer job (ADR-0024 decision 4). The CLI
 /// refuses every command that changes queue state from this environment,
@@ -134,10 +132,10 @@ pub struct UpOptions {
     /// but bounds the drain by `startup_timeout` rather than waiting for a
     /// supervisor that turns out not to stop.
     pub no_wait: bool,
-    /// Passed to the maintainer's `claude` as `--plugin-dir`.
+    /// Passed to the inbox's and the planner's `claude` as `--plugin-dir`.
     pub plugin_dir: Option<PathBuf>,
     /// Resolved executables; the agent runs the supervisor with these, and
-    /// the maintainer workspace starts this `claude`.
+    /// the inbox and planner workspaces start this `claude`.
     pub cmux: PathBuf,
     pub claude: PathBuf,
     /// How long a started supervisor may take to register before `up` fails.
@@ -145,14 +143,15 @@ pub struct UpOptions {
     pub poll: Duration,
 }
 
-/// Ensure the supervisor and the maintainer, inbox and planner workspaces
-/// exist and report the queue's open work. Preflight first (cmux, claude, Claude Code's trust of
+/// Ensure the supervisor and the inbox and planner workspaces exist and report the queue's open work. Preflight first (cmux, claude, Claude Code's trust of
 /// the repository root, an initialized queue, the repository), then prune registrations whose process is gone, start
 /// the agent only when no live registration of this binary's version
 /// remains (after proving that cmux admits a process with the agent's
 /// environment) — draining and replacing a live supervisor of any other
-/// version — and open each of the maintainer, inbox and planner workspaces
-/// only outside that session itself.
+/// version — and open each of the inbox and planner workspaces only outside
+/// that session itself. A workspace recorded for a role that no longer
+/// exists (the retired resident session of ADR-0024) is forgotten; the
+/// workspace itself is left for a person to close.
 pub fn up(
     location: &QueueLocation,
     repo: &Path,
@@ -274,18 +273,7 @@ pub fn up(
         db: &db,
         root: &repository.root,
     };
-    let maintainer = sessions.open(
-        SessionRole::Maintainer,
-        maintainer_workspace_name(&repository.root),
-        || {
-            maintainer_command(
-                &db,
-                &location.log_dir,
-                &options.claude,
-                plugin_dir.as_deref(),
-            )
-        },
-    )?;
+    queue.forget_retired_session_workspaces()?;
     let inbox = sessions.open(
         SessionRole::Inbox,
         inbox_workspace_name(&repository.root),
@@ -299,7 +287,6 @@ pub fn up(
 
     Ok(json!({
         "supervisor": supervisor,
-        "maintainer": maintainer,
         "inbox": inbox,
         "planner": planner,
         "pruned_supervisors": pruned,
@@ -308,8 +295,8 @@ pub fn up(
     }))
 }
 
-/// The Claude sessions `up` keeps a workspace open for: the maintainer, the
-/// inbox and the planner (ADR-0022). Each is opened the same way: skipped
+/// The Claude sessions `up` keeps a workspace open for: the inbox and the
+/// planner (ADR-0022, ADR-0024 decision 6). Each is opened the same way: skipped
 /// when `up` runs inside that very session of this queue (its `DAGQ_ROLE`
 /// and `DAGQ_QUEUE`), reused while its recorded UUID is still listed, and
 /// otherwise created and recorded in `session_workspaces`.
@@ -500,7 +487,7 @@ fn start_supervisor(
 /// Only live registrations are replaced. A supervisor that is alive but no
 /// longer heartbeating is one `up` neither reuses nor kills, so an
 /// old-binary one in that state is left running beside the new supervisor
-/// and reported `stale`; stopping it stays the maintainer's call
+/// and reported `stale`; stopping it stays a person's call
 /// (ADR-0014's Consequences).
 #[allow(clippy::too_many_arguments)]
 fn replace_supervisors(
@@ -754,7 +741,7 @@ fn start_under_launchd(
 /// cmux keeps a workspace open after its command exits, so a leftover
 /// `[<repo>]supervisor` may belong to a supervisor that crashed, or to
 /// one that is alive but no longer heartbeating (which `up` never reuses
-/// and never kills). Either way it is the maintainer's to close, and `up`
+/// and never kills). Either way it is a person's to close, and `up`
 /// stops rather than open a second one or interfere with the first.
 #[allow(clippy::too_many_arguments)]
 fn start_in_cmux(
@@ -913,27 +900,16 @@ pub fn launch_agent_spec(
     })
 }
 
-/// The maintainer workspace's command: `claude` with the generated prompt as
-/// its first message. The role and queue are the workspace's own `--env`
-/// (ADR-0026), not a prefix of this command, so a `claude` started again in
-/// that workspace still has them.
-pub fn maintainer_command(
-    db: &Path,
-    log_dir: &Path,
-    claude: &Path,
-    plugin_dir: Option<&Path>,
-) -> Result<String> {
-    session_command(claude, plugin_dir, maintainer_prompt(db, log_dir)?)
-}
-
-/// The inbox workspace's command: `claude` with `inbox_prompt`, the way the
-/// maintainer's is built.
+/// The inbox workspace's command: `claude` with `inbox_prompt` as its first
+/// message. The role and queue are the workspace's own `--env` (ADR-0026),
+/// not a prefix of this command, so a `claude` started again in that
+/// workspace still has them.
 pub fn inbox_command(db: &Path, claude: &Path, plugin_dir: Option<&Path>) -> Result<String> {
     session_command(claude, plugin_dir, inbox_prompt(db)?)
 }
 
 /// The planner workspace's command: `claude` with `planner_prompt`, the way
-/// the maintainer's is built.
+/// the inbox's is built.
 pub fn planner_command(db: &Path, claude: &Path, plugin_dir: Option<&Path>) -> Result<String> {
     session_command(claude, plugin_dir, planner_prompt(db)?)
 }
@@ -949,7 +925,7 @@ fn session_command(claude: &Path, plugin_dir: Option<&Path>, prompt: String) -> 
     Ok(shell_join(&argv))
 }
 
-/// What the maintainer looks at first: unfinished runs with whether their
+/// What a person looks at first after `up`: unfinished runs with whether their
 /// lease still has a live, heartbeating owner, and the runs that wait for
 /// review (`awaiting_integration`) or a resumed session (`needs_session`).
 fn open_work(queue: &SqliteQueue, processes: &dyn ProcessControl) -> Result<Value> {
@@ -1007,9 +983,9 @@ pub struct DownOptions {
 /// supervisor's process is gone: after the drain under `--wait`, after the
 /// kill under `--force`, or straight away when it had already exited.
 /// Closing it earlier would cut the drain short, so the default (which
-/// returns while the supervisor drains) leaves it open and says so; the
-/// maintainer closes it or runs `down --wait`. The maintainer, inbox and
-/// planner workspaces are never touched.
+/// returns while the supervisor drains) leaves it open and says so; a
+/// person closes it or runs `down --wait`. The inbox and planner
+/// workspaces are never touched.
 pub fn down(
     location: &QueueLocation,
     cmux: &dyn WorkspaceBackend,

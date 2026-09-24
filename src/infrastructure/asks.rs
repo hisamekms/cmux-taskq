@@ -111,7 +111,7 @@ impl SqliteQueue {
             && let Some(run_id) = ask.run_id.as_deref()
         {
             // The supervisor types it into a running worker's terminal; the
-            // answer of a run that stopped running is the maintainer's.
+            // answer of a run that stopped running is the inbox's.
             let status: String =
                 tx.query_row("SELECT status FROM task_runs WHERE id=?1", [run_id], |r| {
                     r.get(0)
@@ -123,7 +123,7 @@ impl SqliteQueue {
         {
             // The supervisor lands, sends back or cancels a run awaiting
             // integration as answered (ADR-0027); any other answer, or one
-            // for a run that moved on, is the maintainer's to read.
+            // for a run that moved on, is the inbox's to read.
             let status: String =
                 tx.query_row("SELECT status FROM task_runs WHERE id=?1", [run_id], |r| {
                     r.get(0)
@@ -147,6 +147,7 @@ impl SqliteQueue {
             payload["runtime_delivers"] = json!(
                 (status == RunStatus::Failed.as_str() || status == RunStatus::Interrupted.as_str())
                     && TRIAGE_OPTIONS.contains(&text.trim())
+                    && ask.options.iter().any(|option| option == text.trim())
             );
         }
         ask_event(
@@ -161,7 +162,7 @@ impl SqliteQueue {
         Ok(answered)
     }
 
-    /// Mark an answered ask read by the maintainer. Writes no event. An
+    /// Mark an answered ask read (by the inbox, once the person acted on it). Writes no event. An
     /// open ask cannot be closed: `ask_answered` is the one event that ends
     /// an ask in `run_events` (what `stats` pairs with `ask_opened`), so an
     /// ask is withdrawn by answering it.
@@ -281,15 +282,31 @@ impl SqliteQueue {
     /// no attention); an answered one is only closed, like `ask close`.
     /// Returns the asks it closed, oldest first.
     pub fn close_stuck_exit_asks(&mut self, run_id: &str, answer: &str) -> Result<Vec<Ask>> {
+        self.close_runtime_asks(run_id, AskKind::StuckExit, answer)
+    }
+
+    /// Close every `answer_prompt` ask of the run nobody closed, the way
+    /// [`Self::close_stuck_exit_asks`] does: the dialog it was about is gone
+    /// (or the session ended), so nobody needs to answer it any more.
+    pub fn close_answer_prompt_asks(&mut self, run_id: &str, answer: &str) -> Result<Vec<Ask>> {
+        self.close_runtime_asks(run_id, AskKind::AnswerPrompt, answer)
+    }
+
+    fn close_runtime_asks(
+        &mut self,
+        run_id: &str,
+        kind: AskKind,
+        answer: &str,
+    ) -> Result<Vec<Ask>> {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let unclosed: Vec<Ask> = tx
             .prepare(
-                "SELECT * FROM asks WHERE run_id=?1 AND kind='stuck_exit'
+                "SELECT * FROM asks WHERE run_id=?1 AND kind=?2
                  AND closed_at IS NULL ORDER BY id",
             )?
-            .query_map([run_id], ask_row)?
+            .query_map(params![run_id, kind.as_str()], ask_row)?
             .collect::<rusqlite::Result<_>>()?;
         let mut closed = Vec::with_capacity(unclosed.len());
         for ask in unclosed {

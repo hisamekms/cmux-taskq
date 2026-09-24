@@ -1274,7 +1274,7 @@ fn killed_supervisor_run_is_adopted_by_the_next_supervisor_and_lands() {
     );
     assert!(!pid_alive(victim_pid));
 
-    // What the maintainer sees before anyone adopts: the registration and
+    // What the inbox sees before anyone adopts: the registration and
     // the lease are stale by pid, the wrapper is alive, and the run keeps going.
     let status = dagq(env, &["status"]);
     let supervisors = status["supervisors"].as_array().unwrap();
@@ -1462,7 +1462,7 @@ fn launchd_e2e_enabled() -> bool {
 }
 
 /// `up` bootstraps the supervisor as a LaunchAgent of the real launchd and
-/// opens the maintainer workspace in the real cmux; `status` lists the
+/// opens the inbox and planner workspaces in the real cmux; `status` lists the
 /// supervisor through its registration; `down --wait` unloads the agent
 /// and returns once the supervisor has drained and deregistered.
 ///
@@ -1538,26 +1538,16 @@ fn up_starts_a_launchd_supervisor_that_status_lists_and_down_wait_stops_it() {
     assert_eq!(first["supervisor"]["plist"], plist.to_str().unwrap());
     assert_eq!(first["supervisor"]["log_dir"], log_dir.to_str().unwrap());
     assert_eq!(first["pruned_supervisors"], Value::Array(vec![]));
-    assert_eq!(first["maintainer"]["outcome"], "created", "{first}");
-    let maintainer = first["maintainer"]["workspace_id"]
-        .as_str()
-        .unwrap()
-        .to_owned();
-    uuid::Uuid::parse_str(&maintainer).expect("workspace id is a UUID");
-    workspaces.ids.push(maintainer.clone());
-    assert!(workspace_listed(cmux, &maintainer));
     let repo_name = repo.file_name().unwrap().to_str().unwrap();
-    assert_eq!(
-        first["maintainer"]["name"],
-        format!("[{repo_name}]maintainer")
-    );
-    // The inbox and the planner open beside it (ADR-0022).
+    // The inbox and the planner are the sessions `up` opens (ADR-0024
+    // decision 6).
     let sessions: Vec<String> = ["inbox", "planner"]
         .into_iter()
         .map(|key| {
             assert_eq!(first[key]["outcome"], "created", "{first}");
             assert_eq!(first[key]["name"], format!("[{repo_name}]{key}"));
             let id = first[key]["workspace_id"].as_str().unwrap().to_owned();
+            uuid::Uuid::parse_str(&id).expect("workspace id is a UUID");
             workspaces.ids.push(id.clone());
             assert!(workspace_listed(cmux, &id));
             id
@@ -1613,8 +1603,6 @@ fn up_starts_a_launchd_supervisor_that_status_lists_and_down_wait_stops_it() {
     assert_eq!(second["supervisor"]["outcome"], "reused", "{second}");
     assert_eq!(second["supervisor"]["version"], VERSION, "{second}");
     assert_eq!(second["supervisor"]["pid"], pid);
-    assert_eq!(second["maintainer"]["outcome"], "reused", "{second}");
-    assert_eq!(second["maintainer"]["workspace_id"], maintainer.as_str());
     for (key, id) in ["inbox", "planner"].into_iter().zip(&sessions) {
         assert_eq!(second[key]["outcome"], "reused", "{second}");
         assert_eq!(second[key]["workspace_id"], id.as_str());
@@ -1637,9 +1625,8 @@ fn up_starts_a_launchd_supervisor_that_status_lists_and_down_wait_stops_it() {
         log.contains("exiting: {\"errors\":[],\"outcome\":\"stopped\""),
         "{log}"
     );
-    // The maintainer, inbox and planner workspaces are left open by
-    // `down`; the guard closes them.
-    assert!(workspace_listed(cmux, &maintainer));
+    // The inbox and planner workspaces are left open by `down`; the guard
+    // closes them.
     for id in &sessions {
         assert!(workspace_listed(cmux, id));
     }
@@ -1706,12 +1693,6 @@ fn up_in_cmux_starts_a_supervisor_in_a_workspace_that_down_wait_stops_and_closes
     assert!(workspace_listed(cmux, &supervisor_workspace));
     let pid = u32::try_from(first["supervisor"]["pid"].as_u64().unwrap()).unwrap();
     assert!(pid_alive(pid));
-    let maintainer = first["maintainer"]["workspace_id"]
-        .as_str()
-        .unwrap()
-        .to_owned();
-    workspaces.ids.push(maintainer.clone());
-    assert_eq!(first["maintainer"]["outcome"], "created", "{first}");
     let [inbox, planner] = ["inbox", "planner"].map(|key| {
         assert_eq!(first[key]["outcome"], "created", "{first}");
         let id = first[key]["workspace_id"].as_str().unwrap().to_owned();
@@ -1724,7 +1705,6 @@ fn up_in_cmux_starts_a_supervisor_in_a_workspace_that_down_wait_stops_and_closes
     let db = fixture.db.canonicalize().unwrap();
     for (id, role) in [
         (&supervisor_workspace, "supervisor"),
-        (&maintainer, "maintainer"),
         (&inbox, "inbox"),
         (&planner, "planner"),
     ] {
@@ -1740,22 +1720,16 @@ fn up_in_cmux_starts_a_supervisor_in_a_workspace_that_down_wait_stops_and_closes
         .iter()
         .map(|id| id.as_str().unwrap().to_ascii_lowercase())
         .collect();
-    for id in [&supervisor_workspace, &maintainer, &inbox, &planner] {
+    for id in [&supervisor_workspace, &inbox, &planner] {
         assert!(members.contains(&id.to_ascii_lowercase()), "{group}");
     }
     assert_eq!(
-        listed_workspace(cmux, &maintainer).unwrap()["description"],
-        format!("dagq role=maintainer queue={}", fixture.group.external_id)
+        listed_workspace(cmux, &inbox).unwrap()["description"],
+        format!("dagq role=inbox queue={}", fixture.group.external_id)
     );
-    // A person renames the maintainer workspace; `up` still knows it.
+    // A person renames the inbox workspace; `up` still knows it.
     let rename = Command::new(cmux)
-        .args([
-            "workspace",
-            "rename",
-            &maintainer,
-            "--title",
-            "renamed by hand",
-        ])
+        .args(["workspace", "rename", &inbox, "--title", "renamed by hand"])
         .output()
         .unwrap();
     assert!(rename.status.success(), "{rename:?}");
@@ -1816,8 +1790,6 @@ fn up_in_cmux_starts_a_supervisor_in_a_workspace_that_down_wait_stops_and_closes
         second["supervisor"]["workspace_id"],
         supervisor_workspace.as_str()
     );
-    assert_eq!(second["maintainer"]["outcome"], "reused", "{second}");
-    assert_eq!(second["maintainer"]["workspace_id"], maintainer.as_str());
     for (key, id) in [("inbox", &inbox), ("planner", &planner)] {
         assert_eq!(second[key]["outcome"], "reused", "{second}");
         assert_eq!(second[key]["workspace_id"], id.as_str());
@@ -1837,9 +1809,9 @@ fn up_in_cmux_starts_a_supervisor_in_a_workspace_that_down_wait_stops_and_closes
     assert!(!pid_alive(pid), "supervisor {pid} is still alive");
     wait_until_not_listed(cmux, &supervisor_workspace);
     assert_eq!(dagq(env, &["status"])["supervisors"], Value::Array(vec![]));
-    // The maintainer, inbox and planner workspaces are left open by
-    // `down`; the guard closes them.
-    for id in [&maintainer, &inbox, &planner] {
+    // The inbox and planner workspaces are left open by `down`; the guard
+    // closes them.
+    for id in [&inbox, &planner] {
         assert!(workspace_listed(cmux, id));
     }
 }
