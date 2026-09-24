@@ -322,16 +322,67 @@ impl Sessions<'_> {
                 .as_deref()
                 .and_then(|queue| queue.canonicalize().ok())
                 .is_some_and(|queue| queue == self.db);
+        let cmux = self.workspaces.cmux;
         if inside {
+            // The session `up` runs in is most likely the recorded one; an
+            // `up` from it is how an older binary's workspace gets its look.
+            if let Some(id) = self.queue.session_workspace(role)?
+                && matches!(cmux.exists(&id), Ok(true))
+            {
+                self.mark(role, &id);
+            }
             return Ok(json!({"outcome": "skipped", "workspace_id": Value::Null, "name": name}));
         }
-        let cmux = self.workspaces.cmux;
         if let Some(id) = recorded_workspace(self.queue, cmux, role)? {
+            self.mark(role, &id);
             return Ok(json!({"outcome": "reused", "workspace_id": id, "name": name}));
         }
         let id = cmux.create_named(&name, self.root, &command()?, &self.workspaces.tags(role)?)?;
         self.queue.register_session_workspace(role, &id)?;
+        self.mark(role, &id);
         Ok(json!({"outcome": "created", "workspace_id": id, "name": name}))
+    }
+
+    /// Color the workspace, put the role's status pill on it and pin it
+    /// (ADR-0031). Every `up` does it again, so a workspace an older `up`
+    /// opened gets it too. None of it is worth failing `up` for: what cmux
+    /// refuses is a warning in `up`'s result.
+    fn mark(&self, role: SessionRole, id: &str) {
+        let Some((color, icon)) = session_look(role) else {
+            return;
+        };
+        let cmux = self.workspaces.cmux;
+        for (what, result) in [
+            ("color", cmux.set_color(id, color)),
+            (
+                "status pill",
+                cmux.set_status(id, ROLE_STATUS_KEY, role.as_str(), icon),
+            ),
+            ("pin", cmux.pin(id)),
+        ] {
+            if let Err(error) = result {
+                self.workspaces.warnings.borrow_mut().push(format!(
+                    "cmux could not set the {what} of the {} workspace {id}: {error:#}",
+                    role.as_str()
+                ));
+            }
+        }
+    }
+}
+
+/// The key of the status pill a session workspace carries: dagq's own, so
+/// it never replaces another tool's pill (Claude Code's `claude_code`).
+pub const ROLE_STATUS_KEY: &str = "dagq_role";
+
+/// How the sidebar tells the inbox and the planner apart at a glance
+/// (ADR-0031): the workspace's cmux color and the SF Symbol of its role
+/// pill (cmux workspaces have no icon of their own). Amber for the inbox,
+/// where things wait for a person. Other roles keep cmux's defaults.
+pub fn session_look(role: SessionRole) -> Option<(&'static str, &'static str)> {
+    match role {
+        SessionRole::Inbox => Some(("Amber", "tray")),
+        SessionRole::Planner => Some(("Blue", "map")),
+        _ => None,
     }
 }
 

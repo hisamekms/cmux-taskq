@@ -154,6 +154,18 @@ impl WorkspaceBackend for RecordingBackend<'_> {
         let result = self.inner.close(workspace_id);
         self.recorded("close", Some(workspace_id), None, result)
     }
+    fn set_color(&self, workspace_id: &str, color: &str) -> Result<()> {
+        let result = self.inner.set_color(workspace_id, color);
+        self.recorded("set_color", Some(workspace_id), None, result)
+    }
+    fn set_status(&self, workspace_id: &str, key: &str, value: &str, icon: &str) -> Result<()> {
+        let result = self.inner.set_status(workspace_id, key, value, icon);
+        self.recorded("set_status", Some(workspace_id), None, result)
+    }
+    fn pin(&self, workspace_id: &str) -> Result<()> {
+        let result = self.inner.pin(workspace_id);
+        self.recorded("pin", Some(workspace_id), None, result)
+    }
     fn send_exit(&self, workspace_id: &str) -> Result<()> {
         let result = self.inner.send_exit(workspace_id);
         self.recorded("send_exit", Some(workspace_id), None, result)

@@ -304,6 +304,11 @@ impl Drop for WorkspaceGuard {
                 eprintln!("workspace {id} already closed");
                 continue;
             }
+            // cmux refuses to close a pinned workspace (the inbox and the
+            // planner are pinned, ADR-0031).
+            let _ = Command::new(&self.cmux)
+                .args(["workspace-action", "--action", "unpin", "--workspace", id])
+                .output();
             match Command::new(&self.cmux)
                 .args(["workspace", "close"])
                 .arg(id)
@@ -318,6 +323,22 @@ impl Drop for WorkspaceGuard {
             }
         }
     }
+}
+
+/// The workspace is pinned, has the sidebar color `color` (cmux lists a
+/// named color by its hex value) and carries the status pill `pill` as
+/// `cmux list-status` prints it.
+fn assert_look(cmux: &Path, id: &str, color: &str, pill: &str) {
+    let listed = listed_workspace(cmux, id).unwrap();
+    assert_eq!(listed["pinned"], true, "{listed}");
+    assert_eq!(listed["custom_color"], color, "{listed}");
+    let status = Command::new(cmux)
+        .args(["list-status", "--workspace", id])
+        .output()
+        .unwrap();
+    assert!(status.status.success(), "{status:?}");
+    let status = String::from_utf8_lossy(&status.stdout);
+    assert!(status.lines().any(|line| line == pill), "{status}");
 }
 
 /// The queue's workspace group in `cmux --json workspace-group list`,
@@ -1992,6 +2013,18 @@ fn up_in_cmux_starts_a_supervisor_in_a_workspace_that_down_wait_stops_and_closes
         listed_workspace(cmux, &inbox).unwrap()["description"],
         format!("dagq role=inbox queue={}", fixture.group.external_id)
     );
+    // The inbox is Amber and the planner Blue, each pinned with its role's
+    // pill (ADR-0031).
+    for (id, color, pill) in [
+        (&inbox, "#7D6608", "dagq_role=inbox icon=tray"),
+        (&planner, "#1565C0", "dagq_role=planner icon=map"),
+    ] {
+        assert_look(cmux, id, color, pill);
+    }
+    assert_eq!(
+        listed_workspace(cmux, &supervisor_workspace).unwrap()["pinned"],
+        false
+    );
     // A person renames the inbox workspace; `up` still knows it.
     let rename = Command::new(cmux)
         .args(["workspace", "rename", &inbox, "--title", "renamed by hand"])
@@ -2059,6 +2092,48 @@ fn up_in_cmux_starts_a_supervisor_in_a_workspace_that_down_wait_stops_and_closes
         assert_eq!(second[key]["outcome"], "reused", "{second}");
         assert_eq!(second[key]["workspace_id"], id.as_str());
     }
+    // The look is put back on a reused workspace that lost it.
+    let unpin = Command::new(cmux)
+        .args([
+            "workspace-action",
+            "--action",
+            "unpin",
+            "--workspace",
+            &planner,
+        ])
+        .output()
+        .unwrap();
+    assert!(unpin.status.success(), "{unpin:?}");
+    let third = dagq_with(env, &[("HOME", home.as_path())], &up_args);
+    assert_eq!(third["planner"]["outcome"], "reused", "{third}");
+    assert_eq!(third["warnings"], serde_json::json!([]), "{third}");
+    assert_look(cmux, &planner, "#1565C0", "dagq_role=planner icon=map");
+
+    // cmux refuses to close a pinned workspace; dagq's close unpins it
+    // first, so `down` closes the supervisor's workspace even when a person
+    // pinned it.
+    let pin = Command::new(cmux)
+        .args([
+            "workspace-action",
+            "--action",
+            "pin",
+            "--workspace",
+            &supervisor_workspace,
+        ])
+        .output()
+        .unwrap();
+    assert!(pin.status.success(), "{pin:?}");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while listed_workspace(cmux, &supervisor_workspace).unwrap()["pinned"] != true {
+        assert!(Instant::now() < deadline, "the pin never showed up");
+        thread::sleep(Duration::from_millis(200));
+    }
+    let refused = Command::new(cmux)
+        .args(["workspace", "close", &supervisor_workspace])
+        .output()
+        .unwrap();
+    eprintln!("cmux workspace close of a pinned workspace: {refused:?}");
+    assert!(!refused.status.success(), "{refused:?}");
 
     let started = Instant::now();
     let down = dagq_with(env, &[("HOME", home.as_path())], &["down", "--wait"]);

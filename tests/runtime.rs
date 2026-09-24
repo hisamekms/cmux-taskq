@@ -564,6 +564,15 @@ impl WorkspaceBackend for TestWorkspace {
         Ok(())
     }
 
+    fn set_color(&self, _: &str, _: &str) -> Result<()> {
+        unreachable!("only up colors a workspace")
+    }
+    fn set_status(&self, _: &str, _: &str, _: &str, _: &str) -> Result<()> {
+        unreachable!("only up puts a status pill on a workspace")
+    }
+    fn pin(&self, _: &str) -> Result<()> {
+        unreachable!("only up pins a workspace")
+    }
     fn send_exit(&self, workspace_id: &str) -> Result<()> {
         self.exits_sent.fetch_add(1, Ordering::SeqCst);
         let run_dir = self.session_run_dir(workspace_id);

@@ -229,6 +229,10 @@ struct FakeCmux {
     groups: Mutex<Vec<(String, String)>>,
     /// `workspace-group create` fails.
     group_fails: bool,
+    /// Every color, status pill and pin call, as (call, workspace, what).
+    looks: Mutex<Vec<(String, String, String)>>,
+    /// cmux refuses every color, status pill and pin call.
+    look_fails: bool,
 }
 
 impl FakeCmux {
@@ -239,6 +243,28 @@ impl FakeCmux {
                 workspace.0 = title.into();
             }
         }
+    }
+
+    fn look(&self, call: &str, id: &str, what: String) -> Result<()> {
+        self.looks
+            .lock()
+            .unwrap()
+            .push((call.into(), id.into(), what));
+        if self.look_fails {
+            bail!("{call} refused")
+        }
+        Ok(())
+    }
+
+    /// The look calls made on `id`, in order.
+    fn looks_of(&self, id: &str) -> Vec<(String, String)> {
+        self.looks
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, workspace, _)| workspace == id)
+            .map(|(call, _, what)| (call.clone(), what.clone()))
+            .collect()
     }
 
     /// An open workspace put there directly, the way one opened by an
@@ -298,6 +324,15 @@ impl WorkspaceBackend for FakeCmux {
         workspaces.remove(index);
         self.tags.lock().unwrap().remove(index);
         Ok(())
+    }
+    fn set_color(&self, workspace_id: &str, color: &str) -> Result<()> {
+        self.look("set-color", workspace_id, color.into())
+    }
+    fn set_status(&self, workspace_id: &str, key: &str, value: &str, icon: &str) -> Result<()> {
+        self.look("set-status", workspace_id, format!("{key}={value} {icon}"))
+    }
+    fn pin(&self, workspace_id: &str) -> Result<()> {
+        self.look("pin", workspace_id, String::new())
     }
     fn send_exit(&self, _: &str) -> Result<()> {
         bail!("not used")
@@ -1610,6 +1645,173 @@ fn up_warns_and_goes_on_when_the_workspace_group_cannot_be_made() {
     assert!(failure.payload.get("parallel").is_some());
 }
 
+/// `up` colors the inbox Amber and the planner Blue, puts a `dagq_role`
+/// pill with the role's icon on each and pins it (ADR-0031), on the
+/// workspace it creates and again on the one it reuses, addressed by the
+/// recorded UUID. The in-cmux supervisor's workspace keeps cmux's look.
+#[test]
+fn up_colors_labels_and_pins_the_inbox_and_the_planner_on_every_up() {
+    let mut fixture = fixture();
+    fixture.options.in_cmux = true;
+    let cmux = FakeCmux {
+        registers_supervisor_in: Some(fixture.location.db.clone()),
+        ..FakeCmux::default()
+    };
+    let launchd = FakeLaunchd::new(&fixture.location.db);
+    let processes = FakeProcesses::default();
+    let look = |color: &str, pill: &str| {
+        vec![
+            ("set-color".to_owned(), color.to_owned()),
+            ("set-status".to_owned(), pill.to_owned()),
+            ("pin".to_owned(), String::new()),
+        ]
+    };
+    let inbox_look = look("Amber", "dagq_role=inbox tray");
+    let planner_look = look("Blue", "dagq_role=planner map");
+
+    let first = up(&fixture, &cmux, &launchd, &processes);
+    assert_eq!(first["warnings"], json!([]), "{first}");
+    let queue = SqliteQueue::open(&fixture.location.db).unwrap();
+    let recorded = |role| queue.session_workspace(role).unwrap().unwrap();
+    let inbox = recorded(SessionRole::Inbox);
+    let planner = recorded(SessionRole::Planner);
+    assert_eq!(first["inbox"]["workspace_id"], inbox.as_str());
+    assert_eq!(cmux.looks_of(&inbox), inbox_look);
+    assert_eq!(cmux.looks_of(&planner), planner_look);
+    let supervisor = first["supervisor"]["workspace_id"].as_str().unwrap();
+    assert!(cmux.looks_of(supervisor).is_empty());
+
+    let second = up(&fixture, &cmux, &launchd, &processes);
+    assert_eq!(second["inbox"]["outcome"], "reused", "{second}");
+    assert_eq!(second["planner"]["outcome"], "reused", "{second}");
+    assert_eq!(
+        cmux.looks_of(&inbox),
+        [inbox_look.clone(), inbox_look.clone()].concat()
+    );
+    assert_eq!(
+        cmux.looks_of(&planner),
+        [planner_look.clone(), planner_look.clone()].concat()
+    );
+
+    // From inside the inbox, `up` skips opening it but still marks the
+    // recorded workspace, so one an older binary opened gets its look.
+    fixture.environment.role = Some(INBOX_ROLE.into());
+    fixture.environment.queue = Some(fixture.location.db.clone());
+    let third = up(&fixture, &cmux, &launchd, &processes);
+    assert_eq!(third["inbox"]["outcome"], "skipped", "{third}");
+    assert_eq!(
+        cmux.looks_of(&inbox),
+        [inbox_look.clone(), inbox_look.clone(), inbox_look].concat()
+    );
+    assert_eq!(cmux.looks_of(&planner).len(), 9);
+}
+
+/// A color, pill or pin cmux refuses does not stop `up`: the workspaces
+/// are still created and recorded, each refusal is a warning naming what
+/// could not be set, and the failed call is recorded like any other.
+#[test]
+fn up_warns_and_goes_on_when_cmux_refuses_the_look() {
+    let fixture = fixture();
+    let cmux = FakeCmux {
+        look_fails: true,
+        ..FakeCmux::default()
+    };
+    let launchd = FakeLaunchd::new(&fixture.location.db);
+    let processes = FakeProcesses::default();
+    let report = up(&fixture, &cmux, &launchd, &processes);
+    assert_eq!(report["inbox"]["outcome"], "created", "{report}");
+    assert_eq!(report["planner"]["outcome"], "created", "{report}");
+    let warnings: Vec<&str> = report["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|warning| warning.as_str().unwrap())
+        .collect();
+    assert_eq!(warnings.len(), 6, "{report}");
+    let inbox = report["inbox"]["workspace_id"].as_str().unwrap();
+    assert_eq!(
+        warnings[0],
+        format!("cmux could not set the color of the inbox workspace {inbox}: set-color refused")
+    );
+    assert!(
+        warnings[1].contains("status pill of the inbox"),
+        "{}",
+        warnings[1]
+    );
+    assert!(warnings[2].contains("pin of the inbox"), "{}", warnings[2]);
+    assert!(
+        warnings[3].contains("color of the planner"),
+        "{}",
+        warnings[3]
+    );
+    let ops: Vec<Value> = backend_failures(&fixture)
+        .iter()
+        .map(|failure| failure.payload["op"].clone())
+        .collect();
+    assert_eq!(
+        ops,
+        [
+            "set_color",
+            "set_status",
+            "pin",
+            "set_color",
+            "set_status",
+            "pin"
+        ]
+    );
+}
+
+/// The real adapter's look calls are `workspace-action --action set-color
+/// --color <c>`, `set-status <key> <value> --icon <i>` and
+/// `workspace-action --action pin`, each with `--workspace <uuid>`; `close`
+/// unpins before it closes, since cmux refuses to close a pinned
+/// workspace, and an unpin that fails does not stop the close.
+#[test]
+fn the_cmux_adapter_marks_a_workspace_and_unpins_it_before_closing() {
+    let dir = tempfile::tempdir().unwrap();
+    let dump = dir.path().join("args.txt");
+    let stub = dir.path().join("cmux-stub");
+    // The unpin of `GONE` and the close of `STUCK` fail.
+    fs::write(
+        &stub,
+        format!(
+            "#!/bin/sh\nprintf '%s ' \"$@\" >> '{}'\necho >> '{}'\ncase \"$*\" in *'unpin --workspace GONE') exit 1 ;; 'workspace close STUCK') exit 1 ;; 'workspace close'*) echo \"OK workspace:3\" ;; *) echo OK ;; esac\n",
+            dump.display(),
+            dump.display()
+        ),
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).unwrap();
+    let cmux = Cmux { executable: stub };
+    let calls = || {
+        let calls = fs::read_to_string(&dump).unwrap_or_default();
+        let _ = fs::remove_file(&dump);
+        calls
+    };
+    cmux.set_color("WS", "Amber").unwrap();
+    cmux.set_status("WS", "dagq_role", "inbox", "tray").unwrap();
+    cmux.pin("WS").unwrap();
+    assert_eq!(
+        calls(),
+        "workspace-action --action set-color --color Amber --workspace WS \n\
+set-status dagq_role inbox --icon tray --workspace WS \n\
+workspace-action --action pin --workspace WS \n"
+    );
+    cmux.close("WS").unwrap();
+    assert_eq!(
+        calls(),
+        "workspace-action --action unpin --workspace WS \nworkspace close WS \n"
+    );
+    cmux.close("GONE").unwrap();
+    assert_eq!(
+        calls(),
+        "workspace-action --action unpin --workspace GONE \nworkspace close GONE \n"
+    );
+    assert!(cmux.close("STUCK").is_err());
+    assert!(cmux.set_color("GONE", "Blue").is_ok());
+}
+
 /// The `backend_call_failed` events of the fixture's queue, oldest first.
 fn backend_failures(fixture: &Fixture) -> Vec<dagq::domain::RunEvent> {
     SqliteQueue::open(&fixture.location.db)
@@ -1653,6 +1855,15 @@ fn up_requires_cmux_claude_and_an_initialized_queue() {
             unreachable!()
         }
         fn close(&self, _: &str) -> Result<()> {
+            unreachable!()
+        }
+        fn set_color(&self, _: &str, _: &str) -> Result<()> {
+            unreachable!()
+        }
+        fn set_status(&self, _: &str, _: &str, _: &str, _: &str) -> Result<()> {
+            unreachable!()
+        }
+        fn pin(&self, _: &str) -> Result<()> {
             unreachable!()
         }
         fn send_exit(&self, _: &str) -> Result<()> {

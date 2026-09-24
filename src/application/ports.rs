@@ -354,8 +354,17 @@ pub trait WorkspaceBackend {
     /// supervisor sends (ADR-0019).
     fn send_text(&self, workspace_id: &str, text: &str) -> Result<()>;
     fn capture(&self, workspace_id: &str) -> Result<String>;
-    /// Close the workspace; the worktree and branch are not touched.
+    /// Close the workspace; the worktree and branch are not touched. A
+    /// pinned workspace is unpinned first, since cmux refuses to close one
+    /// (ADR-0031); every close dagq makes goes through here.
     fn close(&self, workspace_id: &str) -> Result<()>;
+    /// Give the workspace a sidebar color: a cmux color name or `#RRGGBB`.
+    fn set_color(&self, workspace_id: &str, color: &str) -> Result<()>;
+    /// Show the status pill `key` with `value` and `icon` on the
+    /// workspace's sidebar entry, replacing the pill under the same key.
+    fn set_status(&self, workspace_id: &str, key: &str, value: &str, icon: &str) -> Result<()>;
+    /// Pin the workspace in the sidebar; pinning a pinned one is a no-op.
+    fn pin(&self, workspace_id: &str) -> Result<()>;
     /// Ask the agent session to end the way a person would, without killing it.
     fn send_exit(&self, workspace_id: &str) -> Result<()>;
     /// Whether the workspace with this stable ID is still open. Workspaces

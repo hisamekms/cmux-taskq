@@ -1033,7 +1033,12 @@ impl WorkspaceBackend for Cmux {
         ]))
     }
 
+    /// cmux refuses to close a pinned workspace ("protected", cmux
+    /// 0.64.25), so the pin goes first. An unpin that fails (the
+    /// workspace is already gone, say) does not stop the close, whose own
+    /// error is the one reported.
     fn close(&self, workspace_id: &str) -> Result<()> {
+        let _ = self.workspace_action(workspace_id, &["unpin"]);
         let raw = output(
             Command::new(&self.executable)
                 .args(["workspace", "close"])
@@ -1041,6 +1046,27 @@ impl WorkspaceBackend for Cmux {
         )?;
         workspace_handle(&raw).context("cmux did not confirm the workspace close")?;
         Ok(())
+    }
+
+    fn set_color(&self, workspace_id: &str, color: &str) -> Result<()> {
+        self.workspace_action(workspace_id, &["set-color", "--color", color])
+    }
+
+    fn set_status(&self, workspace_id: &str, key: &str, value: &str, icon: &str) -> Result<()> {
+        output(Command::new(&self.executable).args([
+            "set-status",
+            key,
+            value,
+            "--icon",
+            icon,
+            "--workspace",
+            workspace_id,
+        ]))?;
+        Ok(())
+    }
+
+    fn pin(&self, workspace_id: &str) -> Result<()> {
+        self.workspace_action(workspace_id, &["pin"])
     }
 
     /// Type `/exit` at Claude's prompt exactly as a person would.
@@ -1166,6 +1192,17 @@ impl Cmux {
             ),
         }
         .into())
+    }
+
+    /// `cmux workspace-action --action <action> [flags…] --workspace <id>`.
+    fn workspace_action(&self, workspace_id: &str, action: &[&str]) -> Result<()> {
+        output(
+            Command::new(&self.executable)
+                .args(["workspace-action", "--action"])
+                .args(action)
+                .args(["--workspace", workspace_id]),
+        )?;
+        Ok(())
     }
 
     /// `cmux workspace create`; the raw reply carries the `OK workspace:N` handle.
