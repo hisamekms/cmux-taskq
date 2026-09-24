@@ -4,8 +4,8 @@ type: design
 title: System overview
 status: current
 created: 2026-09-21
-updated: 2026-09-24
-last_verified: 2026-09-24
+updated: 2026-09-25
+last_verified: 2026-09-25
 scope: system
 related:
   - adr-0001
@@ -32,7 +32,7 @@ related:
 - `domain`（`src/domain/`）: 集約とドメインの判断。I/O・DBライブラリ・`anyhow`に依存しない。集約は`Task`（`domain::task`）・`Goal`（`domain::goal`）・`TaskRun`（`domain::run`）の3つで、フィールドは非公開、新規作成は`new`、DBからの復元は`restore`、状態の変更は`Result<_, DomainError>`を返すコマンド関数（[domain-model](domain-model.md)）。IDとcommitはnewtype（`domain::ids`の`TaskId`・`GoalId`・`RunId`・`CommitSha`）、業務上の拒否は`DomainError`（`domain::error`）。読み取り専用のview型は`domain::views`、入力型は`domain::input`、scopeの判定は`domain::scope`、statsの集計は`domain::stats`。
 - `application`（`src/application/`）: ユースケースとport。portは`application::ports`のtraitで、queueの`Queue`（`TaskStore`・`RunStore`・`AskStore`。threadごとの接続は`QueueOpener`）、Gitの`Repository`と`MainRemote`、検証コマンドの`Verifier`、cmuxの`WorkspaceBackend`、Claude Codeの`AgentProvider`（コマンドは`CommandSpec`で返す）とその画面のダイアログ・idle markerの内容を読む`AgentSignals`、launchdの`LaunchAgent`、PIDの生死とsignalの`ProcessControl`、子プロセスの`Spawner`、runのファイルの`RunFiles`、時刻とIDの`Clock`・`IdGenerator`（組は`Generators`）。ユースケースは`supervise`（supervisorのループ。`supervise/mod.rs`がループとslotの状態機械、`session`・`exit`・`jobs`・`landing`・`revise`・`resume`・`triage`・`adopt`がphaseごとのwatchとその処理、`idle`がidle markerの判定）、`session`（session wrapper）、`integrate`（着地）、`health`（`status`・`doctor`・`recover`とattention、文字列の切り詰め`truncate`とinbox向けのeventの圧縮`compact_event`）、`lifecycle`（`up`・`down`。LaunchAgentのplistの内容`LaunchAgentSpec`もここ）、`review`・`rebind`・`stats`・`ask`、`prompt`（worker・inbox・plannerのprompt、headlessのreview・triageのprompt、sessionに打ち込むresume・reviseの依頼文）、`recording`（cmux呼び出しの失敗の記録）、`naming`（workspaceの名前とshellの引用）。applicationはinfrastructureの型を名指ししない。進行と診断のメッセージはportを通さず`tracing`のマクロで出し、subscriberは起動部分が組み立てる（[ADR-0033](../adr/0033-one-tracing-pipeline-with-local-json-lines-and-optional-otlp.md)）。
 - `infrastructure`（`src/infrastructure/`）: portの実装。`sqlite`・`runtime_store`・`asks`（`SqliteQueue`。SQLiteとの変換は`sql_ids`、supervisorのthreadごとの接続は`SqliteOpener`）、`adapters`（`GitRepository`、`Cmux`、`ClaudeCode`、`SystemProcesses`）、`claude`（`ClaudeCode`の`AgentSignals`: Claude Codeの画面のダイアログの判定`detect_prompt`とStop hookの入力の読み取り）、`launchd`（`Launchctl`）、`process`（`LocalSpawner`）、`run_files`（`LocalRunFiles`）、`telemetry`（`tracing`のsubscriber。queueの`logs/`へのJSON Linesとstderr、panic hook）、`run_env`（`ShellVerifier`）、`clock`（`SystemClock`と`UuidGenerator`）、`location`（cwdからのqueueの解決、[ADR-0006](../adr/0006-queue-per-repository.md)）。
-- 組み立て: `compose`（`src/compose.rs`）がコマンドごとの入口で、queueとrepositoryを開き、portの実装を作ってユースケースに注入する（`supervise`・`session`・`integrate`・`status`・`doctor`・`recover`・`ask`・`up`・`down`・`review`・`rebind`・`stats`）。`main`（`src/main.rs`）はqueueの位置の解決、CLIの解析と役割による拒否、`compose`の入口か`TaskStore`のportの1回の呼び出し、JSONの出力とexit codeだけを行う。
+- 組み立て: `compose`（`src/compose.rs`）がコマンドごとの入口で、queueとrepositoryを開き、portの実装を作ってユースケースに注入する（`supervise`・`session`・`integrate`・`status`・`doctor`・`recover`・`ask`・`up`・`down`・`review`・`rebind`・`stats`）。one-shotの入口（`integrate`・`status`・`doctor`・`recover`・`stats`・`rebind`・`up`・`down`）は`compose::OneShot`のメソッドで、`OneShot`が持つ`Generators`を開いたqueue（`with_generators`）とユースケースの両方に渡す。同名の自由関数はsystemの`Generators`で作った`OneShot`を呼ぶテスト向けの入口。`main`（`src/main.rs`）はqueueの位置の解決、`Generators`（`SystemClock`と`UuidGenerator`）の1回の組み立てと注入（`OneShot`、`SuperviseOptions.generators`、自分が開くqueue）、CLIの解析と役割による拒否、`compose`の入口か`TaskStore`のportの1回の呼び出し、JSONの出力とexit codeだけを行う。
 - レイヤーの外: `view`（`show`・`goal show`の圧縮した出力）、`watch`（`events`と`watch`。attentionの導出は`application::health`）、`observer`（observerのjob。queueを直接開く）。applicationはこれらを参照せず、`view::truncate`と`watch::compact_event`は`application::health`の再輸出。`runtime`と`lifecycle`は再編前の名前をテストのために再公開するだけのモジュール。
 
 利用方法は[README](../../README.md)を参照。

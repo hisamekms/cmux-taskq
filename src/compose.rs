@@ -3,8 +3,10 @@
 //! `GitRepository`, `Cmux`-backed recording, `ClaudeCode`, `Launchctl`'s
 //! port, `SystemProcesses`, `LocalRunFiles`, the system clock and IDs) and
 //! calls the use case in `application` (ADR-0013). `main` resolves the
-//! queue location, parses the CLI and prints what these return; `runtime`
-//! and `lifecycle` re-export them under the names the tests use.
+//! queue location, assembles the clock and IDs once ([`OneShot`] and
+//! [`SuperviseOptions::generators`]), parses the CLI and prints what these
+//! return; `runtime` and `lifecycle` re-export them under the names the
+//! tests use.
 
 use anyhow::{Context, Result, ensure};
 use serde_json::Value;
@@ -205,72 +207,259 @@ impl<'a> RecordingBackend<'a> {
     }
 }
 
-/// Land one validated run on `main`: take the single integration slot,
-/// rebase the run worktree onto the current `refs/heads/main`, re-validate
-/// (receipt, descent from main, clean tree) and run the verification
-/// commands, the only run of them for the commit (ADR-0023), squash
-/// the tree into one commit with `Dagq-Task` / `Dagq-Run` trailers and
-/// fast-forward `main` to it. Never a merge commit, never a fast-forward of
-/// the run branch itself. A conflict or a failed re-validation parks the run
-/// as `needs_session` for a resumed session to fix; a rewritten receipt that
-/// reports `failed` ends the run. `repo` is any checkout of the repository
-/// the queue is bound to. After a landing, `main` is pushed to `origin`
-/// through `remote` (ADR-0019 decision 3); `None` is `--no-push`. The push
-/// never changes the landing: its outcome is an event and the `push` of the
-/// result. The landed receipt's `follow_ups` become draft tasks
-/// (ADR-0019 decision 4), listed as the result's `follow_ups`.
-///
-/// The use case is [`integration::begin`] and
-/// [`integration::land_integrating`]; this entry point opens the queue and
-/// the repository and keeps the lease alive in between.
+/// The one-shot entry points (`integrate`, `status`, `doctor`, `recover`,
+/// `stats`, `rebind`, `up` and `down`) on the clock and IDs `main`
+/// assembled once: the queue each of them opens reads the time and creates
+/// IDs through `generators`, and so does the use case, instead of the
+/// queue's own default (ADR-0013 policy 7). Tests fix them.
+#[derive(Debug, Clone)]
+pub struct OneShot {
+    pub generators: Generators,
+}
+
+impl OneShot {
+    pub fn new(generators: Generators) -> Self {
+        Self { generators }
+    }
+
+    /// The wall clock and random UUIDs, what the binary runs with.
+    pub fn system() -> Self {
+        Self::new(clock::system())
+    }
+
+    /// The queue at `db`, writing through these generators.
+    fn open(&self, db: &Path) -> Result<SqliteQueue> {
+        Ok(SqliteQueue::open(db)?.with_generators(self.generators.clone()))
+    }
+
+    /// Land one validated run on `main`: take the single integration slot,
+    /// rebase the run worktree onto the current `refs/heads/main`, re-validate
+    /// (receipt, descent from main, clean tree) and run the verification
+    /// commands, the only run of them for the commit (ADR-0023), squash
+    /// the tree into one commit with `Dagq-Task` / `Dagq-Run` trailers and
+    /// fast-forward `main` to it. Never a merge commit, never a fast-forward of
+    /// the run branch itself. A conflict or a failed re-validation parks the run
+    /// as `needs_session` for a resumed session to fix; a rewritten receipt that
+    /// reports `failed` ends the run. `repo` is any checkout of the repository
+    /// the queue is bound to. After a landing, `main` is pushed to `origin`
+    /// through `remote` (ADR-0019 decision 3); `None` is `--no-push`. The push
+    /// never changes the landing: its outcome is an event and the `push` of the
+    /// result. The landed receipt's `follow_ups` become draft tasks
+    /// (ADR-0019 decision 4), listed as the result's `follow_ups`.
+    ///
+    /// The use case is [`integration::begin`] and
+    /// [`integration::land_integrating`]; this entry point opens the queue and
+    /// the repository and keeps the lease alive in between. The slot's token
+    /// is one of these generators' IDs.
+    pub fn integrate(
+        &self,
+        db: &Path,
+        target: IntegrateTarget,
+        repo: &Path,
+        remote: Option<&dyn MainRemote>,
+    ) -> Result<Value> {
+        let db = db
+            .canonicalize()
+            .context("queue must already be initialized")?;
+        let mut queue = self.open(&db)?;
+        let repository = GitRepository::inspect(repo)?;
+        let common_dir = path_text(&repository.common_dir)?;
+        let verifier = ShellVerifier {
+            checkout: main_checkout(&repository),
+            db: db.clone(),
+        };
+        let mut integration = Integration {
+            queue: &mut queue,
+            repository: &repository,
+            verifier: &verifier,
+            remote,
+            files: &LocalRunFiles,
+            common_dir: &common_dir,
+            clock: &*self.generators.clock,
+            ids: &*self.generators.ids,
+            processes: &SystemProcesses,
+            pid: std::process::id(),
+        };
+        let Some(begun) = integration::begin(&mut integration, target, repo)? else {
+            return Ok(serde_json::to_value(IntegrationOutcome::NoRunAwaiting)?);
+        };
+        let heartbeat = Heartbeat::start(
+            Arc::new(SqliteOpener {
+                db: db.clone(),
+                generators: self.generators.clone(),
+            }),
+            begun.token.clone(),
+        );
+        let outcome = integration::land_integrating(
+            &mut integration,
+            &begun.run,
+            begun.previous,
+            &begun.main,
+            &begun.token,
+        )?;
+        drop(heartbeat); // Stops the lease heartbeat before this process reports.
+        Ok(serde_json::to_value(outcome)?)
+    }
+
+    /// `status --role`: see [`health::status`], measured to these
+    /// generators' now.
+    pub fn status_for(&self, db: &Path, role: Option<SessionRole>) -> Result<Value> {
+        let queue = self.open(db)?;
+        health::status(&queue, &SystemProcesses, &*self.generators.clock, role)
+    }
+
+    /// `doctor`: see [`health::doctor`].
+    pub fn doctor(&self, db: &Path, full: bool) -> Result<Value> {
+        let queue = self.open(db)?;
+        health::doctor(
+            &queue,
+            &SystemProcesses,
+            &LocalRunFiles,
+            &*self.generators.clock,
+            full,
+        )
+    }
+
+    /// `recover`: see [`health::recover`].
+    pub fn recover(&self, db: &Path, id: &RunId) -> Result<Value> {
+        let mut queue = self.open(db)?;
+        health::recover(
+            &mut queue,
+            &SystemProcesses,
+            &LocalRunFiles,
+            &*self.generators.clock,
+            id,
+        )
+    }
+
+    /// `stats`: see [`statistics::stats`], measured to these generators' now.
+    pub fn stats(&self, db: &Path, query: &StatsQuery) -> Result<Value> {
+        let queue = self.open(db)?;
+        let now = self.generators.clock.now();
+        Ok(serde_json::to_value(statistics::stats(
+            &queue,
+            &SystemProcesses,
+            now,
+            query,
+        )?)?)
+    }
+
+    /// `rebind`: bind the queue at `db` to the repository containing `repo`
+    /// (see [`rebinding::rebind`]).
+    pub fn rebind(&self, db: &Path, repo: &Path) -> Result<Value> {
+        let db = db
+            .canonicalize()
+            .context("queue must already be initialized")?;
+        let mut queue = self.open(&db)?;
+        let repository = GitRepository::inspect(repo)?;
+        let common_dir = path_text(&repository.common_dir)?;
+        let location = QueueLocation::explicit(&db);
+        let repository_queue_dir = data_home()
+            .ok()
+            .map(|home| QueueLocation::for_repository(&repository.common_dir, &home).queue_dir);
+        rebinding::rebind(
+            Rebind {
+                queue: &mut queue,
+                repository: &repository,
+                files: &LocalRunFiles,
+                processes: &SystemProcesses,
+                clock: &*self.generators.clock,
+            },
+            RebindTarget {
+                repository_file: location.queue_dir.join(REPOSITORY_FILE_NAME),
+                db,
+                common_dir,
+                queue_dir: location.queue_dir,
+                log_dir: location.log_dir,
+                repository_queue_dir,
+            },
+        )
+    }
+
+    /// `up`: see [`lifecycle::up`]. `repo` is any checkout of the repository.
+    #[allow(clippy::too_many_arguments)]
+    pub fn up(
+        &self,
+        location: &QueueLocation,
+        repo: &Path,
+        cmux: &dyn WorkspaceBackend,
+        launchd: &dyn LaunchAgent,
+        processes: &dyn ProcessControl,
+        environment: &UpEnvironment,
+        options: &UpOptions,
+    ) -> Result<Value> {
+        let claude = ClaudeCode {
+            executable: options.claude.clone(),
+        };
+        let queues = |db: &Path| self.queues(db);
+        lifecycle::up(
+            &self.lifecycle_ports(cmux, launchd, processes, &queues),
+            &claude,
+            &queue_paths(location),
+            repo,
+            environment,
+            options,
+        )
+    }
+
+    /// `down`: see [`lifecycle::down`].
+    pub fn down(
+        &self,
+        location: &QueueLocation,
+        cmux: &dyn WorkspaceBackend,
+        launchd: &dyn LaunchAgent,
+        processes: &dyn ProcessControl,
+        options: &DownOptions,
+    ) -> Result<Value> {
+        let queues = |db: &Path| self.queues(db);
+        lifecycle::down(
+            &self.lifecycle_ports(cmux, launchd, processes, &queues),
+            &queue_paths(location),
+            options,
+        )
+    }
+
+    /// The queue at a path, as `up` and `down` open it, writing through
+    /// these generators.
+    fn queues(&self, db: &Path) -> Arc<dyn QueueOpener> {
+        Arc::new(SqliteOpener {
+            db: db.to_path_buf(),
+            generators: self.generators.clone(),
+        })
+    }
+
+    /// The adapters `up` and `down` run on: the queue at a path through
+    /// `SqliteQueue` with these generators, Git for the repository, the
+    /// local files and Claude Code's global config for the folder trust.
+    fn lifecycle_ports<'a>(
+        &'a self,
+        cmux: &'a dyn WorkspaceBackend,
+        launchd: &'a dyn LaunchAgent,
+        processes: &'a dyn ProcessControl,
+        queues: &'a dyn Fn(&Path) -> Arc<dyn QueueOpener>,
+    ) -> LifecyclePorts<'a> {
+        LifecyclePorts {
+            cmux,
+            launchd,
+            processes,
+            files: &LocalRunFiles,
+            clock: &*self.generators.clock,
+            queues,
+            inspect_repository: &inspect_repository,
+            trusts_repository: &claude_trusts_repository,
+            load_average,
+        }
+    }
+}
+
+/// `integrate` on the system clock and IDs: see [`OneShot::integrate`].
 pub fn integrate(
     db: &Path,
     target: IntegrateTarget,
     repo: &Path,
     remote: Option<&dyn MainRemote>,
 ) -> Result<Value> {
-    let db = db
-        .canonicalize()
-        .context("queue must already be initialized")?;
-    let mut queue = SqliteQueue::open(&db)?;
-    let repository = GitRepository::inspect(repo)?;
-    let common_dir = path_text(&repository.common_dir)?;
-    let generators = queue.generators().clone();
-    let verifier = ShellVerifier {
-        checkout: main_checkout(&repository),
-        db: db.clone(),
-    };
-    let mut integration = Integration {
-        queue: &mut queue,
-        repository: &repository,
-        verifier: &verifier,
-        remote,
-        files: &LocalRunFiles,
-        common_dir: &common_dir,
-        clock: &*generators.clock,
-        ids: &*generators.ids,
-        processes: &SystemProcesses,
-        pid: std::process::id(),
-    };
-    let Some(begun) = integration::begin(&mut integration, target, repo)? else {
-        return Ok(serde_json::to_value(IntegrationOutcome::NoRunAwaiting)?);
-    };
-    let heartbeat = Heartbeat::start(
-        Arc::new(SqliteOpener {
-            db: db.clone(),
-            generators: generators.clone(),
-        }),
-        begun.token.clone(),
-    );
-    let outcome = integration::land_integrating(
-        &mut integration,
-        &begun.run,
-        begun.previous,
-        &begun.main,
-        &begun.token,
-    )?;
-    drop(heartbeat); // Stops the lease heartbeat before this process reports.
-    Ok(serde_json::to_value(outcome)?)
+    OneShot::system().integrate(db, target, repo, remote)
 }
 
 /// `status`: see [`status_for`], with all of the attention.
@@ -278,26 +467,19 @@ pub fn status(db: &Path) -> Result<Value> {
     status_for(db, None)
 }
 
-/// `status --role`: see [`health::status`], measured to the queue
-/// clock's now.
+/// `status --role` on the system clock: see [`OneShot::status_for`].
 pub fn status_for(db: &Path, role: Option<SessionRole>) -> Result<Value> {
-    let queue = SqliteQueue::open(db)?;
-    let clock = queue.generators().clock.clone();
-    health::status(&queue, &SystemProcesses, &*clock, role)
+    OneShot::system().status_for(db, role)
 }
 
-/// `doctor`: see [`health::doctor`].
+/// `doctor` on the system clock: see [`OneShot::doctor`].
 pub fn doctor(db: &Path, full: bool) -> Result<Value> {
-    let queue = SqliteQueue::open(db)?;
-    let clock = queue.generators().clock.clone();
-    health::doctor(&queue, &SystemProcesses, &LocalRunFiles, &*clock, full)
+    OneShot::system().doctor(db, full)
 }
 
-/// `recover`: see [`health::recover`].
+/// `recover` on the system clock: see [`OneShot::recover`].
 pub fn recover(db: &Path, id: &RunId) -> Result<Value> {
-    let mut queue = SqliteQueue::open(db)?;
-    let clock = queue.generators().clock.clone();
-    health::recover(&mut queue, &SystemProcesses, &LocalRunFiles, &*clock, id)
+    OneShot::system().recover(db, id)
 }
 
 /// `ask`: register an ask and, when it is new, tell a person with one
@@ -318,37 +500,6 @@ fn queue_paths(location: &QueueLocation) -> QueuePaths {
     }
 }
 
-/// The adapters `up` and `down` run on: the queue at a path through
-/// `SqliteQueue` with the system clock and IDs, Git for the repository,
-/// the local files and Claude Code's global config for the folder trust.
-fn lifecycle_ports<'a>(
-    cmux: &'a dyn WorkspaceBackend,
-    launchd: &'a dyn LaunchAgent,
-    processes: &'a dyn ProcessControl,
-    clock: &'a dyn crate::application::Clock,
-    queues: &'a dyn Fn(&Path) -> Arc<dyn QueueOpener>,
-    inspect_repository: &'a dyn Fn(&Path) -> Result<RepositoryPaths>,
-) -> LifecyclePorts<'a> {
-    LifecyclePorts {
-        cmux,
-        launchd,
-        processes,
-        files: &LocalRunFiles,
-        clock,
-        queues,
-        inspect_repository,
-        trusts_repository: &claude_trusts_repository,
-        load_average,
-    }
-}
-
-fn open_queues(db: &Path) -> Arc<dyn QueueOpener> {
-    Arc::new(SqliteOpener {
-        db: db.to_path_buf(),
-        generators: clock::system(),
-    })
-}
-
 fn inspect_repository(repo: &Path) -> Result<RepositoryPaths> {
     let repository = GitRepository::inspect(repo)?;
     Ok(RepositoryPaths {
@@ -357,7 +508,7 @@ fn inspect_repository(repo: &Path) -> Result<RepositoryPaths> {
     })
 }
 
-/// `up`: see [`lifecycle::up`]. `repo` is any checkout of the repository.
+/// `up` on the system clock: see [`OneShot::up`].
 pub fn up(
     location: &QueueLocation,
     repo: &Path,
@@ -367,28 +518,18 @@ pub fn up(
     environment: &UpEnvironment,
     options: &UpOptions,
 ) -> Result<Value> {
-    let claude = ClaudeCode {
-        executable: options.claude.clone(),
-    };
-    let generators = clock::system();
-    lifecycle::up(
-        &lifecycle_ports(
-            cmux,
-            launchd,
-            processes,
-            &*generators.clock,
-            &open_queues,
-            &inspect_repository,
-        ),
-        &claude,
-        &queue_paths(location),
+    OneShot::system().up(
+        location,
         repo,
+        cmux,
+        launchd,
+        processes,
         environment,
         options,
     )
 }
 
-/// `down`: see [`lifecycle::down`].
+/// `down` on the system clock: see [`OneShot::down`].
 pub fn down(
     location: &QueueLocation,
     cmux: &dyn WorkspaceBackend,
@@ -396,19 +537,7 @@ pub fn down(
     processes: &dyn ProcessControl,
     options: &DownOptions,
 ) -> Result<Value> {
-    let generators = clock::system();
-    lifecycle::down(
-        &lifecycle_ports(
-            cmux,
-            launchd,
-            processes,
-            &*generators.clock,
-            &open_queues,
-            &inspect_repository,
-        ),
-        &queue_paths(location),
-        options,
-    )
+    OneShot::system().down(location, cmux, launchd, processes, options)
 }
 
 /// The main worktree of the repository: the parent of a `.git` common
@@ -506,47 +635,12 @@ pub fn review(db: &Path, task_id: TaskId) -> Result<Value> {
     )
 }
 
-/// `rebind`: bind the queue at `db` to the repository containing `repo`
-/// (see [`rebinding::rebind`]).
+/// `rebind` on the system clock: see [`OneShot::rebind`].
 pub fn rebind(db: &Path, repo: &Path) -> Result<Value> {
-    let db = db
-        .canonicalize()
-        .context("queue must already be initialized")?;
-    let mut queue = SqliteQueue::open(&db)?;
-    let repository = GitRepository::inspect(repo)?;
-    let common_dir = path_text(&repository.common_dir)?;
-    let location = QueueLocation::explicit(&db);
-    let repository_queue_dir = data_home()
-        .ok()
-        .map(|home| QueueLocation::for_repository(&repository.common_dir, &home).queue_dir);
-    let clock = queue.generators().clock.clone();
-    rebinding::rebind(
-        Rebind {
-            queue: &mut queue,
-            repository: &repository,
-            files: &LocalRunFiles,
-            processes: &SystemProcesses,
-            clock: &*clock,
-        },
-        RebindTarget {
-            repository_file: location.queue_dir.join(REPOSITORY_FILE_NAME),
-            db,
-            common_dir,
-            queue_dir: location.queue_dir,
-            log_dir: location.log_dir,
-            repository_queue_dir,
-        },
-    )
+    OneShot::system().rebind(db, repo)
 }
 
-/// `stats`: see [`statistics::stats`], measured to the queue clock's now.
+/// `stats` on the system clock: see [`OneShot::stats`].
 pub fn stats(db: &Path, query: &StatsQuery) -> Result<Value> {
-    let queue = SqliteQueue::open(db)?;
-    let now = queue.generators().clock.now();
-    Ok(serde_json::to_value(statistics::stats(
-        &queue,
-        &SystemProcesses,
-        now,
-        query,
-    )?)?)
+    OneShot::system().stats(db, query)
 }

@@ -4,8 +4,8 @@ type: design
 title: Supervisor and workspace lifecycle
 status: current
 created: 2026-09-21
-updated: 2026-09-24
-last_verified: 2026-09-24
+updated: 2026-09-25
+last_verified: 2026-09-25
 scope: runtime
 related:
   - adr-0002
@@ -81,7 +81,7 @@ failed / interrupted run (a dead run nobody leases is recovered to interrupted f
 
 上の状態機械の遷移（どのstatusからどのstatusへ移れるか、`last_error`に何を書くか）はdomainの`TaskRun`のコマンド（`src/domain/run.rs`、一覧は[domain-model](domain-model.md#集約-taskrun)）が決める。`runtime_store.rs`の各操作（`plan_run`、`register_agent`、`finish_supervision`、`finish_validation`、`workspace_closed`、`begin_integration`、`finish_integration`、`recover_run`など）はrunを読んでそのコマンドに渡し、結果を保存するだけで、SQLの`status`と`supervisor_token`の条件は並行の変更の検出として残る（[persistence](persistence.md#集約の読み書き)）。各操作のエラー文と記録するイベントは変わらない。
 
-現在時刻とIDは使う場所で作らず、applicationの`Clock`（UNIX秒の`now()`と、`created_at` / `updated_at`の書式`%Y-%m-%dT%H:%M:%fZ`の`timestamp()`）と`IdGenerator`（UUID文字列）から得る（[ADR-0013](../adr/0013-layered-architecture-and-type-function-style.md)の方針7）。実装はinfrastructureの`SystemClock`と`UuidGenerator`（`src/infrastructure/clock.rs`）で、2つの組`Generators`を`SuperviseOptions.generators`が持つ（既定は`infrastructure::clock::system()`）。`supervise`はそこからsupervisorのtokenを作り、自分のqueue（`SqliteQueue::with_generators`）、heartbeat thread、検証と着地のthreadが開くqueueに同じ組を渡す（JSON Linesのlogの`timestamp`はsubscriberが壁時計から付ける）。したがってrunのID、leaseとheartbeatの時刻、staleの判定、`workspace_closed_at`は1つの`Clock`から読まれ、テストは固定時刻・固定IDを注入できる（`tests/runtime.rs`のleaseのstale判定とclaimのrun ID）。`integrate`のtoken、`status` / `doctor` / `recover` / `stats`の基準時刻、`up`のsupervisorの鮮度は、それぞれが開いたqueueの`Generators`（`open`の既定はsystem）から読む。1つの操作は基準時刻を1回読んで使い回す（`status`・`doctor`・`recover`の各run、claimのrunとlease、`heartbeat`の登録とlease）。タイムアウトの計測（`Instant::now`）は業務上の時刻ではないので`Clock`を通さない。receiptやidle markerのmtimeと比べる時刻（resumeの開始、revise / conflictの依頼や解消の依頼を送った時刻）は、ファイルに時刻を付ける実時計と揃える必要があるので、注入した`Clock`ではなく`SystemClock`から直接読む。wrapperの`run_processes.heartbeat_at`は別プロセス（`session`）が自分のqueueのsystemの`Clock`で書くので、supervisorの`Clock`を固定したテストでは、wrapperの鮮度の判定が実時刻とずれる。
+現在時刻とIDは使う場所で作らず、applicationの`Clock`（UNIX秒の`now()`と、`created_at` / `updated_at`の書式`%Y-%m-%dT%H:%M:%fZ`の`timestamp()`）と`IdGenerator`（UUID文字列）から得る（[ADR-0013](../adr/0013-layered-architecture-and-type-function-style.md)の方針7）。実装はinfrastructureの`SystemClock`と`UuidGenerator`（`src/infrastructure/clock.rs`）で、2つの組`Generators`を`SuperviseOptions.generators`が持つ（既定は`infrastructure::clock::system()`）。`supervise`はそこからsupervisorのtokenを作り、自分のqueue（`SqliteQueue::with_generators`）、heartbeat thread、検証と着地のthreadが開くqueueに同じ組を渡す（JSON Linesのlogの`timestamp`はsubscriberが壁時計から付ける）。したがってrunのID、leaseとheartbeatの時刻、staleの判定、`workspace_closed_at`は1つの`Clock`から読まれ、テストは固定時刻・固定IDを注入できる（`tests/runtime.rs`のleaseのstale判定とclaimのrun ID）。`integrate`のtoken、`status` / `doctor` / `recover` / `stats` / `rebind`の基準時刻、`up` / `down`のsupervisorの鮮度は、`main`が1回組み立てて`compose::OneShot`に渡した`Generators`から読み、それぞれが開くqueueにも`with_generators`で同じ組を渡す（queueの既定には頼らない）。テストは`OneShot::new`に固定時刻・固定IDを渡す（`tests/runtime.rs`の`integrate_takes_its_time_and_token_from_the_injected_generators`と`status_and_doctor_measure_to_the_injected_clock`）。1つの操作は基準時刻を1回読んで使い回す（`status`・`doctor`・`recover`の各run、claimのrunとlease、`heartbeat`の登録とlease）。タイムアウトの計測（`Instant::now`）は業務上の時刻ではないので`Clock`を通さない。receiptやidle markerのmtimeと比べる時刻（resumeの開始、revise / conflictの依頼や解消の依頼を送った時刻）は、ファイルに時刻を付ける実時計と揃える必要があるので、注入した`Clock`ではなく`SystemClock`から直接読む。wrapperの`run_processes.heartbeat_at`は別プロセス（`session`）が自分のqueueのsystemの`Clock`で書くので、supervisorの`Clock`を固定したテストでは、wrapperの鮮度の判定が実時刻とずれる。
 
 ## Roles
 
@@ -452,7 +452,7 @@ supervisorの再起動ではrunごとのleaseとheartbeatを確認し、孤児�
 
 ### `status`
 
-ユースケースはapplication層の`src/application/health.rs`の`status`（`doctor`・`recover`と、`status`と`watch`が使うattentionの導出`attention`も同じファイル）で、queueは`Queue`（`latest_event_id`・`latest_runs_in_progress`・`runs_with_pending_push`・`asks`を含む）、PIDの生死は`ProcessControl`、時刻は`Clock`から得る。入口は`compose::status_for`。
+ユースケースはapplication層の`src/application/health.rs`の`status`（`doctor`・`recover`と、`status`と`watch`が使うattentionの導出`attention`も同じファイル）で、queueは`Queue`（`latest_event_id`・`latest_runs_in_progress`・`runs_with_pending_push`・`asks`を含む）、PIDの生死は`ProcessControl`、時刻は`Clock`から得る。入口は`compose::OneShot::status_for`（自由関数の`compose::status_for`はsystemの`Generators`で呼ぶ）。
 
 `dagq status`はrunのprocessを調べずに登録とleaseだけを返す。引き継がれたrunは引き継いだsupervisorのtokenのleaseを持つので、他のrunと同じくそのsupervisorの`run_ids`に並ぶ。`supervisors`は`supervisors`表の登録を`started_at`順に、続けて登録のないtokenのlease保持者（着地中の`integrate`プロセス、または登録表以前のsupervisor）をlease順に並べ、leaseはtokenで登録に結び付ける。各項目は`pid`、`alive`（`kill -0`）、`registered`、`mode`と`workspace_id`、`binary_version`（そのプロセスが動いているdagqのversion。登録がなければnull、列より古いbinaryの登録もnull。[ADR-0014](../adr/0014-up-replaces-a-supervisor-of-another-binary-version.md)）、`parallel`と`started_at`（登録がなければnull）、`heartbeat_at`、`heartbeat_age_secs`、`stale`（PIDが死んでいるかheartbeatが30秒より古い）、`run_ids`（そのtokenのlease）。runを持たない常駐supervisorは`run_ids: []`で並ぶ。`runs`は未完了run（`claimed`/`starting`/`running`/`validating`/`integrating`）ごとに`run_id`、`task_id`、`status`、`workspace_id`、`worktree_path`（queueの今の`runs/`から解決したpath。[ADR-0017](../adr/0017-resolve-run-paths-from-the-queue-directory.md)）、`lease`（なければnull。`pid`でどのsupervisorが持つかが分かる）。`awaiting_integration`と`needs_session`はプロセスを持たないので並ばない。
 
@@ -487,7 +487,7 @@ attentionイベントの判定は`domain::event_attention(kind, payload)`（候�
 
 ### `stats`
 
-`dagq stats [--since <event id>] [--goal ID] [--full]`は、run_eventsから時間と閾値超えを導出して返す読むだけのコマンド（[ADR-0023](../adr/0023-verify-once-review-in-supervisor-run-env-graph-and-stats.md)の決定5）。新しい表は持たず、集計は`domain::stats::stats`（events、task→goalの対応、今の時刻、supervisorの空きslotのsnapshotを受ける純粋関数）が行い、application層の`application::stats::stats`が`Queue`（`RunStore`の`all_events`・`task_goals`・`supervisors`・`active_runs`と`TaskStore`の`list`・`list_goals`・`candidates`）とsupervisorの生死を見る`ProcessControl`越しに読んで渡すだけ。`src/compose.rs`の`stats(db, query)`がqueueを開き、そのqueueの`Clock`で今の時刻を1回読んで呼ぶ入口で、`runtime::stats`として再公開する（observerも同じ入口を呼ぶ）。
+`dagq stats [--since <event id>] [--goal ID] [--full]`は、run_eventsから時間と閾値超えを導出して返す読むだけのコマンド（[ADR-0023](../adr/0023-verify-once-review-in-supervisor-run-env-graph-and-stats.md)の決定5）。新しい表は持たず、集計は`domain::stats::stats`（events、task→goalの対応、今の時刻、supervisorの空きslotのsnapshotを受ける純粋関数）が行い、application層の`application::stats::stats`が`Queue`（`RunStore`の`all_events`・`task_goals`・`supervisors`・`active_runs`と`TaskStore`の`list`・`list_goals`・`candidates`）とsupervisorの生死を見る`ProcessControl`越しに読んで渡すだけ。`src/compose.rs`の`OneShot::stats(db, query)`がqueueを開き、注入された`Clock`で今の時刻を1回読んで呼ぶ入口で、systemの`Generators`で呼ぶ自由関数`stats`を`runtime::stats`として再公開する（observerは自分のqueueの`Generators`で作った`OneShot`から呼ぶ）。
 
 - **対象のrun**: 終わったrun。終わりのイベントは`run_integrated`か、payloadの`status`が`failed` / `interrupted`になった最初のイベントで、そのidが`finished_event_id`。既定は終わった順の直近50件、`--full`で全件。`--since`はそのidがcursorより大きいrunだけにし、50件を超えるときは古い方から50件を返して`next_cursor`をその最後の`finished_event_id`にする（続きは同じ`--since next_cursor`で読める）。それ以外の`next_cursor`は読んだ時点のrun_eventsの最新id（`status`の`cursor`と同じ値）。`--goal`はそのgoalのtaskのrunだけに絞る（alertsも同じ）。
 - **`runs`**: runごとに`run_id`、`task_id`、`goal_id`、`status`（`integrated` / `failed` / `interrupted`）、`finished_event_id`と、秒の区間と回数。区間は端のイベントが無ければnull。
@@ -537,6 +537,6 @@ cmux workspaceの存在は確認しない（cmuxなしで動く）。IDを見て
 2. **付け替え**: `rebind_repository`が1トランザクションで旧値を読み、新しいcommon directoryをupsertする。旧値と同じなら`outcome: unchanged`。
 3. **記録**: 変わったときだけ`<queue dir>/logs/rebind.jsonl`に1行追記し、`<queue dir>/repository`があれば新しいpathに書き換える。`run_events`には書かない。
 4. **worktreeのrepair**: runのうちworktree（queueの今の`runs/`から解決したpath）が残っているものに、新しいrepositoryの主working treeで`git worktree repair <worktree>`を実行する。main working treeの移動で壊れた`.git`ファイルが直る。失敗は`worktrees[].error`に出すだけで`rebind`は成功する。
-ユースケースはapplication層の`src/application/rebind.rs`の`rebind(Rebind, RebindTarget)`で、queueは`RunStore`（`rebind_repository`・`all_runs`を含む）、worktreeのrepairは`Repository`、`rebind.jsonl`の追記・`repository`ファイルの書き換え・worktreeの有無・`move_to`の比較のためのcanonicalな解決は`RunFiles`、PIDの生死は`ProcessControl`、`at`は`Clock`越しに行う。queueのpath（`db`、`queue_dir`、`logs/`、`repository`ファイル）と新しいcommon directory、そこから解決されるqueueディレクトリは`RebindTarget`として値で受ける。`src/compose.rs`の`rebind(db, repo)`がqueueとrepositoryを開き、`QueueLocation`とdata homeからそれらを求めて呼ぶ入口で、`runtime::rebind`として再公開する。
+ユースケースはapplication層の`src/application/rebind.rs`の`rebind(Rebind, RebindTarget)`で、queueは`RunStore`（`rebind_repository`・`all_runs`を含む）、worktreeのrepairは`Repository`、`rebind.jsonl`の追記・`repository`ファイルの書き換え・worktreeの有無・`move_to`の比較のためのcanonicalな解決は`RunFiles`、PIDの生死は`ProcessControl`、`at`は`Clock`越しに行う。queueのpath（`db`、`queue_dir`、`logs/`、`repository`ファイル）と新しいcommon directory、そこから解決されるqueueディレクトリは`RebindTarget`として値で受ける。`src/compose.rs`の`OneShot::rebind(db, repo)`がqueueとrepositoryを開き、`QueueLocation`とdata homeからそれらを求めて呼ぶ入口で、`runtime::rebind`として再公開する。
 
 5. **出力**: `previous_git_common_dir`、`git_common_dir`、`db`、`queue_dir`、`repository_queue_dir`（新しいcommon directoryから解決されるqueueディレクトリ。data homeが決まらなければnull）、`move_to`（それが`queue_dir`と違うときだけ。data homeが決まらないときもnull。行き先が既にあるかは見ないので、手順で「存在しないこと」を求める）、`worktrees`。

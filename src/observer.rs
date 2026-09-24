@@ -86,7 +86,7 @@ pub fn observe(db: &Path, provider: &dyn AgentProvider, options: &ObserveOptions
         (None, ObserveMode::Hourly) => read_cursor(&db)?,
         (None, ObserveMode::Daily) => Some(queue.event_id_before(started - DAILY_WINDOW_SECS)?),
     };
-    let stats = crate::runtime::stats(
+    let stats = crate::compose::OneShot::new(queue.generators().clone()).stats(
         &db,
         &StatsQuery {
             since,

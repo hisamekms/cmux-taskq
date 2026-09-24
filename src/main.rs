@@ -590,6 +590,9 @@ fn execute(cli: Cli) -> Result<Value> {
     let location = QueueLocation::resolve(cli.db.as_deref(), &cwd)?;
     let db = location.db.clone();
     install_telemetry(&cli.command, &location);
+    // The clock and IDs of every queue and use case this command runs.
+    let generators = dagq::infrastructure::clock::system();
+    let one_shot = dagq::compose::OneShot::new(generators.clone());
     // The binding is checked on every command of a repository queue; a `--db`
     // queue is bound by its first `supervise` and checked there and by `integrate`.
     let common_dir = location
@@ -604,7 +607,7 @@ fn execute(cli: Cli) -> Result<Value> {
     }
     if matches!(cli.command, Command::Init) {
         location.prepare()?;
-        let mut queue = SqliteQueue::init(&db)?;
+        let mut queue = SqliteQueue::init(&db)?.with_generators(generators);
         if let Some(common_dir) = &common_dir {
             queue.bind_repository(common_dir)?;
         }
@@ -620,9 +623,9 @@ fn execute(cli: Cli) -> Result<Value> {
     let checkout = |repo: Option<PathBuf>| repo.unwrap_or_else(|| cwd.clone());
     // `rebind` is the one command that runs on a queue bound elsewhere.
     if let Command::Rebind { repo } = cli.command {
-        return dagq::compose::rebind(&db, &checkout(repo));
+        return one_shot.rebind(&db, &checkout(repo));
     }
-    let mut queue = SqliteQueue::open(&db)?;
+    let mut queue = SqliteQueue::open(&db)?.with_generators(generators.clone());
     if let Some(common_dir) = &common_dir {
         queue.assert_repository(common_dir)?;
     }
@@ -809,7 +812,7 @@ fn execute(cli: Cli) -> Result<Value> {
             queue.graph_input()?,
             goal_id.map(GoalId::new),
         ))?,
-        Command::Status { role: r } => dagq::compose::status_for(&db, parse_role(r)?)?,
+        Command::Status { role: r } => one_shot.status_for(&db, parse_role(r)?)?,
         Command::Ask {
             command: Some(AskCommand::Close { id }),
             ..
@@ -888,6 +891,7 @@ fn execute(cli: Cli) -> Result<Value> {
                     3600
                 })),
                 observe_daily,
+                generators,
                 ..SuperviseOptions::new(usize::from(parallel), once)
             };
             dagq::compose::supervise(
@@ -939,7 +943,7 @@ fn execute(cli: Cli) -> Result<Value> {
                 startup_timeout: Duration::from_secs(30),
                 poll: Duration::from_millis(500),
             };
-            dagq::compose::up(
+            one_shot.up(
                 &location,
                 &checkout(repo),
                 &Cmux {
@@ -960,7 +964,7 @@ fn execute(cli: Cli) -> Result<Value> {
             // cmux is only needed to close an in-cmux supervisor's
             // workspace, so a queue without one still goes down when cmux
             // is not installed; the unresolved name then fails only there.
-            dagq::compose::down(
+            one_shot.down(
                 &location,
                 &Cmux {
                     executable: executable(&cmux).unwrap_or(cmux),
@@ -993,7 +997,7 @@ fn execute(cli: Cli) -> Result<Value> {
             } else {
                 Some(GitRepository::inspect(&repo)?)
             };
-            dagq::compose::integrate(
+            one_shot.integrate(
                 &db,
                 target,
                 &repo,
@@ -1007,7 +1011,7 @@ fn execute(cli: Cli) -> Result<Value> {
             since,
             goal_id,
             full,
-        } => dagq::compose::stats(
+        } => one_shot.stats(
             &db,
             &dagq::domain::stats::StatsQuery {
                 since,
@@ -1046,8 +1050,8 @@ fn execute(cli: Cli) -> Result<Value> {
                 },
             )?
         }
-        Command::Doctor { full } => dagq::compose::doctor(&db, full)?,
-        Command::Recover { run } => dagq::compose::recover(&db, &RunId::new(run)?)?,
+        Command::Doctor { full } => one_shot.doctor(&db, full)?,
+        Command::Recover { run } => one_shot.recover(&db, &RunId::new(run)?)?,
         Command::Session {
             run,
             lease,

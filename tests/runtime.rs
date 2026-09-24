@@ -11154,3 +11154,98 @@ fn a_refused_run_transition_keeps_the_domain_reason_beside_the_old_error() {
     );
     assert!(!run_dir.exists());
 }
+
+/// `integrate` reads its time and its token from the generators `main`
+/// hands it, not from the queue's own clock and UUIDs: a lease heartbeat
+/// fresh to the injected clock holds the run, a stale one lets it through,
+/// and only the injected token takes over a lease stored under it.
+#[test]
+fn integrate_takes_its_time_and_token_from_the_injected_generators() {
+    let (_dir, db, detail) = run_agent(
+        "git rm -q seed.txt && git commit -q -m 'drop seed'; receipt \"$(git rev-parse HEAD)\"",
+    );
+    let run = detail.runs[0].clone();
+    assert_eq!(run.status(), RunStatus::AwaitingIntegration);
+    let repo = Path::new(&db).parent().unwrap().join("repo's directory");
+    Connection::open(&db)
+        .unwrap()
+        .execute(
+            "INSERT INTO run_leases(run_id,token,pid,heartbeat_at) VALUES (?1,'held',?2,1000)",
+            rusqlite::params![run.id(), std::process::id()],
+        )
+        .unwrap();
+    let clock = ManualClock::at(1_005);
+    let one_shot = |ids: Vec<&'static str>| {
+        runtime::OneShot::new(Generators {
+            clock: Arc::new(clock.clone()),
+            ids: Arc::new(FixedIds(Mutex::new(ids))),
+        })
+    };
+    let target = || IntegrateTarget::Task(TaskId::new(1));
+
+    // Five seconds after the heartbeat by the injected clock: still held.
+    let held = one_shot(vec![])
+        .integrate(&db, target(), &repo, None)
+        .unwrap_err();
+    assert!(
+        format!("{held:#}").contains("is held by the supervisor"),
+        "{held:#}"
+    );
+
+    // Long after it the lease is stale, but a lease is only taken over
+    // under its own token.
+    clock.set(1_000 + 10 * dagq::domain::HEARTBEAT_TIMEOUT_SECS);
+    let leased = one_shot(vec!["other"])
+        .integrate(&db, target(), &repo, None)
+        .unwrap_err();
+    assert!(
+        format!("{leased:#}").contains("run is still leased"),
+        "{leased:#}"
+    );
+    let outcome = one_shot(vec!["held"])
+        .integrate(&db, target(), &repo, None)
+        .unwrap();
+    assert_eq!(outcome["outcome"], "needs_session", "{outcome}");
+    let started: i64 = Connection::open(&db)
+        .unwrap()
+        .query_row(
+            "SELECT count(*) FROM run_events WHERE run_id=?1 AND kind='integration_started'",
+            [run.id()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(started, 1);
+}
+
+/// `status` and `doctor` measure everything to the injected clock's now,
+/// read once per call.
+#[test]
+fn status_and_doctor_measure_to_the_injected_clock() {
+    let (_dir, _repo, db) = fixture();
+    let mut queue = SqliteQueue::open(&db).unwrap();
+    let ask = queue
+        .ask(NewAsk {
+            kind: AskKind::Blocked,
+            task_id: Some(TaskId::new(1)),
+            run_id: None,
+            question: "which way?".into(),
+            options: vec![],
+            asked_by: "planner".into(),
+        })
+        .unwrap()
+        .ask;
+    Connection::open(&db)
+        .unwrap()
+        .execute("UPDATE asks SET created_at=1000", [])
+        .unwrap();
+    let one_shot = runtime::OneShot::new(Generators {
+        clock: Arc::new(ManualClock::at(1_042)),
+        ids: Arc::new(FixedIds(Mutex::new(vec![]))),
+    });
+    let status = one_shot.status_for(&db, None).unwrap();
+    assert_eq!(status["checked_at"], 1_042, "{status}");
+    assert_eq!(status["asks"][0]["id"], ask.id, "{status}");
+    assert_eq!(status["asks"][0]["age_secs"], 42, "{status}");
+    let doctor = one_shot.doctor(&db, false).unwrap();
+    assert_eq!(doctor["checked_at"], 1_042, "{doctor}");
+}

@@ -15,9 +15,9 @@ pub use crate::application::{
     supervise::RunError,
 };
 pub use crate::compose::{
-    SuperviseOptions, ask, doctor, integrate, rebind, recover, resume_session_with_provider,
-    review, session, session_with_provider, stats, status, status_for, supervise,
-    supervise_with_reviewer, triage_prompt,
+    OneShot, SuperviseOptions, ask, doctor, integrate, rebind, recover,
+    resume_session_with_provider, review, session, session_with_provider, stats, status,
+    status_for, supervise, supervise_with_reviewer, triage_prompt,
 };
 pub use crate::infrastructure::claude::{PromptKind, detect_prompt};
 
