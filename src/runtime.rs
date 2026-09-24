@@ -3400,7 +3400,7 @@ impl ResumeWatch {
                 // never ends by itself; or no idle at all within the
                 // resume timeout (a lost request, a dialog, background
                 // work that does not end).
-                let verdict = self.verdict(run, Some(head.as_str()).filter(|_| clean));
+                let verdict = self.verdict(run, clean.then_some(head.as_str()));
                 let idle_after_receipt = match (&idle, &verdict) {
                     (Some(idle), ResumeOutcome::Resolved | ResumeOutcome::Failed(_)) => {
                         idle.idle_after_receipt(&self.receipt_path)?.is_some()

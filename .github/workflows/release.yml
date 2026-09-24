@@ -35,9 +35,10 @@ jobs:
       - name: Install the Rust toolchain
         run: |
           set -euo pipefail
-          rustup update stable --no-self-update
-          rustup default stable
-          rustup target add "$TARGET"
+          # rust-toolchain.toml pins the channel and the target.
+          rustup toolchain install --no-self-update
+          rustup show active-toolchain
+          rustup target list --installed | grep -qx "$TARGET"
           cargo --version
 
       - name: Build the release binary

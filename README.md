@@ -324,7 +324,7 @@ Claude picks the skill from the request ("queue a task to …", "start the runti
 
 ## Development
 
-Building from source is for working on dagq itself; to use it, install the released binary ([Getting started](#getting-started)). Requires Rust 1.93 or newer and a C compiler for bundled SQLite; no separate SQLite installation is needed.
+Building from source is for working on dagq itself; to use it, install the released binary ([Getting started](#getting-started)). Requires Rust 1.93 (`rust-toolchain.toml` pins 1.93.0 with rustfmt, clippy and llvm-tools-preview; rustup installs it on the first `cargo` run) and a C compiler for bundled SQLite; no separate SQLite installation is needed.
 
 ```sh
 cargo build --locked   # target/debug/dagq

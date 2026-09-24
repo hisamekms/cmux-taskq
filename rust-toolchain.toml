@@ -1,0 +1,7 @@
+# The toolchain for local builds, CI and the release build. Raising it is a
+# separate decision; keep it in step with rust-version in Cargo.toml.
+[toolchain]
+channel = "1.93.0"
+components = ["rustfmt", "clippy", "llvm-tools-preview"]
+targets = ["aarch64-apple-darwin"]
+profile = "minimal"

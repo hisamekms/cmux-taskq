@@ -22,10 +22,13 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install Rust
-        # Cargo.toml sets rust-version = "1.93"; stable is at or above it.
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy, llvm-tools-preview
+        # rust-toolchain.toml pins the channel, components and target; rustup
+        # installs exactly that toolchain here (the same one local builds use).
+        run: |
+          set -euo pipefail
+          rustup toolchain install --no-self-update
+          rustup show active-toolchain
+          cargo --version
 
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
