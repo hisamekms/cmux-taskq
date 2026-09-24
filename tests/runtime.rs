@@ -9160,3 +9160,220 @@ fn background_work_that_never_ends_is_waited_for_up_to_the_resume_timeout() {
     let kinds = event_kinds(&detail);
     assert!(position(&kinds, "session_idle_observed") < position(&kinds, "exit_requested"));
 }
+
+/// A reviewer script that moves main in the main checkout with a change to
+/// `change.txt` that conflicts with the run's, then passes the run.
+fn moving_main_then_pass() -> String {
+    format!(
+        "cd \"$(git rev-parse --path-format=absolute --git-common-dir)/..\" && \
+         printf 'main moved by %s\\n' $$ > change.txt && git add change.txt && \
+         git commit -q -m 'main moves' && {}",
+        verdict("pass", &[], "meets the acceptance")
+    )
+}
+
+/// The worker goes idle after its receipt and never exits by itself; each
+/// time a conflict request arrives in its terminal it rebases onto the main
+/// the request names, resolves `change.txt`, rewrites the receipt and goes
+/// idle again, `requests` times.
+fn rebasing_agent(requests: usize) -> String {
+    format!(
+        "commit work; receipt \"$(git rev-parse HEAD)\"; idle; {RESUME_PRELUDE}\n\
+         for n in $(seq 1 {requests}); do \
+           await_message; rm \"$MESSAGE\"; resolve || exit 1; \
+           receipt \"$(git rev-parse HEAD)\"; idle; \
+         done; await_exit"
+    )
+}
+
+/// A passed run whose head conflicts with the main that moved during its
+/// review is not asked to exit (ADR-0027 decision 4): `git merge-tree` finds
+/// the conflict without touching the worktree, `conflict_precheck` is
+/// recorded, and the live session gets the resume's resolution request. It
+/// rebases and rewrites its receipt; the run is validated and reviewed
+/// again, the second precheck finds no conflict, and the run lands without
+/// a `needs_session` or a resume.
+#[test]
+fn a_passed_run_that_conflicts_with_main_is_rebased_by_its_live_session_and_lands() {
+    let (_dir, repo, db) = fixture();
+    let seed = git_out(&repo, &["rev-parse", "main"]);
+    let backend = TestWorkspace::new(&db, false, &rebasing_agent(1));
+    let reviewer = TestReviewer::new(&[
+        moving_main_then_pass(),
+        verdict("pass", &[], "still meets it"),
+    ]);
+    let outcome = supervise_reviewed(&db, &repo, &backend, &reviewer);
+    assert_eq!(outcome["errors"], json!([]), "{outcome}");
+    assert_eq!(outcome["runs"][0]["status"], "integrated", "{outcome}");
+    let mut queue = SqliteQueue::open(&db).unwrap();
+    let detail = queue.show(1).unwrap();
+    assert_eq!(detail.task.status, TaskStatus::Completed);
+    let run = detail.runs[0].clone();
+    let moved = git_out(&repo, &["rev-parse", "main~1"]);
+    assert_eq!(git_out(&repo, &["rev-parse", "main~2"]), seed);
+    assert_landed(&repo, &run, "test task", &moved);
+    assert_eq!(
+        fs::read_to_string(repo.join("change.txt")).unwrap(),
+        "resolved by the resumed session\n"
+    );
+    let validated: Vec<&Value> = payloads(&detail, "validation_finished");
+    assert_eq!(validated.len(), 2);
+    let source = validated[0]["receipt"]["commit"].as_str().unwrap();
+    let prechecks = payloads(&detail, "conflict_precheck");
+    assert_eq!(prechecks.len(), 1);
+    let precheck = prechecks[0];
+    assert_eq!(precheck["main"], json!(moved));
+    // The head that passed, untouched by the precheck.
+    assert_eq!(precheck["head"], json!(source));
+    assert_eq!(precheck["merge_base"], json!(seed));
+    assert_eq!(precheck["conflicts"], json!(["change.txt"]));
+    assert_eq!(precheck["attempt"], 1);
+    assert_eq!(precheck["requested"], true);
+    assert!(precheck["sent_at"].is_i64());
+    let resolved = payloads(&detail, "conflict_resolved");
+    let head = git_out(&repo, &["rev-parse", &format!("refs/dagq/runs/{}", run.id)]);
+    assert_eq!(resolved, [&json!({"attempt": 1, "head": head})]);
+    assert_eq!(
+        git_out(&repo, &["rev-parse", &format!("{head}~1")]),
+        moved,
+        "the session rebased onto the main the request named"
+    );
+    let verdicts: Vec<&Value> = payloads(&detail, "review_finished")
+        .iter()
+        .map(|p| &p["verdict"])
+        .collect();
+    assert_eq!(verdicts, [&json!("pass"), &json!("pass")]);
+    let kinds = event_kinds(&detail);
+    for (earlier, later) in [
+        ("review_finished", "conflict_precheck"),
+        ("conflict_precheck", "conflict_resolved"),
+        ("conflict_resolved", "exit_requested"),
+        ("exit_requested", "workspace_closed"),
+        ("workspace_closed", "integration_started"),
+    ] {
+        assert!(
+            position(&kinds, earlier) < position(&kinds, later),
+            "{earlier} before {later}: {kinds:?}"
+        );
+    }
+    for absent in ["resume_started", "integration_deferred", "revise_requested"] {
+        assert!(!kinds.contains(&absent), "{absent} in {kinds:?}");
+    }
+    assert_eq!(payloads(&detail, "integration_started").len(), 1);
+    assert_eq!(backend.exits_sent.load(Ordering::SeqCst), 1);
+    assert_eq!(backend.closed(), vec![WORKSPACE_ID.to_owned()]);
+    // The request is the resume's, for the live session.
+    let texts = backend.texts();
+    assert_eq!(texts.len(), 1);
+    assert_eq!(texts[0].0, WORKSPACE_ID);
+    let text = &texts[0].1;
+    for expected in [
+        format!(
+            "dagq: the supervisor's review of run {} (task 1) passed, but integrate would conflict with main, so the run was not landed.",
+            run.id
+        ),
+        format!(
+            "Reason: git merge-tree finds that main {moved} conflicts with the run in change.txt"
+        ),
+        format!("main is now {moved} (your base commit was {seed})."),
+        "Tasks landed on main since your base: none.".to_owned(),
+        format!("1. In this worktree run git rebase {moved} and resolve the conflicts."),
+        "[\"test -f seed.txt\"]".to_owned(),
+        "3. Keep the worktree clean.".to_owned(),
+        runtime::STOP_BACKGROUND.to_owned(),
+        format!(
+            "Rewrite the receipt at {} with the new head commit",
+            run.receipt_path.as_ref().unwrap()
+        ),
+        "Do not merge or push. When done, report briefly and stop; do not run /exit.".to_owned(),
+    ] {
+        assert!(text.contains(&expected), "{expected:?} not in {text}");
+    }
+    let run_dir = Path::new(run.run_dir.as_ref().unwrap());
+    assert_eq!(
+        &fs::read_to_string(run_dir.join("conflict-1.txt")).unwrap(),
+        text
+    );
+    assert!(queue.run_leases().unwrap().is_empty());
+    assert!(run_attention_of(&runtime::status(&db).unwrap(), &run.id).is_none());
+}
+
+/// A passed run that merges cleanly with main is not sent anything: no
+/// `conflict_precheck`, one `/exit`, and the landing, as before.
+#[test]
+fn a_passed_run_that_merges_cleanly_with_main_lands_without_a_request() {
+    let (_dir, repo, db) = fixture();
+    let backend = TestWorkspace::new(&db, false, IDLE_AGENT);
+    // Main moves during the review, but in another file.
+    let reviewer = TestReviewer::new(&[format!(
+        "cd \"$(git rev-parse --path-format=absolute --git-common-dir)/..\" && \
+         printf 'other\\n' > other.txt && git add other.txt && \
+         git commit -q -m 'main moves elsewhere' && {}",
+        verdict("pass", &[], "meets the acceptance")
+    )]);
+    let outcome = supervise_reviewed(&db, &repo, &backend, &reviewer);
+    assert_eq!(outcome["errors"], json!([]), "{outcome}");
+    assert_eq!(outcome["runs"][0]["status"], "integrated", "{outcome}");
+    let mut queue = SqliteQueue::open(&db).unwrap();
+    let detail = queue.show(1).unwrap();
+    let moved = git_out(&repo, &["rev-parse", "main~1"]);
+    assert_landed(&repo, &detail.runs[0], "test task", &moved);
+    assert!(repo.join("other.txt").is_file());
+    assert!(payloads(&detail, "conflict_precheck").is_empty());
+    assert!(backend.texts().is_empty());
+    assert_eq!(backend.exits_sent.load(Ordering::SeqCst), 1);
+    assert_eq!(reviewer.prompts().len(), 1);
+}
+
+/// Conflict requests and resumes share the run's `MAX_RESUME_ATTEMPTS`:
+/// when main keeps moving into the run, the precheck after the third
+/// request exits the session and opens an `approve_landing` ask instead of
+/// a fourth request.
+#[test]
+fn conflict_requests_past_the_limit_ask_a_person() {
+    let (_dir, repo, db) = fixture();
+    let backend = TestWorkspace::new(&db, false, &rebasing_agent(3));
+    let reviewer = TestReviewer::new(&[moving_main_then_pass()]);
+    let outcome = supervise_reviewed(&db, &repo, &backend, &reviewer);
+    assert_eq!(outcome["errors"], json!([]), "{outcome}");
+    assert_eq!(outcome["runs"][0]["status"], "awaiting_integration");
+    let mut queue = SqliteQueue::open(&db).unwrap();
+    let detail = queue.show(1).unwrap();
+    let run = detail.runs[0].clone();
+    let prechecks = payloads(&detail, "conflict_precheck");
+    let requested: Vec<&Value> = prechecks.iter().map(|p| &p["requested"]).collect();
+    assert_eq!(
+        requested,
+        [&json!(true), &json!(true), &json!(true), &json!(false)]
+    );
+    assert_eq!(prechecks[3]["attempt"], 4);
+    assert!(prechecks[3].get("sent_at").is_none());
+    assert!(
+        prechecks[3]["asked"]
+            .as_str()
+            .unwrap()
+            .ends_with("after 3 conflict requests and 0 resumes")
+    );
+    assert_eq!(payloads(&detail, "conflict_resolved").len(), 3);
+    assert_eq!(payloads(&detail, "review_finished").len(), 4);
+    assert_eq!(backend.texts().len(), 3);
+    assert_eq!(backend.exits_sent.load(Ordering::SeqCst), 1);
+    assert_eq!(backend.closed(), vec![WORKSPACE_ID.to_owned()]);
+    assert!(queue.run_leases().unwrap().is_empty());
+    let kinds = event_kinds(&detail);
+    assert!(position(&kinds, "workspace_closed") < position(&kinds, "ask_opened"));
+    assert!(!kinds.contains(&"integration_started"), "{kinds:?}");
+    let asks = queue.asks(Default::default()).unwrap();
+    assert_eq!(asks.len(), 1);
+    let ask = &asks[0];
+    assert_eq!(ask.kind, dagq::domain::AskKind::ApproveLanding);
+    assert_eq!(ask.run_id.as_deref(), Some(run.id.as_str()));
+    assert!(
+        ask.question.contains("returned pass (git merge-tree finds that main")
+            && ask
+                .question
+                .contains("conflicts with the run in change.txt, after 3 conflict requests and 0 resumes): meets the acceptance"),
+        "{}",
+        ask.question
+    );
+}

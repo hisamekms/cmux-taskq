@@ -1936,6 +1936,16 @@ mod attention_tests {
             ),
             ("revise_finished", json!({"attempt": 1, "head": "h"}), None),
             (
+                "conflict_precheck",
+                json!({"main": "m", "head": "h", "conflicts": ["f"], "requested": true}),
+                None,
+            ),
+            (
+                "conflict_resolved",
+                json!({"attempt": 1, "head": "h"}),
+                None,
+            ),
+            (
                 "landing_decided",
                 json!({"ask_id": 3, "answer": "cancel", "status": "failed"}),
                 None,

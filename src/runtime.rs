@@ -1190,16 +1190,21 @@ impl Supervisor<'_> {
                     return Ok(Step::Continue);
                 };
                 let session = watch.session.clone();
+                let label = watch.fix.label(watch.attempt);
                 match outcome {
                     ReviseOutcome::Rewritten(head) => {
+                        let kind = match watch.fix {
+                            Fix::Revise(_) => "revise_finished",
+                            Fix::Conflict(_) => "conflict_resolved",
+                        };
                         self.queue.record_runtime_event(
                             &slot.run.id,
-                            "revise_finished",
+                            kind,
                             json!({"attempt": watch.attempt, "head": head}),
                         )?;
                         self.log.note(&format!(
-                            "run {} rewrote its receipt for revise {} (head {head}); validating again",
-                            slot.run.id, watch.attempt
+                            "run {} rewrote its receipt for {label} (head {head}); validating again",
+                            slot.run.id
                         ));
                         let run = self.queue.restart_validation(&slot.run.id, &self.token)?;
                         let handle = spawn_validation(
@@ -1212,20 +1217,24 @@ impl Supervisor<'_> {
                         slot.phase = Phase::Validating(Some(handle), Some(session));
                     }
                     ReviseOutcome::Mismatch(why) => {
-                        let message = revise_mismatch_request(&slot.run, watch.attempt, &why)?;
+                        let message = revise_mismatch_request(&slot.run, &label, &why)?;
                         // Only what the session writes after this counts.
                         let sent_at = SystemTime::now();
                         match self.cmux.send_text(&session.workspace, &message) {
                             Ok(()) => {
                                 watch.sent_at = sent_at;
+                                let kind = match watch.fix {
+                                    Fix::Revise(_) => "revise_receipt_rejected",
+                                    Fix::Conflict(_) => "conflict_receipt_rejected",
+                                };
                                 self.queue.record_runtime_event(
                                     &slot.run.id,
-                                    "revise_receipt_rejected",
+                                    kind,
                                     json!({"attempt": watch.attempt, "reason": why}),
                                 )?;
                                 self.log.note(&format!(
-                                    "run {}: {why}; asked the session to fix it (revise {})",
-                                    slot.run.id, watch.attempt
+                                    "run {}: {why}; asked the session to fix it ({label})",
+                                    slot.run.id
                                 ));
                             }
                             Err(error) => {
@@ -1233,37 +1242,21 @@ impl Supervisor<'_> {
                                     "{why}, and the request to fix it could not be sent: {error:#}"
                                 );
                                 self.log.note(&format!("run {}: {why}", slot.run.id));
-                                let reasons = watch.reasons.clone();
-                                slot.phase = Phase::Exiting(ExitWatch::new(
-                                    Some(session),
-                                    AfterExit::Ask {
-                                        decision: ReviewDecision::Revise,
-                                        summary: why.clone(),
-                                        reasons,
-                                        why: Some(why),
-                                    },
-                                ));
+                                let then = watch.fix.ask(why.clone(), why);
+                                slot.phase = Phase::Exiting(ExitWatch::new(Some(session), then));
                             }
                         }
                     }
                     ReviseOutcome::Ended(why) => {
                         self.log.note(&format!(
-                            "run {}: the session {why} after revise {}; asking a person",
-                            slot.run.id, watch.attempt
+                            "run {}: the session {why} after {label}; asking a person",
+                            slot.run.id
                         ));
-                        let reasons = watch.reasons.clone();
-                        slot.phase = Phase::Exiting(ExitWatch::new(
-                            Some(session),
-                            AfterExit::Ask {
-                                decision: ReviewDecision::Revise,
-                                summary: format!("the session {why}"),
-                                reasons,
-                                why: Some(format!(
-                                    "the session {why} after revise {}",
-                                    watch.attempt
-                                )),
-                            },
-                        ));
+                        let then = watch.fix.ask(
+                            format!("the session {why}"),
+                            format!("the session {why} after {label}"),
+                        );
+                        slot.phase = Phase::Exiting(ExitWatch::new(Some(session), then));
                     }
                 }
                 Ok(Step::Continue)
@@ -1486,7 +1479,7 @@ impl Supervisor<'_> {
             ))
         };
         match verdict.verdict {
-            ReviewDecision::Pass => Ok(Phase::Exiting(ExitWatch::new(session, AfterExit::Land))),
+            ReviewDecision::Pass => self.precheck(run, session, verdict),
             ReviewDecision::Concern => Ok(ask(None, verdict, session)),
             ReviewDecision::Revise => {
                 let revises = self
@@ -1529,12 +1522,131 @@ impl Supervisor<'_> {
                 Ok(Phase::Revise(ReviseWatch {
                     session: live,
                     attempt,
-                    reasons: verdict.reasons,
+                    fix: Fix::Revise(verdict.reasons),
                     sent_at,
                     sent: Instant::now(),
                 }))
             }
         }
+    }
+
+    /// Before a passed run's session is asked to exit, judge with `git
+    /// merge-tree` whether its head conflicts with the current main,
+    /// without touching the worktree (ADR-0027 decision 4). A clean merge
+    /// exits the session and lands. A conflict records `conflict_precheck`
+    /// and sends the live session the resolution request of a resume; the
+    /// session's rewritten receipt is validated and reviewed again. The
+    /// requests and the run's resumes share `MAX_RESUME_ATTEMPTS`: past it,
+    /// the session exits and a person is asked. Without a live session to
+    /// ask (or when Git cannot judge), the run lands as before, and a
+    /// conflicting landing parks it for a resume.
+    fn precheck(
+        &mut self,
+        run: &TaskRun,
+        session: Option<SessionRef>,
+        verdict: ReviewVerdict,
+    ) -> Result<Phase> {
+        let land = |session| Phase::Exiting(ExitWatch::new(session, AfterExit::Land));
+        let head = run
+            .result_commit
+            .clone()
+            .context("accepted run has no result commit")?;
+        let main = self.repository.main_head()?;
+        let conflicts = match self.repository.merge_conflicts(&main, &head) {
+            Ok(conflicts) => conflicts,
+            Err(error) => {
+                self.log.note(&format!(
+                    "run {}: the conflict precheck against main {main} failed: {error:#}; landing",
+                    run.id
+                ));
+                return Ok(land(session));
+            }
+        };
+        if conflicts.is_empty() {
+            return Ok(land(session));
+        }
+        let events = self.queue.run_events(&run.id)?;
+        let requested = events
+            .iter()
+            .filter(|e| e.kind == "conflict_precheck" && e.payload["requested"] == true)
+            .count();
+        let resumes = events.iter().filter(|e| e.kind == "resume_started").count();
+        let attempt = requested + 1;
+        let mut payload = json!({
+            "main": main,
+            "head": head,
+            // Recorded for the reader; a failure to find it does not stop the request.
+            "merge_base": self.repository.merge_base(&main, &head).ok().flatten(),
+            "conflicts": conflicts,
+            "attempt": attempt,
+            "requested": false,
+        });
+        let why = format!(
+            "git merge-tree finds that main {main} conflicts with the run in {}",
+            conflicts.join(", ")
+        );
+        if requested + resumes >= MAX_RESUME_ATTEMPTS {
+            let why = format!("{why}, after {requested} conflict requests and {resumes} resumes");
+            // What an adopter asks, if it takes the run over before the ask.
+            payload["asked"] = json!(why);
+            self.queue
+                .record_runtime_event(&run.id, "conflict_precheck", payload)?;
+            self.log
+                .note(&format!("run {}: {why}; asking a person", run.id));
+            return Ok(Phase::Exiting(ExitWatch::new(
+                session,
+                Fix::Conflict(verdict).ask(String::new(), why),
+            )));
+        }
+        let live = session
+            .clone()
+            .filter(|_| session_alive(&self.queue, &run.id).unwrap_or(false));
+        let sent = match &live {
+            Some(live) => {
+                let task = self.queue.show(run.task_id)?.task;
+                let landed = landed_since(&mut self.queue, &self.repository, run, &main)?;
+                let request = ResumeRequest {
+                    main: main.clone(),
+                    reason: why.clone(),
+                    kind: ResumeKind::Precheck,
+                };
+                let message = resume_request(&task, run, &request, &landed)?;
+                let run_dir = Path::new(run.run_dir.as_ref().context("missing run directory")?);
+                fs::write(run_dir.join(format!("conflict-{attempt}.txt")), &message)?;
+                let sent_at = SystemTime::now();
+                self.cmux
+                    .send_text(&live.workspace, &message)
+                    .map(|()| sent_at)
+                    .map_err(|error| format!("the request could not be sent: {error:#}"))
+            }
+            None => Err("the session had ended".to_owned()),
+        };
+        let (Some(live), Ok(sent_at)) = (live, &sent) else {
+            let error = sent.err().unwrap_or_default();
+            payload["error"] = json!(error);
+            self.queue
+                .record_runtime_event(&run.id, "conflict_precheck", payload)?;
+            self.log.note(&format!(
+                "run {}: {why}, and {error}; landing, whose rebase parks it for a resume",
+                run.id
+            ));
+            return Ok(land(session));
+        };
+        payload["requested"] = json!(true);
+        payload["sent_at"] = json!(unix_seconds(*sent_at));
+        self.queue
+            .record_runtime_event(&run.id, "conflict_precheck", payload)?;
+        self.log.note(&format!(
+            "run {}: {why}; asked its live session in workspace {} to rebase (request {attempt})",
+            run.id, live.workspace
+        ));
+        Ok(Phase::Revise(ReviseWatch {
+            session: live,
+            attempt,
+            fix: Fix::Conflict(verdict),
+            sent_at: *sent_at,
+            sent: Instant::now(),
+        }))
     }
 
     /// Close the session's workspace after it exited: the worker's own
@@ -2190,6 +2302,8 @@ impl Supervisor<'_> {
                     | "review_finished"
                     | "revise_requested"
                     | "revise_finished"
+                    | "conflict_precheck"
+                    | "conflict_resolved"
             )
         }) else {
             return self.start_review(run, session);
@@ -2202,8 +2316,31 @@ impl Supervisor<'_> {
                     return Ok(Phase::Revise(ReviseWatch {
                         session: live,
                         attempt: anchor.payload["attempt"].as_u64().unwrap_or(1) as usize,
-                        reasons: serde_json::from_value(anchor.payload["reasons"].clone())
-                            .unwrap_or_default(),
+                        fix: Fix::Revise(
+                            serde_json::from_value(anchor.payload["reasons"].clone())
+                                .unwrap_or_default(),
+                        ),
+                        sent_at: UNIX_EPOCH
+                            + Duration::from_secs(
+                                anchor.payload["sent_at"].as_u64().unwrap_or_default(),
+                            ),
+                        sent: Instant::now(),
+                    }));
+                }
+                None
+            }
+            // A conflict request with nothing after it waits for the live
+            // session again, with the passed verdict before it.
+            "conflict_precheck" if anchor.payload["requested"] == true => {
+                let passed = passed_before(&events, anchor.id);
+                if let Some(live) = session.clone()
+                    && let Some(verdict) = passed
+                    && session_alive(&self.queue, &run.id)?
+                {
+                    return Ok(Phase::Revise(ReviseWatch {
+                        session: live,
+                        attempt: anchor.payload["attempt"].as_u64().unwrap_or(1) as usize,
+                        fix: Fix::Conflict(verdict),
                         sent_at: UNIX_EPOCH
                             + Duration::from_secs(
                                 anchor.payload["sent_at"].as_u64().unwrap_or_default(),
@@ -2219,6 +2356,16 @@ impl Supervisor<'_> {
                     "reasons": anchor.payload["reasons"],
                     "summary": anchor.payload["summary"],
                 })) {
+                    // A pass not yet followed by its /exit is prechecked
+                    // (again): main may have moved.
+                    Ok(verdict)
+                        if verdict.verdict == ReviewDecision::Pass
+                            && !events
+                                .iter()
+                                .any(|e| e.id > anchor.id && e.kind == "exit_requested") =>
+                    {
+                        return self.precheck(run, session, verdict);
+                    }
                     Ok(verdict) if verdict.verdict == ReviewDecision::Pass => Some(AfterExit::Land),
                     Ok(verdict) => Some(AfterExit::Ask {
                         why: (verdict.verdict == ReviewDecision::Revise).then(|| {
@@ -2231,6 +2378,23 @@ impl Supervisor<'_> {
                     Err(_) => None,
                 }
             }
+            // A precheck that sent nothing decided to land (no session to
+            // ask) or to ask a person (past the limit); before its /exit it
+            // is prechecked again, as main may have moved.
+            "conflict_precheck" => match passed_before(&events, anchor.id) {
+                Some(verdict)
+                    if !events
+                        .iter()
+                        .any(|e| e.id > anchor.id && e.kind == "exit_requested") =>
+                {
+                    return self.precheck(run, session, verdict);
+                }
+                Some(verdict) => Some(match anchor.payload["asked"].as_str() {
+                    Some(why) => Fix::Conflict(verdict).ask(String::new(), why.to_owned()),
+                    None => AfterExit::Land,
+                }),
+                None => None,
+            },
             "validation_finished" if events.iter().any(|e| e.kind == "integration_approved") => {
                 Some(AfterExit::Land)
             }
@@ -2907,6 +3071,10 @@ enum ResumeKind {
     /// The diff changes paths outside the task's `paths` (validation's
     /// `scope_violation`, or a landing deferred for it): take them out.
     ScopeViolation,
+    /// A passed run's live session, before its `/exit`: the precheck found
+    /// that it conflicts with main (ADR-0027 decision 4). Rebase, like
+    /// `Landing`.
+    Precheck,
 }
 
 /// Why the run waits for a session: the reason of its latest
@@ -2974,8 +3142,9 @@ fn landed_since(
 }
 
 /// The fixed resolution request the supervisor types into a resumed
-/// session (ADR-0019 decision 1), one instruction per line; the backend
-/// sends it as one line.
+/// session (ADR-0019 decision 1), or into a passed run's live session whose
+/// head conflicts with main (ADR-0027 decision 4), one instruction per
+/// line; the backend sends it as one line.
 fn resume_request(
     task: &Task,
     run: &TaskRun,
@@ -3000,6 +3169,10 @@ fn resume_request(
         ),
         ResumeKind::Landing => format!(
             "dagq: integrate could not land run {} (task {}) and returned needs_session.",
+            run.id, task.id
+        ),
+        ResumeKind::Precheck => format!(
+            "dagq: the supervisor's review of run {} (task {}) passed, but integrate would conflict with main, so the run was not landed.",
             run.id, task.id
         ),
     }];
@@ -3312,6 +3485,23 @@ impl ResumeWatch {
     }
 }
 
+/// The verdict of the last `review_finished` before event `before`: the
+/// pass a conflict precheck followed.
+fn passed_before(events: &[crate::domain::RunEvent], before: i64) -> Option<ReviewVerdict> {
+    events
+        .iter()
+        .rev()
+        .find(|e| e.id < before && e.kind == "review_finished")
+        .and_then(|e| {
+            serde_json::from_value(json!({
+                "verdict": e.payload["verdict"],
+                "reasons": e.payload["reasons"],
+                "summary": e.payload["summary"],
+            }))
+            .ok()
+        })
+}
+
 /// Kill the headless reviewer of a slot the supervisor stops watching.
 fn stop_reviewer(slot: &mut Slot) {
     if let Phase::Review(watch) = &mut slot.phase {
@@ -3380,15 +3570,55 @@ impl ReviewWatch {
     }
 }
 
-/// A `revise` verdict sent to the live session: it is waited for until the
-/// session rewrites its receipt and goes idle.
+/// A `revise` verdict, or a conflict the precheck found, sent to the live
+/// session: it is waited for until the session rewrites its receipt and
+/// goes idle.
 struct ReviseWatch {
     session: SessionRef,
     attempt: usize,
-    reasons: Vec<String>,
+    fix: Fix,
     /// A receipt or idle marker no newer than this predates the request.
     sent_at: SystemTime,
     sent: Instant,
+}
+
+/// What the live session was asked to fix (ADR-0027 decisions 2 and 4).
+enum Fix {
+    /// A `revise` verdict's findings.
+    Revise(Vec<String>),
+    /// A conflict with main found after a `pass`; the passed verdict, for
+    /// the ask if the session does not resolve it.
+    Conflict(ReviewVerdict),
+}
+
+impl Fix {
+    /// How the request is named in logs and texts: `revise N` or
+    /// `conflict request N`.
+    fn label(&self, attempt: usize) -> String {
+        match self {
+            Fix::Revise(_) => format!("revise {attempt}"),
+            Fix::Conflict(_) => format!("conflict request {attempt}"),
+        }
+    }
+
+    /// The `approve_landing` ask when the session cannot fix it: a revise
+    /// asks with `summary`; a conflict asks with its passed verdict.
+    fn ask(&self, summary: String, why: String) -> AfterExit {
+        match self {
+            Fix::Revise(reasons) => AfterExit::Ask {
+                decision: ReviewDecision::Revise,
+                reasons: reasons.clone(),
+                summary,
+                why: Some(why),
+            },
+            Fix::Conflict(verdict) => AfterExit::Ask {
+                decision: verdict.verdict,
+                reasons: verdict.reasons.clone(),
+                summary: verdict.summary.clone(),
+                why: Some(why),
+            },
+        }
+    }
 }
 
 enum ReviseOutcome {
@@ -3643,12 +3873,12 @@ impl ExitWatch {
 }
 
 /// The fixed request the supervisor types into the live session when the
-/// receipt it rewrote for a revise does not name its clean worktree HEAD.
-fn revise_mismatch_request(run: &TaskRun, attempt: usize, why: &str) -> Result<String> {
+/// receipt it rewrote for a revise or a conflict request does not name its clean worktree HEAD.
+fn revise_mismatch_request(run: &TaskRun, label: &str, why: &str) -> Result<String> {
     let receipt = run.receipt_path.as_ref().context("missing receipt path")?;
     Ok([
         format!(
-            "dagq: the receipt you rewrote for revise {attempt} of run {} cannot be accepted: {why}.",
+            "dagq: the receipt you rewrote for {label} of run {} cannot be accepted: {why}.",
             run.id
         ),
         "Steps:".to_owned(),
@@ -4004,7 +4234,9 @@ fn check_receipt(
     let outside = if task.paths.is_empty() {
         Vec::new()
     } else {
-        let fork = repository.merge_base(&repository.main_head()?, &commit)?;
+        let fork = repository
+            .merge_base(&repository.main_head()?, &commit)?
+            .context("the run branch shares no history with main")?;
         out_of_scope(&task.paths, &repository.changed_paths(&fork, &commit)?)
     };
     if !outside.is_empty() {

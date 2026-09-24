@@ -425,6 +425,57 @@ impl GitRepository {
         }
     }
 
+    /// `git merge-base <a> <b>`: their best common ancestor, `None` when
+    /// they share no history.
+    pub fn merge_base(&self, a: &str, b: &str) -> Result<Option<String>> {
+        let (status, stdout, stderr) = capture(
+            Command::new(&self.git)
+                .arg("-C")
+                .arg(&self.root)
+                .args(["merge-base", a, b]),
+            Duration::from_secs(30),
+        )?;
+        match status.code() {
+            Some(0) => Ok(Some(stdout.trim().to_owned())),
+            Some(1) => Ok(None),
+            _ => bail!("git merge-base failed ({status}): {stderr}"),
+        }
+    }
+
+    /// The paths that conflict when `head` is merged with `main` (over
+    /// their merge base), judged by `git merge-tree --write-tree` in the
+    /// object store alone: no worktree, index or ref moves (ADR-0027
+    /// decision 4). Empty when they merge cleanly.
+    pub fn merge_conflicts(&self, main: &str, head: &str) -> Result<Vec<String>> {
+        let (status, stdout, stderr) = capture(
+            Command::new(&self.git).arg("-C").arg(&self.root).args([
+                "merge-tree",
+                "--write-tree",
+                "--name-only",
+                "--no-messages",
+                "-z",
+                main,
+                head,
+            ]),
+            Duration::from_secs(5 * 60),
+        )?;
+        match status.code() {
+            Some(0) => Ok(Vec::new()),
+            // The tree's OID, then each conflicted path, NUL-terminated and
+            // never quoted.
+            Some(1) => {
+                let mut paths: Vec<String> = Vec::new();
+                for path in stdout.split('\0').skip(1).take_while(|p| !p.is_empty()) {
+                    if !paths.iter().any(|p| p == path) {
+                        paths.push(path.to_owned());
+                    }
+                }
+                Ok(paths)
+            }
+            _ => bail!("git merge-tree failed ({status}): {stderr}"),
+        }
+    }
+
     /// Porcelain status including untracked files; empty means clean.
     pub fn status(&self, worktree: &Path) -> Result<String> {
         output(Command::new(&self.git).arg("-C").arg(worktree).args([
@@ -570,18 +621,6 @@ impl GitRepository {
             numbers.deletions += fields.next().and_then(|n| n.parse().ok()).unwrap_or(0);
         }
         Ok(numbers)
-    }
-
-    /// `git merge-base <a> <b>`: the newest commit both descend from.
-    pub fn merge_base(&self, a: &str, b: &str) -> Result<String> {
-        Ok(output(
-            Command::new(&self.git)
-                .arg("-C")
-                .arg(&self.root)
-                .args(["merge-base", a, b]),
-        )?
-        .trim()
-        .to_owned())
     }
 
     /// The paths whose content differs between the trees of `from` and
