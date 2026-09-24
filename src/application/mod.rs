@@ -9,6 +9,7 @@
 pub mod ask;
 pub mod health;
 pub mod integrate;
+pub mod lifecycle;
 pub mod naming;
 mod ports;
 pub mod prompt;

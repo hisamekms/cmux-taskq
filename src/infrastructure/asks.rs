@@ -7,19 +7,10 @@ use serde_json::json;
 
 use super::sqlite::{SqliteQueue, enum_col, json_col};
 use crate::domain::{
-    Ask, AskKind, AskOutcome, LANDING_OPTIONS, NewAsk, RunId, RunStatus, SessionRole,
-    TRIAGE_OPTIONS, TaskId,
+    Ask, AskKind, AskOutcome, LANDING_OPTIONS, NewAsk, RunId, RunStatus, TRIAGE_OPTIONS, TaskId,
 };
 
-/// Which asks `asks` lists. By default the ones nobody closed; `all` adds
-/// the closed ones, `open` keeps only the unanswered ones, and `role` keeps
-/// those that wait for that role ([`Ask::waits_for`]).
-#[derive(Debug, Clone, Copy, Default)]
-pub struct AskQuery {
-    pub all: bool,
-    pub open: bool,
-    pub role: Option<SessionRole>,
-}
+pub use crate::application::AskQuery;
 
 impl SqliteQueue {
     /// Register an ask, or return the open one of the same task, run and

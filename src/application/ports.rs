@@ -15,10 +15,10 @@ use std::{
 
 use super::{GraphInput, TaskPage, TaskQuery, timestamp, unix_seconds};
 use crate::domain::{
-    Ask, AskOutcome, ClaimOutcome, CommitSha, EvidenceCheck, Goal, GoalDetail, GoalEdit, GoalId,
-    GoalSummary, GoalVerdict, NewAsk, NewGoal, NewNote, NewTask, NotePage, NoteQuery, Predecessor,
-    RunEvent, RunId, RunLease, RunPlan, RunProcess, RunStatus, SessionRole, SupervisorRegistration,
-    Task, TaskAction, TaskDetail, TaskId, TaskRun,
+    Ask, AskKind, AskOutcome, ClaimOutcome, CommitSha, EvidenceCheck, Goal, GoalDetail, GoalEdit,
+    GoalId, GoalSummary, GoalVerdict, NewAsk, NewGoal, NewNote, NewTask, NotePage, NoteQuery,
+    Predecessor, RunEvent, RunId, RunLease, RunPlan, RunProcess, RunStatus, SessionRole,
+    SupervisorMode, SupervisorRegistration, Task, TaskAction, TaskDetail, TaskId, TaskRun,
 };
 
 pub trait TaskStore {
@@ -293,6 +293,10 @@ pub trait MainRemote {
     /// the failed push, with Git's message.
     fn push_main(&self, remote: &str) -> Result<()>;
 }
+
+/// The one `CMUX_*` variable a detached process may carry: cmux's CLI
+/// reads its socket password from it.
+pub const SOCKET_PASSWORD_ENV: &str = "CMUX_SOCKET_PASSWORD";
 
 /// The environment variables the LaunchAgent gives the supervisor, which
 /// is all a launchd-started process keeps of the shell that ran `up`: its
@@ -804,6 +808,27 @@ pub trait RunStore {
     fn last_observe(&self, mode: &str) -> Result<Option<i64>>;
     /// The workspace `up` recorded for `role`.
     fn session_workspace(&self, role: SessionRole) -> Result<Option<String>>;
+    /// Record the cmux workspace `up` opened for `role`, replacing any
+    /// earlier one (ADR-0026).
+    fn register_session_workspace(&self, role: SessionRole, workspace_id: &str) -> Result<()>;
+    /// Forget the workspace of `role`; `false` when none was recorded.
+    fn remove_session_workspace(&self, role: SessionRole) -> Result<bool>;
+    /// Forget the workspaces recorded for a role `up` no longer opens.
+    fn forget_retired_session_workspaces(&self) -> Result<usize>;
+    /// Record how `up` started the supervisor `token`.
+    fn set_supervisor_mode(
+        &self,
+        token: &str,
+        mode: SupervisorMode,
+        workspace_id: Option<&str>,
+    ) -> Result<()>;
+    /// The newest `run_events` id, 0 for an empty queue.
+    fn latest_event_id(&self) -> Result<i64>;
+    /// The latest run of every `in_progress` task, oldest first.
+    fn latest_runs_in_progress(&self) -> Result<Vec<TaskRun>>;
+    /// The `integrated` runs whose push of `main` failed after the latest
+    /// successful push, oldest first.
+    fn runs_with_pending_push(&self) -> Result<Vec<TaskRun>>;
     fn register_wrapper(&mut self, id: &RunId, token: &str, pid: u32) -> Result<()>;
     fn register_resume_wrapper(&mut self, id: &RunId, token: &str, pid: u32) -> Result<()>;
     fn register_agent(&mut self, id: &RunId, wrapper_pid: u32, agent_pid: u32) -> Result<()>;
@@ -823,6 +848,10 @@ pub trait RunStore {
 
 /// The questions the runtime and its sessions put to a person (ADR-0022).
 pub trait AskStore {
+    /// Asks matching `query`, oldest first.
+    fn asks(&self, query: AskQuery) -> Result<Vec<Ask>>;
+    /// Whether the run has an ask of `kind` nobody closed, answered or not.
+    fn has_unclosed_ask(&self, run_id: &RunId, kind: AskKind) -> Result<bool>;
     /// Register an ask, or return the open one it repeats.
     fn ask(&mut self, ask: NewAsk) -> Result<AskOutcome>;
     fn answer(&mut self, id: i64, text: &str) -> Result<Ask>;
@@ -840,6 +869,16 @@ pub trait AskStore {
     fn close_stuck_exit_asks(&mut self, run_id: &RunId, answer: &str) -> Result<Vec<Ask>>;
     /// Close the run's `answer_prompt` asks nobody closed, with `answer`.
     fn close_answer_prompt_asks(&mut self, run_id: &RunId, answer: &str) -> Result<Vec<Ask>>;
+}
+
+/// Which asks [`AskStore::asks`] lists. By default the ones nobody closed;
+/// `all` adds the closed ones, `open` keeps only the unanswered ones, and
+/// `role` keeps those that wait for that role ([`Ask::waits_for`]).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct AskQuery {
+    pub all: bool,
+    pub open: bool,
+    pub role: Option<SessionRole>,
 }
 
 /// The queue a use case works on: its tasks and goals, its runs and its asks.

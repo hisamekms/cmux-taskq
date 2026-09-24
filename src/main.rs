@@ -568,10 +568,10 @@ fn observer_access(command: &Command) -> ObserverAccess {
 }
 
 fn execute(cli: Cli) -> Result<Value> {
-    let role = env::var(dagq::lifecycle::ROLE_ENV)
+    let role = env::var(dagq::application::lifecycle::ROLE_ENV)
         .ok()
         .filter(|role| !role.is_empty());
-    let observer = role.as_deref() == Some(dagq::lifecycle::OBSERVER_ROLE);
+    let observer = role.as_deref() == Some(dagq::application::lifecycle::OBSERVER_ROLE);
     let access = if observer {
         observer_access(&cli.command)
     } else {
@@ -580,7 +580,7 @@ fn execute(cli: Cli) -> Result<Value> {
     if access == ObserverAccess::Denied {
         bail!(OBSERVER_DENIED);
     }
-    if role.as_deref() == Some(dagq::lifecycle::REVIEWER_ROLE)
+    if role.as_deref() == Some(dagq::application::lifecycle::REVIEWER_ROLE)
         && reviewer_access(&cli.command) == ObserverAccess::Denied
     {
         bail!(REVIEWER_DENIED);
@@ -618,7 +618,7 @@ fn execute(cli: Cli) -> Result<Value> {
     let checkout = |repo: Option<PathBuf>| repo.unwrap_or_else(|| cwd.clone());
     // `rebind` is the one command that runs on a queue bound elsewhere.
     if let Command::Rebind { repo } = cli.command {
-        return dagq::runtime::rebind(&db, &checkout(repo));
+        return dagq::compose::rebind(&db, &checkout(repo));
     }
     let mut queue = SqliteQueue::open(&db)?;
     if let Some(common_dir) = &common_dir {
@@ -807,7 +807,7 @@ fn execute(cli: Cli) -> Result<Value> {
             queue.graph_input()?,
             goal_id.map(GoalId::new),
         ))?,
-        Command::Status { role: r } => dagq::runtime::status_for(&db, parse_role(r)?)?,
+        Command::Status { role: r } => dagq::compose::status_for(&db, parse_role(r)?)?,
         Command::Ask {
             command: Some(AskCommand::Close { id }),
             ..
@@ -823,7 +823,7 @@ fn execute(cli: Cli) -> Result<Value> {
         } => {
             use dagq::infrastructure::adapters::{Cmux, executable};
             // A missing cmux fails only the notification, not the ask.
-            dagq::runtime::ask(
+            dagq::compose::ask(
                 &db,
                 &cwd,
                 NewAsk {
@@ -842,7 +842,7 @@ fn execute(cli: Cli) -> Result<Value> {
         }
         Command::Answer { id, text } => serde_json::to_value(queue.answer(id, &text)?)?,
         Command::Asks { open, role: r, all } => {
-            json!({"asks": queue.asks(dagq::infrastructure::asks::AskQuery {
+            json!({"asks": queue.asks(dagq::application::AskQuery {
             all,
             open,
             role: parse_role(r)?,
@@ -875,8 +875,8 @@ fn execute(cli: Cli) -> Result<Value> {
             observe_interval,
             observe_daily,
         } => {
+            use dagq::compose::SuperviseOptions;
             use dagq::infrastructure::adapters::{Cmux, executable};
-            use dagq::runtime::SuperviseOptions;
             let options = SuperviseOptions {
                 stop: install_stop_signal()?,
                 log_dir,
@@ -889,7 +889,7 @@ fn execute(cli: Cli) -> Result<Value> {
                 observe_daily,
                 ..SuperviseOptions::new(usize::from(parallel), once)
             };
-            dagq::runtime::supervise(
+            dagq::compose::supervise(
                 &db,
                 &checkout(repo),
                 &Cmux {
@@ -909,12 +909,12 @@ fn execute(cli: Cli) -> Result<Value> {
             cmux,
             claude,
         } => {
+            use dagq::application::lifecycle::{QUEUE_ENV, ROLE_ENV, UpEnvironment, UpOptions};
             use dagq::infrastructure::adapters::{SOCKET_PASSWORD_ENV, claude_global_config};
             use dagq::infrastructure::{
                 adapters::{Cmux, SystemProcesses, executable},
                 launchd::Launchctl,
             };
-            use dagq::lifecycle::{QUEUE_ENV, ROLE_ENV, UpEnvironment, UpOptions};
             let environment = UpEnvironment {
                 role: env::var(ROLE_ENV).ok(),
                 queue: env::var_os(QUEUE_ENV).map(PathBuf::from),
@@ -938,7 +938,7 @@ fn execute(cli: Cli) -> Result<Value> {
                 startup_timeout: Duration::from_secs(30),
                 poll: Duration::from_millis(500),
             };
-            dagq::lifecycle::up(
+            dagq::compose::up(
                 &location,
                 &checkout(repo),
                 &Cmux {
@@ -951,15 +951,15 @@ fn execute(cli: Cli) -> Result<Value> {
             )?
         }
         Command::Down { wait, force, cmux } => {
+            use dagq::application::lifecycle::DownOptions;
             use dagq::infrastructure::{
                 adapters::{Cmux, SystemProcesses, executable},
                 launchd::Launchctl,
             };
-            use dagq::lifecycle::DownOptions;
             // cmux is only needed to close an in-cmux supervisor's
             // workspace, so a queue without one still goes down when cmux
             // is not installed; the unresolved name then fails only there.
-            dagq::lifecycle::down(
+            dagq::compose::down(
                 &location,
                 &Cmux {
                     executable: executable(&cmux).unwrap_or(cmux),
@@ -979,7 +979,9 @@ fn execute(cli: Cli) -> Result<Value> {
             repo,
             no_push,
         } => {
-            use dagq::{infrastructure::adapters::GitRepository, runtime::IntegrateTarget};
+            use dagq::{
+                application::integrate::IntegrateTarget, infrastructure::adapters::GitRepository,
+            };
             let target = match (id, next) {
                 (Some(id), false) => IntegrateTarget::Task(TaskId::new(id)),
                 _ => IntegrateTarget::Next,
@@ -990,7 +992,7 @@ fn execute(cli: Cli) -> Result<Value> {
             } else {
                 Some(GitRepository::inspect(&repo)?)
             };
-            dagq::runtime::integrate(
+            dagq::compose::integrate(
                 &db,
                 target,
                 &repo,
@@ -999,12 +1001,12 @@ fn execute(cli: Cli) -> Result<Value> {
                     .map(|r| r as &dyn dagq::application::MainRemote),
             )?
         }
-        Command::Review { id } => dagq::runtime::review(&db, TaskId::new(id))?,
+        Command::Review { id } => dagq::compose::review(&db, TaskId::new(id))?,
         Command::Stats {
             since,
             goal_id,
             full,
-        } => dagq::runtime::stats(
+        } => dagq::compose::stats(
             &db,
             &dagq::domain::stats::StatsQuery {
                 since,
@@ -1043,14 +1045,14 @@ fn execute(cli: Cli) -> Result<Value> {
                 },
             )?
         }
-        Command::Doctor { full } => dagq::runtime::doctor(&db, full)?,
-        Command::Recover { run } => dagq::runtime::recover(&db, &RunId::new(run)?)?,
+        Command::Doctor { full } => dagq::compose::doctor(&db, full)?,
+        Command::Recover { run } => dagq::compose::recover(&db, &RunId::new(run)?)?,
         Command::Session {
             run,
             lease,
             claude,
             resume,
-        } => dagq::runtime::session(&db, &RunId::new(run)?, &lease, &claude, resume)?,
+        } => dagq::compose::session(&db, &RunId::new(run)?, &lease, &claude, resume)?,
     })
 }
 

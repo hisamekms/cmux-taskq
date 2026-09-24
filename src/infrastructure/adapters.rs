@@ -3,7 +3,7 @@ use crate::{
         AgentProvider, CommandSpec, DetachedRefusal, MainRemote, ProcessControl, Repository,
         SupervisorEnvironment, WorkspaceBackend, WorkspaceTags,
     },
-    domain::{CommitSha, SessionRole, Task, TaskId, TaskRun},
+    domain::{CommitSha, Task, TaskId, TaskRun},
 };
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::Value;
@@ -22,8 +22,10 @@ use std::{
 
 use crate::application::naming::repository_name;
 pub use crate::application::{
+    SOCKET_PASSWORD_ENV,
     naming::{
-        ask_notification_title, resume_workspace_description, shell_join, shell_quote,
+        ask_notification_title, inbox_workspace_name, planner_workspace_name,
+        resume_workspace_description, shell_join, shell_quote, supervisor_workspace_name,
         workspace_description, workspace_group_name,
     },
     path_text,
@@ -922,10 +924,6 @@ pub struct Cmux {
     pub executable: PathBuf,
 }
 
-/// The one `CMUX_*` variable a detached process may carry: cmux's CLI
-/// reads its socket password from it.
-pub const SOCKET_PASSWORD_ENV: &str = "CMUX_SOCKET_PASSWORD";
-
 /// How long the detached ping may take. Without `CMUX_SOCKET_PATH` cmux's
 /// CLI discovers the socket on its own, which has taken up to 11 seconds
 /// (cmux 0.64.25) before the reply or the refusal came.
@@ -1326,29 +1324,6 @@ pub fn single_line(text: &str) -> String {
         .replace('\\', "/")
 }
 
-/// `[<repo>]supervisor`: the workspace `up --in-cmux` runs `supervise`
-/// in when launchd cannot reach cmux (ADR-0011). The launchd mode has no
-/// workspace at all.
-pub fn supervisor_workspace_name(repo_root: &Path) -> String {
-    role_workspace_name(repo_root, SessionRole::Supervisor)
-}
-
-/// `[<repo>]planner`: the session that talks with a person to register goals
-/// and tasks, which `up` opens (ADR-0028).
-pub fn planner_workspace_name(repo_root: &Path) -> String {
-    role_workspace_name(repo_root, SessionRole::Planner)
-}
-
-/// `[<repo>]inbox`: the session where a person answers the queue's asks,
-/// which `up` opens next to the planner's.
-pub fn inbox_workspace_name(repo_root: &Path) -> String {
-    role_workspace_name(repo_root, SessionRole::Inbox)
-}
-
-fn role_workspace_name(repo_root: &Path, role: SessionRole) -> String {
-    format!("[{}]{}", repository_name(repo_root), role.as_str())
-}
-
 pub fn workspace_handle(raw: &str) -> Result<&str> {
     let handle = raw
         .lines()
@@ -1539,7 +1514,7 @@ pub fn stop_hook_settings(idle_marker: &Path) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::{Provider, RunId, RunStatus};
+    use crate::domain::{Provider, RunId, RunStatus, SessionRole};
 
     #[test]
     fn system_processes_signal_a_child_and_see_it_gone() {

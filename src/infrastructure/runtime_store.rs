@@ -2480,6 +2480,32 @@ impl RunStore for SqliteQueue {
     fn session_workspace(&self, role: SessionRole) -> Result<Option<String>> {
         SqliteQueue::session_workspace(self, role)
     }
+    fn register_session_workspace(&self, role: SessionRole, workspace_id: &str) -> Result<()> {
+        SqliteQueue::register_session_workspace(self, role, workspace_id)
+    }
+    fn remove_session_workspace(&self, role: SessionRole) -> Result<bool> {
+        SqliteQueue::remove_session_workspace(self, role)
+    }
+    fn forget_retired_session_workspaces(&self) -> Result<usize> {
+        SqliteQueue::forget_retired_session_workspaces(self)
+    }
+    fn set_supervisor_mode(
+        &self,
+        token: &str,
+        mode: SupervisorMode,
+        workspace_id: Option<&str>,
+    ) -> Result<()> {
+        SqliteQueue::set_supervisor_mode(self, token, mode, workspace_id)
+    }
+    fn latest_event_id(&self) -> Result<i64> {
+        SqliteQueue::latest_event_id(self)
+    }
+    fn latest_runs_in_progress(&self) -> Result<Vec<TaskRun>> {
+        SqliteQueue::latest_runs_in_progress(self)
+    }
+    fn runs_with_pending_push(&self) -> Result<Vec<TaskRun>> {
+        SqliteQueue::runs_with_pending_push(self)
+    }
     fn register_wrapper(&mut self, id: &RunId, token: &str, pid: u32) -> Result<()> {
         SqliteQueue::register_wrapper(self, id, token, pid)
     }
@@ -2519,6 +2545,12 @@ impl RunStore for SqliteQueue {
 }
 
 impl AskStore for SqliteQueue {
+    fn asks(&self, query: crate::application::AskQuery) -> Result<Vec<crate::domain::Ask>> {
+        SqliteQueue::asks(self, query)
+    }
+    fn has_unclosed_ask(&self, run_id: &RunId, kind: crate::domain::AskKind) -> Result<bool> {
+        SqliteQueue::has_unclosed_ask(self, run_id, kind)
+    }
     fn ask(&mut self, ask: crate::domain::NewAsk) -> Result<crate::domain::AskOutcome> {
         SqliteQueue::ask(self, ask)
     }

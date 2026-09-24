@@ -4,93 +4,21 @@
 //! the supervisor whenever it exits (`KeepAlive`), which is why stopping it
 //! goes through `bootout` rather than a signal.
 use anyhow::{Context, Result, ensure};
-use serde::Serialize;
 use std::{
     fs,
     os::unix::fs::PermissionsExt,
-    path::{Path, PathBuf},
+    path::Path,
     process::Command,
     thread,
     time::{Duration, Instant},
 };
 
-use super::adapters::{SOCKET_PASSWORD_ENV, capture};
-use crate::application::{AgentState, LaunchAgent, SupervisorEnvironment};
+use super::adapters::capture;
+#[cfg(test)]
+use crate::application::SupervisorEnvironment;
+use crate::application::{AgentState, LaunchAgent};
 
-/// How long launchd waits after SIGTERM before it kills the supervisor. A
-/// drain waits for the active runs, which can take as long as their
-/// sessions, so the default (20 s) is far too short.
-pub const EXIT_TIMEOUT_SECS: u32 = 86_400;
-
-/// Everything that goes into the plist, kept as data so tests can check it
-/// without parsing XML.
-#[derive(Debug, Clone, Serialize)]
-pub struct LaunchAgentSpec {
-    pub label: String,
-    pub plist: PathBuf,
-    pub program_arguments: Vec<String>,
-    pub working_directory: String,
-    /// PATH of the shell that ran `up` (launchd's own is too small for
-    /// `cmux` and `claude`) and the socket password when that shell
-    /// exported it.
-    pub environment: SupervisorEnvironment,
-    pub log: String,
-}
-
-impl LaunchAgentSpec {
-    /// The plist as launchd reads it: `KeepAlive` and `RunAtLoad` so the
-    /// supervisor starts now and restarts after any exit, stdout and stderr
-    /// appended to one file, and a long `ExitTimeOut` for the drain.
-    pub fn xml(&self) -> String {
-        let mut xml = String::from(
-            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
-             <!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\
-             <plist version=\"1.0\">\n<dict>\n",
-        );
-        xml.push_str(&format!(
-            "\t<key>Label</key>\n\t<string>{}</string>\n",
-            escape(&self.label)
-        ));
-        xml.push_str("\t<key>ProgramArguments</key>\n\t<array>\n");
-        for argument in &self.program_arguments {
-            xml.push_str(&format!("\t\t<string>{}</string>\n", escape(argument)));
-        }
-        xml.push_str("\t</array>\n");
-        xml.push_str(&format!(
-            "\t<key>WorkingDirectory</key>\n\t<string>{}</string>\n",
-            escape(&self.working_directory)
-        ));
-        xml.push_str(&format!(
-            "\t<key>EnvironmentVariables</key>\n\t<dict>\n\t\t<key>PATH</key>\n\t\t<string>{}</string>\n",
-            escape(&self.environment.path)
-        ));
-        if let Some(password) = &self.environment.socket_password {
-            xml.push_str(&format!(
-                "\t\t<key>{SOCKET_PASSWORD_ENV}</key>\n\t\t<string>{}</string>\n",
-                escape(password)
-            ));
-        }
-        xml.push_str("\t</dict>\n");
-        xml.push_str("\t<key>KeepAlive</key>\n\t<true/>\n");
-        xml.push_str("\t<key>RunAtLoad</key>\n\t<true/>\n");
-        xml.push_str(&format!(
-            "\t<key>ExitTimeOut</key>\n\t<integer>{EXIT_TIMEOUT_SECS}</integer>\n"
-        ));
-        xml.push_str(&format!(
-            "\t<key>StandardOutPath</key>\n\t<string>{log}</string>\n\
-             \t<key>StandardErrorPath</key>\n\t<string>{log}</string>\n",
-            log = escape(&self.log)
-        ));
-        xml.push_str("</dict>\n</plist>\n");
-        xml
-    }
-}
-
-fn escape(text: &str) -> String {
-    text.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-}
+pub use crate::application::lifecycle::{EXIT_TIMEOUT_SECS, LaunchAgentSpec};
 
 /// `launchctl` against the `gui/<uid>` domain of the user running `up`.
 pub struct Launchctl {
