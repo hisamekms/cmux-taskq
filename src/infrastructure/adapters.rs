@@ -365,6 +365,20 @@ impl GitRepository {
         })
     }
 
+    /// A read-only `git -C <worktree>` for a worktree a session may be
+    /// working in. `GIT_OPTIONAL_LOCKS=0` keeps `git status` from taking
+    /// `index.lock` to write back the index it refreshed, which would make
+    /// the session's own `git add` / `rebase --continue` fail on the lock
+    /// or have its index overwritten by a stale one.
+    fn read_worktree(&self, worktree: &Path) -> Command {
+        let mut command = Command::new(&self.git);
+        command
+            .env("GIT_OPTIONAL_LOCKS", "0")
+            .arg("-C")
+            .arg(worktree);
+        command
+    }
+
     /// Current `refs/heads/main`, read again so that a task unblocked by an
     /// integration starts from the main that contains its predecessor.
     pub fn main_head(&self) -> Result<CommitSha> {
@@ -374,11 +388,8 @@ impl GitRepository {
     /// Symbolic HEAD of a worktree, or None when detached.
     pub fn current_branch(&self, worktree: &Path) -> Result<Option<String>> {
         let (status, stdout, stderr) = capture(
-            Command::new(&self.git).arg("-C").arg(worktree).args([
-                "symbolic-ref",
-                "--quiet",
-                "HEAD",
-            ]),
+            self.read_worktree(worktree)
+                .args(["symbolic-ref", "--quiet", "HEAD"]),
             Duration::from_secs(30),
         )?;
         match status.code() {
@@ -390,11 +401,10 @@ impl GitRepository {
 
     pub fn head(&self, worktree: &Path) -> Result<CommitSha> {
         object_id(
-            &output(Command::new(&self.git).arg("-C").arg(worktree).args([
-                "rev-parse",
-                "--verify",
-                "HEAD^{commit}",
-            ]))?,
+            &output(
+                self.read_worktree(worktree)
+                    .args(["rev-parse", "--verify", "HEAD^{commit}"]),
+            )?,
             "HEAD",
         )
     }
@@ -469,7 +479,7 @@ impl GitRepository {
 
     /// Porcelain status including untracked files; empty means clean.
     pub fn status(&self, worktree: &Path) -> Result<String> {
-        output(Command::new(&self.git).arg("-C").arg(worktree).args([
+        output(self.read_worktree(worktree).args([
             "status",
             "--porcelain",
             "--untracked-files=all",
@@ -491,7 +501,7 @@ impl GitRepository {
     /// Whether a `git rebase` was left half-done in the worktree (by a
     /// crashed landing or an unfinished session).
     pub fn rebase_in_progress(&self, worktree: &Path) -> Result<bool> {
-        let paths = output(Command::new(&self.git).arg("-C").arg(worktree).args([
+        let paths = output(self.read_worktree(worktree).args([
             "rev-parse",
             "--git-path",
             "rebase-merge",
@@ -530,18 +540,18 @@ impl GitRepository {
         })
     }
 
-    /// Paths with unresolved conflicts in the worktree.
+    /// Paths with unresolved conflicts in the worktree. The plumbing
+    /// `diff-files`, since porcelain `git diff` writes a refreshed index
+    /// back even under `GIT_OPTIONAL_LOCKS=0`.
     pub fn conflicted_files(&self, worktree: &Path) -> Result<Vec<String>> {
-        Ok(
-            output(Command::new(&self.git).arg("-C").arg(worktree).args([
-                "diff",
-                "--name-only",
-                "--diff-filter=U",
-            ]))?
-            .lines()
-            .map(str::to_owned)
-            .collect(),
-        )
+        Ok(output(self.read_worktree(worktree).args([
+            "diff-files",
+            "--name-only",
+            "--diff-filter=U",
+        ]))?
+        .lines()
+        .map(str::to_owned)
+        .collect())
     }
 
     /// `git log --oneline <base>..<head>`: the commits a run added. Messages
@@ -1534,6 +1544,109 @@ mod tests {
         }
         assert!(!process_alive(u32::MAX));
         assert!(processes.kill(u32::MAX).is_err());
+    }
+
+    fn git_in(dir: &Path, args: &[&str]) -> std::process::Output {
+        Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .unwrap()
+    }
+
+    /// A repository on `main` with one committed `change.txt`.
+    fn committed_repository() -> (tempfile::TempDir, GitRepository) {
+        let dir = tempfile::tempdir().unwrap();
+        for args in [
+            &["init", "-q", "-b", "main"][..],
+            &["config", "user.email", "t@example.com"],
+            &["config", "user.name", "t"],
+        ] {
+            assert!(git_in(dir.path(), args).status.success());
+        }
+        fs::write(dir.path().join("change.txt"), "0\n").unwrap();
+        assert!(git_in(dir.path(), &["add", "change.txt"]).status.success());
+        assert!(
+            git_in(dir.path(), &["commit", "-q", "-m", "c"])
+                .status
+                .success()
+        );
+        let git = GitRepository::inspect(dir.path()).unwrap();
+        (dir, git)
+    }
+
+    /// The supervisor's `status` leaves the index as it found it, where a
+    /// plain `git status` refreshes the stale stat data and writes the
+    /// index back under `index.lock`.
+    #[test]
+    fn worktree_status_does_not_write_back_the_index() {
+        let (dir, git) = committed_repository();
+        let index = dir.path().join(".git/index");
+        let before = fs::read(&index).unwrap();
+        // Same content, new stat data: the index entry is stale.
+        std::thread::sleep(Duration::from_millis(20));
+        fs::remove_file(dir.path().join("change.txt")).unwrap();
+        fs::write(dir.path().join("change.txt"), "0\n").unwrap();
+
+        assert_eq!(git.status(dir.path()).unwrap(), "");
+        assert_eq!(
+            git.current_branch(dir.path()).unwrap().as_deref(),
+            Some("refs/heads/main")
+        );
+        git.head(dir.path()).unwrap();
+        assert!(!git.rebase_in_progress(dir.path()).unwrap());
+        assert!(git.conflicted_files(dir.path()).unwrap().is_empty());
+        assert_eq!(fs::read(&index).unwrap(), before, "index was rewritten");
+
+        assert!(
+            git_in(dir.path(), &["status", "--porcelain"])
+                .status
+                .success()
+        );
+        assert_ne!(
+            fs::read(&index).unwrap(),
+            before,
+            "a plain git status should refresh the stale index"
+        );
+    }
+
+    /// A session's `git add` never meets the supervisor's `index.lock`
+    /// while `status` polls the same worktree in a tight loop, and the
+    /// index ends with what the session staged.
+    #[test]
+    fn worktree_status_polling_does_not_block_a_sessions_git_add() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let (dir, git) = committed_repository();
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let poller = {
+            let (stop, git, path) = (stop.clone(), git.clone(), dir.path().to_owned());
+            std::thread::spawn(move || {
+                let mut polls = 0;
+                loop {
+                    git.status(&path).unwrap();
+                    polls += 1;
+                    if stop.load(Ordering::Relaxed) {
+                        break polls;
+                    }
+                }
+            })
+        };
+        for round in 1..=40 {
+            fs::write(dir.path().join("change.txt"), format!("{round}\n")).unwrap();
+            let add = git_in(dir.path(), &["add", "change.txt"]);
+            assert!(
+                add.status.success(),
+                "round {round}: {}",
+                String::from_utf8_lossy(&add.stderr)
+            );
+        }
+        stop.store(true, Ordering::Relaxed);
+        assert!(poller.join().unwrap() > 0);
+        assert!(!dir.path().join(".git/index.lock").exists());
+        let staged = git_in(dir.path(), &["show", ":change.txt"]);
+        assert_eq!(String::from_utf8_lossy(&staged.stdout), "40\n");
+        assert_eq!(git.status(dir.path()).unwrap(), "M  change.txt\n");
     }
 
     #[test]

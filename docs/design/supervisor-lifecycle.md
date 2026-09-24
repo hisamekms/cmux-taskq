@@ -326,6 +326,10 @@ receiptの形式は`src/domain/views.rs`の`Receipt`で、promptとREADMEに同�
 
 supervisorは`SessionWatch::poll`のたび（1秒ごと）に、`first_commit_observed`がまだのrunのworktreeの`HEAD`を`GitRepository::head`で読み、runの`base_commit`から動いていれば`first_commit_observed`（`commit`=そのHEAD、`base_commit`）を1回だけ記録する。時刻は観測した時点（commitからせいぜい1 tick遅れ）。引き継いだrunは既に記録があれば記録しない。HEADが読めないときはsupervisor logに書いて次のpollで読み直し、runには影響させない。`agent_started`→`first_commit_observed`が`stats`の`startup`で、workerが起動してから作業に入るまで（ダイアログ・読み込み）の長さを見る（goal 11の決定4）。
 
+### worktreeへの読み取り専用のgit
+
+supervisorがsessionの作業中のworktreeに打つ読み取り専用のgit（`GitRepository::status`・`head`・`current_branch`・`rebase_in_progress`・`conflicted_files`。`SessionWatch` / `ResumeWatch` / `ReviseWatch`のpoll、validating、`integrate`が使う）は`GIT_OPTIONAL_LOCKS=0`で実行する（task 235）。付けないと`git status`はstatの古いentryをrefreshした索引を`index.lock`を取って書き戻すので、同時にsessionが打つ`git add` / `rebase --continue`が`index.lock`で失敗するか、古い索引で上書きされる（task 122で50ms周期にして`AA change.txt`が残った）。`conflicted_files`はporcelainの`git diff`ではなくplumbingの`git diff-files --name-only --diff-filter=U`を使う。`git diff`は`GIT_OPTIONAL_LOCKS=0`でもrefreshした索引を書き戻すため。
+
 ## Validation
 
 `validating`のrunに対して、supervisorがセッションと同じleaseの下で、runごとのthreadで次を順に確認する。sessionは開いたまま（上の1）のことも、終了済みのこともある。最初に外れた項目が`failed`の理由（`last_error`）になり、以降は確認しない。
