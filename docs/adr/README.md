@@ -58,7 +58,6 @@ ADRは、将来の実装や運用に大きな影響を与える決定の理由�
 | [ADR-0020](0020-rebind-queue-to-a-moved-repository.md) | repositoryの移動はrebindサブコマンドでqueueの束縛を付け替える |  |
 | [ADR-0021](0021-maintainer-and-supervisor-workspace-names-follow-the-run-style.md) | maintainer / supervisor / resumeのcmux workspace名もrunと同じ`[<repo>]dagq <role>`にそろえる |  |
 | [ADR-0022](0022-ask-answer-inbox-planner-and-landing-on-doubt.md) | 相談をqueueのask / answerにし、upがinboxとplannerを開き、着地は疑義のあるときだけ人に聞き、cmux notifyはinbox宛てにする |  |
-| [ADR-0023](0023-verify-once-review-in-supervisor-run-env-graph-and-stats.md) | 検証をintegrateの1回にし、reviewをsupervisorの工程にしてpassなら着地し、dagq.tomlでrunのenvを渡し、graphと解放数でclaim順を決め、statsで詰まりを数える |  |
 | [ADR-0024](0024-retire-maintainer-into-jobs-and-observer.md) | maintainerを退役させ、review・triage・observerをheadlessのjobにし、observerの権限をnoteとdraft goalとaskに限り、goalにdraft状態を足す |  |
 | [ADR-0025](0025-leaseless-unfinished-run-is-a-recover-run-attention.md) | supervisorが手放した未完了runをattention（recover run）にする |  |
 | [ADR-0026](0026-identify-workspaces-by-uuid-env-and-queue-group.md) | cmux workspaceをtitleではなくqueue DBのUUIDで識別し、roleとqueueを--envで持たせ、queueごとのworkspace groupにまとめる |  |
@@ -71,10 +70,12 @@ ADRは、将来の実装や運用に大きな影響を与える決定の理由�
 | [ADR-0036](0036-delete-frozen-work-records.md) | 凍結済みのdocs/journal/を削除し、今も効く手順と観測事実だけをdesign文書へ移す | 2026-09-25 |
 | [ADR-0037](0037-follow-up-triage-job-decides-follow-up-drafts.md) | follow_upのdraft taskの採否をsupervisorが起動するheadlessのfollow-up triage jobが決め、判断がつかないものだけinboxで人に聞く |  |
 | [ADR-0038](0038-task-depends-on-a-goal-until-it-is-achieved.md) | taskがgoalに依存でき、依存先のgoalがachievedで閉じるまでclaimされない | 2026-09-25 |
+| [ADR-0040](0040-verify-once-review-run-env-graph-stats-and-task-priority-in-claim-order.md) | 検証をintegrateの1回にし、reviewをsupervisorの工程にし、dagq.tomlでrunのenvを渡し、taskの5段階の優先度と解放数でclaim順を決め、statsで詰まりを数える | 2026-09-25 |
 
 ## 置き換え・廃止されたADR
 
-`status: superseded` / `deprecated`のADRと後継の対応。`deprecated`の行は`superseded_by`を空にする。2026-09-24時点で置き換え・廃止されたADRは無い。0001〜0034の棚卸し（後続のtask）で統合ADRが`accepted`になるときに埋まる。
+`status: superseded` / `deprecated`のADRと後継の対応。`deprecated`の行は`superseded_by`を空にする。0001〜0034の棚卸し（後続のtask）で統合ADRが`accepted`になるときにも行が加わる。
 
 | ADR | Status | superseded_by | superseded_on |
 | --- | --- | --- | --- |
+| [ADR-0023](0023-verify-once-review-in-supervisor-run-env-graph-and-stats.md) | superseded | [ADR-0040](0040-verify-once-review-run-env-graph-stats-and-task-priority-in-claim-order.md) | 2026-09-25 |

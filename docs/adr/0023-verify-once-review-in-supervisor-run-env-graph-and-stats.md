@@ -2,9 +2,12 @@
 id: adr-0023
 type: adr
 title: 検証をintegrateの1回にし、reviewをsupervisorの工程にしてpassなら着地し、dagq.tomlでrunのenvを渡し、graphと解放数でclaim順を決め、statsで詰まりを数える
-status: accepted
+status: superseded
 created: 2026-09-23
 updated: 2026-09-23
+accepted_on: 2026-09-23
+superseded_by: adr-0040
+superseded_on: 2026-09-25
 owners:
   - hisamekms
 tags:
@@ -23,6 +26,8 @@ related:
 ---
 
 # ADR-0023: 検証をintegrateの1回にし、reviewをsupervisorの工程にしてpassなら着地し、dagq.tomlでrunのenvを渡し、graphと解放数でclaim順を決め、statsで詰まりを数える
+
+> **置き換え済み（2026-09-25）**: このADRの決定は現在有効ではない。現行の決定は[ADR-0040](0040-verify-once-review-run-env-graph-stats-and-task-priority-in-claim-order.md)を読む。
 
 ## Context
 
