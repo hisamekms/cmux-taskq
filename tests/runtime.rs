@@ -10747,3 +10747,354 @@ fn a_dead_run_nobody_leases_is_recovered_triaged_and_retried() {
     let (prompt, _) = &reviewer.triage_prompts()[0];
     assert!(prompt.contains("which ended interrupted"), "{prompt}");
 }
+
+/// Make the live wrapper of `run_id` go silent the way a wrapper whose
+/// heartbeat stopped does while its process lives on: its row names another
+/// live process (`stand_in`, so the in-test wrapper's heartbeats no longer
+/// match and fail), and once any heartbeat in flight has landed its
+/// heartbeat is made older than the timeout. Returns the wrapper's own pid.
+fn silence_wrapper(db: &Path, run_id: &RunId, stand_in: u32) -> u32 {
+    let raw = Connection::open(db).unwrap();
+    let pid: u32 = raw
+        .query_row(
+            "SELECT pid FROM run_processes WHERE run_id=?1 AND role='wrapper' AND exited_at IS NULL",
+            [run_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    raw.execute(
+        "UPDATE run_processes SET pid=?2 WHERE run_id=?1 AND role='wrapper' AND exited_at IS NULL",
+        rusqlite::params![run_id, stand_in],
+    )
+    .unwrap();
+    thread::sleep(TEST_TICK * 4);
+    raw.execute(
+        "UPDATE run_processes SET heartbeat_at=unixepoch()-31 WHERE run_id=?1 AND role='wrapper' AND exited_at IS NULL",
+        [run_id],
+    )
+    .unwrap();
+    pid
+}
+
+/// Give the silenced wrapper its own pid back, so it heartbeats and records
+/// its exit again.
+fn revive_wrapper(db: &Path, run_id: &RunId, pid: u32) {
+    Connection::open(db)
+        .unwrap()
+        .execute(
+            "UPDATE run_processes SET pid=?2 WHERE run_id=?1 AND role='wrapper' AND exited_at IS NULL",
+            rusqlite::params![run_id, pid],
+        )
+        .unwrap();
+}
+
+/// A live process to stand in for a silent wrapper; killed on drop.
+struct StandIn(std::process::Child);
+impl StandIn {
+    fn new() -> Self {
+        Self(Command::new("sleep").arg("600").spawn().unwrap())
+    }
+    fn pid(&self) -> u32 {
+        self.0.id()
+    }
+}
+impl Drop for StandIn {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// The worker's wrapper stops heartbeating while its process lives on (task
+/// 170): the supervisor records `wrapper_heartbeat_expired`, sends the
+/// session the single `/exit` a finished one gets, and when it does not
+/// exit within the exit timeout opens a `stuck_exit` ask to the inbox that
+/// says why, keeping the run and its lease. Once the session exits the ask
+/// is closed and the run goes on to validating as usual.
+#[test]
+fn a_silent_wrapper_with_a_live_session_is_asked_to_exit_then_raised_to_the_inbox() {
+    let (_dir, repo, db) = fixture();
+    // A receipt but no idle marker: nothing else would ask it to exit.
+    let mut backend = TestWorkspace::new(
+        &db,
+        false,
+        &format!("commit work; receipt \"$(git rev-parse HEAD)\"; await_exit; {HOLD}"),
+    );
+    backend.exit_timeout = Duration::from_secs(1);
+    let backend = Arc::new(backend);
+    SqliteQueue::open(&db)
+        .unwrap()
+        .register_session_workspace(SessionRole::Inbox, "inbox-ws")
+        .unwrap();
+    let supervisor = {
+        let (db, repo, backend) = (db.clone(), repo.clone(), backend.clone());
+        thread::spawn(move || supervise(&db, &repo, &backend))
+    };
+    wait_until(&db, Duration::from_secs(30), |queue| {
+        event_kinds(&queue.show(TaskId::new(1)).unwrap()).contains(&"receipt_observed")
+    });
+    let mut queue = SqliteQueue::open(&db).unwrap();
+    let run = queue.show(TaskId::new(1)).unwrap().runs[0].clone();
+    let stand_in = StandIn::new();
+    let own = silence_wrapper(&db, run.id(), stand_in.pid());
+    wait_until(&db, Duration::from_secs(30), |queue| {
+        !queue.asks(AskQuery::default()).unwrap().is_empty()
+    });
+    let detail = queue.show(TaskId::new(1)).unwrap();
+    let run = detail.runs[0].clone();
+    assert_eq!(run.status(), RunStatus::Running);
+    assert!(run.last_error().is_none());
+    assert!(queue.run_lease(run.id()).unwrap().is_some());
+    let kinds = event_kinds(&detail);
+    assert!(!kinds.contains(&"runtime_error"), "{kinds:?}");
+    let position = |kind: &str| kinds.iter().position(|k| *k == kind).unwrap();
+    assert!(position("wrapper_heartbeat_expired") < position("exit_requested"));
+    assert!(position("exit_requested") < position("exit_request_timed_out"));
+    let expired = payloads(&detail, "wrapper_heartbeat_expired");
+    assert_eq!(expired.len(), 1);
+    assert_eq!(expired[0]["pid"], stand_in.pid());
+    assert_eq!(expired[0]["workspace_id"], WORKSPACE_ID);
+    assert!(expired[0]["heartbeat_age_secs"].as_i64().unwrap() > 30);
+    assert_eq!(backend.exits_sent.load(Ordering::SeqCst), 1);
+    let asks = queue.asks(AskQuery::default()).unwrap();
+    assert_eq!(asks.len(), 1, "{asks:?}");
+    let ask = asks[0].clone();
+    assert_eq!(ask.kind, AskKind::StuckExit);
+    assert_eq!(ask.run_id.as_ref(), Some(run.id()));
+    assert_eq!(ask.options, ["exit", "wait"]);
+    assert!(
+        ask.question.contains(
+            "Its wrapper stopped heartbeating while its process lived on (wrapper_heartbeat_expired), so the supervisor sent the /exit. The run stays running, and goes on to validating once the session exits"
+        ),
+        "{}",
+        ask.question
+    );
+    assert_eq!(backend.notifications.lock().unwrap().len(), 1);
+
+    revive_wrapper(&db, run.id(), own);
+    release_held_session(run.run_dir().unwrap());
+    let outcome = supervisor.join().unwrap().unwrap();
+    backend.join();
+    assert_eq!(outcome["errors"], json!([]), "{outcome}");
+    assert_eq!(outcome["runs"][0]["status"], "awaiting_integration");
+    assert_eq!(backend.exits_sent.load(Ordering::SeqCst), 1);
+    let detail = queue.show(TaskId::new(1)).unwrap();
+    let kinds = event_kinds(&detail);
+    assert!(!kinds.contains(&"runtime_error"), "{kinds:?}");
+    let position = |kind: &str| kinds.iter().position(|k| *k == kind).unwrap();
+    assert!(position("exit_request_timed_out") < position("session_exited"));
+    assert!(position("session_exited") < position("validation_finished"));
+    assert_eq!(payloads(&detail, "wrapper_heartbeat_expired").len(), 1);
+    let closed = queue.read_ask(ask.id).unwrap();
+    assert_eq!(
+        closed.answer.as_deref(),
+        Some("the session exited; closed by the runtime")
+    );
+}
+
+/// A wrapper whose heartbeat expired and whose process is gone is handled
+/// as before: nothing is asked to exit, and the run is given up with the
+/// heartbeat error.
+#[test]
+fn a_silent_wrapper_whose_process_is_gone_is_given_up_as_before() {
+    let (_dir, repo, db) = fixture();
+    let backend = Arc::new(TestWorkspace::new(
+        &db,
+        false,
+        &format!("commit work; receipt \"$(git rev-parse HEAD)\"; {HOLD}"),
+    ));
+    let supervisor = {
+        let (db, repo, backend) = (db.clone(), repo.clone(), backend.clone());
+        thread::spawn(move || supervise(&db, &repo, &backend))
+    };
+    wait_until(&db, Duration::from_secs(30), |queue| {
+        event_kinds(&queue.show(TaskId::new(1)).unwrap()).contains(&"receipt_observed")
+    });
+    let mut queue = SqliteQueue::open(&db).unwrap();
+    let run = queue.show(TaskId::new(1)).unwrap().runs[0].clone();
+    let own = silence_wrapper(&db, run.id(), dead_pid());
+    wait_until(&db, Duration::from_secs(30), |queue| {
+        event_kinds(&queue.show(TaskId::new(1)).unwrap()).contains(&"runtime_error")
+    });
+    let detail = queue.show(TaskId::new(1)).unwrap();
+    let kinds = event_kinds(&detail);
+    assert!(!kinds.contains(&"wrapper_heartbeat_expired"), "{kinds:?}");
+    assert!(!kinds.contains(&"exit_requested"), "{kinds:?}");
+    assert_eq!(backend.exits_sent.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        payloads(&detail, "runtime_error")[0]["message"],
+        "wrapper heartbeat expired; session may still be alive"
+    );
+    assert!(queue.asks(AskQuery::default()).unwrap().is_empty());
+    // Let the in-test wrapper finish so the supervisor's pass can end.
+    revive_wrapper(&db, run.id(), own);
+    release_held_session(run.run_dir().unwrap());
+    let outcome = supervisor.join().unwrap().unwrap();
+    backend.join();
+    assert!(
+        outcome["errors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["message"] == "wrapper heartbeat expired; session may still be alive"),
+        "{outcome}"
+    );
+}
+
+/// A resumed session whose wrapper goes silent is sent the `/exit` too, and
+/// is let go with a `stuck_exit` ask when it does not exit, as a resumed
+/// session that ignores `/exit` is.
+#[test]
+fn a_resumed_session_with_a_silent_wrapper_is_asked_to_exit_then_let_go() {
+    let (_dir, repo, db) = fixture();
+    let mut backend = TestWorkspace::new(&db, false, VALID_AGENT);
+    backend.exit_timeout = Duration::from_secs(1);
+    let backend = Arc::new(backend);
+    let (run, _) = parked_conflict(&repo, &db, &backend);
+    backend.resume_script_for(2, &format!("await_message; {HOLD}"));
+    let supervisor = {
+        let (db, repo, backend) = (db.clone(), repo.clone(), backend.clone());
+        thread::spawn(move || supervise(&db, &repo, &backend))
+    };
+    wait_until(&db, Duration::from_secs(30), |_| {
+        resume_message_path(run.run_dir().unwrap()).exists()
+    });
+    let stand_in = StandIn::new();
+    let own = silence_wrapper(&db, run.id(), stand_in.pid());
+    let outcome = supervisor.join().unwrap().unwrap();
+    assert_eq!(outcome["errors"], json!([]), "{outcome}");
+    let mut queue = SqliteQueue::open(&db).unwrap();
+    let detail = queue.show(TaskId::new(2)).unwrap();
+    let kinds = event_kinds(&detail);
+    assert!(!kinds.contains(&"runtime_error"), "{kinds:?}");
+    assert_eq!(payloads(&detail, "wrapper_heartbeat_expired").len(), 1);
+    let finished = payloads(&detail, "resume_finished");
+    assert_eq!(finished.len(), 1, "{kinds:?}");
+    assert_eq!(finished[0]["outcome"], "unresolved");
+    assert_eq!(finished[0]["exit_timed_out"], true);
+    assert_eq!(backend.exits_sent.load(Ordering::SeqCst), 1);
+    let asks = queue.asks(AskQuery::default()).unwrap();
+    assert_eq!(asks.len(), 1, "{asks:?}");
+    assert_eq!(asks[0].kind, AskKind::StuckExit);
+    assert!(
+        asks[0].question.contains(
+            "(wrapper_heartbeat_expired), so the supervisor sent the /exit. The run stays needs_session, and the supervisor resumes it again once the session exits"
+        ),
+        "{}",
+        asks[0].question
+    );
+    revive_wrapper(&db, run.id(), own);
+    release_held_session(run.run_dir().unwrap());
+    backend.join();
+}
+
+/// A session kept open through its review whose wrapper goes silent while
+/// the supervisor waits for its `/exit` is not given up either: the silence
+/// is recorded, the `stuck_exit` ask does not blame the silence for an
+/// `/exit` sent before it, and the run moves on as its verdict said once the
+/// session exits.
+#[test]
+fn a_silent_wrapper_after_the_review_waits_for_the_exit_with_an_ask() {
+    let (_dir, repo, db) = fixture();
+    let mut backend = TestWorkspace::new(&db, false, HELD_AGENT);
+    backend.exit_timeout = Duration::from_secs(3);
+    let backend = Arc::new(backend);
+    let supervisor = {
+        let (db, repo, backend) = (db.clone(), repo.clone(), backend.clone());
+        thread::spawn(move || supervise(&db, &repo, &backend))
+    };
+    wait_until(&db, Duration::from_secs(30), |queue| {
+        event_kinds(&queue.show(TaskId::new(1)).unwrap()).contains(&"exit_requested")
+    });
+    let mut queue = SqliteQueue::open(&db).unwrap();
+    let run = queue.show(TaskId::new(1)).unwrap().runs[0].clone();
+    let stand_in = StandIn::new();
+    let own = silence_wrapper(&db, run.id(), stand_in.pid());
+    wait_until(&db, Duration::from_secs(30), |queue| {
+        !queue.asks(AskQuery::default()).unwrap().is_empty()
+    });
+    let detail = queue.show(TaskId::new(1)).unwrap();
+    let kinds = event_kinds(&detail);
+    assert!(!kinds.contains(&"runtime_error"), "{kinds:?}");
+    assert_eq!(payloads(&detail, "wrapper_heartbeat_expired").len(), 1);
+    assert_eq!(backend.exits_sent.load(Ordering::SeqCst), 1);
+    let ask = queue.asks(AskQuery::default()).unwrap()[0].clone();
+    assert!(
+        ask.question
+            .contains("exit back. The run stays awaiting_integration under the supervisor"),
+        "{}",
+        ask.question
+    );
+    assert!(
+        !ask.question.contains("wrapper_heartbeat_expired"),
+        "{}",
+        ask.question
+    );
+    revive_wrapper(&db, run.id(), own);
+    release_held_session(run.run_dir().unwrap());
+    let outcome = supervisor.join().unwrap().unwrap();
+    backend.join();
+    assert_eq!(outcome["errors"], json!([]), "{outcome}");
+    let detail = queue.show(TaskId::new(1)).unwrap();
+    let kinds = event_kinds(&detail);
+    assert!(kinds.contains(&"review_failed"), "{kinds:?}");
+    assert!(queue.read_ask(ask.id).unwrap().closed_at.is_some());
+}
+
+/// A silent wrapper that dies without recording its exit after the `/exit`
+/// leaves no session to exit: the run is given up with the heartbeat error
+/// as before, and the `stuck_exit` ask the silence raised is closed.
+#[test]
+fn a_silent_wrapper_that_dies_after_the_exit_closes_its_ask() {
+    let (_dir, repo, db) = fixture();
+    let mut backend = TestWorkspace::new(
+        &db,
+        false,
+        &format!("commit work; receipt \"$(git rev-parse HEAD)\"; await_exit; {HOLD}"),
+    );
+    backend.exit_timeout = Duration::from_secs(1);
+    let backend = Arc::new(backend);
+    let supervisor = {
+        let (db, repo, backend) = (db.clone(), repo.clone(), backend.clone());
+        thread::spawn(move || supervise(&db, &repo, &backend))
+    };
+    wait_until(&db, Duration::from_secs(30), |queue| {
+        event_kinds(&queue.show(TaskId::new(1)).unwrap()).contains(&"receipt_observed")
+    });
+    let mut queue = SqliteQueue::open(&db).unwrap();
+    let run = queue.show(TaskId::new(1)).unwrap().runs[0].clone();
+    let stand_in = StandIn::new();
+    let own = silence_wrapper(&db, run.id(), stand_in.pid());
+    wait_until(&db, Duration::from_secs(30), |queue| {
+        !queue.asks(AskQuery::default()).unwrap().is_empty()
+    });
+    let ask = queue.asks(AskQuery::default()).unwrap()[0].clone();
+    drop(stand_in);
+    wait_until(&db, Duration::from_secs(30), |queue| {
+        event_kinds(&queue.show(TaskId::new(1)).unwrap()).contains(&"runtime_error")
+    });
+    let detail = queue.show(TaskId::new(1)).unwrap();
+    assert_eq!(
+        payloads(&detail, "runtime_error")[0]["message"],
+        "wrapper heartbeat expired; session may still be alive"
+    );
+    let closed = queue.read_ask(ask.id).unwrap();
+    assert!(closed.closed_at.is_some());
+    assert_eq!(
+        closed.answer.as_deref(),
+        Some("the session exited; closed by the runtime")
+    );
+    assert_eq!(backend.exits_sent.load(Ordering::SeqCst), 1);
+    revive_wrapper(&db, run.id(), own);
+    release_held_session(run.run_dir().unwrap());
+    let outcome = supervisor.join().unwrap().unwrap();
+    backend.join();
+    assert!(
+        outcome["errors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["message"] == "wrapper heartbeat expired; session may still be alive"),
+        "{outcome}"
+    );
+}

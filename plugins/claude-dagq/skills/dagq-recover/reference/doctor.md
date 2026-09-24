@@ -12,7 +12,7 @@ Plain `doctor` is the compact form, one line's worth per supervisor and per run 
 
 ## Common cases
 
-- The supervisor gave the run up (`last_error` set, `lease` null, `runtime_error` event with `lease_released: true`, for example after the wrapper's heartbeat was lost) while its session may still be running; the supervisor keeps serving other runs, and recovers the run itself once the session's processes are gone.
+- The supervisor gave the run up (`last_error` set, `lease` null, `runtime_error` event with `lease_released: true`, for example after the wrapper's heartbeat was lost and its process died; a wrapper whose process lives on is not given up but asked to `/exit`, and raised as a `stuck_exit` ask if it does not) while its session may still be running; the supervisor keeps serving other runs, and recovers the run itself once the session's processes are gone.
 - The supervisor was killed (lease stale, PID dead) while the sessions are still running.
 - The whole machine restarted (everything dead).
 - The supervisor is alive but its heartbeat stopped (the person stops it with `down --force`).

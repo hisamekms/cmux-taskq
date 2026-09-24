@@ -2712,6 +2712,8 @@ impl Supervisor<'_> {
             exit_requested: None,
             required_evidence: task.required_evidence().to_vec(),
             approved: self.queue.has_run_event(run.id(), "integration_approved")?,
+            silent: false,
+            exit_for_silence: false,
         })
     }
 
@@ -2974,6 +2976,9 @@ impl Supervisor<'_> {
                     // made none, or a supervisor that died between the two)
                     // still gets one; one asked before is not asked again.
                     exit_asked: !exit_timed_out || self.queue.has_stuck_exit_ask(run.id())?,
+                    // Only a run whose wrapper heartbeats is adopted.
+                    silent: false,
+                    exit_for_silence: false,
                 })
             }
         })
@@ -3286,6 +3291,8 @@ so the run workspace opens outside it: {error:#}",
             prompt_checked: None,
             prompt_hash: None,
             exit_asked: false,
+            silent: false,
+            exit_for_silence: false,
         })
     }
 }
@@ -3317,6 +3324,11 @@ struct SessionWatch {
     /// The `stuck_exit` ask of the exit timeout is registered (also by a
     /// previous supervisor).
     exit_asked: bool,
+    /// The wrapper went silent while its process lived on
+    /// (`wrapper_heartbeat_expired` is recorded).
+    silent: bool,
+    /// The `/exit` was sent because of that silence.
+    exit_for_silence: bool,
 }
 
 impl SessionWatch {
@@ -3402,15 +3414,43 @@ impl SessionWatch {
                 close_answer_prompt_asks(queue, run, PROMPT_EXITED_CLOSED, log)?;
                 return queue.finish_supervision(run.id(), token).map(Some);
             }
-            ensure!(
-                queue.generators().clock.now() - wrapper.heartbeat_at <= HEARTBEAT_TIMEOUT_SECS,
-                "wrapper heartbeat expired; session may still be alive"
-            );
-            if self.exit_requested.is_none() {
-                self.deliver_answers(queue, cmux, run, log)?;
-            }
-            if let Some(agent) = processes.iter().find(|p| p.role == "agent") {
-                self.watch_prompt(queue, cmux, repository, run, agent, log)?;
+            let pulse = wrapper_pulse(
+                queue,
+                run,
+                wrapper,
+                &self.workspace,
+                &mut self.silent,
+                "wrapper heartbeat expired; session may still be alive",
+                log,
+            )?;
+            match pulse {
+                WrapperPulse::Silent if self.exit_requested.is_none() => {
+                    // The same single /exit a finished session gets,
+                    // recorded before it is sent.
+                    let timeout = cmux.exit_timeout();
+                    queue.record_runtime_event(
+                        run.id(),
+                        "exit_requested",
+                        json!({"workspace_id": self.workspace, "timeout_secs": timeout.as_secs()}),
+                    )?;
+                    cmux.send_exit(&self.workspace)?;
+                    log.note(&format!(
+                        "exit requested for {} after its wrapper went silent; waiting for session exit",
+                        run.id()
+                    ));
+                    self.exit_requested = Some(Instant::now());
+                    self.exit_for_silence = true;
+                }
+                WrapperPulse::Silent => (),
+                WrapperPulse::Exited => return Ok(None),
+                WrapperPulse::Fresh => {
+                    if self.exit_requested.is_none() {
+                        self.deliver_answers(queue, cmux, run, log)?;
+                    }
+                    if let Some(agent) = processes.iter().find(|p| p.role == "agent") {
+                        self.watch_prompt(queue, cmux, repository, run, agent, log)?;
+                    }
+                }
             }
         } else {
             let timeout = cmux.registration_timeout();
@@ -3450,7 +3490,10 @@ impl SessionWatch {
                 repository,
                 run,
                 &self.workspace,
-                "The run stays running, and goes on to validating once the session exits",
+                &stuck_exit_after(
+                    self.exit_for_silence,
+                    "The run stays running, and goes on to validating once the session exits",
+                ),
                 log,
             )?;
             self.exit_asked = true;
@@ -3804,6 +3847,92 @@ fn ask_stuck_exit(
     Ok(())
 }
 
+/// How a registered wrapper that has not recorded its exit stands. Its
+/// heartbeat is the supervisor's sign of life, but a wrapper whose
+/// heartbeat stopped while its process lives on (a heartbeat that fails
+/// against the queue, a stall) still holds a live session: waiting for
+/// its exit alone left such sessions running for hours.
+enum WrapperPulse {
+    Fresh,
+    /// The heartbeat expired while the wrapper's process is alive: the
+    /// session is asked to `/exit` the way a finished one is, and a
+    /// `stuck_exit` ask follows when it does not.
+    Silent,
+    /// The wrapper recorded its exit after this poll read its row: the next
+    /// poll handles the exit.
+    Exited,
+}
+
+/// `Silent` also records `wrapper_heartbeat_expired` once per watch (`noted`)
+/// and logs it. A wrapper whose heartbeat expired and whose process is gone
+/// is an error with `message`, as before: nothing is left to ask to exit,
+/// and the run is given up to `recover`; a `stuck_exit` ask the silence
+/// raised is closed then, since no session is left to exit. The row is read
+/// again first, so a wrapper that recorded its exit just before it died is
+/// `Exited`, not an error.
+fn wrapper_pulse(
+    queue: &mut SqliteQueue,
+    run: &TaskRun,
+    wrapper: &RunProcess,
+    workspace: &str,
+    noted: &mut bool,
+    message: &str,
+    log: &SupervisorLog,
+) -> Result<WrapperPulse> {
+    let age = queue.generators().clock.now() - wrapper.heartbeat_at;
+    if age <= HEARTBEAT_TIMEOUT_SECS {
+        return Ok(WrapperPulse::Fresh);
+    }
+    if !process_alive(wrapper.pid) {
+        let exited = queue
+            .processes(run.id())?
+            .iter()
+            .any(|p| p.role == "wrapper" && p.pid == wrapper.pid && p.exited_at.is_some());
+        if exited {
+            return Ok(WrapperPulse::Exited);
+        }
+        if *noted {
+            for ask in queue.close_stuck_exit_asks(run.id(), STUCK_EXIT_CLOSED)? {
+                log.note(&format!(
+                    "wrapper of {} died without recording its exit; closed its stuck_exit ask {}",
+                    run.id(),
+                    ask.id
+                ));
+            }
+        }
+        bail!("{message}");
+    }
+    if !*noted {
+        queue.record_runtime_event(
+            run.id(),
+            "wrapper_heartbeat_expired",
+            json!({"pid": wrapper.pid, "heartbeat_age_secs": age, "workspace_id": workspace}),
+        )?;
+        log.note(&format!(
+            "wrapper of {} (pid {}) stopped heartbeating {age}s ago but its process is alive; asking its session in workspace {workspace} to exit",
+            run.id(),
+            wrapper.pid
+        ));
+        *noted = true;
+    }
+    Ok(WrapperPulse::Silent)
+}
+
+/// What a `stuck_exit` ask says first when the `/exit` was sent because the
+/// wrapper went silent, not because the session finished (a silence that
+/// began after the `/exit` does not change why it was sent).
+const SILENT_WRAPPER_EXIT: &str = "Its wrapper stopped heartbeating while its process lived on (wrapper_heartbeat_expired), so the supervisor sent the /exit";
+
+/// `after` for a `stuck_exit` ask, led by [`SILENT_WRAPPER_EXIT`] when the
+/// `/exit` was sent because the wrapper went silent.
+fn stuck_exit_after(silent: bool, after: &str) -> String {
+    if silent {
+        format!("{SILENT_WRAPPER_EXIT}. {after}")
+    } else {
+        after.to_owned()
+    }
+}
+
 /// The options of the `decide` ask of a run whose resumes are used up: a
 /// subset of [`TRIAGE_OPTIONS`], applied the same way.
 const EXHAUSTED_OPTIONS: &[&str] = &["retry", "cancel"];
@@ -4152,6 +4281,11 @@ struct ResumeWatch {
     /// Its integrate was called: resolved, it exits and lands without a
     /// review; otherwise it stays open for validation and review.
     approved: bool,
+    /// The wrapper went silent while its process lived on
+    /// (`wrapper_heartbeat_expired` is recorded).
+    silent: bool,
+    /// The `/exit` was sent because of that silence.
+    exit_for_silence: bool,
 }
 
 /// What a resumed session left behind when it exited.
@@ -4259,10 +4393,66 @@ impl ResumeWatch {
                 live: false,
             }));
         }
-        ensure!(
-            queue.generators().clock.now() - wrapper.heartbeat_at <= HEARTBEAT_TIMEOUT_SECS,
-            "resumed session's wrapper heartbeat expired; session may still be alive"
-        );
+        let pulse = wrapper_pulse(
+            queue,
+            run,
+            wrapper,
+            &self.workspace,
+            &mut self.silent,
+            "resumed session's wrapper heartbeat expired; session may still be alive",
+            log,
+        )?;
+        if matches!(pulse, WrapperPulse::Exited) {
+            return Ok(None);
+        }
+        if matches!(pulse, WrapperPulse::Silent) && self.exit_requested.is_none() {
+            // Ask once, the way a person would; never kill the session.
+            cmux.send_exit(&self.workspace)?;
+            log.note(&format!(
+                "resumed session of {} lost its wrapper heartbeat; exit requested",
+                run.id()
+            ));
+            self.exit_requested = Some(Instant::now());
+            self.exit_for_silence = true;
+        }
+        if let Some(requested) = self.exit_requested {
+            if requested.elapsed() >= cmux.exit_timeout() {
+                // /exit is not resent (it could pick a dialog's option).
+                log.note(&format!(
+                    "resumed session of {} did not exit within {}s of the exit request; letting it go as unresolved (its workspace {} is kept)",
+                    run.id(),
+                    cmux.exit_timeout().as_secs(),
+                    self.workspace
+                ));
+                // Its dialog stays until someone answers it: raise it to
+                // the inbox, as for the worker's session (task 104). The
+                // next pass closes the ask once the session ended. A failed
+                // ask is only noted: the verdict stands without it.
+                let after = stuck_exit_after(
+                    self.exit_for_silence,
+                    if self.attempt >= MAX_RESUME_ATTEMPTS {
+                        "The run stays needs_session after its last resume attempt, and is left to the person once the session exits"
+                    } else {
+                        "The run stays needs_session, and the supervisor resumes it again once the session exits"
+                    },
+                );
+                if let Err(error) =
+                    ask_stuck_exit(queue, cmux, repository, run, &self.workspace, &after, log)
+                {
+                    log.note(&format!(
+                        "stuck_exit ask for {} could not be opened: {error:#}",
+                        run.id()
+                    ));
+                }
+                return Ok(Some(ResumeVerdict {
+                    kind: ResumeOutcome::Unresolved,
+                    head: repository.head(worktree).ok(),
+                    exit_timed_out: true,
+                    live: false,
+                }));
+            }
+            return Ok(None);
+        }
         let Some((sent, sent_at)) = self.message_sent else {
             if processes.iter().any(|p| p.role == "agent") {
                 let seen = *self.agent_seen.get_or_insert_with(Instant::now);
@@ -4278,100 +4468,58 @@ impl ResumeWatch {
             }
             return Ok(None);
         };
-        match self.exit_requested {
-            None => {
-                // The idle marker is read before the receipt and the
-                // worktree: a receipt rewritten after this read is judged
-                // at the next poll, never as idle without it.
-                let idle = IdleMarker::read(&self.idle_marker)?;
-                let head = repository.head(worktree)?;
-                let clean = repository.status(worktree)?.trim().is_empty();
-                // Resolved (or failed) and idle after the receipt; or idle
-                // after the request with no such receipt, which a session
-                // that could not resolve it (or stopped at a question)
-                // never ends by itself; or no idle at all within the
-                // resume timeout (a lost request, a dialog, background
-                // work that does not end).
-                let verdict = self.verdict(run, clean.then_some(&head));
-                let idle_after_receipt = match (&idle, &verdict) {
-                    (Some(idle), ResumeOutcome::Resolved | ResumeOutcome::Failed(_)) => {
-                        idle.idle_after_receipt(&self.receipt_path)?.is_some()
-                    }
-                    _ => false,
-                };
-                // An unapproved resolved run keeps its session for
-                // validation and review (ADR-0027 decision 3).
-                if matches!(verdict, ResumeOutcome::Resolved)
-                    && !self.approved
-                    && idle_after_receipt
-                {
-                    log.note(&format!(
-                        "resumed session of {} rewrote its receipt and went idle (head {head}); validating with the session open",
-                        run.id()
-                    ));
-                    return Ok(Some(ResumeVerdict {
-                        kind: ResumeOutcome::Resolved,
-                        head: Some(head),
-                        exit_timed_out: false,
-                        live: true,
-                    }));
-                }
-                let why = match verdict {
-                    ResumeOutcome::Unresolved
-                        if idle.is_some_and(|idle| idle.idle_since(sent_at)) =>
-                    {
-                        Some("went idle without a resolving receipt")
-                    }
-                    ResumeOutcome::Unresolved => None,
-                    _ => idle_after_receipt.then_some("rewrote its receipt and went idle"),
-                }
-                .or_else(|| {
-                    (sent.elapsed() >= cmux.resume_timeout())
-                        .then_some("did not finish within the resume timeout")
-                });
-                if let Some(why) = why {
-                    // Ask once, the way a person would; never kill the session.
-                    cmux.send_exit(&self.workspace)?;
-                    log.note(&format!(
-                        "resumed session of {} {why} (head {head}); exit requested",
-                        run.id()
-                    ));
-                    self.exit_requested = Some(Instant::now());
-                }
+        // The idle marker is read before the receipt and the
+        // worktree: a receipt rewritten after this read is judged
+        // at the next poll, never as idle without it.
+        let idle = IdleMarker::read(&self.idle_marker)?;
+        let head = repository.head(worktree)?;
+        let clean = repository.status(worktree)?.trim().is_empty();
+        // Resolved (or failed) and idle after the receipt; or idle
+        // after the request with no such receipt, which a session
+        // that could not resolve it (or stopped at a question)
+        // never ends by itself; or no idle at all within the
+        // resume timeout (a lost request, a dialog, background
+        // work that does not end).
+        let verdict = self.verdict(run, clean.then_some(&head));
+        let idle_after_receipt = match (&idle, &verdict) {
+            (Some(idle), ResumeOutcome::Resolved | ResumeOutcome::Failed(_)) => {
+                idle.idle_after_receipt(&self.receipt_path)?.is_some()
             }
-            Some(requested) if requested.elapsed() >= cmux.exit_timeout() => {
-                // /exit is not resent (it could pick a dialog's option).
-                log.note(&format!(
-                    "resumed session of {} did not exit within {}s of the exit request; letting it go as unresolved (its workspace {} is kept)",
-                    run.id(),
-                    cmux.exit_timeout().as_secs(),
-                    self.workspace
-                ));
-                // Its dialog stays until someone answers it: raise it to
-                // the inbox, as for the worker's session (task 104). The
-                // next pass closes the ask once the session ended. A failed
-                // ask is only noted: the verdict stands without it.
-                let after = if self.attempt >= MAX_RESUME_ATTEMPTS {
-                    "The run stays needs_session after its last resume attempt, and is left to the person once the session exits"
-                } else {
-                    "The run stays needs_session, and the supervisor resumes it again once the session exits"
-                };
-                if let Err(error) =
-                    ask_stuck_exit(queue, cmux, repository, run, &self.workspace, after, log)
-                {
-                    log.note(&format!(
-                        "stuck_exit ask for {} could not be opened: {error:#}",
-                        run.id()
-                    ));
-                }
-                return Ok(Some(ResumeVerdict {
-                    kind: ResumeOutcome::Unresolved,
-                    head: repository.head(worktree).ok(),
-                    exit_timed_out: true,
-                    live: false,
-                }));
+            _ => false,
+        };
+        // An unapproved resolved run keeps its session for
+        // validation and review (ADR-0027 decision 3).
+        if matches!(verdict, ResumeOutcome::Resolved) && !self.approved && idle_after_receipt {
+            log.note(&format!(
+                "resumed session of {} rewrote its receipt and went idle (head {head}); validating with the session open",
+                run.id()
+            ));
+            return Ok(Some(ResumeVerdict {
+                kind: ResumeOutcome::Resolved,
+                head: Some(head),
+                exit_timed_out: false,
+                live: true,
+            }));
+        }
+        let why = match verdict {
+            ResumeOutcome::Unresolved if idle.is_some_and(|idle| idle.idle_since(sent_at)) => {
+                Some("went idle without a resolving receipt")
             }
-            Some(_) => (),
+            ResumeOutcome::Unresolved => None,
+            _ => idle_after_receipt.then_some("rewrote its receipt and went idle"),
+        }
+        .or_else(|| {
+            (sent.elapsed() >= cmux.resume_timeout())
+                .then_some("did not finish within the resume timeout")
+        });
+        if let Some(why) = why {
+            // Ask once, the way a person would; never kill the session.
+            cmux.send_exit(&self.workspace)?;
+            log.note(&format!(
+                "resumed session of {} {why} (head {head}); exit requested",
+                run.id()
+            ));
+            self.exit_requested = Some(Instant::now());
         }
         Ok(None)
     }
@@ -4587,10 +4735,18 @@ impl ReviseWatch {
                 "ended before it rewrote the receipt".to_owned(),
             )));
         };
-        ensure!(
-            queue.generators().clock.now() - wrapper.heartbeat_at <= HEARTBEAT_TIMEOUT_SECS,
-            "wrapper heartbeat expired; session may still be alive"
-        );
+        if queue.generators().clock.now() - wrapper.heartbeat_at > HEARTBEAT_TIMEOUT_SECS {
+            ensure!(
+                process_alive(wrapper.pid),
+                "wrapper heartbeat expired; session may still be alive"
+            );
+            // The exit that follows records `wrapper_heartbeat_expired` and
+            // sends the /exit.
+            return Ok(Some(ReviseOutcome::Ended(
+                "went silent (its wrapper stopped heartbeating while its process lives on)"
+                    .to_owned(),
+            )));
+        }
         let receipt = Path::new(run.receipt_path().context("missing receipt path")?);
         // The idle marker is read before the receipt: a receipt rewritten
         // after this read is judged at the next poll, never as idle without
@@ -4665,6 +4821,11 @@ struct ExitWatch {
     /// The `stuck_exit` ask of the exit timeout is registered (also by a
     /// previous supervisor), as for a running run's session (task 104).
     exit_asked: bool,
+    /// The wrapper went silent while its process lived on
+    /// (`wrapper_heartbeat_expired` is recorded).
+    silent: bool,
+    /// The `/exit` was sent because of that silence.
+    exit_for_silence: bool,
     then: AfterExit,
 }
 
@@ -4677,6 +4838,8 @@ impl ExitWatch {
             requested: None,
             timed_out: false,
             exit_asked: false,
+            silent: false,
+            exit_for_silence: false,
             then,
         }
     }
@@ -4691,9 +4854,12 @@ impl ExitWatch {
             AfterExit::Rest { close: true } => "is resumed in a session of its own",
             AfterExit::Rest { close: false } => "is left to the person",
         };
-        format!(
-            "The run stays {} under the supervisor after its validation and review, and {next} once the session exits",
-            run.status().as_str()
+        stuck_exit_after(
+            self.exit_for_silence,
+            &format!(
+                "The run stays {} under the supervisor after its validation and review, and {next} once the session exits",
+                run.status().as_str()
+            ),
         )
     }
 
@@ -4738,10 +4904,19 @@ impl ExitWatch {
             }
             return Ok(true);
         };
-        ensure!(
-            queue.generators().clock.now() - wrapper.heartbeat_at <= HEARTBEAT_TIMEOUT_SECS,
-            "wrapper heartbeat expired; session may still be alive"
-        );
+        // A silent wrapper's session gets the same single /exit.
+        let pulse = wrapper_pulse(
+            queue,
+            run,
+            wrapper,
+            &session.workspace,
+            &mut self.silent,
+            "wrapper heartbeat expired; session may still be alive",
+            log,
+        )?;
+        if matches!(pulse, WrapperPulse::Exited) {
+            return Ok(false);
+        }
         match self.requested {
             None if self.since.elapsed() < cmux.resume_timeout()
                 && background_running(&run.idle_marker_path()?)? =>
@@ -4773,6 +4948,7 @@ impl ExitWatch {
                     run.id()
                 ));
                 self.requested = Some(Instant::now());
+                self.exit_for_silence = matches!(pulse, WrapperPulse::Silent);
             }
             Some(requested) if !self.timed_out && requested.elapsed() >= cmux.exit_timeout() => {
                 let timeout = cmux.exit_timeout();
