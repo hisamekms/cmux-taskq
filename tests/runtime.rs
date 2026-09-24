@@ -83,7 +83,9 @@ fn add_ready_task(queue: &mut SqliteQueue, title: &str, dependencies: &[i64]) ->
 
 /// Shell prelude for the fake agent: `receipt COMMIT [RUN_ID]` writes an
 /// atomically renamed receipt claiming success with evidence on every check,
-/// `idle` mimics Claude's Stop hook, and `await_exit` blocks until the test
+/// `idle` mimics Claude's Stop hook (`idle_bg` with background work still
+/// running, `idle_bg_done` once it ended, as Claude Code 2.1.281 writes
+/// `background_tasks`), and `await_exit` blocks until the test
 /// workspace delivers the supervisor's exit request.
 const AGENT_PRELUDE: &str = r#"
 test -f seed.txt || exit 99
@@ -94,6 +96,14 @@ receipt() {
 }
 idle() {
   printf '{"session_id":"%s","hook_event_name":"Stop","stop_hook_active":false}' "$RUN_ID" > "$IDLE.tmp"
+  mv "$IDLE.tmp" "$IDLE"
+}
+idle_bg() {
+  printf '{"session_id":"%s","hook_event_name":"Stop","stop_hook_active":false,"background_tasks":[{"id":"b1","type":"shell","status":"running","description":"cargo test","command":"cargo test"}]}' "$RUN_ID" > "$IDLE.tmp"
+  mv "$IDLE.tmp" "$IDLE"
+}
+idle_bg_done() {
+  printf '{"session_id":"%s","hook_event_name":"Stop","stop_hook_active":false,"background_tasks":[]}' "$RUN_ID" > "$IDLE.tmp"
   mv "$IDLE.tmp" "$IDLE"
 }
 await_exit() { while [ ! -f "$EXIT" ]; do sleep 0.05; done; }
@@ -118,6 +128,14 @@ receipt() {
 }
 idle() {
   printf '{"session_id":"%s","hook_event_name":"Stop","stop_hook_active":false}' "$RUN_ID" > "$IDLE.tmp"
+  mv "$IDLE.tmp" "$IDLE"
+}
+idle_bg() {
+  printf '{"session_id":"%s","hook_event_name":"Stop","stop_hook_active":false,"background_tasks":[{"id":"b1","type":"shell","status":"running","description":"cargo test","command":"cargo test"}]}' "$RUN_ID" > "$IDLE.tmp"
+  mv "$IDLE.tmp" "$IDLE"
+}
+idle_bg_done() {
+  printf '{"session_id":"%s","hook_event_name":"Stop","stop_hook_active":false,"background_tasks":[]}' "$RUN_ID" > "$IDLE.tmp"
   mv "$IDLE.tmp" "$IDLE"
 }
 await_exit() { while [ ! -f "$EXIT" ]; do sleep 0.05; done; }
@@ -4768,6 +4786,27 @@ fn a_resumed_session_that_ignores_exit_is_let_go() {
         run_attention_of(&runtime::status(&db).unwrap(), &run.id).unwrap()["next"],
         "resume session"
     );
+    // Its dialog does not go away by itself: one stuck_exit ask goes to the
+    // inbox (task 147), as for the worker's session.
+    let asks = queue.asks(AskQuery::default()).unwrap();
+    assert_eq!(asks.len(), 1, "{asks:?}");
+    let ask = asks[0].clone();
+    assert_eq!(ask.kind, AskKind::StuckExit);
+    assert_eq!(ask.run_id.as_deref(), Some(run.id.as_str()));
+    assert!(ask.question.contains(&kept), "{}", ask.question);
+    assert!(
+        ask.question.contains(
+            "The run stays needs_session, and the supervisor resumes it again once the session exits"
+        ),
+        "{}",
+        ask.question
+    );
+    // A pass while the session still runs neither resumes the run nor asks
+    // again, nor closes the ask.
+    let outcome = supervise(&db, &repo, &backend).unwrap();
+    assert_eq!(outcome["runs"], json!([]), "{outcome}");
+    assert_eq!(queue.asks(AskQuery::default()).unwrap().len(), 1);
+    assert!(queue.read_ask(ask.id).unwrap().is_open());
 
     // Its session ends; the workspace it left no longer blocks the run.
     release_held_session(run.run_dir.as_ref().unwrap());
@@ -4787,6 +4826,19 @@ fn a_resumed_session_that_ignores_exit_is_let_go() {
     let detail = queue.show(2).unwrap();
     assert_landed(&repo, &detail.runs[0], "second", &first_landed);
     assert_eq!(payloads(&detail, "resume_started").len(), 2);
+    // The next pass closed the ask of the session that ended.
+    let closed = queue.read_ask(ask.id).unwrap();
+    assert!(closed.closed_at.is_some());
+    assert_eq!(
+        closed.answer.as_deref(),
+        Some("the session exited; closed by the runtime")
+    );
+    assert!(queue.asks(AskQuery::default()).unwrap().is_empty());
+    let kinds = event_kinds(&detail);
+    assert!(
+        kinds.iter().filter(|k| **k == "ask_opened").count() == 1,
+        "{kinds:?}"
+    );
 }
 
 /// The supervisor never resumes a run next to the live session of a
@@ -8781,4 +8833,330 @@ fn adopted_run_waiting_for_its_exit_after_a_pass_asks_once_and_lands() {
             .len(),
         1
     );
+}
+
+/// Waits until the run's idle marker shows background work running.
+fn wait_for_background(run: &TaskRun) {
+    let marker = run.idle_marker_path().unwrap();
+    let started = Instant::now();
+    while !fs::read_to_string(&marker).is_ok_and(|text| text.contains("\"running\"")) {
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "no background marker"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Writes the Stop hook's marker for the run as the session would, with
+/// `background_tasks` as given.
+fn write_idle_marker(run: &TaskRun, background_tasks: Value) {
+    let marker = run.idle_marker_path().unwrap();
+    let hook = json!({
+        "session_id": run.id,
+        "hook_event_name": "Stop",
+        "stop_hook_active": false,
+        "background_tasks": background_tasks,
+    });
+    let tmp = marker.with_extension("tmp");
+    fs::write(&tmp, hook.to_string()).unwrap();
+    fs::rename(&tmp, &marker).unwrap();
+}
+
+/// Lets the supervisor poll a while: what it did not do by then it holds.
+const HOLD_PERIOD: Duration = Duration::from_millis(600);
+
+/// The session goes idle after its receipt with background work still
+/// running (task 147): the supervisor does not take it for idle, so neither
+/// validation nor `/exit` starts, until the work ended and the Stop hook
+/// wrote a marker with empty `background_tasks`.
+#[test]
+fn background_work_holds_the_first_session_until_it_ends() {
+    let (_dir, repo, db) = fixture();
+    let backend = Arc::new(TestWorkspace::new(
+        &db,
+        false,
+        "commit work; receipt \"$(git rev-parse HEAD)\"; idle_bg; \
+         while [ ! -f \"$EXIT.go\" ]; do sleep 0.05; done; idle_bg_done; await_exit",
+    ));
+    let supervisor = {
+        let (db, repo, backend) = (db.clone(), repo.clone(), backend.clone());
+        thread::spawn(move || supervise(&db, &repo, &backend))
+    };
+    wait_until(&db, Duration::from_secs(30), |queue| {
+        event_kinds(&queue.show(1).unwrap()).contains(&"receipt_observed")
+    });
+    let mut queue = SqliteQueue::open(&db).unwrap();
+    let run = queue.show(1).unwrap().runs[0].clone();
+    wait_for_background(&run);
+    thread::sleep(HOLD_PERIOD);
+    let detail = queue.show(1).unwrap();
+    assert_eq!(detail.runs[0].status, RunStatus::Running);
+    let kinds = event_kinds(&detail);
+    assert!(!kinds.contains(&"session_idle_observed"), "{kinds:?}");
+    assert!(!kinds.contains(&"exit_requested"), "{kinds:?}");
+    assert_eq!(backend.exits_sent.load(Ordering::SeqCst), 0);
+
+    fs::write(
+        exit_request_path(run.run_dir.as_ref().unwrap()).with_extension("go"),
+        "",
+    )
+    .unwrap();
+    let outcome = supervisor.join().unwrap().unwrap();
+    backend.join();
+    assert_eq!(outcome["errors"], json!([]), "{outcome}");
+    assert_eq!(outcome["runs"][0]["status"], "awaiting_integration");
+    assert_eq!(backend.exits_sent.load(Ordering::SeqCst), 1);
+    let detail = queue.show(1).unwrap();
+    let kinds = event_kinds(&detail);
+    assert!(position(&kinds, "session_idle_observed") < position(&kinds, "exit_requested"));
+    assert!(!kinds.contains(&"exit_request_timed_out"));
+}
+
+/// A marker whose background work is over (`completed`) or that names none
+/// is idle as before.
+#[test]
+fn a_marker_without_running_background_work_is_idle() {
+    for tasks in [
+        json!([]),
+        json!([{"id": "b1", "type": "shell", "status": "completed"}]),
+    ] {
+        let script = format!(
+            "commit work; receipt \"$(git rev-parse HEAD)\"; \
+             printf '%s' '{}' > \"$IDLE.tmp\"; mv \"$IDLE.tmp\" \"$IDLE\"; await_exit",
+            json!({"session_id": "s", "hook_event_name": "Stop", "background_tasks": tasks})
+        );
+        let (_dir, repo, db) = fixture();
+        let backend = TestWorkspace::new(&db, false, &script);
+        let outcome = supervise(&db, &repo, &backend).unwrap();
+        backend.join();
+        assert_eq!(outcome["errors"], json!([]), "{outcome}");
+        assert_eq!(outcome["runs"][0]["status"], "awaiting_integration");
+        assert_eq!(backend.exits_sent.load(Ordering::SeqCst), 1);
+    }
+}
+
+/// After the review, the `/exit` waits while the session's marker shows
+/// background work running (the session took a turn up again after its
+/// receipt), and goes once the work ended.
+#[test]
+fn background_work_holds_the_exit_after_the_review() {
+    let (dir, repo, db) = fixture();
+    let base = git_out(&repo, &["rev-parse", "main"]);
+    let gate = dir.path().join("review-gate");
+    let backend = Arc::new(TestWorkspace::new(&db, false, IDLE_AGENT));
+    let reviewer = Arc::new(TestReviewer::new(&[format!(
+        "while [ ! -f {} ]; do sleep 0.05; done; {}",
+        shell_join(&[gate.to_string_lossy().into_owned()]),
+        verdict("pass", &[], "meets the acceptance")
+    )]));
+    let supervisor = {
+        let (db, repo, backend, reviewer) =
+            (db.clone(), repo.clone(), backend.clone(), reviewer.clone());
+        thread::spawn(move || supervise_reviewed(&db, &repo, &backend, &reviewer))
+    };
+    wait_until(&db, Duration::from_secs(30), |queue| {
+        event_kinds(&queue.show(1).unwrap()).contains(&"review_started")
+    });
+    let mut queue = SqliteQueue::open(&db).unwrap();
+    let run = queue.show(1).unwrap().runs[0].clone();
+    write_idle_marker(
+        &run,
+        json!([{"id": "b1", "type": "shell", "status": "running", "command": "cargo test"}]),
+    );
+    fs::write(&gate, "").unwrap();
+    wait_until(&db, Duration::from_secs(30), |queue| {
+        event_kinds(&queue.show(1).unwrap()).contains(&"review_finished")
+    });
+    thread::sleep(HOLD_PERIOD);
+    let detail = queue.show(1).unwrap();
+    let kinds = event_kinds(&detail);
+    assert!(!kinds.contains(&"exit_requested"), "{kinds:?}");
+    assert_eq!(backend.exits_sent.load(Ordering::SeqCst), 0);
+
+    write_idle_marker(&run, json!([]));
+    let outcome = supervisor.join().unwrap();
+    assert_eq!(outcome["errors"], json!([]), "{outcome}");
+    assert_eq!(outcome["runs"][0]["status"], "integrated", "{outcome}");
+    assert_eq!(backend.exits_sent.load(Ordering::SeqCst), 1);
+    assert_landed(&repo, &queue.show(1).unwrap().runs[0], "test task", &base);
+}
+
+/// A resumed session that rewrote its receipt and stopped with background
+/// work running is not asked to exit until the work ended.
+#[test]
+fn background_work_holds_the_resumed_session_until_it_ends() {
+    let (_dir, repo, db) = fixture();
+    let backend = TestWorkspace::new(&db, false, VALID_AGENT);
+    let (run, first_landed) = parked_conflict(&repo, &db, &backend);
+    let sent_before = backend.exits_sent.load(Ordering::SeqCst);
+    backend.resume_script_for(
+        2,
+        "await_message; resolve; receipt \"$(git rev-parse HEAD)\"; idle_bg; \
+         while [ ! -f \"$EXIT.go\" ]; do sleep 0.05; done; idle_bg_done; await_exit",
+    );
+    let backend = Arc::new(backend);
+    let supervisor = {
+        let (db, repo, backend) = (db.clone(), repo.clone(), backend.clone());
+        thread::spawn(move || supervise(&db, &repo, &backend))
+    };
+    wait_for_background(&run);
+    thread::sleep(HOLD_PERIOD);
+    let mut queue = SqliteQueue::open(&db).unwrap();
+    let detail = queue.show(2).unwrap();
+    assert!(payloads(&detail, "resume_finished").is_empty());
+    assert_eq!(backend.exits_sent.load(Ordering::SeqCst), sent_before);
+
+    fs::write(
+        exit_request_path(run.run_dir.as_ref().unwrap()).with_extension("go"),
+        "",
+    )
+    .unwrap();
+    let outcome = supervisor.join().unwrap().unwrap();
+    backend.join();
+    assert_eq!(outcome["errors"], json!([]), "{outcome}");
+    assert_eq!(backend.exits_sent.load(Ordering::SeqCst), sent_before + 1);
+    let detail = queue.show(2).unwrap();
+    assert_landed(&repo, &detail.runs[0], "second", &first_landed);
+    assert_eq!(
+        payloads(&detail, "resume_finished")[0]["outcome"],
+        "resolved"
+    );
+}
+
+/// A session revising its work that stops with background work running is
+/// not taken for done: the revise waits until the work ended.
+#[test]
+fn background_work_holds_the_revise_until_it_ends() {
+    let (_dir, repo, db) = fixture();
+    let base = git_out(&repo, &["rev-parse", "main"]);
+    let backend = Arc::new(TestWorkspace::new(
+        &db,
+        false,
+        "commit work; receipt \"$(git rev-parse HEAD)\"; idle; \
+         while [ ! -f \"$MESSAGE\" ]; do sleep 0.05; done; rm \"$MESSAGE\"; \
+         printf 'fix\\n' >> change.txt; git commit -q -am fix; \
+         receipt \"$(git rev-parse HEAD)\"; idle_bg; \
+         while [ ! -f \"$EXIT.go\" ]; do sleep 0.05; done; idle_bg_done; await_exit",
+    ));
+    let reviewer = Arc::new(TestReviewer::new(&[
+        verdict("revise", &["add a line"], "one gap"),
+        verdict("pass", &[], "fixed"),
+    ]));
+    let supervisor = {
+        let (db, repo, backend, reviewer) =
+            (db.clone(), repo.clone(), backend.clone(), reviewer.clone());
+        thread::spawn(move || supervise_reviewed(&db, &repo, &backend, &reviewer))
+    };
+    wait_until(&db, Duration::from_secs(30), |queue| {
+        event_kinds(&queue.show(1).unwrap()).contains(&"revise_requested")
+    });
+    let mut queue = SqliteQueue::open(&db).unwrap();
+    let run = queue.show(1).unwrap().runs[0].clone();
+    wait_for_background(&run);
+    thread::sleep(HOLD_PERIOD);
+    let detail = queue.show(1).unwrap();
+    let kinds = event_kinds(&detail);
+    assert!(!kinds.contains(&"revise_finished"), "{kinds:?}");
+    assert!(!kinds.contains(&"exit_requested"), "{kinds:?}");
+    assert!(queue.asks(AskQuery::default()).unwrap().is_empty());
+
+    fs::write(
+        exit_request_path(run.run_dir.as_ref().unwrap()).with_extension("go"),
+        "",
+    )
+    .unwrap();
+    let outcome = supervisor.join().unwrap();
+    assert_eq!(outcome["errors"], json!([]), "{outcome}");
+    assert_eq!(outcome["runs"][0]["status"], "integrated", "{outcome}");
+    assert_eq!(backend.exits_sent.load(Ordering::SeqCst), 1);
+    let detail = queue.show(1).unwrap();
+    assert_landed(&repo, &detail.runs[0], "test task", &base);
+    assert_eq!(payloads(&detail, "revise_finished").len(), 1);
+}
+
+/// A revise the session will not finish (it goes idle without rewriting the
+/// receipt) ends in `/exit`; a session that holds that `/exit` back past the
+/// exit timeout raises one `stuck_exit` ask, closed by the runtime once the
+/// session exits, and the run then goes on to its `approve_landing` ask.
+#[test]
+fn a_revise_session_that_holds_exit_back_raises_a_stuck_exit_ask() {
+    let (_dir, repo, db) = fixture();
+    let mut backend = TestWorkspace::new(
+        &db,
+        false,
+        &format!(
+            "commit work; receipt \"$(git rev-parse HEAD)\"; idle; \
+             while [ ! -f \"$MESSAGE\" ]; do sleep 0.05; done; idle; {HOLD}"
+        ),
+    );
+    backend.exit_timeout = Duration::from_secs(1);
+    let backend = Arc::new(backend);
+    let reviewer = Arc::new(TestReviewer::new(&[verdict(
+        "revise",
+        &["add a line"],
+        "one gap",
+    )]));
+    let supervisor = {
+        let (db, repo, backend, reviewer) =
+            (db.clone(), repo.clone(), backend.clone(), reviewer.clone());
+        thread::spawn(move || supervise_reviewed(&db, &repo, &backend, &reviewer))
+    };
+    wait_until(&db, Duration::from_secs(30), |queue| {
+        !queue.asks(AskQuery::default()).unwrap().is_empty()
+    });
+    thread::sleep(HOLD_PERIOD);
+    let mut queue = SqliteQueue::open(&db).unwrap();
+    let asks = queue.asks(AskQuery::default()).unwrap();
+    assert_eq!(asks.len(), 1, "{asks:?}");
+    let ask = asks[0].clone();
+    assert_eq!(ask.kind, AskKind::StuckExit);
+    assert!(
+        ask.question
+            .contains("opens an approve_landing ask for the person once the session exits"),
+        "{}",
+        ask.question
+    );
+    let run = queue.show(1).unwrap().runs[0].clone();
+    let detail = queue.show(1).unwrap();
+    let kinds = event_kinds(&detail);
+    assert!(position(&kinds, "revise_requested") < position(&kinds, "exit_requested"));
+    assert!(!kinds.contains(&"revise_finished"), "{kinds:?}");
+    assert_eq!(backend.exits_sent.load(Ordering::SeqCst), 1);
+
+    release_held_session(run.run_dir.as_ref().unwrap());
+    let outcome = supervisor.join().unwrap();
+    assert_eq!(outcome["errors"], json!([]), "{outcome}");
+    assert_eq!(backend.exits_sent.load(Ordering::SeqCst), 1);
+    let closed = queue.read_ask(ask.id).unwrap();
+    assert!(closed.closed_at.is_some());
+    let open = queue.asks(AskQuery::default()).unwrap();
+    assert_eq!(open.len(), 1, "{open:?}");
+    assert_eq!(open[0].kind, AskKind::ApproveLanding);
+}
+
+/// Background work that never ends does not hold the run forever: past the
+/// resume timeout from the receipt the run goes on to validation (its
+/// `session_idle_observed` saying the work still ran), and past it again the
+/// `/exit` goes, where a dialog would become a `stuck_exit` ask.
+#[test]
+fn background_work_that_never_ends_is_waited_for_up_to_the_resume_timeout() {
+    let (_dir, repo, db) = fixture();
+    let mut backend = TestWorkspace::new(
+        &db,
+        false,
+        "commit work; receipt \"$(git rev-parse HEAD)\"; idle_bg; await_exit",
+    );
+    backend.resume_timeout = Duration::from_secs(1);
+    let outcome = supervise(&db, &repo, &backend).unwrap();
+    backend.join();
+    assert_eq!(outcome["errors"], json!([]), "{outcome}");
+    assert_eq!(outcome["runs"][0]["status"], "awaiting_integration");
+    assert_eq!(backend.exits_sent.load(Ordering::SeqCst), 1);
+    let detail = SqliteQueue::open(&db).unwrap().show(1).unwrap();
+    let idle = payloads(&detail, "session_idle_observed");
+    assert_eq!(idle.len(), 1);
+    assert_eq!(idle[0]["background_running"], true);
+    let kinds = event_kinds(&detail);
+    assert!(position(&kinds, "session_idle_observed") < position(&kinds, "exit_requested"));
 }

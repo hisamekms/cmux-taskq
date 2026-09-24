@@ -1711,7 +1711,28 @@ impl Supervisor<'_> {
     /// oldest first, while slots are free: a run with a lease that is not
     /// stale, or whose last session still runs, is someone's already.
     fn resume_parked_runs(&mut self, parallel: usize) -> Result<()> {
-        for candidate in self.queue.runs_needing_session()? {
+        let candidates = self.queue.runs_needing_session()?;
+        // A resumed session let go after the exit timeout raised a
+        // stuck_exit ask; once it ended nobody needs to answer it, whether
+        // or not a slot is free.
+        for candidate in &candidates {
+            let alive = candidate
+                .wrapper
+                .as_ref()
+                .is_some_and(|w| w.exited_at.is_none() && process_alive(w.pid));
+            if !alive {
+                for ask in self
+                    .queue
+                    .close_stuck_exit_asks(&candidate.run.id, STUCK_EXIT_CLOSED)?
+                {
+                    self.log.note(&format!(
+                        "session of {} exited; closed its stuck_exit ask {}",
+                        candidate.run.id, ask.id
+                    ));
+                }
+            }
+        }
+        for candidate in candidates {
             if self.slots.len() >= parallel {
                 break;
             }
@@ -1722,11 +1743,14 @@ impl Supervisor<'_> {
                 attempts,
             } = candidate;
             let now = unix_time();
+            let session_alive = wrapper
+                .as_ref()
+                .is_some_and(|w| w.exited_at.is_none() && process_alive(w.pid));
             // A previous session whose wrapper process lives on, however
             // silent, is never joined by a second one on the same worktree.
             if attempts >= MAX_RESUME_ATTEMPTS
                 || lease.is_some_and(|lease| !lease_is_stale(&lease, now))
-                || wrapper.is_some_and(|w| w.exited_at.is_none() && process_alive(w.pid))
+                || session_alive
             {
                 continue;
             }
@@ -2090,6 +2114,7 @@ impl Supervisor<'_> {
                     idle_marker: run.idle_marker_path()?,
                     startup: Instant::now(),
                     receipt_seen,
+                    receipt_seen_at: receipt_seen.then(Instant::now),
                     exit_requested,
                     exit_timed_out,
                     first_commit_seen,
@@ -2330,6 +2355,7 @@ so the run workspace opens outside it: {error:#}",
             idle_marker: run.idle_marker_path()?,
             startup: Instant::now(),
             receipt_seen: false,
+            receipt_seen_at: None,
             exit_requested: None,
             exit_timed_out: false,
             first_commit_seen: false,
@@ -2350,6 +2376,9 @@ struct SessionWatch {
     idle_marker: PathBuf,
     startup: Instant,
     receipt_seen: bool,
+    /// When this supervisor first saw the receipt, for the wait on
+    /// background work the session left running after it.
+    receipt_seen_at: Option<Instant>,
     exit_requested: Option<Instant>,
     /// `exit_request_timed_out` is recorded once per run; the lease is kept.
     exit_timed_out: bool,
@@ -2386,6 +2415,7 @@ impl SessionWatch {
         self.watch_first_commit(queue, repository, run, log)?;
         if !self.receipt_seen && self.receipt_path.is_file() {
             self.receipt_seen = true;
+            self.receipt_seen_at = Some(Instant::now());
             queue.record_runtime_event(
                 &run.id,
                 "receipt_observed",
@@ -2400,10 +2430,22 @@ impl SessionWatch {
         // A session that already ended (on its own, by a maintainer's /exit,
         // or before this supervisor adopted the run) is not asked to exit.
         let session_ended = wrapper.is_some_and(|w| w.exited_at.is_some());
+        // Background work the session left running after its receipt is
+        // waited for up to the resume timeout, like a resumed session's:
+        // work that never ends must not hold the run without an attention.
+        // Past it the run goes on, and a /exit held back by the dialog
+        // becomes a stuck_exit ask.
+        let waited_out = self
+            .receipt_seen_at
+            .is_some_and(|at| at.elapsed() >= cmux.resume_timeout());
         if self.receipt_seen
             && self.exit_requested.is_none()
             && !session_ended
-            && let Some(evidence) = idle_after_receipt(&self.receipt_path, &self.idle_marker)?
+            && let Some(evidence) = match IdleMarker::read(&self.idle_marker)? {
+                Some(idle) if waited_out => idle.stopped_after_receipt(&self.receipt_path)?,
+                Some(idle) => idle.idle_after_receipt(&self.receipt_path)?,
+                None => None,
+            }
         {
             queue.record_runtime_event(&run.id, "session_idle_observed", evidence)?;
             // The session stays open through validation and review, and
@@ -2623,6 +2665,8 @@ impl SessionWatch {
         if answers.is_empty() {
             return Ok(());
         }
+        // Background work does not hold an answer back: typing into the
+        // prompt opens no dialog, only /exit does.
         let idle_at = match fs::metadata(&self.idle_marker) {
             Ok(meta) => unix_seconds(meta.modified()?),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -3171,19 +3215,30 @@ impl ResumeWatch {
         };
         match self.exit_requested {
             None => {
+                // The idle marker is read before the receipt and the
+                // worktree: a receipt rewritten after this read is judged
+                // at the next poll, never as idle without it.
+                let idle = IdleMarker::read(&self.idle_marker)?;
                 let head = repository.head(worktree)?;
                 let clean = repository.status(worktree)?.trim().is_empty();
                 // Resolved (or failed) and idle after the receipt; or idle
                 // after the request with no such receipt, which a session
                 // that could not resolve it (or stopped at a question)
                 // never ends by itself; or no idle at all within the
-                // resume timeout (a lost request, a dialog).
+                // resume timeout (a lost request, a dialog, background
+                // work that does not end).
                 let verdict = self.verdict(run, Some(head.as_str()).filter(|_| clean));
+                let idle_after_receipt = match (&idle, &verdict) {
+                    (Some(idle), ResumeOutcome::Resolved | ResumeOutcome::Failed(_)) => {
+                        idle.idle_after_receipt(&self.receipt_path)?.is_some()
+                    }
+                    _ => false,
+                };
                 // An unapproved resolved run keeps its session for
                 // validation and review (ADR-0027 decision 3).
                 if matches!(verdict, ResumeOutcome::Resolved)
                     && !self.approved
-                    && idle_after_receipt(&self.receipt_path, &self.idle_marker)?.is_some()
+                    && idle_after_receipt
                 {
                     log.note(&format!(
                         "resumed session of {} rewrote its receipt and went idle (head {head}); validating with the session open",
@@ -3197,12 +3252,13 @@ impl ResumeWatch {
                     }));
                 }
                 let why = match verdict {
-                    ResumeOutcome::Unresolved if marker_newer_than(&self.idle_marker, sent_at)? => {
+                    ResumeOutcome::Unresolved
+                        if idle.is_some_and(|idle| idle.idle_since(sent_at)) =>
+                    {
                         Some("went idle without a resolving receipt")
                     }
                     ResumeOutcome::Unresolved => None,
-                    _ => idle_after_receipt(&self.receipt_path, &self.idle_marker)?
-                        .map(|_| "rewrote its receipt and went idle"),
+                    _ => idle_after_receipt.then_some("rewrote its receipt and went idle"),
                 }
                 .or_else(|| {
                     (sent.elapsed() >= cmux.resume_timeout())
@@ -3226,6 +3282,23 @@ impl ResumeWatch {
                     cmux.exit_timeout().as_secs(),
                     self.workspace
                 ));
+                // Its dialog stays until someone answers it: raise it to
+                // the inbox, as for the worker's session (task 104). The
+                // next pass closes the ask once the session ended. A failed
+                // ask is only noted: the verdict stands without it.
+                let after = if self.attempt >= MAX_RESUME_ATTEMPTS {
+                    "The run stays needs_session after its last resume attempt, and is left to the person once the session exits"
+                } else {
+                    "The run stays needs_session, and the supervisor resumes it again once the session exits"
+                };
+                if let Err(error) =
+                    ask_stuck_exit(queue, cmux, repository, run, &self.workspace, after, log)
+                {
+                    log.note(&format!(
+                        "stuck_exit ask for {} could not be opened: {error:#}",
+                        run.id
+                    ));
+                }
                 return Ok(Some(ResumeVerdict {
                     kind: ResumeOutcome::Unresolved,
                     head: repository.head(worktree).ok(),
@@ -3354,11 +3427,18 @@ impl ReviseWatch {
             "wrapper heartbeat expired; session may still be alive"
         );
         let receipt = Path::new(run.receipt_path.as_ref().context("missing receipt path")?);
-        let idle_marker = run.idle_marker_path()?;
+        // The idle marker is read before the receipt: a receipt rewritten
+        // after this read is judged at the next poll, never as idle without
+        // it.
+        let idle = IdleMarker::read(&run.idle_marker_path()?)?;
         let rewritten = fs::metadata(receipt)
             .and_then(|meta| meta.modified())
             .is_ok_and(|modified| modified > self.sent_at);
-        if rewritten && idle_after_receipt(receipt, &idle_marker)?.is_some() {
+        let idle_after_receipt = match &idle {
+            Some(idle) if rewritten => idle.idle_after_receipt(receipt)?.is_some(),
+            _ => false,
+        };
+        if idle_after_receipt {
             let worktree = Path::new(run.worktree_path.as_ref().context("missing worktree")?);
             let head = repository.head(worktree)?;
             let clean = repository.status(worktree)?.trim().is_empty();
@@ -3387,7 +3467,7 @@ impl ReviseWatch {
                 }
             }));
         }
-        if !rewritten && marker_newer_than(&idle_marker, self.sent_at)? {
+        if !rewritten && idle.is_some_and(|idle| idle.idle_since(self.sent_at)) {
             return Ok(Some(ReviseOutcome::Ended(
                 "went idle without rewriting the receipt".to_owned(),
             )));
@@ -3404,11 +3484,17 @@ impl ReviseWatch {
 
 /// Asks the run's session to `/exit` once (unless it ended already) and
 /// waits for its wrapper to exit; then the supervisor closes the workspace
-/// and does `then`. A session that holds the `/exit` back past the exit
-/// timeout is recorded as `exit_request_timed_out` and waited for, keeping
-/// the lease, as before (ADR-0027 leaves it unchanged).
+/// and does `then`. The `/exit` waits while the idle marker shows background
+/// work running (task 147), for at most the resume timeout. A session that
+/// holds the `/exit` back past the exit timeout is recorded as
+/// `exit_request_timed_out` and waited for, keeping the lease, as before
+/// (ADR-0027 leaves it unchanged).
 struct ExitWatch {
     session: Option<SessionRef>,
+    /// When the watch began, for the wait on background work.
+    since: Instant,
+    /// The wait on background work is logged.
+    background_noted: bool,
     requested: Option<Instant>,
     timed_out: bool,
     /// The `stuck_exit` ask of the exit timeout is registered (also by a
@@ -3421,6 +3507,8 @@ impl ExitWatch {
     fn new(session: Option<SessionRef>, then: AfterExit) -> Self {
         Self {
             session,
+            since: Instant::now(),
+            background_noted: false,
             requested: None,
             timed_out: false,
             exit_asked: false,
@@ -3489,6 +3577,20 @@ impl ExitWatch {
             "wrapper heartbeat expired; session may still be alive"
         );
         match self.requested {
+            None if self.since.elapsed() < cmux.resume_timeout()
+                && background_running(&run.idle_marker_path()?)? =>
+            {
+                // A /exit now would stop at the "Background work is
+                // running" dialog; Claude Code takes the turn up again when
+                // the work ends and writes a marker without it.
+                if !self.background_noted {
+                    self.background_noted = true;
+                    log.note(&format!(
+                        "session of {} has background work running; /exit waits for it",
+                        run.id
+                    ));
+                }
+            }
             None => {
                 // Recorded before sending: the session may exit, and its
                 // wrapper record `session_exited`, before the send returns.
@@ -3616,39 +3718,87 @@ fn revise_request(
     Ok(lines.join("\n"))
 }
 
-/// Whether the marker exists and was modified after `since`.
-fn marker_newer_than(marker: &Path, since: SystemTime) -> Result<bool> {
-    match fs::metadata(marker) {
-        Ok(meta) => Ok(meta.modified()? > since),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(error) => Err(error).context("inspect idle marker"),
+/// The idle marker as the provider's Stop hook last wrote it: when, and the
+/// hook's input JSON. The agent is idle when it finished a response and
+/// left no background work running (task 147): Claude Code lists the
+/// background tasks of the turn in `background_tasks`, and a `/exit` sent
+/// while one is `running` stops at its "Background work is running" dialog,
+/// which stays until someone answers it. When the work ends, Claude Code
+/// takes the turn up again and the hook writes a new marker. A hook input
+/// without `background_tasks` (an older Claude Code) counts as idle. The
+/// screen is not read (ADR-0016).
+struct IdleMarker {
+    path: PathBuf,
+    modified: SystemTime,
+    hook: Value,
+}
+
+impl IdleMarker {
+    /// `None` when the hook never wrote one. Time and content come from one
+    /// open file, so they belong to the same write (the hook replaces the
+    /// marker by a rename).
+    fn read(path: &Path) -> Result<Option<Self>> {
+        let mut file = match fs::File::open(path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error).context("inspect idle marker"),
+        };
+        let modified = file.metadata()?.modified()?;
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).context("read idle marker")?;
+        Ok(Some(Self {
+            path: path.to_owned(),
+            modified,
+            hook: serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+        }))
+    }
+
+    /// Background work the agent left running when it stopped.
+    fn background_running(&self) -> bool {
+        self.hook
+            .get("background_tasks")
+            .and_then(Value::as_array)
+            .is_some_and(|tasks| tasks.iter().any(|task| task["status"] == "running"))
+    }
+
+    /// Idle, by a marker written after `since`.
+    fn idle_since(&self, since: SystemTime) -> bool {
+        !self.background_running() && self.modified > since
+    }
+
+    /// Evidence that the agent went idle after publishing the receipt: the
+    /// marker is no older than the receipt. Markers from earlier turns (for
+    /// example a question to the maintainer) do not count.
+    fn idle_after_receipt(&self, receipt: &Path) -> Result<Option<Value>> {
+        if self.background_running() {
+            return Ok(None);
+        }
+        self.stopped_after_receipt(receipt)
+    }
+
+    /// Evidence that the agent stopped after publishing the receipt, idle
+    /// or not (its background work still running).
+    fn stopped_after_receipt(&self, receipt: &Path) -> Result<Option<Value>> {
+        let receipt_modified = fs::metadata(receipt)?.modified()?;
+        if self.modified < receipt_modified {
+            return Ok(None);
+        }
+        let field = |name: &str| self.hook.get(name).cloned().unwrap_or(Value::Null);
+        Ok(Some(json!({
+            "marker_path": path_text(&self.path)?,
+            "marker_modified": unix_seconds(self.modified),
+            "receipt_modified": unix_seconds(receipt_modified),
+            "hook_event_name": field("hook_event_name"),
+            "session_id": field("session_id"),
+            "stop_hook_active": field("stop_hook_active"),
+            "background_running": self.background_running(),
+        })))
     }
 }
 
-/// Evidence that the agent finished a response after publishing the receipt: an
-/// idle marker written by the provider's stop hook no older than the receipt.
-/// Markers from earlier turns (for example a question to the maintainer) do not count.
-fn idle_after_receipt(receipt: &Path, marker: &Path) -> Result<Option<Value>> {
-    let marker_meta = match fs::metadata(marker) {
-        Ok(meta) => meta,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error).context("inspect idle marker"),
-    };
-    let receipt_modified = fs::metadata(receipt)?.modified()?;
-    let marker_modified = marker_meta.modified()?;
-    if marker_modified < receipt_modified {
-        return Ok(None);
-    }
-    let hook: Value = serde_json::from_str(&fs::read_to_string(marker)?).unwrap_or(Value::Null);
-    let field = |name: &str| hook.get(name).cloned().unwrap_or(Value::Null);
-    Ok(Some(json!({
-        "marker_path": path_text(marker)?,
-        "marker_modified": unix_seconds(marker_modified),
-        "receipt_modified": unix_seconds(receipt_modified),
-        "hook_event_name": field("hook_event_name"),
-        "session_id": field("session_id"),
-        "stop_hook_active": field("stop_hook_active"),
-    })))
+/// Whether the marker shows background work the agent left running.
+fn background_running(marker: &Path) -> Result<bool> {
+    Ok(IdleMarker::read(marker)?.is_some_and(|idle| idle.background_running()))
 }
 
 fn unix_seconds(time: SystemTime) -> i64 {
@@ -5883,5 +6033,69 @@ mod prompt_tests {
         assert_eq!(option_text("❯ 12. Twelve"), Some("Twelve"));
         assert_eq!(option_text(". none"), None);
         assert_eq!(PromptKind::Confirm.as_str(), "confirm");
+    }
+}
+
+#[cfg(test)]
+mod idle_tests {
+    use super::*;
+
+    fn idle_after_receipt(receipt: &Path, marker: &Path) -> Option<Value> {
+        IdleMarker::read(marker)
+            .unwrap()
+            .and_then(|idle| idle.idle_after_receipt(receipt).unwrap())
+    }
+
+    #[test]
+    fn idle_marker_is_idle_unless_background_work_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("idle.json");
+        let receipt = dir.path().join("receipt.json");
+        assert!(IdleMarker::read(&marker).unwrap().is_none());
+        assert!(!background_running(&marker).unwrap());
+        assert!(idle_after_receipt(&receipt, &marker).is_none());
+        fs::write(&receipt, "{}").unwrap();
+        let before = SystemTime::now() - Duration::from_secs(60);
+        for (hook, running) in [
+            // An older Claude Code writes no `background_tasks`.
+            (json!({"hook_event_name": "Stop"}), false),
+            (json!({"background_tasks": []}), false),
+            (
+                json!({"background_tasks": [{"id": "b1", "status": "completed"}]}),
+                false,
+            ),
+            (
+                json!({"background_tasks": [
+                    {"id": "b1", "status": "completed"},
+                    {"id": "b2", "type": "shell", "status": "running"}
+                ]}),
+                true,
+            ),
+        ] {
+            fs::write(&marker, hook.to_string()).unwrap();
+            let idle = IdleMarker::read(&marker).unwrap().unwrap();
+            assert_eq!(idle.background_running(), running, "{hook}");
+            assert_eq!(background_running(&marker).unwrap(), running);
+            assert_eq!(idle.idle_since(before), !running, "{hook}");
+            assert!(!idle.idle_since(SystemTime::now() + Duration::from_secs(60)));
+            assert_eq!(
+                idle_after_receipt(&receipt, &marker).is_some(),
+                !running,
+                "{hook}"
+            );
+            // Past the wait, the stop counts whatever still runs.
+            let stopped = idle.stopped_after_receipt(&receipt).unwrap().unwrap();
+            assert_eq!(stopped["background_running"], running);
+        }
+        // A marker that is not JSON still tells the agent stopped.
+        fs::write(&marker, "not json").unwrap();
+        let evidence = idle_after_receipt(&receipt, &marker).unwrap();
+        assert_eq!(evidence["hook_event_name"], Value::Null);
+        // Nor does a marker older than the receipt count.
+        fs::write(&marker, "{}").unwrap();
+        let file = fs::File::options().write(true).open(&marker).unwrap();
+        file.set_modified(SystemTime::now() - Duration::from_secs(3600))
+            .unwrap();
+        assert!(idle_after_receipt(&receipt, &marker).is_none());
     }
 }
