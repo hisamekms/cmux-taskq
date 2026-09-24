@@ -2,9 +2,12 @@
 id: adr-0037
 type: adr
 title: follow_upのdraft taskの採否をsupervisorが起動するheadlessのfollow-up triage jobが決め、判断がつかないものだけinboxで人に聞く
-status: accepted
+status: superseded
 created: 2026-09-24
 updated: 2026-09-24
+accepted_on: 2026-09-24
+superseded_by: adr-0041
+superseded_on: 2026-09-25
 owners:
   - hisamekms
 tags:
@@ -28,6 +31,8 @@ related:
 ---
 
 # ADR-0037: follow_upのdraft taskの採否をsupervisorが起動するheadlessのfollow-up triage jobが決め、判断がつかないものだけinboxで人に聞く
+
+> **置き換え済み（2026-09-25）**: このADRの決定は現在有効ではない。現行の決定は[ADR-0041](0041-on-demand-planners-proposals-submitted-and-plan-review-job.md)を読む。
 
 ## Context
 

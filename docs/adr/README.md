@@ -58,7 +58,6 @@ ADRは、将来の実装や運用に大きな影響を与える決定の理由�
 | [ADR-0020](0020-rebind-queue-to-a-moved-repository.md) | repositoryの移動はrebindサブコマンドでqueueの束縛を付け替える |  |
 | [ADR-0021](0021-maintainer-and-supervisor-workspace-names-follow-the-run-style.md) | maintainer / supervisor / resumeのcmux workspace名もrunと同じ`[<repo>]dagq <role>`にそろえる |  |
 | [ADR-0022](0022-ask-answer-inbox-planner-and-landing-on-doubt.md) | 相談をqueueのask / answerにし、upがinboxとplannerを開き、着地は疑義のあるときだけ人に聞き、cmux notifyはinbox宛てにする |  |
-| [ADR-0024](0024-retire-maintainer-into-jobs-and-observer.md) | maintainerを退役させ、review・triage・observerをheadlessのjobにし、observerの権限をnoteとdraft goalとaskに限り、goalにdraft状態を足す |  |
 | [ADR-0025](0025-leaseless-unfinished-run-is-a-recover-run-attention.md) | supervisorが手放した未完了runをattention（recover run）にする |  |
 | [ADR-0026](0026-identify-workspaces-by-uuid-env-and-queue-group.md) | cmux workspaceをtitleではなくqueue DBのUUIDで識別し、roleとqueueを--envで持たせ、queueごとのworkspace groupにまとめる |  |
 | [ADR-0027](0027-keep-worker-session-through-review-revise-verdict-and-merge-tree-precheck.md) | workerのsessionをreviewの後まで残し、機械的な指摘はrevise verdictで生きているworkerに返し、着地前にmerge-treeで衝突を事前判定する |  |
@@ -68,9 +67,9 @@ ADRは、将来の実装や運用に大きな影響を与える決定の理由�
 | [ADR-0031](0031-color-pill-and-pin-for-inbox-and-planner-and-unpin-before-close.md) | upがinbox / plannerのworkspaceに役割の色・status pill・ピンを当て、dagqのworkspace closeはピンを外してから閉じる |  |
 | [ADR-0035](0035-adr-is-superseded-whole-with-dates-and-banner.md) | ADRは丸ごと置き換え、置き換え・廃止の日付とstatusをfrontmatterと本文冒頭の注記に残す | 2026-09-24 |
 | [ADR-0036](0036-delete-frozen-work-records.md) | 凍結済みのdocs/journal/を削除し、今も効く手順と観測事実だけをdesign文書へ移す | 2026-09-25 |
-| [ADR-0037](0037-follow-up-triage-job-decides-follow-up-drafts.md) | follow_upのdraft taskの採否をsupervisorが起動するheadlessのfollow-up triage jobが決め、判断がつかないものだけinboxで人に聞く |  |
 | [ADR-0038](0038-task-depends-on-a-goal-until-it-is-achieved.md) | taskがgoalに依存でき、依存先のgoalがachievedで閉じるまでclaimされない | 2026-09-25 |
 | [ADR-0040](0040-verify-once-review-run-env-graph-stats-and-task-priority-in-claim-order.md) | 検証をintegrateの1回にし、reviewをsupervisorの工程にし、dagq.tomlでrunのenvを渡し、taskの5段階の優先度と解放数でclaim順を決め、statsで詰まりを数える | 2026-09-25 |
+| [ADR-0041](0041-on-demand-planners-proposals-submitted-and-plan-review-job.md) | 役割を5つにし、plannerをproposalごとのオンデマンドのworkspaceにし、taskにsubmitted状態を足し、supervisorが起動するplan review jobだけがreadyにし、follow_upのdraftもruntimeが立てるplannerのproposalとして同じgateを通す | 2026-09-25 |
 
 ## 置き換え・廃止されたADR
 
@@ -79,3 +78,5 @@ ADRは、将来の実装や運用に大きな影響を与える決定の理由�
 | ADR | Status | superseded_by | superseded_on |
 | --- | --- | --- | --- |
 | [ADR-0023](0023-verify-once-review-in-supervisor-run-env-graph-and-stats.md) | superseded | [ADR-0040](0040-verify-once-review-run-env-graph-stats-and-task-priority-in-claim-order.md) | 2026-09-25 |
+| [ADR-0024](0024-retire-maintainer-into-jobs-and-observer.md) | superseded | [ADR-0041](0041-on-demand-planners-proposals-submitted-and-plan-review-job.md) | 2026-09-25 |
+| [ADR-0037](0037-follow-up-triage-job-decides-follow-up-drafts.md) | superseded | [ADR-0041](0041-on-demand-planners-proposals-submitted-and-plan-review-job.md) | 2026-09-25 |

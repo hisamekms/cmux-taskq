@@ -2,9 +2,12 @@
 id: adr-0024
 type: adr
 title: maintainerを退役させ、review・triage・observerをheadlessのjobにし、observerの権限をnoteとdraft goalとaskに限り、goalにdraft状態を足す
-status: accepted
+status: superseded
 created: 2026-09-23
 updated: 2026-09-23
+accepted_on: 2026-09-23
+superseded_by: adr-0041
+superseded_on: 2026-09-25
 owners:
   - hisamekms
 tags:
@@ -32,6 +35,8 @@ related:
 ---
 
 # ADR-0024: maintainerを退役させ、review・triage・observerをheadlessのjobにし、observerの権限をnoteとdraft goalとaskに限り、goalにdraft状態を足す
+
+> **置き換え済み（2026-09-25）**: このADRの決定は現在有効ではない。現行の決定は[ADR-0041](0041-on-demand-planners-proposals-submitted-and-plan-review-job.md)を読む。
 
 ## Context
 
