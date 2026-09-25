@@ -2873,11 +2873,12 @@ fn claim_creates_a_lease_that_only_its_owner_can_use_or_release() {
     let raw = Connection::open(&db).unwrap();
     raw.execute("UPDATE run_leases SET heartbeat_at=0", [])
         .unwrap();
-    assert!(queue.plan_run(run.id(), "first", &plan).is_err()); // Stale.
     assert!(queue.release_lease(run.id(), "second").is_err());
     assert_eq!(queue.run_lease(run.id()).unwrap().unwrap().heartbeat_at, 0);
-    queue.heartbeat_leases("first").unwrap();
+    // A stale lease of the writer's own token is renewed, not refused
+    // (ADR-0039 decision 7).
     queue.plan_run(run.id(), "first", &plan).unwrap();
+    assert!(queue.run_lease(run.id()).unwrap().unwrap().heartbeat_at > 0);
     queue.release_lease(run.id(), "first").unwrap();
     assert!(queue.run_lease(run.id()).unwrap().is_none());
     assert!(queue.release_lease(run.id(), "first").is_err());
@@ -2961,11 +2962,9 @@ fn an_injected_clock_decides_lease_staleness_and_injected_ids_name_the_run() {
         receipt_path: "/run/receipt.json".into(),
         log_path: "/run/log".into(),
     };
-    // The store judges the lease by the same clock: stale one second past
-    // the timeout, fresh again after a heartbeat at that time.
+    // The store stamps heartbeats by the same clock, both the process
+    // heartbeat and the renewal of a lease-guarded write.
     clock.set(T + HEARTBEAT_TIMEOUT_SECS + 1);
-    let error = queue.plan_run(run.id(), "first", &plan).unwrap_err();
-    assert_eq!(error.to_string(), "run lease is missing or stale");
     assert_eq!(queue.heartbeat("first").unwrap(), 1);
     let lease = queue.run_lease(run.id()).unwrap().unwrap();
     assert_eq!(lease.heartbeat_at, T + HEARTBEAT_TIMEOUT_SECS + 1);
@@ -2973,7 +2972,119 @@ fn an_injected_clock_decides_lease_staleness_and_injected_ids_name_the_run() {
         queue.supervisors().unwrap()[0].heartbeat_at,
         T + HEARTBEAT_TIMEOUT_SECS + 1
     );
+    clock.set(T + HEARTBEAT_TIMEOUT_SECS + 5);
     queue.plan_run(run.id(), "first", &plan).unwrap();
+    let lease = queue.run_lease(run.id()).unwrap().unwrap();
+    assert_eq!(lease.heartbeat_at, T + HEARTBEAT_TIMEOUT_SECS + 5);
+}
+
+/// ADR-0039 decision 7: a host sleep jumps the wall clock 120 s past the
+/// last heartbeat between two lease-guarded writes. While the lease row
+/// still carries the supervisor's token, the next write renews it and goes
+/// on, so no other supervisor adopts the run afterwards. A supervisor that
+/// stays asleep until another one adopted its stale lease (the adoption of a
+/// dead supervisor's lease works as before) is refused and writes nothing.
+#[test]
+fn a_lease_of_its_own_token_is_renewed_after_a_host_sleep_until_another_supervisor_adopts_it() {
+    use dagq::{
+        domain::ClaimOutcome,
+        infrastructure::runtime_store::{RunPlan, lease_is_stale},
+    };
+    const T: i64 = 1_900_000_000;
+    const SLEEP: i64 = 120;
+    let (_dir, _repo, db) = fixture();
+    let clock = ManualClock::at(T);
+    let mut queue = SqliteQueue::open(&db).unwrap().with_generators(Generators {
+        clock: Arc::new(clock.clone()),
+        ids: Arc::new(FixedIds(Mutex::new(vec![
+            "11111111-1111-4111-8111-111111111111",
+            "22222222-2222-4222-8222-222222222222",
+        ]))),
+    });
+    add_ready_task(&mut queue, "second", &[]);
+    let plan = |run: &TaskRun| RunPlan {
+        repo_path: "/test".into(),
+        run_dir: format!("/run/{}", run.id()),
+        branch: format!("dagq/{}", run.id()),
+        worktree_path: format!("/run/{}/worktree", run.id()),
+        receipt_path: format!("/run/{}/receipt.json", run.id()),
+        log_path: format!("/run/{}/log", run.id()),
+    };
+    let base = sha("0123456789abcdef0123456789abcdef01234567");
+    let start = |queue: &mut SqliteQueue, token: &str| {
+        let ClaimOutcome::Claimed { run } = queue.claim_for_supervisor(&base, token).unwrap()
+        else {
+            panic!()
+        };
+        queue.plan_run(run.id(), token, &plan(&run)).unwrap();
+        run
+    };
+
+    // The sleeper claims and plans at T, then the host sleeps 120 s.
+    let run = start(&mut queue, "sleeper");
+    clock.set(T + SLEEP);
+    let lease = queue.run_lease(run.id()).unwrap().unwrap();
+    assert!(lease_is_stale(&lease, T + SLEEP));
+    // Woken up, it goes on with the run: every write renews the lease.
+    queue
+        .workspace_created(run.id(), "sleeper", "ws-1")
+        .unwrap();
+    let lease = queue.run_lease(run.id()).unwrap().unwrap();
+    assert_eq!(
+        (lease.token.as_str(), lease.heartbeat_at),
+        ("sleeper", T + SLEEP)
+    );
+    queue
+        .register_wrapper(run.id(), "sleeper", std::process::id())
+        .unwrap();
+    queue
+        .register_agent(run.id(), std::process::id(), std::process::id())
+        .unwrap();
+    assert_eq!(queue.run(run.id()).unwrap().status(), RunStatus::Running);
+    // The renewed lease is fresh, so another supervisor does not adopt it.
+    assert!(
+        queue
+            .adopt_run(run.id(), "sleeper", "other", 2, json!({}))
+            .unwrap()
+            .is_none()
+    );
+    assert!(queue.holds_lease(run.id(), "sleeper").unwrap());
+    assert_eq!(supervisor_token_of(&db, &run), "sleeper");
+    assert!(!queue.has_run_event(run.id(), "run_adopted").unwrap());
+
+    // A second run whose supervisor sleeps until another one adopts it.
+    let taken = start(&mut queue, "late");
+    queue.workspace_created(taken.id(), "late", "ws-2").unwrap();
+    queue
+        .register_wrapper(taken.id(), "late", std::process::id())
+        .unwrap();
+    queue
+        .register_agent(taken.id(), std::process::id(), std::process::id())
+        .unwrap();
+    clock.set(T + 2 * SLEEP);
+    let adopted = queue
+        .adopt_run(taken.id(), "late", "adopter", 3, json!({}))
+        .unwrap()
+        .unwrap();
+    assert_eq!(adopted.status(), RunStatus::Running);
+    let events = queue.show(taken.task_id()).unwrap().events.len();
+    // Woken up after the adoption, the late supervisor is refused and
+    // writes nothing: the lease, the run and its events stay the adopter's.
+    let error = queue.finish_supervision(taken.id(), "late").unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "run lease is missing or held by another supervisor"
+    );
+    let lease = queue.run_lease(taken.id()).unwrap().unwrap();
+    assert_eq!((lease.token.as_str(), lease.pid), ("adopter", 3));
+    assert_eq!(supervisor_token_of(&db, &taken), "adopter");
+    assert_eq!(queue.run(taken.id()).unwrap().status(), RunStatus::Running);
+    assert_eq!(queue.show(taken.task_id()).unwrap().events.len(), events);
+    // The adopter's own writes go on.
+    queue
+        .finish_supervision_live(taken.id(), "adopter")
+        .unwrap();
+    assert!(!queue.holds_lease(taken.id(), "late").unwrap());
 }
 
 #[test]
@@ -3014,7 +3125,7 @@ fn migration_from_v1_preserves_task_and_initializes_runtime_tables() {
 }
 
 #[test]
-fn wrapper_registration_is_one_shot_and_rejects_stale_owners() {
+fn wrapper_registration_is_one_shot_and_rejects_other_owners() {
     use dagq::{
         domain::ClaimOutcome,
         infrastructure::runtime_store::{RunPlan, Validation},
@@ -3049,9 +3160,10 @@ fn wrapper_registration_is_one_shot_and_rejects_stale_owners() {
     let raw = Connection::open(&db).unwrap();
     raw.execute("UPDATE run_leases SET heartbeat_at=0", [])
         .unwrap();
-    assert!(queue.register_wrapper(run.id(), "owner", 10).is_err());
-    queue.heartbeat_leases("owner").unwrap();
+    // A stale lease of the owner's token is renewed, not refused (ADR-0039
+    // decision 7).
     queue.register_wrapper(run.id(), "owner", 10).unwrap();
+    assert!(queue.run_lease(run.id()).unwrap().unwrap().heartbeat_at > 0);
     assert!(queue.register_wrapper(run.id(), "owner", 11).is_err());
     assert!(queue.register_agent(run.id(), 11, 12).is_err());
     queue.register_agent(run.id(), 10, 12).unwrap();
@@ -11749,9 +11861,12 @@ fn triage_answers_resume_the_run_or_ready_the_task() {
             .to_string()
             .contains("is leased")
     );
+    // A stale lease (its triage's supervisor stalled) does not block the
+    // answer, and it goes with it: woken up, that supervisor cannot renew
+    // it and write after the decision (ADR-0039 decision 7).
     Connection::open(&db)
         .unwrap()
-        .execute("DELETE FROM run_leases", [])
+        .execute("UPDATE run_leases SET heartbeat_at=0", [])
         .unwrap();
     queue
         .decide_triage(run.id(), second.id, "retry", "x")
@@ -11759,6 +11874,19 @@ fn triage_answers_resume_the_run_or_ready_the_task() {
     assert_eq!(
         queue.show(TaskId::new(1)).unwrap().task.status(),
         TaskStatus::Ready
+    );
+    assert!(queue.run_lease(run.id()).unwrap().is_none());
+    assert!(
+        queue
+            .finish_triage(
+                run.id(),
+                "other",
+                &dagq::application::TriageAction::Retry,
+                json!({}),
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("run lease is missing")
     );
 }
 

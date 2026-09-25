@@ -550,7 +550,7 @@ impl SqliteQueue {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        assert_lease(&tx, id, token, self.generators.clock.now())?;
+        renew_lease(&tx, id, token, self.generators.clock.now())?;
         apply(
             &tx,
             refusals(&self.runs_dir, &self.generators),
@@ -568,7 +568,7 @@ impl SqliteQueue {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        assert_lease(&tx, id, token, self.generators.clock.now())?;
+        renew_lease(&tx, id, token, self.generators.clock.now())?;
         apply(
             &tx,
             refusals(&self.runs_dir, &self.generators),
@@ -743,7 +743,7 @@ impl SqliteQueue {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        assert_lease(&tx, id, token, self.generators.clock.now())?;
+        renew_lease(&tx, id, token, self.generators.clock.now())?;
         let allowed =
             supervised_run(&tx, id, token)?.is_some_and(|run| run::check_resumable(&run).is_ok());
         ensure!(allowed, "run is not being resumed by this supervisor");
@@ -786,7 +786,7 @@ impl SqliteQueue {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        assert_lease(&tx, id, token, self.generators.clock.now())?;
+        renew_lease(&tx, id, token, self.generators.clock.now())?;
         let allowed = supervised_run(&tx, id, token)?
             .is_some_and(|run| run::check_ready_for_wrapper(&run).is_ok());
         ensure!(allowed, "run is not ready for its wrapper");
@@ -932,7 +932,7 @@ impl SqliteQueue {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        assert_lease(&tx, id, token, self.generators.clock.now())?;
+        renew_lease(&tx, id, token, self.generators.clock.now())?;
         let code: i32 = tx.query_row(
             "SELECT exit_code FROM run_processes WHERE run_id=?1 AND role='wrapper' AND exited_at IS NOT NULL",
             [id], |r| r.get(0)
@@ -963,7 +963,7 @@ impl SqliteQueue {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        assert_lease(&tx, id, token, self.generators.clock.now())?;
+        renew_lease(&tx, id, token, self.generators.clock.now())?;
         let run = apply(
             &tx,
             refusals(&self.runs_dir, &self.generators),
@@ -990,7 +990,7 @@ impl SqliteQueue {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        assert_lease(&tx, id, token, self.generators.clock.now())?;
+        renew_lease(&tx, id, token, self.generators.clock.now())?;
         let run = apply(
             &tx,
             refusals(&self.runs_dir, &self.generators),
@@ -1047,7 +1047,7 @@ impl SqliteQueue {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        assert_lease(&tx, id, token, self.generators.clock.now())?;
+        renew_lease(&tx, id, token, self.generators.clock.now())?;
         let refusal = || "run is not validating under this supervisor".to_owned();
         let run = apply(
             &tx,
@@ -1433,7 +1433,7 @@ impl SqliteQueue {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        assert_lease(&tx, id, token, self.generators.clock.now())?;
+        renew_lease(&tx, id, token, self.generators.clock.now())?;
         if let Some(status) = status {
             apply(
                 &tx,
@@ -1541,7 +1541,7 @@ impl SqliteQueue {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        assert_lease(&tx, id, token, self.generators.clock.now())?;
+        renew_lease(&tx, id, token, self.generators.clock.now())?;
         let run = apply(
             &tx,
             refusals(&self.runs_dir, &self.generators),
@@ -1577,7 +1577,7 @@ impl SqliteQueue {
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let at = self.generators.clock.system_time();
-        assert_lease(&tx, id, token, unix_seconds(at))?;
+        renew_lease(&tx, id, token, unix_seconds(at))?;
         let run = apply(
             &tx,
             refusals(&self.runs_dir, &self.generators),
@@ -1655,7 +1655,7 @@ impl SqliteQueue {
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let now = self.generators.clock.now();
-        assert_lease(&tx, id, token, now)?;
+        renew_lease(&tx, id, token, now)?;
         let result = apply(
             &tx,
             refusals(&self.runs_dir, &self.generators),
@@ -1687,7 +1687,7 @@ impl SqliteQueue {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        assert_lease(&tx, id, token, self.generators.clock.now())?;
+        renew_lease(&tx, id, token, self.generators.clock.now())?;
         let result = apply(
             &tx,
             refusals(&self.runs_dir, &self.generators),
@@ -1800,7 +1800,7 @@ impl SqliteQueue {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        assert_lease(&tx, id, token, self.generators.clock.now())?;
+        renew_lease(&tx, id, token, self.generators.clock.now())?;
         let run = tx.query_row(
             "SELECT * FROM task_runs WHERE id=?1",
             [id],
@@ -2048,6 +2048,9 @@ impl SqliteQueue {
             lease.is_none_or(|lease| lease_is_stale(&lease, now)),
             "run {id} is leased"
         );
+        // The stale lease goes, so its holder cannot renew it and write
+        // after this decision (ADR-0039 decision 7).
+        tx.execute("DELETE FROM run_leases WHERE run_id=?1", [id])?;
         let run = tx.query_row(
             "SELECT * FROM task_runs WHERE id=?1",
             [id],
@@ -2271,14 +2274,21 @@ fn not_at_rest() -> String {
         .to_owned()
 }
 
-/// Whether `token` holds a lease on the run that is fresh at `now`.
-fn assert_lease(conn: &Connection, id: &RunId, token: &str, now: i64) -> Result<()> {
-    let valid: bool = conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM run_leases WHERE run_id=?1 AND token=?2 AND heartbeat_at >= ?3-?4)",
-        params![id, token, now, HEARTBEAT_TIMEOUT_SECS],
-        |r| r.get(0),
+/// Renew `token`'s lease on the run at `now`, inside the caller's
+/// `BEGIN IMMEDIATE` transaction, or refuse when the lease row is gone or
+/// carries another token (ADR-0039 decision 7). A heartbeat older than
+/// `HEARTBEAT_TIMEOUT_SECS` is no reason to refuse: after a host sleep the
+/// row is still this supervisor's until an adopter swaps the token or
+/// `recover` removes it, and SQLite serializes that write with this one.
+fn renew_lease(conn: &Connection, id: &RunId, token: &str, now: i64) -> Result<()> {
+    let renewed = conn.execute(
+        "UPDATE run_leases SET heartbeat_at=?3 WHERE run_id=?1 AND token=?2",
+        params![id, token, now],
     )?;
-    ensure!(valid, "run lease is missing or stale");
+    ensure!(
+        renewed == 1,
+        "run lease is missing or held by another supervisor"
+    );
     Ok(())
 }
 
