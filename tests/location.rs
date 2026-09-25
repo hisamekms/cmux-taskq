@@ -1,5 +1,10 @@
 //! Queue resolution from the working directory: one queue per repository under
 //! the user data directory, shared by all of its worktrees.
+
+mod common;
+
+use common::Bounded;
+
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -15,7 +20,7 @@ fn git(repo: &Path, args: &[&str]) {
         .arg("-C")
         .arg(repo)
         .args(args)
-        .output()
+        .bounded_output()
         .unwrap();
     assert!(
         result.status.success(),
@@ -46,7 +51,7 @@ fn invoke(cwd: &Path, env: &[(&str, &Path)], args: &[&str]) -> Output {
     for (key, value) in env {
         command.env(key, value);
     }
-    command.output().unwrap()
+    command.bounded_output().unwrap()
 }
 
 fn ok(cwd: &Path, env: &[(&str, &Path)], args: &[&str]) -> Value {

@@ -1,3 +1,7 @@
+mod common;
+
+use common::Bounded;
+
 use anyhow::{Result, bail, ensure};
 use dagq::{
     VERSION,
@@ -51,7 +55,7 @@ fn git(repo: &Path, args: &[&str]) {
         .arg("-C")
         .arg(repo)
         .args(args)
-        .output()
+        .bounded_output()
         .unwrap();
     assert!(
         result.status.success(),
@@ -73,10 +77,12 @@ macro_rules! watchdog {
 
 /// A test's directory with its repository and queue. Dropping it, when the
 /// test returns or panics, kills every stub agent started on its queue with
-/// all their children, so none outlives the test (task 317).
+/// all their children, so none outlives the test (task 317). The test is
+/// timed while it is held (task 324).
 struct Fixture {
     db: PathBuf,
     dir: TempDir,
+    _test: common::Waiting,
 }
 impl Fixture {
     fn path(&self) -> &Path {
@@ -150,7 +156,7 @@ impl Spawned for Stub {
 fn running(pid: u32) -> bool {
     let out = Command::new("ps")
         .args(["-o", "stat=", "-p", &pid.to_string()])
-        .output()
+        .bounded_output()
         .unwrap();
     let stat = String::from_utf8_lossy(&out.stdout);
     !stat.trim().is_empty() && !stat.trim().starts_with('Z')
@@ -256,6 +262,7 @@ fn fixture() -> (Fixture, PathBuf, PathBuf) {
         Fixture {
             db: db.clone(),
             dir,
+            _test: common::test(),
         },
         repo,
         db,
@@ -637,10 +644,14 @@ impl TestWorkspace {
             .lock()
             .unwrap()
             .iter_mut()
-            .filter_map(|(_, s)| s.worker.take())
+            .filter_map(|(id, s)| s.worker.take().map(|worker| (id.clone(), worker)))
             .collect();
-        for worker in workers {
-            worker.join().unwrap().unwrap();
+        for (id, worker) in workers {
+            joined(
+                worker,
+                format!("the session wrapper of workspace {id} to return (its stub agent to exit)"),
+            )
+            .unwrap();
         }
     }
     fn session_run_dir(&self, workspace_id: &str) -> String {
@@ -1042,6 +1053,7 @@ fn supervise_with(
     backend: &TestWorkspace,
     options: &SuperviseOptions,
 ) -> Result<Value> {
+    let _waiting = common::within(common::STEP_LIMIT, "supervise to return");
     runtime::supervise(
         db,
         repo,
@@ -1065,6 +1077,15 @@ fn other_asks(queue: &mut SqliteQueue, all: bool) -> Vec<dagq::domain::Ask> {
         .into_iter()
         .filter(|ask| ask.kind != AskKind::ApproveLanding)
         .collect()
+}
+
+/// Join `thread`, failing the test with `what` if it has not returned
+/// within [`common::STEP_LIMIT`]; a panic in it fails the test as is.
+fn joined<T>(thread: thread::JoinHandle<T>, what: impl Into<String>) -> T {
+    let _waiting = common::within(common::STEP_LIMIT, what);
+    thread
+        .join()
+        .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
 }
 
 /// Poll the queue until `condition` holds or the deadline passes.
@@ -1233,7 +1254,7 @@ fn valid_receipt_is_verified_and_awaits_integration() {
         .arg("-C")
         .arg(run.worktree_path().unwrap())
         .args(["rev-parse", "HEAD"])
-        .output()
+        .bounded_output()
         .unwrap();
     assert_eq!(String::from_utf8(head.stdout).unwrap().trim(), commit);
     assert_eq!(
@@ -1298,7 +1319,7 @@ fn valid_receipt_is_verified_and_awaits_integration() {
         .arg("-C")
         .arg(run.worktree_path().unwrap())
         .args(["symbolic-ref", "HEAD"])
-        .output()
+        .bounded_output()
         .unwrap();
     assert_eq!(
         String::from_utf8(branch.stdout).unwrap().trim(),
@@ -1807,7 +1828,7 @@ fn the_first_commit_is_observed_once_while_the_session_works() {
         "",
     )
     .unwrap();
-    let outcome = supervisor.join().unwrap().unwrap();
+    let outcome = joined(supervisor, "the supervisor thread to return").unwrap();
     backend.join();
     assert_eq!(outcome["errors"], json!([]), "{outcome}");
     assert_eq!(outcome["runs"][0]["status"], "awaiting_integration");
@@ -1960,7 +1981,7 @@ fn a_dialog_on_the_screen_is_asked_once_and_cleared() {
         "",
     )
     .unwrap();
-    let outcome = supervisor.join().unwrap().unwrap();
+    let outcome = joined(supervisor, "the supervisor thread to return").unwrap();
     backend.join();
     assert_eq!(outcome["errors"], json!([]), "{outcome}");
     assert_eq!(outcome["runs"][0]["status"], "awaiting_integration");
@@ -2089,7 +2110,7 @@ fn sessions_stopped_at_the_same_login_share_one_authentication_ask() {
         )
         .unwrap();
     }
-    let outcome = supervisor.join().unwrap().unwrap();
+    let outcome = joined(supervisor, "the supervisor thread to return").unwrap();
     backend.join();
     assert_eq!(outcome["errors"], json!([]), "{outcome}");
     assert_eq!(auth_events(&mut queue), [1, 1]);
@@ -2201,7 +2222,7 @@ fn an_answered_worker_question_is_typed_into_the_idle_worker_and_closed() {
     wait_until(&db, Duration::from_secs(30), |queue| {
         queue.read_ask(ask.id).unwrap().closed_at.is_some()
     });
-    let outcome = supervisor.join().unwrap().unwrap();
+    let outcome = joined(supervisor, "the supervisor thread to return").unwrap();
     backend.join();
     assert_eq!(outcome["errors"], json!([]), "{outcome}");
     assert_eq!(outcome["runs"][0]["status"], "awaiting_integration");
@@ -2292,7 +2313,7 @@ fn a_failed_answer_delivery_is_left_to_the_inbox() {
 
     let run = detail.runs[0].clone();
     release_held_session(run.run_dir().unwrap());
-    let outcome = supervisor.join().unwrap().unwrap();
+    let outcome = joined(supervisor, "the supervisor thread to return").unwrap();
     backend.join();
     assert_eq!(outcome["runs"][0]["status"], "awaiting_integration");
     assert_eq!(backend.texts().len(), 1);
@@ -2469,7 +2490,7 @@ fn unanswered_exit_request_times_out_and_keeps_the_run() {
     assert!(runtime::recover(&db, run.id()).is_err());
 
     release_held_session(run.run_dir().unwrap());
-    let outcome = supervisor.join().unwrap().unwrap();
+    let outcome = joined(supervisor, "the supervisor thread to return").unwrap();
     backend.join();
     assert_eq!(outcome["errors"], json!([]), "{outcome}");
     assert_eq!(outcome["runs"][0]["status"], "awaiting_integration");
@@ -2590,6 +2611,7 @@ fn claude_stop_hook_settings_publish_the_idle_marker() {
         .spawn()
         .and_then(|mut child| {
             use std::io::Write;
+            let _waiting = common::within(common::STEP_LIMIT, "the Stop hook to exit");
             child.stdin.take().unwrap().write_all(payload.as_bytes())?;
             child.wait()
         })
@@ -3264,7 +3286,7 @@ fn shell_arguments_round_trip_without_expansion_and_cmux_handles_are_strict() {
     let result = Command::new("/bin/sh")
         .arg("-c")
         .arg(shell_join(&["printf".into(), "%s".into(), value.into()]))
-        .output()
+        .bounded_output()
         .unwrap();
     assert!(result.status.success());
     assert_eq!(String::from_utf8(result.stdout).unwrap(), value);
@@ -3546,7 +3568,7 @@ fn resident_supervisor_without_runs_is_listed_until_it_stops() {
     assert!(queue.run_leases().unwrap().is_empty());
 
     options.stop.store(true, Ordering::SeqCst);
-    let outcome = supervisor.join().unwrap().unwrap();
+    let outcome = joined(supervisor, "the supervisor thread to return").unwrap();
     assert_eq!(outcome["outcome"], "stopped");
     assert_eq!(outcome["runs"], json!([]));
     assert!(queue.supervisors().unwrap().is_empty());
@@ -3571,7 +3593,10 @@ fn resident_supervisor_without_runs_is_listed_until_it_stops() {
     queue
         .transition(TaskId::new(1), TaskAction::BypassReview)
         .unwrap();
-    let error = format!("{:#}", supervisor.join().unwrap().unwrap_err());
+    let error = format!(
+        "{:#}",
+        joined(supervisor, "the supervisor thread to return").unwrap_err()
+    );
     assert!(error.contains("Needed a single revision"), "{error}");
     assert!(queue.supervisors().unwrap().is_empty());
     assert!(queue.show(TaskId::new(1)).unwrap().runs.is_empty());
@@ -3781,7 +3806,7 @@ fn pid_alive(pid: u32) -> bool {
     Command::new("kill")
         .args(["-0", &pid.to_string()])
         .stderr(std::process::Stdio::null())
-        .status()
+        .bounded_status()
         .unwrap()
         .success()
 }
@@ -4245,7 +4270,7 @@ fn git_out(repo: &Path, args: &[&str]) -> String {
         .arg("-C")
         .arg(repo)
         .args(args)
-        .output()
+        .bounded_output()
         .unwrap();
     assert!(
         result.status.success(),
@@ -4446,7 +4471,7 @@ fn git_adapter_pushes_main_to_a_bare_origin() {
     let made = Command::new("git")
         .args(["init", "--bare", "-b", "main"])
         .arg(&origin)
-        .output()
+        .bounded_output()
         .unwrap();
     assert!(made.status.success());
     git(
@@ -5621,7 +5646,7 @@ fn conflicting_run_needs_a_session_and_lands_after_the_session_resolves_it() {
         .arg("-C")
         .arg(&worktree)
         .args(["rebase", &first_landed])
-        .output()
+        .bounded_output()
         .unwrap();
     assert!(!rebase.status.success());
     fs::write(worktree.join("change.txt"), "resolved by the session\n").unwrap();
@@ -5631,7 +5656,7 @@ fn conflicting_run_needs_a_session_and_lands_after_the_session_resolves_it() {
         .arg(&worktree)
         .env("GIT_EDITOR", "true")
         .args(["rebase", "--continue"])
-        .status()
+        .bounded_status()
         .unwrap();
     assert!(status.success());
     let resolved = git_out(&worktree, &["rev-parse", "HEAD"]);
@@ -6114,7 +6139,7 @@ fn resolve_in_worktree(run: &TaskRun, main: &str) -> String {
         .arg("-C")
         .arg(worktree)
         .args(["rebase", main])
-        .output()
+        .bounded_output()
         .unwrap();
     assert!(!rebase.status.success());
     fs::write(worktree.join("change.txt"), "resolved by the session\n").unwrap();
@@ -6124,7 +6149,7 @@ fn resolve_in_worktree(run: &TaskRun, main: &str) -> String {
         .arg(worktree)
         .env("GIT_EDITOR", "true")
         .args(["rebase", "--continue"])
-        .status()
+        .bounded_status()
         .unwrap();
     assert!(status.success());
     git_out(worktree, &["rev-parse", "HEAD"])
@@ -6412,37 +6437,139 @@ type Spoil = fn(&Path, &Path, &TaskRun, &str);
 
 /// A parked run lacking any one condition of the skip is resumed as
 /// before: the resume uses an attempt (and fails here, the backend having
-/// no resume script) and no `resume_skipped` is recorded.
+/// no resume script) and no `resume_skipped` is recorded. `resumed` says
+/// whether an unresolved resume came before. One test per condition, so
+/// the conditions run in parallel (task 324: the eight in one test took
+/// over a minute).
+fn a_run_missing_a_condition_of_the_skip_is_resumed(case: &str, resumed: bool, spoil: Spoil) {
+    let (_dir, repo, db) = fixture();
+    let backend = TestWorkspace::new(&db, false, VALID_AGENT);
+    let (run, first_landed) = parked_conflict(&repo, &db, &backend);
+    if case == "a person sent it back" {
+        SqliteQueue::open(&db)
+            .unwrap()
+            .record_runtime_event(
+                run.id(),
+                "landing_decided",
+                json!({"status": "needs_session", "reason": "findings sent back"}),
+            )
+            .unwrap();
+    }
+    if resumed {
+        unresolved_attempt(&db, &run, &first_landed);
+    }
+    let resolved = resolve_in_worktree(&run, &first_landed);
+    write_receipt(&run, &resolved, "succeeded", "resolved");
+    spoil(&repo, &db, &run, &resolved);
+
+    let outcome = supervise(&db, &repo, &backend).unwrap();
+    assert_eq!(
+        outcome["errors"].as_array().unwrap().len(),
+        1,
+        "{case}: {outcome}"
+    );
+    let mut queue = SqliteQueue::open(&db).unwrap();
+    let detail = queue.show(TaskId::new(2)).unwrap();
+    assert!(
+        payloads(&detail, "resume_skipped").is_empty(),
+        "{case}: {:?}",
+        event_kinds(&detail)
+    );
+    let started = payloads(&detail, "resume_started");
+    assert_eq!(started.len(), usize::from(resumed) + 1, "{case}");
+    let finished = payloads(&detail, "resume_finished");
+    assert_eq!(finished.last().unwrap()["outcome"], "error", "{case}");
+    assert_eq!(detail.runs[0].status(), RunStatus::NeedsSession, "{case}");
+}
+
 #[test]
-fn a_run_missing_any_condition_of_the_skip_is_resumed() {
-    let cases: [(&str, Spoil); 8] = [
-        ("no resume since it was parked", |_, _, _, _| {}),
-        // Recorded before the unresolved attempt below.
-        ("a person sent it back", |_, _, _, _| {}),
-        ("the receipt names the old head", |_, _, run, _| {
+fn a_run_not_resumed_since_it_was_parked_is_resumed() {
+    a_run_missing_a_condition_of_the_skip_is_resumed(
+        "no resume since it was parked",
+        false,
+        |_, _, _, _| {},
+    );
+}
+
+#[test]
+fn a_run_a_person_sent_back_is_resumed() {
+    // Recorded before the unresolved attempt.
+    a_run_missing_a_condition_of_the_skip_is_resumed(
+        "a person sent it back",
+        true,
+        |_, _, _, _| {},
+    );
+}
+
+#[test]
+fn a_run_whose_receipt_names_the_old_head_is_resumed() {
+    a_run_missing_a_condition_of_the_skip_is_resumed(
+        "the receipt names the old head",
+        true,
+        |_, _, run, _| {
             write_receipt(
                 run,
                 run.result_commit().unwrap().as_str(),
                 "succeeded",
                 "stale",
             );
-        }),
-        ("the worktree is dirty", |_, _, run, _| {
+        },
+    );
+}
+
+#[test]
+fn a_run_with_a_dirty_worktree_is_resumed() {
+    a_run_missing_a_condition_of_the_skip_is_resumed(
+        "the worktree is dirty",
+        true,
+        |_, _, run, _| {
             let worktree = Path::new(run.worktree_path().unwrap());
             fs::write(worktree.join("stray.txt"), "left over\n").unwrap();
-        }),
-        ("main moved past the head", |repo, _, _, _| {
+        },
+    );
+}
+
+#[test]
+fn a_run_main_moved_past_is_resumed() {
+    a_run_missing_a_condition_of_the_skip_is_resumed(
+        "main moved past the head",
+        true,
+        |repo, _, _, _| {
             git(repo, &["commit", "-q", "--allow-empty", "-m", "moved on"]);
-        }),
-        ("the receipt is another run's", |_, _, run, resolved| {
+        },
+    );
+}
+
+#[test]
+fn a_run_with_another_runs_receipt_is_resumed() {
+    a_run_missing_a_condition_of_the_skip_is_resumed(
+        "the receipt is another run's",
+        true,
+        |_, _, run, resolved| {
             let mut receipt = session_receipt(run, resolved, "succeeded", "resolved");
             receipt["run_id"] = json!("another-run");
             write_receipt_json(run, receipt);
-        }),
-        ("the receipt reports failed", |_, _, run, resolved| {
+        },
+    );
+}
+
+#[test]
+fn a_run_whose_receipt_reports_failed_is_resumed() {
+    a_run_missing_a_condition_of_the_skip_is_resumed(
+        "the receipt reports failed",
+        true,
+        |_, _, run, resolved| {
             write_receipt(run, resolved, "failed", "gave up");
-        }),
-        ("the required evidence is missing", |_, db, run, _| {
+        },
+    );
+}
+
+#[test]
+fn a_run_missing_the_required_evidence_is_resumed() {
+    a_run_missing_a_condition_of_the_skip_is_resumed(
+        "the required evidence is missing",
+        true,
+        |_, db, run, _| {
             Connection::open(db)
                 .unwrap()
                 .execute(
@@ -6450,48 +6577,8 @@ fn a_run_missing_any_condition_of_the_skip_is_resumed() {
                     [run.task_id()],
                 )
                 .unwrap();
-        }),
-    ];
-    for (index, (case, spoil)) in cases.into_iter().enumerate() {
-        let (_dir, repo, db) = fixture();
-        let backend = TestWorkspace::new(&db, false, VALID_AGENT);
-        let (run, first_landed) = parked_conflict(&repo, &db, &backend);
-        if case == "a person sent it back" {
-            SqliteQueue::open(&db)
-                .unwrap()
-                .record_runtime_event(
-                    run.id(),
-                    "landing_decided",
-                    json!({"status": "needs_session", "reason": "findings sent back"}),
-                )
-                .unwrap();
-        }
-        if index != 0 {
-            unresolved_attempt(&db, &run, &first_landed);
-        }
-        let resolved = resolve_in_worktree(&run, &first_landed);
-        write_receipt(&run, &resolved, "succeeded", "resolved");
-        spoil(&repo, &db, &run, &resolved);
-
-        let outcome = supervise(&db, &repo, &backend).unwrap();
-        assert_eq!(
-            outcome["errors"].as_array().unwrap().len(),
-            1,
-            "{case}: {outcome}"
-        );
-        let mut queue = SqliteQueue::open(&db).unwrap();
-        let detail = queue.show(TaskId::new(2)).unwrap();
-        assert!(
-            payloads(&detail, "resume_skipped").is_empty(),
-            "{case}: {:?}",
-            event_kinds(&detail)
-        );
-        let started = payloads(&detail, "resume_started");
-        assert_eq!(started.len(), usize::from(index != 0) + 1, "{case}");
-        let finished = payloads(&detail, "resume_finished");
-        assert_eq!(finished.last().unwrap()["outcome"], "error", "{case}");
-        assert_eq!(detail.runs[0].status(), RunStatus::NeedsSession, "{case}");
-    }
+        },
+    );
 }
 
 /// A resume that cannot start, or a session that cannot resolve the run,
@@ -7452,7 +7539,7 @@ fn independent_tasks_run_concurrently_and_a_dependent_starts_after_integration()
 
     // A graceful stop ends the loop once nothing is active.
     options.stop.store(true, Ordering::SeqCst);
-    let outcome = supervisor.join().unwrap().unwrap();
+    let outcome = joined(supervisor, "the supervisor thread to return").unwrap();
     backend.join();
     assert_eq!(outcome["outcome"], "stopped");
     assert_eq!(outcome["runs"].as_array().unwrap().len(), 3);
@@ -7524,7 +7611,7 @@ fn a_timed_out_run_is_kept_while_the_other_run_is_accepted() {
     assert!(runtime::recover(&db, stuck.id()).is_err());
 
     release_held_session(stuck.run_dir().unwrap());
-    let outcome = supervisor.join().unwrap().unwrap();
+    let outcome = joined(supervisor, "the supervisor thread to return").unwrap();
     backend.join();
     assert_eq!(outcome["outcome"], "finished");
     assert_eq!(outcome["errors"], json!([]), "{outcome}");
@@ -8137,7 +8224,7 @@ fn adopter_does_not_repeat_an_exit_request_the_previous_supervisor_sent() {
     // Several passes over the idle session send nothing.
     thread::sleep(Duration::from_millis(500));
     release_held_session(run.run_dir().unwrap());
-    let outcome = supervisor.join().unwrap().unwrap();
+    let outcome = joined(supervisor, "the supervisor thread to return").unwrap();
     backend.join();
     assert_eq!(
         outcome["runs"][0]["status"], "awaiting_integration",
@@ -8194,7 +8281,7 @@ fn adopted_exit_request_times_out_from_the_adoption() {
     assert_ne!(lease.token, "dead-supervisor");
     // Let the fake session out, the way a person answering it would.
     fs::write(exit_request_path(run.run_dir().unwrap()), "").unwrap();
-    let outcome = supervisor.join().unwrap().unwrap();
+    let outcome = joined(supervisor, "the supervisor thread to return").unwrap();
     backend.join();
     assert_eq!(outcome["errors"], json!([]), "{outcome}");
     assert_eq!(outcome["runs"][0]["status"], "awaiting_integration");
@@ -8263,7 +8350,7 @@ fn adopted_run_does_not_record_an_exit_timeout_twice() {
     assert_eq!(asks[0].kind, AskKind::StuckExit);
     assert_eq!(backend.notifications.lock().unwrap().len(), 1);
     fs::write(exit_request_path(run.run_dir().unwrap()), "").unwrap();
-    let outcome = supervisor.join().unwrap().unwrap();
+    let outcome = joined(supervisor, "the supervisor thread to return").unwrap();
     backend.join();
     assert_eq!(outcome["errors"], json!([]), "{outcome}");
     assert_eq!(outcome["runs"][0]["status"], "awaiting_integration");
@@ -8338,7 +8425,7 @@ fn adopted_run_does_not_ask_about_its_exit_twice() {
         1
     );
     fs::write(exit_request_path(run.run_dir().unwrap()), "").unwrap();
-    let outcome = supervisor.join().unwrap().unwrap();
+    let outcome = joined(supervisor, "the supervisor thread to return").unwrap();
     backend.join();
     assert_eq!(outcome["errors"], json!([]), "{outcome}");
     assert_eq!(outcome["runs"][0]["status"], "awaiting_integration");
@@ -8458,7 +8545,7 @@ fn two_supervisors_racing_for_one_stale_lease_adopt_it_once() {
         .collect();
     let outcomes: Vec<Value> = racers
         .into_iter()
-        .map(|racer| racer.join().unwrap().unwrap())
+        .map(|racer| joined(racer, "a racing supervisor thread to return").unwrap())
         .collect();
     backend.join();
     let driven: Vec<&Value> = outcomes
@@ -8587,7 +8674,7 @@ fn a_supervisor_that_lost_its_lease_stops_touching_the_run() {
         .unwrap();
     // The original notices within a tick, drops the run and, draining with
     // nothing active, exits.
-    let outcome = original.join().unwrap().unwrap();
+    let outcome = joined(original, "the first supervisor thread to return").unwrap();
     assert_eq!(queue.run(run.id()).unwrap().status(), RunStatus::Running);
     assert_eq!(queue.run_lease(run.id()).unwrap().unwrap().token, "taken");
     let adopter = supervise(&db, &repo, &backend).unwrap();
@@ -8793,7 +8880,7 @@ fn asks_of_a_run_are_attention_for_the_inbox_until_closed() {
     let opened = queue.ask(new_ask(&"q".repeat(250))).unwrap();
     assert!(opened.created);
     assert_eq!(opened.ask.task_id, Some(run.task_id()));
-    let woke = watcher.join().unwrap();
+    let woke = joined(watcher, "the watch thread to return");
     assert_eq!(
         woke["events"],
         json!([{"id": before + 1, "kind": "ask_opened", "task_id": 1, "run_id": run.id(),
@@ -9179,7 +9266,7 @@ fn status_reports_failed_runs_and_unanswered_exit_requests() {
             reason_category: dagq::domain::AskReason::RecoveryFailed,
         })
         .unwrap();
-    let woke = watcher.join().unwrap();
+    let woke = joined(watcher, "the watch thread to return");
     assert_eq!(woke["events"].as_array().unwrap().len(), 1, "{woke}");
     assert_eq!(woke["events"][0]["kind"], "ask_opened");
     let status = runtime::status(&db).unwrap();
@@ -9300,7 +9387,7 @@ fn watch_returns_when_supervisor_registrations_or_health_change() {
     // A supervisor registers.
     let watcher = spawn_watch(&db, Some(cursor));
     queue.register_supervisor("first", pid, 2, VERSION).unwrap();
-    let woke = watcher.join().unwrap();
+    let woke = joined(watcher, "the watch thread to return");
     assert_eq!(woke["events"], json!([]));
     assert_eq!(woke["supervisors_changed"], true);
     assert_eq!(woke["cursor"], json!(cursor));
@@ -9323,7 +9410,7 @@ fn watch_returns_when_supervisor_registrations_or_health_change() {
         .unwrap()
         .execute("UPDATE supervisors SET heartbeat_at=0", [])
         .unwrap();
-    let woke = watcher.join().unwrap();
+    let woke = joined(watcher, "the watch thread to return");
     assert_eq!(woke["supervisors_changed"], true);
     assert_eq!(woke["supervisors"][0]["stale"], true);
     let status = runtime::status(&db).unwrap();
@@ -9339,7 +9426,7 @@ fn watch_returns_when_supervisor_registrations_or_health_change() {
     // Its registration disappears.
     let watcher = spawn_watch(&db, Some(cursor));
     assert!(queue.deregister_supervisor("first").unwrap());
-    let woke = watcher.join().unwrap();
+    let woke = joined(watcher, "the watch thread to return");
     assert_eq!(woke["supervisors_changed"], true);
     assert_eq!(woke["supervisors"], json!([]));
     assert_eq!(
@@ -9368,7 +9455,7 @@ fn rebind_follows_a_moved_repository_and_the_awaiting_run_lands() {
             .arg("-C")
             .arg(&worktree)
             .arg("status")
-            .output()
+            .bounded_output()
             .unwrap()
             .status
             .success()
@@ -10581,6 +10668,7 @@ fn supervise_reviewed(
     backend: &TestWorkspace,
     reviewer: &TestReviewer,
 ) -> Value {
+    let _waiting = common::within(common::STEP_LIMIT, "supervise to return");
     let outcome = runtime::supervise_with_reviewer(
         db,
         repo,
@@ -11334,7 +11422,7 @@ fn adopted_run_waiting_for_its_exit_after_a_pass_asks_once_and_lands() {
     assert_eq!(backend.exits_sent.load(Ordering::SeqCst), 0);
     // The person's /exit reaches the session.
     fs::write(exit_request_path(run.run_dir().unwrap()), "").unwrap();
-    let outcome = supervisor.join().unwrap().unwrap();
+    let outcome = joined(supervisor, "the supervisor thread to return").unwrap();
     backend.join();
     assert_eq!(outcome["errors"], json!([]), "{outcome}");
     let detail = queue.show(TaskId::new(1)).unwrap();
@@ -11429,7 +11517,7 @@ fn background_work_holds_the_first_session_until_it_ends() {
         "",
     )
     .unwrap();
-    let outcome = supervisor.join().unwrap().unwrap();
+    let outcome = joined(supervisor, "the supervisor thread to return").unwrap();
     backend.join();
     assert_eq!(outcome["errors"], json!([]), "{outcome}");
     assert_eq!(outcome["runs"][0]["status"], "awaiting_integration");
@@ -11502,7 +11590,7 @@ fn background_work_holds_the_exit_after_the_review() {
     assert_eq!(backend.exits_sent.load(Ordering::SeqCst), 0);
 
     write_idle_marker(&run, json!([]));
-    let outcome = supervisor.join().unwrap();
+    let outcome = joined(supervisor, "the supervisor thread to return");
     assert_eq!(outcome["errors"], json!([]), "{outcome}");
     assert_eq!(outcome["runs"][0]["status"], "integrated", "{outcome}");
     assert_eq!(backend.exits_sent.load(Ordering::SeqCst), 1);
@@ -11544,7 +11632,7 @@ fn background_work_holds_the_resumed_session_until_it_ends() {
         "",
     )
     .unwrap();
-    let outcome = supervisor.join().unwrap().unwrap();
+    let outcome = joined(supervisor, "the supervisor thread to return").unwrap();
     backend.join();
     assert_eq!(outcome["errors"], json!([]), "{outcome}");
     assert_eq!(backend.exits_sent.load(Ordering::SeqCst), sent_before + 1);
@@ -11598,7 +11686,7 @@ fn background_work_holds_the_revise_until_it_ends() {
         "",
     )
     .unwrap();
-    let outcome = supervisor.join().unwrap();
+    let outcome = joined(supervisor, "the supervisor thread to return");
     assert_eq!(outcome["errors"], json!([]), "{outcome}");
     assert_eq!(outcome["runs"][0]["status"], "integrated", "{outcome}");
     assert_eq!(backend.exits_sent.load(Ordering::SeqCst), 1);
@@ -11657,7 +11745,7 @@ fn a_revise_session_that_holds_exit_back_raises_a_stuck_exit_ask() {
     assert_eq!(backend.exits_sent.load(Ordering::SeqCst), 1);
 
     release_held_session(run.run_dir().unwrap());
-    let outcome = supervisor.join().unwrap();
+    let outcome = joined(supervisor, "the supervisor thread to return");
     assert_eq!(outcome["errors"], json!([]), "{outcome}");
     assert_eq!(backend.exits_sent.load(Ordering::SeqCst), 1);
     let closed = queue.read_ask(ask.id).unwrap();
@@ -12670,7 +12758,7 @@ fn a_silent_wrapper_with_a_live_session_is_asked_to_exit_then_raised_to_the_inbo
 
     revive_wrapper(&db, run.id(), own);
     release_held_session(run.run_dir().unwrap());
-    let outcome = supervisor.join().unwrap().unwrap();
+    let outcome = joined(supervisor, "the supervisor thread to return").unwrap();
     backend.join();
     assert_eq!(outcome["errors"], json!([]), "{outcome}");
     assert_eq!(outcome["runs"][0]["status"], "awaiting_integration");
@@ -12726,7 +12814,7 @@ fn a_silent_wrapper_whose_process_is_gone_is_given_up_as_before() {
     // Let the in-test wrapper finish so the supervisor's pass can end.
     revive_wrapper(&db, run.id(), own);
     release_held_session(run.run_dir().unwrap());
-    let outcome = supervisor.join().unwrap().unwrap();
+    let outcome = joined(supervisor, "the supervisor thread to return").unwrap();
     backend.join();
     assert!(
         outcome["errors"]
@@ -12758,7 +12846,7 @@ fn a_resumed_session_with_a_silent_wrapper_is_asked_to_exit_then_let_go() {
     });
     let stand_in = StandIn::new();
     let own = silence_wrapper(&db, run.id(), stand_in.pid());
-    let outcome = supervisor.join().unwrap().unwrap();
+    let outcome = joined(supervisor, "the supervisor thread to return").unwrap();
     assert_eq!(outcome["errors"], json!([]), "{outcome}");
     let mut queue = SqliteQueue::open(&db).unwrap();
     let detail = queue.show(TaskId::new(2)).unwrap();
@@ -12829,7 +12917,7 @@ fn a_silent_wrapper_after_the_review_waits_for_the_exit_with_an_ask() {
     );
     revive_wrapper(&db, run.id(), own);
     release_held_session(run.run_dir().unwrap());
-    let outcome = supervisor.join().unwrap().unwrap();
+    let outcome = joined(supervisor, "the supervisor thread to return").unwrap();
     backend.join();
     assert_eq!(outcome["errors"], json!([]), "{outcome}");
     let detail = queue.show(TaskId::new(1)).unwrap();
@@ -12884,7 +12972,7 @@ fn a_silent_wrapper_that_dies_after_the_exit_closes_its_ask() {
     assert_eq!(backend.exits_sent.load(Ordering::SeqCst), 1);
     revive_wrapper(&db, run.id(), own);
     release_held_session(run.run_dir().unwrap());
-    let outcome = supervisor.join().unwrap().unwrap();
+    let outcome = joined(supervisor, "the supervisor thread to return").unwrap();
     backend.join();
     assert!(
         outcome["errors"]
@@ -13321,7 +13409,7 @@ receipt "$(git rev-parse HEAD)"; idle; await_exit
     // The error stays on the screen after the person logged in: the
     // answered ask is not opened again, and the nudge goes out.
     queue.answer(hold[0].id, "done").unwrap();
-    let outcome = supervisor.join().unwrap().unwrap();
+    let outcome = joined(supervisor, "the supervisor thread to return").unwrap();
     backend.join();
     assert_eq!(outcome["errors"], json!([]), "{outcome}");
     assert_eq!(outcome["runs"][0]["status"], "awaiting_integration");
@@ -13411,7 +13499,7 @@ receipt "$(git rev-parse HEAD)"; idle; await_exit
         "",
     )
     .unwrap();
-    let outcome = supervisor.join().unwrap().unwrap();
+    let outcome = joined(supervisor, "the supervisor thread to return").unwrap();
     backend.join();
     assert_eq!(outcome["errors"], json!([]), "{outcome}");
     assert_eq!(outcome["runs"][0]["status"], "awaiting_integration");
@@ -13461,7 +13549,7 @@ commit work; receipt "$(git rev-parse HEAD)"; idle; await_exit
     thread::sleep(Duration::from_millis(2500));
     assert!(backend.texts().is_empty(), "{:?}", backend.texts());
     queue.answer(ask.id, "blue").unwrap();
-    let outcome = supervisor.join().unwrap().unwrap();
+    let outcome = joined(supervisor, "the supervisor thread to return").unwrap();
     backend.join();
     assert_eq!(outcome["errors"], json!([]), "{outcome}");
     assert_eq!(backend.texts().len(), 1);
@@ -13535,7 +13623,7 @@ receipt "$(git rev-parse HEAD)"; idle; await_exit
         "",
     )
     .unwrap();
-    let outcome = supervisor.join().unwrap().unwrap();
+    let outcome = joined(supervisor, "the supervisor thread to return").unwrap();
     backend.join();
     assert_eq!(outcome["errors"], json!([]), "{outcome}");
     assert_eq!(outcome["runs"][0]["status"], "awaiting_integration");
@@ -13591,7 +13679,7 @@ receipt "$(git rev-parse HEAD)"; idle; await_exit
         "",
     )
     .unwrap();
-    let outcome = supervisor.join().unwrap().unwrap();
+    let outcome = joined(supervisor, "the supervisor thread to return").unwrap();
     backend.join();
     assert_eq!(outcome["errors"], json!([]), "{outcome}");
     let detail = queue.show(TaskId::new(1)).unwrap();
@@ -13823,7 +13911,7 @@ fn branch_exists(repo: &Path, branch: &str) -> bool {
         .arg(repo)
         .args(["rev-parse", "--verify", "--quiet"])
         .arg(format!("refs/heads/{branch}"))
-        .output()
+        .bounded_output()
         .unwrap()
         .status
         .success()

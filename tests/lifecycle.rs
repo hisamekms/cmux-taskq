@@ -4,6 +4,11 @@
 //! inbox workspace decisions, the planners `plan` opens, and every `down`
 //! outcome. The real
 //! launchd and cmux path is `tests/e2e.rs`.
+
+mod common;
+
+use common::Bounded;
+
 use anyhow::{Result, bail};
 use dagq::{
     VERSION,
@@ -45,7 +50,7 @@ fn git(repo: &Path, args: &[&str]) {
         .arg("-C")
         .arg(repo)
         .args(args)
-        .output()
+        .bounded_output()
         .unwrap();
     assert!(
         result.status.success(),
@@ -61,6 +66,8 @@ struct Fixture {
     location: QueueLocation,
     environment: UpEnvironment,
     options: UpOptions,
+    /// Times the test while held (task 324).
+    _test: common::Waiting,
 }
 
 fn fixture() -> Fixture {
@@ -96,6 +103,7 @@ fn fixture() -> Fixture {
     Fixture {
         repo,
         location,
+        _test: common::test(),
         environment: UpEnvironment {
             role: None,
             queue: None,
@@ -2508,7 +2516,10 @@ fn down_wait_returns_stopped_once_the_registration_is_gone_or_the_process_died()
             .unwrap();
     });
     let report = down(&fixture, &cmux, &launchd, &processes, true, false);
-    drain.join().unwrap();
+    {
+        let _waiting = common::within(common::STEP_LIMIT, "the drain thread to return");
+        drain.join().unwrap();
+    }
     assert_eq!(
         report,
         json!({"outcome": "stopped", "pid": pid, "pids": [pid],

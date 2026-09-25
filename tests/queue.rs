@@ -1,3 +1,5 @@
+mod common;
+
 use std::{
     path::Path,
     sync::{Arc, Barrier, Mutex},
@@ -422,6 +424,7 @@ fn concurrent_connections_claim_each_ready_task_once() {
             })
         })
         .collect();
+    let _waiting = common::within(common::STEP_LIMIT, "the claiming threads to return");
     let outcomes: Vec<_> = workers.into_iter().map(|w| w.join().unwrap()).collect();
     let runs: Vec<_> = outcomes
         .iter()
@@ -463,6 +466,7 @@ fn concurrent_opposite_edges_cannot_create_a_cycle() {
             })
         })
         .collect();
+    let _waiting = common::within(common::STEP_LIMIT, "the editing threads to return");
     assert_eq!(
         workers
             .into_iter()
@@ -900,6 +904,7 @@ fn dependency_change_and_claim_are_serialized() {
         other.wait();
         editor.add_dependency(task, prerequisite)
     });
+    let _waiting = common::within(common::STEP_LIMIT, "the claim and the edit to return");
     let claim = claim.join().unwrap();
     let edit = edit.join().unwrap();
     let detail = queue.show(task).unwrap();

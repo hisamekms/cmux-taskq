@@ -3,6 +3,10 @@
 //! frontmatter, hook, or launcher before `claude plugin validate` or a real
 //! session would.
 
+mod common;
+
+use common::Bounded;
+
 use std::{
     fs,
     os::unix::fs::PermissionsExt,
@@ -329,7 +333,7 @@ fn session_start(env: &[(&str, &str)], data_home: &Path, cwd: &Path) -> Output {
     for (key, value) in env {
         command.env(key, value);
     }
-    command.output().unwrap()
+    command.bounded_output().unwrap()
 }
 
 /// Splits the hook's stdout for `role` into its leading line of text, which
@@ -367,7 +371,7 @@ fn session_start_hook_prints_status_only_in_the_sessions_up_opens() {
         Command::new("git")
             .args(["init", "-q", "-b", "main"])
             .current_dir(&repo)
-            .status()
+            .bounded_status()
             .unwrap()
             .success()
     );
@@ -508,7 +512,7 @@ fn launcher(env: &[(&str, &str)], data_home: &Path, cwd: &Path, args: &[&str]) -
     for (key, value) in env {
         command.env(key, value);
     }
-    command.output().unwrap()
+    command.bounded_output().unwrap()
 }
 
 fn stdout_json(output: &Output) -> Value {
@@ -530,7 +534,7 @@ fn launcher_resolves_the_binary_and_the_repository_queue_under_the_data_home() {
         Command::new("git")
             .args(["init", "-q", "-b", "main"])
             .current_dir(&repo)
-            .status()
+            .bounded_status()
             .unwrap()
             .success()
     );
@@ -598,7 +602,7 @@ fn launcher_resolves_the_binary_and_the_repository_queue_under_the_data_home() {
             .args(["-c", "user.name=t", "-c", "user.email=t@example.com"])
             .args(["commit", "-q", "--allow-empty", "-m", "init"])
             .current_dir(&repo)
-            .status()
+            .bounded_status()
             .unwrap()
             .success()
     );
@@ -607,7 +611,7 @@ fn launcher_resolves_the_binary_and_the_repository_queue_under_the_data_home() {
             .args(["worktree", "add", "-q", "--detach"])
             .arg(&worktree)
             .current_dir(&repo)
-            .status()
+            .bounded_status()
             .unwrap()
             .success()
     );

@@ -4,6 +4,10 @@
 //! No task is claimed in these tests: every task that becomes ready waits
 //! for a draft blocker.
 
+mod common;
+
+use common::Bounded;
+
 use anyhow::{Result, bail};
 use dagq::{
     application::{
@@ -37,7 +41,7 @@ fn git(repo: &Path, args: &[&str]) {
         .arg("-C")
         .arg(repo)
         .args(args)
-        .output()
+        .bounded_output()
         .unwrap();
     assert!(
         out.status.success(),
@@ -51,6 +55,8 @@ struct Fixture {
     repo: PathBuf,
     db: PathBuf,
     claude: PathBuf,
+    /// Times the test while held (task 324).
+    _test: common::Waiting,
 }
 
 /// A repository with one commit on main, a queue next to it, and a draft
@@ -76,6 +82,7 @@ fn fixture() -> Fixture {
     fs::set_permissions(&claude, fs::Permissions::from_mode(0o755)).unwrap();
     Fixture {
         _dir: dir,
+        _test: common::test(),
         repo,
         db,
         claude,

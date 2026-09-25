@@ -36,6 +36,7 @@ cargo clippy --locked --all-targets -- -D warnings
   - runtime（`src/`・`tests/`・`migrations/`）: `--paths` なしで fmt / clippy / `cargo llvm-cov --locked --fail-under-lines 80` と `--evidence e2e`（上の llvm-cov の規則どおり `cargo test --locked` は重ねない）
   - 種類が混ざる task は重い方の検証にする。task が宣言外のパスを本当に必要とするなら、worker は `failed` の receipt に必要なパスを書き、planner が `--paths` を広げて登録し直す（draft / ready のうちは `set-paths TASK --paths ...` / `--none` で変えられる）
 - e2e test: ハッピーパスを `tests/e2e.rs` に置く。実バイナリ・実 Git・実 cmux を使い、Claude の代わりに受け入れ条件どおり commit と receipt を書く stub スクリプトを provider にする。cmux が必要なので `#[ignore]` とし、runtime（`src/`）を変えた run では worker が worktree で `cargo test --locked --test e2e -- --ignored` を実行し、receipt の `e2e` に evidence を書く。inbox も planner も自分では再実行しない
+- test の待ちには上限を付ける。poll の loop は deadline を持ち、上限の無い待ち（thread の join、stub の session の終了、`dagq` の子プロセスの `output()`）は `tests/common/mod.rs` の `within`（fixture が持つ test 全体の `common::test()` と、1 つの待ちの `STEP_LIMIT`）で包む。上限を過ぎると test binary が test の名前と待っていた条件を stderr に出して exit 101 で失敗し、`cargo test | tail` が戻らなくなることはない（task 324）
 - 実 Claude を含む経路は自動化せず、手動スモーク（[docs/design/manual-smoke.md](docs/design/manual-smoke.md)）で確認する
 
 ## 文書のルール

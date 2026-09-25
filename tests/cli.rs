@@ -1,3 +1,7 @@
+mod common;
+
+use common::Bounded;
+
 use std::{
     path::Path,
     process::{Command, Output},
@@ -39,7 +43,12 @@ fn invoke_as(role: Option<&str>, db: &Path, args: &[&str]) -> Output {
     if let Some(role) = role {
         command.env("DAGQ_ROLE", role);
     }
-    command.arg("--db").arg(db).args(args).output().unwrap()
+    command
+        .arg("--db")
+        .arg(db)
+        .args(args)
+        .bounded_output()
+        .unwrap()
 }
 
 /// Every argument the stub `cmux` of `db`'s directory was called with, one per line.
@@ -169,7 +178,7 @@ fn version_works_outside_a_repository_and_without_a_queue() {
     let output = Command::new(env!("CARGO_BIN_EXE_dagq"))
         .arg("--version")
         .current_dir(dir.path())
-        .output()
+        .bounded_output()
         .unwrap();
     assert!(
         output.status.success(),
@@ -2545,7 +2554,7 @@ fn submit_from(db: &Path, workspace: Option<&str>, origin: Option<&str>, args: &
         .arg(db)
         .arg("submit")
         .args(args)
-        .output()
+        .bounded_output()
         .unwrap()
 }
 
@@ -2687,7 +2696,7 @@ fn run_copy(binary: &Path, db: &Path, args: &[&str]) -> Output {
         .arg("--db")
         .arg(db)
         .args(args)
-        .output()
+        .bounded_output()
         .unwrap()
 }
 
@@ -3029,4 +3038,48 @@ fn related_prints_candidates_with_their_clues() {
     assert_eq!(refused(&db, &["related", "9"]), "task 9 does not exist");
     ok_as("observer", &db, &["related", "1"]);
     ok_as("reviewer", &db, &["related", "1"]);
+}
+
+/// Only when [`a_wait_past_its_limit_fails_with_the_test_and_the_condition`]
+/// runs it: a wait that never ends, timed with a short limit.
+#[test]
+#[ignore = "run by a_wait_past_its_limit_fails_with_the_test_and_the_condition"]
+fn deadline_probe() {
+    if std::env::var_os("DAGQ_DEADLINE_PROBE").is_none() {
+        return;
+    }
+    let _waiting = common::within(
+        std::time::Duration::from_millis(300),
+        "the probe's condition to hold",
+    );
+    loop {
+        std::thread::park();
+    }
+}
+
+/// A wait past its limit ends the test binary as a failure, naming the test
+/// and the condition it waited for (task 324), instead of hanging.
+#[test]
+fn a_wait_past_its_limit_fails_with_the_test_and_the_condition() {
+    let started = std::time::Instant::now();
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "deadline_probe",
+            "--ignored",
+            "--test-threads",
+            "2",
+        ])
+        .env("DAGQ_DEADLINE_PROBE", "1")
+        .bounded_output()
+        .unwrap();
+    assert!(started.elapsed() < std::time::Duration::from_secs(30));
+    assert_eq!(output.status.code(), Some(common::TIMED_OUT), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(
+            "test deadline_probe timed out: the probe's condition to hold did not happen within 300ms"
+        ),
+        "{stderr}"
+    );
 }
