@@ -3,8 +3,10 @@
 //! verification commands; its values are strings in which
 //! `${DAGQ_QUEUE_DIR}` and `${DAGQ_RUN_DIR}` are expanded. `[stall]` holds
 //! the thresholds of the stalled-session checks in seconds (ADR-0043
-//! decision 4). The file is parsed by hand: the format is these two tables
-//! of `KEY = value` lines, a subset of TOML that needs no parser crate.
+//! decision 4). `[conflicts]` holds the thresholds of the
+//! `conflict_hotspot` alert of `stats` (goal 31). The file is parsed by
+//! hand: the format is these tables of `KEY = value` lines, a subset of
+//! TOML that needs no parser crate.
 use anyhow::{Context, Result, bail, ensure};
 use std::{
     fs,
@@ -13,7 +15,7 @@ use std::{
 
 use crate::{
     application::{Exit, Verifier},
-    domain::stall::StallConfig,
+    domain::{stall::StallConfig, stats::ConflictConfig},
 };
 
 pub const CONFIG_FILE_NAME: &str = "dagq.toml";
@@ -21,7 +23,8 @@ pub const QUEUE_DIR_VAR: &str = "DAGQ_QUEUE_DIR";
 pub const RUN_DIR_VAR: &str = "DAGQ_RUN_DIR";
 const RUN_ENV_TABLE: &str = "run.env";
 const STALL_TABLE: &str = "stall";
-const TABLES: [&str; 2] = [RUN_ENV_TABLE, STALL_TABLE];
+const CONFLICTS_TABLE: &str = "conflicts";
+const TABLES: [&str; 3] = [RUN_ENV_TABLE, STALL_TABLE, CONFLICTS_TABLE];
 /// Names the runtime itself sets on a workspace (`DAGQ_ROLE`, `DAGQ_QUEUE`)
 /// and may set later; `[run.env]` cannot override them.
 const RESERVED_PREFIX: &str = "DAGQ_";
@@ -31,13 +34,16 @@ pub fn parse_run_env(text: &str) -> Result<Vec<(String, String)>> {
     Ok(parse_config(text)?.run_env)
 }
 
-/// What the file holds: `[run.env]` and `[stall]` (ADR-0043 decision 4).
+/// What the file holds: `[run.env]`, `[stall]` (ADR-0043 decision 4) and
+/// `[conflicts]`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Config {
     /// `[run.env]` as written, in file order, values unexpanded.
     pub run_env: Vec<(String, String)>,
     /// `[stall]`, the defaults for the keys it does not set.
     pub stall: StallConfig,
+    /// `[conflicts]`, the defaults for the keys it does not set.
+    pub conflicts: ConflictConfig,
 }
 
 /// Parse the whole file.
@@ -46,6 +52,7 @@ pub fn parse_config(text: &str) -> Result<Config> {
     let mut seen: Vec<&str> = Vec::new();
     let mut config = Config::default();
     let mut stall_keys: Vec<String> = Vec::new();
+    let mut conflict_keys: Vec<String> = Vec::new();
     let text = text.strip_prefix('\u{feff}').unwrap_or(text);
     for (index, raw) in text.lines().enumerate() {
         let number = index + 1;
@@ -60,7 +67,7 @@ pub fn parse_config(text: &str) -> Result<Config> {
                 .trim();
             let known = TABLES.iter().find(|table| **table == name).with_context(|| {
                 format!(
-                    "{CONFIG_FILE_NAME}:{number}: unknown table [{name}]; only [{RUN_ENV_TABLE}] and [{STALL_TABLE}] are supported"
+                    "{CONFIG_FILE_NAME}:{number}: unknown table [{name}]; only [{RUN_ENV_TABLE}], [{STALL_TABLE}] and [{CONFLICTS_TABLE}] are supported"
                 )
             })?;
             ensure!(
@@ -93,6 +100,21 @@ pub fn parse_config(text: &str) -> Result<Config> {
                     .with_context(|| format!("{CONFIG_FILE_NAME}:{number}: value of {key}"))?;
                 config.run_env.push((key.to_owned(), value));
             }
+            Some(CONFLICTS_TABLE) => {
+                ensure!(
+                    ConflictConfig::KEYS.contains(&key),
+                    "{CONFIG_FILE_NAME}:{number}: unknown key {key} in [{CONFLICTS_TABLE}]; the keys are {}",
+                    ConflictConfig::KEYS.join(", ")
+                );
+                ensure!(
+                    !conflict_keys.iter().any(|existing| existing == key),
+                    "{CONFIG_FILE_NAME}:{number}: {key} is defined twice"
+                );
+                let value = parse_positive(rest.trim(), "number")
+                    .with_context(|| format!("{CONFIG_FILE_NAME}:{number}: value of {key}"))?;
+                config.conflicts.set(key, value);
+                conflict_keys.push(key.to_owned());
+            }
             Some(_) => {
                 ensure!(
                     StallConfig::KEYS.contains(&key),
@@ -103,29 +125,29 @@ pub fn parse_config(text: &str) -> Result<Config> {
                     !stall_keys.iter().any(|existing| existing == key),
                     "{CONFIG_FILE_NAME}:{number}: {key} is defined twice"
                 );
-                let secs = parse_seconds(rest.trim())
+                let secs = parse_positive(rest.trim(), "number of seconds")
                     .with_context(|| format!("{CONFIG_FILE_NAME}:{number}: value of {key}"))?;
                 config.stall.set(key, secs);
                 stall_keys.push(key.to_owned());
             }
             None => bail!(
-                "{CONFIG_FILE_NAME}:{number}: a key outside [{RUN_ENV_TABLE}] or [{STALL_TABLE}]"
+                "{CONFIG_FILE_NAME}:{number}: a key outside [{RUN_ENV_TABLE}], [{STALL_TABLE}] or [{CONFLICTS_TABLE}]"
             ),
         }
     }
     Ok(config)
 }
 
-/// A positive integer of seconds, followed by nothing but an optional comment.
-fn parse_seconds(text: &str) -> Result<i64> {
+/// A positive integer (a `what`), followed by nothing but an optional comment.
+fn parse_positive(text: &str, what: &str) -> Result<i64> {
     let digits = strip_comment(text);
     ensure!(!digits.is_empty(), "missing value");
-    let secs: i64 = digits
+    let value: i64 = digits
         .replace('_', "")
         .parse()
-        .with_context(|| format!("expected a whole number of seconds, not {digits}"))?;
-    ensure!(secs > 0, "must be a positive number of seconds, not {secs}");
-    Ok(secs)
+        .with_context(|| format!("expected a whole {what}, not {digits}"))?;
+    ensure!(value > 0, "must be a positive {what}, not {value}");
+    Ok(value)
 }
 
 /// `[stall]` of the `dagq.toml` in `root` (ADR-0043 decision 4), `None`
@@ -139,6 +161,20 @@ pub fn load_stall_config(root: &Path) -> Result<Option<StallConfig>> {
         parse_config(&text)
             .with_context(|| format!("parse {}", path.display()))?
             .stall,
+    ))
+}
+
+/// `[conflicts]` of the `dagq.toml` in `root`, `None` when there is no
+/// file; no table or no key is the default.
+pub fn load_conflict_config(root: &Path) -> Result<Option<ConflictConfig>> {
+    let path = root.join(CONFIG_FILE_NAME);
+    let Some(text) = read_config(&path)? else {
+        return Ok(None);
+    };
+    Ok(Some(
+        parse_config(&text)
+            .with_context(|| format!("parse {}", path.display()))?
+            .conflicts,
     ))
 }
 
@@ -335,6 +371,15 @@ LITERAL = 'no \n escapes # here'
                 "send_confirm_secs is defined twice",
             ),
             ("[stall]\n[stall]", "[stall] is defined twice"),
+            ("[conflicts]\nother = 1", "unknown key other in [conflicts]"),
+            (
+                "[conflicts]\nhotspot_conflicts = 0",
+                "positive number, not 0",
+            ),
+            (
+                "[conflicts]\nhotspot_conflicts = 1\nhotspot_conflicts = 2",
+                "hotspot_conflicts is defined twice",
+            ),
             ("A = 'x'", "a key outside [run.env]"),
             ("[run.env]\nA 'x'", "expected KEY"),
             ("[run.env]\n1A = 'x'", "not an environment variable name"),
@@ -392,6 +437,26 @@ LITERAL = 'no \n escapes # here'
             error.contains("parse ") && error.contains("unknown key"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn loads_the_conflicts_table_of_the_file_in_the_root() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(load_conflict_config(dir.path()).unwrap(), None);
+        fs::write(
+            dir.path().join(CONFIG_FILE_NAME),
+            "[conflicts]\nhotspot_ratio_percent = 50 # half\n[stall]\nsend_confirm_secs = 30\n",
+        )
+        .unwrap();
+        assert_eq!(
+            load_conflict_config(dir.path()).unwrap().unwrap(),
+            ConflictConfig {
+                hotspot_ratio_percent: 50,
+                ..ConflictConfig::default()
+            }
+        );
+        fs::write(dir.path().join(CONFIG_FILE_NAME), "[conflicts]\nx = 1\n").unwrap();
+        assert!(load_conflict_config(dir.path()).is_err());
     }
 
     #[test]

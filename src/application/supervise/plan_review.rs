@@ -21,12 +21,16 @@ use crate::{
     domain::{
         MAX_PLAN_REVISES, PLAN_OPTIONS, PLAN_REVIEW_ASKER, PlanReviewDecision, PlanReviewVerdict,
         PlannerOrigin, PlannerState, Proposal, next_to_review,
+        stats::{LiveSnapshot, SlotSnapshot, StatsQuery, conflicts::ConflictHotspot},
     },
 };
 
 /// Asks a person answered that the plan review prompt offers as
 /// precedents, newest first.
 const PRECEDENT_ASKS: usize = 30;
+
+/// Files that conflict often the plan review prompt lists at most.
+const HOTSPOT_FILES: usize = 15;
 
 /// Ready and in-progress tasks the plan review prompt lists at most.
 const QUEUED_TASKS: usize = 200;
@@ -198,6 +202,7 @@ impl Supervisor<'_> {
             })?
             .tasks;
         let precedents = self.queue.answered_asks(PRECEDENT_ASKS)?;
+        let hotspots = self.conflict_hotspots()?;
         plan_review_prompt(&PlanReviewMaterial {
             proposal,
             tasks: &tasks,
@@ -206,8 +211,38 @@ impl Supervisor<'_> {
             others: &others,
             queued: &queued,
             precedents: &precedents,
+            hotspots: &hotspots,
             repo_root: &self.layout.repo_root,
         })
+    }
+
+    /// The files the landings conflicted in, as `stats` counts them over
+    /// its default window (goal 31), most conflicts first, at most
+    /// [`HOTSPOT_FILES`] of those main still has.
+    fn conflict_hotspots(&self) -> Result<Vec<ConflictHotspot>> {
+        let events = self.queue.all_events()?;
+        let live = LiveSnapshot {
+            history: crate::application::stats::conflict_history(&events, &|since| {
+                self.repository.main_history(since)
+            }),
+            conflicts: self.conflicts,
+            ..LiveSnapshot::default()
+        };
+        let stats = crate::domain::stats::stats(
+            &events,
+            &self.queue.task_goals()?,
+            self.generators.clock.now(),
+            SlotSnapshot::default(),
+            &StatsQuery::default(),
+            &live,
+        );
+        Ok(stats
+            .conflict_hotspots
+            .files
+            .into_iter()
+            .filter(|file| file.state != "deleted")
+            .take(HOTSPOT_FILES)
+            .collect())
     }
 
     /// Reap the job once it ended and apply its verdict, or record its

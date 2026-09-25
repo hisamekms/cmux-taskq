@@ -381,6 +381,18 @@ fn a_passing_plan_review_readies_the_proposal_with_its_actions() {
     let two = add(&mut queue, "two", &[blocker], Priority::Normal);
     let three = add(&mut queue, "three", &[blocker], Priority::Normal);
     let proposal = submit(&mut queue, &[two, three], None);
+    // Landings conflicted in a file main has and in one it no longer has:
+    // the prompt lists the first as a hotspot (goal 31).
+    Connection::open(&fx.db)
+        .unwrap()
+        .execute(
+            "INSERT INTO run_events(task_id, kind, payload) VALUES (?1, 'conflict_precheck', ?2)",
+            rusqlite::params![
+                blocker.as_i64(),
+                json!({"main": "m", "conflicts": ["seed.txt", "gone.txt"]}).to_string()
+            ],
+        )
+        .unwrap();
     let reviewer = StubReviewer::new(&[json!({
         "verdict": "pass", "reasons": [], "summary": "sound",
         "actions": [
@@ -423,6 +435,8 @@ fn a_passing_plan_review_readies_the_proposal_with_its_actions() {
         "depends_on_draft",
         "an acceptance criterion that contradicts the task's own description or a sibling task's acceptance",
         "cancel_duplicate (only an obvious duplicate; a doubtful one is a concern)",
+        "Files the landings conflicted in most lately",
+        "\"path\":\"seed.txt\"",
     ] {
         assert!(
             prompts[0].contains(expected),
@@ -430,6 +444,7 @@ fn a_passing_plan_review_readies_the_proposal_with_its_actions() {
             prompts[0]
         );
     }
+    assert!(!prompts[0].contains("gone.txt"), "{}", prompts[0]);
     // Reviewed once: a second pass finds nothing to review.
     supervise(&fx, &backend, &reviewer);
     assert_eq!(reviewer.prompts().len(), 1);

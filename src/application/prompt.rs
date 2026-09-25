@@ -20,7 +20,7 @@ use crate::domain::{
     Ask, CommitSha, DraftOrigin, DraftTarget, Goal, GoalId, GoalPredecessor, GoalTask,
     LintViolation, MAX_DRAFT_PLANNERS, MAX_PLAN_REVISES, MAX_RESUME_ATTEMPTS, MAX_REVISE_ATTEMPTS,
     Predecessor, Proposal, ProposalId, Receipt, RunStatus, TRIAGE_RETRY_FAILURES, Task, TaskDetail,
-    TaskId, TaskRun,
+    TaskId, TaskRun, stats::conflicts::ConflictHotspot,
 };
 
 /// What the prompt says about one direct predecessor: the task, the squash
@@ -981,6 +981,9 @@ pub struct PlanReviewMaterial<'a> {
     pub queued: &'a [TaskListItem],
     /// Asks a person answered, newest first.
     pub precedents: &'a [Ask],
+    /// The files the landings conflicted in most (`stats`
+    /// `conflict_hotspots`), that main still has.
+    pub hotspots: &'a [ConflictHotspot],
     pub repo_root: &'a Path,
 }
 
@@ -1098,6 +1101,20 @@ pub fn plan_review_prompt(material: &PlanReviewMaterial<'_>) -> Result<String> {
             .collect::<Vec<_>>()
             .join("\n")
     };
+    let hotspots = json_lines(
+        material
+            .hotspots
+            .iter()
+            .map(|file| {
+                serde_json::json!({
+                    "path": file.renamed_to.as_deref().unwrap_or(&file.path),
+                    "conflicts": file.conflicts, "tasks": file.tasks,
+                    "landings": file.landings, "ratio": file.ratio,
+                    "last_conflict_at": file.last_conflict_at, "alert": file.alert,
+                })
+            })
+            .collect(),
+    );
     Ok(format!(
         "You are the plan review of dagq proposal {id}: decide whether the queue may run its tasks as written, before they become ready.\n\
          Read only. Do not change any file and do not run dagq commands that write.\n\n\
@@ -1110,12 +1127,13 @@ pub fn plan_review_prompt(material: &PlanReviewMaterial<'_>) -> Result<String> {
          Other proposals not ready yet:\n{others}\n\n\
          Ready and in-progress tasks:\n{queued}\n\n\
          Asks a person answered before (newest first):\n{precedents}\n\n\
+         Files the landings conflicted in most lately (`dagq stats` conflict_hotspots: conflicts, tasks, landings on main that changed the file, their ratio; alert when over the thresholds):\n{hotspots}\n\n\
          Check the meaning of the plan:\n\
          - a task that repeats another task (ready, in progress, in another proposal, or already landed on main);\n\
          - a task whose change is already on main (read the source);\n\
          - a contradiction with an ADR or with the goal's constraints;\n\
          - an acceptance criterion that contradicts the task's own description or a sibling task's acceptance (for example a change of a type whose acceptance says a test file that uses the type is not changed);\n\
-         - tasks that change the same files without a dependency between them;\n\
+         - tasks that change the same files without a dependency between them, above all a file listed as conflicting often;\n\
          - a contradiction with another proposal: with one submitted before this one, send this one back; with one submitted after, pass this one (the later one is checked against it);\n\
          - a ready task that has to change for this proposal to hold: name it in reopen, and the runtime takes it out of the claim for a planner to fix; an in-progress task is never changed: send this proposal back asking for a task that fixes it after it lands and depends on it;\n\
          - every finding of `dagq lint` is one to fix.\n\n\

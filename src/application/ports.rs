@@ -1375,6 +1375,13 @@ impl<T: TaskStore + RunStore + AskStore + DraftPlannerStore + PlanReviewStore + 
 pub trait Repository {
     /// Current `refs/heads/main`, read again on every call.
     fn main_head(&self) -> Result<CommitSha>;
+    /// Main's first-parent history since `since` (unix seconds) and the
+    /// paths it has now, for `conflict_hotspots`; a repository that cannot
+    /// tell has none.
+    fn main_history(&self, since: i64) -> Result<crate::domain::stats::conflicts::MainHistory> {
+        let _ = since;
+        anyhow::bail!("this repository keeps no history")
+    }
     /// Symbolic HEAD of a worktree (`refs/heads/...`), `None` when detached.
     fn current_branch(&self, worktree: &Path) -> Result<Option<String>>;
     fn head(&self, worktree: &Path) -> Result<CommitSha>;

@@ -37,7 +37,8 @@ use crate::{
     },
     domain::{
         IntegrationOutcome, NewAsk, PlannerId, RunId, SessionRole, TaskDetail, TaskId, TaskRun,
-        stall::StallConfig, stats::StatsQuery,
+        stall::StallConfig,
+        stats::{ConflictConfigReport, StatsQuery},
     },
     infrastructure::{
         adapters::{
@@ -50,7 +51,7 @@ use crate::{
             runs_dir,
         },
         process::LocalSpawner,
-        run_env::{ShellVerifier, load_stall_config},
+        run_env::{ShellVerifier, load_conflict_config, load_stall_config},
         run_files::LocalRunFiles,
         runtime_store::SqliteOpener,
         sqlite::SqliteQueue,
@@ -123,7 +124,7 @@ impl SuperviseOptions {
         }
     }
 
-    fn settings(&self, stall: StallConfig) -> LoopSettings {
+    fn settings(&self, stall: StallConfig, conflicts: ConflictConfigReport) -> LoopSettings {
         LoopSettings {
             parallel: self.parallel,
             once: self.once,
@@ -134,6 +135,7 @@ impl SuperviseOptions {
             idle_poll: self.idle_poll,
             sweep_interval: self.sweep_interval,
             stall,
+            conflicts,
             runtime_planners: self.runtime_planners,
             planner_timeout: self.planner_timeout,
         }
@@ -177,6 +179,14 @@ pub fn supervise_with_reviewer(
         Some(stall) => stall,
         None => load_stall_config(&main_checkout(&repository))?.unwrap_or_default(),
     };
+    // Only for what the plan review is told: a `[conflicts]` that cannot
+    // be read leaves the defaults rather than stopping the supervisor.
+    let conflicts = statistics::conflict_config(
+        load_conflict_config(&main_checkout(&repository)).unwrap_or_else(|error| {
+            tracing::warn!(error = %format_args!("{error:#}"), "[conflicts] of dagq.toml not read: {error:#}; using the defaults");
+            None
+        }),
+    );
     let pid = std::process::id();
     let generators = options.generators.clone();
     let layout = Layout {
@@ -234,7 +244,7 @@ pub fn supervise_with_reviewer(
         load_average,
         layout,
     };
-    supervisor::supervise(&ports, &options.settings(stall))
+    supervisor::supervise(&ports, &options.settings(stall, conflicts))
 }
 
 /// The runtime's own constructor of the cmux wrapper `up`, `down` and the
@@ -387,8 +397,9 @@ impl OneShot {
 
     /// `stats`: see [`statistics::stats`], measured to these generators'
     /// now. The run directories are read from disk as Claude Code writes
-    /// them, `[stall]` from the `dagq.toml` of the main checkout of the
-    /// repository the queue is bound to, and the workspaces from
+    /// them, `[stall]` and `[conflicts]` from the `dagq.toml` of the main
+    /// checkout of the repository the queue is bound to, main's history
+    /// from that checkout, and the workspaces from
     /// `workspaces` (`None`: `workspace_mismatch` is not judged).
     pub fn stats(
         &self,
@@ -410,6 +421,14 @@ impl OneShot {
             Some(checkout) => load_stall_config(checkout),
             None => Ok(None),
         };
+        let conflicts_file = || match &checkout {
+            Some(checkout) => load_conflict_config(checkout),
+            None => Ok(None),
+        };
+        let history = |since| match &checkout {
+            Some(checkout) => GitRepository::inspect(checkout)?.main_history(since),
+            None => anyhow::bail!("the queue is bound to no repository checkout"),
+        };
         let signals = ClaudeCode {
             executable: PathBuf::from("claude"),
         };
@@ -420,6 +439,8 @@ impl OneShot {
             workspaces,
             queue_hash: &queue_hash,
             config_file: &config_file,
+            conflicts_file: &conflicts_file,
+            history: &history,
         };
         Ok(serde_json::to_value(statistics::stats(
             &queue,

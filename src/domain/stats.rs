@@ -14,8 +14,10 @@ use super::{
     stall::{BackgroundTask, StallConfig},
 };
 
+pub mod conflicts;
 pub mod thresholds;
 
+pub use conflicts::{ConflictConfig, ConflictConfigReport, ConflictHotspots, History};
 pub use thresholds::ThresholdStats;
 
 /// Runs returned without `--full`.
@@ -112,6 +114,9 @@ pub struct Alert {
     pub run_id: Option<RunId>,
     pub value: i64,
     pub threshold: i64,
+    /// The file of a `conflict_hotspot`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
 }
 
 /// The `backend_call_failed` events in the window: how often cmux failed or
@@ -185,6 +190,11 @@ pub struct Stats {
     /// took, the people who stepped in before any detection, and the
     /// running alerts it judges now.
     pub stall_thresholds: BTreeMap<&'static str, ThresholdStats>,
+    /// The files the landings conflicted in, in the same window as
+    /// `backend_failures` (goal 31): how often, in how many tasks, against
+    /// how many landings on main that changed them, and whether main still
+    /// has them.
+    pub conflict_hotspots: ConflictHotspots,
     /// Pass it to `--since` to read only runs that finish later.
     pub next_cursor: EventId,
 }
@@ -311,6 +321,10 @@ pub struct LiveSnapshot {
     /// The queue's hash, which its worker workspaces' descriptions carry.
     pub queue_hash: String,
     pub config: StallConfigReport,
+    /// Main's history since the earliest conflict, for `conflict_hotspots`.
+    pub history: History,
+    /// The thresholds of the `conflict_hotspot` alert.
+    pub conflicts: ConflictConfigReport,
 }
 
 impl Default for LiveSnapshot {
@@ -326,6 +340,8 @@ impl Default for LiveSnapshot {
                 config: StallConfig::default(),
                 source: "default",
             },
+            history: History::default(),
+            conflicts: ConflictConfigReport::default(),
         }
     }
 }
@@ -492,6 +508,7 @@ pub fn stats(
                 run_id: ask.run_id,
                 value: waited,
                 threshold: ASK_UNANSWERED_SECS,
+                path: None,
             });
         }
     }
@@ -515,6 +532,24 @@ pub fn stats(
         &running_alerts,
         &live.config.config,
     );
+    let conflict_hotspots = conflicts::conflict_hotspots(
+        events,
+        window_start,
+        next_cursor,
+        counts,
+        &live.history,
+        live.conflicts,
+    );
+    for file in conflict_hotspots.files.iter().filter(|file| file.alert) {
+        alerts.push(Alert {
+            kind: "conflict_hotspot",
+            task_id: None,
+            run_id: None,
+            value: file.conflicts,
+            threshold: live.conflicts.config.hotspot_conflicts,
+            path: Some(file.path.clone()),
+        });
+    }
     if backend_failures.count >= BACKEND_FAILURES {
         alerts.push(Alert {
             kind: "backend_failures",
@@ -522,6 +557,7 @@ pub fn stats(
             run_id: None,
             value: backend_failures.count,
             threshold: BACKEND_FAILURES,
+            path: None,
         });
     }
     if slots.free_slots > 0 && slots.candidates == 0 && slots.ready > 0 {
@@ -531,6 +567,7 @@ pub fn stats(
             run_id: None,
             value: slots.free_slots,
             threshold: 0,
+            path: None,
         });
     }
 
@@ -546,6 +583,7 @@ pub fn stats(
         workspace_check,
         stall_config: live.config.clone(),
         stall_thresholds,
+        conflict_hotspots,
         next_cursor,
     }
 }
@@ -912,6 +950,7 @@ fn alert(kind: &'static str, run: &RunStats, value: i64, threshold: i64) -> Aler
         run_id: Some(run.run_id.clone()),
         value,
         threshold,
+        path: None,
     }
 }
 
@@ -1201,7 +1240,76 @@ mod tests {
                 config: StallConfig::default(),
                 source: "default",
             },
+            ..LiveSnapshot::default()
         }
+    }
+
+    /// Goal 31: a file that conflicted in three tasks' landings, changed by
+    /// few landings, is a `conflict_hotspot` alert naming it; one main no
+    /// longer has is listed but no alert.
+    #[test]
+    fn conflicted_files_are_hotspots_and_alerts() {
+        use conflicts::{MainChange, MainCommit, MainHistory};
+        let conflict = |id: i64, run: &str, task: i64, files: Value, secs: i64| RunEvent {
+            task_id: Some(TaskId::new(task)),
+            ..run_event(
+                id,
+                run,
+                "integration_deferred",
+                json!({"main": format!("m{id}"), "conflicts": files}),
+                secs,
+            )
+        };
+        let events = [
+            run_event(1, R1, "run_claimed", json!({}), T),
+            conflict(2, R1, 1, json!(["hot.rs", "src/runtime.rs"]), T + 10),
+            conflict(3, R2, 2, json!(["hot.rs"]), T + 20),
+            conflict(4, R3, 3, json!(["hot.rs"]), T + 30),
+        ];
+        let live = LiveSnapshot {
+            history: History::Read(MainHistory {
+                commits: vec![MainCommit {
+                    at: T + 15,
+                    changes: vec![MainChange {
+                        path: "hot.rs".into(),
+                        from: None,
+                        deleted: false,
+                    }],
+                }],
+                paths: ["hot.rs".to_owned()].into_iter().collect(),
+            }),
+            ..LiveSnapshot::default()
+        };
+        let result = stats(
+            &events,
+            &HashMap::new(),
+            T + 40,
+            SlotSnapshot::default(),
+            &StatsQuery {
+                full: true,
+                ..StatsQuery::default()
+            },
+            &live,
+        );
+        let files = &result.conflict_hotspots.files;
+        assert_eq!(files.len(), 2);
+        assert_eq!(
+            (files[0].path.as_str(), files[0].conflicts, files[0].tasks),
+            ("hot.rs", 3, 3)
+        );
+        assert_eq!(files[0].ratio, Some(3.0));
+        assert_eq!(files[1].state, "deleted");
+        let hot: Vec<_> = result
+            .alerts
+            .iter()
+            .filter(|alert| alert.kind == "conflict_hotspot")
+            .collect();
+        assert_eq!(hot.len(), 1);
+        assert_eq!(hot[0].path.as_deref(), Some("hot.rs"));
+        assert_eq!((hot[0].value, hot[0].threshold), (3, 3));
+        let json = serde_json::to_value(&result).unwrap();
+        assert_eq!(json["conflict_hotspots"]["files"][0]["path"], "hot.rs");
+        assert!(json["alerts"][0].get("path").is_some());
     }
 
     fn running(events: &[RunEvent], live: &LiveSnapshot, now: i64) -> Vec<RunningAlert> {

@@ -2,7 +2,7 @@
 //! [`crate::domain::stats::stats`] derives the per-run and per-goal times
 //! and the thresholds crossed from, and what the running alerts (ADR-0043
 //! decision 5) read outside the queue: the run directories' markers and
-//! cmux's workspaces.
+//! cmux's workspaces; and main's Git history for `conflict_hotspots`.
 
 use std::{path::Path, time::SystemTime};
 
@@ -13,8 +13,10 @@ use crate::domain::{
     GoalStatus, RunStatus, SessionRole, SupervisorPulse, TaskRun, TaskStatus,
     stall::{BackgroundTask, IDLE_LOG, StallConfig, background_first_seen},
     stats::{
-        ListedWorkspace, LiveRun, LiveSnapshot, SlotSnapshot, StallConfigReport, Stats, StatsQuery,
-        Workspaces, stats as aggregate,
+        ConflictConfig, ConflictConfigReport, History, ListedWorkspace, LiveRun, LiveSnapshot,
+        SlotSnapshot, StallConfigReport, Stats, StatsQuery, Workspaces,
+        conflicts::{MainHistory, earliest_conflict},
+        stats as aggregate, timestamp_millis,
     },
 };
 
@@ -37,6 +39,43 @@ pub struct StatsSources<'a> {
     pub queue_hash: &'a str,
     /// The `[stall]` of `dagq.toml`; `None` when there is no file.
     pub config_file: &'a dyn Fn() -> Result<Option<StallConfig>>,
+    /// The `[conflicts]` of `dagq.toml`; `None` when there is no file.
+    pub conflicts_file: &'a dyn Fn() -> Result<Option<ConflictConfig>>,
+    /// Main's history since a unix second (see
+    /// [`crate::application::Repository::main_history`]).
+    pub history: &'a dyn Fn(i64) -> Result<MainHistory>,
+}
+
+/// Main's history since the earliest event of `events` (a second before
+/// it), so that the landings of any window before its first conflict are
+/// counted too, or why it could not be read; none is read without a
+/// conflict.
+pub fn conflict_history(
+    events: &[crate::domain::RunEvent],
+    read: &dyn Fn(i64) -> Result<MainHistory>,
+) -> History {
+    let earliest = events
+        .iter()
+        .filter_map(|event| timestamp_millis(&event.created_at))
+        .min();
+    match earliest_conflict(events).and(earliest) {
+        None => History::Read(MainHistory::default()),
+        Some(millis) => match read(millis.div_euclid(1000) - 1) {
+            Ok(history) => History::Read(history),
+            Err(error) => History::Unavailable(format!("{error:#}")),
+        },
+    }
+}
+
+/// The `[conflicts]` thresholds and where they came from.
+pub fn conflict_config(file: Option<ConflictConfig>) -> ConflictConfigReport {
+    match file {
+        Some(config) => ConflictConfigReport {
+            config,
+            source: "file",
+        },
+        None => ConflictConfigReport::default(),
+    }
 }
 
 /// Per-run and per-goal times and the thresholds crossed, derived from
@@ -134,6 +173,8 @@ pub fn stats(
         workspaces,
         queue_hash: sources.queue_hash.to_owned(),
         config,
+        history: conflict_history(&events, sources.history),
+        conflicts: conflict_config((sources.conflicts_file)()?),
     };
     Ok(aggregate(&events, &goals, now, snapshot, query, &live))
 }
@@ -239,4 +280,67 @@ fn background_since(
         .filter_map(|task| seen.get(&task.id).copied())
         .min()
         .filter(|&since| since < at))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::{EventId, RunEvent, TaskId};
+    use serde_json::json;
+
+    fn event(id: i64, kind: &str, payload: serde_json::Value, at: &str) -> RunEvent {
+        RunEvent {
+            id: EventId::new(id),
+            task_id: Some(TaskId::new(1)),
+            goal_id: None,
+            run_id: None,
+            kind: kind.to_owned(),
+            payload,
+            created_at: at.to_owned(),
+        }
+    }
+
+    /// The history is read from the earliest event, not the earliest
+    /// conflict, and only when there is a conflict; a failure to read it
+    /// is reported, not raised.
+    #[test]
+    fn conflict_history_reads_from_the_earliest_event() {
+        let quiet = [event(
+            1,
+            "run_claimed",
+            json!({}),
+            "1970-01-01T00:01:40.000Z",
+        )];
+        let never = |_: i64| -> Result<MainHistory> { unreachable!() };
+        assert_eq!(
+            conflict_history(&quiet, &never),
+            History::Read(MainHistory::default())
+        );
+        let events = [
+            quiet[0].clone(),
+            event(
+                2,
+                "conflict_precheck",
+                json!({"main": "m", "conflicts": ["a"]}),
+                "1970-01-01T00:03:20.000Z",
+            ),
+        ];
+        let since = std::cell::Cell::new(0);
+        let read = |at: i64| {
+            since.set(at);
+            Ok(MainHistory::default())
+        };
+        conflict_history(&events, &read);
+        assert_eq!(since.get(), 99);
+        let failing = |_: i64| -> Result<MainHistory> { anyhow::bail!("no git") };
+        assert_eq!(
+            conflict_history(&events, &failing),
+            History::Unavailable("no git".into())
+        );
+        assert_eq!(conflict_config(None).source, "default");
+        assert_eq!(
+            conflict_config(Some(ConflictConfig::default())).source,
+            "file"
+        );
+    }
 }

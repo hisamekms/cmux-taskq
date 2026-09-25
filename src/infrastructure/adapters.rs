@@ -4,7 +4,14 @@ use crate::{
         Repository, SupervisorEnvironment, WorkspaceBackend, WorkspaceTags,
         stats::WorkspaceListing,
     },
-    domain::{CommitSha, Task, TaskId, TaskRun, stall::IDLE_LOG, stats::ListedWorkspace},
+    domain::{
+        CommitSha, Task, TaskId, TaskRun,
+        stall::IDLE_LOG,
+        stats::{
+            ListedWorkspace,
+            conflicts::{MainChange, MainCommit, MainHistory},
+        },
+    },
 };
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::Value;
@@ -493,6 +500,41 @@ impl GitRepository {
         }
     }
 
+    /// The commits of main's first-parent line since `since` (unix
+    /// seconds), oldest first, with the paths each changed (renames
+    /// followed), and the paths main has now: what `conflict_hotspots`
+    /// counts landings and tells deleted and renamed files by.
+    pub fn main_history(&self, since: i64) -> Result<MainHistory> {
+        let log = review_output(Command::new(&self.git).arg("-C").arg(&self.root).args([
+            "log",
+            "-z",
+            "--first-parent",
+            "--reverse",
+            "--diff-merges=first-parent",
+            "-M",
+            "--name-status",
+            "--format=%x01%ct",
+            &format!("--max-age={}", since.max(0)),
+            "refs/heads/main",
+            "--",
+        ]))?;
+        let tree = review_output(Command::new(&self.git).arg("-C").arg(&self.root).args([
+            "ls-tree",
+            "-r",
+            "--name-only",
+            "-z",
+            "refs/heads/main",
+        ]))?;
+        Ok(MainHistory {
+            commits: parse_main_log(&log),
+            paths: tree
+                .split('\0')
+                .filter(|path| !path.is_empty())
+                .map(str::to_owned)
+                .collect(),
+        })
+    }
+
     /// Porcelain status including untracked files; empty means clean.
     pub fn status(&self, worktree: &Path) -> Result<String> {
         output(self.read_worktree(worktree).args([
@@ -854,11 +896,61 @@ impl GitRepository {
 /// How long `integrate` waits for `git push` before counting it as failed.
 const PUSH_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// `git log -z --format=%x01%ct --name-status` as commits: NUL-separated
+/// fields where a `\x01<unix seconds>` field starts a commit, then each
+/// change is a status field (`M`, `D`, ... after a newline) and its path,
+/// or `R100` / `C75` and the old and new paths. Paths are never quoted.
+fn parse_main_log(log: &str) -> Vec<MainCommit> {
+    let mut commits: Vec<MainCommit> = Vec::new();
+    let mut fields = log.split('\0').map(|field| field.trim_start_matches('\n'));
+    while let Some(field) = fields.next() {
+        if let Some(at) = field.strip_prefix('\u{1}') {
+            if let Ok(at) = at.trim().parse() {
+                commits.push(MainCommit {
+                    at,
+                    changes: Vec::new(),
+                });
+            }
+            continue;
+        }
+        let Some(status) = field.chars().next() else {
+            continue;
+        };
+        let change = match status {
+            'R' | 'C' => {
+                let (Some(from), Some(to)) = (fields.next(), fields.next()) else {
+                    break;
+                };
+                MainChange {
+                    path: to.to_owned(),
+                    from: (status == 'R').then(|| from.to_owned()),
+                    deleted: false,
+                }
+            }
+            _ => {
+                let Some(path) = fields.next() else { break };
+                MainChange {
+                    path: path.to_owned(),
+                    from: None,
+                    deleted: status == 'D',
+                }
+            }
+        };
+        if let Some(commit) = commits.last_mut() {
+            commit.changes.push(change);
+        }
+    }
+    commits
+}
+
 /// The Git port over the inherent methods above, which callers that hold a
 /// `GitRepository` keep using directly.
 impl Repository for GitRepository {
     fn main_head(&self) -> Result<CommitSha> {
         GitRepository::main_head(self)
+    }
+    fn main_history(&self, since: i64) -> Result<MainHistory> {
+        GitRepository::main_history(self, since)
     }
     fn current_branch(&self, worktree: &Path) -> Result<Option<String>> {
         GitRepository::current_branch(self, worktree)
@@ -1750,6 +1842,60 @@ mod tests {
         );
         let git = GitRepository::inspect(dir.path()).unwrap();
         (dir, git)
+    }
+
+    /// `main_history` lists main's commits with the paths each changed,
+    /// following a rename and seeing a deletion, and the paths main has.
+    #[test]
+    fn main_history_follows_renames_and_deletions() {
+        let (dir, git) = committed_repository();
+        let commit = |args: &[&[&str]]| {
+            for step in args {
+                assert!(git_in(dir.path(), step).status.success(), "{step:?}");
+            }
+            assert!(
+                git_in(dir.path(), &["commit", "-q", "-m", "c"])
+                    .status
+                    .success()
+            );
+        };
+        fs::write(dir.path().join("keep.txt"), "k\n").unwrap();
+        commit(&[&["add", "keep.txt"]]);
+        commit(&[&["mv", "change.txt", "moved.txt"]]);
+        commit(&[&["rm", "-q", "keep.txt"]]);
+        let history = git.main_history(0).unwrap();
+        assert_eq!(history.commits.len(), 4);
+        assert_eq!(history.commits[0].changes[0].path, "change.txt");
+        let renamed = &history.commits[2].changes[0];
+        assert_eq!(
+            (renamed.path.as_str(), renamed.from.as_deref()),
+            ("moved.txt", Some("change.txt"))
+        );
+        let deleted = &history.commits[3].changes[0];
+        assert!(deleted.deleted && deleted.path == "keep.txt");
+        assert_eq!(
+            history.paths,
+            ["moved.txt".to_owned()].into_iter().collect()
+        );
+        // Nothing since a time after the last commit.
+        assert!(
+            git.main_history(history.commits[3].at + 3600)
+                .unwrap()
+                .commits
+                .is_empty()
+        );
+        let copied = parse_main_log("\u{1}5\0\nC75\0a\0b\0M\0c\0\u{1}x\0\nM\0d\0\nR100\0e");
+        assert_eq!(copied.len(), 1);
+        assert_eq!(copied[0].changes.len(), 3);
+        assert_eq!(copied[0].changes[0].path, "b");
+        assert_eq!(copied[0].changes[0].from, None);
+        assert_eq!(copied[0].changes[1].path, "c");
+        assert_eq!(copied[0].changes[2].path, "d");
+        // A path Git would quote without -z is read as it is.
+        fs::write(dir.path().join("a\"b.txt"), "q\n").unwrap();
+        commit(&[&["add", "a\"b.txt"]]);
+        let quoted = git.main_history(0).unwrap();
+        assert_eq!(quoted.commits[4].changes[0].path, "a\"b.txt");
     }
 
     /// The supervisor's `status` leaves the index as it found it, where a

@@ -135,6 +135,9 @@ pub struct LoopSettings {
     /// The thresholds of the stalled-session checks (ADR-0043 decision 4),
     /// recorded as `stall_config_loaded` when the loop starts.
     pub stall: StallConfig,
+    /// The thresholds of the `conflict_hotspot` alert, for the files the
+    /// plan review is told conflict often.
+    pub conflicts: crate::domain::stats::ConflictConfigReport,
     /// Upper bound on the planners the runtime has open at once (ADR-0041
     /// decision 12), apart from the run slots; planners a person opened
     /// do not count.
@@ -349,6 +352,7 @@ pub fn supervise(ports: &Ports<'_>, settings: &LoopSettings) -> Result<Value> {
         triaged: Vec::new(),
         generators: ports.generators.clone(),
         stall: settings.stall,
+        conflicts: settings.conflicts,
         plan_review: None,
         planner_exits: Vec::new(),
     };
@@ -405,6 +409,8 @@ struct Supervisor<'a> {
     generators: Generators,
     /// The thresholds of the stalled-session checks (ADR-0043 decision 4).
     stall: StallConfig,
+    /// The `[conflicts]` thresholds the plan review's hotspots are judged by.
+    conflicts: crate::domain::stats::ConflictConfigReport,
     /// The plan review job running now (ADR-0041 decision 11): one at a
     /// time, queue-wide, outside the run slots.
     plan_review: Option<plan_review::PlanReviewWatch>,
