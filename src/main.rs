@@ -164,7 +164,7 @@ enum Command {
         #[arg(long = "proposal", group = "targets")]
         proposals: Vec<i64>,
     },
-    /// Read proposals: the goals and tasks submitted together for plan review.
+    /// Read proposals (the goals and tasks submitted together for plan review), or withdraw one.
     Proposal {
         #[command(subcommand)]
         command: ProposalCommand,
@@ -669,6 +669,9 @@ enum ProposalCommand {
     },
     /// Show a proposal with its member task and goal IDs.
     Show { id: i64 },
+    /// Withdraw a submitted or revising proposal without plan review: it ends as canceled, its
+    /// submitted tasks return to draft, and its tasks and goals may join another proposal.
+    Withdraw { id: i64 },
 }
 
 #[derive(Subcommand)]
@@ -749,7 +752,9 @@ fn reads_only(command: &Command) -> bool {
             | Command::Doctor { .. }
             | Command::Notes { .. }
             | Command::Search { .. }
-            | Command::Proposal { .. }
+            | Command::Proposal {
+                command: ProposalCommand::List { .. } | ProposalCommand::Show { .. },
+            }
             | Command::Planners { .. }
             | Command::Lint { .. }
             | Command::Goal {
@@ -794,7 +799,9 @@ fn observer_access(command: &Command) -> ObserverAccess {
         | Command::Note { .. }
         | Command::Notes { .. }
         | Command::Search { .. }
-        | Command::Proposal { .. }
+        | Command::Proposal {
+            command: ProposalCommand::List { .. } | ProposalCommand::Show { .. },
+        }
         | Command::Planners { .. }
         | Command::Lint { .. }
         | Command::Goal {
@@ -1027,6 +1034,9 @@ fn execute(cli: Cli) -> Result<Value> {
             ProposalCommand::List { all } => json!({"proposals": queue.proposals(all)?}),
             ProposalCommand::Show { id } => {
                 serde_json::to_value(queue.show_proposal(ProposalId::new(id))?)?
+            }
+            ProposalCommand::Withdraw { id } => {
+                serde_json::to_value(queue.withdraw_proposal(ProposalId::new(id))?)?
             }
         },
         Command::Draft { id } => {

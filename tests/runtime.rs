@@ -7131,8 +7131,10 @@ fn independent_tasks_run_concurrently_and_a_dependent_starts_after_integration()
         thread::spawn(move || supervise_with(&db, &repo, &backend, &options))
     };
 
-    // Both independent runs are alive at once; the dependent has none.
-    wait_until(&db, Duration::from_secs(20), |queue| {
+    // Both independent runs are alive at once; the dependent has none. The
+    // wait is as long as the later ones: under a loaded host (parallel
+    // `cargo llvm-cov` runs) starting two runs took longer than 20 seconds.
+    wait_until(&db, Duration::from_secs(30), |queue| {
         let running: Vec<TaskRun> = queue
             .active_runs()
             .unwrap()

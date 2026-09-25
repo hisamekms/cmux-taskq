@@ -718,6 +718,85 @@ fn a_concern_asks_the_inbox_and_the_supervisor_applies_the_answers() {
     );
     // The one sent back went to a planner of the runtime's.
     assert_eq!(backend.opened().len(), 1);
+
+    // Withdrawn while revising, it drops the revise: no planner is sent
+    // it again, and its draft joins a new proposal.
+    queue.withdraw_proposal(proposals[2]).unwrap();
+    assert_eq!(
+        proposal_column(&fx.db, proposals[2], "revise_reasons"),
+        Value::Null
+    );
+    supervise(&fx, &backend, &reviewer);
+    assert_eq!(backend.opened().len(), 1);
+    assert_eq!(status(&mut queue, returned), TaskStatus::Draft);
+    let again = submit(&mut queue, &[returned], None);
+    assert_ne!(again, proposals[2]);
+    assert_eq!(status(&mut queue, returned), TaskStatus::Submitted);
+}
+
+/// Withdrawing a proposal held for a concern closes its `approve_plan`
+/// ask, so the answer never reaches the proposal the task joins next; a
+/// withdrawn draft with an origin waits for a planner of the runtime's
+/// again.
+#[test]
+fn a_withdrawn_proposal_closes_its_concern_and_its_drafts_are_free() {
+    let fx = fixture();
+    let mut queue = SqliteQueue::open(&fx.db).unwrap();
+    let blocker = TaskId::new(1);
+    let task = add(&mut queue, "doubtful", &[blocker], Priority::Normal);
+    queue
+        .record_draft_origin(task, DraftOrigin::FollowUp, &json!({"run": "r"}))
+        .unwrap();
+    assert!(
+        queue
+            .planner_drafts()
+            .unwrap()
+            .iter()
+            .any(|d| d.task.id() == task)
+    );
+    let first = submit(&mut queue, &[task], None);
+    assert!(
+        queue
+            .planner_drafts()
+            .unwrap()
+            .iter()
+            .all(|d| d.task.id() != task)
+    );
+    let reviewer = StubReviewer::new(&[json!({
+        "verdict": "concern", "reasons": ["looks already implemented"], "summary": "maybe"
+    })]);
+    let backend = PlanWorkspace::default();
+    supervise(&fx, &backend, &reviewer);
+    let asks = queue.asks(Default::default()).unwrap();
+    assert_eq!(asks.len(), 1);
+    assert_eq!(asks[0].kind, AskKind::ApprovePlan);
+
+    queue.withdraw_proposal(first).unwrap();
+    assert!(queue.asks(Default::default()).unwrap().is_empty());
+    let closed = queue.read_ask(asks[0].id).unwrap();
+    assert_eq!(closed.answer.as_deref(), Some("withdrawn"));
+    assert!(closed.closed_at.is_some());
+    assert_eq!(
+        events(&mut queue, task, "ask_answered")[0]["runtime_closed"],
+        true
+    );
+    assert_eq!(status(&mut queue, task), TaskStatus::Draft);
+    assert!(
+        queue
+            .planner_drafts()
+            .unwrap()
+            .iter()
+            .any(|d| d.task.id() == task)
+    );
+
+    // Submitted again and held for a concern again, it gets a new ask.
+    let second = submit(&mut queue, &[task], None);
+    assert_ne!(second, first);
+    supervise(&fx, &backend, &reviewer);
+    let asks = queue.asks(Default::default()).unwrap();
+    assert_eq!(asks.len(), 1);
+    assert_ne!(asks[0].id, closed.id);
+    assert_eq!(status(&mut queue, task), TaskStatus::Submitted);
 }
 
 #[test]

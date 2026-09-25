@@ -97,6 +97,11 @@ pub enum DomainError {
         status: ProposalStatus,
         expected: ProposalStatus,
     },
+    /// A proposal that no longer holds its members is not withdrawn.
+    ProposalNotActive {
+        proposal_id: ProposalId,
+        status: ProposalStatus,
+    },
     /// A required text field is blank.
     Blank {
         field: &'static str,
@@ -269,6 +274,14 @@ impl fmt::Display for DomainError {
                 "proposal {proposal_id} is {}, not {}",
                 status.as_str(),
                 expected.as_str()
+            ),
+            Self::ProposalNotActive {
+                proposal_id,
+                status,
+            } => write!(
+                f,
+                "proposal {proposal_id} is {}; only a submitted or revising proposal is withdrawn",
+                status.as_str()
             ),
             Self::Blank { field } => write!(f, "{field} must not be blank"),
             Self::InvalidPathGlob { glob, reason } => {

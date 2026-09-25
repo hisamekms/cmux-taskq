@@ -1,8 +1,9 @@
 //! Proposals (ADR-0041 decisions 7, 8): the goals and tasks a planner
 //! submits for plan review, kept as `proposals` rows with each member's
 //! `proposal_id`. Submitting moves the member drafts to `submitted`; the
-//! plan-review path ([`approve`]) is what makes them `ready`, and a send
-//! back returns them to `draft` for the planner.
+//! plan-review path ([`approve`]) is what makes them `ready`, a send back
+//! returns them to `draft` for the planner, and a [`withdraw`] releases
+//! them as drafts.
 use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, OptionalExtension, Row, params};
 use serde_json::json;
@@ -192,6 +193,76 @@ pub(super) fn send_back(conn: &Connection, id: ProposalId, now: &str) -> Result<
         }
     }
     read(conn, id)
+}
+
+/// Its planner withdraws a submitted or revising proposal: it ends as
+/// `canceled` without plan review, whatever plan review held or had to
+/// deliver for it is dropped, and its submitted tasks return to `draft`.
+/// Its tasks and goals keep their `proposal_id` as history, but a canceled
+/// proposal holds them no longer, so another proposal takes them. Records
+/// `proposal_withdrawn` on each member task and goal. A concern's
+/// `approve_plan` ask nobody closed is closed, answered `withdrawn` when
+/// still open (`ask_answered` with `runtime_closed: true`): left open, its
+/// answer would reach the proposal its task joins next.
+pub(super) fn withdraw(
+    conn: &Connection,
+    id: ProposalId,
+    now: &str,
+    now_secs: i64,
+) -> Result<Proposal> {
+    let current = read(conn, id)?;
+    let from = current.status();
+    let withdrawn = proposal::withdraw(current, now.into())?;
+    save(conn, &withdrawn)?;
+    conn.execute(
+        "UPDATE proposals SET review_hold=NULL, revise_reasons=NULL, revise_sent_at=NULL,
+             revise_planner_id=NULL, unresponsive_at=NULL WHERE id=?1",
+        [id],
+    )?;
+    let payload = json!({"proposal_id": id, "from": from});
+    for &task_id in withdrawn.task_ids() {
+        if status(conn, task_id)? == TaskStatus::Submitted {
+            transition_task(conn, task_id, TaskAction::Draft, now)?;
+        }
+        event(conn, task_id, None, "proposal_withdrawn", payload.clone())?;
+        close_plan_asks(conn, task_id, now_secs)?;
+    }
+    for &goal_id in withdrawn.goal_ids() {
+        goal_event(conn, goal_id, "proposal_withdrawn", payload.clone())?;
+    }
+    read(conn, id)
+}
+
+/// Close the task's `approve_plan` asks nobody closed, answering an open
+/// one `withdrawn` first.
+fn close_plan_asks(conn: &Connection, task_id: TaskId, now: i64) -> Result<()> {
+    let unclosed: Vec<(i64, bool)> = conn
+        .prepare(
+            "SELECT id, answered_at IS NULL FROM asks
+             WHERE task_id=?1 AND kind='approve_plan' AND closed_at IS NULL ORDER BY id",
+        )?
+        .query_map([task_id], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    for (ask_id, open) in unclosed {
+        if open {
+            conn.execute(
+                "UPDATE asks SET answer='withdrawn', answered_at=?2 WHERE id=?1",
+                params![ask_id, now],
+            )?;
+            event(
+                conn,
+                task_id,
+                None,
+                "ask_answered",
+                json!({"ask_id": ask_id, "kind": "approve_plan", "runtime_closed": true}),
+            )?;
+        }
+        conn.execute(
+            "UPDATE asks SET closed_at=?2 WHERE id=?1",
+            params![ask_id, now],
+        )?;
+    }
+    Ok(())
 }
 
 /// The active proposals (submitted or revising) in the order plan review

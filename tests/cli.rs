@@ -2304,6 +2304,48 @@ fn submit_bundles_drafts_into_a_proposal_that_plan_review_or_a_bypass_readies() 
     assert_eq!(ok(&db, &["show", "2"])["task"]["status"], "draft");
 }
 
+/// `proposal withdraw` releases a submitted proposal's goal and tasks as
+/// drafts for another proposal; the observer and the reviewer may not run it.
+#[test]
+fn proposal_withdraw_releases_the_members_for_another_proposal() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("queue.db");
+    ok(&db, &["init"]);
+    ok(&db, &["goal", "add", "planned", "--draft"]);
+    ok(&db, &["add", "in goal", "--goal", "1"]);
+    ok(&db, &["add", "alone"]);
+    let submitted = submit_from(&db, Some("W-1"), None, &["2", "--goal", "1"]);
+    assert!(submitted.status.success());
+
+    for role in ["observer", "reviewer"] {
+        let refused = invoke_as(Some(role), &db, &["proposal", "withdraw", "1"]);
+        assert!(!refused.status.success(), "{role}");
+        ok_as(role, &db, &["proposal", "show", "1"]);
+    }
+    let withdrawn = ok(&db, &["proposal", "withdraw", "1"]);
+    assert_eq!(withdrawn["status"], "canceled");
+    assert_eq!(withdrawn["task_ids"], serde_json::json!([1, 2]));
+    for id in ["1", "2"] {
+        assert_eq!(ok(&db, &["show", id])["task"]["status"], "draft");
+    }
+    assert_eq!(
+        ok(&db, &["proposal", "list"]),
+        serde_json::json!({"proposals": []})
+    );
+    let again = invoke(&db, &["proposal", "withdraw", "1"]);
+    assert!(!again.status.success());
+    assert!(
+        String::from_utf8_lossy(&again.stderr)
+            .contains("only a submitted or revising proposal is withdrawn")
+    );
+
+    let resubmitted = submit_from(&db, Some("W-2"), None, &["2", "--goal", "1"]);
+    let resubmitted: Value = serde_json::from_slice(&resubmitted.stdout).unwrap();
+    assert_eq!(resubmitted["id"], 2);
+    assert_eq!(resubmitted["task_ids"], serde_json::json!([1, 2]));
+    assert_eq!(resubmitted["goal_ids"], serde_json::json!([1]));
+}
+
 /// Runs `binary` (a copy of this one, as `claim` leaves a run's wrapper in
 /// `runs/<id>/runner`) against `db`.
 fn run_copy(binary: &Path, db: &Path, args: &[&str]) -> Output {

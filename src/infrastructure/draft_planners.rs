@@ -22,14 +22,15 @@ use crate::domain::{
 };
 
 /// The drafts waiting for a planner of the runtime's: `draft`, in no
-/// proposal, with an origin, no planner of the runtime's open for it, no
+/// proposal (or in one withdrawn: a canceled proposal holds no draft), with an origin, no planner of the runtime's open for it, no
 /// `planner_question` about it nobody closed, not kept as a draft by an
 /// answer and not exhausted. A `follow_up` ask the retired triage left
 /// holds a draft back only when answered `keep_draft`: nothing applies its
 /// other answers any more. Drafts registered before this existed match too (the
 /// migration gave them their origin).
 const TARGETS: &str = "SELECT t.id FROM tasks t JOIN draft_origins o ON o.task_id=t.id
-    WHERE t.status='draft' AND t.proposal_id IS NULL
+    WHERE t.status='draft' AND NOT EXISTS(SELECT 1 FROM proposals x
+        WHERE x.id=t.proposal_id AND x.status!='canceled')
     AND NOT EXISTS(SELECT 1 FROM planners p WHERE p.draft_task_id=t.id AND p.closed_at IS NULL)
     AND NOT EXISTS(SELECT 1 FROM asks a WHERE a.task_id=t.id AND a.run_id IS NULL
         AND ((a.kind='planner_question' AND a.closed_at IS NULL)
@@ -364,7 +365,8 @@ pub(super) fn route_of(conn: &Connection, ask: &Ask) -> Result<PlannerAnswerRout
         |r| r.get(0),
     )?;
     let in_proposal: bool = conn.query_row(
-        "SELECT proposal_id IS NOT NULL FROM tasks WHERE id=?1",
+        "SELECT EXISTS(SELECT 1 FROM tasks t JOIN proposals p ON p.id=t.proposal_id
+         WHERE t.id=?1 AND p.status!='canceled')",
         [task_id],
         |r| r.get(0),
     )?;

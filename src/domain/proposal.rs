@@ -244,6 +244,21 @@ pub fn cancel(mut proposal: Proposal, now: String) -> Result<Proposal, DomainErr
     Ok(proposal)
 }
 
+/// Its planner (or a person) withdraws a submitted or revising proposal:
+/// it ends as `canceled` without plan review, and its members are released,
+/// the submitted tasks back to draft, free to join another proposal.
+pub fn withdraw(mut proposal: Proposal, now: String) -> Result<Proposal, DomainError> {
+    require(proposal.status.is_active(), || {
+        DomainError::ProposalNotActive {
+            proposal_id: proposal.id,
+            status: proposal.status,
+        }
+    })?;
+    proposal.status = ProposalStatus::Canceled;
+    proposal.updated_at = now;
+    Ok(proposal)
+}
+
 /// A proposal of its own for ready tasks plan review found have to change
 /// (decision 14): it starts out sent back, owned by the runtime's planner
 /// that will fix and submit it, with no revise counted against it.
@@ -455,6 +470,29 @@ mod tests {
         assert_eq!(reopened.owner().workspace_id, None);
         assert_eq!(reopened.task_ids(), [TaskId::new(4)]);
         assert!(reopen(ProposalId::new(7), Vec::new(), "t3".into()).is_err());
+    }
+
+    #[test]
+    fn a_submitted_or_revising_proposal_is_withdrawn_and_releases_its_members() {
+        let withdrawn = withdraw(submitted(), "t1".into()).unwrap();
+        assert_eq!(withdrawn.status(), ProposalStatus::Canceled);
+        assert_eq!(withdrawn.updated_at(), "t1");
+        assert!(!withdrawn.status().is_active());
+        check_task_joins(
+            TaskId::new(3),
+            Some((withdrawn.id(), withdrawn.status())),
+            None,
+        )
+        .unwrap();
+        let revising = send_back(submitted(), "t1".into()).unwrap();
+        let withdrawn = withdraw(revising, "t2".into()).unwrap();
+        assert_eq!(withdrawn.status(), ProposalStatus::Canceled);
+        assert_eq!(withdrawn.revise_count(), 1);
+        assert_eq!(
+            withdraw(withdrawn, "t3".into()).unwrap_err().to_string(),
+            "proposal 2 is canceled; only a submitted or revising proposal is withdrawn"
+        );
+        assert!(withdraw(accept(submitted(), "t1".into()).unwrap(), "t2".into()).is_err());
     }
 
     #[test]

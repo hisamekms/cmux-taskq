@@ -90,6 +90,10 @@ pub trait TaskStore {
     /// Plan review sends the submitted proposal back to its planner: its
     /// submitted tasks return to draft.
     fn send_back_proposal(&mut self, proposal_id: ProposalId) -> Result<Proposal>;
+    /// Withdraw a submitted or revising proposal: it ends as canceled, its
+    /// submitted tasks return to draft, and its tasks and goals are free to
+    /// join another proposal.
+    fn withdraw_proposal(&mut self, proposal_id: ProposalId) -> Result<Proposal>;
     fn show_proposal(&self, proposal_id: ProposalId) -> Result<Proposal>;
     /// The submitted and revising proposals, oldest submission first; with
     /// `all`, every proposal.

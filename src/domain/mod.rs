@@ -136,8 +136,10 @@ string_enum!(AskKind {
 
 // Where a proposal (ADR-0041 decision 7) stands: `submitted` waits for plan
 // review, `revising` was sent back to its planner (its tasks are drafts
-// again), `accepted` passed and made its tasks ready, `canceled` had its
-// tasks canceled on a person's answer.
+// again), `accepted` passed and made its tasks ready, `canceled` ended
+// without passing: a person's `cancel` answer canceled its tasks, or its
+// planner withdrew it and its tasks returned to draft. Neither `accepted`
+// nor `canceled` holds its members any more.
 string_enum!(ProposalStatus {
     Submitted => "submitted",
     Revising => "revising",

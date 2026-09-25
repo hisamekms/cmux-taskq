@@ -1009,6 +1009,20 @@ impl TaskStore for SqliteQueue {
         Ok(proposal)
     }
 
+    fn withdraw_proposal(&mut self, proposal_id: ProposalId) -> Result<Proposal> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let proposal = proposals::withdraw(
+            &tx,
+            proposal_id,
+            &self.generators.clock.timestamp(),
+            self.generators.clock.now(),
+        )?;
+        tx.commit()?;
+        Ok(proposal)
+    }
+
     fn show_proposal(&self, proposal_id: ProposalId) -> Result<Proposal> {
         let tx = self.conn.unchecked_transaction()?;
         proposals::read(&tx, proposal_id)

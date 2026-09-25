@@ -2652,6 +2652,78 @@ fn submitted_tasks_wait_for_plan_review_which_readies_or_sends_them_back() {
     assert_eq!(status_of(&mut queue, a), TaskStatus::Ready);
 }
 
+/// A submitted or revising proposal is withdrawn: it ends as canceled, its
+/// submitted tasks return to draft, and its tasks and goals join another
+/// proposal.
+#[test]
+fn a_withdrawn_proposal_releases_its_goals_and_tasks_as_drafts() {
+    let (_dir, mut queue) = fixture();
+    let goal = queue
+        .add_goal(NewGoal {
+            draft: true,
+            ..new_goal("planned")
+        })
+        .unwrap()
+        .id();
+    let mut in_goal = new_task("in goal");
+    in_goal.goal_id = Some(goal);
+    let a = queue.add(in_goal).unwrap().id();
+    let b = queue.add(new_task("alone")).unwrap().id();
+
+    // A submitted one.
+    let first = queue.submit(submission(&[b], &[goal], None)).unwrap();
+    let withdrawn = queue.withdraw_proposal(first.id()).unwrap();
+    assert_eq!(withdrawn.status(), ProposalStatus::Canceled);
+    assert_eq!(withdrawn.task_ids(), [a, b]);
+    for id in [a, b] {
+        assert_eq!(status_of(&mut queue, id), TaskStatus::Draft);
+        assert!(queue.show(id).unwrap().events.iter().any(|e| {
+            e.kind == "proposal_withdrawn"
+                && e.payload == serde_json::json!({"proposal_id": 1, "from": "submitted"})
+        }));
+    }
+    assert!(
+        queue
+            .show_goal(goal)
+            .unwrap()
+            .events
+            .iter()
+            .any(|e| e.kind == "proposal_withdrawn")
+    );
+    assert!(queue.proposals(false).unwrap().is_empty());
+    assert_eq!(
+        queue.withdraw_proposal(first.id()).unwrap_err().to_string(),
+        "proposal 1 is canceled; only a submitted or revising proposal is withdrawn"
+    );
+    assert!(queue.submit(submission(&[a], &[], Some(1))).is_err());
+
+    // Its members join another proposal, which plan review sends back; the
+    // revising one is withdrawn with its drafts, whatever it held.
+    let second = queue.submit(submission(&[b], &[goal], None)).unwrap();
+    assert_eq!(second.id(), ProposalId::new(2));
+    assert_eq!(second.task_ids(), [a, b]);
+    queue.send_back_proposal(second.id()).unwrap();
+    queue.transition(b, TaskAction::Cancel).unwrap();
+    let withdrawn = queue.withdraw_proposal(second.id()).unwrap();
+    assert_eq!(withdrawn.status(), ProposalStatus::Canceled);
+    assert_eq!(withdrawn.revise_count(), 1);
+    assert_eq!(status_of(&mut queue, a), TaskStatus::Draft);
+    assert_eq!(status_of(&mut queue, b), TaskStatus::Canceled);
+    assert!(queue.show(a).unwrap().events.iter().any(|e| {
+        e.kind == "proposal_withdrawn"
+            && e.payload == serde_json::json!({"proposal_id": 2, "from": "revising"})
+    }));
+
+    // A third proposal takes the goal and its draft, and passes.
+    let third = queue.submit(submission(&[], &[goal], None)).unwrap();
+    assert_eq!(third.task_ids(), [a]);
+    assert_eq!(third.goal_ids(), [goal]);
+    queue.approve_proposal(third.id()).unwrap();
+    assert_eq!(status_of(&mut queue, a), TaskStatus::Ready);
+    assert!(queue.withdraw_proposal(third.id()).is_err());
+    assert!(queue.withdraw_proposal(ProposalId::new(9)).is_err());
+}
+
 #[test]
 fn submit_needs_a_draft_task_and_an_open_goal() {
     let (_dir, mut queue) = fixture();
