@@ -14,6 +14,10 @@ use super::{
     stall::{BackgroundTask, StallConfig},
 };
 
+pub mod thresholds;
+
+pub use thresholds::ThresholdStats;
+
 /// Runs returned without `--full`.
 pub const DEFAULT_RUNS: usize = 50;
 /// A run waiting to land longer than this many seconds is an alert.
@@ -176,6 +180,11 @@ pub struct Stats {
     pub workspace_check: WorkspaceCheck,
     /// The thresholds `running_alerts` were judged by, and where they came from.
     pub stall_config: StallConfigReport,
+    /// Per `[stall]` setting (ADR-0043 decision 6): the detections made in
+    /// the same window as `backend_failures`, how each ended, how long it
+    /// took, the people who stepped in before any detection, and the
+    /// running alerts it judges now.
+    pub stall_thresholds: BTreeMap<&'static str, ThresholdStats>,
     /// Pass it to `--since` to read only runs that finish later.
     pub next_cursor: EventId,
 }
@@ -336,7 +345,7 @@ pub fn stats(
             .is_none_or(|goal| goals.get(&task_id).copied().flatten() == Some(goal))
     };
     let tracks = runs(events, goals);
-    let running_alerts = running_alerts(events, &tracks, now, live)
+    let running_alerts: Vec<RunningAlert> = running_alerts(events, &tracks, now, live)
         .into_iter()
         .filter(|alert| alert.task_id.is_none_or(in_goal))
         .collect();
@@ -495,6 +504,13 @@ pub fn stats(
     let backend_failures = backend_failures(events, window_start, next_cursor, counts);
     let reason_codes = reason_codes(events, window_start, next_cursor, counts);
     let duplicate_cancels = duplicate_cancels(events, window_start, next_cursor, counts);
+    let stall_thresholds = thresholds::thresholds(
+        &thresholds::detections(events, now * 1000),
+        &thresholds::preemptions(events),
+        |id, task_id| id > window_start && id <= next_cursor && counts(task_id),
+        &running_alerts,
+        &live.config.config,
+    );
     if backend_failures.count >= BACKEND_FAILURES {
         alerts.push(Alert {
             kind: "backend_failures",
@@ -525,6 +541,7 @@ pub fn stats(
         running_alerts,
         workspace_check,
         stall_config: live.config.clone(),
+        stall_thresholds,
         next_cursor,
     }
 }
@@ -1603,5 +1620,84 @@ mod tests {
             task == Some(TaskId::new(2))
         });
         assert_eq!(task_two.count, 1);
+    }
+
+    /// `stall_thresholds` counts the detections made after `--since`, of
+    /// the goal's tasks only, and the running alerts judged now.
+    #[test]
+    fn stall_thresholds_follow_the_window_and_the_goal() {
+        let nudged = json!({"phase": "session", "idle_secs": 1250, "threshold_secs": 1200});
+        let resolved = json!({
+            "phase": "session", "detection": "nudge", "threshold": "idle_without_receipt_secs",
+            "threshold_secs": 1200, "detected_after_secs": 1250,
+            "outcome": "resolved_by_nudge", "resolved_after_secs": 60,
+        });
+        let events = vec![
+            run_event(1, R1, "agent_started", json!({}), T),
+            run_event(2, R1, "stall_nudged", nudged.clone(), T + 1250),
+            run_event(3, R1, "stall_resolved", resolved, T + 1310),
+            run_event(4, R2, "agent_started", json!({}), T),
+            RunEvent {
+                task_id: Some(TaskId::new(2)),
+                ..run_event(5, R2, "stall_nudged", nudged, T + 1250)
+            },
+        ];
+        let mut run = live_run(R1, RunStatus::Running);
+        run.idle = Some(((T + 1320) * 1000, Vec::new()));
+        let live = snapshot(vec![run], Workspaces::Unavailable("none".into()));
+        let at = |query: &StatsQuery, goals: &HashMap<TaskId, Option<GoalId>>| {
+            stats(
+                &events,
+                goals,
+                T + 3000,
+                SlotSnapshot::default(),
+                query,
+                &live,
+            )
+        };
+        let all = at(&StatsQuery::default(), &HashMap::new());
+        let idle = &all.stall_thresholds["idle_without_receipt_secs"];
+        assert_eq!(idle.detections, 2);
+        assert_eq!(idle.outcomes["resolved_by_nudge"], 1);
+        assert_eq!(idle.outcomes["pending"], 1);
+        assert_eq!(idle.running_alerts, 1);
+        let json = serde_json::to_value(&all).unwrap();
+        assert_eq!(
+            json["stall_thresholds"]["idle_without_receipt_secs"]["by_detection"]["nudge"]["count"],
+            2
+        );
+        assert_eq!(
+            json["stall_thresholds"]["send_confirm_secs"]["threshold_secs"],
+            60
+        );
+        // After the first nudge only the second counts.
+        let since = at(
+            &StatsQuery {
+                since: Some(EventId::new(3)),
+                ..StatsQuery::default()
+            },
+            &HashMap::new(),
+        );
+        assert_eq!(
+            since.stall_thresholds["idle_without_receipt_secs"].outcomes,
+            BTreeMap::from([("pending".to_owned(), 1)])
+        );
+        // Goal 1 has task 1 only.
+        let goals = HashMap::from([
+            (TaskId::new(1), Some(GoalId::new(1))),
+            (TaskId::new(2), Some(GoalId::new(2))),
+        ]);
+        let goal = at(
+            &StatsQuery {
+                goal_id: Some(GoalId::new(1)),
+                full: true,
+                ..StatsQuery::default()
+            },
+            &goals,
+        );
+        assert_eq!(
+            goal.stall_thresholds["idle_without_receipt_secs"].outcomes,
+            BTreeMap::from([("resolved_by_nudge".to_owned(), 1)])
+        );
     }
 }
