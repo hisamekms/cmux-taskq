@@ -268,7 +268,9 @@ impl TriageVerdict {
 
 /// The whole text as one JSON object of `T`, or else the outermost `{...}`
 /// in it (a model may wrap the object in a fence or a sentence).
-fn parse_json_object<T: serde::de::DeserializeOwned>(stdout: &str) -> serde_json::Result<T> {
+pub(crate) fn parse_json_object<T: serde::de::DeserializeOwned>(
+    stdout: &str,
+) -> serde_json::Result<T> {
     let text = stdout.trim();
     serde_json::from_str::<T>(text).or_else(|error| match (text.find('{'), text.rfind('}')) {
         (Some(start), Some(end)) if start < end => serde_json::from_str::<T>(&text[start..=end]),
@@ -415,6 +417,7 @@ pub mod plan_review;
 pub mod planner;
 pub mod proposal;
 pub mod reason;
+pub mod recovery;
 pub mod related;
 pub mod run;
 pub mod scope;

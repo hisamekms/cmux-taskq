@@ -52,9 +52,9 @@ use super::{
     },
     or_none, path_text,
     prompt::{
-        GoalPredecessorSummary, PredecessorSummary, ResumeKind, ResumeRequest, TRIAGE_TOOLS,
-        prompt, resume_request, review_prompt, revise_mismatch_request, revise_request,
-        siblings_in_progress, stall_nudge, triage_prompt,
+        GoalPredecessorSummary, PredecessorSummary, RecoveryMaterial, ResumeKind, ResumeRequest,
+        TRIAGE_TOOLS, prompt, recovery_prompt, resume_request, review_prompt,
+        revise_mismatch_request, revise_request, siblings_in_progress, stall_nudge, triage_prompt,
     },
     recording::{RecordingBackend, reason_of_error, timed_out_maybe_sent},
     tail, unix_seconds,
@@ -66,6 +66,7 @@ use crate::domain::{
     ReviewDecision, ReviewVerdict, RunId, RunLease, RunPaths, RunPlan, RunProcess, RunStatus,
     SessionRole, TRIAGE_OPTIONS, TRIAGE_RETRY_FAILURES, TaskAction, TaskId, TaskRun, TaskStatus,
     TriageDecision, TriageState, TriageVerdict, heartbeat_stale,
+    recovery::RecoveryDecision,
     stall::{BackgroundTask, STALL_CONFIG_LOADED, StallConfig},
     triage_state,
 };
@@ -78,6 +79,7 @@ mod idle;
 mod jobs;
 mod landing;
 mod plan_review;
+mod recovery;
 mod resume;
 mod revise;
 mod session;
@@ -86,7 +88,8 @@ mod sweep;
 mod triage;
 
 use self::{
-    deliver::*, exit::*, idle::*, jobs::*, resume::*, revise::*, session::*, stall::*, sweep::*,
+    deliver::*, exit::*, idle::*, jobs::*, recovery::*, resume::*, revise::*, session::*, stall::*,
+    sweep::*,
 };
 
 /// How far back the daily observation reads.
@@ -1248,6 +1251,7 @@ fn stop_job(slot: &mut Slot) {
     match &mut slot.phase {
         Phase::Review(watch) => watch.job.stop(),
         Phase::Triage(watch) => watch.job.stop(),
+        Phase::Session(watch) => watch.recovery.stop_job(),
         _ => {}
     }
 }

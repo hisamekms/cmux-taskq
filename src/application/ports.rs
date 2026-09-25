@@ -629,6 +629,11 @@ pub trait ProcessControl {
     fn interrupt(&self, pid: u32) -> Result<()>;
     /// End the process immediately (SIGKILL).
     fn kill(&self, pid: u32) -> Result<()>;
+    /// This user's processes with their parents, ages, commands and
+    /// working directories, for the recovery job (ADR-0047 decision 39).
+    fn list(&self) -> Result<Vec<crate::domain::recovery::ProcessInfo>> {
+        anyhow::bail!("this process control cannot list processes")
+    }
 }
 
 /// The current time, injected so a use case reads it through this port and

@@ -13,6 +13,9 @@ use super::*;
 /// The setting the idle detections are judged by.
 pub(super) const IDLE_THRESHOLD: &str = "idle_without_receipt_secs";
 
+/// The setting the `long_background` alert is judged by.
+pub(super) const BACKGROUND_THRESHOLD: &str = "background_alert_secs";
+
 /// The options of a `stalled` ask: leave the session alone and ask again
 /// if it stays idle, or have a person step in.
 pub(super) const STALLED_OPTIONS: [&str; 2] = ["wait", "intervene"];
@@ -46,6 +49,9 @@ struct Asked {
     detected_after_secs: i64,
     /// Its answer is applied (its `stall_resolved` is recorded).
     applied: bool,
+    /// The setting of the detection it came from: [`IDLE_THRESHOLD`], or
+    /// `background_alert_secs` for a recovery job's escalation.
+    threshold: &'static str,
 }
 
 /// Receipt-less idle of one session, judged each tick.
@@ -166,11 +172,20 @@ impl StallWatch {
         }
         if let Some(ask) = queue.unclosed_stalled_ask(run.id())? {
             let applied = ask.answered_at.is_some() && resolved("ask", Some(ask.id));
+            // A recovery job's escalation names its ask (ADR-0047).
+            let recovery = events
+                .iter()
+                .any(|e| e.kind == "recovery_finished" && e.payload["ask_id"] == json!(ask.id));
             watch.asked = Some(Asked {
                 id: ask.id,
                 at: at_unix(ask.created_at + 1),
                 detected_after_secs: 0,
                 applied,
+                threshold: if recovery {
+                    BACKGROUND_THRESHOLD
+                } else {
+                    IDLE_THRESHOLD
+                },
             });
             if applied {
                 watch.held = watch.held.max(ask.answered_at.map(|at| at_unix(at + 1)));
@@ -188,27 +203,57 @@ impl StallWatch {
         self.last_input = Some(self.last_input.map_or(at, |last| last.max(at)));
     }
 
+    /// Whether the session ended a turn (its idle marker `marker`) since the
+    /// last text the supervisor typed.
+    pub(super) fn turn_since_input(&self, marker: SystemTime) -> bool {
+        self.last_input.is_none_or(|at| marker > at)
+    }
+
+    /// A recovery job escalated the alert of `threshold` to the `stalled`
+    /// ask `id` (ADR-0047 decision 40): the watch follows it like its own,
+    /// closing it once the session moves on and applying its answer.
+    pub(super) fn escalated(
+        &mut self,
+        id: AskId,
+        at: SystemTime,
+        detected_after_secs: i64,
+        threshold: &'static str,
+    ) {
+        self.asked = Some(Asked {
+            id,
+            at,
+            detected_after_secs,
+            applied: false,
+            threshold,
+        });
+    }
+
     /// Record how a detection ended, once.
     #[allow(clippy::too_many_arguments)]
     fn resolved(
         sv: &mut Supervisor<'_>,
         run: &TaskRun,
         detection: &str,
-        ask: Option<AskId>,
+        ask: Option<(AskId, &'static str)>,
         detected_after_secs: i64,
         detected_at: SystemTime,
         outcome: &str,
     ) -> Result<()> {
+        let threshold = ask.map_or(IDLE_THRESHOLD, |(_, threshold)| threshold);
         let mut payload = json!({
             "phase": PHASE,
             "detection": detection,
-            "threshold": IDLE_THRESHOLD,
-            "threshold_secs": sv.stall.idle_without_receipt_secs,
+            "threshold": threshold,
+            "threshold_secs": if threshold == BACKGROUND_THRESHOLD {
+                sv.stall.background_alert_secs
+            } else {
+                sv.stall.idle_without_receipt_secs
+            },
             "detected_after_secs": detected_after_secs,
             "outcome": outcome,
             "resolved_after_secs": secs_between(detected_at, sv.files.now()),
         });
-        if let Some(id) = ask {
+        if let Some((id, _)) = ask {
             payload["ask_id"] = json!(id);
         }
         sv.queue
@@ -290,7 +335,7 @@ impl StallWatch {
                 sv,
                 run,
                 "ask",
-                Some(asked.id),
+                Some((asked.id, asked.threshold)),
                 asked.detected_after_secs,
                 asked.at,
                 outcome,
@@ -463,6 +508,7 @@ impl StallWatch {
             at: now,
             detected_after_secs: idle_secs,
             applied: false,
+            threshold: IDLE_THRESHOLD,
         });
         if !nudge.settled {
             self.nudge = Some(Nudge {
@@ -513,7 +559,7 @@ impl StallWatch {
                     sv,
                     run,
                     "ask",
-                    Some(asked.id),
+                    Some((asked.id, asked.threshold)),
                     asked.detected_after_secs,
                     asked.at,
                     if wait {
@@ -544,7 +590,7 @@ impl StallWatch {
                     sv,
                     run,
                     "ask",
-                    Some(ask.id),
+                    Some((ask.id, asked.threshold)),
                     asked.detected_after_secs,
                     asked.at,
                     "answered_wait",
@@ -558,7 +604,7 @@ impl StallWatch {
                     sv,
                     run,
                     "ask",
-                    Some(ask.id),
+                    Some((ask.id, asked.threshold)),
                     asked.detected_after_secs,
                     asked.at,
                     "answered_intervene",

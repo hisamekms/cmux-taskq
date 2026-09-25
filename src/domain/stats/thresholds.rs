@@ -13,8 +13,10 @@
 //!   `submit_resent` (`resend`), and each `answer_prompt` ask opened right
 //!   after a `submit_unconfirmed` of a text or a `submit_not_started`
 //!   (`ask`), ended by the events after it.
-//! - `background_alert_secs` has no detection of the supervisor: only the
-//!   running alerts it judges now are counted.
+//! - `background_alert_secs` (`long_background`): the `stalled` asks the
+//!   recovery job raised (ADR-0047 decision 40), whose `stall_resolved`
+//!   names this threshold; a repair it applied is `auto_repaired`, not a
+//!   detection here. The running alerts judged now are counted too.
 //!
 //! A detection with no end recorded yet is `pending`.
 use std::collections::BTreeMap;

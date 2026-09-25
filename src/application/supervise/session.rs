@@ -141,6 +141,7 @@ so the run workspace opens outside it: {error:#}", self.layout.queue_hash);
             exit_for_silence: false,
             answer_start: None,
             stall: StallWatch::default(),
+            recovery: RecoveryWatch::default(),
         })
     }
 }
@@ -183,6 +184,9 @@ pub(super) struct SessionWatch {
     /// Idle without a receipt: the nudge and the `stalled` ask (ADR-0043
     /// decision 1).
     pub(super) stall: StallWatch,
+    /// Background work past its threshold: the recovery job (ADR-0047
+    /// decision 39).
+    pub(super) recovery: RecoveryWatch,
 }
 
 impl SessionWatch {
@@ -239,6 +243,7 @@ impl SessionWatch {
             // is asked to exit only once the verdict is known (ADR-0027
             // decision 1).
             info!(run_id = %run.id(), "session of {} is idle after its receipt; validating with the session open", run.id());
+            self.recovery.stop(sv, run);
             return sv
                 .queue
                 .finish_supervision_live(run.id(), &sv.token)
@@ -267,6 +272,7 @@ impl SessionWatch {
                 }
                 close_answer_prompt_asks(sv, run, PROMPT_EXITED_CLOSED)?;
                 self.stall.ended(sv, run)?;
+                self.recovery.stop(sv, run);
                 return sv.queue.finish_supervision(run.id(), &sv.token).map(Some);
             }
             let pulse = wrapper_pulse(
@@ -314,6 +320,7 @@ impl SessionWatch {
                         {
                             self.answer_start = Some(start);
                         }
+                        self.watch_background(sv, run, &processes)?;
                     }
                     if let Some(agent) = processes.iter().find(|p| p.role == "agent") {
                         self.watch_prompt(sv, run, agent)?;

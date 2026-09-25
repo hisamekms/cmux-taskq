@@ -20,7 +20,9 @@ use crate::domain::{
     Ask, CommitSha, DraftOrigin, DraftTarget, Goal, GoalId, GoalPredecessor, GoalTask,
     LintViolation, MAX_DRAFT_PLANNERS, MAX_PLAN_REVISES, MAX_RESUME_ATTEMPTS, MAX_REVISE_ATTEMPTS,
     Predecessor, Proposal, ProposalId, Receipt, RunStatus, TRIAGE_RETRY_FAILURES, Task, TaskDetail,
-    TaskId, TaskRun, stats::conflicts::ConflictHotspot,
+    TaskId, TaskRun,
+    recovery::{ProcessInfo, RecoveryAlert},
+    stats::conflicts::ConflictHotspot,
 };
 
 /// What the prompt says about one direct predecessor: the task, the squash
@@ -921,6 +923,126 @@ pub fn triage_prompt(
         } else {
             earlier.join("\n")
         },
+    ))
+}
+
+/// What the runtime read for a recovery job of a live session's alert
+/// (ADR-0047 decision 39), at the time of the alert.
+pub struct RecoveryMaterial<'a> {
+    pub alert: RecoveryAlert,
+    /// The alert's own facts (`recovery_requested`'s payload).
+    pub facts: &'a Value,
+    pub workspace: &'a str,
+    /// The screen's excerpt, or why it could not be read.
+    pub screen: &'a str,
+    /// The processes that belong to the run (see
+    /// [`crate::domain::recovery::run_processes`]), or why they could not
+    /// be listed.
+    pub processes: std::result::Result<Vec<ProcessInfo>, String>,
+    pub git_status: &'a str,
+    pub head: &'a str,
+    /// The receipt's `commit`, when there is a receipt.
+    pub receipt_commit: Option<&'a str>,
+    /// The run's earlier recovery verdicts and automatic repairs.
+    pub history: &'a [Value],
+    /// The actions that apply to this alert.
+    pub allowed: &'a [&'a str],
+}
+
+/// What each allowed action does, for the recovery prompt.
+fn recovery_action_help(action: &str) -> &'static str {
+    match action {
+        "stop_processes" => {
+            "{\"action\": \"stop_processes\", \"pids\": [pid, ...]}: stop these processes (SIGTERM, then SIGKILL after a grace). Only processes listed below as the run's own are allowed; any other pid makes the whole verdict an escalation. Use it for a background process the session waits for that will not end by itself (an orphan holding a pipe, a hung test). Never the session's own wrapper or agent."
+        }
+        "send_instruction" => {
+            "{\"action\": \"send_instruction\", \"instruction\": string}: type this instruction into the session once (it must be idle at its prompt), for example to stop a background command it waits for and rerun the tests."
+        }
+        "wait" => {
+            "{\"action\": \"wait\", \"recheck_after_secs\": n}: do nothing now; if the alert still holds after n seconds (at most 3600), another recovery job runs. The work looks healthy and is only slow."
+        }
+        _ => "",
+    }
+}
+
+/// What the recovery job of a live session's alert is asked (ADR-0047
+/// decisions 39 and 40): the alert, the task, the screen, the run's
+/// processes, the worktree's state and the run's earlier repairs, the
+/// allowed actions and the verdict schema.
+pub fn recovery_prompt(
+    task: &Task,
+    run: &TaskRun,
+    attempt: usize,
+    material: &RecoveryMaterial<'_>,
+) -> Result<String> {
+    let processes = match &material.processes {
+        Ok(processes) if processes.is_empty() => "none".to_owned(),
+        Ok(processes) => processes
+            .iter()
+            .map(|p| {
+                format!(
+                    "- pid {} (parent {}, running {}s, cwd {}): {}",
+                    p.pid,
+                    p.ppid,
+                    p.elapsed_secs,
+                    p.cwd.as_deref().unwrap_or("unknown"),
+                    tail(&p.command, 300)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+        Err(error) => format!("(the processes could not be listed: {error})"),
+    };
+    let history = if material.history.is_empty() {
+        "none".to_owned()
+    } else {
+        material
+            .history
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let actions = material
+        .allowed
+        .iter()
+        .map(|action| format!("- {}", recovery_action_help(action)))
+        .collect::<Vec<_>>()
+        .join("\n");
+    Ok(format!(
+        "You are dagq's recovery job (attempt {attempt}) for run {run_id} of task {task_id} ({title}), whose session in workspace {workspace} is still running. The supervisor raised the alert {alert}: {meaning}\n\
+         Decide whether the runtime can repair it with one of the allowed actions below, or whether a person has to look.\n\
+         Read only: the material below, and the files it names if you need more (the worktree is {worktree}). Do not change any file and do not run commands; the runtime applies your verdict.\n\n\
+         Task description:\n{description}\n\n\
+         Acceptance criteria:\n{acceptance}\n\n\
+         Alert facts:\n{facts}\n\n\
+         Last lines of the session's screen:\n{screen}\n\n\
+         Processes of the run (working directory in the worktree, or under the session's wrapper; the wrapper and the agent themselves are not listed):\n{processes}\n\n\
+         Worktree: HEAD {head}, receipt commit {receipt}, git status:\n{status}\n\n\
+         Earlier recovery verdicts and repairs of this run:\n{history}\n\n\
+         Allowed actions:\n{actions}\n\
+         Not allowed, ever: cancelling the task, retrying a run that has commits, editing the task, landing without review, writing to main, pushing, deleting branches or worktrees, touching anything outside this run's worktree and workspace, writing the queue database, sending keys to a dialog. If the repair needs any of these, escalate.\n\n\
+         Answer with one JSON object and nothing else, matching this schema:\n\
+         {{\"verdict\": \"repair\" | \"escalate\", \"confidence\": \"high\" | \"low\", \"diagnosis\": string, \"actions\": [action, ...], \"question\": string, \"options\": [string, ...], \"reason_category\": \"recovery_failed\" | \"discard\" | \"scope\"}}\n\
+         diagnosis says what you found in one or two sentences. repair needs at least one action and is applied only with confidence high; with confidence low, or with escalate, a person is asked, with your actions as the recommendation, question as the question and options added to theirs. reason_category says why a person is needed: recovery_failed when you cannot repair it or are not sure, discard when the work would be thrown away, scope when it needs a permission you do not have.\n",
+        run_id = run.id(),
+        task_id = task.id(),
+        title = task.title(),
+        workspace = material.workspace,
+        alert = material.alert.as_str(),
+        meaning = match material.alert {
+            RecoveryAlert::LongBackground =>
+                "background work the session started has run longer than the threshold, and the session waits for it.",
+            _ => "the session looks stuck.",
+        },
+        worktree = run.worktree_path().unwrap_or("none"),
+        description = or_none(task.description()),
+        acceptance = or_none(task.acceptance()),
+        facts = fenced("json", &serde_json::to_string_pretty(material.facts)?),
+        screen = fenced("text", or_none(material.screen.trim())),
+        head = material.head,
+        receipt = material.receipt_commit.unwrap_or("(no receipt)"),
+        status = fenced("text", or_none(material.git_status.trim())),
     ))
 }
 

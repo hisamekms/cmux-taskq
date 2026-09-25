@@ -6,6 +6,7 @@ use crate::{
     },
     domain::{
         CommitSha, Task, TaskId, TaskRun,
+        recovery::ProcessInfo,
         stall::IDLE_LOG,
         stats::{
             ListedWorkspace,
@@ -146,6 +147,95 @@ impl ProcessControl for SystemProcesses {
     fn kill(&self, pid: u32) -> Result<()> {
         signal(pid, libc::SIGKILL)
     }
+
+    fn list(&self) -> Result<Vec<ProcessInfo>> {
+        // SAFETY: getuid(2) has no failure and no memory effects.
+        let uid = unsafe { libc::getuid() }.to_string();
+        let listing =
+            output(Command::new("ps").args(["-U", &uid, "-o", "pid=,ppid=,etime=,command="]))?;
+        let mut processes = parse_ps(&listing);
+        let cwds = working_directories(&uid, &processes);
+        for process in &mut processes {
+            process.cwd = cwds
+                .iter()
+                .find(|(pid, _)| *pid == process.pid)
+                .map(|(_, cwd)| cwd.clone());
+        }
+        Ok(processes)
+    }
+}
+
+/// The lines of `ps -o pid=,ppid=,etime=,command=`; a line that does not
+/// read is skipped.
+fn parse_ps(listing: &str) -> Vec<ProcessInfo> {
+    listing
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let pid = fields.next()?.parse().ok()?;
+            let ppid = fields.next()?.parse().ok()?;
+            let elapsed_secs = parse_etime(fields.next()?)?;
+            let command = fields.collect::<Vec<_>>().join(" ");
+            Some(ProcessInfo {
+                pid,
+                ppid,
+                elapsed_secs,
+                command,
+                cwd: None,
+            })
+        })
+        .collect()
+}
+
+/// `ps`'s `etime`, `[[dd-]hh:]mm:ss`, in seconds.
+fn parse_etime(text: &str) -> Option<u64> {
+    let (days, clock) = match text.split_once('-') {
+        Some((days, clock)) => (days.parse::<u64>().ok()?, clock),
+        None => (0, text),
+    };
+    let mut secs = 0;
+    for part in clock.split(':') {
+        secs = secs * 60 + part.parse::<u64>().ok()?;
+    }
+    Some(days * 86_400 + secs)
+}
+
+/// The working directories of `processes`: `/proc/<pid>/cwd` where there is
+/// a `/proc`, else `lsof`'s `cwd` entries of the user. What cannot be read
+/// is left out.
+fn working_directories(uid: &str, processes: &[ProcessInfo]) -> Vec<(u32, String)> {
+    if Path::new("/proc/self/cwd").exists() {
+        return processes
+            .iter()
+            .filter_map(|p| {
+                let cwd = fs::read_link(format!("/proc/{}/cwd", p.pid)).ok()?;
+                Some((p.pid, cwd.to_string_lossy().into_owned()))
+            })
+            .collect();
+    }
+    // lsof exits non-zero when it could not read some process; what it
+    // printed still holds.
+    match capture(
+        Command::new("lsof").args(["-a", "-d", "cwd", "-u", uid, "-Fpn"]),
+        OUTPUT_TIMEOUT,
+    ) {
+        Ok((_, stdout, _)) => parse_lsof_cwd(&stdout),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// `lsof -Fpn` output: `p<pid>` starts a process, `n<path>` is its file.
+fn parse_lsof_cwd(stdout: &str) -> Vec<(u32, String)> {
+    let mut cwds = Vec::new();
+    let mut pid = None;
+    for line in stdout.lines() {
+        if let Some(value) = line.strip_prefix('p') {
+            pid = value.parse().ok();
+        } else if let (Some(value), Some(pid)) = (line.strip_prefix('n'), pid) {
+            cwds.push((pid, value.to_owned()));
+        }
+    }
+    cwds
 }
 
 fn signal(pid: u32, signal: libc::c_int) -> Result<()> {
@@ -1785,6 +1875,45 @@ pub fn stop_hook_settings(idle_marker: &Path) -> Result<String> {
 mod tests {
     use super::*;
     use crate::domain::{PlannerId, ProposalId, Provider, RunId, RunStatus, SessionRole};
+
+    #[test]
+    fn ps_and_lsof_listings_are_read() {
+        assert_eq!(parse_etime("05"), Some(5));
+        assert_eq!(parse_etime("01:05"), Some(65));
+        assert_eq!(parse_etime("02:01:05"), Some(7265));
+        assert_eq!(parse_etime("3-02:01:05"), Some(3 * 86_400 + 7265));
+        assert_eq!(parse_etime("x"), None);
+        let processes =
+            parse_ps("  1     0  3-00:00:00 /sbin/launchd\n 42  1 01:05 sleep 600 --x\nbad line\n");
+        assert_eq!(processes.len(), 2);
+        assert_eq!(processes[1].pid, 42);
+        assert_eq!(processes[1].ppid, 1);
+        assert_eq!(processes[1].elapsed_secs, 65);
+        assert_eq!(processes[1].command, "sleep 600 --x");
+        assert_eq!(
+            parse_lsof_cwd("p42\nfcwd\nn/tmp/a b\np43\nfcwd\nn/\n"),
+            [(42, "/tmp/a b".to_owned()), (43, "/".to_owned())]
+        );
+    }
+
+    #[test]
+    fn this_users_processes_are_listed_with_their_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        let dir = dir.path().canonicalize().unwrap();
+        let mut child = Command::new("/bin/sleep")
+            .arg("30")
+            .current_dir(&dir)
+            .spawn()
+            .unwrap();
+        let listed = SystemProcesses.list().unwrap();
+        let _ = child.kill();
+        let _ = child.wait();
+        let found = listed.iter().find(|p| p.pid == child.id()).unwrap();
+        assert_eq!(found.ppid, std::process::id());
+        assert!(found.command.contains("sleep 30"), "{found:?}");
+        let cwd = PathBuf::from(found.cwd.as_deref().unwrap());
+        assert_eq!(cwd.canonicalize().unwrap(), dir);
+    }
 
     #[test]
     fn a_long_paste_gets_more_time_before_its_enter() {

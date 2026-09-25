@@ -177,6 +177,7 @@ impl Supervisor<'_> {
                     exit_for_silence: false,
                     answer_start: None,
                     stall: StallWatch::adopt(&*self.queue, run)?,
+                    recovery: RecoveryWatch::adopt(&*self.queue, run)?,
                 })
             }
         })
