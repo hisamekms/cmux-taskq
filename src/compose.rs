@@ -26,6 +26,7 @@ use crate::{
             self, DownOptions, Ports as LifecyclePorts, QUEUE_ENV, QueuePaths, REVIEWER_ROLE,
             ROLE_ENV, RepositoryPaths, UpEnvironment, UpOptions, session_env,
         },
+        planner::{self, PlannerLaunch, PlannerProbes, PlannerWrapper},
         prompt,
         rebind::{self as rebinding, Rebind, RebindTarget},
         recording::RecordingBackend,
@@ -35,7 +36,7 @@ use crate::{
         supervise::{self as supervisor, Heartbeat, Layout, LoopSettings, Ports},
     },
     domain::{
-        IntegrationOutcome, NewAsk, RunId, SessionRole, TaskDetail, TaskId, TaskRun,
+        IntegrationOutcome, NewAsk, PlannerId, RunId, SessionRole, TaskDetail, TaskId, TaskRun,
         stats::StatsQuery,
     },
     infrastructure::{
@@ -44,7 +45,7 @@ use crate::{
             path_text,
         },
         clock,
-        location::{QueueLocation, REPOSITORY_FILE_NAME, data_home, runs_dir},
+        location::{QueueLocation, REPOSITORY_FILE_NAME, data_home, planners_dir, runs_dir},
         process::LocalSpawner,
         run_env::{ShellVerifier, load_stall_config},
         run_files::LocalRunFiles,
@@ -452,6 +453,76 @@ impl OneShot {
         )
     }
 
+    /// Open a planner a person talks with (`dagq plan`, ADR-0041 decision
+    /// 6): preflight cmux and `options.claude`, then open a new workspace
+    /// next to any planner still open (see
+    /// [`planner::open_person_planner`]). `repo` is the checkout the
+    /// planner works in.
+    pub fn plan(
+        &self,
+        location: &QueueLocation,
+        repo: &Path,
+        cmux: &dyn WorkspaceBackend,
+        options: &PlanOptions,
+    ) -> Result<Value> {
+        let db = location
+            .db
+            .canonicalize()
+            .context("queue must already be initialized")?;
+        let repository = GitRepository::inspect(repo)?;
+        cmux.preflight()?;
+        ClaudeCode {
+            executable: options.claude.clone(),
+        }
+        .preflight()?;
+        let plugin_dir = options
+            .plugin_dir
+            .as_deref()
+            .map(|dir| {
+                dir.canonicalize()
+                    .with_context(|| format!("plugin directory {}", dir.display()))
+            })
+            .transpose()?;
+        let queue = self.open(&db)?;
+        let recording = RecordingBackend::over(cmux, self.queues(&db), None, load_average);
+        let opened = planner::open_person_planner(&PlannerLaunch {
+            queue: &queue,
+            cmux: &recording,
+            files: &LocalRunFiles,
+            db: &db,
+            queue_hash: &QueueLocation::explicit(&db).hash(),
+            planners_dir: &planners_dir(&db),
+            repo_root: &repository.root,
+            runner: &options.runner,
+            claude: &options.claude,
+            plugin_dir: plugin_dir.as_deref(),
+        })?;
+        Ok(serde_json::to_value(opened)?)
+    }
+
+    /// `planners`: every planner not closed (with `all`, every one), with
+    /// its state judged by [`planner::planner_views`].
+    pub fn planners(&self, db: &Path, cmux: &dyn WorkspaceBackend, all: bool) -> Result<Value> {
+        let queue = self.open(db)?;
+        // Claude Code's signals only read what its hook and screen show.
+        let signals = ClaudeCode {
+            executable: PathBuf::from("claude"),
+        };
+        let views = planner::planner_views(
+            &queue,
+            &PlannerProbes {
+                cmux,
+                processes: &SystemProcesses,
+                files: &LocalRunFiles,
+                signals: &signals,
+                clock: &*self.generators.clock,
+                planners_dir: &planners_dir(db),
+            },
+            all,
+        )?;
+        Ok(serde_json::json!({ "planners": views }))
+    }
+
     /// The queue at a path, as `up` and `down` open it, writing through
     /// these generators.
     fn queues(&self, db: &Path) -> Arc<dyn QueueOpener> {
@@ -669,6 +740,73 @@ pub fn review(db: &Path, task_id: TaskId) -> Result<Value> {
             pid: std::process::id(),
         },
         task_id,
+    )
+}
+
+/// What `dagq plan` opens a planner with: the resolved Claude Code
+/// executable, the plugin directory its session loads, and the binary its
+/// workspace runs as the session wrapper (this one).
+#[derive(Debug, Clone)]
+pub struct PlanOptions {
+    pub claude: PathBuf,
+    pub plugin_dir: Option<PathBuf>,
+    pub runner: PathBuf,
+}
+
+/// `plan` on the system clock: see [`OneShot::plan`].
+pub fn plan(
+    location: &QueueLocation,
+    repo: &Path,
+    cmux: &dyn WorkspaceBackend,
+    options: &PlanOptions,
+) -> Result<Value> {
+    OneShot::system().plan(location, repo, cmux, options)
+}
+
+/// `planners` on the system clock: see [`OneShot::planners`].
+pub fn planners(db: &Path, cmux: &dyn WorkspaceBackend, all: bool) -> Result<Value> {
+    OneShot::system().planners(db, cmux, all)
+}
+
+/// The session wrapper of a planner (`planner-session`), run from its cmux
+/// workspace: stdout must remain a terminal for Claude.
+pub fn planner_session(
+    db: &Path,
+    id: PlannerId,
+    claude: &Path,
+    plugin_dir: Option<&Path>,
+) -> Result<Value> {
+    ensure!(
+        std::io::stdin().is_terminal() && std::io::stdout().is_terminal(),
+        "interactive Claude wrapper requires a terminal"
+    );
+    let provider = ClaudeCode {
+        executable: claude.into(),
+    };
+    planner_session_with_provider(db, id, &provider, plugin_dir)
+}
+
+/// [`planner_session`] with any provider, in the working directory.
+pub fn planner_session_with_provider(
+    db: &Path,
+    id: PlannerId,
+    provider: &dyn AgentProvider,
+    plugin_dir: Option<&Path>,
+) -> Result<Value> {
+    let queue = SqliteQueue::open(db)?;
+    let cwd = std::env::current_dir().context("working directory is unavailable")?;
+    planner::run_planner_session(
+        PlannerWrapper {
+            queue: &queue,
+            provider,
+            spawner: &LocalSpawner,
+            files: &LocalRunFiles,
+            pid: std::process::id(),
+        },
+        id,
+        &planner::planner_dir(&planners_dir(db), id),
+        &cwd,
+        plugin_dir,
     )
 }
 

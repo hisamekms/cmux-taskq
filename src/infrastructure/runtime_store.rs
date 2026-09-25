@@ -16,9 +16,10 @@ use super::{
 };
 use crate::application::{AskStore, Generators, RunStore, timestamp, unix_seconds};
 use crate::domain::{
-    AskId, ClaimOutcome, CommitSha, DomainError, EventId, GoalId, Reason, ReasonCode, RunEvent,
-    RunId, RunLease, RunPaths, RunProcess, RunStatus, SessionRole, SupervisorMode,
-    SupervisorRegistration, Task, TaskAction, TaskId, TaskRun, run,
+    AskId, ClaimOutcome, CommitSha, DomainError, EventId, GoalId, PlannerId, PlannerOrigin,
+    PlannerSession, ProposalId, Reason, ReasonCode, RunEvent, RunId, RunLease, RunPaths,
+    RunProcess, RunStatus, SessionRole, SupervisorMode, SupervisorRegistration, Task, TaskAction,
+    TaskId, TaskRun, run,
 };
 
 pub use crate::application::{
@@ -228,16 +229,16 @@ impl SqliteQueue {
     }
 
     /// Forget the workspaces recorded for a role `up` no longer opens (the
-    /// resident session ADR-0024 retired): only the in-cmux supervisor's,
-    /// the inbox's and the planner's are kept. Returns how many were
-    /// forgotten; the workspaces themselves are a person's to close.
+    /// resident sessions ADR-0024 and ADR-0041 decision 6 retired: the
+    /// maintainer and the resident planner): only the in-cmux supervisor's
+    /// and the inbox's are kept. Returns how many were forgotten; the
+    /// workspaces themselves are a person's to close.
     pub fn forget_retired_session_workspaces(&self) -> Result<usize> {
         Ok(self.conn.execute(
-            "DELETE FROM session_workspaces WHERE role NOT IN (?1,?2,?3)",
+            "DELETE FROM session_workspaces WHERE role NOT IN (?1,?2)",
             params![
                 SessionRole::Supervisor.as_str(),
-                SessionRole::Inbox.as_str(),
-                SessionRole::Planner.as_str()
+                SessionRole::Inbox.as_str()
             ],
         )?)
     }
@@ -2634,6 +2635,37 @@ impl RunStore for SqliteQueue {
     }
     fn forget_retired_session_workspaces(&self) -> Result<usize> {
         SqliteQueue::forget_retired_session_workspaces(self)
+    }
+    fn open_planner(
+        &self,
+        origin: PlannerOrigin,
+        proposal: Option<ProposalId>,
+    ) -> Result<PlannerSession> {
+        SqliteQueue::open_planner(self, origin, proposal)
+    }
+    fn planner_workspace_created(&self, id: PlannerId, workspace_id: &str) -> Result<()> {
+        SqliteQueue::planner_workspace_created(self, id, workspace_id)
+    }
+    fn close_planner(&self, id: PlannerId, error: Option<&str>) -> Result<PlannerSession> {
+        SqliteQueue::close_planner(self, id, error)
+    }
+    fn planner(&self, id: PlannerId) -> Result<PlannerSession> {
+        SqliteQueue::planner(self, id)
+    }
+    fn planners(&self, all: bool) -> Result<Vec<PlannerSession>> {
+        SqliteQueue::planners(self, all)
+    }
+    fn register_planner_wrapper(&self, id: PlannerId, pid: u32) -> Result<()> {
+        SqliteQueue::register_planner_wrapper(self, id, pid)
+    }
+    fn register_planner_agent(&self, id: PlannerId, wrapper_pid: u32, agent: u32) -> Result<()> {
+        SqliteQueue::register_planner_agent(self, id, wrapper_pid, agent)
+    }
+    fn heartbeat_planner(&self, id: PlannerId, wrapper_pid: u32) -> Result<()> {
+        SqliteQueue::heartbeat_planner(self, id, wrapper_pid)
+    }
+    fn planner_exited(&self, id: PlannerId, wrapper_pid: u32, exit_code: i32) -> Result<()> {
+        SqliteQueue::planner_exited(self, id, wrapper_pid, exit_code)
     }
     fn set_supervisor_mode(
         &self,

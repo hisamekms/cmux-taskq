@@ -1,7 +1,9 @@
 //! `up` and `down`: the cold start and the stop of one queue's runtime. `up`
 //! makes sure a supervisor is resident (as a launchd LaunchAgent, restarted
-//! after any exit) and that the inbox's and the planner's Claude sessions
-//! each have a cmux workspace, and reports the queue's open work. `down` unloads the agent so the
+//! after any exit) and that the inbox's Claude session has a cmux
+//! workspace, and reports the queue's open work. Planners are not resident:
+//! a person opens one with `dagq plan` ([`super::planner`], ADR-0041
+//! decision 6). `down` unloads the agent so the
 //! supervisor drains and is not restarted. Both are idempotent: a second
 //! `up` reuses what the first one started.
 //!
@@ -27,11 +29,11 @@ use super::{
     AgentProvider, Clock, DetachedRefusal, LaunchAgent, ProcessControl, Queue, QueueOpener,
     RunFiles, SOCKET_PASSWORD_ENV, SupervisorEnvironment, WorkspaceBackend, WorkspaceTags,
     naming::{
-        inbox_workspace_name, planner_workspace_name, shell_join, supervisor_workspace_name,
-        workspace_description, workspace_group_name,
+        inbox_workspace_name, shell_join, supervisor_workspace_name, workspace_description,
+        workspace_group_name,
     },
     path_text,
-    prompt::{inbox_prompt, planner_prompt},
+    prompt::inbox_prompt,
     recording::RecordingBackend,
 };
 use crate::{
@@ -54,17 +56,20 @@ use std::{
 
 /// Set in the environment of every workspace of a queue (`--env`, which
 /// every shell of the workspace inherits): the role the workspace plays, so
-/// that `up`, run from inside the inbox or planner session (the plugin
-/// skill calls it), does not open a second one, and the plugin's hook knows the session
+/// that `up`, run from inside the inbox session (the plugin skill calls
+/// it), does not open a second one, and the plugin's hook knows the session
 /// however it was started (ADR-0026).
 pub const ROLE_ENV: &str = "DAGQ_ROLE";
 /// The queue database the workspace belongs to.
 pub const QUEUE_ENV: &str = "DAGQ_QUEUE";
 /// `DAGQ_ROLE` of a run's workspace (and of the resume workspace of its run).
 pub const WORKER_ROLE: &str = SessionRole::Worker.as_str();
-/// `DAGQ_ROLE` of the session that talks with a person to register goals and
-/// tasks. `up` opens its workspace `[<repo>]planner`.
+/// `DAGQ_ROLE` of a planner session, which writes goals and tasks and
+/// submits them as a proposal. A person opens one with `dagq plan` in a
+/// workspace `[<repo>]planner#<id>`; `up` opens none (ADR-0041 decision 6).
 pub const PLANNER_ROLE: &str = SessionRole::Planner.as_str();
+/// The ID of the planner session a planner workspace runs (`planners.id`).
+pub const PLANNER_ID_ENV: &str = "DAGQ_PLANNER_ID";
 /// Who opened a planner session (ADR-0041 decision 7): `person` (the
 /// default when unset) or `runtime`, recorded as the owner of the
 /// proposals it submits.
@@ -179,10 +184,10 @@ pub struct UpOptions {
     /// but bounds the drain by `startup_timeout` rather than waiting for a
     /// supervisor that turns out not to stop.
     pub no_wait: bool,
-    /// Passed to the inbox's and the planner's `claude` as `--plugin-dir`.
+    /// Passed to the inbox's `claude` as `--plugin-dir`.
     pub plugin_dir: Option<PathBuf>,
     /// Resolved executables; the agent runs the supervisor with these, and
-    /// the inbox and planner workspaces start this `claude`.
+    /// the inbox workspace starts this `claude`.
     pub cmux: PathBuf,
     pub claude: PathBuf,
     /// How long a started supervisor may take to register before `up` fails.
@@ -190,18 +195,18 @@ pub struct UpOptions {
     pub poll: Duration,
 }
 
-/// Ensure the supervisor and the inbox and planner workspaces exist and report the queue's open work. Preflight first (cmux, claude, Claude Code's trust of
+/// Ensure the supervisor and the inbox workspace exist and report the queue's open work. Preflight first (cmux, claude, Claude Code's trust of
 /// the repository root, an initialized queue, the repository), then prune registrations whose process is gone, start
 /// the agent only when no live registration of this binary's version
 /// remains (after proving that cmux admits a process with the agent's
 /// environment) — draining and replacing a live supervisor of any other
-/// version — and open each of the inbox and planner workspaces only outside
-/// that session itself. A workspace recorded for a role that no longer
-/// exists (the retired resident session of ADR-0024) is forgotten; the
-/// workspace itself is left for a person to close.
+/// version — and open the inbox workspace only outside that session itself.
+/// A workspace recorded for a role `up` no longer opens (the maintainer
+/// ADR-0024 retired, the resident planner ADR-0041 decision 6 retired) is
+/// forgotten; the workspace itself is left for a person to close.
 ///
-/// `claude` is the Claude Code the inbox and planner sessions start, whose
-/// preflight `up` runs.
+/// `claude` is the Claude Code the inbox session starts, whose preflight
+/// `up` runs.
 pub fn up(
     ports: &Ports,
     claude: &dyn AgentProvider,
@@ -314,24 +319,19 @@ pub fn up(
         db: &db,
         root: &repository.root,
     };
-    queue.forget_retired_session_workspaces()?;
+    let retired_sessions = queue.forget_retired_session_workspaces()?;
     let inbox = sessions.open(
         SessionRole::Inbox,
         inbox_workspace_name(&repository.root),
         || inbox_command(&db, &options.claude, plugin_dir.as_deref()),
     )?;
-    let planner = sessions.open(
-        SessionRole::Planner,
-        planner_workspace_name(&repository.root),
-        || planner_command(&db, &options.claude, plugin_dir.as_deref()),
-    )?;
 
     Ok(json!({
         "supervisor": supervisor,
         "inbox": inbox,
-        "planner": planner,
+        "retired_sessions": retired_sessions,
         "pruned_supervisors": pruned,
-        "warnings": workspaces.warnings.take(),
+        "warnings": workspaces.take_warnings(),
         "doctor": open_work(queue, processes, ports.clock)?,
     }))
 }
@@ -350,8 +350,8 @@ struct Up<'a> {
     options: &'a UpOptions,
 }
 
-/// The Claude sessions `up` keeps a workspace open for: the inbox and the
-/// planner (ADR-0022, ADR-0024 decision 6). Each is opened the same way: skipped
+/// The Claude sessions `up` keeps a workspace open for: the inbox (ADR-0022,
+/// ADR-0041 decision 6). Each is opened the same way: skipped
 /// when `up` runs inside that very session of this queue (its `DAGQ_ROLE`
 /// and `DAGQ_QUEUE`), reused while its recorded UUID is still listed, and
 /// otherwise created and recorded in `session_workspaces`.
@@ -430,10 +430,11 @@ impl Sessions<'_> {
 /// it never replaces another tool's pill (Claude Code's `claude_code`).
 pub const ROLE_STATUS_KEY: &str = "dagq_role";
 
-/// How the sidebar tells the inbox and the planner apart at a glance
+/// How the sidebar tells the inbox and the planners apart at a glance
 /// (ADR-0031): the workspace's cmux color and the SF Symbol of its role
 /// pill (cmux workspaces have no icon of their own). Amber for the inbox,
-/// where things wait for a person. Other roles keep cmux's defaults.
+/// where things wait for a person, Blue for a planner. Other roles keep
+/// cmux's defaults.
 pub fn session_look(role: SessionRole) -> Option<(&'static str, &'static str)> {
     match role {
         SessionRole::Inbox => Some(("Amber", "tray")),
@@ -490,6 +491,11 @@ impl<'a> QueueWorkspaces<'a> {
             description: Some(workspace_description(role, &self.hash, None, None)),
             group: self.group(),
         })
+    }
+
+    /// What cmux refused so far (the group), for the caller's result.
+    pub fn take_warnings(&self) -> Vec<String> {
+        self.warnings.take()
     }
 
     fn group(&self) -> Option<String> {
@@ -964,12 +970,6 @@ pub fn launch_agent_spec(
 /// workspace still has them.
 pub fn inbox_command(db: &Path, claude: &Path, plugin_dir: Option<&Path>) -> Result<String> {
     session_command(claude, plugin_dir, inbox_prompt(db)?)
-}
-
-/// The planner workspace's command: `claude` with `planner_prompt`, the way
-/// the inbox's is built.
-pub fn planner_command(db: &Path, claude: &Path, plugin_dir: Option<&Path>) -> Result<String> {
-    session_command(claude, plugin_dir, planner_prompt(db)?)
 }
 
 fn session_command(claude: &Path, plugin_dir: Option<&Path>, prompt: String) -> Result<String> {

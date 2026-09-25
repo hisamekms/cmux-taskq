@@ -14,6 +14,7 @@ pub mod lifecycle;
 #[cfg(test)]
 mod memory_files;
 pub mod naming;
+pub mod planner;
 mod ports;
 pub mod prompt;
 pub mod rebind;

@@ -1,7 +1,8 @@
 use crate::{
     application::{
-        AgentProvider, CommandSpec, DetachedRefusal, MainRemote, ProcessControl, Repository,
-        SupervisorEnvironment, WorkspaceBackend, WorkspaceTags, stats::WorkspaceListing,
+        AgentProvider, CommandSpec, DetachedRefusal, MainRemote, PlannerCommand, ProcessControl,
+        Repository, SupervisorEnvironment, WorkspaceBackend, WorkspaceTags,
+        stats::WorkspaceListing,
     },
     domain::{CommitSha, Task, TaskId, TaskRun, stats::ListedWorkspace},
 };
@@ -1444,6 +1445,29 @@ impl AgentProvider for ClaudeCode {
         Ok(command)
     }
 
+    /// `claude` in the checkout with the planner directory's settings (its
+    /// `Stop` hook writes the idle marker there), its debug file, the
+    /// directory added, and the plugin directory when one was given.
+    fn planner_command(&self, planner: &PlannerCommand<'_>) -> Result<CommandSpec> {
+        let settings = planner.dir.join("claude-settings.json");
+        fs::write(&settings, stop_hook_settings(&planner.idle_marker())?)
+            .with_context(|| format!("write {}", settings.display()))?;
+        let mut command = CommandSpec::new(&self.executable);
+        command
+            .current_dir(planner.cwd)
+            .arg("--debug-file")
+            .arg(planner.dir.join("claude.log"))
+            .arg("--add-dir")
+            .arg(planner.dir)
+            .arg("--settings")
+            .arg(&settings);
+        if let Some(dir) = planner.plugin_dir {
+            command.arg("--plugin-dir").arg(dir);
+        }
+        command.arg("--").arg(planner.prompt);
+        Ok(command)
+    }
+
     /// `claude -p` (print mode): no terminal, no trust dialog; a tool that
     /// needs permission and is not in `allowed_tools` is refused.
     fn headless_command(
@@ -1566,7 +1590,7 @@ pub fn stop_hook_settings(idle_marker: &Path) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::{Provider, RunId, RunStatus, SessionRole};
+    use crate::domain::{PlannerId, ProposalId, Provider, RunId, RunStatus, SessionRole};
 
     #[test]
     fn a_long_paste_gets_more_time_before_its_enter() {
@@ -1801,14 +1825,21 @@ mod tests {
                 .contains("missing repository path")
         );
         // A root with no basename falls back to the path itself.
-        assert_eq!(planner_workspace_name(Path::new("/")), "[/]planner");
+        assert_eq!(
+            planner_workspace_name(Path::new("/"), PlannerId::new(1), None),
+            "[/]planner#1"
+        );
         assert_eq!(
             supervisor_workspace_name(Path::new("/home/u/ghq/dagq")),
             "[dagq]supervisor"
         );
         assert_eq!(
-            planner_workspace_name(Path::new("/home/u/ghq/dagq")),
-            "[dagq]planner"
+            planner_workspace_name(
+                Path::new("/home/u/ghq/dagq"),
+                PlannerId::new(3),
+                Some(ProposalId::new(7))
+            ),
+            "[dagq]planner#3 - proposal 7"
         );
         assert_eq!(
             inbox_workspace_name(Path::new("/tmp/my repo/")),

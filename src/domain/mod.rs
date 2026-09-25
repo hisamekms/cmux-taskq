@@ -69,9 +69,10 @@ string_enum!(SupervisorMode {
 
 // The part a cmux workspace plays for a queue, carried in its `DAGQ_ROLE`
 // environment variable and its description (ADR-0026). The five roles of
-// ADR-0024 decision 1 are the supervisor, the worker, the planner, the
-// inbox and the observer; `up` opens the planner's and the inbox's
-// workspaces. `Observer` is the periodic job: it has no workspace, and the
+// ADR-0041 decision 1 are the supervisor, the worker, the planner, the
+// inbox and the observer; `up` opens the inbox's workspace, and planners
+// open on demand (`dagq plan`, or the runtime). `Observer` is the periodic
+// job: it has no workspace, and the
 // CLI refuses queue changes from its environment. `Reviewer` is the
 // environment of the supervisor's headless review and triage jobs.
 string_enum!(SessionRole {
@@ -137,6 +138,20 @@ string_enum!(ProposalStatus {
 string_enum!(PlannerOrigin {
     Person => "person",
     Runtime => "runtime",
+});
+
+// How a planner session stands (see [`PlannerSession::state`]): `opening`
+// before its wrapper registers, `working` or `idle` while its agent runs,
+// `exited` once the agent exited in a workspace still open, `lost` when its
+// wrapper died or went silent without recording an exit, `closed` once its
+// workspace is gone.
+string_enum!(PlannerState {
+    Opening => "opening",
+    Working => "working",
+    Idle => "idle",
+    Exited => "exited",
+    Lost => "lost",
+    Closed => "closed",
 });
 
 // The verdict of the supervisor's headless review (ADR-0023 decision 2,
@@ -351,6 +366,7 @@ pub mod follow_up;
 pub mod goal;
 pub mod ids;
 mod input;
+pub mod planner;
 pub mod proposal;
 pub mod reason;
 pub mod run;
@@ -366,8 +382,9 @@ pub use follow_up::{
     FOLLOW_UP_OPTIONS, FollowUpAction, FollowUpDecision, FollowUpProposal, FollowUpVerdict,
 };
 pub use goal::Goal;
-pub use ids::{AskId, CommitSha, EventId, GoalId, ProposalId, RunId, TaskId};
+pub use ids::{AskId, CommitSha, EventId, GoalId, PlannerId, ProposalId, RunId, TaskId};
 pub use input::{GoalEdit, GoalRecord, NewGoal, NewTask, RunPlan, RunRecord, TaskEdit, TaskRecord};
+pub use planner::{IdleProbe, PlannerProbe, PlannerSession};
 pub use proposal::{PlannerOwner, Proposal, ProposalRecord, Submission};
 pub use reason::{Reason, ReasonCode};
 pub use run::TaskRun;

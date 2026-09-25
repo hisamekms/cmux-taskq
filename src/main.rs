@@ -334,7 +334,7 @@ enum Command {
         #[arg(long, default_value = "claude")]
         claude: PathBuf,
     },
-    /// Start the queue's runtime: a launchd-resident supervisor and the inbox's and planner's cmux workspaces. Idempotent; replaces a live supervisor of another version.
+    /// Start the queue's runtime: a launchd-resident supervisor and the inbox's cmux workspace. Idempotent; replaces a live supervisor of another version. Opens no planner (`plan` does) and forgets the resident planner's record.
     Up {
         /// Maximum number of runs the supervisor executes at once.
         #[arg(long, default_value_t = 4, value_parser = clap::value_parser!(u16).range(1..))]
@@ -348,7 +348,7 @@ enum Command {
         /// with an error instead when any run is still in flight.
         #[arg(long)]
         no_wait: bool,
-        /// Claude Code plugin directory the inbox and planner sessions load (`claude --plugin-dir`).
+        /// Claude Code plugin directory the inbox session loads (`claude --plugin-dir`).
         #[arg(long)]
         plugin_dir: Option<PathBuf>,
         /// Checkout of the repository; defaults to the working directory.
@@ -360,6 +360,32 @@ enum Command {
         /// Claude Code executable; a bare name is resolved on PATH.
         #[arg(long, default_value = "claude")]
         claude: PathBuf,
+    },
+    /// Open a new planner session in a cmux workspace `[<repo>]planner#<id>`, next to any planner
+    /// already open; every call opens another. Prints the planner, its workspace and directory.
+    Plan {
+        /// Claude Code plugin directory the planner session loads (`claude --plugin-dir`).
+        #[arg(long)]
+        plugin_dir: Option<PathBuf>,
+        /// Checkout the planner works in; defaults to the working directory.
+        #[arg(long)]
+        repo: Option<PathBuf>,
+        /// cmux executable; a bare name is resolved on PATH.
+        #[arg(long, default_value = "cmux")]
+        cmux: PathBuf,
+        /// Claude Code executable; a bare name is resolved on PATH.
+        #[arg(long, default_value = "claude")]
+        claude: PathBuf,
+    },
+    /// List the planner sessions not closed, each with its state (opening, working, idle, exited,
+    /// lost, closed), whether it is alive and since when it is idle. Reads only.
+    Planners {
+        /// Include closed planners.
+        #[arg(long)]
+        all: bool,
+        /// cmux executable, used to look for each planner's workspace.
+        #[arg(long, default_value = "cmux")]
+        cmux: PathBuf,
     },
     /// Stop the queue's supervisor: unload its launchd agent so it drains and is not restarted, or signal and close the workspace of an in-cmux one. Leaves the inbox and planner workspaces open.
     Down {
@@ -520,6 +546,15 @@ enum Command {
         #[arg(long)]
         resume: bool,
     },
+    #[command(hide = true)]
+    PlannerSession {
+        #[arg(long)]
+        planner: i64,
+        #[arg(long)]
+        claude: PathBuf,
+        #[arg(long)]
+        plugin_dir: Option<PathBuf>,
+    },
 }
 
 /// The session roles attention is addressed to.
@@ -644,6 +679,7 @@ fn reviewer_access(command: &Command) -> ObserverAccess {
         | Command::Doctor { .. }
         | Command::Notes { .. }
         | Command::Proposal { .. }
+        | Command::Planners { .. }
         | Command::Goal {
             command: GoalCommand::List | GoalCommand::Show { .. },
         } => ObserverAccess::Allowed,
@@ -678,6 +714,7 @@ fn observer_access(command: &Command) -> ObserverAccess {
         | Command::Note { .. }
         | Command::Notes { .. }
         | Command::Proposal { .. }
+        | Command::Planners { .. }
         | Command::Goal {
             command:
                 GoalCommand::List | GoalCommand::Show { .. } | GoalCommand::Add { draft: true, .. },
@@ -1183,6 +1220,36 @@ fn execute(cli: Cli) -> Result<Value> {
                 &options,
             )?
         }
+        Command::Plan {
+            plugin_dir,
+            repo,
+            cmux,
+            claude,
+        } => {
+            use dagq::infrastructure::adapters::{Cmux, executable};
+            one_shot.plan(
+                &location,
+                &checkout(repo),
+                &Cmux {
+                    executable: executable(&cmux)?,
+                },
+                &dagq::compose::PlanOptions {
+                    claude: executable(&claude)?,
+                    plugin_dir,
+                    runner: env::current_exe()?,
+                },
+            )?
+        }
+        Command::Planners { all, cmux } => {
+            use dagq::infrastructure::adapters::{Cmux, executable};
+            one_shot.planners(
+                &db,
+                &Cmux {
+                    executable: executable(&cmux)?,
+                },
+                all,
+            )?
+        }
         Command::Down { wait, force, cmux } => {
             use dagq::application::lifecycle::DownOptions;
             use dagq::infrastructure::{
@@ -1294,6 +1361,16 @@ fn execute(cli: Cli) -> Result<Value> {
             claude,
             resume,
         } => dagq::compose::session(&db, &RunId::new(run)?, &lease, &claude, resume)?,
+        Command::PlannerSession {
+            planner,
+            claude,
+            plugin_dir,
+        } => dagq::compose::planner_session(
+            &db,
+            dagq::domain::PlannerId::new(planner),
+            &claude,
+            plugin_dir.as_deref(),
+        )?,
     })
 }
 
@@ -1312,6 +1389,7 @@ fn install_telemetry(command: &Command, location: &QueueLocation) {
         Command::Integrate { .. } => Some(("integrate", location.log_dir.clone())),
         Command::Observe { .. } => Some(("observe", location.log_dir.clone())),
         Command::Session { .. } => Some(("session", location.log_dir.clone())),
+        Command::PlannerSession { .. } => Some(("planner-session", location.log_dir.clone())),
         _ => None,
     };
     let telemetry = match file {

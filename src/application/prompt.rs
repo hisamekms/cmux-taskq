@@ -1,8 +1,8 @@
 //! The worker's prompt (`prompt.txt`): the task, its goal, the summaries
 //! of its landed predecessors and of the goals it waited for, the tasks running alongside it and what the
 //! receipt must hold. Built from what the queue returned at claim time.
-//! Also the initial prompts of the inbox and the planner sessions `up`
-//! opens, and what the supervisor asks of an agent: the headless review and
+//! Also the initial prompts of the inbox session `up` opens and of the
+//! planner sessions a person or the runtime opens, and what the supervisor asks of an agent: the headless review and
 //! triage, and the requests it types into a live session (a resume, a
 //! revise, a receipt that does not match).
 
@@ -18,7 +18,8 @@ use super::{
 };
 use crate::domain::{
     CommitSha, Goal, GoalId, GoalPredecessor, MAX_RESUME_ATTEMPTS, MAX_REVISE_ATTEMPTS,
-    Predecessor, Receipt, RunStatus, TRIAGE_RETRY_FAILURES, Task, TaskDetail, TaskId, TaskRun,
+    Predecessor, ProposalId, Receipt, RunStatus, TRIAGE_RETRY_FAILURES, Task, TaskDetail, TaskId,
+    TaskRun,
 };
 
 /// What the prompt says about one direct predecessor: the task, the squash
@@ -289,14 +290,61 @@ pub fn inbox_prompt(db: &Path) -> Result<String> {
     ))
 }
 
-/// The initial prompt of the planner session that `up` opens in the
-/// `[<repo>]planner` workspace (ADR-0022): it turns a person's problems into
-/// goals and tasks and closes a goal once its tasks meet the acceptance.
+/// The initial prompt of a planner session a person opens with `dagq plan`
+/// (ADR-0041 decisions 1, 6): it turns the person's problems into goals and
+/// tasks, hands them over as the skill says (a proposal for plan review),
+/// and closes a goal once its tasks meet the acceptance.
 pub fn planner_prompt(db: &Path) -> Result<String> {
     Ok(format!(
-        "You are the planner of the dagq queue at {db}: listen to the person's problems and turn them into goals and tasks.\n\
-         Follow the dagq-planner skill of the dagq plugin: register them as its dagq skill describes and make the tasks ready. You do not land runs or answer asks.\n\
+        "You are a planner of the dagq queue at {db}: listen to the person's problems and turn them into goals and tasks.\n\
+         Follow the dagq-planner skill of the dagq plugin: register them and submit them for plan review as its dagq skill describes. You do not land runs or answer asks.\n\
          When every task of a goal is completed, check their receipts against the goal's acceptance and close the goal (`dagq goal close ID --verdict achieved`).\n\
+         Never open the queue database directly; use the dagq CLI only.\n",
+        db = super::path_text(db)?,
+    ))
+}
+
+/// The initial prompt of a planner the runtime opens for a proposal plan
+/// review sent back while its own planner was closed (ADR-0041 decision
+/// 12): the proposal, its tasks, and the reasons to fix. No person watches
+/// the session, so what needs one goes to the inbox as an ask (decision 13).
+pub fn runtime_planner_prompt(
+    db: &Path,
+    proposal: ProposalId,
+    tasks: &[Task],
+    reasons: &[String],
+) -> Result<String> {
+    let tasks = if tasks.is_empty() {
+        "(none)".to_owned()
+    } else {
+        tasks
+            .iter()
+            .map(|task| {
+                format!(
+                    "- task {} ({}): {}",
+                    task.id(),
+                    task.status().as_str(),
+                    task.title()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let reasons = if reasons.is_empty() {
+        "(none given)".to_owned()
+    } else {
+        reasons
+            .iter()
+            .map(|reason| format!("- {reason}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    Ok(format!(
+        "You are a planner the dagq runtime opened for proposal {proposal} of the queue at {db}; no person watches this session.\n\
+         Plan review sent the proposal back. Its reasons:\n{reasons}\n\
+         Its tasks:\n{tasks}\n\
+         Follow the dagq-planner skill of the dagq plugin: read the proposal with `dagq proposal show {proposal}` and each task with `dagq show ID`, fix what the reasons point at, and submit it again with `dagq submit --proposal {proposal}`.\n\
+         A fix that changes the plan's intent (acceptance, scope, the relation to the goal) needs a person: raise it to the inbox with `dagq ask` as the skill describes, stop, and continue from the answer typed into this terminal.\n\
          Never open the queue database directly; use the dagq CLI only.\n",
         db = super::path_text(db)?,
     ))

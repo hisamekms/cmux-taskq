@@ -120,6 +120,28 @@ impl fmt::Display for ProposalId {
     }
 }
 
+/// The ID of a planner session: the `planners.id` rowid (ADR-0041
+/// decisions 1, 6). Its workspace title and directory carry it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct PlannerId(i64);
+
+impl PlannerId {
+    pub const fn new(id: i64) -> Self {
+        Self(id)
+    }
+
+    pub const fn as_i64(self) -> i64 {
+        self.0
+    }
+}
+
+impl fmt::Display for PlannerId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
 /// The ID of an ask: the `asks.id` rowid, as `answer`, `close` and
 /// `deliver` take it. Distinct from [`TaskId`] and [`EventId`] so an ask's
 /// ID cannot be passed where another rowid is meant.

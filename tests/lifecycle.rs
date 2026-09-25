@@ -1,7 +1,8 @@
 //! `up` and `down` against fakes for launchd, cmux and process signals: the
 //! idempotent start in either mode (launchd or `--in-cmux`), the
 //! out-of-cmux connection preflight, the pruning of dead registrations, the
-//! inbox and planner workspace decisions, and every `down` outcome. The real
+//! inbox workspace decisions, the planners `plan` opens, and every `down`
+//! outcome. The real
 //! launchd and cmux path is `tests/e2e.rs`.
 use anyhow::{Result, bail};
 use dagq::{
@@ -18,7 +19,7 @@ use dagq::{
     },
     lifecycle::{
         self, DownOptions, INBOX_ROLE, PLANNER_ROLE, QUEUE_ENV, ROLE_ENV, UpEnvironment, UpOptions,
-        inbox_command, planner_command,
+        inbox_command,
     },
     runtime::{inbox_prompt, planner_prompt},
 };
@@ -233,6 +234,10 @@ struct FakeCmux {
     looks: Mutex<Vec<(String, String, String)>>,
     /// cmux refuses every color, status pill and pin call.
     look_fails: bool,
+    /// `workspace create` fails.
+    create_fails: bool,
+    /// Workspaces created so far, so a UUID is never handed out twice.
+    created: AtomicUsize,
 }
 
 impl FakeCmux {
@@ -371,8 +376,14 @@ impl WorkspaceBackend for FakeCmux {
         tags: &WorkspaceTags,
     ) -> Result<String> {
         self.calls.fetch_add(1, Ordering::SeqCst);
+        if self.create_fails {
+            bail!("workspace create failed")
+        }
         let mut workspaces = self.workspaces.lock().unwrap();
-        let id = format!("01234567-89ab-4def-8123-{:012x}", workspaces.len());
+        let id = format!(
+            "01234567-89ab-4def-8123-{:012x}",
+            self.created.fetch_add(1, Ordering::SeqCst)
+        );
         workspaces.push((name.into(), cwd.into(), id.clone(), command.into()));
         self.tags.lock().unwrap().push(tags.clone());
         if let Some(db) = self.registers_supervisor_in.as_deref()
@@ -528,20 +539,21 @@ fn up_starts_the_agent_and_the_sessions_once_and_reuses_them_after() {
         first["supervisor"]["log_dir"],
         json!(fixture.location.log_dir)
     );
-    // The resident sessions are the inbox and the planner (ADR-0024
-    // decision 6); the report names no other.
+    // The one resident session is the inbox (ADR-0041 decision 6): `up`
+    // opens no planner, and the report names no other session.
     let keys: Vec<&String> = first.as_object().unwrap().keys().collect();
     assert_eq!(
         keys,
         [
             "doctor",
             "inbox",
-            "planner",
             "pruned_supervisors",
+            "retired_sessions",
             "supervisor",
             "warnings"
         ]
     );
+    assert_eq!(first["retired_sessions"], 0);
     assert_eq!(first["pruned_supervisors"], json!([]));
     assert_eq!(first["doctor"]["unfinished_runs"], json!([]));
     assert_eq!(first["doctor"]["awaiting_integration"], json!([]));
@@ -625,15 +637,13 @@ fn up_starts_the_agent_and_the_sessions_once_and_reuses_them_after() {
     );
     assert_eq!(first["warnings"], json!([]));
     let workspaces = cmux.workspaces.lock().unwrap();
-    assert_eq!(workspaces.len(), 2);
+    assert_eq!(workspaces.len(), 1);
     let queue = SqliteQueue::open(&fixture.location.db).unwrap();
+    assert_eq!(queue.session_workspace(SessionRole::Planner).unwrap(), None);
     let tags = cmux.tags.lock().unwrap();
-    for (index, (key, role, opening)) in [
-        ("inbox", SessionRole::Inbox, "You are the inbox of"),
-        ("planner", SessionRole::Planner, "You are the planner of"),
-    ]
-    .into_iter()
-    .enumerate()
+    for (index, (key, role, opening)) in [("inbox", SessionRole::Inbox, "You are the inbox of")]
+        .into_iter()
+        .enumerate()
     {
         let (name, cwd, id, command) = &workspaces[index];
         assert_eq!(name, &format!("[my repo]{key}"));
@@ -675,15 +685,16 @@ fn up_starts_the_agent_and_the_sessions_once_and_reuses_them_after() {
     assert_eq!(second["supervisor"]["outcome"], "reused", "{second}");
     assert_eq!(second["supervisor"]["mode"], "launchd");
     assert_eq!(second["supervisor"]["pid"], json!(std::process::id()));
-    for key in ["inbox", "planner"] {
-        assert_eq!(second[key]["outcome"], "reused", "{second}");
-        assert_eq!(second[key]["workspace_id"], first[key]["workspace_id"]);
-        assert_eq!(second[key]["name"], first[key]["name"]);
-    }
+    assert_eq!(second["inbox"]["outcome"], "reused", "{second}");
+    assert_eq!(
+        second["inbox"]["workspace_id"],
+        first["inbox"]["workspace_id"]
+    );
+    assert_eq!(second["inbox"]["name"], first["inbox"]["name"]);
     assert_eq!(second["pruned_supervisors"], json!([]));
     assert_eq!(launchd.installs.lock().unwrap().len(), 1);
     assert!(launchd.uninstalls.lock().unwrap().is_empty());
-    assert_eq!(cmux.workspaces.lock().unwrap().len(), 2);
+    assert_eq!(cmux.workspaces.lock().unwrap().len(), 1);
     // Reusing everything asks for no group.
     assert_eq!(cmux.groups.lock().unwrap().len(), 1);
     // A reused supervisor already reaches cmux; nothing is proved again.
@@ -921,8 +932,8 @@ fn up_proves_the_connection_with_the_exported_password_and_stores_it_in_the_plis
         ),
         "{contents}"
     );
-    // The password is in no session's command: the inbox and planner
-    // sessions are a cmux terminal's children and need none.
+    // The password is in no session's command: the inbox session is a
+    // cmux terminal's child and needs none.
     let workspaces = cmux.workspaces.lock().unwrap();
     assert!(workspaces.iter().all(|w| !w.3.contains("hunter2")));
 }
@@ -1395,22 +1406,24 @@ fn up_reports_runs_that_wait_for_a_person_or_the_supervisor() {
 }
 
 /// A workspace the queue recorded for a role `up` no longer opens (the
-/// resident session ADR-0024 retired) is forgotten by `up`, which opens only
-/// the inbox and the planner; the workspace itself is left open for a
-/// person to close. A session of a role `up` does not open (a worker's)
-/// skips nothing.
+/// maintainer ADR-0024 retired, the resident planner ADR-0041 decision 6
+/// retired) is forgotten by `up`, which opens only the inbox; the
+/// workspaces themselves are left open for a person to close. A session of
+/// a role `up` does not open (a worker's) skips nothing.
 #[test]
-fn up_forgets_a_retired_session_workspace_and_opens_only_the_inbox_and_the_planner() {
+fn up_forgets_the_retired_and_the_resident_planner_workspaces_and_opens_only_the_inbox() {
     let mut fixture = fixture();
     fixture.environment.role = Some("worker".into());
     fixture.environment.queue = Some(fixture.location.db.clone());
     let cmux = FakeCmux::default();
     let retired = "01234567-89ab-4def-8123-0000000000ee";
+    let planner = "01234567-89ab-4def-8123-0000000000ef";
     cmux.open("[my repo]retired", &fixture.repo, retired);
+    cmux.open("[my repo]planner", &fixture.repo, planner);
     let raw = Connection::open(&fixture.location.db).unwrap();
     raw.execute(
-        "INSERT INTO session_workspaces(role,workspace_id) VALUES ('retired',?1)",
-        [retired],
+        "INSERT INTO session_workspaces(role,workspace_id) VALUES ('retired',?1),('planner',?2)",
+        [retired, planner],
     )
     .unwrap();
     drop(raw);
@@ -1419,8 +1432,8 @@ fn up_forgets_a_retired_session_workspace_and_opens_only_the_inbox_and_the_plann
     let report = up(&fixture, &cmux, &launchd, &processes);
     assert_eq!(report["supervisor"]["outcome"], "started");
     assert_eq!(report["inbox"]["outcome"], "created", "{report}");
-    assert_eq!(report["planner"]["outcome"], "created", "{report}");
-    assert_eq!(report.get("retired"), None);
+    assert_eq!(report.get("planner"), None, "{report}");
+    assert_eq!(report["retired_sessions"], 2, "{report}");
     let names: Vec<String> = cmux
         .workspaces
         .lock()
@@ -1430,7 +1443,7 @@ fn up_forgets_a_retired_session_workspace_and_opens_only_the_inbox_and_the_plann
         .collect();
     assert_eq!(
         names,
-        ["[my repo]retired", "[my repo]inbox", "[my repo]planner"]
+        ["[my repo]retired", "[my repo]planner", "[my repo]inbox"]
     );
     assert!(cmux.closed.lock().unwrap().is_empty());
     let raw = Connection::open(&fixture.location.db).unwrap();
@@ -1441,7 +1454,7 @@ fn up_forgets_a_retired_session_workspace_and_opens_only_the_inbox_and_the_plann
         .unwrap()
         .collect::<rusqlite::Result<_>>()
         .unwrap();
-    assert_eq!(roles, ["inbox", "planner"]);
+    assert_eq!(roles, ["inbox"]);
     // Forgetting is idempotent.
     assert_eq!(
         SqliteQueue::open(&fixture.location.db)
@@ -1450,68 +1463,56 @@ fn up_forgets_a_retired_session_workspace_and_opens_only_the_inbox_and_the_plann
             .unwrap(),
         0
     );
+    let second = up(&fixture, &cmux, &launchd, &processes);
+    assert_eq!(second["retired_sessions"], 0, "{second}");
 }
 
-/// Inside the inbox or the planner session of this queue, `up` skips that
-/// one workspace and still opens (or reuses) the others; the role of a
-/// session of another queue does not count.
+/// Inside the inbox session of this queue, `up` skips that workspace; the
+/// role of a session of another queue does not count. From a planner
+/// session `up` opens the inbox and no planner.
 #[test]
-fn up_skips_the_inbox_and_the_planner_inside_their_own_sessions() {
-    for (role, key, other) in [
-        (INBOX_ROLE, "inbox", "planner"),
-        (PLANNER_ROLE, "planner", "inbox"),
-    ] {
-        let mut fixture = fixture();
-        fixture.environment.role = Some(role.into());
-        fixture.environment.queue = Some(fixture.location.db.clone());
-        let cmux = FakeCmux::default();
-        let launchd = FakeLaunchd::new(&fixture.location.db);
-        let processes = FakeProcesses::default();
-        let report = up(&fixture, &cmux, &launchd, &processes);
-        assert_eq!(
-            report[key],
-            json!({"outcome": "skipped", "workspace_id": null, "name": format!("[my repo]{key}")})
-        );
-        assert_eq!(report[other]["outcome"], "created", "{report}");
-        let queue = SqliteQueue::open(&fixture.location.db).unwrap();
-        let session_role = |name: &str| match name {
-            "inbox" => SessionRole::Inbox,
-            _ => SessionRole::Planner,
-        };
-        assert_eq!(queue.session_workspace(session_role(key)).unwrap(), None);
-        assert!(
-            queue
-                .session_workspace(session_role(other))
-                .unwrap()
-                .is_some()
-        );
-        assert!(
-            cmux.workspaces
-                .lock()
-                .unwrap()
-                .iter()
-                .all(|workspace| workspace.0 != format!("[my repo]{key}"))
-        );
+fn up_skips_the_inbox_inside_its_own_session() {
+    let mut fixture = fixture();
+    fixture.environment.role = Some(INBOX_ROLE.into());
+    fixture.environment.queue = Some(fixture.location.db.clone());
+    let cmux = FakeCmux::default();
+    let launchd = FakeLaunchd::new(&fixture.location.db);
+    let processes = FakeProcesses::default();
+    let report = up(&fixture, &cmux, &launchd, &processes);
+    assert_eq!(
+        report["inbox"],
+        json!({"outcome": "skipped", "workspace_id": null, "name": "[my repo]inbox"})
+    );
+    let queue = SqliteQueue::open(&fixture.location.db).unwrap();
+    assert_eq!(queue.session_workspace(SessionRole::Inbox).unwrap(), None);
+    assert!(cmux.workspaces.lock().unwrap().is_empty());
 
-        // A second `up` from the same session reuses the others and still
-        // skips its own.
-        let second = up(&fixture, &cmux, &launchd, &processes);
-        assert_eq!(second[key]["outcome"], "skipped", "{second}");
-        assert_eq!(second[other]["outcome"], "reused", "{second}");
-        assert_eq!(cmux.workspaces.lock().unwrap().len(), 1);
+    // A second `up` from the same session still skips it.
+    let second = up(&fixture, &cmux, &launchd, &processes);
+    assert_eq!(second["inbox"]["outcome"], "skipped", "{second}");
+    assert!(cmux.workspaces.lock().unwrap().is_empty());
 
-        // From a session of that role in another queue, this queue's
-        // workspace is opened.
-        fixture.environment.queue = Some(fixture._dir.path().join("elsewhere.db"));
-        let third = up(&fixture, &cmux, &launchd, &processes);
-        assert_eq!(third[key]["outcome"], "created", "{third}");
-        assert_eq!(cmux.workspaces.lock().unwrap().len(), 2);
-    }
+    // From an inbox session of another queue, this queue's inbox is opened.
+    fixture.environment.queue = Some(fixture._dir.path().join("elsewhere.db"));
+    let third = up(&fixture, &cmux, &launchd, &processes);
+    assert_eq!(third["inbox"]["outcome"], "created", "{third}");
+    assert_eq!(cmux.workspaces.lock().unwrap().len(), 1);
+
+    // A planner session is not skipped for anything: it opens no planner.
+    let mut fixture = self::fixture();
+    fixture.environment.role = Some(PLANNER_ROLE.into());
+    fixture.environment.queue = Some(fixture.location.db.clone());
+    let cmux = FakeCmux::default();
+    let launchd = FakeLaunchd::new(&fixture.location.db);
+    let report = up(&fixture, &cmux, &launchd, &processes);
+    assert_eq!(report["inbox"]["outcome"], "created", "{report}");
+    assert_eq!(report.get("planner"), None, "{report}");
+    assert_eq!(cmux.workspaces.lock().unwrap().len(), 1);
 }
 
-/// An inbox or planner workspace that was closed is forgotten and opened
-/// again under a new UUID, and `down` closes neither session's workspace,
-/// only the supervisor's.
+/// An inbox workspace that was closed is forgotten and opened again under
+/// a new UUID, and `down` closes no session's workspace, only the
+/// supervisor's.
 #[test]
 fn up_reopens_a_closed_inbox_and_down_leaves_the_sessions_open() {
     let mut fixture = fixture();
@@ -1528,7 +1529,6 @@ fn up_reopens_a_closed_inbox_and_down_leaves_the_sessions_open() {
 
     let second = up(&fixture, &cmux, &launchd, &processes);
     assert_eq!(second["inbox"]["outcome"], "created", "{second}");
-    assert_eq!(second["planner"]["outcome"], "reused", "{second}");
     let reopened = second["inbox"]["workspace_id"].as_str().unwrap();
     assert_ne!(reopened, inbox);
     let queue = SqliteQueue::open(&fixture.location.db).unwrap();
@@ -1565,63 +1565,12 @@ fn up_reopens_a_closed_inbox_and_down_leaves_the_sessions_open() {
         .iter()
         .map(|workspace| workspace.0.clone())
         .collect();
-    assert_eq!(names, ["[my repo]planner", "[my repo]inbox"]);
-    for role in [SessionRole::Inbox, SessionRole::Planner] {
-        assert!(queue.session_workspace(role).unwrap().is_some(), "{role:?}");
-    }
-}
-
-/// The recorded planner workspace is the one `up` reuses, whatever it is
-/// called; one cmux no longer has is forgotten and opened again, and a
-/// workspace that merely carries the planner's title is not taken for it.
-#[test]
-fn up_opens_the_planner_again_when_its_recorded_workspace_is_gone() {
-    let fixture = fixture();
-    let cmux = FakeCmux::default();
-    let launchd = FakeLaunchd::new(&fixture.location.db);
-    let processes = FakeProcesses::default();
-    let first = up(&fixture, &cmux, &launchd, &processes);
-    let id = first["planner"]["workspace_id"]
-        .as_str()
-        .unwrap()
-        .to_owned();
-    cmux.close(&id).unwrap();
-    // Someone opened a workspace with the planner's title by hand.
-    cmux.open(
-        "[my repo]planner",
-        &fixture.repo,
-        "01234567-89ab-4def-8123-0000000000dd",
-    );
-
-    let second = up(&fixture, &cmux, &launchd, &processes);
-    assert_eq!(second["planner"]["outcome"], "created", "{second}");
-    assert_eq!(second["inbox"]["outcome"], "reused", "{second}");
-    let reopened = second["planner"]["workspace_id"].as_str().unwrap();
-    assert_ne!(reopened, id);
-    assert_ne!(reopened, "01234567-89ab-4def-8123-0000000000dd");
-    let queue = SqliteQueue::open(&fixture.location.db).unwrap();
-    assert_eq!(
-        queue
-            .session_workspace(SessionRole::Planner)
-            .unwrap()
-            .as_deref(),
-        Some(reopened)
-    );
-    // The group is asked for again by the same external ID; cmux returns
-    // the same group.
-    let groups = cmux.groups.lock().unwrap();
-    assert_eq!(groups.len(), 2);
-    assert_eq!(groups[0], groups[1]);
-    drop(groups);
+    assert_eq!(names, ["[my repo]inbox"]);
     assert!(
         queue
-            .remove_session_workspace(SessionRole::Planner)
+            .session_workspace(SessionRole::Inbox)
             .unwrap()
-    );
-    assert!(
-        !queue
-            .remove_session_workspace(SessionRole::Planner)
-            .unwrap()
+            .is_some()
     );
 }
 
@@ -1661,12 +1610,12 @@ fn up_warns_and_goes_on_when_the_workspace_group_cannot_be_made() {
     assert!(failure.payload.get("parallel").is_some());
 }
 
-/// `up` colors the inbox Amber and the planner Blue, puts a `dagq_role`
-/// pill with the role's icon on each and pins it (ADR-0031), on the
+/// `up` colors the inbox Amber, puts a `dagq_role` pill with the role's
+/// icon on it and pins it (ADR-0031), on the
 /// workspace it creates and again on the one it reuses, addressed by the
 /// recorded UUID. The in-cmux supervisor's workspace keeps cmux's look.
 #[test]
-fn up_colors_labels_and_pins_the_inbox_and_the_planner_on_every_up() {
+fn up_colors_labels_and_pins_the_inbox_on_every_up() {
     let mut fixture = fixture();
     fixture.options.in_cmux = true;
     let cmux = FakeCmux {
@@ -1683,30 +1632,22 @@ fn up_colors_labels_and_pins_the_inbox_and_the_planner_on_every_up() {
         ]
     };
     let inbox_look = look("Amber", "dagq_role=inbox tray");
-    let planner_look = look("Blue", "dagq_role=planner map");
 
     let first = up(&fixture, &cmux, &launchd, &processes);
     assert_eq!(first["warnings"], json!([]), "{first}");
     let queue = SqliteQueue::open(&fixture.location.db).unwrap();
     let recorded = |role| queue.session_workspace(role).unwrap().unwrap();
     let inbox = recorded(SessionRole::Inbox);
-    let planner = recorded(SessionRole::Planner);
     assert_eq!(first["inbox"]["workspace_id"], inbox.as_str());
     assert_eq!(cmux.looks_of(&inbox), inbox_look);
-    assert_eq!(cmux.looks_of(&planner), planner_look);
     let supervisor = first["supervisor"]["workspace_id"].as_str().unwrap();
     assert!(cmux.looks_of(supervisor).is_empty());
 
     let second = up(&fixture, &cmux, &launchd, &processes);
     assert_eq!(second["inbox"]["outcome"], "reused", "{second}");
-    assert_eq!(second["planner"]["outcome"], "reused", "{second}");
     assert_eq!(
         cmux.looks_of(&inbox),
         [inbox_look.clone(), inbox_look.clone()].concat()
-    );
-    assert_eq!(
-        cmux.looks_of(&planner),
-        [planner_look.clone(), planner_look.clone()].concat()
     );
 
     // From inside the inbox, `up` skips opening it but still marks the
@@ -1719,7 +1660,6 @@ fn up_colors_labels_and_pins_the_inbox_and_the_planner_on_every_up() {
         cmux.looks_of(&inbox),
         [inbox_look.clone(), inbox_look.clone(), inbox_look].concat()
     );
-    assert_eq!(cmux.looks_of(&planner).len(), 9);
 }
 
 /// A color, pill or pin cmux refuses does not stop `up`: the workspaces
@@ -1736,14 +1676,13 @@ fn up_warns_and_goes_on_when_cmux_refuses_the_look() {
     let processes = FakeProcesses::default();
     let report = up(&fixture, &cmux, &launchd, &processes);
     assert_eq!(report["inbox"]["outcome"], "created", "{report}");
-    assert_eq!(report["planner"]["outcome"], "created", "{report}");
     let warnings: Vec<&str> = report["warnings"]
         .as_array()
         .unwrap()
         .iter()
         .map(|warning| warning.as_str().unwrap())
         .collect();
-    assert_eq!(warnings.len(), 6, "{report}");
+    assert_eq!(warnings.len(), 3, "{report}");
     let inbox = report["inbox"]["workspace_id"].as_str().unwrap();
     assert_eq!(
         warnings[0],
@@ -1755,26 +1694,11 @@ fn up_warns_and_goes_on_when_cmux_refuses_the_look() {
         warnings[1]
     );
     assert!(warnings[2].contains("pin of the inbox"), "{}", warnings[2]);
-    assert!(
-        warnings[3].contains("color of the planner"),
-        "{}",
-        warnings[3]
-    );
     let ops: Vec<Value> = backend_failures(&fixture)
         .iter()
         .map(|failure| failure.payload["op"].clone())
         .collect();
-    assert_eq!(
-        ops,
-        [
-            "set_color",
-            "set_status",
-            "pin",
-            "set_color",
-            "set_status",
-            "pin"
-        ]
-    );
+    assert_eq!(ops, ["set_color", "set_status", "pin"]);
 }
 
 /// The real adapter's look calls are `workspace-action --action set-color
@@ -1968,7 +1892,7 @@ fn up_in_cmux_starts_the_supervisor_in_a_workspace_and_leaves_launchd_alone() {
         json!(fixture.location.log_dir)
     );
     assert_eq!(first["inbox"]["outcome"], "created");
-    assert_eq!(first["planner"]["outcome"], "created");
+    assert_eq!(first.get("planner"), None);
 
     // Nothing about launchd happened, and nothing was proved about a
     // connection from outside cmux; that is the point of the mode.
@@ -1981,7 +1905,7 @@ fn up_in_cmux_starts_the_supervisor_in_a_workspace_and_leaves_launchd_alone() {
     // The supervisor workspace runs this binary's `supervise` on this
     // queue from the repository root, with the queue's log directory.
     let workspaces = cmux.workspaces.lock().unwrap();
-    assert_eq!(workspaces.len(), 3, "{workspaces:?}");
+    assert_eq!(workspaces.len(), 2, "{workspaces:?}");
     let (name, cwd, id, command) = &workspaces[0];
     assert_eq!(name, "[my repo]supervisor");
     assert_eq!(cwd, &root);
@@ -2002,7 +1926,6 @@ fn up_in_cmux_starts_the_supervisor_in_a_workspace_and_leaves_launchd_alone() {
     // into a login shell, so every argument is quoted on its own.
     assert!(command.contains(r#"queue'"'"'s dir"#), "{command}");
     assert_eq!(workspaces[1].0, "[my repo]inbox");
-    assert_eq!(workspaces[2].0, "[my repo]planner");
     let tags = cmux.tags.lock().unwrap();
     assert_eq!(
         tags[0].env,
@@ -2065,8 +1988,7 @@ fn up_in_cmux_starts_the_supervisor_in_a_workspace_and_leaves_launchd_alone() {
         first["supervisor"]["workspace_id"]
     );
     assert_eq!(second["inbox"]["outcome"], "reused", "{second}");
-    assert_eq!(second["planner"]["outcome"], "reused", "{second}");
-    assert_eq!(cmux.workspaces.lock().unwrap().len(), 3);
+    assert_eq!(cmux.workspaces.lock().unwrap().len(), 2);
     assert!(launchd.installs.lock().unwrap().is_empty());
 }
 
@@ -2657,13 +2579,16 @@ fn inbox_and_planner_prompts_name_the_queue_and_their_one_job() {
     assert!(inbox.contains("Never open the queue database directly"));
 
     let planner = planner_prompt(db).unwrap();
-    assert!(planner.starts_with("You are the planner of the dagq queue at /data/q/queue.db:"));
+    assert!(planner.starts_with("You are a planner of the dagq queue at /data/q/queue.db:"));
     assert!(planner.lines().count() <= 5, "{planner}");
     assert!(planner.contains("the person's problems"));
     assert!(planner.contains("dagq-planner skill"));
     assert!(planner.contains("dagq skill describes"));
     assert!(planner.contains("You do not land runs or answer asks"));
-    assert!(planner.contains("make the tasks ready"));
+    // A planner submits for plan review; only plan review makes tasks ready
+    // (ADR-0041 decision 8).
+    assert!(planner.contains("submit them for plan review"), "{planner}");
+    assert!(!planner.contains("ready"), "{planner}");
     assert!(planner.contains("check their receipts against the goal's acceptance"));
     assert!(planner.contains("`dagq goal close ID --verdict achieved`"));
     // Observer notes and draft goals are a later goal's; until then the
@@ -2671,19 +2596,9 @@ fn inbox_and_planner_prompts_name_the_queue_and_their_one_job() {
     assert!(!planner.contains("note"), "{planner}");
     assert!(!planner.contains("draft"), "{planner}");
 
-    for (command, opening) in [
-        (
-            inbox_command(db, Path::new("/opt/claude"), Some(Path::new("/p"))).unwrap(),
-            "You are the inbox of",
-        ),
-        (
-            planner_command(db, Path::new("/opt/claude"), None).unwrap(),
-            "You are the planner of",
-        ),
-    ] {
-        assert!(command.starts_with("'/opt/claude' '"), "{command}");
-        assert!(command.contains(&format!("'--' '{opening}")), "{command}");
-    }
+    let command = inbox_command(db, Path::new("/opt/claude"), Some(Path::new("/p"))).unwrap();
+    assert!(command.starts_with("'/opt/claude' '"), "{command}");
+    assert!(command.contains("'--' 'You are the inbox of"), "{command}");
     assert_eq!(ROLE_ENV, "DAGQ_ROLE");
     assert_eq!(QUEUE_ENV, "DAGQ_QUEUE");
     assert!(
@@ -3165,5 +3080,481 @@ fn up_drops_the_row_of_a_replaced_supervisor_that_died_without_deregistering() {
         report["supervisor"]["workspace_id"]
             .as_str()
             .map(str::to_owned)
+    );
+}
+
+/// What `plan` opens a planner with in these tests: the fixture's Claude
+/// Code stub and plugin directory, and a stand-in for this binary.
+fn plan_options(fixture: &Fixture) -> lifecycle::PlanOptions {
+    let runner = fixture._dir.path().join("dagq-binary");
+    fs::write(&runner, "#!/bin/sh\n").unwrap();
+    lifecycle::PlanOptions {
+        claude: fixture.options.claude.clone(),
+        plugin_dir: fixture.options.plugin_dir.clone(),
+        runner,
+    }
+}
+
+fn planners_dir(fixture: &Fixture) -> PathBuf {
+    fixture
+        .location
+        .db
+        .canonicalize()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("planners")
+}
+
+/// `plan` opens a new planner workspace on every call, next to the ones
+/// already open (ADR-0041 decision 6): each is its own `planners` row with
+/// its workspace UUID, a title `[<repo>]planner#<id>`, the planner's role,
+/// queue, origin and ID in the workspace's environment, the queue's group,
+/// the Blue look without a pin, and a directory holding its prompt and the
+/// wrapper binary its workspace runs. A planner whose workspace a person
+/// closed is closed in the queue by the next `plan`; `up` opens none.
+#[test]
+fn plan_opens_a_new_planner_workspace_on_every_call_and_records_each() {
+    let fixture = fixture();
+    let cmux = FakeCmux::default();
+    let options = plan_options(&fixture);
+    let db = fixture.location.db.canonicalize().unwrap();
+    let root = GitRepository::inspect(&fixture.repo).unwrap().root;
+    let hash = fixture.location.hash();
+
+    let first = lifecycle::plan(&fixture.location, &fixture.repo, &cmux, &options).unwrap();
+    let second = lifecycle::plan(&fixture.location, &fixture.repo, &cmux, &options).unwrap();
+    for (report, id) in [(&first, 1), (&second, 2)] {
+        assert_eq!(report["planner"]["id"], id, "{report}");
+        assert_eq!(report["planner"]["origin"], "person");
+        assert_eq!(report["planner"]["proposal_id"], Value::Null);
+        assert_eq!(report["name"], format!("[my repo]planner#{id}"));
+        assert_eq!(report["warnings"], json!([]));
+        let dir = planners_dir(&fixture).join(id.to_string());
+        assert_eq!(report["dir"], json!(dir));
+        let prompt = fs::read_to_string(dir.join("prompt.txt")).unwrap();
+        assert!(
+            prompt.starts_with("You are a planner of the dagq queue at"),
+            "{prompt}"
+        );
+        assert!(dir.join("runner").is_file());
+    }
+    let first_id = first["planner"]["workspace_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let second_id = second["planner"]["workspace_id"].as_str().unwrap();
+    assert_ne!(first_id, second_id);
+
+    let workspaces = cmux.workspaces.lock().unwrap();
+    assert_eq!(workspaces.len(), 2);
+    let tags = cmux.tags.lock().unwrap();
+    for (index, id) in [(0, 1), (1, 2)] {
+        let (name, cwd, workspace, command) = &workspaces[index];
+        assert_eq!(name, &format!("[my repo]planner#{id}"));
+        assert_eq!(cwd, &root);
+        let dir = planners_dir(&fixture).join(id.to_string());
+        let quoted = |path: &Path| shell_quote(path.to_str().unwrap());
+        assert_eq!(
+            command,
+            &format!(
+                "{} '--db' {} 'planner-session' '--planner' '{id}' '--claude' {} '--plugin-dir' {}",
+                quoted(&dir.join("runner")),
+                quoted(&db),
+                quoted(&options.claude),
+                quoted(&options.plugin_dir.as_ref().unwrap().canonicalize().unwrap()),
+            )
+        );
+        assert_eq!(
+            tags[index],
+            WorkspaceTags {
+                env: vec![
+                    ("DAGQ_ROLE".into(), "planner".into()),
+                    ("DAGQ_QUEUE".into(), db.to_str().unwrap().into()),
+                    ("DAGQ_PLANNER_ORIGIN".into(), "person".into()),
+                    ("DAGQ_PLANNER_ID".into(), id.to_string()),
+                ],
+                description: Some(format!("dagq role=planner queue={hash} planner={id}")),
+                group: Some(format!("group-{hash}")),
+            }
+        );
+        // Blue with the planner's pill, and not pinned: planners come and go.
+        assert_eq!(
+            cmux.looks_of(workspace),
+            [
+                ("set-color".to_owned(), "Blue".to_owned()),
+                ("set-status".to_owned(), "dagq_role=planner map".to_owned()),
+            ]
+        );
+    }
+    drop(tags);
+    drop(workspaces);
+    let queue = SqliteQueue::open(&fixture.location.db).unwrap();
+    let recorded: Vec<Option<String>> = queue
+        .planners(false)
+        .unwrap()
+        .into_iter()
+        .map(|planner| planner.workspace_id)
+        .collect();
+    assert_eq!(
+        recorded,
+        [Some(first_id.clone()), Some(second_id.to_owned())]
+    );
+    // No planner is a session workspace of `up`'s.
+    assert_eq!(queue.session_workspace(SessionRole::Planner).unwrap(), None);
+
+    // A person closes the first planner; the next `plan` opens a third and
+    // gives no record up on a listing that shows one cmux window only.
+    cmux.close(&first_id).unwrap();
+    let third = lifecycle::plan(&fixture.location, &fixture.repo, &cmux, &options).unwrap();
+    assert_eq!(third["planner"]["id"], 3, "{third}");
+    assert_eq!(queue.planners(false).unwrap().len(), 3);
+
+    // `up` opens the inbox and leaves the planners alone.
+    let launchd = FakeLaunchd::new(&fixture.location.db);
+    let report = up(&fixture, &cmux, &launchd, &FakeProcesses::default());
+    assert_eq!(report.get("planner"), None, "{report}");
+    assert_eq!(queue.planners(false).unwrap().len(), 3);
+    assert_eq!(cmux.workspaces.lock().unwrap().len(), 3);
+}
+
+/// A planner workspace cmux does not open leaves a closed record with the
+/// error, and `plan` fails with it; a missing plugin directory stops
+/// `plan` before anything is recorded.
+#[test]
+fn plan_closes_the_record_of_a_planner_whose_workspace_did_not_open() {
+    let fixture = fixture();
+    let cmux = FakeCmux {
+        create_fails: true,
+        ..FakeCmux::default()
+    };
+    let options = plan_options(&fixture);
+    let error = lifecycle::plan(&fixture.location, &fixture.repo, &cmux, &options).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("workspace create failed"),
+        "{error:#}"
+    );
+    let queue = SqliteQueue::open(&fixture.location.db).unwrap();
+    assert!(queue.planners(false).unwrap().is_empty());
+    let all = queue.planners(true).unwrap();
+    assert_eq!(all.len(), 1);
+    assert!(all[0].closed_at.is_some());
+    assert!(
+        all[0]
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("workspace create failed"),
+        "{:?}",
+        all[0].error
+    );
+
+    let missing = lifecycle::PlanOptions {
+        plugin_dir: Some(fixture._dir.path().join("no such plugin")),
+        ..options
+    };
+    let error = lifecycle::plan(
+        &fixture.location,
+        &fixture.repo,
+        &FakeCmux::default(),
+        &missing,
+    )
+    .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("plugin directory"),
+        "{error:#}"
+    );
+    assert_eq!(queue.planners(true).unwrap().len(), 1);
+}
+
+/// The runtime opens a planner for a proposal plan review sent back
+/// (ADR-0041 decision 12): the proposal's planner is recorded as the
+/// runtime's, its title names the proposal, and its first message carries
+/// the proposal, its tasks and the reasons. A proposal that does not exist
+/// opens nothing.
+#[test]
+fn the_runtime_opens_a_planner_for_a_proposal_with_its_reasons() {
+    use dagq::application::planner::{PlannerLaunch, open_runtime_planner};
+    use dagq::domain::{PlannerOrigin, PlannerOwner, ProposalId, Submission};
+    let fixture = fixture();
+    let cmux = FakeCmux::default();
+    let mut queue = SqliteQueue::open(&fixture.location.db).unwrap();
+    let task = queue
+        .add(NewTask {
+            title: "planned change".into(),
+            description: "d".into(),
+            acceptance: "a".into(),
+            verification_commands: vec![],
+            required_evidence: Vec::new(),
+            paths: Vec::new(),
+            priority: Default::default(),
+            dependencies: vec![],
+            goal_dependencies: Vec::new(),
+            goal_id: None,
+            context: String::new(),
+        })
+        .unwrap();
+    let proposal = queue
+        .submit(Submission {
+            tasks: vec![task.id()],
+            goals: vec![],
+            proposal: None,
+            owner: PlannerOwner {
+                origin: PlannerOrigin::Person,
+                workspace_id: Some("closed-planner".into()),
+            },
+        })
+        .unwrap();
+    let task = queue.show(task.id()).unwrap().task;
+    let db = fixture.location.db.canonicalize().unwrap();
+    let root = GitRepository::inspect(&fixture.repo).unwrap().root;
+    let runner = plan_options(&fixture).runner;
+    let planners = planners_dir(&fixture);
+    let launch = PlannerLaunch {
+        queue: &queue,
+        cmux: &cmux,
+        files: &dagq::infrastructure::run_files::LocalRunFiles,
+        db: &db,
+        queue_hash: "hash",
+        planners_dir: &planners,
+        repo_root: &root,
+        runner: &runner,
+        claude: &fixture.options.claude,
+        plugin_dir: None,
+    };
+    let reasons = vec!["the acceptance is not testable".to_owned()];
+    let opened = open_runtime_planner(
+        &launch,
+        proposal.id(),
+        std::slice::from_ref(&task),
+        &reasons,
+    )
+    .unwrap();
+    assert_eq!(opened.planner.origin, PlannerOrigin::Runtime);
+    assert_eq!(opened.planner.proposal_id, Some(proposal.id()));
+    assert_eq!(
+        opened.name,
+        format!("[my repo]planner#1 - proposal {}", proposal.id())
+    );
+    let prompt = fs::read_to_string(opened.dir.join("prompt.txt")).unwrap();
+    assert!(
+        prompt.starts_with(&format!(
+            "You are a planner the dagq runtime opened for proposal {}",
+            proposal.id()
+        )),
+        "{prompt}"
+    );
+    assert!(
+        prompt.contains("- the acceptance is not testable"),
+        "{prompt}"
+    );
+    assert!(
+        prompt.contains(&format!("- task {} (submitted): planned change", task.id())),
+        "{prompt}"
+    );
+    assert!(
+        prompt.contains(&format!("`dagq submit --proposal {}`", proposal.id())),
+        "{prompt}"
+    );
+    let tags = cmux.tags.lock().unwrap();
+    assert!(
+        tags[0]
+            .env
+            .contains(&("DAGQ_PLANNER_ORIGIN".into(), "runtime".into())),
+        "{:?}",
+        tags[0]
+    );
+    let command = &cmux.workspaces.lock().unwrap()[0].3;
+    assert!(!command.contains("--plugin-dir"), "{command}");
+    drop(tags);
+    assert_eq!(
+        queue.planner(opened.planner.id).unwrap().proposal_id,
+        Some(proposal.id())
+    );
+    // Nothing to fix and no reasons still makes a prompt that says so.
+    let empty =
+        dagq::application::prompt::runtime_planner_prompt(&db, proposal.id(), &[], &[]).unwrap();
+    assert!(
+        empty.contains("(none given)") && empty.contains("(none)"),
+        "{empty}"
+    );
+
+    let missing = open_runtime_planner(&launch, ProposalId::new(99), &[], &reasons);
+    assert!(missing.is_err());
+    assert_eq!(queue.planners(true).unwrap().len(), 1);
+}
+
+/// Stands in for Claude Code in a planner's workspace: it goes idle the
+/// way the `Stop` hook marks it, then exits with `code`.
+struct PlannerAgent {
+    code: i32,
+}
+
+impl dagq::application::AgentProvider for PlannerAgent {
+    fn preflight(&self) -> Result<()> {
+        Ok(())
+    }
+    fn command(&self, _: &TaskRun, _: &str) -> Result<dagq::application::CommandSpec> {
+        bail!("not a run")
+    }
+    fn resume_command(&self, _: &TaskRun) -> Result<dagq::application::CommandSpec> {
+        bail!("not a run")
+    }
+    fn review_command(&self, _: &TaskRun, _: &str) -> Result<dagq::application::CommandSpec> {
+        bail!("not a run")
+    }
+    fn wait_interval(&self) -> Duration {
+        Duration::from_millis(20)
+    }
+    fn planner_command(
+        &self,
+        planner: &dagq::application::PlannerCommand<'_>,
+    ) -> Result<dagq::application::CommandSpec> {
+        assert!(planner.prompt.starts_with("You are a planner of"));
+        assert_eq!(planner.plugin_dir, Some(Path::new("/plugins")));
+        let marker = planner.idle_marker();
+        let mut command = dagq::application::CommandSpec::new("/bin/sh");
+        command.current_dir(planner.cwd).arg("-c").arg(format!(
+            "sleep 0.2; printf '{{\"hook_event_name\":\"Stop\"}}' > {marker}; exit {code}",
+            marker = shell_quote(marker.to_str().unwrap()),
+            code = self.code,
+        ));
+        Ok(command)
+    }
+}
+
+/// A provider without planner sessions (the default refusal).
+struct NoPlanner;
+
+impl dagq::application::AgentProvider for NoPlanner {
+    fn preflight(&self) -> Result<()> {
+        Ok(())
+    }
+    fn command(&self, _: &TaskRun, _: &str) -> Result<dagq::application::CommandSpec> {
+        bail!("not a run")
+    }
+    fn resume_command(&self, _: &TaskRun) -> Result<dagq::application::CommandSpec> {
+        bail!("not a run")
+    }
+    fn review_command(&self, _: &TaskRun, _: &str) -> Result<dagq::application::CommandSpec> {
+        bail!("not a run")
+    }
+}
+
+/// A planner's session wrapper registers itself and its agent, heartbeats
+/// and records the agent's exit, and its state is judged from those, its
+/// workspace and the idle marker the agent's `Stop` hook writes, as a
+/// worker's is: opening before the wrapper, working, idle, exited, lost
+/// when the wrapper is gone without an exit, closed with its workspace.
+#[test]
+fn a_planner_session_is_judged_alive_and_idle_like_a_worker() {
+    use dagq::application::planner::{PlannerProbes, planner_views};
+    use dagq::domain::{PlannerId, PlannerState};
+    use dagq::infrastructure::{clock::SystemClock, run_files::LocalRunFiles};
+    let fixture = fixture();
+    let cmux = FakeCmux::default();
+    let options = plan_options(&fixture);
+    let opened = lifecycle::plan(&fixture.location, &fixture.repo, &cmux, &options).unwrap();
+    let id = PlannerId::new(opened["planner"]["id"].as_i64().unwrap());
+    let queue = SqliteQueue::open(&fixture.location.db).unwrap();
+    let processes = FakeProcesses::default();
+    let signals = dagq::infrastructure::adapters::ClaudeCode {
+        executable: "claude".into(),
+    };
+    let planners = planners_dir(&fixture);
+    let probes = PlannerProbes {
+        cmux: &cmux,
+        processes: &processes,
+        files: &LocalRunFiles,
+        signals: &signals,
+        clock: &SystemClock,
+        planners_dir: &planners,
+    };
+    let state = |all: bool| -> Vec<(PlannerState, bool, bool)> {
+        planner_views(&queue, &probes, all)
+            .unwrap()
+            .into_iter()
+            .map(|view| (view.state, view.alive, view.idle_since.is_some()))
+            .collect()
+    };
+    assert_eq!(state(false), [(PlannerState::Opening, true, false)]);
+
+    // The wrapper runs the agent, which goes idle and exits.
+    let db = fixture.location.db.canonicalize().unwrap();
+    let result = dagq::compose::planner_session_with_provider(
+        &db,
+        id,
+        &PlannerAgent { code: 3 },
+        Some(Path::new("/plugins")),
+    )
+    .unwrap();
+    assert_eq!(result, json!({"planner_id": 1, "exit_code": 3}));
+    let planner = queue.planner(id).unwrap();
+    assert_eq!(planner.wrapper_pid, Some(std::process::id()));
+    assert!(planner.agent_pid.is_some());
+    assert_eq!(planner.exit_code, Some(3));
+    assert!(planner.heartbeat_at.is_some());
+    assert!(planners.join("1/idle.json").is_file());
+    assert_eq!(state(false), [(PlannerState::Exited, false, false)]);
+    // An agent that cannot start is recorded as an exit of 127.
+    let third = lifecycle::plan(&fixture.location, &fixture.repo, &cmux, &options).unwrap();
+    let third_id = PlannerId::new(third["planner"]["id"].as_i64().unwrap());
+    let error =
+        dagq::compose::planner_session_with_provider(&db, third_id, &NoPlanner, None).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("no planner session"),
+        "{error:#}"
+    );
+    assert_eq!(queue.planner(third_id).unwrap().exit_code, Some(127));
+    queue.close_planner(third_id, None).unwrap();
+    // One session per planner.
+    assert!(
+        dagq::compose::planner_session_with_provider(&db, id, &PlannerAgent { code: 0 }, None)
+            .is_err()
+    );
+
+    // A live session: working until the Stop hook marks it idle.
+    let second = lifecycle::plan(&fixture.location, &fixture.repo, &cmux, &options).unwrap();
+    let second_id = PlannerId::new(second["planner"]["id"].as_i64().unwrap());
+    queue.register_planner_wrapper(second_id, 4242).unwrap();
+    queue.heartbeat_planner(second_id, 4242).unwrap();
+    assert_eq!(state(false)[1], (PlannerState::Working, true, false));
+    fs::write(
+        planners.join(format!("{second_id}/idle.json")),
+        r#"{"hook_event_name":"Stop","background_tasks":[]}"#,
+    )
+    .unwrap();
+    assert_eq!(state(false)[1], (PlannerState::Idle, true, true));
+    // Background work left running is not idle.
+    fs::write(
+        planners.join(format!("{second_id}/idle.json")),
+        r#"{"hook_event_name":"Stop","background_tasks":[{"status":"running"}]}"#,
+    )
+    .unwrap();
+    assert_eq!(state(false)[1], (PlannerState::Working, true, false));
+    // Its wrapper died without recording an exit.
+    processes.dead.lock().unwrap().insert(4242);
+    assert_eq!(state(false)[1], (PlannerState::Lost, false, false));
+    // A person closed its workspace.
+    cmux.close(second["planner"]["workspace_id"].as_str().unwrap())
+        .unwrap();
+    assert_eq!(state(false)[1], (PlannerState::Closed, false, false));
+    queue.close_planner(second_id, None).unwrap();
+    assert_eq!(state(false).len(), 1);
+    assert_eq!(state(true).len(), 3);
+
+    // `planners` reads the same through the real processes.
+    let listed = dagq::lifecycle::planners(&fixture.location.db, &cmux, true).unwrap();
+    let states: Vec<&str> = listed["planners"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|planner| planner["state"].as_str().unwrap())
+        .collect();
+    assert_eq!(states, ["exited", "closed", "closed"], "{listed}");
+    assert_eq!(listed["planners"][0]["alive"], false);
+    assert_eq!(
+        listed["planners"][0]["workspace_id"],
+        opened["planner"]["workspace_id"]
     );
 }

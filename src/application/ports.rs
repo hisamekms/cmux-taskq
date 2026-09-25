@@ -17,10 +17,11 @@ use super::{GraphInput, TaskPage, TaskQuery, timestamp, unix_seconds};
 use crate::domain::{
     Ask, AskId, AskKind, AskOutcome, ClaimOutcome, CommitSha, EventId, EvidenceCheck,
     FollowUpAction, FollowUpVerdict, Goal, GoalDetail, GoalEdit, GoalId, GoalPredecessor,
-    GoalSummary, GoalVerdict, NewAsk, NewGoal, NewNote, NewTask, NotePage, NoteQuery, Predecessor,
-    Priority, Proposal, ProposalId, Reason, ReasonCode, RunEvent, RunId, RunLease, RunPlan,
-    RunProcess, RunStatus, SessionRole, Submission, SupervisorMode, SupervisorRegistration, Task,
-    TaskAction, TaskDetail, TaskEdit, TaskId, TaskRun,
+    GoalSummary, GoalVerdict, NewAsk, NewGoal, NewNote, NewTask, NotePage, NoteQuery, PlannerId,
+    PlannerOrigin, PlannerSession, Predecessor, Priority, Proposal, ProposalId, Reason, ReasonCode,
+    RunEvent, RunId, RunLease, RunPlan, RunProcess, RunStatus, SessionRole, Submission,
+    SupervisorMode, SupervisorRegistration, Task, TaskAction, TaskDetail, TaskEdit, TaskId,
+    TaskRun,
 };
 
 pub trait TaskStore {
@@ -291,6 +292,15 @@ pub trait AgentProvider {
         let _ = (cwd, prompt, allowed_tools);
         anyhow::bail!("this provider has no headless execution")
     }
+    /// The agent of a planner session (ADR-0041 decisions 1, 6): an
+    /// interactive agent in `planner.cwd` with `planner.prompt` as its first
+    /// message, whose `Stop` hook writes [`PlannerCommand::idle_marker`] the
+    /// way a worker's does, and that loads `planner.plugin_dir`. A provider
+    /// without one refuses.
+    fn planner_command(&self, planner: &PlannerCommand<'_>) -> Result<CommandSpec> {
+        let _ = planner;
+        anyhow::bail!("this provider has no planner session")
+    }
     /// How often the session wrapper checks the agent for its exit and
     /// heartbeats; tests shorten it.
     fn wait_interval(&self) -> std::time::Duration {
@@ -314,6 +324,31 @@ pub trait AgentProvider {
     fn review_timeout(&self) -> std::time::Duration {
         std::time::Duration::from_secs(600)
     }
+}
+
+/// What the agent of a planner session is started with: the planner's
+/// directory (its prompt, settings, log and idle marker), the directory it
+/// works in (the repository's checkout), its first message and the plugin
+/// directory it loads.
+#[derive(Debug, Clone, Copy)]
+pub struct PlannerCommand<'a> {
+    pub dir: &'a std::path::Path,
+    pub cwd: &'a std::path::Path,
+    pub prompt: &'a str,
+    pub plugin_dir: Option<&'a std::path::Path>,
+}
+
+impl PlannerCommand<'_> {
+    /// Where the agent's `Stop` hook writes its input when the agent stops,
+    /// in the planner's directory like a run's `idle.json`.
+    pub fn idle_marker(&self) -> std::path::PathBuf {
+        planner_idle_marker(self.dir)
+    }
+}
+
+/// The idle marker of the planner whose directory is `dir`.
+pub fn planner_idle_marker(dir: &std::path::Path) -> std::path::PathBuf {
+    dir.join("idle.json")
 }
 
 /// What the supervisor reads of the agent of a live session: its screen,
@@ -915,6 +950,25 @@ pub trait RunStore {
     fn remove_session_workspace(&self, role: SessionRole) -> Result<bool>;
     /// Forget the workspaces recorded for a role `up` no longer opens.
     fn forget_retired_session_workspaces(&self) -> Result<usize>;
+    /// Record a new planner session (ADR-0041 decisions 1, 6) before its
+    /// workspace opens.
+    fn open_planner(
+        &self,
+        origin: PlannerOrigin,
+        proposal: Option<ProposalId>,
+    ) -> Result<PlannerSession>;
+    /// The UUID of the workspace cmux opened for the planner.
+    fn planner_workspace_created(&self, id: PlannerId, workspace_id: &str) -> Result<()>;
+    /// Give the planner up; the first close and its error are kept.
+    fn close_planner(&self, id: PlannerId, error: Option<&str>) -> Result<PlannerSession>;
+    fn planner(&self, id: PlannerId) -> Result<PlannerSession>;
+    /// The planners not closed, oldest first; with `all`, every planner.
+    fn planners(&self, all: bool) -> Result<Vec<PlannerSession>>;
+    /// The planner's session wrapper registers itself, once.
+    fn register_planner_wrapper(&self, id: PlannerId, pid: u32) -> Result<()>;
+    fn register_planner_agent(&self, id: PlannerId, wrapper_pid: u32, agent: u32) -> Result<()>;
+    fn heartbeat_planner(&self, id: PlannerId, wrapper_pid: u32) -> Result<()>;
+    fn planner_exited(&self, id: PlannerId, wrapper_pid: u32, exit_code: i32) -> Result<()>;
     /// Record how `up` started the supervisor `token`.
     fn set_supervisor_mode(
         &self,

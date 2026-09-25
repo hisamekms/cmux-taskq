@@ -39,7 +39,7 @@ if [ "${1:-}" = "--version" ]; then
   printf 'claude-stub 0.0.0\n'
   exit 0
 fi
-session_id= debug_file= add_dir= settings= prompt= resume= headless= tools= denied=
+session_id= debug_file= add_dir= settings= prompt= resume= headless= tools= denied= plugin_dir=
 while [ $# -gt 0 ]; do
   case "$1" in
     -p) headless=1; shift ;;
@@ -50,11 +50,40 @@ while [ $# -gt 0 ]; do
     --debug-file) debug_file=$2; shift 2 ;;
     --add-dir) add_dir=$2; shift 2 ;;
     --settings) settings=$2; shift 2 ;;
+    --plugin-dir) plugin_dir=$2; shift 2 ;;
     --) shift; prompt=$1; shift; break ;;
     *) printf 'stub: unexpected argument %s\n' "$1" >&2; exit 64 ;;
   esac
 done
 [ $# -eq 0 ] || { printf 'stub: trailing arguments after the prompt\n' >&2; exit 64; }
+if [ "${DAGQ_ROLE:-}" = planner ]; then
+  # A planner session `plan` opened (ADR-0041 decision 6): register a task,
+  # submit it as this planner's proposal, go idle the way the Stop hook
+  # marks it, and wait for /exit on the terminal.
+  [ -z "$session_id" ] && [ -n "$debug_file" ] && [ -n "$add_dir" ] && [ -n "$settings" ] && [ -n "$prompt" ] \
+    || { printf 'stub: bad planner arguments\n' >&2; exit 64; }
+  grep -q '"Stop"' "$settings" || { printf 'stub: planner settings lack a Stop hook\n' >&2; exit 64; }
+  case "$prompt" in 'You are a planner of the dagq queue at '*) ;; *) printf 'stub: not a planner prompt\n' >&2; exit 65 ;; esac
+  {
+    printf 'argv: --debug-file %s --add-dir %s --settings %s --plugin-dir %s\n' "$debug_file" "$add_dir" "$settings" "$plugin_dir"
+    printf 'cwd: %s\n' "$(pwd)"
+    printf 'env: DAGQ_ROLE=%s DAGQ_PLANNER_ORIGIN=%s DAGQ_PLANNER_ID=%s\n' "$DAGQ_ROLE" "${DAGQ_PLANNER_ORIGIN:-}" "${DAGQ_PLANNER_ID:-}"
+  } > "$debug_file"
+  "$add_dir/runner" --db "$DAGQ_QUEUE" add "planned by planner ${DAGQ_PLANNER_ID:-}" --acceptance 'the e2e planner wrote it' > "$add_dir/added.json"
+  task=$(sed -n 's/^  "id": \([0-9]*\),$/\1/p' "$add_dir/added.json")
+  [ -n "$task" ] || { printf 'stub: add printed no task id\n' >&2; exit 66; }
+  "$add_dir/runner" --db "$DAGQ_QUEUE" submit "$task" > "$add_dir/submitted.json"
+  printf 'submitted task %s\n' "$task"
+  idle="$add_dir/idle.json"
+  printf '{"hook_event_name":"Stop","stop_hook_active":false}\n' > "$idle.tmp"
+  mv "$idle.tmp" "$idle"
+  printf 'idle; waiting for /exit\n'
+  while read -r line; do
+    [ "$line" = "/exit" ] && break
+  done
+  printf 'bye\n'
+  exit 0
+fi
 if [ -n "$headless" ]; then
   # The supervisor's headless review (ADR-0027): read review.md, print the
   # verdict JSON on stdout. Only a task that says E2E-REVIEW-PASS passes;
@@ -308,8 +337,8 @@ impl Drop for WorkspaceGuard {
                 eprintln!("workspace {id} already closed");
                 continue;
             }
-            // cmux refuses to close a pinned workspace (the inbox and the
-            // planner are pinned, ADR-0031).
+            // cmux refuses to close a pinned workspace (the inbox is
+            // pinned, ADR-0031).
             let _ = Command::new(&self.cmux)
                 .args(["workspace-action", "--action", "unpin", "--workspace", id])
                 .output();
@@ -1774,7 +1803,7 @@ fn launchd_e2e_enabled() -> bool {
 }
 
 /// `up` bootstraps the supervisor as a LaunchAgent of the real launchd and
-/// opens the inbox and planner workspaces in the real cmux; `status` lists the
+/// opens the inbox workspace in the real cmux; `status` lists the
 /// supervisor through its registration; `down --wait` unloads the agent
 /// and returns once the supervisor has drained and deregistered.
 ///
@@ -1851,9 +1880,9 @@ fn up_starts_a_launchd_supervisor_that_status_lists_and_down_wait_stops_it() {
     assert_eq!(first["supervisor"]["log_dir"], log_dir.to_str().unwrap());
     assert_eq!(first["pruned_supervisors"], Value::Array(vec![]));
     let repo_name = repo.file_name().unwrap().to_str().unwrap();
-    // The inbox and the planner are the sessions `up` opens (ADR-0024
-    // decision 6).
-    let sessions: Vec<String> = ["inbox", "planner"]
+    // The inbox is the one session `up` opens (ADR-0041 decision 6).
+    assert_eq!(first.get("planner"), None, "{first}");
+    let sessions: Vec<String> = ["inbox"]
         .into_iter()
         .map(|key| {
             assert_eq!(first[key]["outcome"], "created", "{first}");
@@ -1915,7 +1944,7 @@ fn up_starts_a_launchd_supervisor_that_status_lists_and_down_wait_stops_it() {
     assert_eq!(second["supervisor"]["outcome"], "reused", "{second}");
     assert_eq!(second["supervisor"]["version"], VERSION, "{second}");
     assert_eq!(second["supervisor"]["pid"], pid);
-    for (key, id) in ["inbox", "planner"].into_iter().zip(&sessions) {
+    for (key, id) in ["inbox"].into_iter().zip(&sessions) {
         assert_eq!(second[key]["outcome"], "reused", "{second}");
         assert_eq!(second[key]["workspace_id"], id.as_str());
     }
@@ -1938,8 +1967,7 @@ fn up_starts_a_launchd_supervisor_that_status_lists_and_down_wait_stops_it() {
             .any(|m| m.contains("exiting: {\"errors\":[],\"outcome\":\"stopped\"")),
         "{log:?}"
     );
-    // The inbox and planner workspaces are left open by `down`; the guard
-    // closes them.
+    // The inbox workspace is left open by `down`; the guard closes it.
     for id in &sessions {
         assert!(workspace_listed(cmux, id));
     }
@@ -2006,21 +2034,16 @@ fn up_in_cmux_starts_a_supervisor_in_a_workspace_that_down_wait_stops_and_closes
     assert!(workspace_listed(cmux, &supervisor_workspace));
     let pid = u32::try_from(first["supervisor"]["pid"].as_u64().unwrap()).unwrap();
     assert!(pid_alive(pid));
-    let [inbox, planner] = ["inbox", "planner"].map(|key| {
-        assert_eq!(first[key]["outcome"], "created", "{first}");
-        let id = first[key]["workspace_id"].as_str().unwrap().to_owned();
-        workspaces.ids.push(id.clone());
-        id
-    });
+    assert_eq!(first["inbox"]["outcome"], "created", "{first}");
+    let inbox = first["inbox"]["workspace_id"].as_str().unwrap().to_owned();
+    workspaces.ids.push(inbox.clone());
+    // `up` opens no planner (ADR-0041 decision 6); `plan` does.
+    assert_eq!(first.get("planner"), None, "{first}");
 
     // Every workspace carries its role and the queue in its own
     // environment, and all joined the queue's group (ADR-0026).
     let db = fixture.db.canonicalize().unwrap();
-    for (id, role) in [
-        (&supervisor_workspace, "supervisor"),
-        (&inbox, "inbox"),
-        (&planner, "planner"),
-    ] {
+    for (id, role) in [(&supervisor_workspace, "supervisor"), (&inbox, "inbox")] {
         let env = workspace_env(cmux, id);
         assert_eq!(env["DAGQ_ROLE"], role, "{env}");
         assert_eq!(env["DAGQ_QUEUE"], db.to_str().unwrap(), "{env}");
@@ -2033,21 +2056,15 @@ fn up_in_cmux_starts_a_supervisor_in_a_workspace_that_down_wait_stops_and_closes
         .iter()
         .map(|id| id.as_str().unwrap().to_ascii_lowercase())
         .collect();
-    for id in [&supervisor_workspace, &inbox, &planner] {
+    for id in [&supervisor_workspace, &inbox] {
         assert!(members.contains(&id.to_ascii_lowercase()), "{group}");
     }
     assert_eq!(
         listed_workspace(cmux, &inbox).unwrap()["description"],
         format!("dagq role=inbox queue={}", fixture.group.external_id)
     );
-    // The inbox is Amber and the planner Blue, each pinned with its role's
-    // pill (ADR-0031).
-    for (id, color, pill) in [
-        (&inbox, "#7D6608", "dagq_role=inbox icon=tray"),
-        (&planner, "#1565C0", "dagq_role=planner icon=map"),
-    ] {
-        assert_look(cmux, id, color, pill);
-    }
+    // The inbox is Amber, pinned with its role's pill (ADR-0031).
+    assert_look(cmux, &inbox, "#7D6608", "dagq_role=inbox icon=tray");
     assert_eq!(
         listed_workspace(cmux, &supervisor_workspace).unwrap()["pinned"],
         false
@@ -2191,10 +2208,8 @@ fn up_in_cmux_starts_a_supervisor_in_a_workspace_that_down_wait_stops_and_closes
         second["supervisor"]["workspace_id"],
         supervisor_workspace.as_str()
     );
-    for (key, id) in [("inbox", &inbox), ("planner", &planner)] {
-        assert_eq!(second[key]["outcome"], "reused", "{second}");
-        assert_eq!(second[key]["workspace_id"], id.as_str());
-    }
+    assert_eq!(second["inbox"]["outcome"], "reused", "{second}");
+    assert_eq!(second["inbox"]["workspace_id"], inbox.as_str());
     // The look is put back on a reused workspace that lost it.
     let unpin = Command::new(cmux)
         .args([
@@ -2202,15 +2217,15 @@ fn up_in_cmux_starts_a_supervisor_in_a_workspace_that_down_wait_stops_and_closes
             "--action",
             "unpin",
             "--workspace",
-            &planner,
+            &inbox,
         ])
         .output()
         .unwrap();
     assert!(unpin.status.success(), "{unpin:?}");
     let third = dagq_with(env, &[("HOME", home.as_path())], &up_args);
-    assert_eq!(third["planner"]["outcome"], "reused", "{third}");
+    assert_eq!(third["inbox"]["outcome"], "reused", "{third}");
     assert_eq!(third["warnings"], serde_json::json!([]), "{third}");
-    assert_look(cmux, &planner, "#1565C0", "dagq_role=planner icon=map");
+    assert_look(cmux, &inbox, "#7D6608", "dagq_role=inbox icon=tray");
 
     // cmux refuses to close a pinned workspace; dagq's close unpins it
     // first, so `down` closes the supervisor's workspace even when a person
@@ -2252,9 +2267,203 @@ fn up_in_cmux_starts_a_supervisor_in_a_workspace_that_down_wait_stops_and_closes
     assert!(!pid_alive(pid), "supervisor {pid} is still alive");
     wait_until_not_listed(cmux, &supervisor_workspace);
     assert_eq!(dagq(env, &["status"])["supervisors"], Value::Array(vec![]));
-    // The inbox and planner workspaces are left open by `down`; the guard
-    // closes them.
-    for id in [&inbox, &planner] {
-        assert!(workspace_listed(cmux, id));
+    // The inbox workspace is left open by `down`; the guard closes it.
+    assert!(workspace_listed(cmux, &inbox));
+}
+
+/// The planners of the queue as `planners --all` lists them, by ID.
+fn planners(env: &Env) -> Vec<Value> {
+    dagq(env, &["planners", "--all"])["planners"]
+        .as_array()
+        .unwrap()
+        .clone()
+}
+
+/// Type `/exit` at a session's prompt the way the supervisor does.
+fn send_exit(cmux: &Path, workspace: &str) {
+    for args in [
+        &["send", "--workspace", workspace, "--", "/exit"][..],
+        &["send-key", "--workspace", workspace, "--", "enter"],
+    ] {
+        let output = Command::new(cmux).args(args).output().unwrap();
+        assert!(output.status.success(), "{args:?}: {output:?}");
     }
+}
+
+/// `dagq plan` opens planners on demand, side by side (ADR-0041 decision
+/// 6): each in its own workspace `[<repo>]planner#<id>` with the
+/// planner's role, queue, origin and ID in its environment, in the queue's
+/// group, Blue and not pinned. Each runs the session wrapper, whose agent
+/// (the stub) submits a proposal owned by that workspace and goes idle;
+/// `planners` reports each alive and idle, then the one sent `/exit` as no
+/// longer alive with its exit code, and closed once its workspace is gone.
+#[test]
+#[ignore = "needs a running cmux; run with --ignored"]
+fn plan_opens_planners_side_by_side_that_submit_go_idle_and_exit() {
+    let fixture = fixture();
+    let Fixture {
+        cmux,
+        repo,
+        stub,
+        env,
+        db,
+        ..
+    } = &fixture;
+    let mut workspaces = WorkspaceGuard {
+        cmux: cmux.clone(),
+        ids: Vec::new(),
+    };
+    let plugin_dir = fixture._dir.path().join("plugin");
+    fs::create_dir(&plugin_dir).unwrap();
+    let plan_args = [
+        "plan",
+        "--cmux",
+        cmux.to_str().unwrap(),
+        "--claude",
+        stub.to_str().unwrap(),
+        "--plugin-dir",
+        plugin_dir.to_str().unwrap(),
+    ];
+    let first = dagq(env, &plan_args);
+    let second = dagq(env, &plan_args);
+    eprintln!("plan: {first}\nplan: {second}");
+    let repo_name = repo.file_name().unwrap().to_str().unwrap();
+    let db = db.canonicalize().unwrap();
+    let group = fixture.group().expect("the queue's workspace group exists");
+    let members: Vec<String> = group["member_workspace_ids"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|id| id.as_str().unwrap().to_ascii_lowercase())
+        .collect();
+    let mut ids = Vec::new();
+    for (report, planner) in [(&first, 1), (&second, 2)] {
+        assert_eq!(report["planner"]["id"], planner, "{report}");
+        assert_eq!(report["name"], format!("[{repo_name}]planner#{planner}"));
+        assert_eq!(report["warnings"], json!([]), "{report}");
+        let id = report["planner"]["workspace_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        uuid::Uuid::parse_str(&id).expect("workspace id is a UUID");
+        workspaces.ids.push(id.clone());
+        let listed = listed_workspace(cmux, &id).expect("the planner workspace is listed");
+        assert_eq!(listed["title"], format!("[{repo_name}]planner#{planner}"));
+        assert_eq!(listed["pinned"], false, "{listed}");
+        assert_eq!(listed["custom_color"], "#1565C0", "{listed}");
+        let workspace_env = workspace_env(cmux, &id);
+        assert_eq!(workspace_env["DAGQ_ROLE"], "planner", "{workspace_env}");
+        assert_eq!(workspace_env["DAGQ_QUEUE"], db.to_str().unwrap());
+        assert_eq!(workspace_env["DAGQ_PLANNER_ORIGIN"], "person");
+        assert_eq!(workspace_env["DAGQ_PLANNER_ID"], planner.to_string());
+        assert!(members.contains(&id.to_ascii_lowercase()), "{group}");
+        ids.push(id);
+    }
+    assert_ne!(ids[0], ids[1]);
+
+    // Both planners run at once: each submits its own proposal and goes
+    // idle, which `planners` reports from its wrapper and idle marker.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let listed = planners(env);
+        if listed.iter().all(|planner| planner["state"] == "idle") && listed.len() == 2 {
+            for planner in &listed {
+                assert_eq!(planner["alive"], true, "{planner}");
+                assert!(planner["idle_since"].is_i64(), "{planner}");
+                assert!(planner["wrapper_pid"].is_u64(), "{planner}");
+                assert!(planner["agent_pid"].is_u64(), "{planner}");
+            }
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "planners never went idle: {listed:#?}"
+        );
+        thread::sleep(Duration::from_millis(300));
+    }
+    let proposals = dagq(env, &["proposal", "list"]);
+    let mut owners: Vec<String> = proposals["proposals"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|proposal| {
+            assert_eq!(proposal["owner"]["origin"], "person", "{proposal}");
+            proposal["owner"]["workspace_id"]
+                .as_str()
+                .unwrap()
+                .to_ascii_lowercase()
+        })
+        .collect();
+    owners.sort();
+    let mut expected: Vec<String> = ids.iter().map(|id| id.to_ascii_lowercase()).collect();
+    expected.sort();
+    assert_eq!(owners, expected, "{proposals}");
+    for (report, planner) in [(&first, 1), (&second, 2)] {
+        let dir = PathBuf::from(report["dir"].as_str().unwrap());
+        let debug = fs::read_to_string(dir.join("claude.log")).unwrap();
+        eprintln!("planner {planner}: {debug}");
+        assert!(
+            debug.contains(&format!(
+                "--plugin-dir {}",
+                plugin_dir.canonicalize().unwrap().display()
+            )),
+            "{debug}"
+        );
+        assert!(
+            debug.contains(&format!(
+                "env: DAGQ_ROLE=planner DAGQ_PLANNER_ORIGIN=person DAGQ_PLANNER_ID={planner}"
+            )),
+            "{debug}"
+        );
+    }
+
+    // The first planner is sent /exit: its wrapper records the exit and it
+    // is no longer alive; the second is still idle.
+    send_exit(cmux, &ids[0]);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let exited = loop {
+        let listed = planners(env);
+        if listed[0]["exit_code"] == 0 {
+            break listed;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "planner 1 never exited: {listed:#?}"
+        );
+        thread::sleep(Duration::from_millis(300));
+    };
+    assert!(
+        exited[0]["state"] == "exited" || exited[0]["state"] == "closed",
+        "{exited:#?}"
+    );
+    assert_eq!(exited[0]["alive"], false);
+    assert_eq!(exited[1]["state"], "idle", "{exited:#?}");
+
+    // A person closes the first planner's workspace (cmux may already have
+    // closed it with its command): `planners` reports it closed, and the
+    // next `plan` opens a third.
+    if workspace_listed(cmux, &ids[0]) {
+        let close = Command::new(cmux)
+            .args(["workspace", "close", &ids[0]])
+            .output()
+            .unwrap();
+        assert!(close.status.success(), "{close:?}");
+    }
+    wait_until_not_listed(cmux, &ids[0]);
+    let third = dagq(env, &plan_args);
+    workspaces.ids.push(
+        third["planner"]["workspace_id"]
+            .as_str()
+            .unwrap()
+            .to_owned(),
+    );
+    assert_eq!(third["planner"]["id"], 3, "{third}");
+    let states: Vec<Value> = planners(env)
+        .iter()
+        .map(|planner| planner["state"].clone())
+        .collect();
+    assert_eq!(states[0], "closed", "{states:?}");
+    assert_eq!(states[1], "idle", "{states:?}");
+    assert_eq!(states.len(), 3, "{states:?}");
+    send_exit(cmux, &ids[1]);
 }

@@ -52,6 +52,7 @@ pub(super) const MIGRATIONS: &[&str] = &[
     include_str!("../../migrations/0020_task_priority.sql"),
     include_str!("../../migrations/0021_proposals.sql"),
     include_str!("../../migrations/0022_follow_up_triage.sql"),
+    include_str!("../../migrations/0023_planners.sql"),
 ];
 /// Ready tasks whose predecessors are completed, whose goal dependencies
 /// are all closed as achieved (ADR-0038), that own no unfinished run and

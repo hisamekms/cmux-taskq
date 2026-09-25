@@ -1130,6 +1130,8 @@ fn observer_may_note_and_propose_but_not_change_queue_state() {
         &["init"],
         &["review", "1"],
         &["down"],
+        &["plan"],
+        &["planner-session", "--planner", "1", "--claude", "claude"],
         &["ask", "--kind", "decide", "--question", "q", "--task", "1"],
         &["answer", "1", "--text", "x"],
         &["ask", "close", "1"],
@@ -1155,6 +1157,7 @@ fn observer_may_note_and_propose_but_not_change_queue_state() {
         &["notes"],
         &["asks"],
         &["status", "--role", "inbox"],
+        &["planners", "--all"],
     ] {
         ok_as("observer", &db, args);
     }
@@ -2091,6 +2094,7 @@ fn reviewer_may_only_read_the_queue() {
         &["review", "1"],
         &["goal", "add", "draft", "--draft"],
         &["submit", "1"],
+        &["plan"],
     ] {
         let output = invoke_as(Some("reviewer"), &db, args);
         assert!(!output.status.success(), "{args:?} was allowed");
@@ -2109,9 +2113,15 @@ fn reviewer_may_only_read_the_queue() {
         &["notes"],
         &["goal", "show", "1"],
         &["proposal", "list", "--all"],
+        &["planners"],
     ] {
         ok_as("reviewer", &db, args);
     }
+    // No planner was opened yet.
+    assert_eq!(
+        ok(&db, &["planners", "--all"]),
+        serde_json::json!({"planners": []})
+    );
 }
 
 /// `submit` as a planner session would run it: in a cmux workspace, with

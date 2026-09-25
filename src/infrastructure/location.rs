@@ -19,6 +19,7 @@ use super::adapters::git_common_dir;
 pub const DATA_DIR_NAME: &str = "dagq";
 pub const DB_FILE_NAME: &str = "queue.db";
 pub const RUNS_DIR_NAME: &str = "runs";
+pub const PLANNERS_DIR_NAME: &str = "planners";
 /// Supervisor logs (`supervisor-<started_at>-<pid>.log`, `launchd.log`).
 pub const LOGS_DIR_NAME: &str = "logs";
 /// LaunchAgent labels are `com.dagq.<queue hash>`.
@@ -152,6 +153,14 @@ impl QueueLocation {
 /// Runs of the queue at `db` live in `runs/` next to it.
 pub fn runs_dir(db: &Path) -> PathBuf {
     QueueLocation::explicit(db).runs_dir
+}
+
+/// `planners/` next to the database: one directory per planner session
+/// (ADR-0041 decision 6), named by its ID.
+pub fn planners_dir(db: &Path) -> PathBuf {
+    QueueLocation::explicit(db)
+        .queue_dir
+        .join(PLANNERS_DIR_NAME)
 }
 
 /// The canonical form of `path` when it exists, else of its nearest existing

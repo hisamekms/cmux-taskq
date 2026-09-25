@@ -50,9 +50,10 @@ supervisors          -- 0007: 常駐superviseプロセスの登録（token主キ
 goals                -- 0008: 複数taskが解く課題（title、description、acceptance、constraints、doc、closed_at、verdict）
                      -- 0013: status（'draft' | 'open'、既定'open'）
                      -- 0021: proposal_id（所属するproposal、null可）
-session_workspaces   -- 0011: up が開いた常駐sessionのworkspace UUID（role主キー。supervisor / inbox / planner。退役したroleの行はupが消す）
+session_workspaces   -- 0011: up が開いた常駐sessionのworkspace UUID（role主キー。supervisor / inbox。退役したrole（maintainer、常駐のplanner）の行はupが消す）
 asks                 -- 0014（0016、0017、0022で作り直し）: 人に答えを求める相談（kind、task / run、question、options、answer、asked_by、各時刻）
 task_leases          -- 0022: runを持たないtask（follow-up triageの途中のdraft）のlease（task_id主キー、supervisor_token、reason、heartbeat_at）
+planners             -- 0023: plannerのsession 1つに1行（origin、proposal_id、workspace_id、wrapper_pid、agent_pid、heartbeat_at、exit_code、exited_at、closed_at、error、created_at）
 ```
 
 `tasks.required_evidence`（0015、ADR-0019の決定5）はtaskがreceiptに要求するcheck名のJSON配列（`TEXT NOT NULL DEFAULT '[]'`）で、v14以前のtaskは移行後に`[]`（要求なし）になる。値は`add --evidence`が`tests` / `e2e` / `subagent_review`に限って書く。
@@ -68,6 +69,8 @@ task_leases          -- 0022: runを持たないtask（follow-up triageの途中
 - bypassの`ready`（`TaskAction::BypassReview`）は`transition_task`が`task_status_changed`に続けて`review_bypassed`（`from`）を書く。
 
 `tasks.follow_up_depth`（0022、ADR-0037の決定6）は人の判断を経ずに続いたfollow-upの段数（`INTEGER NOT NULL DEFAULT 0`）。domainの`Task`には載せず、storeの`follow_up_depth` / `set_follow_up_depth`が読み書きする。`integrate`の`register_follow_ups`はdraftに元のtaskの値+1を書き、`transition_task`は`TaskAction::BypassReview`（`ready --bypass-review`）で0に戻す（人の判断。adoptはその後にdraftの深さを書く）。migrationは既存のtaskを0にし、`follow_up_registered`の`task_id`が指すtaskのうちまだ`draft`のものを1にする。
+
+`planners`（0023、ADR-0041の決定1・6・12・13）はplannerのsession 1つを1行で持つ。`session_workspaces`はroleが主キーでplannerを1つしか持てないので、plannerはここに移した（常駐のplannerの`session_workspaces`の`planner`行は`up`の`forget_retired_session_workspaces`が消す）。列は`origin`（CHECK `'person' | 'runtime'`）、runtimeが立てたときの`proposal_id`（`REFERENCES proposals(id)`、null可。index `planners_by_proposal`）、cmux workspaceのUUID（`workspace_id`、UNIQUE、workspaceができてから書く）、session wrapper（`planner-session`）が書く`wrapper_pid` / `agent_pid` / `heartbeat_at` / `exit_code` / `exited_at`（時刻はUnix秒）、終わった印の`closed_at`と、workspaceを開けなかったときの`error`、`created_at`。書き込みは`src/infrastructure/planners.rs`: `open_planner`（行を作る）、`planner_workspace_created`（`workspace_id`が空の行にだけ書く）、`close_planner`（最初のcloseとerrorを残す）、`register_planner_wrapper`（wrapperが無く閉じていない行にだけ。1つのplannerにsessionは1つ）、`register_planner_agent` / `heartbeat_planner` / `planner_exited`（`wrapper_pid`が一致するときだけ。exitは1回）。読むのは`planner`と`planners(all)`（閉じていない行、`all`なら全部をID順）。
 
 ## 集約の読み書き
 
