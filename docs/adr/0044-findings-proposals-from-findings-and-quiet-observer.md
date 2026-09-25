@@ -2,10 +2,12 @@
 id: adr-0044
 type: adr
 title: ADR-0041の役割・proposal・plan reviewを引き継ぎ、observerの検出をfindingにし、findingとaskのanswerからruntimeが立てるplannerがproposalを作り、人へのエスカレーションはAIが判断し、observerは変化の無いときに何もせず、記録を見るCLIを持つ
-status: accepted
+status: superseded
 created: 2026-09-26
 updated: 2026-09-26
 accepted_on: 2026-09-26
+superseded_by: adr-0047
+superseded_on: 2026-09-26
 supersedes:
   - adr-0041
 owners:
@@ -49,6 +51,8 @@ related:
 ---
 
 # ADR-0044: ADR-0041の役割・proposal・plan reviewを引き継ぎ、observerの検出をfindingにし、findingとaskのanswerからruntimeが立てるplannerがproposalを作り、人へのエスカレーションはAIが判断し、observerは変化の無いときに何もせず、記録を見るCLIを持つ
+
+> **置き換え済み（2026-09-26）**: このADRの決定は現在有効ではない。現行の決定は[ADR-0047](0047-irregularities-in-three-layers-recovery-job-ask-reasons-and-goal-review.md)を読む。
 
 ## Context
 

@@ -2,10 +2,12 @@
 id: adr-0019
 type: adr
 title: maintainerの定型作業をruntimeに移す（needs_sessionの自動resume、exit timeoutで放棄しない、push、follow_ups、evidence、prompt待ち）
-status: accepted
+status: superseded
 created: 2026-09-23
 updated: 2026-09-23
 accepted_on: 2026-09-23
+superseded_by: adr-0047
+superseded_on: 2026-09-26
 owners:
   - hisamekms
 tags:
@@ -24,6 +26,8 @@ related:
 ---
 
 # ADR-0019: maintainerの定型作業をruntimeに移す（needs_sessionの自動resume、exit timeoutで放棄しない、push、follow_ups、evidence、prompt待ち）
+
+> **置き換え済み（2026-09-26）**: このADRの決定は現在有効ではない。現行の決定は[ADR-0047](0047-irregularities-in-three-layers-recovery-job-ask-reasons-and-goal-review.md)を読む。
 
 ## Context
 
