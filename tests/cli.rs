@@ -2346,3 +2346,70 @@ fn migrate_is_explicit_and_older_binaries_keep_working_within_the_floor() {
     }
     assert_eq!(version(), SqliteQueue::SCHEMA_VERSION + 2);
 }
+
+/// ADR-0041 decision 10: `lint` checks the fixed rules of TASKs and of a
+/// proposal's members, printing each violation with its code, and an empty
+/// list when the plan passes. It only reads, so the observer and the
+/// reviewer may run it.
+#[test]
+fn lint_reports_violations_by_code_and_passes_a_sound_plan() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("queue.db");
+    ok(&db, &["init"]);
+    let sound = ["--acceptance", "works", "--verify", "cargo test"];
+    ok(&db, &[&["add", "done"][..], &sound].concat());
+    ok(&db, &["ready", "1", "--bypass-review"]);
+    ok(&db, &["cancel", "1"]);
+    ok(&db, &[&["add", "sound"][..], &sound].concat());
+    ok(&db, &["add", "loose", "--depends-on", "1"]);
+    ok(
+        &db,
+        &[&["add", "Sound", "--depends-on", "2"][..], &sound].concat(),
+    );
+
+    let passed = ok(&db, &["lint", "2"]);
+    assert_eq!(passed, serde_json::json!({"tasks": [2], "violations": []}));
+
+    let submitted = submit_from(&db, None, None, &["3", "4"]);
+    assert!(submitted.status.success());
+    let linted = ok(&db, &["lint", "2", "--proposal", "1"]);
+    assert_eq!(linted["tasks"], serde_json::json!([2, 3, 4]));
+    let found: Vec<(i64, &str)> = linted["violations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| (v["task_id"].as_i64().unwrap(), v["code"].as_str().unwrap()))
+        .collect();
+    assert_eq!(
+        found,
+        [
+            (2, "duplicate_title"),
+            (3, "depends_on_canceled"),
+            (3, "unscoped_without_verification"),
+            (3, "blank_acceptance"),
+            (4, "duplicate_title"),
+        ]
+    );
+    assert_eq!(
+        linted["violations"][1]["reason"],
+        "it depends on task 1, which was canceled and never completes"
+    );
+    // A task given both directly and through its proposal is linted once.
+    assert_eq!(
+        ok(&db, &["lint", "4", "--proposal", "1"])["tasks"],
+        serde_json::json!([4, 3])
+    );
+    assert_eq!(
+        ok_as("observer", &db, &["lint", "2"])["violations"],
+        serde_json::json!([])
+    );
+    assert_eq!(
+        ok_as("reviewer", &db, &["lint", "2"])["violations"],
+        serde_json::json!([])
+    );
+
+    // A missing task or proposal is an error, and lint needs a target.
+    assert!(!invoke(&db, &["lint", "99"]).status.success());
+    assert!(!invoke(&db, &["lint", "--proposal", "9"]).status.success());
+    assert!(!invoke(&db, &["lint"]).status.success());
+}

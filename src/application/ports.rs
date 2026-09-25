@@ -17,9 +17,9 @@ use super::{GraphInput, TaskPage, TaskQuery, timestamp, unix_seconds};
 use crate::domain::{
     Ask, AskId, AskKind, AskOutcome, ClaimOutcome, CommitSha, EventId, EvidenceCheck,
     FollowUpAction, FollowUpVerdict, Goal, GoalDetail, GoalEdit, GoalId, GoalPredecessor,
-    GoalSummary, GoalVerdict, NewAsk, NewGoal, NewNote, NewTask, NotePage, NoteQuery, PlannerId,
-    PlannerOrigin, PlannerSession, Predecessor, Priority, Proposal, ProposalId, Reason, ReasonCode,
-    RunEvent, RunId, RunLease, RunPlan, RunProcess, RunStatus, SessionRole, Submission,
+    GoalSummary, GoalVerdict, LintInput, NewAsk, NewGoal, NewNote, NewTask, NotePage, NoteQuery,
+    PlannerId, PlannerOrigin, PlannerSession, Predecessor, Priority, Proposal, ProposalId, Reason,
+    ReasonCode, RunEvent, RunId, RunLease, RunPlan, RunProcess, RunStatus, SessionRole, Submission,
     SupervisorMode, SupervisorRegistration, Task, TaskAction, TaskDetail, TaskEdit, TaskId,
     TaskRun,
 };
@@ -90,6 +90,10 @@ pub trait TaskStore {
     /// The submitted and revising proposals, oldest submission first; with
     /// `all`, every proposal.
     fn proposals(&self, all: bool) -> Result<Vec<Proposal>>;
+    /// What `lint` checks `tasks` against (ADR-0041 decision 10), read in
+    /// one snapshot: the tasks in the order given, every task's status and
+    /// dependencies, and every goal's verdict. A missing task is an error.
+    fn lint_input(&self, tasks: &[TaskId]) -> Result<LintInput>;
     /// Open a draft goal so its tasks become candidates (ADR-0024 decision 5).
     fn ready_goal(&mut self, goal_id: GoalId) -> Result<Goal>;
     /// Record a note as an `observation` run event on its task, run or goal.

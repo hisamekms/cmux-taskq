@@ -149,6 +149,20 @@ enum Command {
         #[arg(long, group = "members")]
         proposal: Option<i64>,
     },
+    /// Check the fixed rules of a plan (plan review's mechanical checks): dependency cycles,
+    /// dependencies on completed, canceled or unsubmitted draft tasks and on abandoned goals, no
+    /// verification (with or without declared paths), invalid path globs, blank acceptance and
+    /// titles repeated within the set. Lints TASKs and the members of each --proposal. Prints
+    /// {"tasks", "violations"}, each violation {"code", "task_id", "reason"}; none: an empty list.
+    #[command(group = clap::ArgGroup::new("targets").multiple(true).required(true))]
+    Lint {
+        /// Task to check; repeatable.
+        #[arg(group = "targets")]
+        tasks: Vec<i64>,
+        /// Proposal whose tasks to check; repeatable.
+        #[arg(long = "proposal", group = "targets")]
+        proposals: Vec<i64>,
+    },
     /// Read proposals: the goals and tasks submitted together for plan review.
     Proposal {
         #[command(subcommand)]
@@ -688,6 +702,7 @@ fn reviewer_access(command: &Command) -> ObserverAccess {
         | Command::Notes { .. }
         | Command::Proposal { .. }
         | Command::Planners { .. }
+        | Command::Lint { .. }
         | Command::Goal {
             command: GoalCommand::List | GoalCommand::Show { .. },
         } => ObserverAccess::Allowed,
@@ -723,6 +738,7 @@ fn observer_access(command: &Command) -> ObserverAccess {
         | Command::Notes { .. }
         | Command::Proposal { .. }
         | Command::Planners { .. }
+        | Command::Lint { .. }
         | Command::Goal {
             command:
                 GoalCommand::List | GoalCommand::Show { .. } | GoalCommand::Add { draft: true, .. },
@@ -921,6 +937,16 @@ fn execute(cli: Cli) -> Result<Value> {
                     },
                 })?,
             )?
+        }
+        Command::Lint { tasks, proposals } => {
+            let mut targets: Vec<TaskId> = tasks.into_iter().map(TaskId::new).collect();
+            for id in proposals {
+                targets.extend_from_slice(queue.show_proposal(ProposalId::new(id))?.task_ids());
+            }
+            let mut seen = std::collections::HashSet::new();
+            targets.retain(|id| seen.insert(*id));
+            let input = queue.lint_input(&targets)?;
+            json!({"tasks": targets, "violations": dagq::domain::lint::lint(&input)})
         }
         Command::Proposal { command } => match command {
             ProposalCommand::List { all } => json!({"proposals": queue.proposals(all)?}),

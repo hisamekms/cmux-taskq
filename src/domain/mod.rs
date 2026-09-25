@@ -366,6 +366,7 @@ pub mod follow_up;
 pub mod goal;
 pub mod ids;
 mod input;
+pub mod lint;
 pub mod planner;
 pub mod proposal;
 pub mod reason;
@@ -384,6 +385,7 @@ pub use follow_up::{
 pub use goal::Goal;
 pub use ids::{AskId, CommitSha, EventId, GoalId, PlannerId, ProposalId, RunId, TaskId};
 pub use input::{GoalEdit, GoalRecord, NewGoal, NewTask, RunPlan, RunRecord, TaskEdit, TaskRecord};
+pub use lint::{LintCode, LintInput, LintNode, LintViolation};
 pub use planner::{IdleProbe, PlannerProbe, PlannerSession};
 pub use proposal::{PlannerOwner, Proposal, ProposalRecord, Submission};
 pub use reason::{Reason, ReasonCode};

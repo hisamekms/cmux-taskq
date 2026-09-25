@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     path::{Path, PathBuf},
     str::FromStr,
     time::{Duration, SystemTime},
@@ -19,11 +20,11 @@ use crate::{
     },
     domain::{
         ClaimOutcome, CommitSha, DomainError, EventId, Goal, GoalDetail, GoalEdit, GoalId,
-        GoalPredecessor, GoalRecord, GoalSummary, GoalTask, GoalVerdict, NewGoal, NewNote, NewTask,
-        NotePage, NoteQuery, NoteTarget, OBSERVATION_KIND, Predecessor, Priority, Proposal,
-        ProposalId, Provider, RunEvent, RunId, RunRecord, Submission, Task, TaskAction, TaskDetail,
-        TaskEdit, TaskId, TaskRecord, TaskRun, TaskStatus, TaskStatusCounts, goal,
-        scope::validate_path_globs, task,
+        GoalPredecessor, GoalRecord, GoalSummary, GoalTask, GoalVerdict, LintInput, LintNode,
+        NewGoal, NewNote, NewTask, NotePage, NoteQuery, NoteTarget, OBSERVATION_KIND, Predecessor,
+        Priority, Proposal, ProposalId, Provider, RunEvent, RunId, RunRecord, Submission, Task,
+        TaskAction, TaskDetail, TaskEdit, TaskId, TaskRecord, TaskRun, TaskStatus,
+        TaskStatusCounts, goal, scope::validate_path_globs, task,
     },
     infrastructure::{
         clock,
@@ -954,6 +955,11 @@ impl TaskStore for SqliteQueue {
         proposals::list(&tx, all)
     }
 
+    fn lint_input(&self, tasks: &[TaskId]) -> Result<LintInput> {
+        let tx = self.conn.unchecked_transaction()?;
+        read_lint_input(&tx, tasks)
+    }
+
     fn ready_goal(&mut self, goal_id: GoalId) -> Result<Goal> {
         let tx = self
             .conn
@@ -1450,6 +1456,57 @@ fn read_graph_input(conn: &Connection) -> Result<GraphInput> {
         .query_map([], |r| r.get("id"))?
         .collect::<rusqlite::Result<_>>()?;
     Ok(GraphInput { tasks, candidates })
+}
+
+/// The queue as `lint` reads it: `targets` in the order given and every
+/// task's status and dependencies, and every goal's verdict.
+fn read_lint_input(conn: &Connection, targets: &[TaskId]) -> Result<LintInput> {
+    let targets = targets
+        .iter()
+        .map(|&id| read_task(conn, id))
+        .collect::<Result<_>>()?;
+    let mut nodes: BTreeMap<TaskId, LintNode> = conn
+        .prepare("SELECT id, status, goal_id FROM tasks")?
+        .query_map([], |r| {
+            Ok((
+                r.get("id")?,
+                LintNode {
+                    status: enum_col(r, "status")?,
+                    goal_id: r.get("goal_id")?,
+                    depends_on: Vec::new(),
+                    goal_dependencies: Vec::new(),
+                },
+            ))
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    let edges: Vec<(TaskId, TaskId)> = conn
+        .prepare("SELECT task_id, predecessor_id FROM task_dependencies ORDER BY predecessor_id")?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    for (task_id, predecessor_id) in edges {
+        if let Some(node) = nodes.get_mut(&task_id) {
+            node.depends_on.push(predecessor_id);
+        }
+    }
+    let goal_edges: Vec<(TaskId, GoalId)> = conn
+        .prepare("SELECT task_id, goal_id FROM task_goal_dependencies ORDER BY goal_id")?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    for (task_id, goal_id) in goal_edges {
+        if let Some(node) = nodes.get_mut(&task_id) {
+            node.goal_dependencies.push(goal_id);
+        }
+    }
+    let goals = conn
+        .prepare("SELECT * FROM goals")?
+        .query_map([], goal_row)?
+        .map(|goal| goal.map(|goal| (goal.id(), goal.verdict())))
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(LintInput {
+        targets,
+        nodes,
+        goals,
+    })
 }
 
 /// The claimable task IDs in claim order (ADR-0040 decision 4), from the
