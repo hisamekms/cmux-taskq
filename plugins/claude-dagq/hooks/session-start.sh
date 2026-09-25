@@ -1,9 +1,9 @@
 #!/bin/sh
 # SessionStart hook (matcher compact|clear) of the claude-dagq plugin.
 #
-# Only the sessions `dagq up` opens are affected: DAGQ_ROLE (inbox or
-# planner, which `up` puts in the workspace's environment with
-# --env) selects `dagq status --role <role>` (supervisors, unfinished runs,
+# Only the inbox `dagq up` opens and the planners `dagq plan` or the
+# supervisor opens are affected: DAGQ_ROLE (inbox or planner, which they
+# put in the workspace's environment with --env) selects `dagq status --role <role>` (supervisors, unfinished runs,
 # the attention and asks addressed to that role, and the next cursor) on
 # stdout, which Claude Code adds to the context, so the session re-orients
 # itself after compaction or /clear. The status comes after one line of text
@@ -30,7 +30,7 @@ elif ! command -v dagq >/dev/null 2>&1; then
   exit 0
 fi
 
-# `up` names the session's queue in DAGQ_QUEUE; an explicit DAGQ_DB wins.
+# `up` and `plan` name the session's queue in DAGQ_QUEUE; an explicit DAGQ_DB wins.
 if [ -z "${DAGQ_DB:-}" ] && [ -n "${DAGQ_QUEUE:-}" ]; then
   DAGQ_DB=$DAGQ_QUEUE
   export DAGQ_DB

@@ -1,6 +1,6 @@
 # Review by hand, integrate, and a failed push
 
-Read this for attention `review by hand` (`kind` `review_failed`), `review and integrate`, or `push main` (the `dagq-recover` skill, section 6). Everything here is done on the person's word. Never merge, rebase, cherry-pick or fast-forward a run's branch yourself: landing is the runtime's job, and it keeps `main` linear with one squash commit per task. Never read the full diff in the inbox or planner session.
+Read this for attention `review by hand` (`kind` `review_failed`), `review and integrate`, or `push main` (the `dagq-recover` skill, section 6). Everything here is done on the person's word. Never merge, rebase, cherry-pick or fast-forward a run's branch yourself: landing is the runtime's job, and it keeps `main` linear with one squash commit per task. Never read the full diff in the inbox or a planner session.
 
 ## The supervisor reviews first
 
@@ -20,7 +20,7 @@ Only `review by hand` (the headless review exited non-zero, printed no verdict o
 
 `integrate` and the supervisor's landing push `main` themselves. When `push.outcome` is `failed`, or `status` shows `push main` (`kind: push_failed`), fix the cause with the person (a rejected non-fast-forward, credentials), then `git push origin main`. The attention clears at the next successful push.
 
-Report the landed commit, what it unblocked, and the draft tasks from `follow_ups`; whether each becomes `ready` is the planner's with the person.
+Report the landed commit, what it unblocked, and the draft tasks from `follow_ups`; the runtime opens a planner for each, which submits it for plan review, cancels it or asks the inbox.
 
 ## What review.md holds
 
@@ -47,7 +47,7 @@ The landing happens in the current directory's repository; pass `--repo PATH` on
 
 ## follow_ups
 
-A receipt's `follow_ups` is an optional array of `{title, description}` for work the worker found outside its task. It is in review.md and in the `receipt` of the `validation_finished` event (`show ID --full`). When the run lands, `integrate` registers each entry whose `title` is a non-blank string and whose `description` is a string as a `draft` task (ADR-0019 decision 4): the title and description as proposed, no acceptance, verification commands or dependencies, the landed task's goal (none when the task has no goal; none with `goal_closed: true` in the event when the goal is closed), and the context "task <id>（<title>）の run <run-id> の receipt が提案した follow_up". Each registration records `follow_up_registered` (`task_id`, `title`, `index`) on the run, and an entry already recorded is never registered again, so a landing after `needs_session` registers once. An entry that is not registered gets a `follow_up_registered` with `task_id: null`, `skipped` and the entry as `follow_up`; report it to the person with the others. The `integrated` JSON lists them as `follow_ups: [{task_id, title}]`. A draft is never claimed: report the IDs; whether each becomes `ready` or is canceled is decided by the planner with the person (the `dagq-planner` skill).
+A receipt's `follow_ups` is an optional array of `{title, description}` for work the worker found outside its task. It is in review.md and in the `receipt` of the `validation_finished` event (`show ID --full`). When the run lands, `integrate` registers each entry whose `title` is a non-blank string and whose `description` is a string as a `draft` task (ADR-0019 decision 4): the title and description as proposed, no acceptance, verification commands or dependencies, the landed task's goal (none when the task has no goal; none with `goal_closed: true` in the event when the goal is closed), and the context "task <id>（<title>）の run <run-id> の receipt が提案した follow_up". Each registration records `follow_up_registered` (`task_id`, `title`, `index`) on the run, and an entry already recorded is never registered again, so a landing after `needs_session` registers once. An entry that is not registered gets a `follow_up_registered` with `task_id: null`, `skipped` and the entry as `follow_up`; report it to the person with the others. The `integrated` JSON lists them as `follow_ups: [{task_id, title}]`. A draft is never claimed: report the IDs. The supervisor opens a runtime planner for each (ADR-0044 decision 16), which adopts it (completes and submits it for plan review), drops it, or asks the inbox a `planner_question` (the `dagq-planner` skill).
 
 ## approve_landing answers
 

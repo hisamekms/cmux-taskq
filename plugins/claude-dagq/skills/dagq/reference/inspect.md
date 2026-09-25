@@ -1,6 +1,6 @@
 # Inspect commands and their fields
 
-Read this when you need a field of `list`, `show`, `goal show`, `graph`, `status`, `stats` or `doctor`, the meaning of a task or run status, how priority orders claiming, or how to edit a draft task.
+Read this when you need a field of `list`, `show`, `goal show`, `graph`, `status`, `stats` or `doctor`, the meaning of a task or run status, how priority orders claiming, or how to edit a draft or submitted task.
 
 | Command | Use |
 | --- | --- |
@@ -34,12 +34,12 @@ Useful run fields: `branch` (`dagq/<run-id>`), `worktree_path`, `workspace_id` (
 
 ## Decide what to run first with `graph`
 
-When planning a goal or deciding what to make `ready` next, read `"$DAGQ" graph --goal ID` (or `graph` for the whole queue) instead of reading each task's `dependencies`:
+When planning a goal or deciding what to submit next, read `"$DAGQ" graph --goal ID` (or `graph` for the whole queue) instead of reading each task's `dependencies`:
 
-1. `critical` is the chain that holds back the most work. Its first task should be `ready` and running; if it is `draft`, make it `ready` before tasks with small `unblocks`.
+1. `critical` is the chain that holds back the most work. Its first task should be `ready` and running; if it is `draft`, complete it and `submit` it for plan review before tasks with small `unblocks` (only plan review, or a person's explicit `ready --bypass-review`, makes it `ready`).
 2. A task with a large `unblocks` that is not in `candidates` waits on its `ready_after`; those predecessors are what to finish (or to review and land) first.
 3. When one task blocks many (goal 8 had five tasks waiting on one), consider splitting it or removing a dependency that is not real (`dependency remove`) so more tasks run in parallel.
-4. `candidates` is the order the supervisor will claim in, so there is no need to register or `ready` tasks in a particular order to get the releasing ones first. To put a task ahead of the others, give it a priority (below).
+4. `candidates` is the order the supervisor will claim in, so there is no need to register or submit tasks in a particular order to get the releasing ones first. To put a task ahead of the others, give it a priority (below).
 
 ## Priority and claim order
 
@@ -64,9 +64,9 @@ Every task has one of five priorities. Pick it by what waiting costs, not by how
 - **Express urgency with priority only.** Do not move other tasks back to `draft`, and do not add or remove dependencies that are not real, to get one task claimed first; give it a higher priority instead.
 - **No aging.** A `low` task waits as long as higher ones keep arriving; nothing raises it over time. Check `graph` for ready tasks that never reach the front and raise them by hand.
 
-## Edit a draft task
+## Edit a draft or submitted task
 
-Fix a draft task in place instead of canceling it and registering it again (that changes its ID and its dependents' edges):
+Fix a draft or submitted task in place instead of canceling it and registering it again (that changes its ID and its dependents' edges):
 
 ```sh
 "$DAGQ" edit TASK --description "..." --acceptance "..."   # also --title, --context
@@ -75,7 +75,7 @@ Fix a draft task in place instead of canceling it and registering it again (that
 ```
 
 - Each given field replaces the old value; a repeatable flag (`--verify`, `--evidence`, `--paths`) replaces the whole list, so pass every value it should keep. At least one field is required. The values follow the `add` rules (no blank title or command, valid globs).
-- **When it can change.** Only a `draft` task. A `ready` task is refused: take it back with `draft ID`, edit it, and `ready` it again. An `in_progress` or finished task is refused; a run already claimed keeps the prompt it started with.
+- **When it can change.** Only a `draft` or `submitted` task. Editing a `submitted` task does not yet restart its plan review (ADR-0044 decision 9 is not implemented): a review already running may pass the old text, so fix a proposal while it is sent back (`draft`) rather than while it is `submitted`. A `ready` task is refused: it changes only through plan review, which moves it back to `submitted` for a planner (ADR-0044 decision 14), or by taking it back with `draft ID`, editing it and submitting it again. An `in_progress` or finished task is refused; a run already claimed keeps the prompt it started with.
 - The change is recorded as a `task_edited` event whose `from` and `to` hold only the fields that changed (under their task JSON names); `show ID` lists it with long texts cut to 300 characters, `show ID --full` has the whole values. Nothing changed, nothing recorded.
 - Priority, goal and dependencies have their own commands: `set-priority`, `set-goal`, `dependency add|remove`.
 
