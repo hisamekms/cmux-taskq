@@ -518,7 +518,8 @@ fn failed_push(error: &anyhow::Error) -> PushReport {
 }
 
 /// Register the landed receipt's `follow_ups` of `task`'s run `run_id` as
-/// draft tasks of the task's goal (ADR-0019 decision 4): the title and
+/// draft tasks of the task's goal (ADR-0019 decision 4), one follow-up
+/// deeper than the task (`follow_up_depth`, ADR-0037 decision 6): the title and
 /// description as proposed, no acceptance, verification commands or
 /// dependencies, and a context naming where they came from. A closed goal
 /// takes no task, so the follow-up is registered without a goal and its
@@ -571,6 +572,24 @@ pub fn register_follow_ups<Q: Queue + ?Sized>(
             }
         },
         None => false,
+    };
+    // A draft is one follow-up further from a person's judgement than the
+    // task that proposed it (ADR-0037 decision 6).
+    // An unreadable depth counts as the deepest that still asks, so the
+    // registration goes on and no draft is adopted without a person.
+    let depth = match queue.follow_up_depth(task.id()) {
+        Ok(depth) => depth + 1,
+        Err(error) => {
+            warn!(
+                op = "follow_up",
+                run_id = %run_id,
+                task_id = %task.id(),
+                error = %format_args!("{error:#}"),
+                "run {run_id}: the follow_up_depth of task {} could not be read: {error:#}",
+                task.id()
+            );
+            crate::domain::follow_up::FOLLOW_UP_ASK_DEPTH
+        }
     };
     let mut added = Vec::new();
     for (index, entry) in entries.iter().enumerate() {
@@ -640,6 +659,16 @@ pub fn register_follow_ups<Q: Queue + ?Sized>(
                 continue;
             }
         };
+        if let Err(error) = queue.set_follow_up_depth(created.id(), depth) {
+            warn!(
+                op = "follow_up",
+                run_id = %run_id,
+                task_id = %created.id(),
+                error = %format_args!("{error:#}"),
+                "run {run_id}: could not record the follow_up_depth of task {}: {error:#}",
+                created.id()
+            );
+        }
         let mut payload =
             json!({"task_id": created.id(), "title": created.title(), "index": index});
         if goal_closed {

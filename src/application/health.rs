@@ -687,6 +687,14 @@ pub fn attention(
                 "ask_answered",
                 AttentionNext::ApplyingAnswer { ask_id: ask.id },
             )
+        } else if ask.kind == AskKind::FollowUp && queue.applies_follow_up_answer(&ask)? {
+            // The supervisor adopts, cancels or keeps the follow_up draft
+            // (ADR-0037 decision 7).
+            (
+                "answered",
+                "ask_answered",
+                AttentionNext::ApplyingAnswer { ask_id: ask.id },
+            )
         } else if ask.kind == AskKind::ApproveLanding
             && let Some(run_id) = ask.run_id.as_ref()
             && queue.run(run_id)?.status() == RunStatus::AwaitingIntegration

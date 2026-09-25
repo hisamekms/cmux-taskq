@@ -29,7 +29,7 @@ use crate::{
 };
 
 const APPLICATION_ID: i64 = 0x43545131;
-const MIGRATIONS: &[&str] = &[
+pub(super) const MIGRATIONS: &[&str] = &[
     include_str!("../../migrations/0001_queue.sql"),
     include_str!("../../migrations/0002_supervisor.sql"),
     include_str!("../../migrations/0003_workspace_close.sql"),
@@ -51,6 +51,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../../migrations/0019_task_goal_dependencies.sql"),
     include_str!("../../migrations/0020_task_priority.sql"),
     include_str!("../../migrations/0021_proposals.sql"),
+    include_str!("../../migrations/0022_follow_up_triage.sql"),
 ];
 /// Ready tasks whose predecessors are completed, whose goal dependencies
 /// are all closed as achieved (ADR-0038), that own no unfinished run and
@@ -204,40 +205,7 @@ impl TaskStore for SqliteQueue {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let now = self.generators.clock.timestamp();
-        let dependencies = new.dependencies.clone();
-        let goal_dependencies = new.goal_dependencies.clone();
-        let task = Task::new(TaskId::new(next_id(&tx, "tasks")?), new, now.clone())?;
-        if let Some(goal_id) = task.goal_id() {
-            goal::check_accepts_tasks(&read_goal(&tx, goal_id)?)?;
-        }
-        let id = task.id();
-        tx.execute(
-            "INSERT INTO tasks(id, title, description, acceptance, verification_commands, status, goal_id,
-                               context, required_evidence, paths, priority, created_at, updated_at)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
-            params![id, task.title(), task.description(), task.acceptance(),
-                serde_json::to_string(task.verification_commands())?, task.status().as_str(),
-                task.goal_id(), task.context(), serde_json::to_string(task.required_evidence())?,
-                serde_json::to_string(task.paths())?, task.priority().as_i64(), task.created_at(),
-                task.updated_at()],
-        )?;
-        event(
-            &tx,
-            id,
-            None,
-            "task_created",
-            json!({"goal_id": task.goal_id()}),
-        )?;
-        // Inserted after the task, which is in its goal already, so the
-        // cycle checks see the goal's wait for it (ADR-0038).
-        for predecessor in dependencies {
-            insert_dependency(&tx, id, predecessor, &now)?;
-        }
-        for goal_id in goal_dependencies {
-            insert_goal_dependency(&tx, id, goal_id, &now)?;
-        }
-        let result = read_task(&tx, id)?;
+        let result = insert_task(&tx, new, &self.generators.clock.timestamp())?;
         tx.commit()?;
         Ok(result)
     }
@@ -977,6 +945,45 @@ const EDITABLE_TASK_FIELDS: [&str; 7] = [
     "context",
 ];
 
+/// Register `new` inside the caller's write transaction with
+/// `task_created` and its dependencies: what `add` does, and what a
+/// follow-up triage's `adopt` does in the transaction that cancels the draft.
+pub(super) fn insert_task(tx: &Connection, new: NewTask, now: &str) -> Result<Task> {
+    let dependencies = new.dependencies.clone();
+    let goal_dependencies = new.goal_dependencies.clone();
+    let task = Task::new(TaskId::new(next_id(tx, "tasks")?), new, now.to_owned())?;
+    if let Some(goal_id) = task.goal_id() {
+        goal::check_accepts_tasks(&read_goal(tx, goal_id)?)?;
+    }
+    let id = task.id();
+    tx.execute(
+            "INSERT INTO tasks(id, title, description, acceptance, verification_commands, status, goal_id,
+                               context, required_evidence, paths, priority, created_at, updated_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+            params![id, task.title(), task.description(), task.acceptance(),
+                serde_json::to_string(task.verification_commands())?, task.status().as_str(),
+                task.goal_id(), task.context(), serde_json::to_string(task.required_evidence())?,
+                serde_json::to_string(task.paths())?, task.priority().as_i64(), task.created_at(),
+                task.updated_at()],
+        )?;
+    event(
+        tx,
+        id,
+        None,
+        "task_created",
+        json!({"goal_id": task.goal_id()}),
+    )?;
+    // Inserted after the task, which is in its goal already, so the
+    // cycle checks see the goal's wait for it (ADR-0038).
+    for predecessor in dependencies {
+        insert_dependency(tx, id, predecessor, now)?;
+    }
+    for goal_id in goal_dependencies {
+        insert_goal_dependency(tx, id, goal_id, now)?;
+    }
+    read_task(tx, id)
+}
+
 pub(super) fn read_goal(conn: &Connection, goal_id: GoalId) -> Result<Goal> {
     conn.query_row("SELECT * FROM goals WHERE id=?1", [goal_id], goal_row)
         .optional()?
@@ -1264,6 +1271,12 @@ pub(super) fn transition_task(
         params![task.status().as_str(), now, task_id, from.as_str()],
     )?;
     ensure!(changed == 1, "task {task_id} changed concurrently");
+    if action == TaskAction::BypassReview {
+        // A person readied the task past plan review: its follow-ups count
+        // again from 1 (ADR-0037 decision 6, kept by ADR-0041 decision 16).
+        // The follow-up triage's adopt writes the draft's depth afterwards.
+        conn.execute("UPDATE tasks SET follow_up_depth=0 WHERE id=?1", [task_id])?;
+    }
     event(
         conn,
         task_id,

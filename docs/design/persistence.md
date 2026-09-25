@@ -26,12 +26,13 @@ related:
   - adr-0024
   - adr-0022
   - adr-0029
+  - adr-0037
   - design-domain-model
 ---
 
 # SQLite persistence
 
-SQLiteはキューの正本であり、プロセス間共有と再起動後の復旧に使う。stdoutは正本にしない。ステップ2で4テーブル、ステップ3で3テーブル、ステップ4で`task_runs.workspace_closed_at`列を実装し、ステップ4の統合確認で`task_runs`を作り直して`integrated`を加え（schema version 4）、ステップ6でleaseをrun単位の`run_leases`に移してqueue全体の実行枠を外し（schema version 5、[ADR-0007](../adr/0007-run-level-leases-parallel-execution.md)）、ステップ7で`task_runs`を再び作り直して`integrating`と`needs_session`を加え、統合スロットの部分UNIQUE indexを足した（schema version 6、[ADR-0008](../adr/0008-merge-queue-squash-landing.md)）。`0007_supervisors.sql`は常駐supervisorの登録表`supervisors`を足した（schema version 7）。`0008_goals.sql`は`goals`、`tasks.goal_id` / `tasks.context`を足し、`run_events`を作り直してgoal単位のイベントを持てるようにした（schema version 8、[ADR-0009](../adr/0009-goal-groups-tasks.md)。ADRの「schema v6」は7がsupervisorsに使われたためv8と読み替える）。`0009_supervisor_mode.sql`は`supervisors`に`mode`と`workspace_id`を足した（schema version 9、[ADR-0011](../adr/0011-cmux-socket-password-and-in-cmux-fallback.md)）。`0012_queue_events.sql`は`run_events`を作り直し、`backend_call_failed`だけはtaskにもgoalにも紐づかない行を持てるようにした（schema version 12、task 109）。`0016_observer.sql`は`asks`と`run_events`を作り直し、observerの`blocked`のaskとその事象、observer自身の`observe_started` / `observe_finished`をtaskの無い行として持てるようにした（schema version 16、task 99）。`0017_stuck_exit_ask.sql`は`asks`を0016と同じ手順で作り直し、kindのCHECKに`stuck_exit`（supervisorが`/exit`のtimeoutで作るask。task 104）を足した（schema version 17）。`0018_task_paths.sql`は`tasks.paths`を足した（schema version 18、[ADR-0029](../adr/0029-task-declares-paths-and-verification-follows-the-kind-of-change.md)）。`0019_task_goal_dependencies.sql`は`task_goal_dependencies`を足した（schema version 19）。`0020_task_priority.sql`は`tasks.priority`を足した（schema version 20、[ADR-0040](../adr/0040-verify-once-review-run-env-graph-stats-and-task-priority-in-claim-order.md)の決定4）。`0021_proposals.sql`は`proposals`、`tasks.proposal_id` / `goals.proposal_id`とtaskのstatus `submitted`を足した（schema version 21、[ADR-0041](../adr/0041-on-demand-planners-proposals-submitted-and-plan-review-job.md)の決定7、8）。
+SQLiteはキューの正本であり、プロセス間共有と再起動後の復旧に使う。stdoutは正本にしない。ステップ2で4テーブル、ステップ3で3テーブル、ステップ4で`task_runs.workspace_closed_at`列を実装し、ステップ4の統合確認で`task_runs`を作り直して`integrated`を加え（schema version 4）、ステップ6でleaseをrun単位の`run_leases`に移してqueue全体の実行枠を外し（schema version 5、[ADR-0007](../adr/0007-run-level-leases-parallel-execution.md)）、ステップ7で`task_runs`を再び作り直して`integrating`と`needs_session`を加え、統合スロットの部分UNIQUE indexを足した（schema version 6、[ADR-0008](../adr/0008-merge-queue-squash-landing.md)）。`0007_supervisors.sql`は常駐supervisorの登録表`supervisors`を足した（schema version 7）。`0008_goals.sql`は`goals`、`tasks.goal_id` / `tasks.context`を足し、`run_events`を作り直してgoal単位のイベントを持てるようにした（schema version 8、[ADR-0009](../adr/0009-goal-groups-tasks.md)。ADRの「schema v6」は7がsupervisorsに使われたためv8と読み替える）。`0009_supervisor_mode.sql`は`supervisors`に`mode`と`workspace_id`を足した（schema version 9、[ADR-0011](../adr/0011-cmux-socket-password-and-in-cmux-fallback.md)）。`0012_queue_events.sql`は`run_events`を作り直し、`backend_call_failed`だけはtaskにもgoalにも紐づかない行を持てるようにした（schema version 12、task 109）。`0016_observer.sql`は`asks`と`run_events`を作り直し、observerの`blocked`のaskとその事象、observer自身の`observe_started` / `observe_finished`をtaskの無い行として持てるようにした（schema version 16、task 99）。`0017_stuck_exit_ask.sql`は`asks`を0016と同じ手順で作り直し、kindのCHECKに`stuck_exit`（supervisorが`/exit`のtimeoutで作るask。task 104）を足した（schema version 17）。`0018_task_paths.sql`は`tasks.paths`を足した（schema version 18、[ADR-0029](../adr/0029-task-declares-paths-and-verification-follows-the-kind-of-change.md)）。`0019_task_goal_dependencies.sql`は`task_goal_dependencies`を足した（schema version 19）。`0020_task_priority.sql`は`tasks.priority`を足した（schema version 20、[ADR-0040](../adr/0040-verify-once-review-run-env-graph-stats-and-task-priority-in-claim-order.md)の決定4）。`0021_proposals.sql`は`proposals`、`tasks.proposal_id` / `goals.proposal_id`とtaskのstatus `submitted`を足した（schema version 21、[ADR-0041](../adr/0041-on-demand-planners-proposals-submitted-and-plan-review-job.md)の決定7、8）。`0022_follow_up_triage.sql`は`task_leases`と`tasks.follow_up_depth`を足し、`asks`を0017と同じ手順で作り直してkindに`follow_up`を足した（schema version 22、[ADR-0037](../adr/0037-follow-up-triage-job-decides-follow-up-drafts.md)）。
 
 ```text
 tasks                -- 0020: priority（INTEGER、low=0 … interrupt=4、既定1、CHECK 0〜4）
@@ -50,7 +51,8 @@ goals                -- 0008: 複数taskが解く課題（title、description、
                      -- 0013: status（'draft' | 'open'、既定'open'）
                      -- 0021: proposal_id（所属するproposal、null可）
 session_workspaces   -- 0011: up が開いた常駐sessionのworkspace UUID（role主キー。supervisor / inbox / planner。退役したroleの行はupが消す）
-asks                 -- 0014（0016と0017で作り直し）: 人に答えを求める相談（kind、task / run、question、options、answer、asked_by、各時刻）
+asks                 -- 0014（0016、0017、0022で作り直し）: 人に答えを求める相談（kind、task / run、question、options、answer、asked_by、各時刻）
+task_leases          -- 0022: runを持たないtask（follow-up triageの途中のdraft）のlease（task_id主キー、supervisor_token、reason、heartbeat_at）
 ```
 
 `tasks.required_evidence`（0015、ADR-0019の決定5）はtaskがreceiptに要求するcheck名のJSON配列（`TEXT NOT NULL DEFAULT '[]'`）で、v14以前のtaskは移行後に`[]`（要求なし）になる。値は`add --evidence`が`tests` / `e2e` / `subagent_review`に限って書く。
@@ -64,6 +66,8 @@ asks                 -- 0014（0016と0017で作り直し）: 人に答えを求
 - `approve_proposal`（plan reviewの経路）: `proposal::accept`、memberの`submitted`のtaskを`TaskAction::Approve`で`ready`に、draftで閉じていないmemberのgoalを`goal::ready`で`open`にして`goal_status_changed`を記録する。`send_back_proposal`: `proposal::send_back`（`revising`、`revise_count`+1）、memberの`submitted`のtaskを`draft`に戻す。
 - `proposals(all)`はactive（`submitted` / `revising`）なもの（`all`なら全部）を`submitted_at, id`の順に、`show_proposal`は1件を、memberのtask / goal IDの昇順とともに返す。`status`は`proposals(false)`を`proposals`に載せる。
 - bypassの`ready`（`TaskAction::BypassReview`）は`transition_task`が`task_status_changed`に続けて`review_bypassed`（`from`）を書く。
+
+`tasks.follow_up_depth`（0022、ADR-0037の決定6）は人の判断を経ずに続いたfollow-upの段数（`INTEGER NOT NULL DEFAULT 0`）。domainの`Task`には載せず、storeの`follow_up_depth` / `set_follow_up_depth`が読み書きする。`integrate`の`register_follow_ups`はdraftに元のtaskの値+1を書き、`transition_task`は`TaskAction::BypassReview`（`ready --bypass-review`）で0に戻す（人の判断。adoptはその後にdraftの深さを書く）。migrationは既存のtaskを0にし、`follow_up_registered`の`task_id`が指すtaskのうちまだ`draft`のものを1にする。
 
 ## 集約の読み書き
 
@@ -93,6 +97,18 @@ note（ADR-0024の決定4）は表を作らず`run_events`のkind `observation`�
 - **open**は`answered_at`も`closed_at`もnullの行。部分UNIQUE index `asks_open (ifnull(task_id,0), ifnull(run_id,''), kind) WHERE answered_at IS NULL AND closed_at IS NULL`が（task、run、kind）ごとにopenなaskを1件に限る（taskの無い`blocked`はopenなもの1件にまとまる）。`ask`は同じトランザクションで既存のopenな行を探し、あればそれを返して何も書かない。
 - 登録（`SqliteQueue::ask`）は行と`ask_opened`イベントを、回答（`answer`）は`answer` / `answered_at`と`ask_answered`イベントを、それぞれ1トランザクションで書く。どちらのイベントもaskの`task_id` / `run_id`に結び付き（taskの無い`blocked`のaskではどちらも無い行になる）、payloadに`ask_id`を持つので、`watch`のcursor（run_eventsのid）に乗る。`worker_question`の回答をworkerのterminalに送ったsupervisorは、`ask_delivered`（`SqliteQueue::ask_delivered`）で`closed_at`と`ask_delivered`イベントを1トランザクションで書く（送信の失敗は`ask_delivery_failed`だけを書き、closeしない）。`close_ask`は回答済みのaskに`closed_at`だけを書き、イベントは書かない（未回答のaskはcloseできない。run_eventsでaskを終えるのは`ask_answered`だけで、`stats`はそれで未回答を判定する）。
 - 誰が動かすかは列から導出する（`Ask::waits_for`）: openなものも回答済みでcloseされていないものもinbox（ADR-0024の決定6。回答に従う操作は人がinboxから打つ）、closeされたものは誰も待たない。`status`のattentionとaskの一覧、`asks --role`はこれを読む（[supervisor-lifecycle](supervisor-lifecycle.md#ask--answer--asks)）。
+
+### follow-up triage（`follow_ups.rs`）
+
+ADR-0037は[ADR-0041](../adr/0041-on-demand-planners-proposals-submitted-and-plan-review-job.md)が丸ごと置き換えた（決定16: follow_upのdraftは1件ごとにruntimeが立てるplannerのproposalにする）。ここに書く実装（task 205）はADR-0041の指示どおり着地させ、goal 29のtaskで決定16に置き換える。
+
+follow_upのdraftの採否（[ADR-0037](../adr/0037-follow-up-triage-job-decides-follow-up-drafts.md)、[domain-model](domain-model.md#follow-up-triage)）は`src/infrastructure/follow_ups.rs`がport `FollowUpStore`として持つ。draftに紐づくイベントは`task_id`と`goal_id`を持ち`run_id`はnull。
+
+- **対象**（`follow_up_drafts`）: statusが`draft`で、`follow_up_registered`のpayloadの`task_id`がそのtaskを指し（`json_extract`。導入前のdraftも同じ条件で出る）、そのtaskに`follow_up_triage_finished`も`follow_up_triage_failed`も無いtaskをID昇順。人が`add`したdraftと、`task_id`がnullの（skippedの）登録は出ない。`keep_draft`・adopt・drop・askのどれでも`follow_up_triage_finished`が付くので、以後は出ない。
+- **開始**（`begin_follow_up_triage`）: `BEGIN IMMEDIATE`で対象であることを再検査し、draftに新鮮な`task_leases`の行があれば、または他のdraftの`reason: follow_up_triage`の新鮮な行が1件あれば（queue全体で同時1件）`Skipped`。staleな行（heartbeatが`HEARTBEAT_TIMEOUT_SECS`より古い）は置き換える。`follow_up_triage_started`が既に3件（`MAX_FOLLOW_UP_TRIAGE_ATTEMPTS`）なら起動せず`follow_up_triage_failed`（起動の上限）を書いて`Exhausted`。それ以外は行を作り、`lease_acquired`（`reason: follow_up_triage`、`previous_token`）と`follow_up_triage_started`（`attempt`）を書く。`heartbeat(token)`は`run_leases`と同じトランザクションで`task_leases`の同じtokenの行も更新する。
+- **verdictの適用**（`finish_follow_up_triage`）: `BEGIN IMMEDIATE`でtokenの新鮮なleaseを確かめ（失っていれば何も書かずに`None`）、draftが`draft`でなければ（job中に人が`ready` / cancelにした）lease行を消して`lease_released`だけを書き`closed`を返し、上書き規則を判定してから、adopt（`insert_task`で登録、依存、依存元の付け替え（`dependency_removed` / `dependency_added`の`by: follow_up_adopted`）、`transition_task`の`TaskAction::BypassReview`で`ready`（plan reviewを経ないので`review_bypassed`も書く。ADR-0041の後はgoal 29で置き換える）、深さ、draftのcancel、`follow_up_adopted`を2件）、drop（cancel）、ask（`insert_ask`で`follow_up`のaskと`ask_opened`）のどれかを行い（adoptの登録をstoreが拒否したとき、たとえばtask → goalの依存（ADR-0038）で循環するときはsavepointまで戻して提案の無いaskにする）、lease行を消して`lease_released`と`follow_up_triage_finished`（`attempt`、`verdict`、`reason`、`question`、`overridden`、`task`、`action`、`new_task_id`、`ask_id`、`depth`、`duration_secs`、`status`）を書く。すべて1トランザクション。inboxへの`cmux notify`はcommitの後にapplicationの`follow_up::finish`が`ask::notify`で送る。
+- **失敗**（`fail_follow_up_triage`）: 他のtokenの新鮮なleaseがあれば何も書かずに`false`。draftに`follow_up_triage_finished` / `failed`が既にあるか`draft`でなければ（verdictの適用後の通知のerrorなど）、自分のlease行だけを消して`false`（失敗は記録しない）。それ以外はlease行を消し（あれば`lease_released`）、`follow_up_triage_failed`（`attempt`、`error`、`duration_secs`、`status`）を書く。draftはそのまま。
+- **answerの適用**（`decide_follow_up`）: 1トランザクションでaskが`follow_up`で回答済み・未closeであること、draftに新鮮なleaseが無いことを確かめ、draftが`draft`ならanswer（`adopt` / `cancel` / `keep_draft`でaskのoptionsにあるもの。`adopt`は直近の`follow_up_triage_finished`の`task`を検査し直す）を適用し、askの`closed_at`と`follow_up_decided`（`ask_id`、`answer`、`action`、`new_task_id`、`status`）を書く。draftが`draft`でなければaskを閉じるだけ。適用できないanswerは何も書かない。`answer`は`follow_up`のaskの`ask_answered`に、このanswerを適用できるか（`runtime_delivers`。draftが既に`draft`でなければanswerによらず`true`で、supervisorが閉じる）を書く。
 
 ## Runtime ownership
 

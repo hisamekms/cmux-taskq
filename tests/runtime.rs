@@ -12374,3 +12374,124 @@ fn status_and_doctor_measure_to_the_injected_clock() {
     let doctor = one_shot.doctor(&db, false).unwrap();
     assert_eq!(doctor["checked_at"], 1_042, "{doctor}");
 }
+
+#[test]
+fn a_follow_up_verdict_that_asks_notifies_the_inbox_and_its_answer_is_the_runtimes() {
+    use dagq::{
+        application::{FollowUpJob, FollowUpStart, follow_up, integrate::register_follow_ups},
+        domain::{FollowUpDecision, FollowUpProposal, FollowUpVerdict},
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("queue.db");
+    let mut queue = SqliteQueue::init(&db).unwrap();
+    let source = queue
+        .add(NewTask {
+            title: "source".into(),
+            description: String::new(),
+            acceptance: "a".into(),
+            verification_commands: Vec::new(),
+            required_evidence: Vec::new(),
+            paths: Vec::new(),
+            dependencies: Vec::new(),
+            goal_dependencies: Vec::new(),
+            priority: Default::default(),
+            goal_id: None,
+            context: String::new(),
+        })
+        .unwrap();
+    queue
+        .transition(source.id(), TaskAction::BypassReview)
+        .unwrap();
+    let dagq::domain::ClaimOutcome::Claimed { run } = queue
+        .claim(&sha("0123456789abcdef0123456789abcdef01234567"))
+        .unwrap()
+    else {
+        panic!("nothing claimed");
+    };
+    // integrate registers the draft one follow-up deeper than its source.
+    queue.set_follow_up_depth(source.id(), 1).unwrap();
+    let registered = register_follow_ups(
+        &mut queue,
+        &source,
+        run.id(),
+        Some(&json!([{"title": "follow", "description": "d"}])),
+    );
+    let draft = registered[0].task_id;
+    assert_eq!(queue.follow_up_depth(draft).unwrap(), 2);
+    let FollowUpStart::Started { attempt, .. } = queue.begin_follow_up_triage(draft, "sv").unwrap()
+    else {
+        panic!("not started");
+    };
+    let backend = TestWorkspace::new(&db, false, "");
+    let verdict = FollowUpVerdict {
+        verdict: FollowUpDecision::Adopt,
+        reason: "small".into(),
+        task: Some(FollowUpProposal {
+            title: "complete".into(),
+            description: String::new(),
+            acceptance: "works".into(),
+            verification_commands: Vec::new(),
+            paths: Vec::new(),
+            evidence: Vec::new(),
+            depends_on: Vec::new(),
+            context: String::new(),
+        }),
+        question: String::new(),
+    };
+    let job = FollowUpJob {
+        attempt,
+        ..FollowUpJob::default()
+    };
+    let applied = follow_up::finish(
+        &mut queue,
+        dir.path(),
+        &backend,
+        draft,
+        "sv",
+        &job,
+        &verdict,
+    )
+    .unwrap()
+    .unwrap();
+    // A draft without a goal: the adopt waits for a person.
+    assert!(applied.overridden.unwrap().contains("closed"));
+    let ask = applied.ask.unwrap().ask;
+    assert_eq!(ask.kind, AskKind::FollowUp);
+    let notifications = backend.notifications.lock().unwrap().clone();
+    assert_eq!(notifications.len(), 1, "{notifications:?}");
+    assert!(
+        notifications[0].0.ends_with("follow_up"),
+        "{notifications:?}"
+    );
+    // The lease is gone: nothing more is applied.
+    assert!(
+        follow_up::finish(
+            &mut queue,
+            dir.path(),
+            &backend,
+            draft,
+            "sv",
+            &job,
+            &verdict
+        )
+        .unwrap()
+        .is_none()
+    );
+
+    queue.answer(ask.id, "adopt").unwrap();
+    let status = runtime::status_for(&db, Some(SessionRole::Inbox)).unwrap();
+    let attention = status["attention"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["ask_id"] == ask.id.as_i64())
+        .cloned()
+        .unwrap();
+    assert_eq!(
+        attention["next"],
+        format!("applying the answer of ask {} (runtime)", ask.id)
+    );
+    let applied = queue.decide_follow_up(ask.id).unwrap().unwrap();
+    assert_eq!(applied.new_task.unwrap().status(), TaskStatus::Ready);
+    assert_eq!(queue.follow_up_depth(applied.draft.id()).unwrap(), 2);
+}

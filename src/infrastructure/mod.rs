@@ -2,6 +2,7 @@ pub mod adapters;
 pub mod asks;
 pub mod claude;
 pub mod clock;
+pub mod follow_ups;
 pub mod launchd;
 pub mod location;
 pub mod process;

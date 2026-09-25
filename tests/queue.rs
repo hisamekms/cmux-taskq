@@ -1029,10 +1029,11 @@ fn migration_from_v6_adds_goals_and_keeps_tasks_runs_and_events() {
     // (queue-level backend failures), 0013 (goal draft), 0014 (asks) and
     // 0015 (required evidence), 0016 (observer events and task-less
     // blocked asks), 0017 (the stuck_exit ask), 0018 (task paths), 0019
-    // (goal dependencies), 0020 (task priority) and 0021 (proposals) are
+    // (goal dependencies), 0020 (task priority), 0021 (proposals) and 0022
+    // (follow-up triage: task leases, follow_up_depth, the follow_up ask) are
     // applied together.
-    assert_eq!(SqliteQueue::SCHEMA_VERSION, 21);
-    assert_eq!(queue.schema_version().unwrap(), 21);
+    assert_eq!(SqliteQueue::SCHEMA_VERSION, 22);
+    assert_eq!(queue.schema_version().unwrap(), 22);
     assert_eq!(
         queue
             .session_workspace(dagq::domain::SessionRole::Inbox)
@@ -2436,7 +2437,7 @@ fn migration_to_v21_keeps_drafts_and_the_task_id_sequence() {
     .unwrap();
     drop(raw);
     let mut queue = SqliteQueue::open(&path).unwrap();
-    assert_eq!(queue.schema_version().unwrap(), 21);
+    assert_eq!(queue.schema_version().unwrap(), 22);
     let kept = queue.show(TaskId::new(1)).unwrap().task;
     assert_eq!(kept.status(), TaskStatus::Draft);
     assert_eq!(

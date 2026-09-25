@@ -114,6 +114,10 @@ string_enum!(AskKind {
     // supervisor asks the inbox to clear what holds it and send `/exit`,
     // and closes the ask itself once the session exits.
     StuckExit => "stuck_exit",
+    // A follow-up triage that cannot decide a follow_up draft, or whose
+    // `adopt` the runtime overrode (ADR-0037 decision 5): it belongs to the
+    // draft and no run, and the supervisor applies its answer.
+    FollowUp => "follow_up",
 });
 
 // Where a proposal (ADR-0041 decision 7) stands: `submitted` waits for plan
@@ -343,6 +347,7 @@ impl std::str::FromStr for Priority {
 }
 
 mod error;
+pub mod follow_up;
 pub mod goal;
 pub mod ids;
 mod input;
@@ -357,6 +362,9 @@ mod views;
 
 pub use error::DomainError;
 use error::require;
+pub use follow_up::{
+    FOLLOW_UP_OPTIONS, FollowUpAction, FollowUpDecision, FollowUpProposal, FollowUpVerdict,
+};
 pub use goal::Goal;
 pub use ids::{AskId, CommitSha, EventId, GoalId, ProposalId, RunId, TaskId};
 pub use input::{GoalEdit, GoalRecord, NewGoal, NewTask, RunPlan, RunRecord, TaskEdit, TaskRecord};
@@ -948,13 +956,14 @@ pub fn event_attention(kind: &str, payload: &serde_json::Value) -> Option<Attent
                 _ => None,
             }
         }
-        // An answer the supervisor applies to the run itself: an
-        // `approve_landing` one, or a triage's `decide` one.
+        // An answer the supervisor applies itself: an `approve_landing` one,
+        // a triage's `decide` one, or a follow-up triage's `follow_up` one.
         ("ask_answered", _)
             if matches!(
                 payload.get("kind").and_then(serde_json::Value::as_str),
                 Some(kind) if kind == AskKind::ApproveLanding.as_str()
                     || kind == AskKind::Decide.as_str()
+                    || kind == AskKind::FollowUp.as_str()
             ) && payload.get("runtime_delivers") == Some(&serde_json::Value::Bool(true)) =>
         {
             None

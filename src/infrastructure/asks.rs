@@ -23,67 +23,9 @@ impl SqliteQueue {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let task_id = match (&ask.run_id, ask.task_id) {
-            (Some(run_id), _) => tx
-                .query_row("SELECT task_id FROM task_runs WHERE id=?1", [run_id], |r| {
-                    r.get::<_, TaskId>(0)
-                })
-                .optional()?
-                .with_context(|| format!("run {run_id} does not exist"))
-                .map(Some)?,
-            (None, Some(task_id)) => {
-                ensure!(
-                    tx.query_row("SELECT count(*) FROM tasks WHERE id=?1", [task_id], |r| r
-                        .get::<_, i64>(
-                        0
-                    ))? == 1,
-                    "task {task_id} does not exist"
-                );
-                Some(task_id)
-            }
-            // `validate` admits this for a blocked ask only.
-            (None, None) => None,
-        };
-        if let Some(existing) = tx
-            .query_row(
-                "SELECT * FROM asks WHERE ifnull(task_id,0)=ifnull(?1,0) AND ifnull(run_id,'')=ifnull(?2,'')
-                 AND kind=?3 AND answered_at IS NULL AND closed_at IS NULL",
-                params![task_id, ask.run_id, ask.kind.as_str()],
-                ask_row,
-            )
-            .optional()?
-        {
-            return Ok(AskOutcome {
-                ask: existing,
-                created: false,
-            });
-        }
-        tx.execute(
-            "INSERT INTO asks(kind,task_id,run_id,question,options,asked_by)
-             VALUES (?1,?2,?3,?4,?5,?6)",
-            params![
-                ask.kind.as_str(),
-                task_id,
-                ask.run_id,
-                ask.question,
-                serde_json::to_string(&ask.options)?,
-                ask.asked_by
-            ],
-        )?;
-        let id = AskId::new(tx.last_insert_rowid());
-        ask_event(
-            &tx,
-            task_id,
-            ask.run_id.as_ref(),
-            "ask_opened",
-            json!({"ask_id": id, "kind": ask.kind, "asked_by": ask.asked_by}),
-        )?;
-        let created = read_ask(&tx, id)?;
+        let outcome = insert_ask(&tx, &ask)?;
         tx.commit()?;
-        Ok(AskOutcome {
-            ask: created,
-            created: true,
-        })
+        Ok(outcome)
     }
 
     /// Write the answer of an open ask and record `ask_answered` (with the
@@ -142,6 +84,17 @@ impl SqliteQueue {
                     && TRIAGE_OPTIONS.contains(&text.trim())
                     && ask.options.iter().any(|option| option == text.trim())
             );
+        }
+        if ask.kind == AskKind::FollowUp {
+            // The supervisor adopts, cancels or keeps the draft as answered
+            // (ADR-0037 decision 7); any other answer, an `adopt` without a
+            // valid proposal, or one for a draft that moved on is a
+            // person's to read.
+            payload["runtime_delivers"] = json!(SqliteQueue::follow_up_answer_applies(
+                &tx,
+                &ask,
+                text.trim()
+            )?);
         }
         ask_event(
             &tx,
@@ -338,6 +291,71 @@ impl SqliteQueue {
     }
 }
 
+/// Register `ask` inside the caller's write transaction, or return the open
+/// one of the same task, run and kind unchanged (see [`SqliteQueue::ask`]).
+pub(super) fn insert_ask(tx: &Connection, ask: &NewAsk) -> Result<AskOutcome> {
+    let task_id = match (&ask.run_id, ask.task_id) {
+        (Some(run_id), _) => tx
+            .query_row("SELECT task_id FROM task_runs WHERE id=?1", [run_id], |r| {
+                r.get::<_, TaskId>(0)
+            })
+            .optional()?
+            .with_context(|| format!("run {run_id} does not exist"))
+            .map(Some)?,
+        (None, Some(task_id)) => {
+            ensure!(
+                tx.query_row("SELECT count(*) FROM tasks WHERE id=?1", [task_id], |r| r
+                    .get::<_, i64>(
+                    0
+                ))? == 1,
+                "task {task_id} does not exist"
+            );
+            Some(task_id)
+        }
+        // `validate` admits this for a blocked ask only.
+        (None, None) => None,
+    };
+    if let Some(existing) = tx
+            .query_row(
+                "SELECT * FROM asks WHERE ifnull(task_id,0)=ifnull(?1,0) AND ifnull(run_id,'')=ifnull(?2,'')
+                 AND kind=?3 AND answered_at IS NULL AND closed_at IS NULL",
+                params![task_id, ask.run_id, ask.kind.as_str()],
+                ask_row,
+            )
+            .optional()?
+        {
+            return Ok(AskOutcome {
+                ask: existing,
+                created: false,
+            });
+        }
+    tx.execute(
+        "INSERT INTO asks(kind,task_id,run_id,question,options,asked_by)
+             VALUES (?1,?2,?3,?4,?5,?6)",
+        params![
+            ask.kind.as_str(),
+            task_id,
+            ask.run_id,
+            ask.question,
+            serde_json::to_string(&ask.options)?,
+            ask.asked_by
+        ],
+    )?;
+    let id = AskId::new(tx.last_insert_rowid());
+    ask_event(
+        tx,
+        task_id,
+        ask.run_id.as_ref(),
+        "ask_opened",
+        json!({"ask_id": id, "kind": ask.kind, "asked_by": ask.asked_by}),
+    )?;
+    let created = read_ask(tx, id)?;
+    Ok(AskOutcome {
+        ask: created,
+        created: true,
+    })
+}
+
 /// An ask's event: on its task (and run), or, for a task-less `blocked`
 /// ask, on nothing.
 fn ask_event(
@@ -354,7 +372,7 @@ fn ask_event(
     Ok(())
 }
 
-fn read_ask(conn: &Connection, id: AskId) -> Result<Ask> {
+pub(super) fn read_ask(conn: &Connection, id: AskId) -> Result<Ask> {
     conn.query_row("SELECT * FROM asks WHERE id=?1", [id], ask_row)
         .optional()?
         .with_context(|| format!("ask {id} does not exist"))

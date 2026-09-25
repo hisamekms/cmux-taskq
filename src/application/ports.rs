@@ -15,12 +15,12 @@ use std::{
 
 use super::{GraphInput, TaskPage, TaskQuery, timestamp, unix_seconds};
 use crate::domain::{
-    Ask, AskId, AskKind, AskOutcome, ClaimOutcome, CommitSha, EventId, EvidenceCheck, Goal,
-    GoalDetail, GoalEdit, GoalId, GoalPredecessor, GoalSummary, GoalVerdict, NewAsk, NewGoal,
-    NewNote, NewTask, NotePage, NoteQuery, Predecessor, Priority, Proposal, ProposalId, Reason,
-    ReasonCode, RunEvent, RunId, RunLease, RunPlan, RunProcess, RunStatus, SessionRole, Submission,
-    SupervisorMode, SupervisorRegistration, Task, TaskAction, TaskDetail, TaskEdit, TaskId,
-    TaskRun,
+    Ask, AskId, AskKind, AskOutcome, ClaimOutcome, CommitSha, EventId, EvidenceCheck,
+    FollowUpAction, FollowUpVerdict, Goal, GoalDetail, GoalEdit, GoalId, GoalPredecessor,
+    GoalSummary, GoalVerdict, NewAsk, NewGoal, NewNote, NewTask, NotePage, NoteQuery, Predecessor,
+    Priority, Proposal, ProposalId, Reason, ReasonCode, RunEvent, RunId, RunLease, RunPlan,
+    RunProcess, RunStatus, SessionRole, Submission, SupervisorMode, SupervisorRegistration, Task,
+    TaskAction, TaskDetail, TaskEdit, TaskId, TaskRun,
 };
 
 pub trait TaskStore {
@@ -981,10 +981,86 @@ pub struct AskQuery {
     pub role: Option<SessionRole>,
 }
 
-/// The queue a use case works on: its tasks and goals, its runs and its asks.
-pub trait Queue: TaskStore + RunStore + AskStore {}
+/// How [`FollowUpStore::begin_follow_up_triage`] ended.
+#[derive(Debug, Clone)]
+pub enum FollowUpStart {
+    /// The draft is leased to the caller for its `attempt`-th job.
+    Started { draft: Box<Task>, attempt: usize },
+    /// The draft's job was started [`crate::domain::follow_up::MAX_FOLLOW_UP_TRIAGE_ATTEMPTS`]
+    /// times without a verdict: `follow_up_triage_failed` is recorded and
+    /// a person decides.
+    Exhausted { attempts: usize },
+    /// Not now: the draft moved on, another job holds a fresh lease, or the
+    /// queue's one follow-up triage slot is taken.
+    Skipped,
+}
 
-impl<T: TaskStore + RunStore + AskStore + ?Sized> Queue for T {}
+/// What the runtime did to a follow_up draft with a verdict or an answer.
+#[derive(Debug, Clone)]
+pub struct FollowUpApplied {
+    pub action: FollowUpAction,
+    /// The draft after it.
+    pub draft: Task,
+    /// The `ready` task that replaced it (`adopted`).
+    pub new_task: Option<Task>,
+    /// The `follow_up` ask opened (`asked`); `created: false` when an open
+    /// one already stood.
+    pub ask: Option<AskOutcome>,
+    /// Why the runtime turned an `adopt` into an ask.
+    pub overridden: Option<String>,
+}
+
+/// The job a follow-up triage verdict came from, for its events and ask.
+#[derive(Debug, Clone, Default)]
+pub struct FollowUpJob {
+    pub attempt: usize,
+    pub duration_secs: u64,
+    /// The prompt file the ask points a person to, when there is one.
+    pub prompt_path: Option<String>,
+}
+
+/// The follow_up drafts of `integrate` and their headless triage (ADR-0037):
+/// the drafts it decides, its task lease, and the verdicts and answers the
+/// runtime applies, each in one transaction.
+pub trait FollowUpStore {
+    /// `draft` tasks some `follow_up_registered` names, with neither
+    /// `follow_up_triage_finished` nor `follow_up_triage_failed`, by ID.
+    fn follow_up_drafts(&self) -> Result<Vec<Task>>;
+    /// Lease a draft to `token` for its job, re-checking it is a target.
+    fn begin_follow_up_triage(&mut self, draft: TaskId, token: &str) -> Result<FollowUpStart>;
+    /// Apply the verdict under the lease; `None` when the lease was lost.
+    fn finish_follow_up_triage(
+        &mut self,
+        draft: TaskId,
+        token: &str,
+        job: &FollowUpJob,
+        verdict: &FollowUpVerdict,
+    ) -> Result<Option<FollowUpApplied>>;
+    /// Record the job's failure and give the lease up; `false` when
+    /// another process holds the lease.
+    fn fail_follow_up_triage(
+        &mut self,
+        draft: TaskId,
+        token: &str,
+        job: &FollowUpJob,
+        error: &str,
+    ) -> Result<bool>;
+    /// Answered `follow_up` asks nobody closed, oldest first.
+    fn follow_up_answers(&self) -> Result<Vec<Ask>>;
+    /// Apply a person's answer to a `follow_up` ask and close it; `None`
+    /// when it is not one the runtime applies.
+    fn decide_follow_up(&mut self, ask_id: AskId) -> Result<Option<FollowUpApplied>>;
+    /// Whether the supervisor applies the answer the `follow_up` ask has.
+    fn applies_follow_up_answer(&self, ask: &Ask) -> Result<bool>;
+    /// The `follow_up_depth` of a task (ADR-0037 decision 6).
+    fn follow_up_depth(&self, task: TaskId) -> Result<i64>;
+    fn set_follow_up_depth(&mut self, task: TaskId, depth: i64) -> Result<()>;
+}
+
+/// The queue a use case works on: its tasks and goals, its runs and its asks.
+pub trait Queue: TaskStore + RunStore + AskStore + FollowUpStore {}
+
+impl<T: TaskStore + RunStore + AskStore + FollowUpStore + ?Sized> Queue for T {}
 
 /// The Git operations `integrate` and the supervisor use on the repository
 /// the queue is bound to and on its run worktrees. Commits are named by

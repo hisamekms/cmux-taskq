@@ -7,7 +7,7 @@ use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 
 use super::{Queue, WorkspaceBackend, naming::ask_notification_title};
-use crate::domain::{NewAsk, SessionRole};
+use crate::domain::{AskOutcome, NewAsk, SessionRole};
 
 /// Characters of an ask's question the notification keeps before `…`.
 const NOTIFY_QUESTION_CHARS: usize = 200;
@@ -24,7 +24,19 @@ pub fn ask(
     cmux: &dyn WorkspaceBackend,
 ) -> Result<Value> {
     let outcome = queue.ask(ask)?;
-    let mut value = serde_json::to_value(&outcome)?;
+    notify(queue, checkout, &outcome, cmux)
+}
+
+/// Notify the inbox of an ask registered elsewhere (the `follow_up` ask a
+/// verdict opens in its own transaction) as [`ask`] does: only a new one,
+/// and a failed notification is `notify_error` next to `notified: false`.
+pub fn notify(
+    queue: &mut dyn Queue,
+    checkout: &Path,
+    outcome: &AskOutcome,
+    cmux: &dyn WorkspaceBackend,
+) -> Result<Value> {
+    let mut value = serde_json::to_value(outcome)?;
     if !outcome.created {
         value["notified"] = json!(false);
         return Ok(value);
