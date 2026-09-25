@@ -313,7 +313,7 @@ pub struct PlannerProbes<'a> {
 }
 
 /// Judge `planner` the way a worker session is judged: its workspace UUID
-/// in `cmux workspace list`, its wrapper's pid and heartbeat, the idle
+/// in every window's `cmux workspace list`, its wrapper's pid and heartbeat, the idle
 /// marker its agent's `Stop` hook wrote and, with a marker, whether the
 /// screen shows the agent at work on a new turn. A closed planner is not
 /// looked at.
@@ -363,9 +363,8 @@ pub fn planner_view(probes: &PlannerProbes<'_>, planner: PlannerSession) -> Resu
 }
 
 /// Every planner not closed (with `all`, every planner), each judged by
-/// [`planner_view`]. Nothing is written: `cmux workspace list` shows only
-/// the caller's window, so a planner another window shows as `closed`
-/// here is not given up in the queue on that evidence.
+/// [`planner_view`]. Nothing is written: a planner that only looks
+/// `closed` here is not given up in the queue on that evidence.
 pub fn planner_views(
     queue: &dyn Queue,
     probes: &PlannerProbes<'_>,

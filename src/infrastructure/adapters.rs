@@ -1156,16 +1156,30 @@ impl WorkspaceListing for Cmux {
 }
 
 impl Cmux {
-    /// `cmux --json --id-format uuids workspace list`, decoded.
+    /// Every window's `cmux --json --id-format uuids workspace list`, merged
+    /// into one listing. Without `--window` cmux lists only the caller's
+    /// window, so a workspace a person moved to another window would look
+    /// closed and `up` would open a second one.
     fn workspace_listing(&self) -> Result<Value> {
-        let listing = output(Command::new(&self.executable).args([
+        let windows = output(Command::new(&self.executable).args([
             "--json",
             "--id-format",
             "uuids",
-            "workspace",
-            "list",
+            "list-windows",
         ]))?;
-        serde_json::from_str(&listing).context("decode cmux workspace list")
+        let windows: Value = serde_json::from_str(&windows).context("decode cmux list-windows")?;
+        merged_workspace_listing(&windows, |window| {
+            let listing = output(Command::new(&self.executable).args([
+                "--json",
+                "--id-format",
+                "uuids",
+                "workspace",
+                "list",
+                "--window",
+                window,
+            ]))?;
+            serde_json::from_str(&listing).context("decode cmux workspace list")
+        })
     }
 
     /// The detached ping with an explicit deadline. cmux admits a client by
@@ -1286,6 +1300,36 @@ pub fn workspace_create_arguments(name: &str, command: &str, tags: &WorkspaceTag
         "false".into(),
     ]);
     arguments
+}
+
+/// One `workspace list`-shaped listing of the workspaces of every window in
+/// a `cmux --json --id-format uuids list-windows` reply, `list` giving each
+/// window's listing by its UUID. A window that cannot be listed fails the
+/// whole listing: a workspace missed there would look closed.
+pub fn merged_workspace_listing(
+    windows: &Value,
+    mut list: impl FnMut(&str) -> Result<Value>,
+) -> Result<Value> {
+    let mut workspaces = Vec::new();
+    for window in windows
+        .as_array()
+        .context("cmux list-windows is not a list")?
+    {
+        let id = window
+            .get("id")
+            .and_then(Value::as_str)
+            .context("cmux listed a window without an ID")?;
+        let listing = list(id).with_context(|| format!("list the workspaces of window {id}"))?;
+        workspaces.extend(
+            listing
+                .get("workspaces")
+                .and_then(Value::as_array)
+                .with_context(|| format!("cmux workspace list of window {id} has no workspaces"))?
+                .iter()
+                .cloned(),
+        );
+    }
+    Ok(serde_json::json!({ "workspaces": workspaces }))
 }
 
 /// Whether a `cmux --json --id-format uuids workspace list` reply lists the
@@ -1935,7 +1979,7 @@ mod tests {
     }
 
     /// `ensure_group` asks for the group by its external ID and `exists`
-    /// reads the UUID listing, both through the real argv.
+    /// reads the UUID listing of every window, both through the real argv.
     #[cfg(unix)]
     #[test]
     fn ensure_group_and_exists_call_cmux() {
@@ -1950,7 +1994,13 @@ mod tests {
 printf '%s ' "$@" >> '{log}'; printf '\n' >> '{log}'
 case "$4" in
   workspace-group) echo '{{"created":true,"group":{{"id":"G-1"}}}}' ;;
-  workspace) echo '{{"workspaces":[{{"id":"W-1"}}]}}' ;;
+  list-windows) echo '[{{"id":"A"}},{{"id":"B"}}]' ;;
+  workspace)
+    case "$7" in
+      A) echo '{{"window_id":"A","workspaces":[{{"id":"W-0"}}]}}' ;;
+      B) echo '{{"window_id":"B","workspaces":[{{"id":"W-1"}}]}}' ;;
+      *) echo 'Error: unavailable: TabManager not available' >&2; exit 1 ;;
+    esac ;;
 esac
 "#,
                 log = log.display()
@@ -1960,8 +2010,10 @@ esac
         fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
         let cmux = Cmux { executable };
         assert_eq!(cmux.ensure_group("abc", "[dagq]").unwrap(), "G-1");
-        assert!(cmux.exists("w-1").unwrap());
+        assert!(cmux.exists("W-0").unwrap());
+        assert!(cmux.exists("w-1").unwrap(), "a workspace of another window");
         assert!(!cmux.exists("W-2").unwrap());
+        assert_eq!(cmux.list_workspaces().unwrap().len(), 2);
         let calls = fs::read_to_string(&log).unwrap();
         assert!(
             calls.contains(
@@ -1969,7 +2021,38 @@ esac
             ),
             "{calls}"
         );
-        assert!(calls.contains("--json --id-format uuids workspace list"));
+        assert!(calls.contains("--json --id-format uuids list-windows"));
+        assert!(calls.contains("--json --id-format uuids workspace list --window A"));
+        assert!(calls.contains("--json --id-format uuids workspace list --window B"));
+    }
+
+    /// The windows' listings are concatenated; a window that cannot be
+    /// listed, or a reply of the wrong shape, fails the whole listing.
+    #[test]
+    fn merged_workspace_listing_joins_every_window() {
+        let windows = serde_json::json!([{"id": "A"}, {"id": "B"}]);
+        let merged = merged_workspace_listing(&windows, |window| {
+            Ok(serde_json::json!({"window_id": window, "workspaces": [{"id": format!("{window}-1")}]}))
+        })
+        .unwrap();
+        assert_eq!(
+            merged,
+            serde_json::json!({"workspaces": [{"id": "A-1"}, {"id": "B-1"}]})
+        );
+        assert!(workspace_listed(&merged, "b-1"));
+        assert_eq!(
+            merged_workspace_listing(&serde_json::json!([]), |_| unreachable!()).unwrap(),
+            serde_json::json!({"workspaces": []})
+        );
+        let error = merged_workspace_listing(&windows, |window| {
+            ensure!(window == "A", "TabManager not available");
+            Ok(serde_json::json!({"workspaces": []}))
+        })
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("window B"), "{error:#}");
+        assert!(merged_workspace_listing(&serde_json::json!({}), |_| unreachable!()).is_err());
+        assert!(merged_workspace_listing(&serde_json::json!([{}]), |_| unreachable!()).is_err());
+        assert!(merged_workspace_listing(&windows, |_| Ok(serde_json::json!({}))).is_err());
     }
 
     /// `create` passes the run's name and its tags (description, env,
