@@ -26,7 +26,7 @@ Read this when a field of `status`, `watch` or `show` is unclear.
   - `read the answer of ask <id> and close it`: an answered ask nobody closed and the runtime does not apply (`kind` `ask_answered`, `status` `answered`); the person's answer is carried out through the inbox. It disappears after `ask close <id>`.
   - `delivering the answer of ask <id> (runtime)`: an answered `worker_question` of a `running` run; the supervisor types the answer into the worker's terminal once the worker is idle after asking, closes the ask and records `ask_delivered`. Nothing to do; its `ask_answered` is not a `watch` event.
   - `send the answer of ask <id> to the worker and close it`: an answered `worker_question` the supervisor could not type (`kind` `ask_delivery_failed`, tried once), or whose run is no longer `running`. Handle it as the `dagq-recover` skill's `reference/session.md` says.
-- `status --role <inbox|planner>` keeps only the attention for that role: all of it is the inbox's (ADR-0024 decision 6), none the planner's.
+- `status --role <inbox|planner>` keeps only the attention for that role: all of it is the inbox's (ADR-0041 decision 17), none the planner's.
 - `asks`: the open asks, each with `id`, `kind`, `question` (first 200 characters, `…` when cut), `task_id`, `run_id`, `asked_by` and `age_secs`.
 - `cursor`: the newest event id.
 

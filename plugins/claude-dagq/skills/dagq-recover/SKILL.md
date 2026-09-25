@@ -5,9 +5,9 @@ description: What a person does by hand in a dagq queue, from the inbox or plann
 
 # dagq: what a person does by hand
 
-Prerequisite: resolve the launcher as in the `dagq` skill (`DAGQ="${CLAUDE_PLUGIN_ROOT}/bin/dagq"`). Never touch the queue database directly; the binary refuses unsafe recoveries itself, so do not work around it. Everything here is done from the inbox or planner session, when the person says so (ADR-0024 decision 6).
+Prerequisite: resolve the launcher as in the `dagq` skill (`DAGQ="${CLAUDE_PLUGIN_ROOT}/bin/dagq"`). Never touch the queue database directly; the binary refuses unsafe recoveries itself, so do not work around it. Everything here is done from the inbox or planner session, when the person says so (ADR-0041 decision 6).
 
-The supervisor does most of the work itself (ADR-0024 decision 3). A run without a lease whose session processes are all gone is recovered by the next supervisor pass (`run_recovered` with `by: supervisor`); every `failed` or `interrupted` run goes to its headless triage (`next: triaging (runtime)`), which readies the task, resumes the run or opens a `decide` ask, then closes the run's workspace; a `needs_session` run is resumed (`resuming (runtime)`) and, after three resumes, handed to the person as a `decide` ask (`retry` / `cancel`). Do not recover, `ready` or close anything for such a run. `status` is authoritative over what a `watch` reported.
+The supervisor does most of the work itself (ADR-0041 decision 3). A run without a lease whose session processes are all gone is recovered by the next supervisor pass (`run_recovered` with `by: supervisor`); every `failed` or `interrupted` run goes to its headless triage (`next: triaging (runtime)`), which readies the task, resumes the run or opens a `decide` ask, then closes the run's workspace; a `needs_session` run is resumed (`resuming (runtime)`) and, after three resumes, handed to the person as a `decide` ask (`retry` / `cancel`). Do not recover, `ready` or close anything for such a run. `status` is authoritative over what a `watch` reported.
 
 ## 1. Diagnose without changing state
 

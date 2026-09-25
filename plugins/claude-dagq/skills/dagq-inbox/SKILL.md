@@ -7,7 +7,7 @@ description: Be a dagq queue's inbox: start from status --role inbox, wait for i
 
 Prerequisite: `DAGQ="${CLAUDE_PLUGIN_ROOT}/bin/dagq"` resolved as in the `dagq` skill (`"$DAGQ" --resolve`). Never open or edit the queue database; go through the CLI only.
 
-Roles (ADR-0024): the **supervisor** (`dagq supervise`) claims, runs, validates, reviews, resumes, triages and lands runs; a **worker** is one run's Claude session; the **planner** registers goals and tasks with the person (`dagq-planner`); the **observer** is the supervisor's periodic job. This session, the **inbox**, is where everything that waits for the person reaches them: an **ask** (a question a worker, the supervisor, a job or the observer registered and then moved on from) and every other **attention**. `dagq ask` also sends one `cmux notify` to this workspace.
+Roles (ADR-0041 decision 1): the **supervisor** (`dagq supervise`) claims, runs, validates, reviews, resumes, triages and lands runs; a **worker** is one run's Claude session; the **planner** registers goals and tasks with the person (`dagq-planner`); the **observer** is the supervisor's periodic job. This session, the **inbox**, is where everything that waits for the person reaches them: an **ask** (a question a worker, the supervisor, a job or the observer registered and then moved on from) and every other **attention**. `dagq ask` also sends one `cmux notify` to this workspace.
 
 This session holds no state of its own. After a restart, compaction or `/clear`, start again from step 1 (the plugin's SessionStart hook prints `status --role inbox` after compaction and `/clear`).
 
