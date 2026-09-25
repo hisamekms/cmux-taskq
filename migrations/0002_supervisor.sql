@@ -1,3 +1,4 @@
+-- dagq-schema: breaking
 ALTER TABLE task_runs ADD COLUMN repo_path TEXT;
 ALTER TABLE task_runs ADD COLUMN run_dir TEXT;
 ALTER TABLE task_runs ADD COLUMN supervisor_token TEXT;

@@ -1,3 +1,4 @@
+-- dagq-schema: breaking
 -- Planner sessions (ADR-0041 decisions 1, 6, 12, 13). A planner is an
 -- on-demand cmux workspace, never a resident one: a person opens as many as
 -- they like with `dagq plan`, and the runtime opens one for a proposal it

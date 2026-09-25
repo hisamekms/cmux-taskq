@@ -25,35 +25,15 @@ use crate::{
         TaskEdit, TaskId, TaskRecord, TaskRun, TaskStatus, TaskStatusCounts, goal,
         scope::validate_path_globs, task,
     },
-    infrastructure::{clock, location::runs_dir, proposals},
+    infrastructure::{
+        clock,
+        location::runs_dir,
+        proposals,
+        schema::{self, BINARY_SCHEMA, MIGRATIONS},
+    },
 };
 
 const APPLICATION_ID: i64 = 0x43545131;
-pub(super) const MIGRATIONS: &[&str] = &[
-    include_str!("../../migrations/0001_queue.sql"),
-    include_str!("../../migrations/0002_supervisor.sql"),
-    include_str!("../../migrations/0003_workspace_close.sql"),
-    include_str!("../../migrations/0004_integration.sql"),
-    include_str!("../../migrations/0005_run_leases.sql"),
-    include_str!("../../migrations/0006_merge_queue.sql"),
-    include_str!("../../migrations/0007_supervisors.sql"),
-    include_str!("../../migrations/0008_goals.sql"),
-    include_str!("../../migrations/0009_supervisor_mode.sql"),
-    include_str!("../../migrations/0010_supervisor_binary_version.sql"),
-    include_str!("../../migrations/0011_session_workspaces.sql"),
-    include_str!("../../migrations/0012_queue_events.sql"),
-    include_str!("../../migrations/0013_goal_draft.sql"),
-    include_str!("../../migrations/0014_asks.sql"),
-    include_str!("../../migrations/0015_task_required_evidence.sql"),
-    include_str!("../../migrations/0016_observer.sql"),
-    include_str!("../../migrations/0017_stuck_exit_ask.sql"),
-    include_str!("../../migrations/0018_task_paths.sql"),
-    include_str!("../../migrations/0019_task_goal_dependencies.sql"),
-    include_str!("../../migrations/0020_task_priority.sql"),
-    include_str!("../../migrations/0021_proposals.sql"),
-    include_str!("../../migrations/0022_follow_up_triage.sql"),
-    include_str!("../../migrations/0023_planners.sql"),
-];
 /// Ready tasks whose predecessors are completed, whose goal dependencies
 /// are all closed as achieved (ADR-0038), that own no unfinished run and
 /// whose goal, if any, is not a draft (ADR-0024 decision 5).
@@ -94,20 +74,113 @@ pub struct SqliteQueue {
 
 impl SqliteQueue {
     /// `user_version` a fully migrated queue reports.
-    pub const SCHEMA_VERSION: i64 = MIGRATIONS.len() as i64;
+    pub const SCHEMA_VERSION: i64 = BINARY_SCHEMA;
 
-    /// Explicit initialization is the only operation that creates a database file.
+    /// Explicit initialization is the only operation that creates a database
+    /// file, and the only one besides [`SqliteQueue::migrate`] that applies
+    /// migrations: an empty file becomes a queue at the latest schema. An
+    /// existing queue is checked as [`SqliteQueue::open`] checks it, never
+    /// migrated (ADR-0045 decision 5).
     pub fn init(path: impl AsRef<Path>) -> Result<Self> {
         let mut queue = Self::connect(path.as_ref(), true)?;
-        queue.migrate(true)?;
+        if queue.state()?.is_none() {
+            queue.apply(0, None)?;
+        }
+        queue
+            .state()?
+            .context("queue is not initialized; use init first")?
+            .check_opens()?;
         queue.conn.pragma_update(None, "journal_mode", "WAL")?;
         Ok(queue)
     }
 
+    /// Opens an initialized queue without changing its schema. A queue older
+    /// than this binary is refused with a pointer to `dagq migrate`; a newer
+    /// one is accepted while its floor is at most this binary's schema, and
+    /// this binary then leaves the tables and columns it does not know alone
+    /// (ADR-0045 decisions 5, 7).
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        let mut queue = Self::connect(path.as_ref(), false)?;
-        queue.migrate(false)?;
+        let queue = Self::connect(path.as_ref(), false)?;
+        queue
+            .state()?
+            .context("queue is not initialized; use init first")?
+            .check_opens()?;
         Ok(queue)
+    }
+
+    /// The schema of the queue at `path` as this binary sees it, without
+    /// changing it.
+    pub fn schema(path: impl AsRef<Path>) -> Result<SchemaState> {
+        let queue = Self::connect(path.as_ref(), false)?;
+        let state = queue
+            .state()?
+            .context("queue is not initialized; use init first")?;
+        Ok(state.report())
+    }
+
+    /// `dagq migrate`: applies the migrations this binary knows and the
+    /// queue lacks, with `user_version` and the floor in one transaction.
+    /// Before a breaking migration it refuses a queue in use — a
+    /// registration of a live supervisor, an unfinished run, a live wrapper
+    /// (liveness per `alive`; `None` skips the check, for tests and tools
+    /// that know the queue is idle) — because their binaries could not open
+    /// the queue afterwards, and copies the database to `backups/` next to
+    /// it (ADR-0045 decisions 8, 9). `now` (UNIX seconds) names the copy.
+    pub fn migrate(
+        path: impl AsRef<Path>,
+        alive: Option<&dyn Fn(u32) -> bool>,
+        now: i64,
+    ) -> Result<MigrationReport> {
+        let path = path.as_ref();
+        let mut queue = Self::connect(path, false)?;
+        let state = queue
+            .state()?
+            .context("queue is not initialized; use init first")?;
+        state.check_floor()?;
+        let pending = pending_migrations(state.version);
+        let breaking = pending.iter().any(|m| !m.compatible);
+        let mut backup = None;
+        if breaking {
+            if let Some(alive) = alive {
+                ensure_idle(&queue.conn, alive, &pending)?;
+            }
+            let dir = path
+                .canonicalize()
+                .unwrap_or_else(|_| path.to_path_buf())
+                .with_file_name("backups");
+            std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
+            // A rerun within the same second keeps the earlier copy.
+            let copy = (0..)
+                .map(|n| {
+                    let suffix = if n == 0 {
+                        String::new()
+                    } else {
+                        format!("-{n}")
+                    };
+                    dir.join(format!("queue-{}-{now}{suffix}.sqlite3", state.version))
+                })
+                .find(|copy| !copy.exists())
+                .expect("an unused backup name");
+            queue
+                .conn
+                .execute("VACUUM INTO ?1", [path_text(&copy)?])
+                .with_context(|| format!("back up the queue to {}", copy.display()))?;
+            backup = Some(copy);
+        }
+        if !pending.is_empty() {
+            queue.apply(state.version, alive.filter(|_| breaking))?;
+        }
+        let after = queue
+            .state()?
+            .context("queue is not initialized; use init first")?;
+        Ok(MigrationReport {
+            previous_version: state.version,
+            schema_version: after.version,
+            binary_schema_version: BINARY_SCHEMA,
+            floor: after.floor,
+            applied: pending,
+            backup,
+        })
     }
 
     /// The queue reading the time and creating IDs through `generators`
@@ -146,46 +219,80 @@ impl SqliteQueue {
         })
     }
 
-    fn migrate(&mut self, allow_initialize: bool) -> Result<()> {
-        // Table rebuilds drop and rename tables that other rows reference, so
-        // enforcement is off during migration (a no-op inside a transaction)
-        // and integrity is checked explicitly before commit.
-        self.conn.pragma_update(None, "foreign_keys", false)?;
-        let result = self.apply_migrations(allow_initialize);
-        self.conn.pragma_update(None, "foreign_keys", true)?;
-        result
-    }
-
-    fn apply_migrations(&mut self, allow_initialize: bool) -> Result<()> {
-        let tx = self
+    /// The queue's `user_version` and floor; `None` for an empty file that
+    /// `init` may turn into a queue. Another application's database, or a
+    /// file with tables but no dagq header, is an error.
+    fn state(&self) -> Result<Option<QueueSchema>> {
+        let app: i64 = self
             .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let app: i64 = tx.pragma_query_value(None, "application_id", |r| r.get(0))?;
-        let version: i64 = tx.pragma_query_value(None, "user_version", |r| r.get(0))?;
-        ensure!(
-            version >= 0 && version <= MIGRATIONS.len() as i64,
-            "unsupported queue schema version {version}; this binary supports {}",
-            MIGRATIONS.len()
-        );
-        if version == 0 && app == 0 {
-            ensure!(allow_initialize, "queue is not initialized; use init first");
-            let objects: i64 = tx.query_row(
+            .pragma_query_value(None, "application_id", |r| r.get(0))?;
+        let version: i64 = self
+            .conn
+            .pragma_query_value(None, "user_version", |r| r.get(0))?;
+        if app == 0 && version == 0 {
+            let objects: i64 = self.conn.query_row(
                 "SELECT count(*) FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'",
                 [],
                 |r| r.get(0),
             )?;
             ensure!(objects == 0, "database is not an empty dagq queue");
+            return Ok(None);
+        }
+        ensure!(app == APPLICATION_ID, "database is not a dagq queue");
+        ensure!(version >= 1, "unsupported queue schema version {version}");
+        // Read before judging user_version: the floor, not the version,
+        // decides whether this binary may use a newer queue.
+        let floor = if has_table(&self.conn, "schema_floor")? {
+            self.conn
+                .query_row("SELECT floor FROM schema_floor", [], |r| r.get(0))
+                .optional()?
+                .unwrap_or(version)
         } else {
-            ensure!(app == APPLICATION_ID, "database is not a dagq queue");
+            version
+        };
+        Ok(Some(QueueSchema { version, floor }))
+    }
+
+    fn apply(&mut self, from: i64, alive: Option<&dyn Fn(u32) -> bool>) -> Result<()> {
+        // Table rebuilds drop and rename tables that other rows reference, so
+        // enforcement is off during migration (a no-op inside a transaction)
+        // and integrity is checked explicitly before commit.
+        self.conn.pragma_update(None, "foreign_keys", false)?;
+        let result = self.apply_migrations(from, alive);
+        self.conn.pragma_update(None, "foreign_keys", true)?;
+        result
+    }
+
+    fn apply_migrations(&mut self, from: i64, alive: Option<&dyn Fn(u32) -> bool>) -> Result<()> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let version: i64 = tx.pragma_query_value(None, "user_version", |r| r.get(0))?;
+        if from == 0 && version != 0 {
+            // Another `init` created the queue first; the caller checks it.
+            return Ok(());
+        }
+        ensure!(
+            version == from,
+            "queue schema changed from {from} to {version} while migrating; run migrate again"
+        );
+        let pending = pending_migrations(version);
+        // Checked again under the write lock: a claim may have slipped in
+        // since the first look.
+        if let Some(alive) = alive {
+            ensure_idle(&tx, alive, &pending)?;
         }
         for (index, migration) in MIGRATIONS.iter().enumerate().skip(version as usize) {
             tx.execute_batch(migration)
-                .context("apply queue migration")?;
+                .with_context(|| format!("apply queue migration {}", index + 1))?;
             tx.pragma_update(None, "user_version", (index + 1) as i64)?;
         }
-        if app != APPLICATION_ID {
-            tx.pragma_update(None, "application_id", APPLICATION_ID)?;
-        }
+        tx.execute(
+            "INSERT INTO schema_floor(singleton, floor) VALUES (1, ?1)
+             ON CONFLICT(singleton) DO UPDATE SET floor = excluded.floor",
+            [schema::floor_for(BINARY_SCHEMA)],
+        )?;
+        tx.pragma_update(None, "application_id", APPLICATION_ID)?;
         let violations: i64 =
             tx.query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |r| {
                 r.get(0)
@@ -197,6 +304,170 @@ impl SqliteQueue {
         tx.commit()?;
         Ok(())
     }
+}
+
+/// A queue's schema as its header and floor table record it.
+struct QueueSchema {
+    version: i64,
+    floor: i64,
+}
+
+impl QueueSchema {
+    /// Refuses a queue that refuses binaries of this binary's schema.
+    fn check_floor(&self) -> Result<()> {
+        ensure!(
+            self.floor <= BINARY_SCHEMA,
+            "unsupported queue schema version {}: the queue refuses binaries older than schema {} \
+             and this binary knows schema {BINARY_SCHEMA}; install a newer dagq",
+            self.version,
+            self.floor
+        );
+        Ok(())
+    }
+
+    /// Whether this binary may use the queue as it is.
+    fn check_opens(&self) -> Result<()> {
+        self.check_floor()?;
+        ensure!(
+            self.version >= BINARY_SCHEMA,
+            "queue schema version {} is older than this binary's schema {BINARY_SCHEMA}; \
+             run `dagq migrate` to apply the {} pending migration(s)",
+            self.version,
+            BINARY_SCHEMA - self.version
+        );
+        Ok(())
+    }
+
+    fn report(&self) -> SchemaState {
+        SchemaState {
+            schema_version: self.version,
+            binary_schema_version: BINARY_SCHEMA,
+            floor: self.floor,
+            pending: pending_migrations(self.version),
+            opens: self.check_opens().is_ok(),
+        }
+    }
+}
+
+/// A queue's schema as `migrate --check` reports it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct SchemaState {
+    pub schema_version: i64,
+    /// The schema this binary knows.
+    pub binary_schema_version: i64,
+    /// Binaries knowing an older schema than this are refused.
+    pub floor: i64,
+    /// What `migrate` would apply.
+    pub pending: Vec<SchemaMigration>,
+    /// Whether this binary's other commands open the queue as it is.
+    pub opens: bool,
+}
+
+/// One migration of this binary and its declaration.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct SchemaMigration {
+    pub version: i64,
+    pub compatible: bool,
+}
+
+/// What `migrate` did.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct MigrationReport {
+    pub previous_version: i64,
+    pub schema_version: i64,
+    pub binary_schema_version: i64,
+    pub floor: i64,
+    pub applied: Vec<SchemaMigration>,
+    /// The copy taken before a breaking migration.
+    pub backup: Option<PathBuf>,
+}
+
+/// The migrations this binary knows beyond `version`.
+fn pending_migrations(version: i64) -> Vec<SchemaMigration> {
+    MIGRATIONS
+        .iter()
+        .enumerate()
+        .skip(usize::try_from(version).unwrap_or(0))
+        .map(|(index, migration)| SchemaMigration {
+            version: index as i64 + 1,
+            compatible: schema::is_compatible(migration),
+        })
+        .collect()
+}
+
+fn has_table(conn: &Connection, name: &str) -> Result<bool> {
+    Ok(conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1",
+            [name],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some())
+}
+
+/// Refuses a breaking migration while anything that runs an older binary
+/// uses the queue: a registered supervisor whose PID is alive, an unfinished
+/// run, a wrapper whose PID is alive (ADR-0045 decision 8). Reads only what
+/// every schema since the tables were added has, so it runs on the old schema.
+fn ensure_idle(
+    conn: &Connection,
+    alive: &dyn Fn(u32) -> bool,
+    pending: &[SchemaMigration],
+) -> Result<()> {
+    let mut users = Vec::new();
+    if has_table(conn, "supervisors")? {
+        let mut rows = conn.prepare("SELECT token, pid FROM supervisors ORDER BY token")?;
+        for row in rows.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))? {
+            let (token, pid) = row?;
+            if u32::try_from(pid).is_ok_and(alive) {
+                users.push(format!("supervisor {token} (pid {pid})"));
+            }
+        }
+    }
+    if has_table(conn, "task_runs")? {
+        let mut rows = conn.prepare(
+            "SELECT id, status FROM task_runs
+             WHERE status IN ('claimed','starting','running','validating','integrating')
+             ORDER BY rowid",
+        )?;
+        for row in rows.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))? {
+            let (id, status) = row?;
+            users.push(format!("run {id} ({status})"));
+        }
+    }
+    if has_table(conn, "run_processes")? {
+        let mut rows = conn.prepare(
+            "SELECT run_id, pid FROM run_processes
+             WHERE role='wrapper' AND exited_at IS NULL ORDER BY run_id",
+        )?;
+        for row in rows.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))? {
+            let (run, pid) = row?;
+            if u32::try_from(pid).is_ok_and(alive) {
+                users.push(format!("wrapper of run {run} (pid {pid})"));
+            }
+        }
+    }
+    if users.is_empty() {
+        return Ok(());
+    }
+    let breaking: Vec<String> = pending
+        .iter()
+        .filter(|m| !m.compatible)
+        .map(|m| m.version.to_string())
+        .collect();
+    anyhow::bail!(
+        "migrate refuses breaking migration(s) {} while the queue is in use by {}: their binaries \
+         could not open the queue afterwards; stop the supervisor with `down --wait`, let the \
+         runs finish or `recover` them, then migrate again",
+        breaking.join(", "),
+        users.join(", ")
+    )
+}
+
+fn path_text(path: &Path) -> Result<&str> {
+    path.to_str()
+        .with_context(|| format!("path is not UTF-8: {}", path.display()))
 }
 
 impl TaskStore for SqliteQueue {

@@ -1,3 +1,4 @@
+-- dagq-schema: breaking
 -- How the supervisor behind a registration was started, recorded by `up`
 -- once the process has registered itself (ADR-0011): `launchd` for the
 -- LaunchAgent that launchd keeps resident, `in_cmux` for the fallback that

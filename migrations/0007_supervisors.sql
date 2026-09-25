@@ -1,3 +1,4 @@
+-- dagq-schema: breaking
 -- Resident supervisor registration. A `supervise` process registers itself
 -- when it starts, refreshes the row together with its run leases on every
 -- heartbeat, and deletes it on a graceful exit. A row whose pid is dead or

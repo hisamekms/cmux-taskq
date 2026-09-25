@@ -1,3 +1,4 @@
+-- dagq-schema: breaking
 -- Goal dependencies (ADR-0038): a task waits for a goal to be closed as
 -- achieved, not only for predecessor tasks to complete. The edges live
 -- beside task_dependencies, which this migration leaves untouched; a task

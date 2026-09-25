@@ -1,3 +1,4 @@
+-- dagq-schema: breaking
 -- The supervisor raises a session that did not answer `/exit` within the
 -- exit timeout (`exit_request_timed_out`) as a `stuck_exit` ask to the inbox,
 -- the only way the runtime tells a person (ADR-0022 decision 5), and closes

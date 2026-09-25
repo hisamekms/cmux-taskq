@@ -1,3 +1,4 @@
+-- dagq-schema: breaking
 -- Draft goals (ADR-0024 decision 5): a goal is `draft` or `open`. The tasks
 -- of a draft goal are not candidates, so the supervisor does not claim them
 -- until `goal ready` opens the goal. Existing goals are open. Closing stays

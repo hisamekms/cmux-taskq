@@ -445,7 +445,7 @@ impl SqliteQueue {
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         tx.execute(
-            "INSERT OR IGNORE INTO queue_repository VALUES (1,?1)",
+            "INSERT OR IGNORE INTO queue_repository(singleton, git_common_dir) VALUES (1,?1)",
             [common_dir],
         )?;
         let bound: String = tx.query_row(
@@ -476,7 +476,7 @@ impl SqliteQueue {
             )
             .optional()?;
         tx.execute(
-            "INSERT INTO queue_repository VALUES (1,?1)
+            "INSERT INTO queue_repository(singleton, git_common_dir) VALUES (1,?1)
              ON CONFLICT(singleton) DO UPDATE SET git_common_dir=excluded.git_common_dir",
             [common_dir],
         )?;

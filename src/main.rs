@@ -40,8 +40,16 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Initialize or migrate the queue, creating its directory if needed.
+    /// Initialize the queue, creating its directory if needed. An existing queue is checked, never migrated.
     Init,
+    /// Apply the migrations this binary knows and the queue lacks; opening a queue never does (ADR-0045).
+    /// A breaking migration is refused while a supervisor, run or wrapper uses the queue, and the
+    /// database is copied to `backups/` first.
+    Migrate {
+        /// Report the schema and what would be applied, without changing anything.
+        #[arg(long)]
+        check: bool,
+    },
     /// Show which queue this directory resolves to, without opening it.
     Locate,
     /// Register a draft task; verification commands are stored, not executed.
@@ -783,6 +791,19 @@ fn execute(cli: Cli) -> Result<Value> {
             "git_common_dir": common_dir,
         }));
     }
+    if let Command::Migrate { check } = cli.command {
+        if check {
+            return Ok(serde_json::to_value(SqliteQueue::schema(&db)?)?);
+        }
+        let report = SqliteQueue::migrate(
+            &db,
+            Some(&dagq::infrastructure::adapters::process_alive),
+            generators.clock.now(),
+        )?;
+        let mut value = serde_json::to_value(report)?;
+        value["db"] = json!(db);
+        return Ok(value);
+    }
     // A repository queue already resolved the working directory; `--repo`
     // overrides it for a `--db` queue used from elsewhere or a moved checkout.
     let checkout = |repo: Option<PathBuf>| repo.unwrap_or_else(|| cwd.clone());
@@ -800,7 +821,9 @@ fn execute(cli: Cli) -> Result<Value> {
         bail!(OBSERVER_DENIED);
     }
     Ok(match cli.command {
-        Command::Init | Command::Locate | Command::Rebind { .. } => unreachable!(),
+        Command::Init | Command::Locate | Command::Rebind { .. } | Command::Migrate { .. } => {
+            unreachable!()
+        }
         Command::Add {
             title,
             description,

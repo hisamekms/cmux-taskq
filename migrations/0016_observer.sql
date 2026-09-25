@@ -1,3 +1,4 @@
+-- dagq-schema: breaking
 -- The observer job (ADR-0024 decision 4). It raises a threshold crossing as
 -- a `blocked` ask; one that belongs to no task (free slots with no
 -- candidates, backend failures) has neither a task nor a run, so asks is

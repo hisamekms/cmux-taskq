@@ -1,3 +1,4 @@
+-- dagq-schema: breaking
 -- The cmux workspace of each resident session role that is not a run or a
 -- supervisor registration: the maintainer, the in-cmux supervisor's
 -- workspace (which outlives the registration of a crashed supervisor), and

@@ -1,3 +1,4 @@
+-- dagq-schema: breaking
 -- Merge queue (ADR-0008): 'integrating' holds the single integration slot
 -- while the runtime rebases, re-validates and squash-lands a run; 'needs_session'
 -- parks a run whose rebase conflicted or whose re-validation failed until a

@@ -1,4 +1,5 @@
 use std::{
+    path::Path,
     sync::{Arc, Barrier, Mutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -51,6 +52,29 @@ fn new_goal(title: &str) -> NewGoal {
         doc: Some("docs/adr/0009-goal-groups-tasks.md".into()),
         draft: false,
     }
+}
+
+/// An old queue after `dagq migrate`: opening it alone is refused and
+/// leaves its `user_version` as it was (ADR-0045 decision 5).
+fn migrated(path: &Path) -> SqliteQueue {
+    let version = |path: &Path| -> i64 {
+        Connection::open(path)
+            .unwrap()
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap()
+    };
+    let before = version(path);
+    let error = SqliteQueue::open(path).err().unwrap().to_string();
+    assert!(error.contains("run `dagq migrate`"), "{error}");
+    assert_eq!(version(path), before);
+    let report = SqliteQueue::migrate(path, None, 1_700_000_000).unwrap();
+    assert_eq!(report.previous_version, before);
+    assert_eq!(report.schema_version, SqliteQueue::SCHEMA_VERSION);
+    // Every migration so far is breaking, so the old queue was copied first.
+    let backup = report.backup.unwrap();
+    assert!(backup.ends_with(format!("backups/queue-{before}-1700000000.sqlite3")));
+    assert_eq!(version(&backup), before);
+    SqliteQueue::open(path).unwrap()
 }
 
 fn fixture() -> (TempDir, SqliteQueue) {
@@ -561,16 +585,208 @@ fn foreign_and_future_databases_are_rejected_without_rewriting_them() {
             .unwrap(),
         0
     );
+    // A newer queue whose floor is above this binary's schema: refused by
+    // every entry point, and left as it was.
     let future = dir.path().join("future.db");
     drop(SqliteQueue::init(&future).unwrap());
     let raw = Connection::open(&future).unwrap();
     raw.pragma_update(None, "user_version", 99).unwrap();
-    assert!(SqliteQueue::open(&future).is_err());
+    raw.execute("UPDATE schema_floor SET floor = 99", [])
+        .unwrap();
+    for error in [
+        SqliteQueue::open(&future).err().unwrap(),
+        SqliteQueue::init(&future).err().unwrap(),
+        SqliteQueue::migrate(&future, None, 0).err().unwrap(),
+    ] {
+        let error = error.to_string();
+        assert!(
+            error.contains("unsupported queue schema version 99")
+                && error.contains("older than schema 99")
+                && error.contains("install a newer dagq"),
+            "{error}"
+        );
+    }
+    assert!(!SqliteQueue::schema(&future).unwrap().opens);
     assert_eq!(
         raw.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
             .unwrap(),
         99
     );
+}
+
+/// What a later binary's compatible migration does: a table and a nullable
+/// column this binary does not know (ADR-0045 decision 6).
+fn apply_future_compatible_migration(raw: &Connection) {
+    raw.execute_batch(&format!(
+        "ALTER TABLE tasks ADD COLUMN future_hint TEXT;
+         ALTER TABLE task_runs ADD COLUMN future_weight INTEGER NOT NULL DEFAULT 0;
+         CREATE TABLE future_things (id INTEGER PRIMARY KEY, note TEXT);
+         PRAGMA user_version = {};",
+        SqliteQueue::SCHEMA_VERSION + 1
+    ))
+    .unwrap();
+}
+
+#[test]
+fn a_newer_queue_within_the_floor_is_used_as_it_is() {
+    let (dir, mut queue) = fixture();
+    let first = queue.add(new_task("before")).unwrap().id();
+    drop(queue);
+    let path = dir.path().join("queue.db");
+    let raw = Connection::open(&path).unwrap();
+    apply_future_compatible_migration(&raw);
+    let newer = SqliteQueue::SCHEMA_VERSION + 1;
+    let schema = SqliteQueue::schema(&path).unwrap();
+    assert_eq!(
+        (schema.schema_version, schema.floor, schema.opens),
+        (newer, SqliteQueue::SCHEMA_VERSION, true)
+    );
+    assert!(schema.pending.is_empty());
+    // Reads, writes and a claim all work on the columns this binary knows.
+    let mut queue = SqliteQueue::open(&path).unwrap();
+    let second = queue.add(new_task("after")).unwrap().id();
+    queue.transition(second, TaskAction::BypassReview).unwrap();
+    assert!(matches!(
+        queue.claim(&base()).unwrap(),
+        ClaimOutcome::Claimed { .. }
+    ));
+    assert_eq!(queue.show(first).unwrap().task.title(), "before");
+    assert_eq!(queue.list(&TaskQuery::default()).unwrap().total, 2);
+    drop(queue);
+    drop(SqliteQueue::init(&path).unwrap());
+    // Nothing to apply, and a newer queue is never taken down to this binary.
+    let report = SqliteQueue::migrate(&path, None, 0).unwrap();
+    assert_eq!(
+        (report.previous_version, report.schema_version),
+        (newer, newer)
+    );
+    assert!(report.applied.is_empty() && report.backup.is_none());
+    assert!(!dir.path().join("backups").exists());
+    assert_eq!(
+        raw.query_row("SELECT count(*) FROM future_things", [], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        raw.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
+            .unwrap(),
+        newer
+    );
+}
+
+/// A queue at schema 23, before the floor table: what the fixed binary
+/// leaves until `dagq migrate` runs.
+fn queue_before_the_floor(dir: &TempDir) -> std::path::PathBuf {
+    let path = dir.path().join("queue.db");
+    drop(SqliteQueue::init(&path).unwrap());
+    let raw = Connection::open(&path).unwrap();
+    raw.execute_batch("DROP TABLE schema_floor; PRAGMA user_version = 23;")
+        .unwrap();
+    path
+}
+
+#[test]
+fn opening_or_initializing_an_older_queue_never_migrates_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = queue_before_the_floor(&dir);
+    for error in [
+        SqliteQueue::open(&path).err().unwrap(),
+        SqliteQueue::init(&path).err().unwrap(),
+    ] {
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "queue schema version 23 is older than this binary's schema {}; run `dagq \
+                 migrate` to apply the 1 pending migration(s)",
+                SqliteQueue::SCHEMA_VERSION
+            )
+        );
+    }
+    let schema = SqliteQueue::schema(&path).unwrap();
+    assert_eq!((schema.schema_version, schema.floor), (23, 23));
+    assert!(!schema.opens);
+    assert_eq!(
+        schema
+            .pending
+            .iter()
+            .map(|m| (m.version, m.compatible))
+            .collect::<Vec<_>>(),
+        vec![(24, false)]
+    );
+    let raw = Connection::open(&path).unwrap();
+    assert_eq!(
+        raw.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
+            .unwrap(),
+        23
+    );
+    // A copy from an earlier attempt in the same second is kept.
+    std::fs::create_dir_all(dir.path().join("backups")).unwrap();
+    std::fs::write(dir.path().join("backups/queue-23-5.sqlite3"), "earlier").unwrap();
+    let report = SqliteQueue::migrate(&path, Some(&|_| false), 5).unwrap();
+    assert_eq!(report.floor, SqliteQueue::SCHEMA_VERSION);
+    assert_eq!(report.applied.len(), 1);
+    let backup = report.backup.unwrap();
+    assert!(
+        backup.ends_with("backups/queue-23-5-1.sqlite3"),
+        "{backup:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("backups/queue-23-5.sqlite3")).unwrap(),
+        "earlier"
+    );
+    let schema = SqliteQueue::schema(&path).unwrap();
+    assert!(schema.opens && schema.pending.is_empty());
+    SqliteQueue::open(&path).unwrap();
+}
+
+#[test]
+fn a_breaking_migration_waits_for_an_idle_queue() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = queue_before_the_floor(&dir);
+    let raw = Connection::open(&path).unwrap();
+    raw.execute_batch(&format!(
+        "INSERT INTO supervisors(token, pid, parallel) VALUES ('live', 101, 1), ('dead', 102, 1);
+         INSERT INTO tasks(title,description,acceptance,verification_commands,status)
+         VALUES ('t','','','[]','in_progress');
+         INSERT INTO task_runs(id,task_id,status,requested_provider,actual_provider,base_commit)
+         VALUES ('run-live',1,'running','claude','claude','{BASE}');
+         INSERT INTO run_processes(run_id,role,pid) VALUES ('run-live','wrapper',103);"
+    ))
+    .unwrap();
+    let alive = |pid: u32| pid != 102;
+    let error = SqliteQueue::migrate(&path, Some(&alive), 0)
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(
+        error.contains("breaking migration(s) 24")
+            && error.contains("supervisor live (pid 101)")
+            && !error.contains("dead")
+            && error.contains("run run-live (running)")
+            && error.contains("wrapper of run run-live (pid 103)")
+            && error.contains("down --wait"),
+        "{error}"
+    );
+    // Refused before anything was copied or applied.
+    assert!(!dir.path().join("backups").exists());
+    assert_eq!(
+        raw.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
+            .unwrap(),
+        23
+    );
+    // Once the supervisor and the run are gone, it goes through.
+    raw.execute_batch(
+        "DELETE FROM supervisors WHERE token='live';
+         UPDATE run_processes SET exited_at=1, exit_code=0;
+         UPDATE task_runs SET status='failed';",
+    )
+    .unwrap();
+    let report = SqliteQueue::migrate(&path, Some(&alive), 0).unwrap();
+    assert_eq!(report.schema_version, SqliteQueue::SCHEMA_VERSION);
+    // A second migrate has nothing left to do.
+    let again = SqliteQueue::migrate(&path, Some(&alive), 0).unwrap();
+    assert!(again.applied.is_empty() && again.backup.is_none());
 }
 
 #[test]
@@ -679,7 +895,7 @@ fn migration_to_v5_rebuilds_runs_moves_the_lease_and_keeps_foreign_keys() {
     ))
     .unwrap();
     drop(raw);
-    let mut queue = SqliteQueue::open(&path).unwrap();
+    let mut queue = migrated(&path);
     assert_eq!(queue.schema_version().unwrap(), SqliteQueue::SCHEMA_VERSION);
     // The queue-wide lease became the orphaned run's lease; the slot index is gone.
     let leases = queue.run_leases().unwrap();
@@ -779,7 +995,7 @@ fn migration_to_v6_adds_the_integration_statuses_and_the_single_slot() {
     ))
     .unwrap();
     drop(raw);
-    let mut queue = SqliteQueue::open(&path).unwrap();
+    let mut queue = migrated(&path);
     assert_eq!(queue.schema_version().unwrap(), SqliteQueue::SCHEMA_VERSION);
     assert_eq!(
         queue.show(TaskId::new(1)).unwrap().runs[0].status(),
@@ -890,7 +1106,7 @@ fn migration_to_v7_adds_the_supervisor_registry_and_keeps_leases() {
     .unwrap();
     assert!(raw.execute("SELECT count(*) FROM supervisors", []).is_err());
     drop(raw);
-    let mut queue = SqliteQueue::open(&path).unwrap();
+    let mut queue = migrated(&path);
     assert_eq!(queue.schema_version().unwrap(), SqliteQueue::SCHEMA_VERSION);
     // A v6 supervisor that was running has no registration; its lease is intact.
     assert!(queue.supervisors().unwrap().is_empty());
@@ -1023,17 +1239,17 @@ fn migration_from_v6_adds_goals_and_keeps_tasks_runs_and_events() {
     ))
     .unwrap();
     drop(raw);
-    let mut queue = SqliteQueue::open(&path).unwrap();
+    let mut queue = migrated(&path);
     // 0007 (supervisors), 0008 (goals), 0009 (supervisor mode), 0010
     // (supervisor binary version), 0011 (session workspaces), 0012
     // (queue-level backend failures), 0013 (goal draft), 0014 (asks) and
     // 0015 (required evidence), 0016 (observer events and task-less
     // blocked asks), 0017 (the stuck_exit ask), 0018 (task paths), 0019
     // (goal dependencies), 0020 (task priority), 0021 (proposals) and 0022
-    // (follow-up triage: task leases, follow_up_depth, the follow_up ask) and
-    // 0023 (planner sessions) are applied together.
-    assert_eq!(SqliteQueue::SCHEMA_VERSION, 23);
-    assert_eq!(queue.schema_version().unwrap(), 23);
+    // (follow-up triage: task leases, follow_up_depth, the follow_up ask),
+    // 0023 (planner sessions) and 0024 (the schema floor) are applied together.
+    assert_eq!(SqliteQueue::SCHEMA_VERSION, 24);
+    assert_eq!(queue.schema_version().unwrap(), 24);
     assert_eq!(
         queue
             .session_workspace(dagq::domain::SessionRole::Inbox)
@@ -1178,7 +1394,7 @@ fn goals_of_a_version_12_queue_migrate_as_open() {
     )
     .unwrap();
     drop(raw);
-    let mut queue = SqliteQueue::open(&path).unwrap();
+    let mut queue = migrated(&path);
     assert_eq!(queue.schema_version().unwrap(), SqliteQueue::SCHEMA_VERSION);
     // 0015: an existing task requires no evidence.
     assert!(
@@ -2436,7 +2652,7 @@ fn migration_to_v21_keeps_drafts_and_the_task_id_sequence() {
     ))
     .unwrap();
     drop(raw);
-    let mut queue = SqliteQueue::open(&path).unwrap();
+    let mut queue = migrated(&path);
     assert_eq!(queue.schema_version().unwrap(), SqliteQueue::SCHEMA_VERSION);
     let kept = queue.show(TaskId::new(1)).unwrap().task;
     assert_eq!(kept.status(), TaskStatus::Draft);

@@ -1,3 +1,4 @@
+-- dagq-schema: breaking
 -- The cmux-taskq version behind a registration (`CARGO_PKG_VERSION`),
 -- written by the `supervise` process itself when it registers: only that
 -- process knows which binary it is. NULL is a supervisor that registered

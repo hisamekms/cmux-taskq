@@ -1,3 +1,4 @@
+-- dagq-schema: breaking
 -- Follow-up triage (ADR-0037). A headless job decides each follow_up draft
 -- the supervisor hands it; the runtime applies its verdict and a person's
 -- answer to its `follow_up` ask.

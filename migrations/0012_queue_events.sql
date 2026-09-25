@@ -1,3 +1,4 @@
+-- dagq-schema: breaking
 -- A failed or timed-out call to the workspace backend (cmux) is recorded as
 -- `backend_call_failed`. A call that belongs to no run (the maintainer and
 -- in-cmux supervisor workspaces `up` opens, the queue's workspace group,

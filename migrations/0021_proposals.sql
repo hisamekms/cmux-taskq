@@ -1,3 +1,4 @@
+-- dagq-schema: breaking
 -- Proposals and the submitted task status (ADR-0041 decisions 7, 8). A
 -- proposal bundles goals and tasks a planner submits for plan review and
 -- names the planner that owns it: its cmux workspace and whether a person

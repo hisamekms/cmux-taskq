@@ -1,3 +1,4 @@
+-- dagq-schema: breaking
 -- Goals (ADR-0009): a goal groups the tasks that solve one higher-level
 -- problem. It has no state machine; progress derives from its tasks' status
 -- and closing is recorded once in closed_at / verdict. Tasks gain an optional

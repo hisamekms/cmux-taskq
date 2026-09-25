@@ -1,3 +1,4 @@
+-- dagq-schema: breaking
 -- Questions that wait for a person's answer (ADR-0022): the maintainer's
 -- or a worker's consultation as a queue row, delivered by `status` and
 -- `watch --role`. An ask belongs to a task and, when it is about one run,

@@ -1415,7 +1415,7 @@ mod tests {
         f.queue
             .conn
             .execute(
-                "INSERT INTO task_leases VALUES (?1,'other',?2,?3)",
+                "INSERT INTO task_leases(task_id, supervisor_token, reason, heartbeat_at) VALUES (?1,'other',?2,?3)",
                 params![leased, FOLLOW_UP_TRIAGE, f.queue.generators.clock.now()],
             )
             .unwrap();
@@ -1557,7 +1557,7 @@ mod tests {
         f.queue
             .conn
             .execute(
-                "INSERT INTO task_leases VALUES (?1,?2,?3,?4)",
+                "INSERT INTO task_leases(task_id, supervisor_token, reason, heartbeat_at) VALUES (?1,?2,?3,?4)",
                 params![
                     done,
                     TOKEN,
@@ -1645,7 +1645,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("v21.db");
         let raw = Connection::open(&path).unwrap();
-        for migration in &super::super::sqlite::MIGRATIONS[..21] {
+        for migration in &super::super::schema::MIGRATIONS[..21] {
             raw.execute_batch(migration).unwrap();
         }
         raw.pragma_update(None, "application_id", 0x43545131)
@@ -1663,6 +1663,7 @@ mod tests {
         )
         .unwrap();
         drop(raw);
+        SqliteQueue::migrate(&path, None, 0).unwrap();
         let queue = SqliteQueue::open(&path).unwrap();
         let targets: Vec<i64> = queue
             .follow_up_drafts()

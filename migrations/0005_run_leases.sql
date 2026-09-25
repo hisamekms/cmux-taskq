@@ -1,3 +1,4 @@
+-- dagq-schema: breaking
 -- Run-level supervisor leases and parallel execution (ADR-0007).
 -- A supervisor owns each run it executes through its own lease row; the
 -- queue-wide singleton lease and the single execution slot are gone. The

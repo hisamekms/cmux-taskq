@@ -1122,6 +1122,37 @@ fn rejection_reason(detail: &dagq::domain::TaskDetail) -> String {
     reason
 }
 
+/// While the agent works, a later binary applies a compatible migration
+/// (ADR-0045 decision 6): the run's wrapper, the supervisor and the CLI the
+/// worker runs are then older than the queue, and carry the run to its
+/// receipt anyway.
+#[test]
+fn a_compatible_migration_during_a_run_leaves_the_run_working() {
+    let newer = SqliteQueue::SCHEMA_VERSION + 1;
+    let script = format!(
+        "sqlite3 -cmd '.timeout 5000' \"$DB\" \\
+           'ALTER TABLE task_runs ADD COLUMN future_hint TEXT;
+            CREATE TABLE future_things (id INTEGER PRIMARY KEY);
+            PRAGMA user_version = {newer};' || exit 97
+         \"$DAGQ\" --db \"$DB\" show 1 > /dev/null || exit 98
+         {VALID_AGENT}"
+    );
+    let (_dir, db, detail) = run_agent(&script);
+    let run = &detail.runs[0];
+    assert_eq!(run.status(), RunStatus::AwaitingIntegration);
+    assert!(run.last_error().is_none());
+    assert!(
+        detail
+            .processes
+            .iter()
+            .all(|p| p.exited_at.is_some() && p.exit_code == Some(0))
+    );
+    assert_eq!(
+        SqliteQueue::open(&db).unwrap().schema_version().unwrap(),
+        newer
+    );
+}
+
 #[test]
 fn valid_receipt_is_verified_and_awaits_integration() {
     let (_dir, db, detail) = run_agent(VALID_AGENT);
@@ -2920,6 +2951,8 @@ fn migration_from_v1_preserves_task_and_initializes_runtime_tables() {
         .unwrap();
     raw.pragma_update(None, "user_version", 1).unwrap();
     raw.execute("INSERT INTO tasks(title,description,acceptance,verification_commands) VALUES ('preserved','','','[]')", []).unwrap();
+    assert!(SqliteQueue::open(&db).is_err());
+    SqliteQueue::migrate(&db, None, 0).unwrap();
     let mut queue = SqliteQueue::open(&db).unwrap();
     assert_eq!(queue.schema_version().unwrap(), SqliteQueue::SCHEMA_VERSION);
     assert_eq!(

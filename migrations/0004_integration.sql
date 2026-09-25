@@ -1,3 +1,4 @@
+-- dagq-schema: breaking
 -- Add the 'integrated' run status and limit each task to one integrated run.
 -- SQLite cannot change a CHECK constraint in place, so task_runs is rebuilt
 -- with every column added so far (0002, 0003) and its rowid order preserved.

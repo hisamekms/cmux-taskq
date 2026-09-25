@@ -2234,3 +2234,115 @@ fn submit_bundles_drafts_into_a_proposal_that_plan_review_or_a_bypass_readies() 
     ok(&db, &["draft", "2"]);
     assert_eq!(ok(&db, &["show", "2"])["task"]["status"], "draft");
 }
+
+/// Runs `binary` (a copy of this one, as `claim` leaves a run's wrapper in
+/// `runs/<id>/runner`) against `db`.
+fn run_copy(binary: &Path, db: &Path, args: &[&str]) -> Output {
+    Command::new(binary)
+        .env_remove("DAGQ_ROLE")
+        .arg("--db")
+        .arg(db)
+        .args(args)
+        .output()
+        .unwrap()
+}
+
+#[test]
+fn migrate_is_explicit_and_older_binaries_keep_working_within_the_floor() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("queue.db");
+    ok(&db, &["init"]);
+    let raw = rusqlite::Connection::open(&db).unwrap();
+    let version = || -> i64 {
+        raw.pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap()
+    };
+    // A queue left at schema 23 by the binary before the floor table.
+    raw.execute_batch("DROP TABLE schema_floor; PRAGMA user_version = 23;")
+        .unwrap();
+    for args in [&["list"][..], &["status"], &["init"]] {
+        let error = refused(&db, args);
+        assert!(error.contains("run `dagq migrate`"), "{args:?}: {error}");
+    }
+    assert_eq!(version(), 23);
+    let check = ok(&db, &["migrate", "--check"]);
+    assert_eq!(check["schema_version"], 23);
+    assert_eq!(check["opens"], false);
+    assert_eq!(
+        check["pending"],
+        serde_json::json!([{"version": 24, "compatible": false}])
+    );
+    assert_eq!(version(), 23);
+    let migrated = ok(&db, &["migrate"]);
+    assert_eq!(migrated["previous_version"], 23);
+    assert_eq!(migrated["schema_version"], SqliteQueue::SCHEMA_VERSION);
+    assert_eq!(migrated["floor"], SqliteQueue::SCHEMA_VERSION);
+    let backup = migrated["backup"].as_str().unwrap();
+    assert!(Path::new(backup).starts_with(dir.path().canonicalize().unwrap().join("backups")));
+    assert_eq!(version(), SqliteQueue::SCHEMA_VERSION);
+    ok(&db, &["add", "task one"]);
+
+    // A later binary's compatible migration: this binary, and the wrapper
+    // copy of it a running run uses, now are the older binaries.
+    let runner = dir.path().join("runs/run-1/runner");
+    std::fs::create_dir_all(runner.parent().unwrap()).unwrap();
+    std::fs::copy(env!("CARGO_BIN_EXE_dagq"), &runner).unwrap();
+    raw.execute_batch(&format!(
+        "ALTER TABLE tasks ADD COLUMN future_hint TEXT;
+         CREATE TABLE future_things (id INTEGER PRIMARY KEY);
+         PRAGMA user_version = {};",
+        SqliteQueue::SCHEMA_VERSION + 1
+    ))
+    .unwrap();
+    for args in [
+        &["add", "task two"][..],
+        &["show", "2"],
+        &["list"],
+        &["status"],
+        &["doctor"],
+        &["migrate"],
+    ] {
+        let output = run_copy(&runner, &db, args);
+        assert!(
+            output.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    assert_eq!(ok(&db, &["list"])["total"], 2);
+    assert_eq!(version(), SqliteQueue::SCHEMA_VERSION + 1);
+
+    // A later breaking migration raises the floor: the older binaries stop
+    // with the reason, and leave the queue alone.
+    raw.execute_batch(&format!(
+        "UPDATE schema_floor SET floor = {0}; PRAGMA user_version = {0};",
+        SqliteQueue::SCHEMA_VERSION + 2
+    ))
+    .unwrap();
+    for args in [
+        &["list"][..],
+        &["migrate"],
+        &[
+            "session",
+            "--run",
+            "run-1",
+            "--lease",
+            "token",
+            "--claude",
+            "/bin/false",
+        ],
+    ] {
+        let output = run_copy(&runner, &db, args);
+        assert!(!output.status.success(), "{args:?} succeeded");
+        let error: Value = serde_json::from_slice(&output.stderr).unwrap();
+        let error = error["error"].as_str().unwrap();
+        assert!(
+            error.contains(&format!(
+                "unsupported queue schema version {0}: the queue refuses binaries older than schema {0}",
+                SqliteQueue::SCHEMA_VERSION + 2
+            )),
+            "{args:?}: {error}"
+        );
+    }
+    assert_eq!(version(), SqliteQueue::SCHEMA_VERSION + 2);
+}
