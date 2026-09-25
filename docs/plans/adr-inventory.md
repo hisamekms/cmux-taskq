@@ -4,7 +4,7 @@ type: plan
 title: ADR 0001〜0034の棚卸しと統合ADRの組
 status: active
 created: 2026-09-25
-updated: 2026-09-25
+updated: 2026-09-26
 owners:
   - hisamekms
 tags:
@@ -29,7 +29,7 @@ related:
 - **失効**: 一時的な制約や一度きりの手順で、今は効かない（後のADRが変えたものも含む）。
 - **記録**: 実装の割り当て・schemaの番号など、その時点の事実の記録で、決定ではない。統合ADRは引き継がない。
 - **未実装**: 後継の決定は`accepted`だが実装がまだのもの。ADRとしては後継の決定が現在の決定なので、上書きとして扱う。
-- 対象外: 0032〜0034は`proposed`のまま（acceptedになるときにADR-0042の規則に従う）。0012・0014・0023・0024は置き換え済み（0012 → [ADR-0039](../adr/0039-adopt-stale-lease-of-live-wrapper-and-renew-own-stale-lease.md)、0014 → [ADR-0045](../adr/0045-build-identifier-explicit-migrate-schema-compat-handoff-and-auto-update.md)、0023 → [ADR-0040](../adr/0040-verify-once-review-run-env-graph-stats-and-task-priority-in-claim-order.md)、0024 → [ADR-0041](../adr/0041-on-demand-planners-proposals-submitted-and-plan-review-job.md)）で、表には後継だけを書く。
+- 対象外: 0032〜0034は`proposed`のまま（acceptedになるときにADR-0042の規則に従う）。0012・0014・0023・0024は置き換え済み（0012 → [ADR-0039](../adr/0039-adopt-stale-lease-of-live-wrapper-and-renew-own-stale-lease.md)、0014 → [ADR-0045](../adr/0045-build-identifier-explicit-migrate-schema-compat-handoff-and-auto-update.md)、0023 → [ADR-0040](../adr/0040-verify-once-review-run-env-graph-stats-and-task-priority-in-claim-order.md)、0024 → [ADR-0041](../adr/0041-on-demand-planners-proposals-submitted-and-plan-review-job.md)）で、表には後継だけを書く。ADR-0041は2026-09-26に[ADR-0044](../adr/0044-findings-proposals-from-findings-and-quiet-observer.md)に丸ごと置き換えられ、決定1〜17は同じ番号で引き継がれた（決定4だけ内容が変わった）ので、この文書の「ADR-0041 決定N」はADR-0044の決定Nと読む。
 
 ## ADRごとの表
 

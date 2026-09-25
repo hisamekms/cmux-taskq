@@ -63,13 +63,13 @@ cargo clippy --locked --all-targets -- -D warnings
 
 ## 役割: supervisor と worker と planner と inbox と observer
 
-役割はこの 5 つ（[ADR-0041](docs/adr/0041-on-demand-planners-proposals-submitted-and-plan-review-job.md) の決定 1、[docs/design/overview.md](docs/design/overview.md) の用語集）。runtime の `supervise` プロセスが **supervisor**（claim・worker の起動・validating・run ごとの headless の review / triage の job・resume・着地・後始末）、run ごとに worktree で作業する Claude session が **worker**、人と対話して goal / task を登録する常駐 session が **planner**、人に届くもの（ask と attention）の窓口になる常駐 session が **inbox**、supervisor が timer で起動する headless の job が **observer**。以前の常駐 session（ADR-0010〜0023 に出てくる英字の役割名）は ADR-0024 で退役し（ADR-0041 が引き継ぐ）、既存 ADR のその記述は overview の用語集で読み替える。
+役割はこの 5 つ（[ADR-0044](docs/adr/0044-findings-proposals-from-findings-and-quiet-observer.md) の決定 1、[docs/design/overview.md](docs/design/overview.md) の用語集）。runtime の `supervise` プロセスが **supervisor**（claim・worker の起動・validating・run ごとの headless の review / triage の job・resume・着地・後始末）、run ごとに worktree で作業する Claude session が **worker**、人と対話して goal / task を登録する常駐 session が **planner**、人に届くもの（ask と attention）の窓口になる常駐 session が **inbox**、supervisor が timer で起動する headless の job が **observer**。以前の常駐 session（ADR-0010〜0023 に出てくる英字の役割名）は ADR-0024 で退役し（ADR-0044 が引き継ぐ）、既存 ADR のその記述は overview の用語集で読み替える。
 
 同じ commit に対する verification は `integrate` の 1 回が正で、validating は receipt・commit・clean・要求 evidence だけを見て `verification_commands` を実行しない。`integrate` は rebase の有無に関わらず rebase 後に必ず `verification_commands` を実行し（試行ごとの `integrate-<attempt>-verify-N.log`）、失敗すれば run は `needs_session` になって supervisor が resume する（[ADR-0040](docs/adr/0040-verify-once-review-run-env-graph-stats-and-task-priority-in-claim-order.md) 決定 1）。
 
 ### 起動と停止（`up` / `down`）
 
-cold start は repository の中で1行。`up` は supervisor・inbox・planner を開く（ADR-0041 の決定 6 で planner は開かなくなるが、goal 29 の実装が入るまでは開く）。当面は in-cmux mode で運用する（cmux の socket password を設定していないので launchd mode は preflight で止まる。[ADR-0011](docs/adr/0011-cmux-socket-password-and-in-cmux-fallback.md)）。`up` / `down` / 固定バイナリの更新は、人が inbox か planner の session から打つ（手順は plugin の `dagq-recover` skill の section 5）。
+cold start は repository の中で1行。`up` は supervisor・inbox・planner を開く（ADR-0044 の決定 6 で planner は開かなくなるが、goal 29 の実装が入るまでは開く）。当面は in-cmux mode で運用する（cmux の socket password を設定していないので launchd mode は preflight で止まる。[ADR-0011](docs/adr/0011-cmux-socket-password-and-in-cmux-fallback.md)）。`up` / `down` / 固定バイナリの更新は、人が inbox か planner の session から打つ（手順は plugin の `dagq-recover` skill の section 5）。
 
 ```sh
 dagq up --in-cmux --claude ~/.local/bin/claude --plugin-dir <この repository>/plugins/claude-dagq

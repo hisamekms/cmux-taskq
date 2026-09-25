@@ -2,10 +2,12 @@
 id: adr-0041
 type: adr
 title: 役割を5つにし、plannerをproposalごとのオンデマンドのworkspaceにし、taskにsubmitted状態を足し、supervisorが起動するplan review jobだけがreadyにし、follow_upのdraftもruntimeが立てるplannerのproposalとして同じgateを通す
-status: accepted
+status: superseded
 created: 2026-09-25
 updated: 2026-09-25
 accepted_on: 2026-09-25
+superseded_by: adr-0044
+superseded_on: 2026-09-26
 supersedes:
   - adr-0024
   - adr-0037
@@ -45,6 +47,8 @@ related:
 ---
 
 # ADR-0041: 役割を5つにし、plannerをproposalごとのオンデマンドのworkspaceにし、taskにsubmitted状態を足し、supervisorが起動するplan review jobだけがreadyにし、follow_upのdraftもruntimeが立てるplannerのproposalとして同じgateを通す
+
+> **置き換え済み（2026-09-26）**: このADRの決定は現在有効ではない。現行の決定は[ADR-0044](0044-findings-proposals-from-findings-and-quiet-observer.md)を読む。
 
 ## Context
 

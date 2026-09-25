@@ -174,7 +174,7 @@ Verification commands are shell lines that `integrate` runs once in the worktree
 
 ## Start the runtime with `up`
 
-Five roles share a queue (ADR-0041): the **supervisor** is the resident `supervise` process that runs, reviews, resumes, triages and lands tasks (its review and triage are headless `claude -p` jobs); a **worker** is the Claude session of one run; a **planner** is a Claude Code session you open on demand with `dagq plan` (as many at once as you like) to write goals and tasks and submit them for plan review; the **inbox** is the resident Claude Code session where everything that waits for you arrives (asks and other attention) and where you answer; and the **observer** is a periodic headless job the supervisor starts to record notes, `blocked` asks and draft goals. `up` starts the supervisor and the inbox from a shell whose PATH has `dagq`, `cmux` and `claude`:
+Five roles share a queue (ADR-0044): the **supervisor** is the resident `supervise` process that runs, reviews, resumes, triages and lands tasks (its review and triage are headless `claude -p` jobs); a **worker** is the Claude session of one run; a **planner** is a Claude Code session you open on demand with `dagq plan` (as many at once as you like) to write goals and tasks and submit them for plan review; the **inbox** is the resident Claude Code session where everything that waits for you arrives (asks and other attention) and where you answer; and the **observer** is a periodic headless job the supervisor starts to record notes, `blocked` asks and draft goals. `up` starts the supervisor and the inbox from a shell whose PATH has `dagq`, `cmux` and `claude`:
 
 ```sh
 dagq up --parallel 4 --plugin-dir /path/to/dagq/plugins/claude-dagq

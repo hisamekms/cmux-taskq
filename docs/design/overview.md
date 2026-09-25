@@ -4,7 +4,7 @@ type: design
 title: System overview
 status: current
 created: 2026-09-21
-updated: 2026-09-25
+updated: 2026-09-26
 last_verified: 2026-09-25
 scope: system
 related:
@@ -18,7 +18,7 @@ related:
   - adr-0008
   - adr-0010
   - adr-0022
-  - adr-0041
+  - adr-0044
   - adr-0013
   - adr-0028
 ---
@@ -41,17 +41,17 @@ dagqは、依存関係を持つ開発タスクをSQLiteで管理し、着手可�
 
 ## 用語集
 
-役割は5つで、ADR-0024の決定1で確定し、[ADR-0041](../adr/0041-on-demand-planners-proposals-submitted-and-plan-review-job.md)の決定1が引き継いだ: supervisor、worker、planner、inbox、observer。このうち`DAGQ_ROLE`で名乗るworkspaceを持つのはsupervisor（in-cmux modeのとき）、worker、planner、inboxで、cmux workspaceのtitleは`[<repo>]<role>`（workerは`[<repo>]worker#<task-id> - <task title>`、[ADR-0028](../adr/0028-workspace-titles-are-repo-and-role.md)）。plannerは`[<repo>]planner#<planner-id>`で、同時に開いている複数のplannerを見分ける。`up`が開くのはsupervisor（in-cmux mode）とinboxだけで、plannerはproposalごとのオンデマンドのworkspaceとして人が`dagq plan`で開くか、runtimeが立てる（ADR-0041の決定1・6。task 277で実装。[supervisor-lifecycle](supervisor-lifecycle.md#plan--planners)）。planの検査はsupervisorが起動するheadlessのplan review jobが行い、taskを`ready`にする（goal 29の後続taskが実装する）。observerとreview / triageのjobはworkspaceを持たないheadlessの`claude -p`で、`DAGQ_ROLE`はobserverが`observer`、review / triageのjobが`reviewer`。
+役割は5つで、ADR-0024の決定1で確定し、[ADR-0044](../adr/0044-findings-proposals-from-findings-and-quiet-observer.md)の決定1が引き継いだ: supervisor、worker、planner、inbox、observer。このうち`DAGQ_ROLE`で名乗るworkspaceを持つのはsupervisor（in-cmux modeのとき）、worker、planner、inboxで、cmux workspaceのtitleは`[<repo>]<role>`（workerは`[<repo>]worker#<task-id> - <task title>`、[ADR-0028](../adr/0028-workspace-titles-are-repo-and-role.md)）。plannerは`[<repo>]planner#<planner-id>`で、同時に開いている複数のplannerを見分ける。`up`が開くのはsupervisor（in-cmux mode）とinboxだけで、plannerはproposalごとのオンデマンドのworkspaceとして人が`dagq plan`で開くか、runtimeが立てる（ADR-0044の決定1・6。task 277で実装。[supervisor-lifecycle](supervisor-lifecycle.md#plan--planners)）。planの検査はsupervisorが起動するheadlessのplan review jobが行い、taskを`ready`にする（goal 29の後続taskが実装する）。observerとreview / triageのjobはworkspaceを持たないheadlessの`claude -p`で、`DAGQ_ROLE`はobserverが`observer`、review / triageのjobが`reviewer`。
 
 | 用語 | 指すもの | 旧称 |
 | --- | --- | --- |
-| **supervisor** | runtimeの`dagq supervise`プロセス。依存が解けたtaskをclaimし、runごとにworktreeとcmux workspaceを作ってworkerを起動し、receiptを検証し、runごとのheadlessのjob（review、triage）を起動してそのverdictで着地・差し戻し・resume・retryを行い、`needs_session`のrunをresumeし（3回で解消しなければ人へのaskにする）、後始末をする（[ADR-0003](../adr/0003-supervisor-owns-lifecycle.md)、[ADR-0007](../adr/0007-run-level-leases-parallel-execution.md)、[ADR-0040](../adr/0040-verify-once-review-run-env-graph-stats-and-task-priority-in-claim-order.md)、[ADR-0027](../adr/0027-keep-worker-session-through-review-revise-verdict-and-merge-tree-precheck.md)、ADR-0041）。launchdのLaunchAgentとして、またはin-cmux modeで常駐する。 | "SV"（supervisorの略） |
+| **supervisor** | runtimeの`dagq supervise`プロセス。依存が解けたtaskをclaimし、runごとにworktreeとcmux workspaceを作ってworkerを起動し、receiptを検証し、runごとのheadlessのjob（review、triage）を起動してそのverdictで着地・差し戻し・resume・retryを行い、`needs_session`のrunをresumeし（3回で解消しなければ人へのaskにする）、後始末をする（[ADR-0003](../adr/0003-supervisor-owns-lifecycle.md)、[ADR-0007](../adr/0007-run-level-leases-parallel-execution.md)、[ADR-0040](../adr/0040-verify-once-review-run-env-graph-stats-and-task-priority-in-claim-order.md)、[ADR-0027](../adr/0027-keep-worker-session-through-review-revise-verdict-and-merge-tree-precheck.md)、ADR-0044）。launchdのLaunchAgentとして、またはin-cmux modeで常駐する。 | "SV"（supervisorの略） |
 | **worker** | runごとにsupervisorが起動するClaude（将来はCodex）のsession。割り当てられたworktreeの中だけで作業し、commitしてreceiptを書く。判断が要るときは`worker_question`のaskを登録して止まる。 | agent session、run session |
-| **planner** | goal / taskを書いてproposalとしてsubmitし、follow_upのdraft taskとobserverのdraft goalの採否を人と決め、goalをcloseするsession（[ADR-0022](../adr/0022-ask-answer-inbox-planner-and-landing-on-doubt.md)、ADR-0041の決定1・6）。常駐せず、proposalごとのオンデマンドのworkspace `[<repo>]planner#<planner-id>`で動く。人が`dagq plan`で開く（複数同時に開ける）か、runtimeが立てる。人の指示で`up` / `down`も打つ。 | （新設） |
-| **inbox** | 人に届くものすべての窓口になる常駐session（[ADR-0022](../adr/0022-ask-answer-inbox-planner-and-landing-on-doubt.md)、ADR-0041の決定6）。openなaskを人に見せてanswerを書き戻し、それ以外のattention（回答済みのask、止まったsupervisor、失敗したreview / triage、pushの失敗）を人に知らせ、人の指示があるときだけ`dagq-recover`の手順（`up` / `down`、手でのreviewと`integrate`、`recover`、run workspaceへのキー送信）を実行する。自分では判断しない。`up`が`[<repo>]inbox`のworkspaceに`inbox_prompt`付きで開く。 | （新設） |
-| **observer** | supervisorのtimerで定期起動するheadlessのjob（ADR-0041の決定4）。`stats`と直近のnoteを読み、note・`blocked`のask・draftのgoalだけを書く。状態は変えない。 | （新設） |
+| **planner** | goal / taskを書いてproposalとしてsubmitし、follow_upのdraft taskとobserverのdraft goalの採否を人と決め、goalをcloseするsession（[ADR-0022](../adr/0022-ask-answer-inbox-planner-and-landing-on-doubt.md)、ADR-0044の決定1・6）。常駐せず、proposalごとのオンデマンドのworkspace `[<repo>]planner#<planner-id>`で動く。人が`dagq plan`で開く（複数同時に開ける）か、runtimeが立てる。人の指示で`up` / `down`も打つ。 | （新設） |
+| **inbox** | 人に届くものすべての窓口になる常駐session（[ADR-0022](../adr/0022-ask-answer-inbox-planner-and-landing-on-doubt.md)、ADR-0044の決定6）。openなaskを人に見せてanswerを書き戻し、それ以外のattention（回答済みのask、止まったsupervisor、失敗したreview / triage、pushの失敗）を人に知らせ、人の指示があるときだけ`dagq-recover`の手順（`up` / `down`、手でのreviewと`integrate`、`recover`、run workspaceへのキー送信）を実行する。自分では判断しない。`up`が`[<repo>]inbox`のworkspaceに`inbox_prompt`付きで開く。 | （新設） |
+| **observer** | supervisorのtimerで定期起動するheadlessのjob（ADR-0044の決定4）。状態は変えない。今の実装は`stats`と直近のnoteを読み、note・`blocked`のask・draftのgoalだけを書く（置き換え済みの[ADR-0041](../adr/0041-on-demand-planners-proposals-submitted-and-plan-review-job.md)の決定4の形）。ADR-0044の決定4・18〜23はこれをfindingの記録と更新・findingに紐づく`blocked`のaskに改め、noteとdraft goalを書かせない（goal 31の後続taskが実装する）。 | （新設） |
 
-**退役した役割。** ADR-0010からADR-0023までの記述に出てくる常駐のClaude Code session「メンテナー」（英字表記の役割名。`up`が`[<repo>]`＋その名のworkspaceを開き、`DAGQ_ROLE`にその名を持っていた）は、ADR-0024で退役し、その決定は[ADR-0041](../adr/0041-on-demand-planners-proposals-submitted-and-plan-review-job.md)の決定1が引き継いでいる。既存のADRは書き換えないので、そこでのメンテナーの仕事は次のとおり読み替える: レビューと着地はsupervisorのreview job、失敗runの扱い（recoverしてready / cancel）はsupervisorのtriage job、3回resumeして解消しない`needs_session`と作業中のdialog（`prompt_waiting`）はinbox宛てのask、継続的な監視と改善提案はobserver、人への相談とanswerに従う操作・`up` / `down` / 固定バイナリの更新はinbox（またはplanner）のsessionから人の指示で行う。`up`はそのworkspaceを開かず、queueに記録されたそのworkspaceの行を忘れる（workspace自体は人が閉じる）。
+**退役した役割。** ADR-0010からADR-0023までの記述に出てくる常駐のClaude Code session「メンテナー」（英字表記の役割名。`up`が`[<repo>]`＋その名のworkspaceを開き、`DAGQ_ROLE`にその名を持っていた）は、ADR-0024で退役し、その決定は[ADR-0044](../adr/0044-findings-proposals-from-findings-and-quiet-observer.md)の決定1が引き継いでいる。既存のADRは書き換えないので、そこでのメンテナーの仕事は次のとおり読み替える: レビューと着地はsupervisorのreview job、失敗runの扱い（recoverしてready / cancel）はsupervisorのtriage job、3回resumeして解消しない`needs_session`と作業中のdialog（`prompt_waiting`）はinbox宛てのask、継続的な監視と改善提案はobserver、人への相談とanswerに従う操作・`up` / `down` / 固定バイナリの更新はinbox（またはplanner）のsessionから人の指示で行う。`up`はそのworkspaceを開かず、queueに記録されたそのworkspaceの行を忘れる（workspace自体は人が閉じる）。
 
 既存のADR（0001〜0009）に残る旧称もこの表で読み替える。runtimeのCLI名（`supervise`）と`supervisors`表は変えない。
 
@@ -76,6 +76,6 @@ CLI / Claude plugin / Codex plugin
 
 テストは3層に分ける。`tests/queue.rs`・`tests/cli.rs`・`tests/location.rs`はSQLiteキュー、CLI、cwdからのqueue解決を、`tests/runtime.rs`はproviderとworkspaceをテストダブルに差し替えたsupervisor/wrapperを、cmuxなしで検証する（行カバレッジ80%の対象）。`tests/e2e.rs`は実バイナリ・実Git・実cmuxで、使い捨てrepositoryをcwdにして（`XDG_DATA_HOME`は一時dir）`init → add → ready → supervise --once → integrate`（squash着地、worktree削除）を1件と、2件同時（`--parallel 2`、依存taskは着地後の2回目のpassで新しいmainから、`integrate --next`のFIFO、同じファイルを書いた2件目の`needs_session`とテストがセッション役で解消してからの着地）で通し、Claudeの代わりに、promptからreceipt pathを読み取って変更・commit・receipt提出を行い、Stop hook相当のidle markerを書いてから端末の`/exit`を待つstubスクリプトを`--claude`に渡す。supervisorの`/exit`送信とworkspace closeも実cmuxで通る。cmuxが必要なので`#[ignore]`で、`cargo test --locked --test e2e -- --ignored`で実行する。cmuxが起動する`runner`は`LLVM_PROFILE_FILE`を継承せずworktreeに`.profraw`を書いてclean判定を落とすため、`cargo llvm-cov -- --include-ignored`では通らない。カバレッジは通常のテストだけで測る。e2eの後片付け（workspace・workspace groupのguard、`TempDir`）はDrop頼みで、testのプロセスがSIGTERM / SIGKILLで終わると走らないので、各testのfixtureは始める前に前のe2eの残骸をsweepする。fixtureは一時dirの`e2e-owner`にflockを取って持ち続け（ロック済みのfileをrenameで置くので、ロック前のownerが見えることはない）、sweepはlockを取れたdir（ownerのプロセスが死んでいる）と、`e2e-owner`が無くfixtureの形（`claude-stub`と`data/`）で1時間以上古いdirだけを対象にする。lockを持ったまま、そのdirにある実行ファイル（runnerの複製）、`/bin/sh <dir>/claude-stub`、`--db`か`--claude`にdirの中を渡された`dagq`（一時queueのsupervisor）のプロセス（`ps`はargvの区切りを失うので、この形だけを見て、promptの中の語では選ばない）をSIGTERM（3秒後にSIGKILL）で止め、そのqueue hashをexternal IDに持つworkspace groupを`--close-workspaces`で消し、`DAGQ_QUEUE`か`E2E_SHARED`がdirを指すworkspaceを閉じ、dirを消す。並行する別のe2eのdirはownerがlockを持っているので触らず、本番queueのworkspaceとgroupは条件に当たらない。片付けたものは`e2e sweep:`で始まるstderrの行に残る。
 
-タスクは`draft | submitted | ready | in_progress | completed | canceled`を持つ。`submitted`はplan review待ちで（[ADR-0041](../adr/0041-on-demand-planners-proposals-submitted-and-plan-review-job.md)の決定8）、plannerが`submit`でproposalにして出す。`ready`にするのはplan reviewの経路と、人の`ready --bypass-review`と、失敗したrunの再試行だけ。`ready`で依存先がすべて`completed`のタスクだけがschedulerの起動候補になる。詳細な実行状態はTaskRunに保存する。
+タスクは`draft | submitted | ready | in_progress | completed | canceled`を持つ。`submitted`はplan review待ちで（[ADR-0044](../adr/0044-findings-proposals-from-findings-and-quiet-observer.md)の決定8）、plannerが`submit`でproposalにして出す。`ready`にするのはplan reviewの経路と、人の`ready --bypass-review`と、失敗したrunの再試行だけ。`ready`で依存先がすべて`completed`のタスクだけがschedulerの起動候補になる。詳細な実行状態はTaskRunに保存する。
 
 supervisorはagentの完了レシート、コミット、テスト、worktreeのclean状態を確認してからworkspaceを削除する。worktreeとbranchは`integrate`がmainへ着地させるまで残し、着地後に`integrate`が削除する。
