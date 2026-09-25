@@ -63,16 +63,24 @@ impl Submission {
 /// no dialog is up) Enter alone is sent again, at most
 /// [`SUBMIT_RETRIES`] times. Returns the outcome and the Enters sent
 /// again. An error is a failed typing of the input; an Enter that fails
-/// after it leaves the input stuck in the box.
+/// after it leaves the input stuck in the box. A typing that timed out
+/// with the input maybe typed (a `/exit` is never typed again, task 326)
+/// is judged from the screen like one that returned.
 pub(super) fn submit_input(
     cmux: &dyn WorkspaceBackend,
     signals: &dyn AgentSignals,
     workspace: &str,
     input: Input<'_>,
 ) -> Result<(Submission, usize)> {
-    match input {
-        Input::Text(text) => cmux.send_text(workspace, text)?,
-        Input::Exit => cmux.send_exit(workspace)?,
+    let typed = match input {
+        Input::Text(text) => cmux.send_text(workspace, text),
+        Input::Exit => cmux.send_exit(workspace),
+    };
+    match typed {
+        Err(error) if timed_out_maybe_sent(&error) => {
+            warn!(error = %format_args!("{error:#}"), "{} for workspace {workspace} timed out and may have been typed; reading the screen for it: {error:#}", input.name());
+        }
+        typed => typed?,
     }
     let mut retries = 0;
     loop {
@@ -363,14 +371,23 @@ impl StartCheck {
 mod tests {
     use super::*;
     use crate::application::SupervisorEnvironment;
+    use crate::application::{Queue, QueueOpener};
     use crate::domain::{Task, TaskRun};
-    use std::sync::Mutex;
+    use std::sync::{
+        Mutex,
+        atomic::{AtomicUsize, Ordering},
+    };
 
     /// A session whose screen is one of `screens` per capture (the last
-    /// one repeats), recording what was sent.
+    /// one repeats), recording what was sent. The first `send_timeouts`
+    /// texts and `capture_timeouts` captures time out as cmux does under
+    /// load, and so does every `/exit` with `exit_times_out`.
     struct Backend {
         screens: Mutex<Vec<String>>,
         sent: Mutex<Vec<String>>,
+        send_timeouts: AtomicUsize,
+        capture_timeouts: AtomicUsize,
+        exit_times_out: bool,
     }
 
     impl Backend {
@@ -378,6 +395,9 @@ mod tests {
             Self {
                 screens: Mutex::new(screens.iter().rev().map(|s| (*s).to_owned()).collect()),
                 sent: Mutex::new(Vec::new()),
+                send_timeouts: AtomicUsize::new(0),
+                capture_timeouts: AtomicUsize::new(0),
+                exit_times_out: false,
             }
         }
 
@@ -407,13 +427,14 @@ mod tests {
         }
         fn send_text(&self, _: &str, text: &str) -> Result<()> {
             self.sent.lock().unwrap().push(text.to_owned());
-            Ok(())
+            timeout(&self.send_timeouts, "cmux send failed")
         }
         fn send_enter(&self, _: &str) -> Result<()> {
             self.sent.lock().unwrap().push("<enter>".to_owned());
             Ok(())
         }
         fn capture(&self, _: &str) -> Result<String> {
+            timeout(&self.capture_timeouts, "cmux read-screen failed")?;
             let mut screens = self.screens.lock().unwrap();
             match screens.len() {
                 0 => bail!("no screen"),
@@ -435,6 +456,7 @@ mod tests {
         }
         fn send_exit(&self, _: &str) -> Result<()> {
             self.sent.lock().unwrap().push("/exit".to_owned());
+            ensure!(!self.exit_times_out, "cmux send failed: Command timed out");
             Ok(())
         }
         fn exists(&self, _: &str) -> Result<bool> {
@@ -455,6 +477,33 @@ mod tests {
         fn submit_check_interval(&self) -> Duration {
             Duration::ZERO
         }
+        fn retry_backoff(&self) -> Duration {
+            Duration::ZERO
+        }
+    }
+
+    /// Fails with cmux's timeout while `left` counts down.
+    fn timeout(left: &AtomicUsize, what: &str) -> Result<()> {
+        match left.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1)) {
+            Ok(_) => bail!("{what}: Command timed out"),
+            Err(_) => Ok(()),
+        }
+    }
+
+    /// No queue: the failures [`RecordingBackend`] records are dropped.
+    struct NoQueue;
+
+    impl QueueOpener for NoQueue {
+        fn open(&self) -> Result<Box<dyn Queue + Send>> {
+            bail!("no queue")
+        }
+    }
+
+    /// [`submit_input`] through the [`RecordingBackend`] the supervisor
+    /// uses, which retries what timed out.
+    fn submitted_through(backend: &Backend, input: Input<'_>) -> Result<(Submission, usize)> {
+        let recording = RecordingBackend::over(backend, Arc::new(NoQueue), None, || None);
+        submit_input(&recording, &Signals, "ws", input)
     }
 
     /// Screens as words: `ready`, `pending:<text>` (in the box), `dialog`,
@@ -575,5 +624,65 @@ mod tests {
         assert!(check.done);
         assert_eq!(check.submitted.as_deref(), Some("s"));
         assert_eq!(Input::Exit.name(), "exit");
+    }
+
+    #[test]
+    fn a_text_that_timed_out_without_reaching_the_screen_is_typed_again() {
+        let backend = Backend::new(&["ready", "ready", "working"]);
+        backend.send_timeouts.store(2, Ordering::SeqCst);
+        let (submission, retries) = submitted_through(&backend, Input::Text(TEXT)).unwrap();
+        assert_eq!(submission, Submission::Submitted(Some("working".into())));
+        assert_eq!(retries, 0);
+        assert_eq!(backend.sent(), [TEXT, TEXT, TEXT]);
+        // Past the attempts it fails as before, known not to have been sent.
+        let backend = Backend::new(&["ready"]);
+        backend.send_timeouts.store(9, Ordering::SeqCst);
+        let error = submitted_through(&backend, Input::Text(TEXT)).unwrap_err();
+        assert!(!timed_out_maybe_sent(&error), "{error:#}");
+        assert_eq!(backend.sent().len(), 3);
+    }
+
+    #[test]
+    fn a_text_that_timed_out_but_reached_the_box_is_not_typed_again() {
+        let pending = format!("pending:{TEXT}");
+        let backend = Backend::new(&[&pending, &pending, "working"]);
+        backend.send_timeouts.store(1, Ordering::SeqCst);
+        let (submission, retries) = submitted_through(&backend, Input::Text(TEXT)).unwrap();
+        assert_eq!(submission, Submission::Submitted(Some("working".into())));
+        // The Enter the timeout may have cost is sent alone.
+        assert_eq!(
+            (retries, backend.sent()),
+            (1, vec![TEXT.into(), "<enter>".into()])
+        );
+        // A screen that cannot be read is no reason to type it again.
+        let backend = Backend::new(&[]);
+        backend.send_timeouts.store(1, Ordering::SeqCst);
+        let (submission, _) = submitted_through(&backend, Input::Text(TEXT)).unwrap();
+        assert_eq!(submission, Submission::Submitted(None));
+        assert_eq!(backend.sent(), [TEXT]);
+    }
+
+    #[test]
+    fn an_exit_that_timed_out_is_never_typed_again_and_does_not_fail() {
+        let mut backend = Backend::new(&["ready"]);
+        backend.exit_times_out = true;
+        let (submission, retries) = submitted_through(&backend, Input::Exit).unwrap();
+        assert_eq!(submission, Submission::Submitted(Some("ready".into())));
+        assert_eq!((retries, backend.sent()), (0, vec!["/exit".to_owned()]));
+    }
+
+    #[test]
+    fn a_capture_that_timed_out_is_read_again() {
+        let backend = Backend::new(&["ready"]);
+        backend.capture_timeouts.store(2, Ordering::SeqCst);
+        let recording = RecordingBackend::over(&backend, Arc::new(NoQueue), None, || None);
+        assert_eq!(recording.capture("ws").unwrap(), "ready");
+        backend.capture_timeouts.store(3, Ordering::SeqCst);
+        let error = recording.capture("ws").unwrap_err();
+        assert_eq!(
+            reason_of_error(&error, ReasonCode::Other).code,
+            ReasonCode::BackendTimeout
+        );
+        assert!(!timed_out_maybe_sent(&error));
     }
 }

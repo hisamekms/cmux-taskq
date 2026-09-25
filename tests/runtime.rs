@@ -565,6 +565,8 @@ struct TestWorkspace {
     listed: Mutex<Vec<String>>,
     /// Workspaces cmux does not list for now although they are open.
     hidden: Mutex<Vec<String>>,
+    /// This many captures time out, as `cmux read-screen` does under load.
+    capture_timeouts: AtomicUsize,
 }
 impl TestWorkspace {
     fn new(db: &Path, fail: bool, script: &str) -> Self {
@@ -601,6 +603,7 @@ impl TestWorkspace {
             exists_fails: false,
             listed: Mutex::new(Vec::new()),
             hidden: Mutex::new(Vec::new()),
+            capture_timeouts: AtomicUsize::new(0),
         }
     }
     /// Let cmux list `workspace` as if an earlier supervisor opened it.
@@ -839,7 +842,17 @@ impl WorkspaceBackend for TestWorkspace {
     }
     fn capture(&self, _: &str) -> Result<String> {
         self.captures.fetch_add(1, Ordering::SeqCst);
+        if self
+            .capture_timeouts
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+            .is_ok()
+        {
+            bail!("cmux read-screen failed: Error: Command timed out");
+        }
         Ok(self.screen.lock().unwrap().clone())
+    }
+    fn retry_backoff(&self) -> Duration {
+        Duration::from_millis(10)
     }
     fn close(&self, workspace_id: &str) -> Result<()> {
         // The session must have exited (or died, its wrapper's pid gone)
@@ -2608,7 +2621,8 @@ fn failed_backend_calls_are_recorded_with_the_load_and_counted_by_stats() {
             .any(|a| a["kind"] == "backend_failures")
     );
 
-    // send: the /exit that timed out abandons the run.
+    // send: the /exit that timed out is not typed again, and the run goes
+    // on, its screen read for whether the /exit got there (task 326).
     let (_dir, repo, db) = fixture();
     let mut backend = TestWorkspace::new(
         &db,
@@ -2618,17 +2632,15 @@ fn failed_backend_calls_are_recorded_with_the_load_and_counted_by_stats() {
     backend.send_times_out = true;
     let cursor = runtime::status(&db).unwrap()["cursor"].as_i64().unwrap();
     let outcome = supervise(&db, &repo, &backend).unwrap();
-    // The abandoned session still exits on the delivered request; its
-    // wrapper no longer holds the run.
-    for (_, session) in backend.sessions.lock().unwrap().iter_mut() {
-        let _ = session.worker.take().unwrap().join();
-    }
-    assert_eq!(outcome["errors"].as_array().unwrap().len(), 1, "{outcome}");
+    backend.join();
+    assert_eq!(outcome["errors"], json!([]), "{outcome}");
+    assert_eq!(backend.exits_sent.load(Ordering::SeqCst), 1);
     let detail = SqliteQueue::open(&db)
         .unwrap()
         .show(TaskId::new(1))
         .unwrap();
     let run = &detail.runs[0];
+    assert_eq!(run.status(), RunStatus::AwaitingIntegration);
     let failures = backend_failures(&detail);
     assert_eq!(failures.len(), 1, "{failures:?}");
     assert_backend_failure(
@@ -2638,30 +2650,43 @@ fn failed_backend_calls_are_recorded_with_the_load_and_counted_by_stats() {
         "did not finish within 30s",
         run.id(),
     );
-    let abandoned = detail
-        .events
-        .iter()
-        .find(|e| e.kind == "runtime_error")
-        .unwrap();
-    assert!(failures[0].id < abandoned.id);
     // cmux's timeout is told apart from its other failures.
     assert_eq!(failures[0].payload["code"], "backend_timeout");
-    assert_eq!(abandoned.payload["code"], "backend_timeout");
-    assert_eq!(abandoned.payload["op"], "send_exit");
-    assert!(
-        abandoned.payload["message"]
-            .as_str()
-            .unwrap()
-            .contains("did not finish within 30s"),
-        "{:?}",
-        abandoned.payload
-    );
-    let status = runtime::status(&db).unwrap();
+    assert_eq!(failures[0].payload["attempt"], 1);
+    assert_eq!(failures[0].payload["max_attempts"], 1);
+    assert_eq!(failures[0].payload["retry_after_ms"], Value::Null);
+    assert!(!detail.events.iter().any(|e| e.kind == "runtime_error"));
+
+    // capture: a timeout is read again after a backoff, each failed
+    // attempt recorded with its number and the backoff that followed.
+    backend.capture_timeouts.store(2, Ordering::SeqCst);
+    let recording = runtime::RecordingBackend::new(&backend, db.clone(), None);
+    assert_eq!(recording.capture(WORKSPACE_ID).unwrap(), READY_SCREEN);
+    let detail = SqliteQueue::open(&db)
+        .unwrap()
+        .show(TaskId::new(1))
+        .unwrap();
+    let retried: Vec<_> = backend_failures(&detail)
+        .into_iter()
+        .filter(|e| e.payload["op"] == "capture")
+        .map(|e| {
+            (
+                e.payload["attempt"].clone(),
+                e.payload["max_attempts"].clone(),
+                e.payload["retry_after_ms"].clone(),
+                e.payload["code"].clone(),
+            )
+        })
+        .collect();
     assert_eq!(
-        run_attention_of(&status, run.id()).unwrap()["last_error_code"],
-        "backend_timeout",
-        "{status}"
+        retried,
+        [
+            (json!(1), json!(3), json!(10), json!("backend_timeout")),
+            (json!(2), json!(3), json!(20), json!("backend_timeout")),
+        ]
     );
+    // Recorded on the run whose workspace it read.
+    assert_eq!(retried.len(), 2);
 
     // A second failure in the same window is an alert.
     backend.exists_fails = true;
@@ -2676,19 +2701,20 @@ fn failed_backend_calls_are_recorded_with_the_load_and_counted_by_stats() {
     )
     .unwrap();
     let failures = &stats["backend_failures"];
-    assert_eq!(failures["count"], 2, "{stats}");
-    assert_eq!(failures["by_op"], json!({"exists": 1, "send_exit": 1}));
+    assert_eq!(failures["count"], 4, "{stats}");
+    assert_eq!(
+        failures["by_op"],
+        json!({"capture": 2, "exists": 1, "send_exit": 1})
+    );
     // The codes of the window, per code and per kind.
     let codes = &stats["reason_codes"];
     // `backend_call_failed` is `backend_failures`' to count, not again here.
-    assert_eq!(codes["by_code"]["backend_timeout"], 1, "{stats}");
-    assert_eq!(codes["by_kind"]["runtime_error"]["backend_timeout"], 1);
-    assert_eq!(codes["by_kind"].get("backend_call_failed"), None);
+    assert_eq!(codes["by_kind"].get("backend_call_failed"), None, "{stats}");
     assert_eq!(failures["max_slots"], 1);
     assert!(failures["max_load_avg"].is_f64() || failures["max_load_avg"].is_null());
     assert!(stats["alerts"].as_array().unwrap().contains(&json!({
         "kind": "backend_failures", "task_id": null, "run_id": null,
-        "value": 2, "threshold": 2
+        "value": 4, "threshold": 2
     })));
 }
 

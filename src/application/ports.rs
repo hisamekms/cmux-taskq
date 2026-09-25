@@ -530,6 +530,17 @@ pub trait WorkspaceBackend {
     fn call_timeout(&self) -> std::time::Duration {
         std::time::Duration::from_secs(30)
     }
+    /// How many times in all a call that timed out is made when making it
+    /// again is safe (a read, or a text that did not reach the screen;
+    /// task 326).
+    fn call_attempts(&self) -> u32 {
+        3
+    }
+    /// The backoff before the first retry of a call that timed out,
+    /// doubled before each next one.
+    fn retry_backoff(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(2)
+    }
     /// How long the session may take to exit after the request before the
     /// supervisor stops waiting and leaves the run to a human.
     fn exit_timeout(&self) -> std::time::Duration {
