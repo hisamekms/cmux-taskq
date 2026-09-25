@@ -2,9 +2,12 @@
 id: adr-0014
 type: adr
 title: upはbinary versionの違うsupervisorをdrainして入れ替える
-status: accepted
+status: superseded
 created: 2026-09-22
 updated: 2026-09-22
+accepted_on: 2026-09-22
+superseded_by: adr-0045
+superseded_on: 2026-09-25
 owners:
   - hisamekms
 tags:
@@ -23,6 +26,8 @@ related:
 ---
 
 # ADR-0014: `up`はbinary versionの違うsupervisorをdrainして入れ替える
+
+> **置き換え済み（2026-09-25）**: このADRの決定は現在有効ではない。現行の決定は[ADR-0045](0045-build-identifier-explicit-migrate-schema-compat-handoff-and-auto-update.md)を読む。
 
 ## Context
 

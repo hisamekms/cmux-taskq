@@ -49,7 +49,6 @@ ADRは、将来の実装や運用に大きな影響を与える決定の理由�
 | [ADR-0011](0011-cmux-socket-password-and-in-cmux-fallback.md) | launchd常駐のsupervisorにはcmuxのsocket passwordを前提とし、up --in-cmuxをlaunchdなしのfallbackにする |  |
 | [ADR-0012](0012-adopt-stale-lease-of-live-wrapper.md) | supervisorが死んだrunは、wrapperが生きていれば次のsupervisorが引き継ぐ |  |
 | [ADR-0013](0013-layered-architecture-and-type-function-style.md) | domain / application / infrastructureのレイヤーと「型＋関数」でruntimeを構成する |  |
-| [ADR-0014](0014-up-replaces-a-supervisor-of-another-binary-version.md) | upはbinary versionの違うsupervisorをdrainして入れ替える |  |
 | [ADR-0015](0015-rename-to-dagq.md) | cmux-taskqをdagqに改名する |  |
 | [ADR-0016](0016-maintainer-notification-and-compact-output.md) | maintainerを使い捨てのsessionにし、status / watch / doctorの通知経路と圧縮出力、pluginの起き直しhookを持たせる |  |
 | [ADR-0017](0017-resolve-run-paths-from-the-queue-directory.md) | runのqueue配下のpathは読むたびにqueueディレクトリとrun IDから解決する |  |
@@ -71,6 +70,7 @@ ADRは、将来の実装や運用に大きな影響を与える決定の理由�
 | [ADR-0040](0040-verify-once-review-run-env-graph-stats-and-task-priority-in-claim-order.md) | 検証をintegrateの1回にし、reviewをsupervisorの工程にし、dagq.tomlでrunのenvを渡し、taskの5段階の優先度と解放数でclaim順を決め、statsで詰まりを数える | 2026-09-25 |
 | [ADR-0041](0041-on-demand-planners-proposals-submitted-and-plan-review-job.md) | 役割を5つにし、plannerをproposalごとのオンデマンドのworkspaceにし、taskにsubmitted状態を足し、supervisorが起動するplan review jobだけがreadyにし、follow_upのdraftもruntimeが立てるplannerのproposalとして同じgateを通す | 2026-09-25 |
 | [ADR-0043](0043-detect-stalled-worker-sessions-nudge-once-then-ask.md) | supervisorが止まったworkerのsessionを決まった規則で検知し、一度促すかEnterを一度送り直してからinboxのaskにし、statsが走っているrunのalertと閾値ごとの結果を返す | 2026-09-25 |
+| [ADR-0045](0045-build-identifier-explicit-migrate-schema-compat-handoff-and-auto-update.md) | 固定バイナリをbuild識別子で見分け、queueを開いただけではmigrateせず、互換の範囲のschemaを受け入れ、supervisorを待たずに引き継ぎで入れ替え、up --auto-updateで着地のたびに自動で更新する | 2026-09-25 |
 
 ## 置き換え・廃止されたADR
 
@@ -78,6 +78,7 @@ ADRは、将来の実装や運用に大きな影響を与える決定の理由�
 
 | ADR | Status | superseded_by | superseded_on |
 | --- | --- | --- | --- |
+| [ADR-0014](0014-up-replaces-a-supervisor-of-another-binary-version.md) | superseded | [ADR-0045](0045-build-identifier-explicit-migrate-schema-compat-handoff-and-auto-update.md) | 2026-09-25 |
 | [ADR-0023](0023-verify-once-review-in-supervisor-run-env-graph-and-stats.md) | superseded | [ADR-0040](0040-verify-once-review-run-env-graph-stats-and-task-priority-in-claim-order.md) | 2026-09-25 |
 | [ADR-0024](0024-retire-maintainer-into-jobs-and-observer.md) | superseded | [ADR-0041](0041-on-demand-planners-proposals-submitted-and-plan-review-job.md) | 2026-09-25 |
 | [ADR-0037](0037-follow-up-triage-job-decides-follow-up-drafts.md) | superseded | [ADR-0041](0041-on-demand-planners-proposals-submitted-and-plan-review-job.md) | 2026-09-25 |
