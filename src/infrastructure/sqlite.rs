@@ -1749,7 +1749,6 @@ fn apply_transition(
     if action == TaskAction::BypassReview {
         // A person readied the task past plan review: its follow-ups count
         // again from 1 (ADR-0037 decision 6, kept by ADR-0041 decision 16).
-        // The follow-up triage's adopt writes the draft's depth afterwards.
         conn.execute("UPDATE tasks SET follow_up_depth=0 WHERE id=?1", [task_id])?;
     }
     event(

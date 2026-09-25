@@ -500,7 +500,7 @@ enum Command {
     Ask {
         #[command(subcommand)]
         command: Option<AskCommand>,
-        #[arg(long, required = true, value_parser = ["approve_landing", "answer_prompt", "decide", "worker_question", "blocked"])]
+        #[arg(long, required = true, value_parser = ["approve_landing", "answer_prompt", "decide", "worker_question", "planner_question", "blocked"])]
         kind: Option<String>,
         #[arg(long, required = true)]
         question: Option<String>,

@@ -115,9 +115,9 @@ string_enum!(AskKind {
     // supervisor asks the inbox to clear what holds it and send `/exit`,
     // and closes the ask itself once the session exits.
     StuckExit => "stuck_exit",
-    // A follow-up triage that cannot decide a follow_up draft, or whose
-    // `adopt` the runtime overrode (ADR-0037 decision 5): it belongs to the
-    // draft and no run, and the supervisor applies its answer.
+    // The retired follow-up triage's ask about a follow_up draft (ADR-0037):
+    // no longer opened, kept so the asks it may have left still read. A
+    // person acts on its answer.
     FollowUp => "follow_up",
     // A worker's session idle without a receipt past its one nudge
     // (ADR-0043 decision 1): the supervisor asks the inbox whether to wait
@@ -127,6 +127,11 @@ string_enum!(AskKind {
     // or a proposal sent back too often. It belongs to the first task of
     // the proposal and no run, and the supervisor applies its answer.
     ApprovePlan => "approve_plan",
+    // A planner of the runtime's that needs a person (ADR-0041 decision
+    // 13): about the draft (or the proposal's task) it works on and no run.
+    // The supervisor types the answer into that planner's workspace, as it
+    // does a `worker_question`'s into a worker's.
+    PlannerQuestion => "planner_question",
 });
 
 // Where a proposal (ADR-0041 decision 7) stands: `submitted` waits for plan
@@ -389,9 +394,7 @@ mod views;
 
 pub use error::DomainError;
 use error::require;
-pub use follow_up::{
-    FOLLOW_UP_OPTIONS, FollowUpAction, FollowUpDecision, FollowUpProposal, FollowUpVerdict,
-};
+pub use follow_up::{DraftOrigin, DraftTarget, MAX_DRAFT_PLANNERS, PLANNER_QUESTION_OPTIONS};
 pub use goal::Goal;
 pub use ids::{AskId, CommitSha, EventId, GoalId, PlannerId, ProposalId, RunId, TaskId};
 pub use input::{GoalEdit, GoalRecord, NewGoal, NewTask, RunPlan, RunRecord, TaskEdit, TaskRecord};
@@ -848,6 +851,10 @@ pub enum AttentionNext {
     /// within the planner timeout (`planner_unresponsive`, ADR-0041
     /// decision 13): a person looks at its workspace.
     CheckPlanner,
+    /// The runtime opened its planners for a draft the runtime or a job
+    /// registered, and none decided it (`draft_planner_exhausted`,
+    /// ADR-0041 decision 16): a person decides it in a planner of theirs.
+    DecideDraft,
 }
 
 /// How many times the supervisor resumes one `needs_session` run (one
@@ -884,6 +891,7 @@ impl fmt::Display for AttentionNext {
             Self::TriageByHand => f.write_str("triage by hand"),
             Self::PlanReviewByHand => f.write_str("plan review by hand"),
             Self::CheckPlanner => f.write_str("check the planner"),
+            Self::DecideDraft => f.write_str("decide the draft in a planner"),
         }
     }
 }
@@ -910,6 +918,7 @@ pub const ATTENTION_KINDS: &[&str] = &[
     "triage_failed",
     "plan_review_failed",
     "planner_unresponsive",
+    "draft_planner_exhausted",
     "ask_opened",
     "ask_answered",
     "ask_delivery_failed",
@@ -980,6 +989,7 @@ pub fn event_attention(kind: &str, payload: &serde_json::Value) -> Option<Attent
         // and a planner that did not answer a revise are a person's.
         ("plan_review_failed", _) => Some(AttentionNext::PlanReviewByHand),
         ("planner_unresponsive", _) => Some(AttentionNext::CheckPlanner),
+        ("draft_planner_exhausted", _) => Some(AttentionNext::DecideDraft),
         ("push_failed", _) => Some(AttentionNext::PushMain),
         ("runtime_error", _)
             if payload.get("lease_released") == Some(&serde_json::Value::Bool(true)) =>
@@ -995,9 +1005,15 @@ pub fn event_attention(kind: &str, payload: &serde_json::Value) -> Option<Attent
         {
             None
         }
+        // The supervisor types the answer of a `worker_question` into the
+        // worker's terminal, and that of a `planner_question` into the
+        // planner's workspace (ADR-0041 decision 13).
         ("ask_answered", _)
-            if payload.get("kind").and_then(serde_json::Value::as_str)
-                == Some(AskKind::WorkerQuestion.as_str()) =>
+            if matches!(
+                payload.get("kind").and_then(serde_json::Value::as_str),
+                Some(kind) if kind == AskKind::WorkerQuestion.as_str()
+                    || kind == AskKind::PlannerQuestion.as_str()
+            ) =>
         {
             match payload.get("runtime_delivers") {
                 Some(serde_json::Value::Bool(false)) => {
@@ -1007,14 +1023,12 @@ pub fn event_attention(kind: &str, payload: &serde_json::Value) -> Option<Attent
             }
         }
         // An answer the supervisor applies itself: an `approve_landing` one,
-        // a triage's `decide` one, a follow-up triage's `follow_up` one, or
-        // a plan review's `approve_plan` one.
+        // a triage's `decide` one, or a plan review's `approve_plan` one.
         ("ask_answered", _)
             if matches!(
                 payload.get("kind").and_then(serde_json::Value::as_str),
                 Some(kind) if kind == AskKind::ApproveLanding.as_str()
                     || kind == AskKind::Decide.as_str()
-                    || kind == AskKind::FollowUp.as_str()
                     || kind == AskKind::ApprovePlan.as_str()
             ) && payload.get("runtime_delivers") == Some(&serde_json::Value::Bool(true)) =>
         {
@@ -1498,6 +1512,18 @@ mod attention_tests {
                 json!({"ask_id": 4, "kind": "worker_question", "runtime_delivers": false}),
                 Some(DeliverAnswer {
                     ask_id: AskId::new(4),
+                }),
+            ),
+            (
+                "ask_answered",
+                json!({"ask_id": 5, "kind": "planner_question", "runtime_delivers": true}),
+                None,
+            ),
+            (
+                "ask_answered",
+                json!({"ask_id": 5, "kind": "planner_question", "runtime_delivers": false}),
+                Some(DeliverAnswer {
+                    ask_id: AskId::new(5),
                 }),
             ),
             ("ask_delivered", json!({"ask_id": 4}), None),

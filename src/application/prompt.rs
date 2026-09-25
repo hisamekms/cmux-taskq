@@ -17,9 +17,10 @@ use super::{
     or_none, tail,
 };
 use crate::domain::{
-    Ask, CommitSha, Goal, GoalId, GoalPredecessor, LintViolation, MAX_PLAN_REVISES,
-    MAX_RESUME_ATTEMPTS, MAX_REVISE_ATTEMPTS, Predecessor, Proposal, ProposalId, Receipt,
-    RunStatus, TRIAGE_RETRY_FAILURES, Task, TaskDetail, TaskId, TaskRun,
+    Ask, CommitSha, DraftOrigin, DraftTarget, Goal, GoalId, GoalPredecessor, GoalTask,
+    LintViolation, MAX_DRAFT_PLANNERS, MAX_PLAN_REVISES, MAX_RESUME_ATTEMPTS, MAX_REVISE_ATTEMPTS,
+    Predecessor, Proposal, ProposalId, Receipt, RunStatus, TRIAGE_RETRY_FAILURES, Task, TaskDetail,
+    TaskId, TaskRun,
 };
 
 /// What the prompt says about one direct predecessor: the task, the squash
@@ -344,10 +345,170 @@ pub fn runtime_planner_prompt(
          Plan review sent the proposal back. Its reasons:\n{reasons}\n\
          Its tasks:\n{tasks}\n\
          Follow the dagq-planner skill of the dagq plugin: read the proposal with `dagq proposal show {proposal}` and each task with `dagq show ID`, fix what the reasons point at, and submit it again with `dagq submit --proposal {proposal}`.\n\
-         A fix that changes the plan's intent (acceptance, scope, the relation to the goal) needs a person: raise it to the inbox with `dagq ask` as the skill describes, stop, and continue from the answer typed into this terminal.\n\
+         A fix that changes the plan's intent (acceptance, scope, the relation to the goal) needs a person: raise it to the inbox with `dagq ask --task ID --kind planner_question` as the skill describes, stop, and continue from the answer typed into this terminal.\n\
          Never open the queue database directly; use the dagq CLI only.\n",
         db = super::path_text(db)?,
     ))
+}
+
+/// What the initial prompt of a planner the runtime opens for a draft
+/// (ADR-0041 decision 16) shows it: the draft and where it came from, the
+/// source task and its landed receipt for a follow_up, the goal and its
+/// other tasks, and the answer of its `planner_question` it carries when
+/// the planner that asked is gone.
+pub struct DraftPlannerMaterial<'a> {
+    pub db: &'a Path,
+    pub target: &'a DraftTarget,
+    /// Which planner of the runtime's this is for the draft (1-based).
+    pub attempt: usize,
+    /// The task whose run's receipt proposed a follow_up.
+    pub source: Option<&'a Task>,
+    /// That run's landed receipt.
+    pub receipt: Option<&'a Value>,
+    pub goal: Option<&'a Goal>,
+    pub goal_closed: bool,
+    /// The goal's other tasks.
+    pub siblings: &'a [GoalTask],
+    pub answer: Option<&'a Ask>,
+}
+
+/// The initial prompt of a planner the runtime opens for a draft the
+/// runtime or a job registered (ADR-0041 decision 16): the material, and
+/// the three things it may do with the draft — submit it completed
+/// (adopt), cancel it with a note (drop), or ask the inbox a
+/// `planner_question` and apply the answer typed into its terminal.
+pub fn draft_planner_prompt(material: &DraftPlannerMaterial<'_>) -> Result<String> {
+    let target = material.target;
+    let task = &target.task;
+    let id = task.id();
+    let mut out = format!(
+        "You are a planner the dagq runtime opened for draft task {id} of the queue at {db}; no person watches this session. The {origin} draft is not ready: the runtime or a job registered it, and you decide what becomes of it (planner {attempt} of at most {max} the runtime opens for it).\n",
+        db = super::path_text(material.db)?,
+        origin = target.origin.as_str(),
+        attempt = material.attempt,
+        max = MAX_DRAFT_PLANNERS,
+    );
+    out.push_str(&format!(
+        "\n## The draft\n\nTask {id}: {title}\n\n### Description\n\n{description}\n\n### Context\n\n{context}\n",
+        title = task.title(),
+        description = or_none(task.description()),
+        context = or_none(task.context()),
+    ));
+    out.push_str(&format!(
+        "\n## Where it came from: {}\n\n",
+        target.origin.as_str()
+    ));
+    match target.origin {
+        DraftOrigin::FollowUp => {
+            out.push_str(&format!(
+                "The receipt of run {run} of task {source} proposed it as a follow_up: work its worker found outside that task.\n",
+                run = target.material["source_run_id"].as_str().unwrap_or("(unknown)"),
+                source = target.material["source_task_id"],
+            ));
+            if let Some(source) = material.source {
+                out.push_str(&format!(
+                    "\n### Source task {sid}: {title} ({status})\n\n{description}\n\nAcceptance:\n{acceptance}\n\nVerification: {verify}\nPaths: {paths}\nEvidence: {evidence}\n",
+                    sid = source.id(),
+                    title = source.title(),
+                    status = source.status().as_str(),
+                    description = or_none(source.description()),
+                    acceptance = or_none(source.acceptance()),
+                    verify = list_or_none(source.verification_commands()),
+                    paths = list_or_none(source.paths()),
+                    evidence = list_or_none(
+                        &source
+                            .required_evidence()
+                            .iter()
+                            .map(|check| check.as_str().to_owned())
+                            .collect::<Vec<_>>()
+                    ),
+                ));
+            }
+            if let Some(receipt) = material.receipt {
+                out.push_str(&format!(
+                    "\n### The landed receipt\n\nSummary:\n{summary}\n\nIts follow_ups:\n{follow_ups}",
+                    summary = or_none(receipt["summary"].as_str().unwrap_or_default()),
+                    follow_ups = fenced(
+                        "json",
+                        &serde_json::to_string_pretty(&receipt["follow_ups"])?
+                    ),
+                ));
+            }
+        }
+        DraftOrigin::GoalGap => {
+            out.push_str(
+                "A job that judged the goal below against its acceptance found this gap. Its findings:\n",
+            );
+            out.push_str(&fenced(
+                "json",
+                &serde_json::to_string_pretty(&target.material)?,
+            ));
+        }
+    }
+    match material.goal {
+        Some(goal) => {
+            out.push_str(&format!(
+                "\n## Goal {gid}: {title}{closed}\n\n{description}\n\nAcceptance:\n{acceptance}\n\nConstraints:\n{constraints}\n\nDoc: {doc}\n\nIts other tasks:\n{tasks}\n",
+                gid = goal.id(),
+                title = goal.title(),
+                closed = if material.goal_closed { " (closed)" } else { "" },
+                description = or_none(goal.description()),
+                acceptance = or_none(goal.acceptance()),
+                constraints = or_none(goal.constraints()),
+                doc = goal.doc().unwrap_or("(none)"),
+                tasks = if material.siblings.is_empty() {
+                    "(none)".to_owned()
+                } else {
+                    material
+                        .siblings
+                        .iter()
+                        .map(|t| format!("- task {} ({}): {}", t.id, t.status.as_str(), t.title))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                },
+            ));
+        }
+        None => out.push_str(
+            "\n## Goal\n\nThe draft belongs to no goal (the source's goal was closed, or it had none).\n",
+        ),
+    }
+    out.push_str(&format!(
+        "\n## What to do\n\n\
+         Follow the dagq-planner skill of the dagq plugin. Read the repository's AGENTS.md (or CLAUDE.md) for its rules on verification, paths, evidence and ADR numbers. Look for tasks that already cover the draft or code that already does it (`dagq search '<words>'`, `dagq show ID`, the source) before you decide. Then do exactly one of these three:\n\
+         1. Adopt: complete the draft with `dagq edit {id}` (acceptance, `--verify`, `--paths`, `--evidence`, and `--context` beginning with `{context_head}`), add its dependencies with `dagq dependency add`, check it with `dagq lint {id}` and submit it with `dagq submit {id}`. Plan review checks it before it becomes ready.\n\
+         2. Drop: when it is already done, duplicated or not worth doing, cancel it with `dagq cancel {id}` and record why with `dagq note --task {id} --text '<why>'`.\n\
+         3. Ask: when you cannot decide without a person (the plan's intent, its scope, whether it belongs to this goal or a new one), run `dagq ask --task {id} --kind planner_question --question '<everything the person needs, with your recommendation>' --option adopt --option cancel --option keep_draft`, report briefly and stop. The answer arrives in this terminal as `answer to ask <id>: ...`: on adopt do 1, on cancel do 2 (the note names the ask), on keep_draft leave the draft as it is and stop.\n\
+         The runtime refuses your submit of a follow_up draft whose goal is closed or that is two follow-ups from a person's judgement unless a person answered adopt: ask then.\n\
+         When you are done, report the outcome in one or two sentences and stop; the runtime ends this session. Do not work on anything but this draft. Never open the queue database directly; use the dagq CLI only.\n",
+        context_head = match target.origin {
+            DraftOrigin::FollowUp => format!(
+                "follow-up draft（task {} の run {} の receipt が提案）",
+                target.material["source_task_id"],
+                target.material["source_run_id"].as_str().unwrap_or("?"),
+            ),
+            DraftOrigin::GoalGap => format!(
+                "goal gap draft（goal {} の判断が提案）",
+                task.goal_id().map_or("?".to_owned(), |g| g.to_string())
+            ),
+        },
+    ));
+    if let Some(answer) = material.answer {
+        out.push_str(&format!(
+            "\nThe planner before you asked a person (ask {aid}) and is gone:\n{question}\n\nanswer to ask {aid}: {text}\n\nApply this answer as step 3 says.\n",
+            aid = answer.id,
+            question = answer.question,
+            text = answer.answer.as_deref().unwrap_or_default(),
+        ));
+    }
+    Ok(out)
+}
+
+fn list_or_none(items: &[String]) -> String {
+    if items.is_empty() {
+        "(none)".to_owned()
+    } else {
+        items.join(", ")
+    }
 }
 
 /// What the resolution request tells a resumed session.

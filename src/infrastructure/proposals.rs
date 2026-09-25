@@ -98,6 +98,7 @@ pub(super) fn submit(conn: &Connection, submission: Submission, now: &str) -> Re
             target,
         )?;
     }
+    let adoptions = super::draft_planners::check_adoptions(conn, &tasks, submission.owner.origin)?;
     let submitted = match existing {
         Some(existing) => {
             let mut members = existing.task_ids().to_vec();
@@ -137,6 +138,7 @@ pub(super) fn submit(conn: &Connection, submission: Submission, now: &str) -> Re
             json!({"proposal_id": id}),
         )?;
     }
+    super::draft_planners::record_adoptions(conn, &adoptions)?;
     for &goal_id in submitted.goal_ids() {
         let joined = conn.execute(
             "UPDATE goals SET proposal_id=?1 WHERE id=?2 AND proposal_id IS NOT ?1",

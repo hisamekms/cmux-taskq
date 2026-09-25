@@ -720,7 +720,13 @@ fn opening_or_initializing_an_older_queue_never_migrates_it() {
             .iter()
             .map(|m| (m.version, m.compatible))
             .collect::<Vec<_>>(),
-        vec![(24, false), (25, false), (26, true), (27, false)]
+        vec![
+            (24, false),
+            (25, false),
+            (26, true),
+            (27, false),
+            (28, false)
+        ]
     );
     let raw = Connection::open(&path).unwrap();
     assert_eq!(
@@ -733,7 +739,7 @@ fn opening_or_initializing_an_older_queue_never_migrates_it() {
     std::fs::write(dir.path().join("backups/queue-23-5.sqlite3"), "earlier").unwrap();
     let report = SqliteQueue::migrate(&path, Some(&|_| false), 5).unwrap();
     assert_eq!(report.floor, floor_for(SqliteQueue::SCHEMA_VERSION));
-    assert_eq!(report.applied.len(), 4);
+    assert_eq!(report.applied.len(), 5);
     let backup = report.backup.unwrap();
     assert!(
         backup.ends_with("backups/queue-23-5-1.sqlite3"),
@@ -846,7 +852,7 @@ fn a_breaking_migration_waits_for_an_idle_queue() {
         .unwrap()
         .to_string();
     assert!(
-        error.contains("breaking migration(s) 24, 25, 27")
+        error.contains("breaking migration(s) 24, 25, 27, 28")
             && error.contains("supervisor live (pid 101)")
             && !error.contains("dead")
             && error.contains("run run-live (running)")
@@ -1334,10 +1340,11 @@ fn migration_from_v6_adds_goals_and_keeps_tasks_runs_and_events() {
     // (goal dependencies), 0020 (task priority), 0021 (proposals) and 0022
     // (follow-up triage: task leases, follow_up_depth, the follow_up ask),
     // 0023 (planner sessions), 0024 (the schema floor), 0025 (the stalled
-    // ask), 0026 (the search index) and 0027 (plan review) are applied
-    // together.
-    assert_eq!(SqliteQueue::SCHEMA_VERSION, 27);
-    assert_eq!(queue.schema_version().unwrap(), 27);
+    // ask), 0026 (the search index), 0027 (plan review) and 0028 (draft
+    // planners: draft origins, the planner_question ask, no task leases)
+    // are applied together.
+    assert_eq!(SqliteQueue::SCHEMA_VERSION, 28);
+    assert_eq!(queue.schema_version().unwrap(), 28);
     assert_eq!(
         queue
             .session_workspace(dagq::domain::SessionRole::Inbox)
@@ -2966,6 +2973,60 @@ fn search_finds_every_kind_in_every_status_and_follows_edits() {
 }
 
 #[test]
+fn migration_to_v28_gives_the_follow_up_drafts_already_queued_their_origin() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("queue.db");
+    let raw = Connection::open(&path).unwrap();
+    for migration in &MIGRATIONS[..27] {
+        raw.execute_batch(migration).unwrap();
+    }
+    raw.execute_batch(&format!(
+        "PRAGMA application_id = 1129599281; PRAGMA user_version = 27;
+         INSERT INTO schema_floor(singleton, floor) VALUES (1, 27);
+         INSERT INTO tasks(title,description,acceptance,verification_commands,status,updated_at)
+         VALUES ('source','','a','[]','completed','2026-09-02T00:00:00.000Z'),
+                ('follow','later','','[]','draft','2026-09-02T00:00:00.000Z'),
+                ('mine','','','[]','draft','2026-09-02T00:00:00.000Z');
+         INSERT INTO task_runs(id,task_id,status,requested_provider,actual_provider,base_commit)
+         VALUES ('run-1',1,'integrated','claude','claude','{BASE}');
+         INSERT INTO task_leases(task_id,supervisor_token,reason,heartbeat_at)
+         VALUES (2,'old','follow_up_triage',1);
+         INSERT INTO run_events(task_id,run_id,kind,payload) VALUES
+           (1,'run-1','follow_up_registered','{{\"task_id\":2,\"title\":\"follow\",\"index\":0}}'),
+           (1,'run-1','follow_up_registered','{{\"task_id\":null,\"index\":1,\"skipped\":\"x\"}}');"
+    ))
+    .unwrap();
+    SqliteQueue::migrate(&path, None, 0).unwrap();
+    let queue = SqliteQueue::open(&path).unwrap();
+    // The follow_up draft from before gets a planner like a new one; the
+    // person's draft does not.
+    let (origin, material) = queue.draft_origin(TaskId::new(2)).unwrap().unwrap();
+    assert_eq!(origin, dagq::domain::DraftOrigin::FollowUp);
+    assert_eq!(
+        material,
+        serde_json::json!({"source_task_id": 1, "source_run_id": "run-1", "index": 0})
+    );
+    assert!(queue.draft_origin(TaskId::new(3)).unwrap().is_none());
+    let targets: Vec<TaskId> = queue
+        .planner_drafts()
+        .unwrap()
+        .iter()
+        .map(|t| t.task.id())
+        .collect();
+    assert_eq!(targets, [TaskId::new(2)]);
+    // The follow-up triage's leases are gone with it.
+    let leases: i64 = Connection::open(&path)
+        .unwrap()
+        .query_row(
+            "SELECT count(*) FROM sqlite_master WHERE name='task_leases'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(leases, 0);
+}
+
+#[test]
 fn migration_indexes_the_existing_rows_and_landings_record_their_message() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("queue.db");
@@ -2999,12 +3060,12 @@ fn migration_indexes_the_existing_rows_and_landings_record_their_message() {
             .iter()
             .map(|m| (m.version, m.compatible))
             .collect::<Vec<_>>(),
-        [(26, true), (27, false)]
+        [(26, true), (27, false), (28, false)]
     );
-    // 0027 (plan review) is applied with it and is breaking: a copy is
-    // taken and the floor rises to it.
+    // 0027 (plan review) and 0028 (draft planners) are applied with it and
+    // are breaking: a copy is taken and the floor rises to the last.
     assert!(report.backup.is_some());
-    assert_eq!(report.floor, 27);
+    assert_eq!(report.floor, 28);
     let mut queue = SqliteQueue::open(&path).unwrap();
     assert_eq!(
         search(&queue, "古い", |_| {}),

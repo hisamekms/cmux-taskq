@@ -468,6 +468,10 @@ impl Supervisor<'_> {
                 _ => {}
             }
         }
+        // Then the drafts the runtime or a job registered (ADR-0041
+        // decision 16), within the same limit.
+        self.deliver_planner_answers(options, &views, &mut runtime_open)?;
+        self.open_draft_planners(options, &mut runtime_open)?;
         self.end_runtime_planners(&views)
     }
 
@@ -486,7 +490,7 @@ impl Supervisor<'_> {
         }
     }
 
-    fn planner_views(&self) -> Result<Vec<PlannerView>> {
+    pub(super) fn planner_views(&self) -> Result<Vec<PlannerView>> {
         let probes = PlannerProbes {
             cmux: self.cmux,
             processes: &*self.processes,
@@ -513,24 +517,24 @@ impl Supervisor<'_> {
             .iter()
             .map(|&id| Ok(self.queue.show(id)?.task))
             .collect::<Result<Vec<_>>>()?;
+        open_runtime_planner(&self.planner_launch(), proposal.id(), &tasks, reasons)
+    }
+
+    /// What opening a planner of the runtime's works with.
+    pub(super) fn planner_launch(&self) -> PlannerLaunch<'_> {
         let layout = self.layout;
-        open_runtime_planner(
-            &PlannerLaunch {
-                queue: &*self.queue,
-                cmux: self.cmux,
-                files: &*self.files,
-                db: &layout.db,
-                queue_hash: &layout.queue_hash,
-                planners_dir: &layout.planners_dir,
-                repo_root: &layout.repo_root,
-                runner: &layout.runner,
-                claude: &layout.claude,
-                plugin_dir: layout.plugin_dir.as_deref(),
-            },
-            proposal.id(),
-            &tasks,
-            reasons,
-        )
+        PlannerLaunch {
+            queue: &*self.queue,
+            cmux: self.cmux,
+            files: &*self.files,
+            db: &layout.db,
+            queue_hash: &layout.queue_hash,
+            planners_dir: &layout.planners_dir,
+            repo_root: &layout.repo_root,
+            runner: &layout.runner,
+            claude: &layout.claude,
+            plugin_dir: layout.plugin_dir.as_deref(),
+        }
     }
 
     /// End the runtime's planners that are done: one idle with no revise of
@@ -577,7 +581,7 @@ impl Supervisor<'_> {
                     || (revise.sent_at.is_none()
                         && revise.proposal.owner().workspace_id.is_some()
                         && revise.proposal.owner().workspace_id == workspace)
-            });
+            }) || self.waits_on_question(view)?;
             if view.state == PlannerState::Idle
                 && !busy
                 && asked.is_none()
@@ -589,6 +593,49 @@ impl Supervisor<'_> {
             }
         }
         Ok(())
+    }
+}
+
+impl Supervisor<'_> {
+    /// Whether a planner of the runtime's still waits on a
+    /// `planner_question` about its draft: one nobody closed (unanswered,
+    /// or its answer not typed yet), or one whose answer the supervisor
+    /// typed into this planner's workspace after its agent last stopped (it
+    /// is at work on the answer). An ask closed without a typing holds
+    /// nothing.
+    fn waits_on_question(&mut self, view: &PlannerView) -> Result<bool> {
+        let Some(draft) = view.planner.draft_task_id else {
+            return Ok(false);
+        };
+        let asks: Vec<_> = self
+            .queue
+            .asks(crate::application::AskQuery {
+                all: true,
+                ..Default::default()
+            })?
+            .into_iter()
+            .filter(|ask| ask.kind == AskKind::PlannerQuestion && ask.task_id == Some(draft))
+            .collect();
+        if asks.iter().any(|ask| ask.closed_at.is_none()) {
+            return Ok(true);
+        }
+        let Some(workspace) = view.planner.workspace_id.as_deref() else {
+            return Ok(false);
+        };
+        let events = self.queue.show(draft)?.events;
+        Ok(asks.iter().any(|ask| {
+            let typed_here = events.iter().any(|event| {
+                event.kind == "ask_delivered"
+                    && event.payload.get("ask_id").and_then(Value::as_i64) == Some(ask.id.as_i64())
+                    && event.payload.get("workspace_id").and_then(Value::as_str) == Some(workspace)
+            });
+            // The typing happened when the ask closed; an agent idle since
+            // before it has not taken the answer up yet.
+            typed_here
+                && ask
+                    .closed_at
+                    .is_some_and(|closed| view.idle_since.is_none_or(|since| since <= closed))
+        }))
     }
 }
 

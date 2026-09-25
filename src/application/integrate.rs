@@ -15,9 +15,10 @@ use super::{
     Verifier, path_text, reason_of_error, tail,
 };
 use crate::domain::{
-    CommitSha, EvidenceCheck, IntegrationOutcome, MAX_RESUME_ATTEMPTS, NewTask, PUSH_REMOTE,
-    PushReport, PushResult, Reason, ReasonCode, Receipt, ReceiptResult, RegisteredFollowUp, RunId,
-    RunStatus, Task, TaskId, TaskRun, evidence_missing_reason, heartbeat_stale,
+    CommitSha, DraftOrigin, EvidenceCheck, IntegrationOutcome, MAX_RESUME_ATTEMPTS, NewTask,
+    PUSH_REMOTE, PushReport, PushResult, Reason, ReasonCode, Receipt, ReceiptResult,
+    RegisteredFollowUp, RunId, RunStatus, Task, TaskId, TaskRun, evidence_missing_reason,
+    heartbeat_stale,
     scope::{out_of_scope, scope_violation_reason},
 };
 
@@ -519,7 +520,9 @@ fn failed_push(error: &anyhow::Error) -> PushReport {
 
 /// Register the landed receipt's `follow_ups` of `task`'s run `run_id` as
 /// draft tasks of the task's goal (ADR-0019 decision 4), one follow-up
-/// deeper than the task (`follow_up_depth`, ADR-0037 decision 6): the title and
+/// deeper than the task (`follow_up_depth`, ADR-0037 decision 6), with their
+/// origin (`follow_up`, the task and run) for the planner the runtime opens
+/// for each (ADR-0041 decision 16): the title and
 /// description as proposed, no acceptance, verification commands or
 /// dependencies, and a context naming where they came from. A closed goal
 /// takes no task, so the follow-up is registered without a goal and its
@@ -666,6 +669,25 @@ pub fn register_follow_ups<Q: Queue + ?Sized>(
                 task_id = %created.id(),
                 error = %format_args!("{error:#}"),
                 "run {run_id}: could not record the follow_up_depth of task {}: {error:#}",
+                created.id()
+            );
+        }
+        // The draft waits for a planner of the runtime's (ADR-0041 decision
+        // 16), which is shown where it came from.
+        let material = json!({
+            "source_task_id": task.id(),
+            "source_run_id": run_id,
+            "index": index,
+        });
+        if let Err(error) =
+            queue.record_draft_origin(created.id(), DraftOrigin::FollowUp, &material)
+        {
+            warn!(
+                op = "follow_up",
+                run_id = %run_id,
+                task_id = %created.id(),
+                error = %format_args!("{error:#}"),
+                "run {run_id}: could not record where draft task {} came from: {error:#}",
                 created.id()
             );
         }

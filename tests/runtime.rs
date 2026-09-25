@@ -12493,10 +12493,12 @@ fn status_and_doctor_measure_to_the_injected_clock() {
 }
 
 #[test]
-fn a_follow_up_verdict_that_asks_notifies_the_inbox_and_its_answer_is_the_runtimes() {
+fn a_follow_up_draft_records_its_origin_and_its_planner_question_is_delivered_by_the_runtime() {
     use dagq::{
-        application::{FollowUpJob, FollowUpStart, follow_up, integrate::register_follow_ups},
-        domain::{FollowUpDecision, FollowUpProposal, FollowUpVerdict},
+        application::{PlannerAnswerRoute, integrate::register_follow_ups},
+        domain::{
+            DraftOrigin, NewAsk, PLANNER_QUESTION_OPTIONS, PlannerOrigin, PlannerOwner, Submission,
+        },
     };
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("queue.db");
@@ -12525,7 +12527,8 @@ fn a_follow_up_verdict_that_asks_notifies_the_inbox_and_its_answer_is_the_runtim
     else {
         panic!("nothing claimed");
     };
-    // integrate registers the draft one follow-up deeper than its source.
+    // integrate registers the draft one follow-up deeper than its source,
+    // with where it came from.
     queue.set_follow_up_depth(source.id(), 1).unwrap();
     let registered = register_follow_ups(
         &mut queue,
@@ -12535,82 +12538,112 @@ fn a_follow_up_verdict_that_asks_notifies_the_inbox_and_its_answer_is_the_runtim
     );
     let draft = registered[0].task_id;
     assert_eq!(queue.follow_up_depth(draft).unwrap(), 2);
-    let FollowUpStart::Started { attempt, .. } = queue.begin_follow_up_triage(draft, "sv").unwrap()
-    else {
-        panic!("not started");
-    };
-    let backend = TestWorkspace::new(&db, false, "");
-    let verdict = FollowUpVerdict {
-        verdict: FollowUpDecision::Adopt,
-        reason: "small".into(),
-        task: Some(FollowUpProposal {
-            title: "complete".into(),
-            description: String::new(),
-            acceptance: "works".into(),
-            verification_commands: Vec::new(),
-            paths: Vec::new(),
-            evidence: Vec::new(),
-            depends_on: Vec::new(),
-            context: String::new(),
-        }),
-        question: String::new(),
-    };
-    let job = FollowUpJob {
-        attempt,
-        ..FollowUpJob::default()
-    };
-    let applied = follow_up::finish(
-        &mut queue,
-        dir.path(),
-        &backend,
-        draft,
-        "sv",
-        &job,
-        &verdict,
-    )
-    .unwrap()
-    .unwrap();
-    // A draft without a goal: the adopt waits for a person.
-    assert!(applied.overridden.unwrap().contains("closed"));
-    let ask = applied.ask.unwrap().ask;
-    assert_eq!(ask.kind, AskKind::FollowUp);
-    let notifications = backend.notifications.lock().unwrap().clone();
-    assert_eq!(notifications.len(), 1, "{notifications:?}");
-    assert!(
-        notifications[0].0.ends_with("follow_up"),
-        "{notifications:?}"
-    );
-    // The lease is gone: nothing more is applied.
-    assert!(
-        follow_up::finish(
-            &mut queue,
-            dir.path(),
-            &backend,
-            draft,
-            "sv",
-            &job,
-            &verdict
-        )
-        .unwrap()
-        .is_none()
-    );
+    let (origin, material) = queue.draft_origin(draft).unwrap().unwrap();
+    assert_eq!(origin, DraftOrigin::FollowUp);
+    assert_eq!(material["source_task_id"], source.id().as_i64());
+    assert_eq!(material["source_run_id"], run.id().as_str());
+    let targets = queue.planner_drafts().unwrap();
+    assert_eq!(targets.len(), 1);
+    assert_eq!(targets[0].task.id(), draft);
 
-    queue.answer(ask.id, "adopt").unwrap();
+    // A planner of the runtime's may not submit it: it has no goal and is
+    // two follow-ups from a person.
+    queue
+        .edit_task(
+            draft,
+            dagq::domain::TaskEdit {
+                acceptance: Some("works".into()),
+                verification_commands: Some(vec!["true".into()]),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let runtime_owner = PlannerOwner {
+        origin: PlannerOrigin::Runtime,
+        workspace_id: Some("RT".into()),
+    };
+    let refused = queue
+        .submit(Submission {
+            tasks: vec![draft],
+            goals: Vec::new(),
+            proposal: None,
+            owner: runtime_owner.clone(),
+        })
+        .unwrap_err()
+        .to_string();
+    assert!(refused.contains("planner_question"), "{refused}");
+
+    // So it asks; the question keeps the draft from other planners, and its
+    // answer goes to a new planner (none works on the draft).
+    let asked = queue
+        .ask(NewAsk {
+            kind: AskKind::PlannerQuestion,
+            task_id: Some(draft),
+            run_id: None,
+            question: "adopt it?".into(),
+            options: PLANNER_QUESTION_OPTIONS
+                .iter()
+                .map(|o| (*o).into())
+                .collect(),
+            asked_by: "planner".into(),
+        })
+        .unwrap()
+        .ask;
+    assert!(queue.planner_drafts().unwrap().is_empty());
+    let answered = queue.answer(asked.id, "adopt").unwrap();
+    assert_eq!(
+        queue.planner_answer_route(&answered).unwrap(),
+        PlannerAnswerRoute::NewPlanner
+    );
     let status = runtime::status_for(&db, Some(SessionRole::Inbox)).unwrap();
     let attention = status["attention"]
         .as_array()
         .unwrap()
         .iter()
-        .find(|a| a["ask_id"] == ask.id.as_i64())
+        .find(|a| a["ask_id"] == asked.id.as_i64())
         .cloned()
         .unwrap();
     assert_eq!(
         attention["next"],
-        format!("applying the answer of ask {} (runtime)", ask.id)
+        format!("delivering the answer of ask {} (runtime)", asked.id)
     );
-    let applied = queue.decide_follow_up(ask.id).unwrap().unwrap();
-    assert_eq!(applied.new_task.unwrap().status(), TaskStatus::Ready);
-    assert_eq!(queue.follow_up_depth(applied.draft.id()).unwrap(), 2);
+    let events = dagq::watch::events(&db, dagq::domain::EventId::new(0), 100, false).unwrap();
+    assert!(
+        !events["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["kind"] == "ask_answered"),
+        "{events}"
+    );
+
+    // With the person's adopt the runtime's planner submits it, and the
+    // follow-up counts from 0 again.
+    queue
+        .submit(Submission {
+            tasks: vec![draft],
+            goals: Vec::new(),
+            proposal: None,
+            owner: runtime_owner,
+        })
+        .unwrap();
+    assert_eq!(queue.follow_up_depth(draft).unwrap(), 0);
+    let adopted: Vec<_> = queue
+        .show(draft)
+        .unwrap()
+        .events
+        .into_iter()
+        .filter(|e| e.kind == "follow_up_adopted")
+        .collect();
+    assert_eq!(adopted.len(), 1);
+    assert_eq!(adopted[0].payload["by"], "person");
+    assert_eq!(adopted[0].payload["ask_id"], asked.id.as_i64());
+    assert_eq!(adopted[0].payload["source_task_id"], source.id().as_i64());
+    // The draft moved on: its answer is closed by the runtime, not typed.
+    assert_eq!(
+        queue.planner_answer_route(&answered).unwrap(),
+        PlannerAnswerRoute::Close
+    );
 }
 
 /// Supervisor options whose receipt-less idle threshold is one second.

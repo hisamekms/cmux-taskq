@@ -72,6 +72,7 @@ use crate::domain::{
 
 mod adopt;
 mod deliver;
+mod draft_planner;
 mod exit;
 mod idle;
 mod jobs;

@@ -7,7 +7,7 @@
 
 use serde::Serialize;
 
-use super::{PlannerId, PlannerOrigin, PlannerState, ProposalId, heartbeat_stale};
+use super::{PlannerId, PlannerOrigin, PlannerState, ProposalId, TaskId, heartbeat_stale};
 
 /// One planner as the queue records it. Times are Unix seconds.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -18,6 +18,9 @@ pub struct PlannerSession {
     /// The proposal the runtime opened it for; a person's planner has none
     /// until it submits (the proposal then names its workspace).
     pub proposal_id: Option<ProposalId>,
+    /// The draft the runtime opened it for (ADR-0041 decision 16): a
+    /// follow_up or another draft the runtime or a job registered.
+    pub draft_task_id: Option<TaskId>,
     /// The cmux workspace's UUID, once cmux created it (ADR-0026).
     pub workspace_id: Option<String>,
     pub wrapper_pid: Option<u32>,
@@ -116,6 +119,7 @@ mod tests {
             id: PlannerId::new(1),
             origin: PlannerOrigin::Person,
             proposal_id: None,
+            draft_task_id: None,
             workspace_id: Some("W".into()),
             wrapper_pid: Some(10),
             agent_pid: Some(11),

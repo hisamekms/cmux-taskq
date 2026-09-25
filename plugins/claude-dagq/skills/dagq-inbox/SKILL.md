@@ -42,7 +42,7 @@ It prints each open ask in full (`question`, `options`, `kind`, `task_id`, `run_
 
 When the person wants more context before answering, read it for them with `"$DAGQ" show <task_id>` (and `--full` for a receipt), without changing anything. Leave an ask they do not want to answer yet open.
 
-What the kinds mean: `approve_landing` (the supervisor's review doubted a landing: `land`, `send_back` or `cancel`, applied by the supervisor), `decide` (a triage's choice, `retry` / `resume` / `cancel`, or `retry` / `cancel` for a run that used up its resumes; applied by the supervisor), `worker_question` (a worker's own question; the supervisor types the answer into its terminal), `answer_prompt` (a worker's session stopped at a dialog; the question ends with its screen), `stuck_exit` (a session held the supervisor's `/exit` back, including one sent because its wrapper stopped heartbeating: `exit` or `wait`), `blocked` (the observer saw a threshold crossed; when the answer is new work, tell the person the planner registers it).
+What the kinds mean: `approve_landing` (the supervisor's review doubted a landing: `land`, `send_back` or `cancel`, applied by the supervisor), `decide` (a triage's choice, `retry` / `resume` / `cancel`, or `retry` / `cancel` for a run that used up its resumes; applied by the supervisor), `worker_question` (a worker's own question; the supervisor types the answer into its terminal), `planner_question` (a planner the runtime opened for a draft cannot decide it: `adopt`, `cancel` or `keep_draft`; the supervisor types the answer into that planner or hands it to a new one), `answer_prompt` (a worker's session stopped at a dialog; the question ends with its screen), `stuck_exit` (a session held the supervisor's `/exit` back, including one sent because its wrapper stopped heartbeating: `exit` or `wait`), `blocked` (the observer saw a threshold crossed; when the answer is new work, tell the person the planner registers it).
 
 ## 4. Report the other attention, act only on the person's word
 
@@ -50,6 +50,7 @@ Report each to the person in one short list (task, status, `next`, gist of `last
 
 - `read the answer of ask <id> and close it` (`ask_answered`): an answer the runtime does not apply. `stuck_exit` `exit`, `answer_prompt`, or text the person wrote: carry it out as `${CLAUDE_PLUGIN_ROOT}/skills/dagq-recover/reference/session.md` says, then `"$DAGQ" ask close <id>`. `wait`, or an answer that needs nothing from this session: `ask close <id>`.
 - `send the answer of ask <id> to the worker and close it`: the supervisor could not type a worker's answer; `session.md` too.
+- `decide the draft in a planner` (`draft_planner_exhausted`): the runtime's planners left a draft undecided; tell the person, who decides it in a planner of theirs.
 - `restart supervisor` (`supervisor_stopped`, `supervisor_stale`): tell the person; `up` once they say so (`dagq-recover`, section 5).
 - `review by hand`, `review and integrate`, `push main`: `${CLAUDE_PLUGIN_ROOT}/skills/dagq-recover/reference/review-by-hand.md`, with the person.
 - `recover run`, `triage by hand`: the `dagq-recover` skill.

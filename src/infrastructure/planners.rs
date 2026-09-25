@@ -118,11 +118,12 @@ impl SqliteQueue {
     }
 }
 
-fn planner_row(r: &Row<'_>) -> rusqlite::Result<PlannerSession> {
+pub(super) fn planner_row(r: &Row<'_>) -> rusqlite::Result<PlannerSession> {
     Ok(PlannerSession {
         id: r.get("id")?,
         origin: enum_col(r, "origin")?,
         proposal_id: r.get("proposal_id")?,
+        draft_task_id: r.get("draft_task_id")?,
         workspace_id: r.get("workspace_id")?,
         wrapper_pid: r.get("wrapper_pid")?,
         agent_pid: r.get("agent_pid")?,

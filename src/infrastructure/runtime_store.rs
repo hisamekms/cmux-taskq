@@ -99,8 +99,7 @@ impl SqliteQueue {
     }
 
     /// One heartbeat of a process identified by `token`: its registration
-    /// (if it is a resident supervisor) and every lease it holds (run leases
-    /// and the task leases of its follow-up triages), in one
+    /// (if it is a resident supervisor) and every run lease it holds, in one
     /// transaction so `status` never sees them disagree. Returns the number
     /// of leases refreshed.
     pub fn heartbeat(&mut self, token: &str) -> Result<usize> {
@@ -114,9 +113,6 @@ impl SqliteQueue {
         )?;
         let leases = tx.execute(
             "UPDATE run_leases SET heartbeat_at=?2 WHERE token=?1",
-            params![token, now],
-        )? + tx.execute(
-            "UPDATE task_leases SET heartbeat_at=?2 WHERE supervisor_token=?1",
             params![token, now],
         )?;
         tx.commit()?;

@@ -7,7 +7,6 @@
 //! the dependency view of `list` and `graph` stay here.
 
 pub mod ask;
-pub mod follow_up;
 pub mod health;
 pub mod integrate;
 pub mod lifecycle;

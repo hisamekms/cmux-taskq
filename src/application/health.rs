@@ -10,7 +10,7 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use std::path::Path;
 
-use super::{AskQuery, Clock, ProcessControl, Queue, RunFiles, TRIAGE_ASKER};
+use super::{AskQuery, Clock, PlannerAnswerRoute, ProcessControl, Queue, RunFiles, TRIAGE_ASKER};
 use crate::domain::{
     ASK_EVENT_KINDS, AskId, AskKind, Attention, AttentionNext, HEARTBEAT_TIMEOUT_SECS,
     LANDING_OPTIONS, ReasonCode, RunEvent, RunId, RunLease, RunProcess, RunStatus, SessionRole,
@@ -628,6 +628,21 @@ pub fn attention(
     // A proposal whose plan review failed, or whose planner did not answer
     // a revise, waits for a person outside any ask (ADR-0041 decisions 13,
     // 17); it is shown on the proposal's first task.
+    // A draft the runtime's planners left undecided waits for a person's
+    // planner (ADR-0041 decision 16).
+    for draft in queue.exhausted_drafts()? {
+        attention.push(Attention {
+            run_id: None,
+            task_id: Some(draft.id()),
+            pid: None,
+            ask_id: None,
+            status: draft.status().as_str().into(),
+            kind: "draft_planner_exhausted".into(),
+            last_error: None,
+            last_error_code: None,
+            next: AttentionNext::DecideDraft,
+        });
+    }
     for hold in queue.plan_review_holds()? {
         let (status, next) = match hold.kind {
             "plan_review_failed" => ("submitted", AttentionNext::PlanReviewByHand),
@@ -715,13 +730,22 @@ pub fn attention(
                 "ask_answered",
                 AttentionNext::ApplyingAnswer { ask_id: ask.id },
             )
-        } else if ask.kind == AskKind::FollowUp && queue.applies_follow_up_answer(&ask)? {
-            // The supervisor adopts, cancels or keeps the follow_up draft
-            // (ADR-0037 decision 7).
+        } else if ask.kind == AskKind::PlannerQuestion
+            && queue.planner_answer_route(&ask)? != PlannerAnswerRoute::Person
+        {
+            // The supervisor types the answer into the runtime's planner
+            // that works on the task, or opens one with it (ADR-0041
+            // decision 13).
             (
                 "answered",
                 "ask_answered",
-                AttentionNext::ApplyingAnswer { ask_id: ask.id },
+                AttentionNext::DeliveringAnswer { ask_id: ask.id },
+            )
+        } else if ask.kind == AskKind::PlannerQuestion {
+            (
+                "answered",
+                "ask_answered",
+                AttentionNext::DeliverAnswer { ask_id: ask.id },
             )
         } else if ask.kind == AskKind::Stalled
             && ask.answer.as_deref().map(str::trim) == Some("wait")

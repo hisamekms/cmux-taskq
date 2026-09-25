@@ -85,16 +85,19 @@ impl SqliteQueue {
                     && ask.options.iter().any(|option| option == text.trim())
             );
         }
-        if ask.kind == AskKind::FollowUp {
-            // The supervisor adopts, cancels or keeps the draft as answered
-            // (ADR-0037 decision 7); any other answer, an `adopt` without a
-            // valid proposal, or one for a draft that moved on is a
-            // person's to read.
-            payload["runtime_delivers"] = json!(SqliteQueue::follow_up_answer_applies(
-                &tx,
-                &ask,
-                text.trim()
-            )?);
+        if ask.kind == AskKind::PlannerQuestion {
+            // The supervisor types it into the workspace of the runtime's
+            // planner that works on its task, or opens one for a draft that
+            // still waits (ADR-0041 decision 13); otherwise it is the
+            // inbox's to deliver.
+            let answered = Ask {
+                answer: Some(text.to_owned()),
+                ..ask.clone()
+            };
+            payload["runtime_delivers"] = json!(
+                super::draft_planners::route_of(&tx, &answered)?
+                    != crate::application::PlannerAnswerRoute::Person
+            );
         }
         if ask.kind == AskKind::ApprovePlan {
             // The supervisor readies, sends back or cancels the proposal as
@@ -407,7 +410,7 @@ pub(super) fn read_ask(conn: &Connection, id: AskId) -> Result<Ask> {
         .with_context(|| format!("ask {id} does not exist"))
 }
 
-fn ask_row(row: &Row<'_>) -> rusqlite::Result<Ask> {
+pub(super) fn ask_row(row: &Row<'_>) -> rusqlite::Result<Ask> {
     Ok(Ask {
         id: row.get("id")?,
         kind: enum_col(row, "kind")?,

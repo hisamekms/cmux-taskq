@@ -2,7 +2,8 @@
 //! workspaces where a planner writes goals and tasks and submits them as a
 //! proposal. A person opens one with `dagq plan` (as many as they like at
 //! once); the runtime opens one for a proposal plan review sent back while
-//! its own planner was closed ([`open_runtime_planner`]). Each is a
+//! its own planner was closed ([`open_runtime_planner`]) and for a draft
+//! the runtime or a job registered ([`open_draft_planner`]). Each is a
 //! `planners` row with its own directory under the queue's `planners/`
 //! (its prompt, the wrapper binary, the agent's settings, log and idle
 //! marker).
@@ -115,8 +116,28 @@ pub fn open_planner(
     proposal: Option<ProposalId>,
     prompt: &str,
 ) -> Result<OpenedPlanner> {
+    let planner = launch.queue.open_planner(origin, proposal)?;
+    launch_planner(launch, planner, prompt)
+}
+
+/// Open the workspace of a planner the runtime recorded for a draft
+/// (ADR-0041 decision 16, [`super::DraftPlannerStore::open_draft_planner`])
+/// with `prompt`, the way [`open_planner`] does.
+pub fn open_draft_planner(
+    launch: &PlannerLaunch<'_>,
+    planner: PlannerSession,
+    prompt: &str,
+) -> Result<OpenedPlanner> {
+    launch_planner(launch, planner, prompt)
+}
+
+fn launch_planner(
+    launch: &PlannerLaunch<'_>,
+    planner: PlannerSession,
+    prompt: &str,
+) -> Result<OpenedPlanner> {
     let queue = launch.queue;
-    let planner = queue.open_planner(origin, proposal)?;
+    let proposal = planner.proposal_id;
     let dir = planner_dir(launch.planners_dir, planner.id);
     let workspaces = QueueWorkspaces::new(
         launch.cmux,
@@ -124,7 +145,10 @@ pub fn open_planner(
         launch.queue_hash.to_owned(),
         launch.repo_root,
     );
-    let name = planner_workspace_name(launch.repo_root, planner.id, proposal);
+    let mut name = planner_workspace_name(launch.repo_root, planner.id, proposal);
+    if let Some(draft) = planner.draft_task_id {
+        name.push_str(&format!(" - draft task {draft}"));
+    }
     let opened = create_workspace(launch, &workspaces, &planner, &dir, &name, prompt);
     let workspace_id = match opened {
         Ok(id) => id,
