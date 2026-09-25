@@ -10,13 +10,17 @@ use dagq::{
         Clock, Generators, IdGenerator, StatusFilter, TaskQuery, TaskStore, dependency_graph,
         timestamp,
     },
+    domain::search::{SearchKind, SearchQuery, SearchRef},
     domain::{
         ClaimOutcome, CommitSha, EventId, EvidenceCheck, GoalEdit, GoalId, GoalStatus, GoalVerdict,
         NewGoal, NewNote, NewTask, NotePage, NoteQuery, NoteTarget, PlannerOrigin, PlannerOwner,
         Priority, ProposalId, ProposalStatus, Provider, RunId, RunStatus, Submission,
         SupervisorMode, TaskAction, TaskEdit, TaskId, TaskStatus,
     },
-    infrastructure::sqlite::SqliteQueue,
+    infrastructure::{
+        schema::{MIGRATIONS, floor_for},
+        sqlite::SqliteQueue,
+    },
 };
 use rusqlite::Connection;
 use tempfile::TempDir;
@@ -639,7 +643,7 @@ fn a_newer_queue_within_the_floor_is_used_as_it_is() {
     let schema = SqliteQueue::schema(&path).unwrap();
     assert_eq!(
         (schema.schema_version, schema.floor, schema.opens),
-        (newer, SqliteQueue::SCHEMA_VERSION, true)
+        (newer, floor_for(SqliteQueue::SCHEMA_VERSION), true)
     );
     assert!(schema.pending.is_empty());
     // Reads, writes and a claim all work on the columns this binary knows.
@@ -679,10 +683,13 @@ fn a_newer_queue_within_the_floor_is_used_as_it_is() {
 /// leaves until `dagq migrate` runs.
 fn queue_before_the_floor(dir: &TempDir) -> std::path::PathBuf {
     let path = dir.path().join("queue.db");
-    drop(SqliteQueue::init(&path).unwrap());
     let raw = Connection::open(&path).unwrap();
-    raw.execute_batch("DROP TABLE schema_floor; PRAGMA user_version = 23;")
+    for migration in &MIGRATIONS[..23] {
+        raw.execute_batch(migration).unwrap();
+    }
+    raw.pragma_update(None, "application_id", 0x43545131)
         .unwrap();
+    raw.pragma_update(None, "user_version", 23).unwrap();
     path
 }
 
@@ -698,8 +705,9 @@ fn opening_or_initializing_an_older_queue_never_migrates_it() {
             error.to_string(),
             format!(
                 "queue schema version 23 is older than this binary's schema {}; run `dagq \
-                 migrate` to apply the 2 pending migration(s)",
-                SqliteQueue::SCHEMA_VERSION
+                 migrate` to apply the {} pending migration(s)",
+                SqliteQueue::SCHEMA_VERSION,
+                SqliteQueue::SCHEMA_VERSION - 23
             )
         );
     }
@@ -712,7 +720,7 @@ fn opening_or_initializing_an_older_queue_never_migrates_it() {
             .iter()
             .map(|m| (m.version, m.compatible))
             .collect::<Vec<_>>(),
-        vec![(24, false), (25, false)]
+        vec![(24, false), (25, false), (26, true)]
     );
     let raw = Connection::open(&path).unwrap();
     assert_eq!(
@@ -724,8 +732,8 @@ fn opening_or_initializing_an_older_queue_never_migrates_it() {
     std::fs::create_dir_all(dir.path().join("backups")).unwrap();
     std::fs::write(dir.path().join("backups/queue-23-5.sqlite3"), "earlier").unwrap();
     let report = SqliteQueue::migrate(&path, Some(&|_| false), 5).unwrap();
-    assert_eq!(report.floor, SqliteQueue::SCHEMA_VERSION);
-    assert_eq!(report.applied.len(), 2);
+    assert_eq!(report.floor, floor_for(SqliteQueue::SCHEMA_VERSION));
+    assert_eq!(report.applied.len(), 3);
     let backup = report.backup.unwrap();
     assert!(
         backup.ends_with("backups/queue-23-5-1.sqlite3"),
@@ -1247,10 +1255,10 @@ fn migration_from_v6_adds_goals_and_keeps_tasks_runs_and_events() {
     // blocked asks), 0017 (the stuck_exit ask), 0018 (task paths), 0019
     // (goal dependencies), 0020 (task priority), 0021 (proposals) and 0022
     // (follow-up triage: task leases, follow_up_depth, the follow_up ask),
-    // 0023 (planner sessions), 0024 (the schema floor) and 0025 (the stalled
-    // ask) are applied together.
-    assert_eq!(SqliteQueue::SCHEMA_VERSION, 25);
-    assert_eq!(queue.schema_version().unwrap(), 25);
+    // 0023 (planner sessions), 0024 (the schema floor), 0025 (the stalled
+    // ask) and 0026 (the search index) are applied together.
+    assert_eq!(SqliteQueue::SCHEMA_VERSION, 26);
+    assert_eq!(queue.schema_version().unwrap(), 26);
     assert_eq!(
         queue
             .session_workspace(dagq::domain::SessionRole::Inbox)
@@ -2686,4 +2694,293 @@ fn migration_to_v21_keeps_drafts_and_the_task_id_sequence() {
         })
         .unwrap();
     assert_eq!(violations, 0);
+}
+
+fn search(queue: &SqliteQueue, terms: &str, adjust: impl FnOnce(&mut SearchQuery)) -> Vec<String> {
+    let mut query = SearchQuery {
+        terms: terms.into(),
+        limit: 20,
+        ..SearchQuery::default()
+    };
+    adjust(&mut query);
+    let page = queue.search(&query).unwrap();
+    assert_eq!(page.total, page.hits.len());
+    page.hits
+        .iter()
+        .map(|hit| {
+            let id = match &hit.id {
+                SearchRef::Id(id) => id.to_string(),
+                SearchRef::Commit(sha) => sha.clone(),
+            };
+            format!(
+                "{} {id} {} {}: {}",
+                hit.kind.as_str(),
+                hit.status.as_deref().unwrap_or("-"),
+                hit.field,
+                hit.excerpt
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn search_finds_every_kind_in_every_status_and_follows_edits() {
+    let (dir, mut queue) = fixture();
+    let goal = queue
+        .add_goal(NewGoal {
+            constraints: "埋め込みは入れない".into(),
+            ..new_goal("重複を見つける")
+        })
+        .unwrap()
+        .id();
+    let task = queue
+        .add(NewTask {
+            description: "FTS5 の trigram で src/infrastructure/search.rs を足す".into(),
+            goal_id: Some(goal),
+            ..new_task("runtime: 全文検索を入れる")
+        })
+        .unwrap()
+        .id();
+    let other = queue
+        .add(new_task("Find duplicate tasks by their test names"))
+        .unwrap()
+        .id();
+    queue.transition(other, TaskAction::Cancel).unwrap();
+    for (target, text) in [
+        (NoteTarget::Task(task), "ID の衝突に注意する"),
+        (NoteTarget::Goal(goal), "goal の観察メモ"),
+    ] {
+        queue
+            .add_note(NewNote {
+                target,
+                text: text.into(),
+                kind: None,
+                by: "human".into(),
+            })
+            .unwrap();
+    }
+    assert_eq!(
+        search(&queue, "全文検索", |_| {}),
+        ["task 1 draft title: runtime: «全文検索»を入れる"]
+    );
+    assert_eq!(
+        search(&queue, "埋め込み", |_| {}),
+        ["goal 1 open constraints: «埋め込み»は入れない"]
+    );
+    assert_eq!(
+        search(&queue, "search.rs", |_| {}),
+        ["task 1 draft description: …am で src/infrastructure/«search.rs» を足す"]
+    );
+    // A canceled task is found, and --status keeps to the statuses given.
+    assert_eq!(
+        search(&queue, "DUPLICATE", |_| {}),
+        ["task 2 canceled title: Find «duplicate» tasks by their test nam…"]
+    );
+    assert!(search(&queue, "duplicate", |q| q.statuses = vec!["draft".into()]).is_empty());
+    // Terms under three characters are matched too, all of them.
+    assert_eq!(
+        search(&queue, "ID", |_| {}),
+        ["note 5 draft text: «ID» の衝突に注意する"]
+    );
+    assert_eq!(
+        search(&queue, "観察 goal", |_| {}),
+        ["note 6 open text: «goal» の観察メモ"]
+    );
+    assert!(search(&queue, "ID 観察", |_| {}).is_empty());
+    assert_eq!(
+        search(&queue, "trigram OR 観察メモ", |q| q.kinds =
+            vec![SearchKind::Note])
+        .len(),
+        1
+    );
+    assert_eq!(
+        search(&queue, "を入れる OR 見つける OR 観察メモ", |_| {}).len(),
+        3
+    );
+    assert_eq!(
+        search(
+            &queue,
+            "を入れる OR 見つける OR 観察メモ OR 注意する OR test",
+            |q| { q.goal_id = Some(goal) }
+        )
+        .len(),
+        4
+    );
+    assert!(
+        queue
+            .search(&SearchQuery {
+                terms: "ID OR x".into(),
+                limit: 1,
+                ..SearchQuery::default()
+            })
+            .unwrap_err()
+            .to_string()
+            .contains("cannot be combined")
+    );
+
+    // Edits replace what is indexed; the new status reaches the notes.
+    queue
+        .edit_task(
+            task,
+            TaskEdit {
+                description: Some("SQLite の索引を使う".into()),
+                ..TaskEdit::default()
+            },
+        )
+        .unwrap();
+    assert!(search(&queue, "trigram", |_| {}).is_empty());
+    assert_eq!(search(&queue, "sqlite", |_| {}).len(), 1);
+    queue
+        .edit_goal(
+            goal,
+            GoalEdit {
+                constraints: Some("意味の検索は後回し".into()),
+                ..GoalEdit::default()
+            },
+        )
+        .unwrap();
+    assert!(search(&queue, "埋め込み", |_| {}).is_empty());
+    assert_eq!(search(&queue, "後回し", |_| {}).len(), 1);
+    queue.transition(task, TaskAction::Cancel).unwrap();
+    queue.close_goal(goal, GoalVerdict::Abandoned).unwrap();
+    let mut closed = search(&queue, "注意する OR 観察メモ OR 後回し", |_| {});
+    closed.sort();
+    assert_eq!(
+        closed,
+        [
+            "goal 1 abandoned constraints: 意味の検索は«後回し»",
+            "note 5 canceled text: ID の衝突に«注意する»",
+            "note 6 abandoned text: goal の«観察メモ»",
+        ]
+    );
+
+    // --full adds every field and the score.
+    let full = queue
+        .search(&SearchQuery {
+            terms: "後回し".into(),
+            limit: 5,
+            full: true,
+            ..SearchQuery::default()
+        })
+        .unwrap();
+    let hit = &full.hits[0];
+    assert!(hit.score.is_some());
+    assert_eq!(
+        hit.fields.as_ref().unwrap()["constraints"],
+        "意味の検索は後回し"
+    );
+
+    // What an older binary writes is indexed by the triggers alike.
+    drop(queue);
+    let raw = Connection::open(dir.path().join("queue.db")).unwrap();
+    raw.execute(
+        "INSERT INTO tasks(title,description,acceptance,verification_commands)
+         VALUES ('older binary の登録','','','[]')",
+        [],
+    )
+    .unwrap();
+    let queue = SqliteQueue::open(dir.path().join("queue.db")).unwrap();
+    assert_eq!(
+        search(&queue, "older", |_| {}),
+        ["task 3 draft title: «older» binary の登録"]
+    );
+}
+
+#[test]
+fn migration_indexes_the_existing_rows_and_landings_record_their_message() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("queue.db");
+    let raw = Connection::open(&path).unwrap();
+    for migration in &MIGRATIONS[..25] {
+        raw.execute_batch(migration).unwrap();
+    }
+    raw.execute_batch(&format!(
+        "PRAGMA application_id = 1129599281; PRAGMA user_version = 25;
+         INSERT INTO schema_floor(singleton, floor) VALUES (1, 25);
+         INSERT INTO goals(title, constraints, updated_at)
+         VALUES ('古い goal', '互換を宣言する', '2026-09-01T00:00:00.000Z');
+         INSERT INTO tasks(title,description,acceptance,verification_commands,status,goal_id,
+                           updated_at)
+         VALUES ('古い task','着地済みの変更','','[]','completed',1,'2026-09-02T00:00:00.000Z'),
+                ('second','','','[]','completed',NULL,'2026-09-02T00:00:00.000Z');
+         INSERT INTO task_runs(id,task_id,status,requested_provider,actual_provider,base_commit)
+         VALUES ('run-1',1,'integrated','claude','claude','{BASE}'),
+                ('run-2',2,'integrated','claude','claude','{BASE}');
+         INSERT INTO run_events(task_id,goal_id,run_id,kind,payload) VALUES
+           (1,NULL,'run-1','observation','{{\"text\":\"古いメモ\",\"kind\":\"note\",\"by\":\"human\"}}'),
+           (1,NULL,'run-1','run_integrated',
+            '{{\"result_commit\":\"aaaa\",\"message\":\"docs: 古い task\\n\\nsummary を書いた\",\"git_common_dir\":\"/repo/.git\"}}'),
+           (2,NULL,'run-2','run_integrated','{{\"result_commit\":\"bbbb\"}}');"
+    ))
+    .unwrap();
+    let report = SqliteQueue::migrate(&path, None, 0).unwrap();
+    assert_eq!(
+        report
+            .applied
+            .iter()
+            .map(|m| (m.version, m.compatible))
+            .collect::<Vec<_>>(),
+        [(26, true)]
+    );
+    // A compatible migration alone takes no copy and keeps the floor.
+    assert!(report.backup.is_none());
+    assert_eq!(report.floor, 25);
+    let mut queue = SqliteQueue::open(&path).unwrap();
+    assert_eq!(
+        search(&queue, "古い", |_| {}),
+        [
+            "commit aaaa completed message: docs: «古い» task\n\nsummary を書いた",
+            "note 1 completed text: «古い»メモ",
+            "task 1 completed title: «古い» task",
+            "goal 1 open title: «古い» goal",
+        ]
+    );
+    let page = queue
+        .search(&SearchQuery {
+            terms: "summary".into(),
+            kinds: vec![SearchKind::Commit],
+            goal_id: Some(GoalId::new(1)),
+            limit: 5,
+            ..SearchQuery::default()
+        })
+        .unwrap();
+    let hit = &page.hits[0];
+    assert_eq!(
+        (hit.task_id, hit.run_id.as_deref(), hit.title.as_str()),
+        (Some(1), Some("run-1"), "docs: 古い task")
+    );
+    // The landing recorded without its message is filled from Git.
+    let seen = Mutex::new(Vec::new());
+    let filled = queue
+        .fill_commit_messages(|dir, commit| {
+            seen.lock()
+                .unwrap()
+                .push((dir.map(str::to_owned), commit.to_owned()));
+            Some("fix: 読み直した message".into())
+        })
+        .unwrap();
+    assert_eq!(filled, 1);
+    assert_eq!(seen.into_inner().unwrap(), [(None, "bbbb".to_owned())]);
+    assert_eq!(
+        search(&queue, "読み直した", |_| {}),
+        ["commit bbbb completed message: fix: «読み直した» message"]
+    );
+    assert_eq!(queue.fill_commit_messages(|_, _| None).unwrap(), 0);
+
+    // A later landing is recorded with the event that records it.
+    drop(queue);
+    raw.execute_batch(&format!(
+        "INSERT INTO tasks(title,description,acceptance,verification_commands,status)
+         VALUES ('third','','','[]','completed');
+         INSERT INTO task_runs(id,task_id,status,requested_provider,actual_provider,base_commit)
+         VALUES ('run-3',3,'integrated','claude','claude','{BASE}');
+         INSERT INTO run_events(task_id,run_id,kind,payload) VALUES
+           (3,'run-3','run_integrated','{{\"result_commit\":\"cccc\",\"message\":\"feat: 新しい着地\"}}');"
+    ))
+    .unwrap();
+    let queue = SqliteQueue::open(&path).unwrap();
+    assert_eq!(
+        search(&queue, "新しい着地", |_| {}),
+        ["commit cccc completed message: feat: «新しい着地»"]
+    );
 }

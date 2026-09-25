@@ -77,6 +77,10 @@ pub enum DomainError {
     },
     /// A proposal without a task (`submit`).
     EmptyProposal,
+    /// A `search` query the index cannot run (ADR-0046 decision 1).
+    SearchQuery {
+        reason: String,
+    },
     /// A task already in another proposal that is submitted or revising.
     TaskInOtherProposal {
         task_id: TaskId,
@@ -241,6 +245,7 @@ impl fmt::Display for DomainError {
                 "moving task {task_id} to goal {goal_id} would create a cycle: the task already waits for the goal"
             ),
             Self::EmptyProposal => f.write_str("a proposal needs at least one draft task"),
+            Self::SearchQuery { reason } => write!(f, "invalid search query: {reason}"),
             Self::TaskInOtherProposal {
                 task_id,
                 proposal_id,

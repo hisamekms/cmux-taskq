@@ -2251,14 +2251,16 @@ fn run_copy(binary: &Path, db: &Path, args: &[&str]) -> Output {
 fn migrate_is_explicit_and_older_binaries_keep_working_within_the_floor() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("queue.db");
-    ok(&db, &["init"]);
     let raw = rusqlite::Connection::open(&db).unwrap();
     let version = || -> i64 {
         raw.pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap()
     };
     // A queue left at schema 23 by the binary before the floor table.
-    raw.execute_batch("DROP TABLE schema_floor; PRAGMA user_version = 23;")
+    for migration in &dagq::infrastructure::schema::MIGRATIONS[..23] {
+        raw.execute_batch(migration).unwrap();
+    }
+    raw.execute_batch("PRAGMA application_id = 1129599281; PRAGMA user_version = 23;")
         .unwrap();
     for args in [&["list"][..], &["status"], &["init"]] {
         let error = refused(&db, args);
@@ -2272,14 +2274,19 @@ fn migrate_is_explicit_and_older_binaries_keep_working_within_the_floor() {
         check["pending"],
         serde_json::json!([
             {"version": 24, "compatible": false},
-            {"version": 25, "compatible": false}
+            {"version": 25, "compatible": false},
+            {"version": 26, "compatible": true}
         ])
     );
     assert_eq!(version(), 23);
     let migrated = ok(&db, &["migrate"]);
     assert_eq!(migrated["previous_version"], 23);
     assert_eq!(migrated["schema_version"], SqliteQueue::SCHEMA_VERSION);
-    assert_eq!(migrated["floor"], SqliteQueue::SCHEMA_VERSION);
+    assert_eq!(
+        migrated["floor"],
+        dagq::infrastructure::schema::floor_for(SqliteQueue::SCHEMA_VERSION)
+    );
+    assert_eq!(migrated["commit_messages_filled"], 0);
     let backup = migrated["backup"].as_str().unwrap();
     assert!(Path::new(backup).starts_with(dir.path().canonicalize().unwrap().join("backups")));
     assert_eq!(version(), SqliteQueue::SCHEMA_VERSION);
@@ -2415,4 +2422,78 @@ fn lint_reports_violations_by_code_and_passes_a_sound_plan() {
     assert!(!invoke(&db, &["lint", "99"]).status.success());
     assert!(!invoke(&db, &["lint", "--proposal", "9"]).status.success());
     assert!(!invoke(&db, &["lint"]).status.success());
+}
+
+#[test]
+fn search_prints_hits_with_excerpts_and_checks_its_filters() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("queue.db");
+    ok(&db, &["init"]);
+    ok(
+        &db,
+        &[
+            "goal",
+            "add",
+            "重複を見つける",
+            "--acceptance",
+            "上位 5 件に出る",
+        ],
+    );
+    ok(
+        &db,
+        &[
+            "add",
+            "runtime: 全文検索",
+            "--goal",
+            "1",
+            "--description",
+            "FTS5 の trigram",
+        ],
+    );
+    ok(&db, &["add", "unrelated"]);
+    ok(&db, &["cancel", "2"]);
+    ok(&db, &["note", "--task", "1", "--text", "全文検索のメモ"]);
+    let found = ok(&db, &["search", "全文検索"]);
+    assert_eq!(found["total"], 2, "{found}");
+    let kinds: Vec<&str> = found["hits"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|hit| hit["kind"].as_str().unwrap())
+        .collect();
+    assert_eq!(kinds.len(), 2);
+    assert!(kinds.contains(&"task") && kinds.contains(&"note"));
+    let goal = ok(
+        &db,
+        &["search", "上位", "--kind", "goal", "--status", "open"],
+    );
+    assert_eq!(
+        goal["hits"][0],
+        serde_json::json!({
+            "kind": "goal", "id": 1, "status": "open", "title": "重複を見つける",
+            "field": "acceptance", "excerpt": "«上位» 5 件に出る",
+        })
+    );
+    let full = ok(
+        &db,
+        &[
+            "search", "trigram", "--goal", "1", "--kind", "task", "--full", "--limit", "1",
+        ],
+    );
+    assert_eq!(full["hits"][0]["fields"]["description"], "FTS5 の trigram");
+    assert!(full["hits"][0]["score"].is_number(), "{full}");
+    let canceled = ok(
+        &db,
+        &["search", "unrelated", "--status", "canceled,completed"],
+    );
+    assert_eq!(canceled["hits"][0]["id"], 2);
+    assert_eq!(
+        refused(&db, &["search", "x", "--status", "closed"]),
+        "unknown status: closed"
+    );
+    assert!(refused(&db, &["search", "AND"]).contains("the query has no term"));
+    assert!(refused(&db, &["search", "trigram OR"]).starts_with("invalid search query: fts5"));
+    // Reading, so the observer and the headless reviewer may search.
+    ok_as("observer", &db, &["search", "全文検索"]);
+    ok_as("reviewer", &db, &["search", "全文検索"]);
 }

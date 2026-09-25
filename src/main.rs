@@ -20,6 +20,7 @@ use dagq::{
         AskId, AskKind, EventId, GoalEdit, GoalId, GoalVerdict, NewAsk, NewGoal, NewNote, NewTask,
         NoteQuery, NoteTarget, PlannerOrigin, PlannerOwner, ProposalId, RunId, SessionRole,
         Submission, TaskAction, TaskEdit, TaskId, TaskStatus,
+        search::{self, SearchQuery},
     },
     infrastructure::{adapters::path_text, location::QueueLocation, sqlite::SqliteQueue},
 };
@@ -286,6 +287,32 @@ enum Command {
         since: Option<i64>,
         #[arg(long, default_value_t = 20, value_parser = clap::value_parser!(u32).range(1..))]
         limit: u32,
+    },
+    /// Full-text search of tasks (title, description, acceptance, context), goals (title,
+    /// description, acceptance, constraints), notes and the messages of landed commits, in every
+    /// status (ADR-0046). QUERY is words (all must match; `"..."` for a phrase) with FTS5's AND,
+    /// OR, NOT and parentheses; any substring of 3 or more characters matches, including in
+    /// Japanese, and shorter terms must all be present. Prints {"hits", "total"}, best first: per
+    /// hit its kind, id (a task, goal or note event ID, or a commit SHA), status, title and the
+    /// matching field with an excerpt marking the match with « ».
+    Search {
+        query: String,
+        /// Only these statuses (comma-separated): a task's (draft, submitted, ready, in_progress,
+        /// completed, canceled) or a goal's (draft, open, achieved, abandoned); a note or commit
+        /// has the status of its task or goal.
+        #[arg(long, value_delimiter = ',')]
+        status: Vec<String>,
+        /// Only these kinds (comma-separated): task, goal, note, commit.
+        #[arg(long = "kind", value_delimiter = ',', value_parser = ["task", "goal", "note", "commit"])]
+        kinds: Vec<String>,
+        /// Only this goal, its tasks and their notes and commits.
+        #[arg(long = "goal")]
+        goal_id: Option<i64>,
+        #[arg(long, default_value_t = 20, value_parser = clap::value_parser!(u32).range(1..))]
+        limit: u32,
+        /// Include every searched field in full and the bm25 score.
+        #[arg(long)]
+        full: bool,
     },
     /// List ready tasks whose prerequisites are all completed, whose goal dependencies are all
     /// closed as achieved and whose goal is not a draft, in claim order (highest
@@ -700,6 +727,7 @@ fn reviewer_access(command: &Command) -> ObserverAccess {
         | Command::Stats { .. }
         | Command::Doctor { .. }
         | Command::Notes { .. }
+        | Command::Search { .. }
         | Command::Proposal { .. }
         | Command::Planners { .. }
         | Command::Lint { .. }
@@ -736,6 +764,7 @@ fn observer_access(command: &Command) -> ObserverAccess {
         | Command::Doctor { .. }
         | Command::Note { .. }
         | Command::Notes { .. }
+        | Command::Search { .. }
         | Command::Proposal { .. }
         | Command::Planners { .. }
         | Command::Lint { .. }
@@ -817,6 +846,18 @@ fn execute(cli: Cli) -> Result<Value> {
             generators.clock.now(),
         )?;
         let mut value = serde_json::to_value(report)?;
+        // A landing recorded without its message (ADR-0046 decision 3).
+        if let Ok(mut queue) = SqliteQueue::open(&db) {
+            let fallback = common_dir.clone();
+            value["commit_messages_filled"] =
+                json!(queue.fill_commit_messages(|dir, commit| {
+                    let dir = dir.map(str::to_owned).or_else(|| fallback.clone())?;
+                    dagq::infrastructure::adapters::commit_message(
+                        std::path::Path::new(&dir),
+                        commit,
+                    )
+                })?);
+        }
         value["db"] = json!(db);
         return Ok(value);
     }
@@ -1118,6 +1159,29 @@ fn execute(cli: Cli) -> Result<Value> {
             since: since.map(EventId::new),
             limit: usize::try_from(limit)?,
         })?)?,
+        Command::Search {
+            query,
+            status,
+            kinds,
+            goal_id,
+            limit,
+            full,
+        } => serde_json::to_value(
+            queue.search(&SearchQuery {
+                terms: query,
+                kinds: kinds
+                    .iter()
+                    .map(|kind| kind.parse())
+                    .collect::<Result<_, _>>()?,
+                statuses: status
+                    .iter()
+                    .map(|value| search::parse_status(value))
+                    .collect::<Result<_, _>>()?,
+                goal_id: goal_id.map(GoalId::new),
+                limit: usize::try_from(limit)?,
+                full,
+            })?,
+        )?,
         Command::Candidates => {
             let graph = dependency_graph(queue.graph_input()?, None);
             serde_json::to_value(claim_candidates(queue.candidates()?, &graph))?

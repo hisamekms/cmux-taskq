@@ -10,6 +10,7 @@ use dagq::{
         AskId, AskKind, CommitSha, EventId, EvidenceCheck, GoalEdit, GoalId, MAX_RESUME_ATTEMPTS,
         NewAsk, NewGoal, NewTask, Priority, ReasonCode, RunId, RunStatus, SessionRole, Task,
         TaskAction, TaskId, TaskRun, TaskStatus,
+        search::{SearchKind, SearchQuery, SearchRef},
     },
     infrastructure::{
         adapters::{GitRepository, shell_join, workspace_handle},
@@ -3908,6 +3909,25 @@ fn integrate_pushes_the_landed_main_to_origin() {
     );
     let status = runtime::status(&db).unwrap();
     assert!(run_attention_of(&status, run.id()).is_none(), "{status}");
+    // The landing's message is searchable with its task and run (ADR-0046).
+    let subject = git_out(&repo, &["log", "-1", "--format=%s", "main"]);
+    let page = SqliteQueue::open(&db)
+        .unwrap()
+        .search(&SearchQuery {
+            terms: subject.clone(),
+            kinds: vec![SearchKind::Commit],
+            limit: 5,
+            ..SearchQuery::default()
+        })
+        .unwrap();
+    assert_eq!(page.total, 1, "{subject}");
+    let hit = &page.hits[0];
+    assert_eq!(hit.id, SearchRef::Commit(landed));
+    assert_eq!(hit.title, subject.trim());
+    assert_eq!(
+        (hit.task_id, hit.run_id.as_deref(), hit.status.as_deref()),
+        (Some(1), Some(run.id().as_str()), Some("completed"))
+    );
 }
 
 #[test]

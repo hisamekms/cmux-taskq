@@ -39,6 +39,7 @@ pub const MIGRATIONS: &[&str] = &[
     include_str!("../../migrations/0023_planners.sql"),
     include_str!("../../migrations/0024_schema_floor.sql"),
     include_str!("../../migrations/0025_stalled_ask.sql"),
+    include_str!("../../migrations/0026_search.sql"),
 ];
 
 /// The schema version this binary knows: a fully migrated queue's
@@ -80,10 +81,13 @@ pub fn floor_for(version: i64) -> i64 {
 
 /// Why `migration` may not be declared compatible: every statement that
 /// could break a binary unaware of it. Empty means the declaration holds.
-/// Allowed: `CREATE TABLE`, a non-unique `CREATE INDEX`, `ALTER TABLE ...
-/// ADD COLUMN` whose column is nullable or has a default, and `INSERT`
-/// into a table the same migration creates, none of them with a foreign
-/// key or a block comment.
+/// Allowed: `CREATE TABLE`, `CREATE VIRTUAL TABLE`, a non-unique `CREATE
+/// INDEX`, `ALTER TABLE ... ADD COLUMN` whose column is nullable or has a
+/// default, `INSERT` into a table the same migration creates, and an
+/// `AFTER` trigger whose body only inserts into, updates or deletes from
+/// tables the same migration creates (an older binary's write then only
+/// adds to what it does not read), none of them with a foreign key, a
+/// block comment or `RAISE`.
 pub fn compatibility_violations(migration: &str) -> Vec<String> {
     let text: String = migration
         .lines()
@@ -92,7 +96,7 @@ pub fn compatibility_violations(migration: &str) -> Vec<String> {
         .join("\n");
     let mut created = Vec::new();
     let mut violations = Vec::new();
-    for statement in text.split(';') {
+    for statement in statements(&text) {
         let words: Vec<String> = statement
             .split_whitespace()
             .map(str::to_ascii_uppercase)
@@ -103,10 +107,12 @@ pub fn compatibility_violations(migration: &str) -> Vec<String> {
         let head: Vec<&str> = words.iter().map(String::as_str).collect();
         let ok = match head.as_slice() {
             ["CREATE", "TABLE", "IF", "NOT", "EXISTS", name, ..]
-            | ["CREATE", "TABLE", name, ..] => {
+            | ["CREATE", "TABLE", name, ..]
+            | ["CREATE", "VIRTUAL", "TABLE", name, ..] => {
                 created.push(table_name(name));
                 true
             }
+            ["CREATE", "TRIGGER", ..] => trigger_writes_only(&head, &created),
             ["CREATE", "INDEX", ..] => true,
             ["ALTER", "TABLE", _, "ADD", rest @ ..] => {
                 let definition = rest.strip_prefix(&["COLUMN"]).unwrap_or(rest).join(" ");
@@ -130,6 +136,65 @@ pub fn compatibility_violations(migration: &str) -> Vec<String> {
         }
     }
     violations
+}
+
+/// The statements of `text`, split at `;` except inside a trigger, whose
+/// body runs to the `END` after its last statement.
+fn statements(text: &str) -> Vec<String> {
+    let mut statements = Vec::new();
+    let mut trigger: Option<String> = None;
+    for chunk in text.split(';') {
+        if let Some(open) = trigger.as_mut() {
+            open.push(';');
+            open.push_str(chunk);
+            if chunk.trim().eq_ignore_ascii_case("END") {
+                statements.extend(trigger.take());
+            }
+            continue;
+        }
+        let words: Vec<String> = chunk
+            .split_whitespace()
+            .take(2)
+            .map(str::to_ascii_uppercase)
+            .collect();
+        if words == ["CREATE", "TRIGGER"] {
+            trigger = Some(chunk.to_owned());
+        } else {
+            statements.push(chunk.to_owned());
+        }
+    }
+    // An unterminated trigger is still judged, and fails.
+    statements.extend(trigger);
+    statements
+}
+
+/// Whether a `CREATE TRIGGER` statement (upper-cased words) runs after the
+/// write that fires it and only writes tables in `created`.
+fn trigger_writes_only(words: &[&str], created: &[String]) -> bool {
+    let Some(begin) = words.iter().position(|w| *w == "BEGIN") else {
+        return false;
+    };
+    // RAISE anywhere, the WHEN clause included, would fail the write.
+    if !words[..begin].contains(&"AFTER")
+        || words.last() != Some(&"END")
+        || words.iter().any(|w| w.contains("RAISE"))
+    {
+        return false;
+    }
+    let body = words[begin + 1..words.len() - 1].join(" ");
+    body.split(';')
+        .map(|statement| statement.split_whitespace().collect::<Vec<_>>())
+        .filter(|statement| !statement.is_empty())
+        .all(|statement| {
+            let target = match statement.as_slice() {
+                ["INSERT", "INTO", name, ..]
+                | ["INSERT", "OR", _, "INTO", name, ..]
+                | ["UPDATE", name, ..]
+                | ["DELETE", "FROM", name, ..] => table_name(name),
+                _ => return false,
+            };
+            created.contains(&target)
+        })
 }
 
 /// A table name as a statement spells it, without its column list or quotes.
@@ -201,6 +266,33 @@ mod tests {
             INSERT INTO extra(note) VALUES ('seed');
             INSERT OR IGNORE INTO more(id) VALUES (1);";
         assert_eq!(compatibility_violations(sql), Vec::<String>::new());
+    }
+
+    #[test]
+    fn triggers_writing_only_created_tables_are_compatible() {
+        let sql = "-- dagq-schema: compatible
+            CREATE VIRTUAL TABLE idx USING fts5(body, tokenize = 'trigram');
+            CREATE TABLE log (id INTEGER);
+            CREATE TRIGGER a AFTER UPDATE OF status ON tasks WHEN old.status IS NOT new.status BEGIN
+                DELETE FROM idx WHERE rowid = old.id;
+                INSERT INTO idx (rowid, body) VALUES (new.id, new.title);
+                UPDATE idx SET body = '' WHERE rowid = 0;
+                INSERT OR IGNORE INTO log (id) VALUES (new.id);
+            END;";
+        assert_eq!(compatibility_violations(sql), Vec::<String>::new());
+        let sql = "CREATE TABLE log (id INTEGER);
+            CREATE TRIGGER before BEFORE INSERT ON tasks BEGIN INSERT INTO log VALUES (1); END;
+            CREATE TRIGGER other AFTER INSERT ON tasks BEGIN UPDATE goals SET title = ''; END;
+            CREATE TRIGGER raise AFTER INSERT ON tasks BEGIN
+                INSERT INTO log SELECT RAISE(ABORT, 'no'); END;
+            CREATE TRIGGER read AFTER INSERT ON tasks BEGIN SELECT 1; END;
+            CREATE TRIGGER nested AFTER INSERT ON tasks BEGIN
+                INSERT INTO log VALUES ((RAISE(ABORT, 'no'))); END;
+            CREATE TRIGGER guarded AFTER INSERT ON tasks WHEN (SELECT RAISE(ABORT, 'no')) BEGIN
+                INSERT INTO log VALUES (1); END;";
+        let violations = compatibility_violations(sql);
+        assert_eq!(violations.len(), 6, "{violations:#?}");
+        assert!(violations.iter().all(|v| v.starts_with("CREATE TRIGGER")));
     }
 
     #[test]

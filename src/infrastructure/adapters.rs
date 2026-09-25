@@ -316,6 +316,21 @@ pub fn git_common_dir(path: &Path) -> Result<PathBuf> {
         .context("resolve Git common directory")
 }
 
+/// The full message of `commit` in the repository whose Git directory is
+/// `git_dir`; `None` when Git cannot read it there.
+pub fn commit_message(git_dir: &Path, commit: &str) -> Option<String> {
+    let git = executable(Path::new("git")).ok()?;
+    output(Command::new(&git).arg("--git-dir").arg(git_dir).args([
+        "show",
+        "-s",
+        "--format=%B",
+        commit,
+        "--",
+    ]))
+    .ok()
+    .map(|message| message.trim_end().to_owned())
+}
+
 fn main_head(git: &Path, root: &Path) -> Result<CommitSha> {
     object_id(
         &output(Command::new(git).arg("-C").arg(root).args([
