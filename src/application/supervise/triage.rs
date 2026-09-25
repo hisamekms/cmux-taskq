@@ -389,6 +389,9 @@ impl Supervisor<'_> {
         // for an answer any more.
         self.queue
             .close_answer_prompt_asks(run.id(), "the run was triaged; closed by the runtime")?;
+        // Nor is its session stalled.
+        self.queue
+            .close_stalled_asks(run.id(), "the run was triaged; closed by the runtime")?;
         Ok(())
     }
     /// Record `triage_failed` (a person triages the run) and give the lease

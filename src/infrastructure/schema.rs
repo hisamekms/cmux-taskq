@@ -38,6 +38,7 @@ pub const MIGRATIONS: &[&str] = &[
     include_str!("../../migrations/0022_follow_up_triage.sql"),
     include_str!("../../migrations/0023_planners.sql"),
     include_str!("../../migrations/0024_schema_floor.sql"),
+    include_str!("../../migrations/0025_stalled_ask.sql"),
 ];
 
 /// The schema version this binary knows: a fully migrated queue's

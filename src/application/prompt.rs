@@ -515,6 +515,47 @@ pub(crate) fn revise_mismatch_request(run: &TaskRun, label: &str, why: &str) -> 
     .join("\n"))
 }
 
+/// The one nudge the supervisor types into a worker's session that stayed
+/// idle without a receipt for `idle_secs` (ADR-0043 decision 1): commit and
+/// write the receipt, ask with `dagq ask`, or say what background work it
+/// waits for. `background` names the tasks its idle marker lists as running.
+pub(crate) fn stall_nudge(
+    run: &TaskRun,
+    idle_secs: i64,
+    background: &[crate::domain::stall::BackgroundTask],
+) -> Result<String> {
+    let receipt = run.receipt_path().context("missing receipt path")?;
+    let minutes = idle_secs / 60;
+    let mut lines = vec![format!(
+        "dagq: run {} has been idle for {minutes} minutes without a receipt.",
+        run.id()
+    )];
+    if background.is_empty() {
+        lines.push("No background task was running when you stopped.".to_owned());
+    } else {
+        lines.push("Background tasks still running when you stopped:".to_owned());
+        for task in background {
+            lines.push(format!("- {}: {}", task.description, task.command));
+        }
+    }
+    lines.push("Do one of these now:".to_owned());
+    lines.push(format!(
+        "1. If the work is done, commit it and write the receipt at {receipt} (a temporary file in the same directory, then rename)."
+    ));
+    lines.push(format!(
+        "2. If you need a decision, run `dagq ask --run {} --kind worker_question --question '...'` and stop.",
+        run.id()
+    ));
+    lines.push(
+        "3. If you are waiting for background work, write here what you wait for, when it should end, and what you will do if it does not return; then go on with the work."
+            .to_owned(),
+    );
+    lines.push(
+        "If nothing changes, the supervisor asks a person to look at this session.".to_owned(),
+    );
+    Ok(lines.join("\n"))
+}
+
 /// What the headless reviewer is asked (ADR-0023 decision 2, ADR-0027
 /// decision 2): where the material is, the task's acceptance, the verdict
 /// schema and where `revise` ends and `concern` begins.

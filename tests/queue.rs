@@ -698,7 +698,7 @@ fn opening_or_initializing_an_older_queue_never_migrates_it() {
             error.to_string(),
             format!(
                 "queue schema version 23 is older than this binary's schema {}; run `dagq \
-                 migrate` to apply the 1 pending migration(s)",
+                 migrate` to apply the 2 pending migration(s)",
                 SqliteQueue::SCHEMA_VERSION
             )
         );
@@ -712,7 +712,7 @@ fn opening_or_initializing_an_older_queue_never_migrates_it() {
             .iter()
             .map(|m| (m.version, m.compatible))
             .collect::<Vec<_>>(),
-        vec![(24, false)]
+        vec![(24, false), (25, false)]
     );
     let raw = Connection::open(&path).unwrap();
     assert_eq!(
@@ -725,7 +725,7 @@ fn opening_or_initializing_an_older_queue_never_migrates_it() {
     std::fs::write(dir.path().join("backups/queue-23-5.sqlite3"), "earlier").unwrap();
     let report = SqliteQueue::migrate(&path, Some(&|_| false), 5).unwrap();
     assert_eq!(report.floor, SqliteQueue::SCHEMA_VERSION);
-    assert_eq!(report.applied.len(), 1);
+    assert_eq!(report.applied.len(), 2);
     let backup = report.backup.unwrap();
     assert!(
         backup.ends_with("backups/queue-23-5-1.sqlite3"),
@@ -1247,9 +1247,10 @@ fn migration_from_v6_adds_goals_and_keeps_tasks_runs_and_events() {
     // blocked asks), 0017 (the stuck_exit ask), 0018 (task paths), 0019
     // (goal dependencies), 0020 (task priority), 0021 (proposals) and 0022
     // (follow-up triage: task leases, follow_up_depth, the follow_up ask),
-    // 0023 (planner sessions) and 0024 (the schema floor) are applied together.
-    assert_eq!(SqliteQueue::SCHEMA_VERSION, 24);
-    assert_eq!(queue.schema_version().unwrap(), 24);
+    // 0023 (planner sessions), 0024 (the schema floor) and 0025 (the stalled
+    // ask) are applied together.
+    assert_eq!(SqliteQueue::SCHEMA_VERSION, 25);
+    assert_eq!(queue.schema_version().unwrap(), 25);
     assert_eq!(
         queue
             .session_workspace(dagq::domain::SessionRole::Inbox)

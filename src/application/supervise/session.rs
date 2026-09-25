@@ -140,6 +140,7 @@ so the run workspace opens outside it: {error:#}", self.layout.queue_hash);
             silent: false,
             exit_for_silence: false,
             answer_start: None,
+            stall: StallWatch::default(),
         })
     }
 }
@@ -176,8 +177,12 @@ pub(super) struct SessionWatch {
     pub(super) silent: bool,
     /// The `/exit` was sent because of that silence.
     pub(super) exit_for_silence: bool,
-    /// Whether the session took the last answer delivered (task 285).
+    /// Whether the session took the last answer delivered or the nudge
+    /// (task 285).
     pub(super) answer_start: Option<StartCheck>,
+    /// Idle without a receipt: the nudge and the `stalled` ask (ADR-0043
+    /// decision 1).
+    pub(super) stall: StallWatch,
 }
 
 impl SessionWatch {
@@ -203,6 +208,7 @@ impl SessionWatch {
             )?;
             info!(run_id = %run.id(), "receipt received for {}; waiting for the session to go idle (or a person's /exit)", run.id());
         }
+        self.stall.settle(sv, run, self.receipt_seen)?;
         let wrapper = processes.iter().find(|p| p.role == "wrapper");
         // A session that already ended (on its own, by a person's /exit,
         // or before this supervisor adopted the run) is not asked to exit.
@@ -260,6 +266,7 @@ impl SessionWatch {
                     info!(run_id = %run.id(), ask_id = %ask.id, "session of {} exited; closed its stuck_exit ask {}", run.id(), ask.id);
                 }
                 close_answer_prompt_asks(sv, run, PROMPT_EXITED_CLOSED)?;
+                self.stall.ended(sv, run)?;
                 return sv.queue.finish_supervision(run.id(), &sv.token).map(Some);
             }
             let pulse = wrapper_pulse(
@@ -295,6 +302,17 @@ impl SessionWatch {
                             && let Some(start) = &mut self.answer_start
                         {
                             start.poll(sv, run, &self.workspace, &self.idle_marker)?;
+                        }
+                        if !self.receipt_seen
+                            && let Some(start) = self.stall.poll(
+                                sv,
+                                run,
+                                &self.workspace,
+                                &self.idle_marker,
+                                self.prompt_hash.is_some(),
+                            )?
+                        {
+                            self.answer_start = Some(start);
                         }
                     }
                     if let Some(agent) = processes.iter().find(|p| p.role == "agent") {
@@ -495,6 +513,7 @@ impl SessionWatch {
                 // Sent: failing to record it must not cost the live run its
                 // lease, so it is only noted (the ask then shows unclosed).
                 Ok(submission) => {
+                    self.stall.input_sent(sent_at);
                     self.answer_start = Some(StartCheck::new(&what, &text, sent_at, &submission));
                     match sv.queue.ask_delivered(ask.id, &self.workspace) {
                         Ok(_) => {

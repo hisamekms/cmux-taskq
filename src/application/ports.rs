@@ -1002,6 +1002,8 @@ pub trait RunStore {
     /// Record `backend_call_failed`, on `run` when the call was for one.
     fn record_backend_failure(&self, run: Option<&RunId>, payload: serde_json::Value)
     -> Result<()>;
+    /// Record an event of the queue itself, on no task, goal or run.
+    fn record_queue_event(&self, kind: &str, payload: serde_json::Value) -> Result<EventId>;
 }
 
 /// The questions the runtime and its sessions put to a person (ADR-0022).
@@ -1027,6 +1029,10 @@ pub trait AskStore {
     fn close_stuck_exit_asks(&mut self, run_id: &RunId, answer: &str) -> Result<Vec<Ask>>;
     /// Close the run's `answer_prompt` asks nobody closed, with `answer`.
     fn close_answer_prompt_asks(&mut self, run_id: &RunId, answer: &str) -> Result<Vec<Ask>>;
+    /// The run's `stalled` ask nobody closed, answered or not.
+    fn unclosed_stalled_ask(&self, run_id: &RunId) -> Result<Option<Ask>>;
+    /// Close the run's `stalled` asks nobody closed, with `answer`.
+    fn close_stalled_asks(&mut self, run_id: &RunId, answer: &str) -> Result<Vec<Ask>>;
 }
 
 /// Which asks [`AskStore::asks`] lists. By default the ones nobody closed;

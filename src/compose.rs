@@ -37,7 +37,7 @@ use crate::{
     },
     domain::{
         IntegrationOutcome, NewAsk, PlannerId, RunId, SessionRole, TaskDetail, TaskId, TaskRun,
-        stats::StatsQuery,
+        stall::StallConfig, stats::StatsQuery,
     },
     infrastructure::{
         adapters::{
@@ -79,6 +79,10 @@ pub struct SuperviseOptions {
     pub idle_poll: Duration,
     /// The clock and IDs of everything the supervisor records; tests fix them.
     pub generators: Generators,
+    /// The thresholds of the stalled-session checks; `None` reads `[stall]`
+    /// from the `dagq.toml` of the repository's main checkout (ADR-0043
+    /// decision 4). Tests set them.
+    pub stall: Option<StallConfig>,
 }
 
 impl SuperviseOptions {
@@ -92,10 +96,11 @@ impl SuperviseOptions {
             tick: TICK,
             idle_poll: IDLE_POLL,
             generators: clock::system(),
+            stall: None,
         }
     }
 
-    fn settings(&self) -> LoopSettings {
+    fn settings(&self, stall: StallConfig) -> LoopSettings {
         LoopSettings {
             parallel: self.parallel,
             once: self.once,
@@ -104,6 +109,7 @@ impl SuperviseOptions {
             observe_daily: self.observe_daily,
             tick: self.tick,
             idle_poll: self.idle_poll,
+            stall,
         }
     }
 }
@@ -141,6 +147,10 @@ pub fn supervise_with_reviewer(
         .canonicalize()
         .context("queue must already be initialized")?;
     let repository = GitRepository::inspect(repo)?;
+    let stall = match options.stall {
+        Some(stall) => stall,
+        None => load_stall_config(&main_checkout(&repository))?.unwrap_or_default(),
+    };
     let pid = std::process::id();
     let generators = options.generators.clone();
     let layout = Layout {
@@ -188,7 +198,7 @@ pub fn supervise_with_reviewer(
         load_average,
         layout,
     };
-    supervisor::supervise(&ports, &options.settings())
+    supervisor::supervise(&ports, &options.settings(stall))
 }
 
 /// The runtime's own constructor of the cmux wrapper `up`, `down` and the

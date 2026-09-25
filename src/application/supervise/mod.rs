@@ -54,7 +54,7 @@ use super::{
     prompt::{
         GoalPredecessorSummary, PredecessorSummary, ResumeKind, ResumeRequest, TRIAGE_TOOLS,
         prompt, resume_request, review_prompt, revise_mismatch_request, revise_request,
-        siblings_in_progress, triage_prompt,
+        siblings_in_progress, stall_nudge, triage_prompt,
     },
     recording::{RecordingBackend, reason_of_error},
     tail, unix_seconds,
@@ -65,7 +65,9 @@ use crate::domain::{
     Predecessor, Reason, ReasonCode, Receipt, ReceiptResult, ReviewDecision, ReviewVerdict, RunId,
     RunLease, RunPaths, RunPlan, RunProcess, RunStatus, SessionRole, TRIAGE_OPTIONS,
     TRIAGE_RETRY_FAILURES, TaskAction, TaskId, TaskRun, TaskStatus, TriageDecision, TriageState,
-    TriageVerdict, heartbeat_stale, triage_state,
+    TriageVerdict, heartbeat_stale,
+    stall::{BackgroundTask, STALL_CONFIG_LOADED, StallConfig},
+    triage_state,
 };
 
 mod adopt;
@@ -77,9 +79,10 @@ mod landing;
 mod resume;
 mod revise;
 mod session;
+mod stall;
 mod triage;
 
-use self::{deliver::*, exit::*, idle::*, jobs::*, resume::*, revise::*, session::*};
+use self::{deliver::*, exit::*, idle::*, jobs::*, resume::*, revise::*, session::*, stall::*};
 
 /// How far back the daily observation reads.
 pub const DAILY_WINDOW_SECS: i64 = 24 * 60 * 60;
@@ -121,6 +124,9 @@ pub struct LoopSettings {
     pub tick: Duration,
     /// Pause between two looks for claimable work while no run is active.
     pub idle_poll: Duration,
+    /// The thresholds of the stalled-session checks (ADR-0043 decision 4),
+    /// recorded as `stall_config_loaded` when the loop starts.
+    pub stall: StallConfig,
 }
 
 /// Where the supervisor works and what it starts: the queue database and
@@ -284,6 +290,9 @@ pub fn supervise(ports: &Ports<'_>, settings: &LoopSettings) -> Result<Value> {
         layout.db.display(),
         layout.repo_root.display()
     );
+    let mut config = serde_json::to_value(settings.stall)?;
+    config["supervisor"] = json!(token);
+    queue.record_queue_event(STALL_CONFIG_LOADED, config)?;
     let heartbeat = Heartbeat::start(ports.queues.clone(), token.clone());
     let cmux = RecordingBackend::over(
         ports.cmux,
@@ -316,6 +325,7 @@ pub fn supervise(ports: &Ports<'_>, settings: &LoopSettings) -> Result<Value> {
         observers_launched: Vec::new(),
         triaged: Vec::new(),
         generators: ports.generators.clone(),
+        stall: settings.stall,
     };
     let result = supervisor.run_loop(settings);
     match &result {
@@ -362,6 +372,8 @@ struct Supervisor<'a> {
     triaged: Vec<Value>,
     /// The clock and IDs `queue` also uses.
     generators: Generators,
+    /// The thresholds of the stalled-session checks (ADR-0043 decision 4).
+    stall: StallConfig,
 }
 
 /// One executing run between provisioning and rest.

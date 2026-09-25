@@ -176,6 +176,7 @@ impl Supervisor<'_> {
                     silent: false,
                     exit_for_silence: false,
                     answer_start: None,
+                    stall: StallWatch::adopt(&*self.queue, run)?,
                 })
             }
         })

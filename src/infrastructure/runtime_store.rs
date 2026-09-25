@@ -2720,6 +2720,9 @@ impl RunStore for SqliteQueue {
     ) -> Result<()> {
         SqliteQueue::record_backend_failure(self, run, payload)
     }
+    fn record_queue_event(&self, kind: &str, payload: serde_json::Value) -> Result<EventId> {
+        SqliteQueue::record_queue_event(self, kind, payload)
+    }
 }
 
 impl AskStore for SqliteQueue {
@@ -2769,6 +2772,16 @@ impl AskStore for SqliteQueue {
         answer: &str,
     ) -> Result<Vec<crate::domain::Ask>> {
         SqliteQueue::close_answer_prompt_asks(self, run_id, answer)
+    }
+    fn unclosed_stalled_ask(&self, run_id: &RunId) -> Result<Option<crate::domain::Ask>> {
+        SqliteQueue::unclosed_stalled_ask(self, run_id)
+    }
+    fn close_stalled_asks(
+        &mut self,
+        run_id: &RunId,
+        answer: &str,
+    ) -> Result<Vec<crate::domain::Ask>> {
+        SqliteQueue::close_stalled_asks(self, run_id, answer)
     }
 }
 

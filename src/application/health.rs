@@ -695,6 +695,21 @@ pub fn attention(
                 "ask_answered",
                 AttentionNext::ApplyingAnswer { ask_id: ask.id },
             )
+        } else if ask.kind == AskKind::Stalled
+            && ask.answer.as_deref().map(str::trim) == Some("wait")
+            && let Some(run_id) = ask.run_id.as_ref()
+            && queue.run(run_id)?.status() == RunStatus::Running
+            && queue
+                .run_lease(run_id)?
+                .is_some_and(|lease| !lease_is_stale(&lease, now, control))
+        {
+            // The supervisor watching the session counts its idle again
+            // and closes the ask (ADR-0043 decision 1).
+            (
+                "answered",
+                "ask_answered",
+                AttentionNext::ApplyingAnswer { ask_id: ask.id },
+            )
         } else if ask.kind == AskKind::ApproveLanding
             && let Some(run_id) = ask.run_id.as_ref()
             && queue.run(run_id)?.status() == RunStatus::AwaitingIntegration

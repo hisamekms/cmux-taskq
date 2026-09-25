@@ -2270,7 +2270,10 @@ fn migrate_is_explicit_and_older_binaries_keep_working_within_the_floor() {
     assert_eq!(check["opens"], false);
     assert_eq!(
         check["pending"],
-        serde_json::json!([{"version": 24, "compatible": false}])
+        serde_json::json!([
+            {"version": 24, "compatible": false},
+            {"version": 25, "compatible": false}
+        ])
     );
     assert_eq!(version(), 23);
     let migrated = ok(&db, &["migrate"]);

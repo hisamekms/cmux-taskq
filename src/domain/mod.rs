@@ -119,6 +119,10 @@ string_enum!(AskKind {
     // `adopt` the runtime overrode (ADR-0037 decision 5): it belongs to the
     // draft and no run, and the supervisor applies its answer.
     FollowUp => "follow_up",
+    // A worker's session idle without a receipt past its one nudge
+    // (ADR-0043 decision 1): the supervisor asks the inbox whether to wait
+    // or step in, and closes the ask itself once the session moves on.
+    Stalled => "stalled",
 });
 
 // Where a proposal (ADR-0041 decision 7) stands: `submitted` waits for plan

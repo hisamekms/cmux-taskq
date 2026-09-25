@@ -244,6 +244,28 @@ impl SqliteQueue {
         self.close_runtime_asks(run_id, AskKind::AnswerPrompt, answer)
     }
 
+    /// The run's `stalled` ask nobody closed, answered or not: at most one
+    /// is open, and an answered one the supervisor has not applied yet
+    /// comes first (ADR-0043 decision 1).
+    pub fn unclosed_stalled_ask(&self, run_id: &RunId) -> Result<Option<Ask>> {
+        Ok(self
+            .conn
+            .prepare(
+                "SELECT * FROM asks WHERE run_id=?1 AND kind='stalled' AND closed_at IS NULL
+                 ORDER BY id LIMIT 1",
+            )?
+            .query_map([run_id], ask_row)?
+            .next()
+            .transpose()?)
+    }
+
+    /// Close every `stalled` ask of the run nobody closed, the way
+    /// [`Self::close_stuck_exit_asks`] does: the session moved on or ended,
+    /// so nobody needs to answer it any more.
+    pub fn close_stalled_asks(&mut self, run_id: &RunId, answer: &str) -> Result<Vec<Ask>> {
+        self.close_runtime_asks(run_id, AskKind::Stalled, answer)
+    }
+
     fn close_runtime_asks(
         &mut self,
         run_id: &RunId,

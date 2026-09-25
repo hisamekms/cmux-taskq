@@ -32,6 +32,16 @@ impl IdleMarker {
         }))
     }
 
+    /// When the agent wrote it.
+    pub(super) fn modified(&self) -> SystemTime {
+        self.modified
+    }
+
+    /// The background tasks still `running` when the agent stopped.
+    pub(super) fn background_tasks(&self) -> &[BackgroundTask] {
+        &self.hook.background_tasks
+    }
+
     /// Background work the agent left running when it stopped.
     pub(super) fn background_running(&self) -> bool {
         self.hook.background_running
