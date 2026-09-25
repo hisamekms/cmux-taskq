@@ -71,6 +71,7 @@ ADRは、将来の実装や運用に大きな影響を与える決定の理由�
 | [ADR-0042](0042-adr-is-superseded-whole-and-deprecation-date-is-deprecated-on.md) | ADRは丸ごと置き換え、置き換えの日付はsuperseded_on、廃止の日付はdeprecated_onに分けてfrontmatterと本文冒頭の注記に残す | 2026-09-25 |
 | [ADR-0043](0043-detect-stalled-worker-sessions-nudge-once-then-ask.md) | supervisorが止まったworkerのsessionを決まった規則で検知し、一度促すかEnterを一度送り直してからinboxのaskにし、statsが走っているrunのalertと閾値ごとの結果を返す | 2026-09-25 |
 | [ADR-0045](0045-build-identifier-explicit-migrate-schema-compat-handoff-and-auto-update.md) | 固定バイナリをbuild識別子で見分け、queueを開いただけではmigrateせず、互換の範囲のschemaを受け入れ、supervisorを待たずに引き継ぎで入れ替え、up --auto-updateで着地のたびに自動で更新する | 2026-09-25 |
+| [ADR-0046](0046-full-text-search-related-and-duplicate-of.md) | taskの全文検索（search）と決まった規則の関連（related）と重複の記録（cancel --duplicate-of）を持ち、plannerとplan reviewはその候補だけをLLMで判断する | 2026-09-25 |
 
 ## 置き換え・廃止されたADR
 
