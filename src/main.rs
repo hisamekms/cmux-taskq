@@ -25,7 +25,7 @@ use dagq::{
 
 #[derive(Parser)]
 #[command(
-    version,
+    version = dagq::VERSION,
     about = "Manage a local dependency-aware task queue (JSON output)"
 )]
 struct Cli {

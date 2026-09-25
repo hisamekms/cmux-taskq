@@ -128,7 +128,7 @@ skillはすべて`${CLAUDE_PLUGIN_ROOT}/bin/dagq`を呼ぶ。launcherはバイ�
 
 - バイナリ: `DAGQ_BIN`、なければPATHの`dagq`。どちらもなければ`{"error": ...}`をstderrに出し、GitHub Release（<https://github.com/hisamekms/dagq/releases>）の`dagq-v<plugin_version>-aarch64-apple-darwin.tar.gz`を`SHA256SUMS`で検証して`~/.local/bin`に置く手順と、開発時の`cargo build --locked`＋`DAGQ_BIN`を案内する（CLI本体のエラー形式と同じ）。
 - queue: バイナリがcwdのrepositoryから`$XDG_DATA_HOME/dagq/<hash>/queue.db`に解決する。`DAGQ_DB`が設定されているときだけ`--db "$DAGQ_DB"`を前置する。dirの作成と束縛は`init`が行う。
-- `--resolve`: `dagq locate`のJSON（`db`、`db_exists`、`queue_dir`、`runs_dir`、`source`、`git_common_dir`）に`binary`、`binary_version`（`dagq --version`の数字部分）、`plugin_version`（launcherの隣の`.claude-plugin/plugin.json`をsedで読む）、`repo`（`git rev-parse --show-toplevel`、repository外は空文字）を加えた1つのobjectを返す。skillはこれをユーザーへの報告と、cmux workspaceへ渡す絶対pathの取得に使う。`--version` / `--help`はそのままバイナリに渡す。
+- `--resolve`: `dagq locate`のJSON（`db`、`db_exists`、`queue_dir`、`runs_dir`、`source`、`git_common_dir`）に`binary`、`binary_version`（`dagq --version`の`dagq `の後、build識別子`X.Y.Z`または`X.Y.Z-dev+<commit>[.dirty]`。[supervisor-lifecycle](supervisor-lifecycle.md#build-identifier)）、`plugin_version`（launcherの隣の`.claude-plugin/plugin.json`をsedで読む）、`repo`（`git rev-parse --show-toplevel`、repository外は空文字）を加えた1つのobjectを返す。skillはこれをユーザーへの報告と、cmux workspaceへ渡す絶対pathの取得に使う。`--version` / `--help`はそのままバイナリに渡す。
 - version不一致: `plugin_version`と`binary_version`のmajor.minorが違うとき、stdoutの解決結果はそのまま出したうえでstderrに`{"warning": ...}`を1行出し、exitは0のまま（解決自体は正しく、CLIの差だけが不明）。skillは止まらずユーザーに報告し、古い方の更新（pluginは`claude plugin update claude-dagq@dagq`、バイナリはRelease）を案内する。
 
 ### skillの契約

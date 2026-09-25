@@ -119,9 +119,9 @@ impl SqliteQueue {
 
     /// Register a resident `supervise` process before it claims anything,
     /// so `status` and `doctor` can list it while it holds no run.
-    /// `binary_version` is the running binary's own `CARGO_PKG_VERSION`,
-    /// which only this process knows; `up` reads it back to decide whether
-    /// a live supervisor is of its own build (ADR-0014).
+    /// `binary_version` is the running binary's own build identifier
+    /// (`crate::VERSION`), which only this process knows; `up` reads it back
+    /// to decide whether a live supervisor is of its own build (ADR-0045).
     pub fn register_supervisor(
         &mut self,
         token: &str,

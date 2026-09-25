@@ -177,8 +177,29 @@ fn version_works_outside_a_repository_and_without_a_queue() {
     );
     assert_eq!(
         String::from_utf8(output.stdout).unwrap().trim(),
-        format!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"))
+        format!("{} {}", env!("CARGO_PKG_NAME"), dagq::VERSION)
     );
+}
+
+/// `--version` names the build (ADR-0045 decision 2): a development version
+/// carries the commit it was built from, and a release its version alone.
+#[test]
+fn version_is_the_build_identifier() {
+    let package = env!("CARGO_PKG_VERSION");
+    if dagq::build_id::is_prerelease(package) {
+        let metadata = dagq::VERSION
+            .strip_prefix(&format!("{package}+"))
+            .unwrap_or_else(|| panic!("{} lacks build metadata", dagq::VERSION));
+        let commit = metadata.strip_suffix(".dirty").unwrap_or(metadata);
+        assert!(
+            commit == dagq::build_id::UNKNOWN_COMMIT
+                || (commit.len() == 40 && commit.bytes().all(|b| b.is_ascii_hexdigit())),
+            "{}",
+            dagq::VERSION
+        );
+    } else {
+        assert_eq!(dagq::VERSION, package);
+    }
 }
 
 #[test]

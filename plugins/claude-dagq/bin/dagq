@@ -30,7 +30,8 @@ plugin_version=$(
     "$plugin_dir/.claude-plugin/plugin.json" 2>/dev/null | head -n 1
 )
 
-# `dagq --version` prints `dagq X.Y.Z`; keep the number alone.
+# `dagq --version` prints `dagq <build identifier>` (`X.Y.Z`, or
+# `X.Y.Z-dev+<commit>[.dirty]` for a build of main); keep the identifier alone.
 version_number() {
   printf '%s' "$1" | sed -e 's/^dagq[[:space:]]*//' -e 's/[[:space:]].*//'
 }

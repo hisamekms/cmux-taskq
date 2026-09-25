@@ -540,7 +540,7 @@ fn launcher_resolves_the_binary_and_the_repository_queue_under_the_data_home() {
 
     let resolved = stdout_json(&launcher(&env, &data_home, &repo, &["--resolve"]));
     assert_eq!(resolved["binary"], binary);
-    assert_eq!(resolved["binary_version"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(resolved["binary_version"], dagq::VERSION);
     assert_eq!(resolved["plugin_version"], plugin_manifest()["version"]);
     assert_eq!(resolved["db"], expected_db.to_str().unwrap());
     assert_eq!(resolved["db_exists"], false);

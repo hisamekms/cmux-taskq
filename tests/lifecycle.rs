@@ -2689,12 +2689,16 @@ fn inbox_and_planner_prompts_name_the_queue_and_their_one_job() {
 
 /// A live supervisor of another build is not reused: `up` unloads its
 /// agent, waits for the drain and starts one of its own version in its
-/// place (ADR-0014). A registration older than the `binary_version` column
+/// place (ADR-0014). The whole build identifier is compared (ADR-0045
+/// decision 3), so a build of the same package version from another commit
+/// is replaced too. A registration older than the `binary_version` column
 /// has no version at all, which is not this one either, so it is replaced
 /// the same way.
 #[test]
 fn up_drains_and_replaces_a_launchd_supervisor_of_another_version() {
-    for previous in [Some("0.0.1"), None] {
+    let other_commit = format!("{}+{}", env!("CARGO_PKG_VERSION"), "0".repeat(40));
+    assert_ne!(other_commit, VERSION);
+    for previous in [Some("0.0.1"), Some(other_commit.as_str()), None] {
         let fixture = fixture();
         let mut queue = SqliteQueue::open(&fixture.location.db).unwrap();
         let pid = std::process::id();

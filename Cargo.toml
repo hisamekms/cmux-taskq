@@ -4,7 +4,7 @@ resolver = "3"
 
 [package]
 name = "dagq"
-version = "0.3.0"
+version = "0.4.0-dev"
 edition = "2024"
 rust-version = "1.93"
 description = "A dependency-aware task queue for cmux and isolated Git worktrees"
@@ -14,8 +14,9 @@ homepage = "https://github.com/hisamekms/dagq"
 readme = "README.md"
 keywords = ["task-queue", "dag", "git-worktree", "cmux", "claude"]
 categories = ["command-line-utilities", "development-tools"]
-# Only what builds the binary: migrations are embedded with include_str!.
-include = ["/src/**", "/migrations/**", "/Cargo.toml", "/Cargo.lock", "/README.md", "/LICENSE"]
+# Only what builds the binary: migrations are embedded with include_str!,
+# and build.rs embeds the build identifier.
+include = ["/build.rs", "/src/**", "/migrations/**", "/Cargo.toml", "/Cargo.lock", "/README.md", "/LICENSE"]
 
 [dependencies]
 anyhow = "1.0"

@@ -7,7 +7,9 @@ description: dagq 自身のリリース手順。version を上げる、tag v* �
 
 根拠は [README の Release 節](../../../README.md#release) と [ADR-0030](../../../docs/adr/0030-publish-to-crates-io-on-tag-push-with-trusted-publishing.md)。tag `vX.Y.Z` の push で `.github/workflows/release.yml` が、tag と `Cargo.toml` の version の一致を検査し、`aarch64-apple-darwin` のバイナリを build して GitHub Release に添付し、同じ version を crates.io に publish する（crates.io に既にあれば skip）。
 
-以下 `X.Y.Z` は新しい version。1・3・4・5 のコマンドは repository の main checkout で打つ（読むだけで、main の作業ファイルは変えない）。2 の変更は task の worker が worktree で行う。tag の作成と push はユーザーの確認を取ってから行う。
+main の version はリリースの直後に次の開発版 `X.Y.Z-dev` へ上げてあり（今は `0.4.0-dev`）、main のビルドは `dagq --version` で build 識別子 `X.Y.Z-dev+<commit>`（worktree が dirty なら `.dirty` が付く）を名乗る。リリースは `-dev` を外した `X.Y.Z` で、build 識別子も `X.Y.Z` だけになる（[ADR-0045](../../../docs/adr/0045-build-identifier-explicit-migrate-schema-compat-handoff-and-auto-update.md) 決定 1・2。`build.rs` が埋め込む）。
+
+以下 `X.Y.Z` は新しい version。1・3・4・5 のコマンドは repository の main checkout で打つ（読むだけで、main の作業ファイルは変えない）。2 と 6 の変更は task の worker が worktree で行う。tag の作成と push はユーザーの確認を取ってから行う。
 
 ## 1. 前提の確認
 
@@ -21,11 +23,11 @@ cargo publish --dry-run --locked  # package の作成と build が通ること
 ```
 
 - `gh run list` の先頭が main の HEAD の commit で `completed success` でなければリリースしない（`gh run view <run-id> --log-failed` で原因を見る）
-- `cargo publish --dry-run --locked` は PATH の `dagq`（`~/.local/bin/dagq`）とは無関係に、package の中身（`src/`・`migrations/`・`Cargo.toml`・`Cargo.lock`・`README.md`・`LICENSE`）だけで build できるかを見る。`cargo package --list --locked` で中身を確かめられる
+- `cargo publish --dry-run --locked` は PATH の `dagq`（`~/.local/bin/dagq`）とは無関係に、package の中身（`build.rs`・`src/`・`migrations/`・`Cargo.toml`・`Cargo.lock`・`README.md`・`LICENSE`）だけで build できるかを見る。`cargo package --list --locked` で中身を確かめられる
 
-## 2. version を上げる
+## 2. `-dev` を外して version を確定する
 
-`Cargo.toml` の `[package]` の `version` と `plugins/claude-dagq/.claude-plugin/plugin.json` の `"version"` を同じ `X.Y.Z` にし、`Cargo.lock` を更新する。
+`Cargo.toml` の `[package]` の `version` と `plugins/claude-dagq/.claude-plugin/plugin.json` の `"version"` を同じ `X.Y.Z` にし（main の `X.Y.Z-dev` から `-dev` を外す。上げる桁を変えるなら、ここで `-dev` の数字と違う `X.Y.Z` にしてよい）、`Cargo.lock` を更新する。tag は `-dev` の無い commit に打つ（`release.yml` は tag と `Cargo.toml` の version の一致を検査するので、`-dev` が残っていれば落ちる）。
 
 worker が task の worktree で行う:
 
@@ -110,6 +112,20 @@ gh run view <run-id> --log | grep -E 'Authenticate to crates.io|Publish to crate
 - **crates.io の API の失敗**: `crates.io answered HTTP <status>` で止まったら、時間を置いて rerun する
 - GitHub Release が出た後に crates.io だけ失敗しても、原因を直して rerun すれば Release は上書き、crates.io は publish される（ADR-0030 の Consequences）
 
-## 6. 固定バイナリの更新
+## 6. 次の開発版へ上げる
 
-`~/.local/bin/dagq` の入れ替えはこの skill では行わない。AGENTS.md の「作業中」と「起動と停止」の手順（入替はユーザーに報告してから、version が変われば `up` が supervisor を drain して入れ替える）に従う。
+tag の run が成功したら（4 の確認の後）、main の version を次の開発版 `X.Y.Z-dev` に上げる task を登録する。ここでの `X.Y.Z` は次のリリースの見込みで、普段は minor を 1 つ上げる（`0.4.0` の後は `0.5.0-dev`）。互換を保つ修正だけのリリースが続くと分かっていれば patch でもよく、次のリリースの 2 で改めて決め直せる。2 と同じく `Cargo.toml`・`plugin.json`・`Cargo.lock` の 3 つを変える:
+
+```sh
+dagq add 'release: version を次の開発版 X.Y.Z-dev に上げる' \
+  --description 'vPREV のリリース後、Cargo.toml と plugins/claude-dagq/.claude-plugin/plugin.json の version を X.Y.Z-dev にし、Cargo.lock を更新する' \
+  --acceptance 'Cargo.toml・plugin.json・Cargo.lock の dagq の version が X.Y.Z-dev で、main のビルドの dagq --version が X.Y.Z-dev+<commit> を出す' \
+  --paths Cargo.toml --paths Cargo.lock --paths 'plugins/claude-dagq/.claude-plugin/plugin.json' \
+  --verify 'cargo publish --dry-run --locked' --verify 'cargo test --locked --test plugin'
+```
+
+これを忘れると、main のビルドがリリースと同じ `X.Y.Z` を名乗り、build 識別子に commit が入らないので、`up` がリリースのバイナリと開発中のビルドを見分けられない。
+
+## 7. 固定バイナリの更新
+
+`~/.local/bin/dagq` の入れ替えはこの skill では行わない。AGENTS.md の「作業中」と「起動と停止」の手順（入替はユーザーに報告してから、build 識別子が変われば `up` が supervisor を入れ替える）に従う。
