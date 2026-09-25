@@ -2,8 +2,9 @@ use anyhow::{Result, bail, ensure};
 use dagq::{
     VERSION,
     application::{
-        AgentProvider, Clock, CommandSpec, Generators, IdGenerator, MainRemote,
-        SupervisorEnvironment, TaskStore, WorkspaceBackend, WorkspaceTags, dependency_graph,
+        AgentProvider, Clock, CommandSpec, Exit, Generators, IdGenerator, MainRemote, Spawned,
+        Spawner, Streams, SupervisorEnvironment, TaskStore, WorkspaceBackend, WorkspaceTags,
+        dependency_graph,
     },
     domain::{
         AskId, AskKind, CommitSha, EventId, EvidenceCheck, GoalEdit, GoalId, NewAsk, NewGoal,
@@ -15,6 +16,7 @@ use dagq::{
         asks::AskQuery,
         clock::{self, SystemClock},
         location::QueueLocation,
+        process,
         run_files::LocalRunFiles,
         sqlite::SqliteQueue,
         telemetry::Telemetry,
@@ -26,10 +28,11 @@ use serde_json::{Value, json};
 use std::{
     collections::HashMap,
     fs,
+    os::unix::process::CommandExt,
     path::{Path, PathBuf},
-    process::Command,
+    process::{Child, Command, Stdio},
     sync::{
-        Arc, Mutex,
+        Arc, LazyLock, Mutex, MutexGuard, PoisonError,
         atomic::{AtomicI64, AtomicUsize, Ordering},
     },
     thread,
@@ -56,7 +59,186 @@ fn git(repo: &Path, args: &[&str]) {
     );
 }
 
-fn fixture() -> (TempDir, PathBuf, PathBuf) {
+/// The first lines of every stub agent: a stub whose test process is gone
+/// (killed, or ended while the session still ran) kills its own process
+/// group, the one [`StubSpawner`] made, with every child in it.
+macro_rules! watchdog {
+    () => {
+        r#"
+( while kill -0 $$ 2>/dev/null; do kill -0 "$PPID" 2>/dev/null || kill -s KILL -- -$$; sleep 0.2; done ) &
+"#
+    };
+}
+
+/// A test's directory with its repository and queue. Dropping it, when the
+/// test returns or panics, kills every stub agent started on its queue with
+/// all their children, so none outlives the test (task 317).
+struct Fixture {
+    db: PathBuf,
+    dir: TempDir,
+}
+impl Fixture {
+    fn path(&self) -> &Path {
+        self.dir.path()
+    }
+}
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        kill_stubs(&self.db);
+    }
+}
+
+/// The process groups of the stub agents started per queue; a queue whose
+/// fixture was dropped maps to `None` and starts no more.
+static STUBS: LazyLock<Mutex<HashMap<PathBuf, Option<Vec<u32>>>>> = LazyLock::new(Default::default);
+
+fn stubs() -> MutexGuard<'static, HashMap<PathBuf, Option<Vec<u32>>>> {
+    STUBS.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+fn kill_stubs(db: &Path) {
+    let groups = stubs().insert(db.into(), None).flatten();
+    for group in groups.unwrap_or_default() {
+        // SAFETY: kill(2) takes no pointer; a negative pid names the group.
+        unsafe { libc::kill(-(group as libc::pid_t), libc::SIGKILL) };
+    }
+}
+
+/// Starts the stub agents of the sessions on `db`, as `LocalSpawner` would
+/// start Claude, but each in a process group of its own, which [`Fixture`]
+/// kills, and with no stream of the test process: a stub left running does
+/// not hold the pipe of `cargo test | grep` open.
+struct StubSpawner {
+    db: PathBuf,
+}
+impl Spawner for StubSpawner {
+    fn spawn(&self, spec: &CommandSpec, streams: Streams<'_>) -> Result<Box<dyn Spawned>> {
+        assert!(matches!(streams, Streams::Inherit), "the agent's terminal");
+        let mut stubs = stubs();
+        let Some(groups) = stubs.entry(self.db.clone()).or_insert(Some(Vec::new())) else {
+            bail!("the test's fixture is gone");
+        };
+        let child = process::command(spec)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0)
+            .spawn()?;
+        groups.push(child.id());
+        Ok(Box::new(Stub(child)))
+    }
+}
+
+struct Stub(Child);
+impl Spawned for Stub {
+    fn id(&self) -> u32 {
+        self.0.id()
+    }
+    fn try_wait(&mut self) -> Result<Option<Exit>> {
+        Ok(self.0.try_wait()?.map(process::exit))
+    }
+    fn kill(&mut self) -> Result<()> {
+        Ok(self.0.kill()?)
+    }
+    fn wait(&mut self) -> Result<Exit> {
+        Ok(process::exit(self.0.wait()?))
+    }
+}
+
+/// Whether `pid` runs: neither gone nor a zombie.
+fn running(pid: u32) -> bool {
+    let out = Command::new("ps")
+        .args(["-o", "stat=", "-p", &pid.to_string()])
+        .output()
+        .unwrap();
+    let stat = String::from_utf8_lossy(&out.stdout);
+    !stat.trim().is_empty() && !stat.trim().starts_with('Z')
+}
+
+/// A stub agent and the children it started die with the test's fixture
+/// when the test ends while the stub still runs, here by a panic, and the
+/// stub holds none of the test process's streams (task 317). To check a
+/// whole run by hand: after `cargo test --locked`,
+/// `ps -axo pid,ppid,command | grep -e 'test -f seed.txt' -e await_exit`
+/// lists no stub.
+#[test]
+fn a_stub_agent_dies_with_its_fixture_and_holds_no_stream_of_the_test() {
+    let out = tempfile::tempdir().unwrap();
+    let (pids, streams) = (out.path().join("pids"), out.path().join("streams"));
+    let (stub_pid, db) = {
+        let (pids, streams) = (pids.clone(), streams.clone());
+        let stub = Arc::new(Mutex::new(None));
+        let started = stub.clone();
+        let panicked = std::panic::catch_unwind(move || {
+            let (_dir, _repo, db) = fixture();
+            let mut spec = CommandSpec::new("/bin/sh");
+            spec.env("PIDS", &pids)
+                .env("STREAMS", &streams)
+                .arg("-c")
+                .arg(concat!(
+                    watchdog!(),
+                    r#"
+for fd in 0 1 2; do [ /dev/fd/$fd -ef /dev/null ] && printf '%s ' null >> "$STREAMS.tmp"; done
+mv "$STREAMS.tmp" "$STREAMS"
+sleep 300 &
+printf '%s %s\n' $$ $! > "$PIDS.tmp"
+mv "$PIDS.tmp" "$PIDS"
+while :; do sleep 0.05; done
+"#
+                ));
+            let child = StubSpawner { db: db.clone() }
+                .spawn(&spec, Streams::Inherit)
+                .unwrap();
+            *started.lock().unwrap() = Some((child.id(), db));
+            let begun = Instant::now();
+            while !pids.exists() {
+                assert!(begun.elapsed() < Duration::from_secs(30));
+                thread::sleep(Duration::from_millis(20));
+            }
+            panic!("the test fails while its stub runs");
+        });
+        assert!(panicked.is_err());
+        stub.lock().unwrap().take().unwrap()
+    };
+    assert_eq!(fs::read_to_string(&streams).unwrap(), "null null null ");
+    let text = fs::read_to_string(&pids).unwrap();
+    let (shell, sleep) = text.trim().split_once(' ').unwrap();
+    assert_eq!(shell, stub_pid.to_string());
+    let sleep: u32 = sleep.parse().unwrap();
+    // The shell is this process's child: reaped here once killed.
+    let begun = Instant::now();
+    loop {
+        // SAFETY: waitpid(2) with a null status pointer writes nothing.
+        let reaped =
+            unsafe { libc::waitpid(stub_pid as libc::pid_t, std::ptr::null_mut(), libc::WNOHANG) };
+        if reaped == stub_pid as libc::pid_t {
+            break;
+        }
+        assert!(
+            begun.elapsed() < Duration::from_secs(10),
+            "stub {stub_pid} lives on"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+    while running(sleep) {
+        assert!(
+            begun.elapsed() < Duration::from_secs(10),
+            "sleep {sleep} lives on"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+    // The fixture's queue starts no more stubs.
+    let error = StubSpawner { db }
+        .spawn(
+            CommandSpec::new("/bin/sh").arg("-c").arg("exit 0"),
+            Streams::Inherit,
+        )
+        .err()
+        .unwrap();
+    assert_eq!(error.to_string(), "the test's fixture is gone");
+}
+
+fn fixture() -> (Fixture, PathBuf, PathBuf) {
     let dir = tempfile::tempdir().unwrap();
     let repo = dir.path().join("repo's directory");
     fs::create_dir(&repo).unwrap();
@@ -69,7 +251,14 @@ fn fixture() -> (TempDir, PathBuf, PathBuf) {
     let db = dir.path().join("queue's data.db");
     let mut queue = SqliteQueue::init(&db).unwrap();
     add_ready_task(&mut queue, "test task", &[]);
-    (dir, repo, db)
+    (
+        Fixture {
+            db: db.clone(),
+            dir,
+        },
+        repo,
+        db,
+    )
 }
 
 fn add_ready_task(queue: &mut SqliteQueue, title: &str, dependencies: &[TaskId]) -> TaskId {
@@ -100,7 +289,9 @@ fn add_ready_task(queue: &mut SqliteQueue, title: &str, dependencies: &[TaskId])
 /// running, `idle_bg_done` once it ended, as Claude Code 2.1.281 writes
 /// `background_tasks`), and `await_exit` blocks until the test
 /// workspace delivers the supervisor's exit request.
-const AGENT_PRELUDE: &str = r#"
+const AGENT_PRELUDE: &str = concat!(
+    watchdog!(),
+    r#"
 test -f seed.txt || exit 99
 printf 'fixture log\n' > "$LOG"
 receipt() {
@@ -121,7 +312,8 @@ idle_bg_done() {
 }
 await_exit() { while [ ! -f "$EXIT" ]; do sleep 0.05; done; }
 commit() { printf 'change by %s\n' "$RUN_ID" > change.txt && git add change.txt && git commit -q -m "$1"; }
-"#;
+"#
+);
 const VALID_AGENT: &str = "commit work; receipt \"$(git rev-parse HEAD)\"";
 /// The first workspace the test backend hands out; see `workspace_id`.
 const WORKSPACE_ID: &str = "01234567-89ab-4def-8123-000000000000";
@@ -134,7 +326,9 @@ fn workspace_id(n: usize) -> String {
 /// supervisor's resolution request arrived (the test backend writes it to
 /// `$MESSAGE`) and sets `$MAIN` to the main it names; `receipt` / `idle` /
 /// `await_exit` are the worker's.
-const RESUME_PRELUDE: &str = r#"
+const RESUME_PRELUDE: &str = concat!(
+    watchdog!(),
+    r#"
 receipt() {
   printf '{"run_id":"%s","result":"%s","commit":"%s","tests":{"status":"passed","evidence_or_reason":"reran after the rebase"},"e2e":{"status":"not_applicable","evidence_or_reason":"no e2e surface"},"subagent_review":{"status":"not_applicable","evidence_or_reason":"resumed session"},"summary":"%s"}' "$RUN_ID" "${2:-succeeded}" "$1" "${3:-resolved}" > "$RECEIPT.tmp"
   mv "$RECEIPT.tmp" "$RECEIPT"
@@ -187,7 +381,8 @@ resolve() {
     fi || sleep 0.05
   done
 }
-"#;
+"#
+);
 
 struct TestProvider {
     script: String,
@@ -499,7 +694,8 @@ impl WorkspaceBackend for TestWorkspace {
                 script,
                 db: db.clone(),
             };
-            runtime::session_with_provider(&db, &id, &token, &provider)
+            let spawner = StubSpawner { db: db.clone() };
+            runtime::session_with_provider(&db, &id, &token, &provider, &spawner)
         });
         sessions.push((
             workspace.clone(),
@@ -563,7 +759,8 @@ impl WorkspaceBackend for TestWorkspace {
                 script,
                 db: db.clone(),
             };
-            runtime::resume_session_with_provider(&db, &id, &token, &provider)
+            let spawner = StubSpawner { db: db.clone() };
+            runtime::resume_session_with_provider(&db, &id, &token, &provider, &spawner)
         });
         sessions.push((
             workspace.clone(),
@@ -831,11 +1028,11 @@ fn wait_until(db: &Path, timeout: Duration, mut condition: impl FnMut(&mut Sqlit
 }
 
 /// Run one fake agent script through supervise and return the task detail.
-fn run_agent(script: &str) -> (TempDir, PathBuf, dagq::domain::TaskDetail) {
+fn run_agent(script: &str) -> (Fixture, PathBuf, dagq::domain::TaskDetail) {
     run_agent_with(script, false)
 }
 
-fn run_agent_with(script: &str, close_fail: bool) -> (TempDir, PathBuf, dagq::domain::TaskDetail) {
+fn run_agent_with(script: &str, close_fail: bool) -> (Fixture, PathBuf, dagq::domain::TaskDetail) {
     let (dir, repo, db) = fixture();
     let mut backend = TestWorkspace::new(&db, false, script);
     backend.close_fail = close_fail;
@@ -3222,6 +3419,17 @@ fn pid_alive(pid: u32) -> bool {
         .success()
 }
 
+/// A `sleep 60` with no stream of the test process: one a failing test
+/// leaves behind does not hold the pipe of `cargo test | grep` open.
+fn sleeper() -> Child {
+    Command::new("sleep")
+        .arg("60")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap()
+}
+
 /// A PID that certainly belonged to a process that has already exited.
 fn dead_pid() -> u32 {
     let mut child = Command::new("true").spawn().unwrap();
@@ -3283,8 +3491,8 @@ fn orphan_run(repo: &Path, db: &Path, token: &str, wrapper: u32, agent: u32) -> 
 #[test]
 fn recover_requires_dead_processes_and_stale_lease_then_allows_a_new_run() {
     let (_dir, repo, db) = fixture();
-    let mut wrapper = Command::new("sleep").arg("60").spawn().unwrap();
-    let mut agent = Command::new("sleep").arg("60").spawn().unwrap();
+    let mut wrapper = sleeper();
+    let mut agent = sleeper();
     let run = orphan_run(&repo, &db, "owner", wrapper.id(), agent.id());
     let mut queue = SqliteQueue::open(&db).unwrap();
 
@@ -3772,7 +3980,7 @@ fn assert_landed(repo: &Path, run: &TaskRun, task_title: &str, expected_parent: 
 }
 
 /// A validated run plus a ready dependent task, before any landing.
-fn awaiting_run() -> (TempDir, PathBuf, PathBuf, TaskRun) {
+fn awaiting_run() -> (Fixture, PathBuf, PathBuf, TaskRun) {
     let (dir, db, detail) = run_agent(VALID_AGENT);
     let run = detail.runs[0].clone();
     assert_eq!(run.status(), RunStatus::AwaitingIntegration);
@@ -6777,10 +6985,10 @@ fn recovering_one_orphaned_run_leaves_the_other_running() {
     let (_dir, repo, db) = fixture();
     let mut queue = SqliteQueue::open(&db).unwrap();
     add_ready_task(&mut queue, "still alive", &[]);
-    let mut dead_wrapper = Command::new("sleep").arg("60").spawn().unwrap();
-    let mut dead_agent = Command::new("sleep").arg("60").spawn().unwrap();
-    let mut live_wrapper = Command::new("sleep").arg("60").spawn().unwrap();
-    let mut live_agent = Command::new("sleep").arg("60").spawn().unwrap();
+    let mut dead_wrapper = sleeper();
+    let mut dead_agent = sleeper();
+    let mut live_wrapper = sleeper();
+    let mut live_agent = sleeper();
     let orphan = orphan_run(&repo, &db, "owner", dead_wrapper.id(), dead_agent.id());
     let survivor = orphan_run(&repo, &db, "owner", live_wrapper.id(), live_agent.id());
     // One supervisor, two leases; it died and took nothing with it.
@@ -7081,7 +7289,7 @@ fn fresh_leases_dead_wrappers_early_runs_leaseless_and_integrating_runs_are_not_
     // lease is what decides here).
     let mut children: Vec<std::process::Child> = Vec::new();
     let mut spawn = || {
-        let child = Command::new("sleep").arg("60").spawn().unwrap();
+        let child = sleeper();
         let pid = child.id();
         children.push(child);
         pid
@@ -8836,7 +9044,7 @@ fn a_broken_dagq_toml_stops_provisioning_before_the_workspace() {
 }
 
 /// A fixture whose only ready task requires `evidence` in the receipt.
-fn evidence_fixture(evidence: &[EvidenceCheck]) -> (TempDir, PathBuf, PathBuf) {
+fn evidence_fixture(evidence: &[EvidenceCheck]) -> (Fixture, PathBuf, PathBuf) {
     let (dir, repo, db) = fixture();
     let mut queue = SqliteQueue::open(&db).unwrap();
     queue
@@ -9062,7 +9270,7 @@ fn a_resume_or_integrate_without_the_required_evidence_does_not_land() {
 }
 
 /// A fixture whose only ready task declares `paths` (ADR-0029).
-fn scope_fixture(paths: &[&str]) -> (TempDir, PathBuf, PathBuf) {
+fn scope_fixture(paths: &[&str]) -> (Fixture, PathBuf, PathBuf) {
     let (dir, repo, db) = fixture();
     let mut queue = SqliteQueue::open(&db).unwrap();
     queue
@@ -11581,7 +11789,14 @@ fn revive_wrapper(db: &Path, run_id: &RunId, pid: u32) {
 struct StandIn(std::process::Child);
 impl StandIn {
     fn new() -> Self {
-        Self(Command::new("sleep").arg("600").spawn().unwrap())
+        Self(
+            Command::new("sleep")
+                .arg("600")
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap(),
+        )
     }
     fn pid(&self) -> u32 {
         self.0.id()

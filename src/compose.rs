@@ -20,7 +20,7 @@ use std::{
 use crate::{
     application::{
         AgentProvider, Generators, LaunchAgent, MainRemote, ProcessControl, QueueOpener,
-        Repository, WorkspaceBackend, health,
+        Repository, Spawner, WorkspaceBackend, health,
         integrate::{self as integration, IntegrateTarget, Integration},
         lifecycle::{
             self, DownOptions, Ports as LifecyclePorts, QUEUE_ENV, QueuePaths, REVIEWER_ROLE,
@@ -573,16 +573,18 @@ pub fn session(db: &Path, id: &RunId, token: &str, claude: &Path, resume: bool) 
     let provider = ClaudeCode {
         executable: claude.into(),
     };
-    run_session(db, id, token, &provider, resume)
+    run_session(db, id, token, &provider, &LocalSpawner, resume)
 }
 
+/// The wrapper with `provider`'s agent started by `spawner`.
 pub fn session_with_provider(
     db: &Path,
     id: &RunId,
     token: &str,
     provider: &dyn AgentProvider,
+    spawner: &dyn Spawner,
 ) -> Result<Value> {
-    run_session(db, id, token, provider, false)
+    run_session(db, id, token, provider, spawner, false)
 }
 
 /// The wrapper of a resumed session: `session --resume`.
@@ -591,8 +593,9 @@ pub fn resume_session_with_provider(
     id: &RunId,
     token: &str,
     provider: &dyn AgentProvider,
+    spawner: &dyn Spawner,
 ) -> Result<Value> {
-    run_session(db, id, token, provider, true)
+    run_session(db, id, token, provider, spawner, true)
 }
 
 fn run_session(
@@ -600,6 +603,7 @@ fn run_session(
     id: &RunId,
     token: &str,
     provider: &dyn AgentProvider,
+    spawner: &dyn Spawner,
     resume: bool,
 ) -> Result<Value> {
     let mut queue = SqliteQueue::open(db)?;
@@ -607,7 +611,7 @@ fn run_session(
         Session {
             queue: &mut queue,
             provider,
-            spawner: &LocalSpawner,
+            spawner,
             files: &LocalRunFiles,
             pid: std::process::id(),
         },
