@@ -98,6 +98,19 @@ pub struct RunEvent {
     pub created_at: String,
 }
 
+/// Which run events `events` reads (ADR-0044 decision 22): every field
+/// that is set narrows them. `since` / `until` are queue timestamps
+/// (`since <= created_at < until`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EventFilter {
+    pub kinds: Option<Vec<String>>,
+    pub run: Option<RunId>,
+    pub task: Option<TaskId>,
+    pub goal: Option<GoalId>,
+    pub since: Option<String>,
+    pub until: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct TaskDetail {
     pub task: Task,

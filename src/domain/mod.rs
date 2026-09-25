@@ -392,6 +392,7 @@ pub mod search;
 pub mod stall;
 pub mod stats;
 pub mod task;
+pub mod timeline;
 mod views;
 
 pub use error::DomainError;
@@ -411,9 +412,10 @@ pub use reason::{Reason, ReasonCode};
 pub use run::TaskRun;
 pub use task::{Task, TaskAction};
 pub use views::{
-    ClaimOutcome, GoalDetail, GoalPredecessor, GoalSummary, GoalTask, IntegrationOutcome,
-    Predecessor, Receipt, ReceiptCheck, RegisteredFollowUp, RunEvent, RunLease, RunPaths,
-    RunProcess, SupervisorRegistration, TaskDetail, TaskStatusCounts, evidence_missing_reason,
+    ClaimOutcome, EventFilter, GoalDetail, GoalPredecessor, GoalSummary, GoalTask,
+    IntegrationOutcome, Predecessor, Receipt, ReceiptCheck, RegisteredFollowUp, RunEvent, RunLease,
+    RunPaths, RunProcess, SupervisorRegistration, TaskDetail, TaskStatusCounts,
+    evidence_missing_reason,
 };
 
 /// A question for a person (ADR-0022): about a task, or one of its runs when

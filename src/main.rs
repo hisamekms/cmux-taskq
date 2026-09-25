@@ -546,6 +546,39 @@ enum Command {
         /// Every event kind, not only attention.
         #[arg(long)]
         all: bool,
+        /// Every field (run_id included) and the whole payload instead of the compact form.
+        #[arg(long)]
+        full: bool,
+        /// Only this run's events.
+        #[arg(long)]
+        run: Option<String>,
+        /// Only this task's events.
+        #[arg(long)]
+        task: Option<i64>,
+        /// Only this goal's events.
+        #[arg(long)]
+        goal: Option<i64>,
+        /// Only events of this kind, attention or not; repeat for several.
+        #[arg(long)]
+        kind: Vec<String>,
+        /// Only events at or after this UTC time (YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS[.fff]Z).
+        #[arg(long)]
+        since: Option<String>,
+        /// Only events before this UTC time.
+        #[arg(long)]
+        until: Option<String>,
+    },
+    /// A run's events oldest first and the gaps between them of at least --gap seconds, each
+    /// with the reason the events show (idle, waiting_ask, background, after_receipt,
+    /// waiting_integration, integrating, no_supervisor, unknown). Reads only.
+    Timeline {
+        run: String,
+        /// The shortest gap reported, in seconds.
+        #[arg(long, default_value_t = dagq::domain::timeline::DEFAULT_GAP_SECS, value_parser = clap::value_parser!(i64).range(1..))]
+        gap: i64,
+        /// Every field and the whole payload of each event instead of the compact form.
+        #[arg(long)]
+        full: bool,
     },
     /// Block until an attention event after the cursor arrives or the supervisors' health changes; returns empty on timeout. Reads only, never integrates.
     Watch {
@@ -748,6 +781,7 @@ fn reads_only(command: &Command) -> bool {
             | Command::Status { .. }
             | Command::Asks { .. }
             | Command::Events { .. }
+            | Command::Timeline { .. }
             | Command::Stats { .. }
             | Command::Doctor { .. }
             | Command::Notes { .. }
@@ -793,6 +827,7 @@ fn observer_access(command: &Command) -> ObserverAccess {
         | Command::Status { .. }
         | Command::Asks { .. }
         | Command::Events { .. }
+        | Command::Timeline { .. }
         | Command::Watch { .. }
         | Command::Stats { .. }
         | Command::Doctor { .. }
@@ -1276,8 +1311,36 @@ fn execute(cli: Cli) -> Result<Value> {
             role: parse_role(r)?,
         })?})
         }
-        Command::Events { after, limit, all } => {
-            dagq::watch::events(&db, EventId::new(after), limit as usize, all)?
+        Command::Events {
+            after,
+            limit,
+            all,
+            full,
+            run,
+            task,
+            goal,
+            kind,
+            since,
+            until,
+        } => dagq::watch::events_matching(
+            &db,
+            &dagq::watch::EventsQuery {
+                after: EventId::new(after),
+                limit: limit as usize,
+                all,
+                full,
+                filter: dagq::domain::EventFilter {
+                    kinds: (!kind.is_empty()).then_some(kind),
+                    run: run.map(RunId::new).transpose()?,
+                    task: task.map(TaskId::new),
+                    goal: goal.map(GoalId::new),
+                    since: since.as_deref().map(dagq::watch::event_time).transpose()?,
+                    until: until.as_deref().map(dagq::watch::event_time).transpose()?,
+                },
+            },
+        )?,
+        Command::Timeline { run, gap, full } => {
+            dagq::watch::timeline(&db, &RunId::new(run)?, gap, full)?
         }
         Command::Watch {
             after,

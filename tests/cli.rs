@@ -438,6 +438,209 @@ fn events_and_watch_read_past_a_cursor() {
     assert!(!invoke(&db, &["watch", "--interval", "0"]).status.success());
 }
 
+/// A claimed run of task 1 (goal 1) with the given events, their
+/// `created_at` set to 2026-09-24 at the given `HH:MM:SS`; the run's ID.
+fn run_with_events(db: &Path, events: &[(&str, serde_json::Value, &str)]) -> String {
+    use dagq::domain::{ClaimOutcome, CommitSha};
+    ok(db, &["init"]);
+    ok(db, &["goal", "add", "measured"]);
+    ok(db, &["add", "first", "--goal", "1"]);
+    ok(db, &["ready", "1", "--bypass-review"]);
+    let mut queue = SqliteQueue::open(db).unwrap();
+    let base = CommitSha::try_from("0123456789abcdef0123456789abcdef01234567").unwrap();
+    let ClaimOutcome::Claimed { run } = queue.claim_for_supervisor(&base, "t").unwrap() else {
+        panic!("nothing to claim");
+    };
+    let conn = rusqlite::Connection::open(db).unwrap();
+    conn.execute(
+        "UPDATE run_events SET created_at='2026-09-24T00:00:00.000Z' WHERE run_id=?1",
+        [run.id().as_str()],
+    )
+    .unwrap();
+    for (kind, payload, at) in events {
+        queue
+            .record_runtime_event(run.id(), kind, payload.clone())
+            .unwrap();
+        conn.execute(
+            "UPDATE run_events SET created_at=?1 WHERE id=(SELECT MAX(id) FROM run_events)",
+            [format!("2026-09-24T{at}.000Z")],
+        )
+        .unwrap();
+    }
+    run.id().as_str().to_owned()
+}
+
+#[test]
+fn events_full_and_filters_narrow_what_they_read() {
+    use serde_json::json;
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("queue.db");
+    let run = run_with_events(
+        &db,
+        &[
+            ("agent_started", json!({"pid": 1}), "00:00:05"),
+            (
+                "receipt_observed",
+                json!({"path": "/r/receipt.json"}),
+                "10:00:00",
+            ),
+            (
+                "validation_finished",
+                json!({"accepted": true, "receipt": {"summary": "s"}}),
+                "10:00:01",
+            ),
+        ],
+    );
+    ok(&db, &["add", "other"]);
+    let kinds = |value: &Value| {
+        value["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["kind"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>()
+    };
+
+    // --full keeps every field and the whole payload; the compact form drops the payload.
+    let full = ok(&db, &["events", "--all", "--full", "--run", &run]);
+    let events = full["events"].as_array().unwrap();
+    assert!(events.len() >= 4);
+    assert!(
+        events
+            .iter()
+            .all(|e| e["run_id"] == run.as_str() && e["payload"].is_object())
+    );
+    let validated = events.last().unwrap();
+    assert_eq!(validated["payload"]["receipt"]["summary"], "s");
+    assert_eq!(validated["task_id"], 1);
+    let compact = ok(&db, &["events", "--all", "--run", &run]);
+    assert!(compact["events"][0].get("payload").is_none());
+
+    // --kind reads that kind, attention or not; repeated, several.
+    assert_eq!(
+        kinds(&ok(
+            &db,
+            &[
+                "events",
+                "--kind",
+                "receipt_observed",
+                "--kind",
+                "agent_started"
+            ]
+        )),
+        ["agent_started", "receipt_observed"]
+    );
+    // Without --all or --kind, the filters still keep attention only.
+    assert_eq!(
+        kinds(&ok(&db, &["events", "--run", &run])),
+        Vec::<String>::new()
+    );
+    // --task and --goal.
+    let other = kinds(&ok(&db, &["events", "--all", "--task", "2"]));
+    assert_eq!(other, ["task_created"]);
+    // --goal reads the goal's own events and those of its tasks and runs.
+    let goal = ok(&db, &["events", "--all", "--goal", "1"]);
+    let goal_kinds = kinds(&goal);
+    assert!(goal_kinds.contains(&"goal_created".to_owned()));
+    assert!(goal_kinds.contains(&"receipt_observed".to_owned()));
+    assert!(
+        goal["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|e| e["task_id"] != 2)
+    );
+    // --since is inclusive, --until exclusive; a date is its midnight.
+    assert_eq!(
+        kinds(&ok(
+            &db,
+            &[
+                "events",
+                "--all",
+                "--run",
+                &run,
+                "--since",
+                "2026-09-24T00:00:05Z",
+                "--until",
+                "2026-09-24T10:00:01",
+            ]
+        )),
+        ["agent_started", "receipt_observed"]
+    );
+    assert_eq!(
+        kinds(&ok(
+            &db,
+            &["events", "--all", "--run", &run, "--until", "2026-09-24"]
+        )),
+        Vec::<String>::new()
+    );
+    for bad in [
+        "yesterday",
+        "2026-09-26T1:00:00Z",
+        "2026-09-26T24:00:00",
+        "2026-13-01",
+        "2026-09-26T10:00:00.Z",
+    ] {
+        let output = invoke(&db, &["events", "--since", bad]);
+        assert!(!output.status.success(), "{bad}");
+        assert!(String::from_utf8_lossy(&output.stderr).contains("not a UTC time"));
+    }
+}
+
+#[test]
+fn timeline_names_the_long_gap_before_the_receipt() {
+    use serde_json::json;
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("queue.db");
+    // Task 182's shape: the session starts, then nothing until the receipt
+    // ten hours later; the run waits on a question for an hour after it.
+    let run = run_with_events(
+        &db,
+        &[
+            ("agent_started", json!({}), "00:00:05"),
+            ("receipt_observed", json!({}), "10:00:00"),
+            (
+                "ask_opened",
+                json!({"ask_id": 9, "kind": "worker_question"}),
+                "10:00:10",
+            ),
+            (
+                "ask_answered",
+                json!({"ask_id": 9, "kind": "worker_question"}),
+                "11:00:10",
+            ),
+        ],
+    );
+    let timeline = ok(&db, &["timeline", &run]);
+    assert_eq!(timeline["run_id"], run.as_str());
+    assert_eq!(timeline["task_id"], 1);
+    assert_eq!(timeline["status"], "claimed");
+    assert_eq!(timeline["gap_secs"], 300);
+    let gaps = timeline["gaps"].as_array().unwrap();
+    assert_eq!(gaps[0]["reason"], "idle");
+    assert_eq!(gaps[0]["phase"], "session");
+    assert_eq!(gaps[0]["confirmed"], false);
+    assert_eq!(gaps[0]["secs"], 10 * 3600 - 5);
+    assert_eq!(gaps[0]["from"], "2026-09-24T00:00:05.000Z");
+    assert_eq!(gaps[0]["until"], "2026-09-24T10:00:00.000Z");
+    assert_eq!(gaps[1]["reason"], "waiting_ask");
+    assert_eq!(gaps[1]["ask_ids"], json!([9]));
+    // The run is not finished: the time since its last event is a gap too.
+    let last = gaps.last().unwrap();
+    assert!(last["before_event"].is_null() && last["until"].is_null());
+    assert_eq!(last["reason"], "after_receipt");
+    assert!(timeline["events"][0].get("payload").is_none());
+    let full = ok(&db, &["timeline", &run, "--full", "--gap", "7200"]);
+    assert!(full["events"][0]["payload"].is_object());
+    assert_eq!(full["gaps"][0]["secs"], 10 * 3600 - 5);
+    assert!(!invoke(&db, &["timeline", "no-such-run"]).status.success());
+    assert!(
+        !invoke(&db, &["timeline", &run, "--gap", "0"])
+            .status
+            .success()
+    );
+}
+
 #[test]
 fn ask_answer_asks_and_close_through_the_cli() {
     let dir = tempfile::tempdir().unwrap();

@@ -16,10 +16,10 @@ use super::{
 };
 use crate::application::{AskStore, Generators, RunStore, timestamp, unix_seconds};
 use crate::domain::{
-    AskId, ClaimOutcome, CommitSha, DomainError, EventId, GoalId, PlannerId, PlannerOrigin,
-    PlannerSession, ProposalId, Reason, ReasonCode, RunEvent, RunId, RunLease, RunPaths,
-    RunProcess, RunStatus, SessionRole, SupervisorMode, SupervisorRegistration, Task, TaskAction,
-    TaskId, TaskRun, run,
+    AskId, ClaimOutcome, CommitSha, DomainError, EventFilter, EventId, GoalId, PlannerId,
+    PlannerOrigin, PlannerSession, ProposalId, Reason, ReasonCode, RunEvent, RunId, RunLease,
+    RunPaths, RunProcess, RunStatus, SessionRole, SupervisorMode, SupervisorRegistration, Task,
+    TaskAction, TaskId, TaskRun, run,
 };
 
 pub use crate::application::{
@@ -1132,25 +1132,44 @@ impl SqliteQueue {
             .collect::<rusqlite::Result<_>>()?)
     }
 
-    /// Events with `after < id <= upto`, oldest first, at most `limit`;
-    /// `kinds` narrows them to those kinds. A pure read.
+    /// Events with `after < id <= upto` that `filter` keeps, oldest first,
+    /// at most `limit`. A pure read.
     pub fn events_between(
         &self,
         after: EventId,
         upto: EventId,
-        kinds: Option<&[&str]>,
+        filter: &EventFilter,
         limit: usize,
     ) -> Result<Vec<RunEvent>> {
-        let kinds = kinds.map(serde_json::to_string).transpose()?;
+        let kinds = filter
+            .kinds
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?;
         Ok(self
             .conn
             .prepare(
                 "SELECT * FROM run_events WHERE id>?1 AND id<=?2
                  AND (?3 IS NULL OR kind IN (SELECT value FROM json_each(?3)))
-                 ORDER BY id LIMIT ?4",
+                 AND (?4 IS NULL OR run_id=?4) AND (?5 IS NULL OR task_id=?5)
+                 AND (?6 IS NULL OR goal_id=?6
+                      OR task_id IN (SELECT id FROM tasks WHERE goal_id=?6))
+                 AND (?7 IS NULL OR julianday(created_at)>=julianday(?7))
+                 AND (?8 IS NULL OR julianday(created_at)<julianday(?8))
+                 ORDER BY id LIMIT ?9",
             )?
             .query_map(
-                params![after, upto, kinds, i64::try_from(limit)?],
+                params![
+                    after,
+                    upto,
+                    kinds,
+                    filter.run,
+                    filter.task,
+                    filter.goal,
+                    filter.since,
+                    filter.until,
+                    i64::try_from(limit)?
+                ],
                 event_row,
             )?
             .collect::<rusqlite::Result<_>>()?)
