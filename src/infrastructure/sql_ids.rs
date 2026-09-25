@@ -8,7 +8,7 @@ use rusqlite::{
     types::{FromSql, FromSqlError, FromSqlResult, ToSqlOutput, ValueRef},
 };
 
-use crate::domain::{AskId, CommitSha, EventId, GoalId, RunId, TaskId};
+use crate::domain::{AskId, CommitSha, EventId, GoalId, ProposalId, RunId, TaskId};
 
 impl ToSql for TaskId {
     fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
@@ -31,6 +31,18 @@ impl ToSql for GoalId {
 impl FromSql for GoalId {
     fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
         i64::column_result(value).map(GoalId::new)
+    }
+}
+
+impl ToSql for ProposalId {
+    fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
+        Ok(ToSqlOutput::from(self.as_i64()))
+    }
+}
+
+impl FromSql for ProposalId {
+    fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
+        i64::column_result(value).map(ProposalId::new)
     }
 }
 
@@ -110,13 +122,17 @@ mod tests {
         assert_eq!(run.as_str(), "r");
         assert_eq!(commit.as_str(), SHA1);
 
-        let (ask, event): (AskId, EventId) = conn
-            .query_row("SELECT ?1, ?2", (AskId::new(3), EventId::new(8)), |row| {
-                Ok((row.get(0)?, row.get(1)?))
-            })
+        let (ask, event, proposal): (AskId, EventId, ProposalId) = conn
+            .query_row(
+                "SELECT ?1, ?2, ?3",
+                (AskId::new(3), EventId::new(8), ProposalId::new(6)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
             .unwrap();
         assert_eq!(ask, AskId::new(3));
         assert_eq!(event, EventId::new(8));
+        assert_eq!(proposal, ProposalId::new(6));
+        assert_eq!((proposal.to_string(), proposal.as_i64()), ("6".into(), 6));
 
         let blank = conn.query_row("SELECT ''", [], |row| row.get::<_, RunId>(0));
         assert!(blank.is_err());

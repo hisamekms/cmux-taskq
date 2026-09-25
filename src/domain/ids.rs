@@ -99,6 +99,27 @@ impl fmt::Display for GoalId {
     }
 }
 
+/// The ID of a proposal: the `proposals.id` rowid (ADR-0041 decision 7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ProposalId(i64);
+
+impl ProposalId {
+    pub const fn new(id: i64) -> Self {
+        Self(id)
+    }
+
+    pub const fn as_i64(self) -> i64 {
+        self.0
+    }
+}
+
+impl fmt::Display for ProposalId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
 /// The ID of an ask: the `asks.id` rowid, as `answer`, `close` and
 /// `deliver` take it. Distinct from [`TaskId`] and [`EventId`] so an ask's
 /// ID cannot be passed where another rowid is meant.

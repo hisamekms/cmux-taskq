@@ -15,6 +15,9 @@ use super::{
 pub struct TaskStatusCounts {
     pub total: usize,
     pub draft: usize,
+    /// Waiting for plan review (ADR-0041 decision 8).
+    #[serde(default)]
+    pub submitted: usize,
     pub ready: usize,
     pub in_progress: usize,
     pub completed: usize,
@@ -26,6 +29,7 @@ impl TaskStatusCounts {
         self.total += n;
         *match status {
             TaskStatus::Draft => &mut self.draft,
+            TaskStatus::Submitted => &mut self.submitted,
             TaskStatus::Ready => &mut self.ready,
             TaskStatus::InProgress => &mut self.in_progress,
             TaskStatus::Completed => &mut self.completed,

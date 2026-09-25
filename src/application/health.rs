@@ -209,8 +209,9 @@ const REASON_CHARS: usize = 300;
 /// unfinished runs with their leases, without inspecting the runs'
 /// processes, plus what waits for a person narrowed to what `role` acts on
 /// (`attention`, ADR-0022; `None` is all of it), every open ask with its
-/// question cut to 200 characters, and the newest event id (`cursor`) to
-/// `watch` from (ADR-0016).
+/// question cut to 200 characters, the proposals waiting for plan review
+/// or being revised (ADR-0041 decision 7) in plan review's order, and the
+/// newest event id (`cursor`) to `watch` from (ADR-0016).
 pub fn status(
     queue: &dyn Queue,
     control: &dyn ProcessControl,
@@ -274,6 +275,7 @@ pub fn status(
             .filter(|_| for_role(role))
             .collect::<Vec<_>>(),
         "asks": asks,
+        "proposals": queue.proposals(false)?,
         "cursor": cursor,
     }))
 }

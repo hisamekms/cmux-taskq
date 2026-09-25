@@ -65,6 +65,13 @@ pub const WORKER_ROLE: &str = SessionRole::Worker.as_str();
 /// `DAGQ_ROLE` of the session that talks with a person to register goals and
 /// tasks. `up` opens its workspace `[<repo>]planner`.
 pub const PLANNER_ROLE: &str = SessionRole::Planner.as_str();
+/// Who opened a planner session (ADR-0041 decision 7): `person` (the
+/// default when unset) or `runtime`, recorded as the owner of the
+/// proposals it submits.
+pub const PLANNER_ORIGIN_ENV: &str = "DAGQ_PLANNER_ORIGIN";
+/// The cmux workspace a session runs in, set by cmux in every terminal:
+/// the planner workspace that owns the proposals it submits.
+pub const CMUX_WORKSPACE_ENV: &str = "CMUX_WORKSPACE_ID";
 /// `DAGQ_ROLE` of the session where a person answers the queue's asks. `up`
 /// opens its workspace `[<repo>]inbox`.
 pub const INBOX_ROLE: &str = SessionRole::Inbox.as_str();

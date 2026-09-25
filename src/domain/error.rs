@@ -1,8 +1,8 @@
 use std::fmt;
 
 use super::{
-    AskKind, CheckStatus, GoalId, GoalVerdict, ReceiptResult, RunId, RunStatus, TaskAction, TaskId,
-    TaskStatus,
+    AskKind, CheckStatus, GoalId, GoalVerdict, ProposalId, ProposalStatus, ReceiptResult, RunId,
+    RunStatus, TaskAction, TaskId, TaskStatus,
 };
 
 /// A business rejection by the domain: an invalid value, a transition the
@@ -35,12 +35,17 @@ pub enum DomainError {
     GoalCloseInconsistent {
         goal_id: GoalId,
     },
-    /// `what` of a task that is neither a draft nor ready.
+    /// A draft or submitted task made ready by hand without the bypass:
+    /// only plan review readies it (ADR-0041 decision 8).
+    ReadyNeedsPlanReview {
+        status: TaskStatus,
+    },
+    /// `what` of a task that is neither a draft, submitted nor ready.
     TaskNotEditable {
         what: &'static str,
     },
     /// `dagq edit` of a task whose status keeps its content (ADR-0041
-    /// decision 9): only a draft is edited.
+    /// decision 9): only a draft or a submitted task is edited.
     TaskContentNotEditable {
         task_id: TaskId,
         status: TaskStatus,
@@ -69,6 +74,24 @@ pub enum DomainError {
     GoalMembershipCycle {
         task_id: TaskId,
         goal_id: GoalId,
+    },
+    /// A proposal without a task (`submit`).
+    EmptyProposal,
+    /// A task already in another proposal that is submitted or revising.
+    TaskInOtherProposal {
+        task_id: TaskId,
+        proposal_id: ProposalId,
+    },
+    /// A goal already in another proposal that is submitted or revising.
+    GoalInOtherProposal {
+        goal_id: GoalId,
+        proposal_id: ProposalId,
+    },
+    /// A proposal command its status does not allow.
+    ProposalNotInStatus {
+        proposal_id: ProposalId,
+        status: ProposalStatus,
+        expected: ProposalStatus,
     },
     /// A required text field is blank.
     Blank {
@@ -171,6 +194,12 @@ impl fmt::Display for DomainError {
                 "cannot apply {action:?} to task in {} state",
                 status.as_str()
             ),
+            Self::ReadyNeedsPlanReview { status } => write!(
+                f,
+                "a {} task becomes ready through plan review (submit it); \
+                 pass --bypass-review to skip the review",
+                status.as_str()
+            ),
             Self::GoalClosed { goal_id, verdict } => write!(
                 f,
                 "goal {goal_id} is closed as {}; create a new goal for further work",
@@ -181,11 +210,14 @@ impl fmt::Display for DomainError {
                 "goal {goal_id} has a close time without a verdict or a verdict without a close time"
             ),
             Self::TaskNotEditable { what } => {
-                write!(f, "{what} can only be changed for draft or ready tasks")
+                write!(
+                    f,
+                    "{what} can only be changed for draft, submitted or ready tasks"
+                )
             }
             Self::TaskContentNotEditable { task_id, status } => write!(
                 f,
-                "task {task_id} is {}; only a draft task can be edited",
+                "task {task_id} is {}; only a draft or submitted task can be edited",
                 status.as_str()
             ),
             Self::SelfDependency => f.write_str("a task cannot depend on itself"),
@@ -207,6 +239,31 @@ impl fmt::Display for DomainError {
             Self::GoalMembershipCycle { task_id, goal_id } => write!(
                 f,
                 "moving task {task_id} to goal {goal_id} would create a cycle: the task already waits for the goal"
+            ),
+            Self::EmptyProposal => f.write_str("a proposal needs at least one draft task"),
+            Self::TaskInOtherProposal {
+                task_id,
+                proposal_id,
+            } => write!(
+                f,
+                "task {task_id} already belongs to proposal {proposal_id}"
+            ),
+            Self::GoalInOtherProposal {
+                goal_id,
+                proposal_id,
+            } => write!(
+                f,
+                "goal {goal_id} already belongs to proposal {proposal_id}"
+            ),
+            Self::ProposalNotInStatus {
+                proposal_id,
+                status,
+                expected,
+            } => write!(
+                f,
+                "proposal {proposal_id} is {}, not {}",
+                status.as_str(),
+                expected.as_str()
             ),
             Self::Blank { field } => write!(f, "{field} must not be blank"),
             Self::InvalidPathGlob { glob, reason } => {

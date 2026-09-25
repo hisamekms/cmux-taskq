@@ -669,7 +669,7 @@ mod tests {
         .unwrap_err();
         assert!(matches!(error, DomainError::RunOfUnclaimedTask { .. }));
         assert!(error.to_string().starts_with("task 3 is "));
-        let ready = task::transition(ready, task::TaskAction::Ready, false).unwrap();
+        let ready = task::transition(ready, task::TaskAction::BypassReview, false).unwrap();
         let claimed = task::claim(ready).unwrap();
         let run = TaskRun::new(
             RunId::new("r1").unwrap(),

@@ -17,9 +17,10 @@ use super::{GraphInput, TaskPage, TaskQuery, timestamp, unix_seconds};
 use crate::domain::{
     Ask, AskId, AskKind, AskOutcome, ClaimOutcome, CommitSha, EventId, EvidenceCheck, Goal,
     GoalDetail, GoalEdit, GoalId, GoalPredecessor, GoalSummary, GoalVerdict, NewAsk, NewGoal,
-    NewNote, NewTask, NotePage, NoteQuery, Predecessor, Priority, Reason, ReasonCode, RunEvent,
-    RunId, RunLease, RunPlan, RunProcess, RunStatus, SessionRole, SupervisorMode,
-    SupervisorRegistration, Task, TaskAction, TaskDetail, TaskEdit, TaskId, TaskRun,
+    NewNote, NewTask, NotePage, NoteQuery, Predecessor, Priority, Proposal, ProposalId, Reason,
+    ReasonCode, RunEvent, RunId, RunLease, RunPlan, RunProcess, RunStatus, SessionRole, Submission,
+    SupervisorMode, SupervisorRegistration, Task, TaskAction, TaskDetail, TaskEdit, TaskId,
+    TaskRun,
 };
 
 pub trait TaskStore {
@@ -70,6 +71,24 @@ pub trait TaskStore {
     /// Give a draft or ready task another priority (ADR-0040 decision 4);
     /// it takes effect at the next claim.
     fn set_priority(&mut self, task_id: TaskId, priority: Priority) -> Result<Task>;
+    /// Bundle draft tasks, the draft tasks of the given goals and those
+    /// goals into a proposal and submit it for plan review (ADR-0041
+    /// decisions 7, 8): the tasks become `submitted`, which no claim takes.
+    /// With a proposal ID, submit that proposal again after a revise,
+    /// with the drafts it holds. A task or goal of another active proposal
+    /// is refused.
+    fn submit(&mut self, submission: Submission) -> Result<Proposal>;
+    /// The plan-review path to `ready` (ADR-0041 decisions 8, 11): the
+    /// submitted proposal is accepted, its submitted tasks become ready and
+    /// its draft goals open.
+    fn approve_proposal(&mut self, proposal_id: ProposalId) -> Result<Proposal>;
+    /// Plan review sends the submitted proposal back to its planner: its
+    /// submitted tasks return to draft.
+    fn send_back_proposal(&mut self, proposal_id: ProposalId) -> Result<Proposal>;
+    fn show_proposal(&self, proposal_id: ProposalId) -> Result<Proposal>;
+    /// The submitted and revising proposals, oldest submission first; with
+    /// `all`, every proposal.
+    fn proposals(&self, all: bool) -> Result<Vec<Proposal>>;
     /// Open a draft goal so its tasks become candidates (ADR-0024 decision 5).
     fn ready_goal(&mut self, goal_id: GoalId) -> Result<Goal>;
     /// Record a note as an `observation` run event on its task, run or goal.

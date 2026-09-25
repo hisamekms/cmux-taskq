@@ -30,8 +30,12 @@ macro_rules! string_enum {
     };
 }
 
+// `submitted` waits for plan review (ADR-0041 decision 8): only plan review,
+// a person's explicit bypass and a retry of the same task make a task
+// `ready`.
 string_enum!(TaskStatus {
     Draft => "draft",
+    Submitted => "submitted",
     Ready => "ready",
     InProgress => "in_progress",
     Completed => "completed",
@@ -110,6 +114,25 @@ string_enum!(AskKind {
     // supervisor asks the inbox to clear what holds it and send `/exit`,
     // and closes the ask itself once the session exits.
     StuckExit => "stuck_exit",
+});
+
+// Where a proposal (ADR-0041 decision 7) stands: `submitted` waits for plan
+// review, `revising` was sent back to its planner (its tasks are drafts
+// again), `accepted` passed and made its tasks ready, `canceled` had its
+// tasks canceled on a person's answer.
+string_enum!(ProposalStatus {
+    Submitted => "submitted",
+    Revising => "revising",
+    Accepted => "accepted",
+    Canceled => "canceled",
+});
+
+// Who opened the planner that owns a proposal (ADR-0041 decisions 7, 13): a
+// person with `dagq plan`, or the runtime (a revise whose planner closed, a
+// follow_up). The two differ in where a question for a person goes.
+string_enum!(PlannerOrigin {
+    Person => "person",
+    Runtime => "runtime",
 });
 
 // The verdict of the supervisor's headless review (ADR-0023 decision 2,
@@ -323,6 +346,7 @@ mod error;
 pub mod goal;
 pub mod ids;
 mod input;
+pub mod proposal;
 pub mod reason;
 pub mod run;
 pub mod scope;
@@ -333,8 +357,9 @@ mod views;
 pub use error::DomainError;
 use error::require;
 pub use goal::Goal;
-pub use ids::{AskId, CommitSha, EventId, GoalId, RunId, TaskId};
+pub use ids::{AskId, CommitSha, EventId, GoalId, ProposalId, RunId, TaskId};
 pub use input::{GoalEdit, GoalRecord, NewGoal, NewTask, RunPlan, RunRecord, TaskEdit, TaskRecord};
+pub use proposal::{PlannerOwner, Proposal, ProposalRecord, Submission};
 pub use reason::{Reason, ReasonCode};
 pub use run::TaskRun;
 pub use task::{Task, TaskAction};

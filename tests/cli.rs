@@ -92,9 +92,9 @@ fn cli_persists_across_processes_and_reports_dependency_errors_as_json() {
     let a = first["id"].to_string();
     let second = ok(&db, &["add", "second", "--depends-on", &a]);
     let b = second["id"].to_string();
-    ok(&db, &["ready", &b]);
+    ok(&db, &["ready", &b, "--bypass-review"]);
     assert_eq!(ok(&db, &["candidates"]), serde_json::json!([]));
-    ok(&db, &["ready", &a]);
+    ok(&db, &["ready", &a, "--bypass-review"]);
     assert_eq!(ok(&db, &["candidates"])[0]["id"], first["id"]);
     let output = invoke(&db, &["dependency", "add", &a, &b]);
     assert!(!output.status.success());
@@ -135,6 +135,7 @@ fn reads_do_not_create_a_queue_and_unknown_tasks_fail() {
                 "kind": "supervisor_stopped", "last_error": null, "next": "restart supervisor",
             }]);
             expected["asks"] = serde_json::json!([]);
+            expected["proposals"] = serde_json::json!([]);
             expected["cursor"] = serde_json::json!(0);
         }
         assert_eq!(report, expected, "{command}");
@@ -244,7 +245,7 @@ fn goals_group_tasks_and_report_counts_by_status() {
     assert_eq!(second["context"], "");
     let alone = ok(&db, &["add", "stands alone"]);
     assert!(alone["goal_id"].is_null());
-    ok(&db, &["ready", "2"]);
+    ok(&db, &["ready", "2", "--bypass-review"]);
     let detail = ok(&db, &["show", "1"]);
     assert_eq!(detail["task"]["goal_id"], 1);
     assert_eq!(detail["task"]["context"], "Stage 1 of the ADR");
@@ -266,7 +267,8 @@ fn goals_group_tasks_and_report_counts_by_status() {
     assert!(listed[0]["verdict"].is_null());
     assert_eq!(
         listed[0]["tasks"],
-        serde_json::json!({"total": 2, "draft": 1, "ready": 1, "in_progress": 0, "completed": 0, "canceled": 0})
+        serde_json::json!({"total": 2, "draft": 1, "submitted": 0, "ready": 1, "in_progress": 0,
+                           "completed": 0, "canceled": 0})
     );
     // Moving tasks and editing the goal.
     assert_eq!(ok(&db, &["set-goal", "3", "1"])["goal_id"], 1);
@@ -345,7 +347,7 @@ fn list_options_filter_page_and_expand_tasks() {
         .as_i64()
         .unwrap();
     let c = ok(&db, &["add", "third"])["id"].as_i64().unwrap();
-    ok(&db, &["ready", &a.to_string()]);
+    ok(&db, &["ready", &a.to_string(), "--bypass-review"]);
     ok(&db, &["cancel", &c.to_string()]);
 
     let ids = |value: &Value| -> Vec<i64> {
@@ -663,7 +665,7 @@ fn show_goal_show_and_doctor_are_compact_unless_full() {
     );
     // Draft and ready back and forth: one event each, twelve in all with `task_created`.
     for _ in 0..6 {
-        ok(&db, &["ready", "1"]);
+        ok(&db, &["ready", "1", "--bypass-review"]);
         ok(&db, &["draft", "1"]);
     }
     ok(&db, &["goal", "edit", "1", "--constraints", &long]);
@@ -748,7 +750,7 @@ fn graph_reports_unfinished_dependencies_releases_and_the_critical_chain() {
         &["add", "after goal", "--goal", &goal, "--depends-on", "1"],
     );
     for id in ["1", "2", "3"] {
-        ok(&db, &["ready", id]);
+        ok(&db, &["ready", id, "--bypass-review"]);
     }
     ok(&db, &["cancel", "5"]);
 
@@ -801,7 +803,7 @@ fn a_task_waits_for_its_goal_dependency_until_the_goal_is_achieved() {
     let waiting = ok(&db, &["add", "downstream", "--depends-on-goal", "1"]);
     assert_eq!(waiting["id"], 2);
     for id in ["1", "2"] {
-        ok(&db, &["ready", id]);
+        ok(&db, &["ready", id, "--bypass-review"]);
     }
     let shown = ok(&db, &["show", "2"]);
     assert_eq!(shown["goal_dependencies"], serde_json::json!([1]));
@@ -865,7 +867,7 @@ fn a_task_waits_for_its_goal_dependency_until_the_goal_is_achieved() {
     // An abandoned goal never releases its dependents.
     ok(&db, &["goal", "add", "dropped"]);
     ok(&db, &["add", "stuck", "--depends-on-goal", "2"]);
-    ok(&db, &["ready", "3"]);
+    ok(&db, &["ready", "3", "--bypass-review"]);
     ok(&db, &["goal", "close", "2", "--verdict", "abandoned"]);
     assert_eq!(candidates(&db), [2]);
     let graph = ok(&db, &["graph"]);
@@ -966,7 +968,7 @@ fn draft_goal_tasks_wait_for_goal_ready() {
     assert_eq!(goal["status"], "draft");
     let id = goal["id"].to_string();
     ok(&db, &["add", "proposed", "--goal", &id]);
-    ok(&db, &["ready", "1"]);
+    ok(&db, &["ready", "1", "--bypass-review"]);
     assert_eq!(ok(&db, &["candidates"]), serde_json::json!([]));
     assert_eq!(ok(&db, &["goal", "list"])[0]["status"], "draft");
     assert_eq!(ok(&db, &["goal", "show", &id])["goal"]["status"], "draft");
@@ -1004,12 +1006,12 @@ fn ready_tasks_of_a_draft_goal_do_not_raise_idle_slots() {
     };
     ok(&db, &["goal", "add", "proposal", "--draft"]);
     ok(&db, &["add", "proposed", "--goal", "1"]);
-    ok(&db, &["ready", "1"]);
+    ok(&db, &["ready", "1", "--bypass-review"]);
     assert!(!idle(&db));
     // A ready task blocked by a predecessor still raises it.
     ok(&db, &["add", "first"]);
     ok(&db, &["add", "blocked", "--depends-on", "2"]);
-    ok(&db, &["ready", "3"]);
+    ok(&db, &["ready", "3", "--bypass-review"]);
     assert!(idle(&db));
 }
 
@@ -1110,7 +1112,8 @@ fn observer_may_note_and_propose_but_not_change_queue_state() {
         );
     };
     for args in [
-        &["ready", "1"][..],
+        &["ready", "1", "--bypass-review"][..],
+        &["submit", "1"],
         &["draft", "1"],
         &["cancel", "1"],
         &["integrate", "1"],
@@ -1722,8 +1725,8 @@ mod stats {
         ok(&db, &["goal", "add", "measured"]);
         ok(&db, &["add", "first", "--goal", "1"]);
         ok(&db, &["add", "second"]);
-        ok(&db, &["ready", "1"]);
-        ok(&db, &["ready", "2"]);
+        ok(&db, &["ready", "1", "--bypass-review"]);
+        ok(&db, &["ready", "2", "--bypass-review"]);
         let base = "0123456789abcdef0123456789abcdef01234567";
         let finish = |queue: &mut SqliteQueue| {
             let ClaimOutcome::Claimed { run } = queue
@@ -1832,7 +1835,7 @@ fn priority_is_named_changed_while_editable_and_orders_candidates() {
         ],
     );
     for id in ["1", "2", "3", "4"] {
-        ok(&db, &["ready", id]);
+        ok(&db, &["ready", id, "--bypass-review"]);
     }
     assert_eq!(ok(&db, &["show", "2"])["task"]["priority"], "low");
     assert_eq!(ok(&db, &["list"])["tasks"][0]["priority"], "urgent");
@@ -1889,7 +1892,7 @@ fn priority_is_named_changed_while_editable_and_orders_candidates() {
     ok(&db, &["cancel", "1"]);
     assert_eq!(
         refused(&db, &["set-priority", "1", "high"]),
-        "the priority can only be changed for draft or ready tasks"
+        "the priority can only be changed for draft, submitted or ready tasks"
     );
 }
 
@@ -2006,10 +2009,10 @@ fn edit_replaces_fields_of_a_draft_task_only() {
     ] {
         assert!(!invoke(&db, args).status.success(), "{args:?}");
     }
-    ok(&db, &["ready", &id]);
+    ok(&db, &["ready", &id, "--bypass-review"]);
     assert_eq!(
         refused(&db, &["edit", &id, "--title", "late"]),
-        format!("task {id} is ready; only a draft task can be edited")
+        format!("task {id} is ready; only a draft or submitted task can be edited")
     );
     // Back to draft, it can be edited again.
     ok(&db, &["draft", &id]);
@@ -2074,12 +2077,13 @@ fn reviewer_may_only_read_the_queue() {
     ok(&db, &["goal", "add", "open goal"]);
     ok(&db, &["add", "existing", "--goal", "1"]);
     for args in [
-        &["ready", "1"][..],
+        &["ready", "1", "--bypass-review"][..],
         &["note", "--task", "1", "--text", "x"],
         &["ask", "--kind", "decide", "--question", "q", "--task", "1"],
         &["integrate", "1"],
         &["review", "1"],
         &["goal", "add", "draft", "--draft"],
+        &["submit", "1"],
     ] {
         let output = invoke_as(Some("reviewer"), &db, args);
         assert!(!output.status.success(), "{args:?} was allowed");
@@ -2097,7 +2101,119 @@ fn reviewer_may_only_read_the_queue() {
         &["asks"],
         &["notes"],
         &["goal", "show", "1"],
+        &["proposal", "list", "--all"],
     ] {
         ok_as("reviewer", &db, args);
     }
+}
+
+/// `submit` as a planner session would run it: in a cmux workspace, with
+/// the planner's origin when the runtime opened it.
+fn submit_from(db: &Path, workspace: Option<&str>, origin: Option<&str>, args: &[&str]) -> Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_dagq"));
+    command
+        .env_remove("DAGQ_ROLE")
+        .env_remove("CMUX_WORKSPACE_ID")
+        .env_remove("DAGQ_PLANNER_ORIGIN");
+    if let Some(workspace) = workspace {
+        command.env("CMUX_WORKSPACE_ID", workspace);
+    }
+    if let Some(origin) = origin {
+        command.env("DAGQ_PLANNER_ORIGIN", origin);
+    }
+    command
+        .arg("--db")
+        .arg(db)
+        .arg("submit")
+        .args(args)
+        .output()
+        .unwrap()
+}
+
+/// ADR-0041 decisions 7 and 8: `submit` bundles drafts into a proposal
+/// owned by the planner's workspace; a submitted task is never claimed,
+/// and only plan review or `ready --bypass-review` makes it ready.
+#[test]
+fn submit_bundles_drafts_into_a_proposal_that_plan_review_or_a_bypass_readies() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("queue.db");
+    ok(&db, &["init"]);
+    ok(&db, &["goal", "add", "planned", "--draft"]);
+    ok(&db, &["add", "in goal", "--goal", "1"]);
+    ok(&db, &["add", "alone"]);
+    ok(&db, &["add", "left out"]);
+
+    let submitted = submit_from(&db, Some("W-1"), None, &["2", "--goal", "1"]);
+    assert!(
+        submitted.status.success(),
+        "{}",
+        String::from_utf8_lossy(&submitted.stderr)
+    );
+    let proposal: Value = serde_json::from_slice(&submitted.stdout).unwrap();
+    assert_eq!(proposal["id"], 1);
+    assert_eq!(proposal["status"], "submitted");
+    assert_eq!(proposal["task_ids"], serde_json::json!([1, 2]));
+    assert_eq!(proposal["goal_ids"], serde_json::json!([1]));
+    assert_eq!(
+        proposal["owner"],
+        serde_json::json!({"origin": "person", "workspace_id": "W-1"})
+    );
+    assert_eq!(ok(&db, &["show", "1"])["task"]["status"], "submitted");
+    let listed = ok(&db, &["list", "--status", "submitted"]);
+    assert_eq!(listed["total"], 2);
+    assert_eq!(ok(&db, &["candidates"]), serde_json::json!([]));
+    let graph = ok(&db, &["graph"]);
+    assert_eq!(graph["candidates"], serde_json::json!([]));
+    assert_eq!(ok(&db, &["status"])["proposals"][0]["id"], 1);
+    assert_eq!(ok(&db, &["proposal", "list"])["proposals"][0]["id"], 1);
+    assert_eq!(
+        ok(&db, &["proposal", "show", "1"])["task_ids"],
+        serde_json::json!([1, 2])
+    );
+    assert_eq!(ok(&db, &["goal", "list"])[0]["tasks"]["submitted"], 1);
+    // A submitted task is still edited in place.
+    ok(&db, &["edit", "1", "--acceptance", "sharper"]);
+
+    // Without the bypass, ready is plan review's.
+    for id in ["1", "3"] {
+        let refused = invoke(&db, &["ready", id]);
+        assert!(!refused.status.success());
+        assert!(
+            String::from_utf8_lossy(&refused.stderr).contains("pass --bypass-review"),
+            "{}",
+            String::from_utf8_lossy(&refused.stderr)
+        );
+    }
+    let again = submit_from(&db, None, None, &["1"]);
+    assert!(
+        String::from_utf8_lossy(&again.stderr).contains("task 1 already belongs to proposal 1")
+    );
+    let bad_origin = submit_from(&db, None, Some("robot"), &["3"]);
+    assert!(!bad_origin.status.success());
+    assert!(!invoke(&db, &["submit"]).status.success(), "no members");
+
+    let runtime = submit_from(&db, None, Some("runtime"), &["3"]);
+    let runtime: Value = serde_json::from_slice(&runtime.stdout).unwrap();
+    assert_eq!(
+        runtime["owner"],
+        serde_json::json!({"origin": "runtime", "workspace_id": null})
+    );
+
+    let bypassed = ok(&db, &["ready", "1", "--bypass-review"]);
+    assert_eq!(bypassed["status"], "ready");
+    let shown = ok(&db, &["show", "1", "--full"]);
+    assert!(
+        shown["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["kind"] == "review_bypassed")
+    );
+    assert_eq!(
+        ok(&db, &["candidates"]).as_array().unwrap().len(),
+        0,
+        "draft goal"
+    );
+    ok(&db, &["draft", "2"]);
+    assert_eq!(ok(&db, &["show", "2"])["task"]["status"], "draft");
 }

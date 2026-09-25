@@ -88,7 +88,9 @@ fn add_ready_task(queue: &mut SqliteQueue, title: &str, dependencies: &[TaskId])
             context: String::new(),
         })
         .unwrap();
-    queue.transition(task.id(), TaskAction::Ready).unwrap();
+    queue
+        .transition(task.id(), TaskAction::BypassReview)
+        .unwrap();
     task.id()
 }
 
@@ -3002,7 +3004,9 @@ fn resident_supervisor_without_runs_is_listed_until_it_stops() {
         queue.supervisors().unwrap().len() == 1
     });
     git(&repo, &["update-ref", "-d", "refs/heads/main"]);
-    queue.transition(TaskId::new(1), TaskAction::Ready).unwrap();
+    queue
+        .transition(TaskId::new(1), TaskAction::BypassReview)
+        .unwrap();
     let error = format!("{:#}", supervisor.join().unwrap().unwrap_err());
     assert!(error.contains("Needed a single revision"), "{error}");
     assert!(queue.supervisors().unwrap().is_empty());
@@ -3308,7 +3312,11 @@ fn recover_requires_dead_processes_and_stale_lease_then_allows_a_new_run() {
         error.contains("wrapper pid") && error.contains("lease heartbeat"),
         "{error}"
     );
-    assert!(queue.transition(TaskId::new(1), TaskAction::Ready).is_err());
+    assert!(
+        queue
+            .transition(TaskId::new(1), TaskAction::BypassReview)
+            .is_err()
+    );
 
     // The supervisor is gone (stale heartbeat, dead PID) but the session is not.
     let raw = Connection::open(&db).unwrap();
@@ -3373,7 +3381,11 @@ fn recover_requires_dead_processes_and_stale_lease_then_allows_a_new_run() {
     assert_eq!(detail.runs[0].worktree_path(), run.worktree_path());
     assert!(Path::new(run.worktree_path().unwrap()).exists());
     assert_ne!(detail.runs[1].worktree_path(), run.worktree_path());
-    assert!(queue.transition(TaskId::new(1), TaskAction::Ready).is_err()); // Awaiting integration still owns the task.
+    assert!(
+        queue
+            .transition(TaskId::new(1), TaskAction::BypassReview)
+            .is_err()
+    ); // Awaiting integration still owns the task.
 }
 
 #[test]
@@ -3669,7 +3681,9 @@ fn add_file_task(
             context: String::new(),
         })
         .unwrap();
-    queue.transition(task.id(), TaskAction::Ready).unwrap();
+    queue
+        .transition(task.id(), TaskAction::BypassReview)
+        .unwrap();
     backend.script_for(
         task.id().as_i64(),
         &format!(
@@ -3778,7 +3792,9 @@ fn awaiting_run() -> (TempDir, PathBuf, PathBuf, TaskRun) {
             context: String::new(),
         })
         .unwrap();
-    queue.transition(dependent.id(), TaskAction::Ready).unwrap();
+    queue
+        .transition(dependent.id(), TaskAction::BypassReview)
+        .unwrap();
     assert!(queue.candidates().unwrap().is_empty());
     let repo = dir.path().join("repo's directory");
     (dir, repo, db, run)
@@ -4264,7 +4280,9 @@ fn add_ready_task_in(
             context: context.into(),
         })
         .unwrap();
-    queue.transition(task.id(), TaskAction::Ready).unwrap();
+    queue
+        .transition(task.id(), TaskAction::BypassReview)
+        .unwrap();
     task.id()
 }
 
@@ -4768,7 +4786,11 @@ fn conflicting_run_needs_a_session_and_lands_after_the_session_resolves_it() {
     assert_eq!(detail.task.status(), TaskStatus::InProgress);
     assert!(queue.run_leases().unwrap().is_empty());
     // A parked run still owns its task and is not picked by --next.
-    assert!(queue.transition(TaskId::new(2), TaskAction::Ready).is_err());
+    assert!(
+        queue
+            .transition(TaskId::new(2), TaskAction::BypassReview)
+            .is_err()
+    );
     assert_eq!(integrate_next(&db, &repo)["outcome"], "no_run_awaiting");
     assert!(queue.candidates().unwrap().is_empty());
     assert_eq!(runtime::doctor(&db, true).unwrap()["runs"], json!([]));
@@ -6316,7 +6338,7 @@ fn verification_failure_after_rebase_needs_a_session_and_keeps_the_rebased_tree(
         })
         .unwrap()
         .id();
-    queue.transition(breaker, TaskAction::Ready).unwrap();
+    queue.transition(breaker, TaskAction::BypassReview).unwrap();
     backend.script_for(
         breaker.as_i64(),
         "git rm -q seed.txt && git commit -q -m 'drop seed'; receipt \"$(git rev-parse HEAD)\"",
@@ -6440,7 +6462,11 @@ fn integration_slot_is_exclusive_and_an_abandoned_landing_is_recoverable() {
         .begin_integration(run.id(), "crashed", &sha(&seed))
         .unwrap();
     assert_eq!(taken.status(), RunStatus::Integrating);
-    assert!(queue.transition(TaskId::new(1), TaskAction::Ready).is_err());
+    assert!(
+        queue
+            .transition(TaskId::new(1), TaskAction::BypassReview)
+            .is_err()
+    );
     let error = format!("{:#}", integrate(&db, other.as_i64(), &repo).unwrap_err());
     assert!(
         error.contains(&format!("run {} is integrating", run.id())),
@@ -8751,7 +8777,9 @@ fn dagq_toml_run_env_reaches_the_workspace_and_the_verification_commands() {
     queue
         .transition(TaskId::new(1), TaskAction::Cancel)
         .unwrap();
-    queue.transition(task.id(), TaskAction::Ready).unwrap();
+    queue
+        .transition(task.id(), TaskAction::BypassReview)
+        .unwrap();
     drop(queue);
     let backend = TestWorkspace::new(&db, false, VALID_AGENT);
     let outcome = supervise(&db, &repo, &backend).unwrap();
@@ -8831,7 +8859,9 @@ fn evidence_fixture(evidence: &[EvidenceCheck]) -> (TempDir, PathBuf, PathBuf) {
         .unwrap();
     assert_eq!(task.id(), TaskId::new(2));
     assert_eq!(task.required_evidence(), evidence);
-    queue.transition(task.id(), TaskAction::Ready).unwrap();
+    queue
+        .transition(task.id(), TaskAction::BypassReview)
+        .unwrap();
     (dir, repo, db)
 }
 
@@ -9054,7 +9084,9 @@ fn scope_fixture(paths: &[&str]) -> (TempDir, PathBuf, PathBuf) {
         })
         .unwrap();
     assert_eq!(task.id(), TaskId::new(2));
-    queue.transition(task.id(), TaskAction::Ready).unwrap();
+    queue
+        .transition(task.id(), TaskAction::BypassReview)
+        .unwrap();
     (dir, repo, db)
 }
 

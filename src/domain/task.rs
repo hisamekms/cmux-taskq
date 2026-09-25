@@ -10,12 +10,24 @@ use super::{
     scope::{dedup_globs, validate_path_globs},
 };
 
-/// User operations cannot mark a task in progress or completed.
+/// What moves a task between statuses by hand or by plan review; only a
+/// claim marks it in progress and only a landing completes it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TaskAction {
+    /// A retry: an in-progress task whose runs all failed or were
+    /// interrupted goes back to ready unchanged, which needs no plan review
+    /// (ADR-0041 decision 8). A draft or submitted task is refused: plan
+    /// review ([`Self::Approve`]) or a person's bypass readies it.
     Ready,
     Draft,
     Cancel,
+    /// `dagq submit`: a draft enters plan review in a proposal.
+    Submit,
+    /// Plan review passed the task's proposal: the one path to ready for a
+    /// submitted task besides the bypass.
+    Approve,
+    /// `ready --bypass-review`: a person skips plan review.
+    BypassReview,
 }
 
 impl TaskStatus {
@@ -24,9 +36,14 @@ impl TaskStatus {
     /// been interrupted may be retried or canceled by hand; a retry is a new run.
     pub fn transition(self, action: TaskAction, unfinished_run: bool) -> Result<Self, DomainError> {
         match (self, action) {
-            (Self::Draft, TaskAction::Ready) => Ok(Self::Ready),
-            (Self::Ready, TaskAction::Draft) => Ok(Self::Draft),
-            (Self::Draft | Self::Ready, TaskAction::Cancel) => Ok(Self::Canceled),
+            (Self::Draft, TaskAction::Submit) => Ok(Self::Submitted),
+            (Self::Submitted, TaskAction::Approve)
+            | (Self::Draft | Self::Submitted, TaskAction::BypassReview) => Ok(Self::Ready),
+            (Self::Draft | Self::Submitted, TaskAction::Ready) => {
+                Err(DomainError::ReadyNeedsPlanReview { status: self })
+            }
+            (Self::Ready | Self::Submitted, TaskAction::Draft) => Ok(Self::Draft),
+            (Self::Draft | Self::Submitted | Self::Ready, TaskAction::Cancel) => Ok(Self::Canceled),
             (Self::InProgress, _) if unfinished_run => {
                 Err(DomainError::TaskHasUnfinishedRun { action })
             }
@@ -40,17 +57,18 @@ impl TaskStatus {
         }
     }
 
-    /// Dependencies and the goal may change only before the task is claimed.
+    /// Dependencies, the goal, the paths and the priority may change only
+    /// before the task is claimed; plan review adds dependencies and lowers
+    /// priorities of submitted tasks (ADR-0041 decision 11).
     pub fn dependencies_editable(self) -> bool {
-        matches!(self, Self::Draft | Self::Ready)
+        matches!(self, Self::Draft | Self::Submitted | Self::Ready)
     }
 
-    /// Whether `dagq edit` may change the content of the task: a draft
-    /// only. `submitted` joins it when that status exists (ADR-0041
-    /// decision 9); a ready task goes back to submitted to be edited
-    /// (decision 14).
+    /// Whether `dagq edit` may change the content of the task: a draft or a
+    /// submitted task (ADR-0041 decision 9). A ready task goes back to
+    /// submitted to be edited (decision 14).
     pub fn content_editable(self) -> bool {
-        matches!(self, Self::Draft)
+        matches!(self, Self::Draft | Self::Submitted)
     }
 
     pub fn is_terminal(self) -> bool {
@@ -208,7 +226,7 @@ pub fn dependencies_editable(task: &Task) -> bool {
     task.status.dependencies_editable()
 }
 
-/// Rejects a change to `what` of a task that is no longer a draft or ready.
+/// Rejects a change to `what` of a task that is already claimed or finished.
 fn require_editable(task: &Task, what: &'static str) -> Result<(), DomainError> {
     require(dependencies_editable(task), || {
         DomainError::TaskNotEditable { what }
@@ -502,7 +520,7 @@ mod tests {
     fn transition_follows_the_status_rules() {
         let ready = transition(
             Task::restore(record(TaskStatus::Draft)).unwrap(),
-            TaskAction::Ready,
+            TaskAction::BypassReview,
             false,
         )
         .unwrap();
@@ -519,10 +537,78 @@ mod tests {
         let in_progress = Task::restore(record(TaskStatus::InProgress)).unwrap();
         assert!(transition(in_progress.clone(), TaskAction::Draft, true).is_err());
         assert_eq!(
-            transition(in_progress, TaskAction::Draft, false)
+            transition(in_progress.clone(), TaskAction::Draft, false)
                 .unwrap()
                 .status(),
             TaskStatus::Draft
+        );
+        // A retry returns an in-progress task to ready without plan review.
+        assert_eq!(
+            transition(in_progress.clone(), TaskAction::Ready, false)
+                .unwrap()
+                .status(),
+            TaskStatus::Ready
+        );
+        assert!(transition(in_progress, TaskAction::BypassReview, false).is_err());
+    }
+
+    #[test]
+    fn only_plan_review_or_a_bypass_readies_a_draft_or_submitted_task() {
+        let draft = || Task::restore(record(TaskStatus::Draft)).unwrap();
+        let submitted = transition(draft(), TaskAction::Submit, false).unwrap();
+        assert_eq!(submitted.status(), TaskStatus::Submitted);
+        assert_eq!(
+            serde_json::to_value(submitted.status()).unwrap(),
+            serde_json::json!("submitted")
+        );
+        for task in [draft(), submitted.clone()] {
+            let status = task.status();
+            let error = transition(task, TaskAction::Ready, false).unwrap_err();
+            assert_eq!(error, DomainError::ReadyNeedsPlanReview { status });
+            assert!(error.to_string().contains("pass --bypass-review"));
+        }
+        assert_eq!(
+            transition(submitted.clone(), TaskAction::Approve, false)
+                .unwrap()
+                .status(),
+            TaskStatus::Ready
+        );
+        assert_eq!(
+            transition(submitted.clone(), TaskAction::BypassReview, false)
+                .unwrap()
+                .status(),
+            TaskStatus::Ready
+        );
+        assert_eq!(
+            transition(submitted.clone(), TaskAction::Draft, false)
+                .unwrap()
+                .status(),
+            TaskStatus::Draft
+        );
+        assert_eq!(
+            transition(submitted.clone(), TaskAction::Cancel, false)
+                .unwrap()
+                .status(),
+            TaskStatus::Canceled
+        );
+        // Plan review approves only a submitted task, and submits only a draft.
+        assert!(transition(draft(), TaskAction::Approve, false).is_err());
+        assert_eq!(
+            transition(submitted, TaskAction::Submit, false)
+                .unwrap_err()
+                .to_string(),
+            "cannot apply Submit to task in submitted state"
+        );
+        let ready = Task::restore(record(TaskStatus::Ready)).unwrap();
+        assert!(transition(ready, TaskAction::Submit, false).is_err());
+        // Nothing claims a submitted task.
+        let waiting = Task::restore(record(TaskStatus::Submitted)).unwrap();
+        assert!(claim(waiting.clone()).is_err());
+        assert!(waiting.status().content_editable());
+        assert!(dependencies_editable(&waiting));
+        assert_eq!(
+            set_priority(waiting, Priority::Low).unwrap().priority(),
+            Priority::Low
         );
     }
 
@@ -556,11 +642,11 @@ mod tests {
         assert!(!dependencies_editable(&claimed()));
         assert_eq!(
             set_goal(claimed(), None).unwrap_err().to_string(),
-            "the goal can only be changed for draft or ready tasks"
+            "the goal can only be changed for draft, submitted or ready tasks"
         );
         assert_eq!(
             set_paths(claimed(), Vec::new()).unwrap_err().to_string(),
-            "the paths can only be changed for draft or ready tasks"
+            "the paths can only be changed for draft, submitted or ready tasks"
         );
         for status in [
             TaskStatus::InProgress,
@@ -572,19 +658,19 @@ mod tests {
                 set_priority(task, Priority::Interrupt)
                     .unwrap_err()
                     .to_string(),
-                "the priority can only be changed for draft or ready tasks"
+                "the priority can only be changed for draft, submitted or ready tasks"
             );
         }
         assert_eq!(
             check_dependencies_editable(&claimed())
                 .unwrap_err()
                 .to_string(),
-            "dependencies can only be changed for draft or ready tasks"
+            "dependencies can only be changed for draft, submitted or ready tasks"
         );
     }
 
     #[test]
-    fn edit_replaces_the_given_fields_of_a_draft_only() {
+    fn edit_replaces_the_given_fields_of_a_draft_or_submitted_task_only() {
         let draft = Task::new(TaskId::new(3), new_task(), "now".into()).unwrap();
         let kept = edit(draft.clone(), TaskEdit::default()).unwrap();
         assert_eq!(
@@ -687,7 +773,20 @@ mod tests {
             )
             .unwrap_err()
             .to_string(),
-            "task 5 is ready; only a draft task can be edited"
+            "task 5 is ready; only a draft or submitted task can be edited"
+        );
+        let submitted = Task::restore(record(TaskStatus::Submitted)).unwrap();
+        let edited = edit(
+            submitted,
+            TaskEdit {
+                acceptance: Some("a3".into()),
+                ..TaskEdit::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            (edited.acceptance(), edited.status()),
+            ("a3", TaskStatus::Submitted)
         );
     }
 

@@ -20,11 +20,12 @@ use crate::{
     domain::{
         ClaimOutcome, CommitSha, DomainError, EventId, Goal, GoalDetail, GoalEdit, GoalId,
         GoalPredecessor, GoalRecord, GoalSummary, GoalTask, GoalVerdict, NewGoal, NewNote, NewTask,
-        NotePage, NoteQuery, NoteTarget, OBSERVATION_KIND, Predecessor, Priority, Provider,
-        RunEvent, RunId, RunRecord, Task, TaskAction, TaskDetail, TaskEdit, TaskId, TaskRecord,
-        TaskRun, TaskStatus, TaskStatusCounts, goal, scope::validate_path_globs, task,
+        NotePage, NoteQuery, NoteTarget, OBSERVATION_KIND, Predecessor, Priority, Proposal,
+        ProposalId, Provider, RunEvent, RunId, RunRecord, Submission, Task, TaskAction, TaskDetail,
+        TaskEdit, TaskId, TaskRecord, TaskRun, TaskStatus, TaskStatusCounts, goal,
+        scope::validate_path_globs, task,
     },
-    infrastructure::{clock, location::runs_dir},
+    infrastructure::{clock, location::runs_dir, proposals},
 };
 
 const APPLICATION_ID: i64 = 0x43545131;
@@ -49,6 +50,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../../migrations/0018_task_paths.sql"),
     include_str!("../../migrations/0019_task_goal_dependencies.sql"),
     include_str!("../../migrations/0020_task_priority.sql"),
+    include_str!("../../migrations/0021_proposals.sql"),
 ];
 /// Ready tasks whose predecessors are completed, whose goal dependencies
 /// are all closed as achieved (ADR-0038), that own no unfinished run and
@@ -247,6 +249,7 @@ impl TaskStore for SqliteQueue {
         let statuses: Vec<TaskStatus> = match &query.status {
             StatusFilter::Open => [
                 TaskStatus::Draft,
+                TaskStatus::Submitted,
                 TaskStatus::Ready,
                 TaskStatus::InProgress,
                 TaskStatus::Completed,
@@ -674,6 +677,43 @@ impl TaskStore for SqliteQueue {
         Ok(result)
     }
 
+    fn submit(&mut self, submission: Submission) -> Result<Proposal> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let proposal = proposals::submit(&tx, submission, &self.generators.clock.timestamp())?;
+        tx.commit()?;
+        Ok(proposal)
+    }
+
+    fn approve_proposal(&mut self, proposal_id: ProposalId) -> Result<Proposal> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let proposal = proposals::approve(&tx, proposal_id, &self.generators.clock.timestamp())?;
+        tx.commit()?;
+        Ok(proposal)
+    }
+
+    fn send_back_proposal(&mut self, proposal_id: ProposalId) -> Result<Proposal> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let proposal = proposals::send_back(&tx, proposal_id, &self.generators.clock.timestamp())?;
+        tx.commit()?;
+        Ok(proposal)
+    }
+
+    fn show_proposal(&self, proposal_id: ProposalId) -> Result<Proposal> {
+        let tx = self.conn.unchecked_transaction()?;
+        proposals::read(&tx, proposal_id)
+    }
+
+    fn proposals(&self, all: bool) -> Result<Vec<Proposal>> {
+        let tx = self.conn.unchecked_transaction()?;
+        proposals::list(&tx, all)
+    }
+
     fn ready_goal(&mut self, goal_id: GoalId) -> Result<Goal> {
         let tx = self
             .conn
@@ -937,7 +977,7 @@ const EDITABLE_TASK_FIELDS: [&str; 7] = [
     "context",
 ];
 
-fn read_goal(conn: &Connection, goal_id: GoalId) -> Result<Goal> {
+pub(super) fn read_goal(conn: &Connection, goal_id: GoalId) -> Result<Goal> {
     conn.query_row("SELECT * FROM goals WHERE id=?1", [goal_id], goal_row)
         .optional()?
         .with_context(|| format!("goal {goal_id} does not exist"))
@@ -1034,7 +1074,7 @@ fn waits_for(conn: &Connection, from: Node, to: Node) -> Result<bool> {
 /// the highest ever used. Inside the caller's write transaction no other
 /// insert can take it first, so the aggregate is built with its ID before
 /// it is saved.
-fn next_id(conn: &Connection, table: &str) -> Result<i64> {
+pub(super) fn next_id(conn: &Connection, table: &str) -> Result<i64> {
     Ok(conn.query_row(
         &format!(
             "SELECT max(coalesce((SELECT seq FROM sqlite_sequence WHERE name=?1), 0),
@@ -1061,7 +1101,7 @@ fn task_counts(conn: &Connection, goal_id: GoalId) -> Result<TaskStatusCounts> {
     Ok(counts)
 }
 
-fn goal_event(
+pub(super) fn goal_event(
     conn: &Connection,
     goal_id: GoalId,
     kind: &str,
@@ -1087,7 +1127,7 @@ fn ready_tasks(conn: &Connection) -> Result<Vec<Task>> {
 /// transaction so they are one snapshot.
 fn read_graph_input(conn: &Connection) -> Result<GraphInput> {
     let tasks: Vec<Task> = conn
-        .prepare("SELECT * FROM tasks WHERE status IN ('draft','ready','in_progress') ORDER BY id")?
+        .prepare("SELECT * FROM tasks WHERE status IN ('draft','submitted','ready','in_progress') ORDER BY id")?
         .query_map([], task_row)?
         .collect::<rusqlite::Result<_>>()?;
     let mut dependencies = conn.prepare(
@@ -1231,6 +1271,16 @@ pub(super) fn transition_task(
         "task_status_changed",
         json!({"from": from, "to": task.status()}),
     )?;
+    // A person skipped plan review (ADR-0041 decision 8).
+    if action == TaskAction::BypassReview {
+        event(
+            conn,
+            task_id,
+            None,
+            "review_bypassed",
+            json!({"from": from}),
+        )?;
+    }
     read_task(conn, task_id)
 }
 

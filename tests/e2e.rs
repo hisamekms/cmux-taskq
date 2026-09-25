@@ -812,7 +812,10 @@ fn add_ready_task_described(
         args.extend(["--depends-on", dependency]);
     }
     let id = dagq(env, &args)["id"].to_string();
-    assert_eq!(dagq(env, &["ready", &id])["status"], "ready");
+    assert_eq!(
+        dagq(env, &["ready", &id, "--bypass-review"])["status"],
+        "ready"
+    );
     id
 }
 
@@ -1242,7 +1245,10 @@ fn a_worker_question_is_answered_through_the_worker_terminal() {
         ],
     )["id"]
         .to_string();
-    assert_eq!(dagq(env, &["ready", &task_id])["status"], "ready");
+    assert_eq!(
+        dagq(env, &["ready", &task_id, "--bypass-review"])["status"],
+        "ready"
+    );
     let mut guard = WorkspaceGuard {
         cmux: cmux.clone(),
         ids: Vec::new(),

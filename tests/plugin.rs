@@ -576,7 +576,12 @@ fn launcher_resolves_the_binary_and_the_repository_queue_under_the_data_home() {
     ));
     assert_eq!(added["status"], "draft");
     let id = added["id"].to_string();
-    stdout_json(&launcher(&env, &data_home, &repo, &["ready", &id]));
+    stdout_json(&launcher(
+        &env,
+        &data_home,
+        &repo,
+        &["ready", &id, "--bypass-review"],
+    ));
     let shown = stdout_json(&launcher(&env, &data_home, &repo, &["show", &id]));
     assert_eq!(shown["task"]["status"], "ready");
     assert_eq!(shown["task"]["verification_commands"][0], "true");

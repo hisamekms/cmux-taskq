@@ -477,7 +477,9 @@ fn claim_a_run(fixture: &Fixture, queue: &mut SqliteQueue, token: &str) -> Strin
             context: String::new(),
         })
         .unwrap();
-    queue.transition(task.id(), TaskAction::Ready).unwrap();
+    queue
+        .transition(task.id(), TaskAction::BypassReview)
+        .unwrap();
     let repository = GitRepository::inspect(&fixture.repo).unwrap();
     match queue
         .claim_for_supervisor(&repository.base_commit, token)
@@ -1256,7 +1258,9 @@ fn up_prunes_dead_registrations_and_keeps_live_ones_and_leases() {
             context: String::new(),
         })
         .unwrap();
-    queue.transition(task.id(), TaskAction::Ready).unwrap();
+    queue
+        .transition(task.id(), TaskAction::BypassReview)
+        .unwrap();
     let repository = GitRepository::inspect(&fixture.repo).unwrap();
     queue
         .claim_for_supervisor(&repository.base_commit, "live")
@@ -1329,7 +1333,9 @@ fn up_reports_runs_that_wait_for_a_person_or_the_supervisor() {
                 context: String::new(),
             })
             .unwrap();
-        queue.transition(task.id(), TaskAction::Ready).unwrap();
+        queue
+            .transition(task.id(), TaskAction::BypassReview)
+            .unwrap();
         let dagq::domain::ClaimOutcome::Claimed { run } = queue
             .claim_for_supervisor(&repository.base_commit, "gone")
             .unwrap()

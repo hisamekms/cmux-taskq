@@ -220,6 +220,7 @@ pub fn close(
     require_open(&goal)?;
     let blocking: Vec<(TaskStatus, usize)> = [
         (TaskStatus::Draft, counts.draft),
+        (TaskStatus::Submitted, counts.submitted),
         (TaskStatus::Ready, counts.ready),
         (TaskStatus::InProgress, counts.in_progress),
     ]
@@ -414,14 +415,17 @@ mod tests {
     #[test]
     fn a_goal_closes_once_and_only_when_its_tasks_allow_the_verdict() {
         let mut counts = TaskStatusCounts::default();
+        counts.count(TaskStatus::Submitted, 1);
         counts.count(TaskStatus::Ready, 2);
         counts.count(TaskStatus::InProgress, 1);
+        assert_eq!((counts.total, counts.submitted), (4, 1));
         let at = || "2026-09-24T00:00:00Z".to_owned();
         assert_eq!(
             close(goal(None), GoalVerdict::Achieved, &counts, at())
                 .unwrap_err()
                 .to_string(),
-            "goal 7 cannot be closed as achieved: 2 task(s) ready, 1 task(s) in_progress"
+            "goal 7 cannot be closed as achieved: 1 task(s) submitted, 2 task(s) ready, \
+             1 task(s) in_progress"
         );
         assert_eq!(
             close(goal(None), GoalVerdict::Abandoned, &counts, at()).unwrap_err(),

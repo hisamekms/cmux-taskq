@@ -5,6 +5,7 @@ pub mod clock;
 pub mod launchd;
 pub mod location;
 pub mod process;
+mod proposals;
 pub mod run_env;
 pub mod run_files;
 pub mod runtime_store;

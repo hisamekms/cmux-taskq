@@ -18,7 +18,8 @@ use dagq::{
     application::{StatusFilter, TaskQuery, TaskStore, claim_candidates, dependency_graph},
     domain::{
         AskId, AskKind, EventId, GoalEdit, GoalId, GoalVerdict, NewAsk, NewGoal, NewNote, NewTask,
-        NoteQuery, NoteTarget, RunId, SessionRole, TaskAction, TaskEdit, TaskId, TaskStatus,
+        NoteQuery, NoteTarget, PlannerOrigin, PlannerOwner, ProposalId, RunId, SessionRole,
+        Submission, TaskAction, TaskEdit, TaskId, TaskStatus,
     },
     infrastructure::{adapters::path_text, location::QueueLocation, sqlite::SqliteQueue},
 };
@@ -83,7 +84,8 @@ enum Command {
     /// List one page of tasks, newest first: unfinished ones unless --status or --all says otherwise.
     /// Prints {"tasks", "next", "total"}; pass `next` to --before for the following page (null: none).
     List {
-        /// Only these statuses (comma-separated, any of them): draft, ready, in_progress, completed, canceled.
+        /// Only these statuses (comma-separated, any of them): draft, submitted, ready, in_progress,
+        /// completed, canceled.
         #[arg(long, value_delimiter = ',', conflicts_with = "all")]
         status: Vec<String>,
         /// Include completed and canceled tasks.
@@ -113,11 +115,38 @@ enum Command {
         #[arg(long, default_value_t = dagq::view::DEFAULT_EVENTS, conflicts_with = "full")]
         events: usize,
     },
-    /// Make a draft task ready (dependencies may still block execution).
-    Ready { id: i64 },
-    /// Return a ready task to draft.
+    /// Make a task ready (dependencies may still block execution). Plan review readies submitted
+    /// tasks; by hand a draft or submitted task needs --bypass-review. Without it only an
+    /// in-progress task whose runs all failed or were interrupted returns to ready (a retry).
+    Ready {
+        id: i64,
+        /// Skip plan review (recorded as a review_bypassed event).
+        #[arg(long)]
+        bypass_review: bool,
+    },
+    /// Return a ready or submitted task to draft.
     Draft { id: i64 },
-    /// Cancel a draft or ready task. Does not satisfy its dependents.
+    /// Submit draft tasks for plan review as one proposal owned by this planner session: TASKs,
+    /// and with --goal a goal and its draft tasks. The tasks become submitted, which no claim
+    /// takes; plan review makes them ready. Prints the proposal.
+    #[command(group = clap::ArgGroup::new("members").multiple(true).required(true))]
+    Submit {
+        /// Draft task to submit; repeatable.
+        #[arg(group = "members")]
+        tasks: Vec<i64>,
+        /// Open or draft goal to submit with its draft tasks; repeatable.
+        #[arg(long = "goal", group = "members")]
+        goals: Vec<i64>,
+        /// Submit this proposal again after plan review sent it back, with the drafts it holds.
+        #[arg(long, group = "members")]
+        proposal: Option<i64>,
+    },
+    /// Read proposals: the goals and tasks submitted together for plan review.
+    Proposal {
+        #[command(subcommand)]
+        command: ProposalCommand,
+    },
+    /// Cancel a draft, submitted or ready task. Does not satisfy its dependents.
     Cancel { id: i64 },
     /// Manage prerequisites; TASK depends on PREDECESSOR, or with --goal on a goal
     /// that must be closed as achieved first.
@@ -156,13 +185,13 @@ enum Command {
         #[arg(long)]
         none: bool,
     },
-    /// Replace fields of a draft task; each given field replaces the old value, and a
+    /// Replace fields of a draft or submitted task; each given field replaces the old value, and a
     /// repeatable flag replaces the whole list. Prints the task; `show` lists the change as
     /// a `task_edited` event with the old and new values. Other statuses are refused: a
     /// ready task goes back to draft (`draft ID`) first, and a running run keeps its prompt.
     #[command(group = clap::ArgGroup::new("field").multiple(true).required(true))]
     Edit {
-        /// Draft task.
+        /// Draft or submitted task.
         task: i64,
         #[arg(long, group = "field")]
         title: Option<String>,
@@ -525,6 +554,18 @@ enum DependencyCommand {
 }
 
 #[derive(Subcommand)]
+enum ProposalCommand {
+    /// The submitted and revising proposals, oldest submission first (plan review's order).
+    List {
+        /// Include accepted and canceled proposals.
+        #[arg(long)]
+        all: bool,
+    },
+    /// Show a proposal with its member task and goal IDs.
+    Show { id: i64 },
+}
+
+#[derive(Subcommand)]
 enum GoalCommand {
     /// Register a goal; it has no state machine and no verification commands.
     Add {
@@ -598,6 +639,7 @@ fn reviewer_access(command: &Command) -> ObserverAccess {
         | Command::Stats { .. }
         | Command::Doctor { .. }
         | Command::Notes { .. }
+        | Command::Proposal { .. }
         | Command::Goal {
             command: GoalCommand::List | GoalCommand::Show { .. },
         } => ObserverAccess::Allowed,
@@ -631,6 +673,7 @@ fn observer_access(command: &Command) -> ObserverAccess {
         | Command::Doctor { .. }
         | Command::Note { .. }
         | Command::Notes { .. }
+        | Command::Proposal { .. }
         | Command::Goal {
             command:
                 GoalCommand::List | GoalCommand::Show { .. } | GoalCommand::Add { draft: true, .. },
@@ -783,9 +826,44 @@ fn execute(cli: Cli) -> Result<Value> {
                 dagq::view::task_detail(&detail, events)
             }
         }
-        Command::Ready { id } => {
-            serde_json::to_value(queue.transition(TaskId::new(id), TaskAction::Ready)?)?
+        Command::Ready { id, bypass_review } => {
+            let action = if bypass_review {
+                TaskAction::BypassReview
+            } else {
+                TaskAction::Ready
+            };
+            serde_json::to_value(queue.transition(TaskId::new(id), action)?)?
         }
+        Command::Submit {
+            tasks,
+            goals,
+            proposal,
+        } => {
+            use dagq::application::lifecycle::{CMUX_WORKSPACE_ENV, PLANNER_ORIGIN_ENV};
+            let origin = match env::var(PLANNER_ORIGIN_ENV) {
+                Ok(origin) if !origin.is_empty() => origin.parse()?,
+                _ => PlannerOrigin::Person,
+            };
+            serde_json::to_value(
+                queue.submit(Submission {
+                    tasks: tasks.into_iter().map(TaskId::new).collect(),
+                    goals: goals.into_iter().map(GoalId::new).collect(),
+                    proposal: proposal.map(ProposalId::new),
+                    owner: PlannerOwner {
+                        origin,
+                        workspace_id: env::var(CMUX_WORKSPACE_ENV)
+                            .ok()
+                            .filter(|id| !id.trim().is_empty()),
+                    },
+                })?,
+            )?
+        }
+        Command::Proposal { command } => match command {
+            ProposalCommand::List { all } => json!({"proposals": queue.proposals(all)?}),
+            ProposalCommand::Show { id } => {
+                serde_json::to_value(queue.show_proposal(ProposalId::new(id))?)?
+            }
+        },
         Command::Draft { id } => {
             serde_json::to_value(queue.transition(TaskId::new(id), TaskAction::Draft)?)?
         }

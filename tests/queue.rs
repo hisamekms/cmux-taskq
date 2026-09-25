@@ -11,8 +11,9 @@ use dagq::{
     },
     domain::{
         ClaimOutcome, CommitSha, EventId, EvidenceCheck, GoalEdit, GoalId, GoalStatus, GoalVerdict,
-        NewGoal, NewNote, NewTask, NotePage, NoteQuery, NoteTarget, Priority, Provider, RunId,
-        RunStatus, SupervisorMode, TaskAction, TaskEdit, TaskId, TaskStatus,
+        NewGoal, NewNote, NewTask, NotePage, NoteQuery, NoteTarget, PlannerOrigin, PlannerOwner,
+        Priority, ProposalId, ProposalStatus, Provider, RunId, RunStatus, Submission,
+        SupervisorMode, TaskAction, TaskEdit, TaskId, TaskStatus,
     },
     infrastructure::sqlite::SqliteQueue,
 };
@@ -65,7 +66,7 @@ fn tasks_dependencies_runs_and_events_survive_reopen() {
     let mut spec = new_task("後続タスク");
     spec.dependencies = vec![a.id(), a.id()];
     let b = queue.add(spec).unwrap();
-    queue.transition(a.id(), TaskAction::Ready).unwrap();
+    queue.transition(a.id(), TaskAction::BypassReview).unwrap();
     let ClaimOutcome::Claimed { run } = queue.claim(&base()).unwrap() else {
         panic!()
     };
@@ -88,10 +89,15 @@ fn tasks_dependencies_runs_and_events_survive_reopen() {
             .iter()
             .map(|e| e.kind.as_str())
             .collect::<Vec<_>>(),
-        ["task_created", "task_status_changed", "run_claimed"]
+        [
+            "task_created",
+            "task_status_changed",
+            "review_bypassed",
+            "run_claimed"
+        ]
     );
     assert_eq!(
-        detail.events[2].run_id.as_ref().map(RunId::as_str),
+        detail.events[3].run_id.as_ref().map(RunId::as_str),
         Some(run.id().as_str())
     );
     let second = reopened.show(b.id()).unwrap();
@@ -135,7 +141,7 @@ fn dependencies_reject_self_cycles_and_missing_tasks_and_can_be_removed() {
     assert!(queue.add_dependency(a, TaskId::new(999)).is_err());
     assert!(queue.add_dependency(TaskId::new(999), a).is_err());
     assert!(queue.show(a).unwrap().dependencies.is_empty());
-    queue.transition(c, TaskAction::Ready).unwrap();
+    queue.transition(c, TaskAction::BypassReview).unwrap();
     assert!(queue.candidates().unwrap().is_empty());
     queue.remove_dependency(c, b).unwrap();
     assert_eq!(queue.candidates().unwrap()[0].id(), c);
@@ -154,7 +160,7 @@ fn candidates_require_every_predecessor_to_be_completed() {
     let c = queue.add(new_task("c")).unwrap().id();
     queue.add_dependency(c, a).unwrap();
     queue.add_dependency(c, b).unwrap();
-    queue.transition(c, TaskAction::Ready).unwrap();
+    queue.transition(c, TaskAction::BypassReview).unwrap();
     assert!(matches!(
         queue.claim(&base()).unwrap(),
         ClaimOutcome::NoReadyTask
@@ -206,7 +212,7 @@ fn predecessors_carry_the_integrated_run_and_in_progress_tasks_are_listed() {
     assert!(queue.tasks_in_progress().unwrap().is_empty());
 
     // a landed through a run; b was completed without one (no integrated run).
-    queue.transition(a, TaskAction::Ready).unwrap();
+    queue.transition(a, TaskAction::BypassReview).unwrap();
     let ClaimOutcome::Claimed { run } = queue.claim(&base()).unwrap() else {
         panic!()
     };
@@ -279,8 +285,8 @@ fn a_goal_dependency_holds_the_claim_until_the_goal_is_achieved() {
     queue.add_goal_dependency(waiting, goal).unwrap();
     assert!(queue.add_goal_dependency(waiting, GoalId::new(99)).is_err());
     assert!(queue.add_goal_dependency(TaskId::new(99), goal).is_err());
-    queue.transition(waiting, TaskAction::Ready).unwrap();
-    queue.transition(member, TaskAction::Ready).unwrap();
+    queue.transition(waiting, TaskAction::BypassReview).unwrap();
+    queue.transition(member, TaskAction::BypassReview).unwrap();
 
     let ClaimOutcome::Claimed { run } = queue.claim(&base()).unwrap() else {
         panic!()
@@ -350,9 +356,9 @@ fn manual_transitions_cannot_change_claimed_or_terminal_tasks() {
     let (_dir, mut queue) = fixture();
     let a = queue.add(new_task("a")).unwrap().id();
     assert!(queue.transition(a, TaskAction::Draft).is_err());
-    queue.transition(a, TaskAction::Ready).unwrap();
+    queue.transition(a, TaskAction::BypassReview).unwrap();
     queue.transition(a, TaskAction::Draft).unwrap();
-    queue.transition(a, TaskAction::Ready).unwrap();
+    queue.transition(a, TaskAction::BypassReview).unwrap();
     assert!(CommitSha::try_from("main").is_err());
     assert_eq!(queue.show(a).unwrap().task.status(), TaskStatus::Ready);
     queue.claim(&base()).unwrap();
@@ -363,7 +369,7 @@ fn manual_transitions_cannot_change_claimed_or_terminal_tasks() {
     assert!(queue.add_dependency(a, b).is_err());
     assert!(queue.remove_dependency(a, b).is_err());
     queue.transition(b, TaskAction::Cancel).unwrap();
-    assert!(queue.transition(b, TaskAction::Ready).is_err());
+    assert!(queue.transition(b, TaskAction::BypassReview).is_err());
     assert!(queue.add_dependency(b, a).is_err());
 }
 
@@ -372,7 +378,9 @@ fn concurrent_connections_claim_each_ready_task_once() {
     let (dir, mut queue) = fixture();
     for title in ["first", "second"] {
         let task = queue.add(new_task(title)).unwrap();
-        queue.transition(task.id(), TaskAction::Ready).unwrap();
+        queue
+            .transition(task.id(), TaskAction::BypassReview)
+            .unwrap();
     }
     let barrier = Arc::new(Barrier::new(8));
     let workers: Vec<_> = (0..8)
@@ -444,7 +452,9 @@ fn concurrent_opposite_edges_cannot_create_a_cycle() {
 fn event_write_failure_rolls_back_claim_and_task_transition() {
     let (dir, mut queue) = fixture();
     let task = queue.add(new_task("atomic claim")).unwrap();
-    queue.transition(task.id(), TaskAction::Ready).unwrap();
+    queue
+        .transition(task.id(), TaskAction::BypassReview)
+        .unwrap();
     let raw = Connection::open(dir.path().join("queue.db")).unwrap();
     raw.execute_batch(
         "CREATE TRIGGER reject_claim_event BEFORE INSERT ON run_events
@@ -455,7 +465,7 @@ fn event_write_failure_rolls_back_claim_and_task_transition() {
     let detail = queue.show(task.id()).unwrap();
     assert_eq!(detail.task.status(), TaskStatus::Ready);
     assert!(detail.runs.is_empty());
-    assert_eq!(detail.events.len(), 2);
+    assert_eq!(detail.events.len(), 3);
     raw.execute_batch("DROP TRIGGER reject_claim_event;")
         .unwrap();
     assert!(matches!(
@@ -472,7 +482,7 @@ fn awaiting_integration_keeps_dependents_blocked_but_frees_execution_slot() {
     let c = queue.add(new_task("independent")).unwrap().id();
     queue.add_dependency(b, a).unwrap();
     for id in [a, b, c] {
-        queue.transition(id, TaskAction::Ready).unwrap();
+        queue.transition(id, TaskAction::BypassReview).unwrap();
     }
     let ClaimOutcome::Claimed { run } = queue.claim(&base()).unwrap() else {
         panic!()
@@ -568,7 +578,7 @@ fn dependency_change_and_claim_are_serialized() {
     let (dir, mut queue) = fixture();
     let task = queue.add(new_task("ready task")).unwrap().id();
     let prerequisite = queue.add(new_task("unfinished prerequisite")).unwrap().id();
-    queue.transition(task, TaskAction::Ready).unwrap();
+    queue.transition(task, TaskAction::BypassReview).unwrap();
     let mut claimant = SqliteQueue::open(dir.path().join("queue.db")).unwrap();
     let mut editor = SqliteQueue::open(dir.path().join("queue.db")).unwrap();
     let barrier = Arc::new(Barrier::new(2));
@@ -604,7 +614,7 @@ fn database_constraints_guard_per_task_runs_and_integration_ownership() {
     let (dir, mut queue) = fixture();
     let a = queue.add(new_task("a")).unwrap().id();
     let b = queue.add(new_task("b")).unwrap().id();
-    queue.transition(a, TaskAction::Ready).unwrap();
+    queue.transition(a, TaskAction::BypassReview).unwrap();
     queue.claim(&base()).unwrap();
     let raw = Connection::open(dir.path().join("queue.db")).unwrap();
     let insert = |id: TaskId| {
@@ -1019,9 +1029,10 @@ fn migration_from_v6_adds_goals_and_keeps_tasks_runs_and_events() {
     // (queue-level backend failures), 0013 (goal draft), 0014 (asks) and
     // 0015 (required evidence), 0016 (observer events and task-less
     // blocked asks), 0017 (the stuck_exit ask), 0018 (task paths), 0019
-    // (goal dependencies) and 0020 (task priority) are applied together.
-    assert_eq!(SqliteQueue::SCHEMA_VERSION, 20);
-    assert_eq!(queue.schema_version().unwrap(), 20);
+    // (goal dependencies), 0020 (task priority) and 0021 (proposals) are
+    // applied together.
+    assert_eq!(SqliteQueue::SCHEMA_VERSION, 21);
+    assert_eq!(queue.schema_version().unwrap(), 21);
     assert_eq!(
         queue
             .session_workspace(dagq::domain::SessionRole::Inbox)
@@ -1205,8 +1216,12 @@ fn draft_goal_tasks_are_not_candidates_until_the_goal_is_ready() {
         })
         .unwrap();
     let plain = queue.add(new_task("plain")).unwrap();
-    queue.transition(task.id(), TaskAction::Ready).unwrap();
-    queue.transition(plain.id(), TaskAction::Ready).unwrap();
+    queue
+        .transition(task.id(), TaskAction::BypassReview)
+        .unwrap();
+    queue
+        .transition(plain.id(), TaskAction::BypassReview)
+        .unwrap();
     let ids = |queue: &SqliteQueue| {
         queue
             .candidates()
@@ -1269,7 +1284,9 @@ fn notes_attach_to_tasks_runs_and_goals_and_page_by_cursor() {
         })
         .unwrap();
     let other = queue.add(new_task("elsewhere")).unwrap();
-    queue.transition(task.id(), TaskAction::Ready).unwrap();
+    queue
+        .transition(task.id(), TaskAction::BypassReview)
+        .unwrap();
     let run = match queue.claim(&base()).unwrap() {
         ClaimOutcome::Claimed { run } => run,
         ClaimOutcome::NoReadyTask => panic!("task is claimable"),
@@ -1393,7 +1410,7 @@ fn goal_close_verdicts_depend_on_task_statuses() {
     let b = queue.add(spec).unwrap().id();
     // Draft tasks block `achieved` but not `abandoned`.
     assert!(queue.close_goal(goal.id(), GoalVerdict::Achieved).is_err());
-    queue.transition(a.id(), TaskAction::Ready).unwrap();
+    queue.transition(a.id(), TaskAction::BypassReview).unwrap();
     queue.claim(&base()).unwrap();
     // An in-progress task blocks both verdicts.
     let error = format!(
@@ -1432,7 +1449,7 @@ fn goal_close_verdicts_depend_on_task_statuses() {
     let mut spec = new_task("never started");
     spec.goal_id = Some(other.id());
     let c = queue.add(spec).unwrap().id();
-    queue.transition(c, TaskAction::Ready).unwrap();
+    queue.transition(c, TaskAction::BypassReview).unwrap();
     let abandoned = queue
         .close_goal(other.id(), GoalVerdict::Abandoned)
         .unwrap();
@@ -1479,7 +1496,7 @@ fn set_goal_and_add_with_goal_follow_the_dependency_rules() {
     assert!(queue.set_goal(task, Some(closed)).is_err());
     assert!(queue.set_goal(task, Some(GoalId::new(99))).is_err());
     assert_eq!(queue.show(task).unwrap().task.goal_id(), Some(open));
-    queue.transition(task, TaskAction::Ready).unwrap();
+    queue.transition(task, TaskAction::BypassReview).unwrap();
     assert_eq!(queue.set_goal(task, None).unwrap().goal_id(), None);
     assert_eq!(
         queue.set_goal(task, Some(open)).unwrap().goal_id(),
@@ -1530,7 +1547,9 @@ fn paths_are_stored_and_replaced_while_the_task_is_editable() {
         .set_paths(task.id(), globs(&["docs/**", "*.md"]))
         .unwrap();
     assert!(queue.set_paths(task.id(), globs(&["../x"])).is_err());
-    queue.transition(task.id(), TaskAction::Ready).unwrap();
+    queue
+        .transition(task.id(), TaskAction::BypassReview)
+        .unwrap();
     let widened = queue
         .set_paths(task.id(), globs(&["docs/**", "src/**"]))
         .unwrap();
@@ -1571,7 +1590,7 @@ fn paths_are_stored_and_replaced_while_the_task_is_editable() {
         .to_string();
     assert_eq!(
         error,
-        "the paths can only be changed for draft or ready tasks"
+        "the paths can only be changed for draft, submitted or ready tasks"
     );
     assert!(queue.set_paths(TaskId::new(99), Vec::new()).is_err());
 }
@@ -1670,14 +1689,16 @@ fn edit_task_replaces_draft_fields_and_records_the_change() {
         ..TaskEdit::default()
     };
     assert!(queue.edit_task(TaskId::new(99), change()).is_err());
-    queue.transition(task.id(), TaskAction::Ready).unwrap();
+    queue
+        .transition(task.id(), TaskAction::BypassReview)
+        .unwrap();
     assert_eq!(
         queue
             .edit_task(task.id(), change())
             .unwrap_err()
             .to_string(),
         format!(
-            "task {} is ready; only a draft task can be edited",
+            "task {} is ready; only a draft or submitted task can be edited",
             task.id()
         )
     );
@@ -1688,7 +1709,7 @@ fn edit_task_replaces_draft_fields_and_records_the_change() {
             .unwrap_err()
             .to_string(),
         format!(
-            "task {} is in_progress; only a draft task can be edited",
+            "task {} is in_progress; only a draft or submitted task can be edited",
             task.id()
         )
     );
@@ -1714,7 +1735,9 @@ fn priority_is_stored_changed_while_editable_and_checked_by_the_schema() {
     );
     // No change, no event.
     queue.set_priority(task.id(), Priority::Urgent).unwrap();
-    queue.transition(task.id(), TaskAction::Ready).unwrap();
+    queue
+        .transition(task.id(), TaskAction::BypassReview)
+        .unwrap();
     let low = queue.set_priority(task.id(), Priority::Low).unwrap();
     assert_eq!(low.priority(), Priority::Low);
     let changes: Vec<_> = queue
@@ -1735,7 +1758,7 @@ fn priority_is_stored_changed_while_editable_and_checked_by_the_schema() {
             .set_priority(task.id(), Priority::Interrupt)
             .unwrap_err()
             .to_string(),
-        "the priority can only be changed for draft or ready tasks"
+        "the priority can only be changed for draft, submitted or ready tasks"
     );
     assert!(queue.set_priority(TaskId::new(99), Priority::Low).is_err());
 
@@ -1786,7 +1809,7 @@ fn candidates_graph_and_claims_share_the_priority_order() {
         Some(draft_goal),
     );
     for id in [plain, releasing, low, lifted, waiter, high, in_draft_goal] {
-        queue.transition(id, TaskAction::Ready).unwrap();
+        queue.transition(id, TaskAction::BypassReview).unwrap();
     }
     assert_eq!(queue.show(parked).unwrap().task.status(), TaskStatus::Draft);
 
@@ -1912,11 +1935,11 @@ fn list_defaults_to_unfinished_tasks_newest_first_with_compact_items() {
     raw.execute("UPDATE tasks SET status='completed' WHERE id=?1", [a])
         .unwrap();
     queue.transition(b, TaskAction::Cancel).unwrap();
-    queue.transition(c, TaskAction::Ready).unwrap();
+    queue.transition(c, TaskAction::BypassReview).unwrap();
     let ClaimOutcome::Claimed { run } = queue.claim(&base()).unwrap() else {
         panic!()
     };
-    queue.transition(d, TaskAction::Ready).unwrap();
+    queue.transition(d, TaskAction::BypassReview).unwrap();
 
     let page = queue.list(&TaskQuery::default()).unwrap();
     assert_eq!(page.total, 2);
@@ -2066,7 +2089,9 @@ fn claim_takes_the_run_id_and_its_time_from_the_injected_generators() {
     });
     let task = queue.add(new_task("fixed")).unwrap();
     assert_eq!(task.created_at(), "2024-02-29T00:00:00.042Z");
-    queue.transition(task.id(), TaskAction::Ready).unwrap();
+    queue
+        .transition(task.id(), TaskAction::BypassReview)
+        .unwrap();
     let ClaimOutcome::Claimed { run } = queue.claim(&base()).unwrap() else {
         panic!()
     };
@@ -2101,4 +2126,346 @@ fn injected_timestamps_have_the_form_sqlite_gives_its_timestamp_columns() {
             sqlite
         );
     }
+}
+
+fn person(workspace: &str) -> PlannerOwner {
+    PlannerOwner {
+        origin: PlannerOrigin::Person,
+        workspace_id: Some(workspace.into()),
+    }
+}
+
+fn submission(tasks: &[TaskId], goals: &[GoalId], proposal: Option<i64>) -> Submission {
+    Submission {
+        tasks: tasks.to_vec(),
+        goals: goals.to_vec(),
+        proposal: proposal.map(ProposalId::new),
+        owner: person("W1"),
+    }
+}
+
+fn status_of(queue: &mut SqliteQueue, id: TaskId) -> TaskStatus {
+    queue.show(id).unwrap().task.status()
+}
+
+#[test]
+fn submitted_tasks_wait_for_plan_review_which_readies_or_sends_them_back() {
+    let (_dir, mut queue) = fixture();
+    let goal = queue
+        .add_goal(NewGoal {
+            draft: true,
+            ..new_goal("planned")
+        })
+        .unwrap()
+        .id();
+    let mut in_goal = new_task("in goal");
+    in_goal.goal_id = Some(goal);
+    let a = queue.add(in_goal).unwrap().id();
+    let b = queue.add(new_task("alone")).unwrap().id();
+    let later = queue.add(new_task("joins later")).unwrap().id();
+
+    let proposal = queue.submit(submission(&[b], &[goal], None)).unwrap();
+    assert_eq!(proposal.id(), ProposalId::new(1));
+    assert_eq!(proposal.status(), ProposalStatus::Submitted);
+    assert_eq!(proposal.task_ids(), [a, b]);
+    assert_eq!(proposal.goal_ids(), [goal]);
+    assert_eq!(proposal.owner(), &person("W1"));
+    for id in [a, b] {
+        assert_eq!(status_of(&mut queue, id), TaskStatus::Submitted);
+    }
+    assert_eq!(status_of(&mut queue, later), TaskStatus::Draft);
+    let events = queue.show(a).unwrap().events;
+    assert!(
+        events
+            .iter()
+            .any(|e| e.kind == "task_submitted"
+                && e.payload == serde_json::json!({"proposal_id": 1}))
+    );
+    assert!(
+        queue
+            .show_goal(goal)
+            .unwrap()
+            .events
+            .iter()
+            .any(|e| e.kind == "goal_submitted")
+    );
+    assert_eq!(
+        queue.list_goals().unwrap()[0].tasks.submitted,
+        1,
+        "the goal counts its submitted task"
+    );
+
+    // Nothing claims or lists a submitted task as a candidate, but the graph
+    // and the open list still show it.
+    assert!(queue.candidates().unwrap().is_empty());
+    assert!(matches!(
+        queue.claim(&base()).unwrap(),
+        ClaimOutcome::NoReadyTask
+    ));
+    let graph = dependency_graph(queue.graph_input().unwrap(), None);
+    let graph = serde_json::to_value(graph).unwrap();
+    assert!(
+        graph["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|t| t["id"] == a.as_i64() && t["status"] == "submitted")
+    );
+    let open = queue
+        .list(&TaskQuery {
+            status: StatusFilter::Open,
+            limit: 10,
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(open.total, 3);
+
+    // A plain ready is refused; the membership is exclusive while active.
+    assert_eq!(
+        queue
+            .transition(a, TaskAction::Ready)
+            .unwrap_err()
+            .to_string(),
+        "a submitted task becomes ready through plan review (submit it); \
+         pass --bypass-review to skip the review"
+    );
+    assert_eq!(
+        queue
+            .transition(later, TaskAction::Ready)
+            .unwrap_err()
+            .to_string(),
+        "a draft task becomes ready through plan review (submit it); \
+         pass --bypass-review to skip the review"
+    );
+    queue.transition(b, TaskAction::Draft).unwrap();
+    assert_eq!(
+        queue
+            .submit(submission(&[b], &[], None))
+            .unwrap_err()
+            .to_string(),
+        format!("task {b} already belongs to proposal 1")
+    );
+    assert_eq!(
+        queue
+            .submit(submission(&[later], &[goal], None))
+            .unwrap_err()
+            .to_string(),
+        format!("goal {goal} already belongs to proposal 1")
+    );
+    assert_eq!(
+        queue
+            .submit(submission(&[later], &[], Some(1)))
+            .unwrap_err()
+            .to_string(),
+        "proposal 1 is submitted, not revising"
+    );
+    // A submitted task keeps its content editable.
+    queue
+        .edit_task(
+            a,
+            TaskEdit {
+                acceptance: Some("sharper".into()),
+                ..TaskEdit::default()
+            },
+        )
+        .unwrap();
+
+    // Plan review sends it back: the submitted task returns to draft, and the
+    // planner submits it again with the drafts it holds and a new one.
+    let revising = queue.send_back_proposal(ProposalId::new(1)).unwrap();
+    assert_eq!(revising.status(), ProposalStatus::Revising);
+    assert_eq!(revising.revise_count(), 1);
+    assert_eq!(status_of(&mut queue, a), TaskStatus::Draft);
+    assert_eq!(queue.proposals(false).unwrap().len(), 1);
+    let again = queue
+        .submit(Submission {
+            owner: PlannerOwner {
+                origin: PlannerOrigin::Runtime,
+                workspace_id: None,
+            },
+            ..submission(&[later], &[], Some(1))
+        })
+        .unwrap();
+    assert_eq!(again.id(), ProposalId::new(1));
+    assert_eq!(again.status(), ProposalStatus::Submitted);
+    assert_eq!(again.task_ids(), [a, b, later]);
+    assert_eq!(again.owner().origin, PlannerOrigin::Runtime);
+    for id in [a, b, later] {
+        assert_eq!(status_of(&mut queue, id), TaskStatus::Submitted);
+    }
+
+    // The plan-review path: every submitted task becomes ready and the draft
+    // goal opens.
+    let accepted = queue.approve_proposal(ProposalId::new(1)).unwrap();
+    assert_eq!(accepted.status(), ProposalStatus::Accepted);
+    for id in [a, b, later] {
+        assert_eq!(status_of(&mut queue, id), TaskStatus::Ready);
+    }
+    assert!(!queue.show_goal(goal).unwrap().goal.is_draft());
+    assert_eq!(queue.candidates().unwrap().len(), 3);
+    assert_eq!(
+        queue
+            .approve_proposal(ProposalId::new(1))
+            .unwrap_err()
+            .to_string(),
+        "proposal 1 is accepted, not submitted"
+    );
+    assert!(queue.send_back_proposal(ProposalId::new(1)).is_err());
+    assert!(queue.proposals(false).unwrap().is_empty());
+    assert_eq!(queue.proposals(true).unwrap().len(), 1);
+    assert_eq!(
+        queue
+            .show_proposal(ProposalId::new(1))
+            .unwrap()
+            .task_ids()
+            .len(),
+        3
+    );
+    assert!(queue.show_proposal(ProposalId::new(9)).is_err());
+
+    // An accepted proposal no longer holds its members; a person may bypass
+    // plan review, which is recorded.
+    queue.transition(a, TaskAction::Draft).unwrap();
+    let second = queue.submit(submission(&[a], &[], None)).unwrap();
+    assert_eq!(second.id(), ProposalId::new(2));
+    let bypassed = queue.transition(a, TaskAction::BypassReview).unwrap();
+    assert_eq!(bypassed.status(), TaskStatus::Ready);
+    let events = queue.show(a).unwrap().events;
+    assert!(
+        events.iter().any(|e| e.kind == "review_bypassed"
+            && e.payload == serde_json::json!({"from": "submitted"}))
+    );
+    // Approving the proposal leaves the bypassed task as it is.
+    queue.approve_proposal(ProposalId::new(2)).unwrap();
+    assert_eq!(status_of(&mut queue, a), TaskStatus::Ready);
+}
+
+#[test]
+fn submit_needs_a_draft_task_and_an_open_goal() {
+    let (_dir, mut queue) = fixture();
+    let empty = queue.add_goal(new_goal("nothing yet")).unwrap().id();
+    assert_eq!(
+        queue
+            .submit(submission(&[], &[empty], None))
+            .unwrap_err()
+            .to_string(),
+        "a proposal needs at least one draft task"
+    );
+    queue.close_goal(empty, GoalVerdict::Abandoned).unwrap();
+    assert!(
+        queue
+            .submit(submission(&[], &[empty], None))
+            .unwrap_err()
+            .to_string()
+            .starts_with(&format!("goal {empty} is closed"))
+    );
+    let task = queue.add(new_task("ready")).unwrap().id();
+    queue.transition(task, TaskAction::BypassReview).unwrap();
+    assert_eq!(
+        queue
+            .submit(submission(&[task], &[], None))
+            .unwrap_err()
+            .to_string(),
+        "cannot apply Submit to task in ready state"
+    );
+    assert!(
+        queue
+            .submit(submission(&[TaskId::new(99)], &[], None))
+            .is_err()
+    );
+    assert!(queue.submit(submission(&[task], &[], Some(5))).is_err());
+    assert_eq!(
+        queue
+            .submit(submission(&[TaskId::new(0)], &[], None))
+            .unwrap_err()
+            .to_string(),
+        "task ID must be positive"
+    );
+    // A failed submit leaves nothing behind.
+    assert!(queue.proposals(true).unwrap().is_empty());
+}
+
+#[test]
+fn migration_to_v21_keeps_drafts_and_the_task_id_sequence() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("v20.db");
+    let raw = Connection::open(&path).unwrap();
+    for migration in [
+        include_str!("../migrations/0001_queue.sql"),
+        include_str!("../migrations/0002_supervisor.sql"),
+        include_str!("../migrations/0003_workspace_close.sql"),
+        include_str!("../migrations/0004_integration.sql"),
+        include_str!("../migrations/0005_run_leases.sql"),
+        include_str!("../migrations/0006_merge_queue.sql"),
+        include_str!("../migrations/0007_supervisors.sql"),
+        include_str!("../migrations/0008_goals.sql"),
+        include_str!("../migrations/0009_supervisor_mode.sql"),
+        include_str!("../migrations/0010_supervisor_binary_version.sql"),
+        include_str!("../migrations/0011_session_workspaces.sql"),
+        include_str!("../migrations/0012_queue_events.sql"),
+        include_str!("../migrations/0013_goal_draft.sql"),
+        include_str!("../migrations/0014_asks.sql"),
+        include_str!("../migrations/0015_task_required_evidence.sql"),
+        include_str!("../migrations/0016_observer.sql"),
+        include_str!("../migrations/0017_stuck_exit_ask.sql"),
+        include_str!("../migrations/0018_task_paths.sql"),
+        include_str!("../migrations/0019_task_goal_dependencies.sql"),
+        include_str!("../migrations/0020_task_priority.sql"),
+    ] {
+        raw.execute_batch(migration).unwrap();
+    }
+    raw.pragma_update(None, "application_id", 0x43545131)
+        .unwrap();
+    raw.pragma_update(None, "user_version", 20).unwrap();
+    raw.execute_batch(&format!(
+        "INSERT INTO goals(title) VALUES ('existing');
+         INSERT INTO tasks(title,description,acceptance,verification_commands,status,goal_id,
+                           context,required_evidence,paths,priority)
+         VALUES ('kept draft','d','a','[\"cargo test\"]','draft',1,'c','[\"e2e\"]','[\"src/**\"]',3);
+         INSERT INTO tasks(title,description,acceptance,verification_commands,status)
+         VALUES ('landed','','','[]','completed');
+         INSERT INTO task_runs(id,task_id,status,requested_provider,actual_provider,base_commit)
+         VALUES ('run-landed',2,'integrated','claude','claude','{BASE}');
+         INSERT INTO tasks(title,description,acceptance,verification_commands,status)
+         VALUES ('waiting','','','[]','ready');
+         INSERT INTO task_dependencies(task_id,predecessor_id) VALUES (3,2);
+         INSERT INTO tasks(title,description,acceptance,verification_commands,status)
+         VALUES ('gone','','','[]','draft');
+         DELETE FROM tasks WHERE id=4;"
+    ))
+    .unwrap();
+    drop(raw);
+    let mut queue = SqliteQueue::open(&path).unwrap();
+    assert_eq!(queue.schema_version().unwrap(), 21);
+    let kept = queue.show(TaskId::new(1)).unwrap().task;
+    assert_eq!(kept.status(), TaskStatus::Draft);
+    assert_eq!(
+        (kept.context(), kept.paths(), kept.priority()),
+        ("c", &["src/**".to_owned()][..], Priority::Urgent)
+    );
+    assert_eq!(kept.required_evidence(), [EvidenceCheck::E2e]);
+    assert_eq!(kept.goal_id(), Some(GoalId::new(1)));
+    assert_eq!(
+        queue.show(TaskId::new(3)).unwrap().task.status(),
+        TaskStatus::Ready
+    );
+    assert_eq!(queue.candidates().unwrap().len(), 1);
+    assert!(queue.proposals(true).unwrap().is_empty());
+    // The deleted task's ID is never handed out again.
+    assert_eq!(queue.add(new_task("new")).unwrap().id(), TaskId::new(5));
+    let raw = Connection::open(&path).unwrap();
+    assert!(
+        raw.execute(
+            "INSERT INTO tasks(title,description,acceptance,verification_commands,status)
+             VALUES ('x','','','[]','bogus')",
+            []
+        )
+        .is_err()
+    );
+    let violations: i64 = raw
+        .query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(violations, 0);
 }
