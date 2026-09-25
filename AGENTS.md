@@ -31,6 +31,7 @@ cargo clippy --locked --all-targets -- -D warnings
 - unit test: 行カバレッジの合計を 80% 以上に保つ（`cargo-llvm-cov`、行基準、全体）。下回る変更は着地しない。門番は task の `verification_commands`（`integrate` が rebase 後に worker の receipt を信用せず 1 回だけ実行する。validating では実行しない）と CI で、worker が手元で `cargo llvm-cov` を回す必要はない。runtime（`src/`）を触る task を `dagq add` するときは verification に `cargo llvm-cov --locked --fail-under-lines 80` を含め、`--evidence e2e` も付ける（receipt の `e2e` が evidence 付きの `passed` でない run は validating で `needs_session`（`evidence_missing`）になり、supervisor の resume が不足分を補わせる。ADR-0019 決定 5）。llvm-cov を verification に含める task では `cargo test --locked` を verification に重ねない。`cargo llvm-cov` は `cargo test` と同じ test binary 群（`src/lib.rs` の unit test と `tests/*.rs`。この crate に doctest は無い）を全部実行し、1 件でも落ちれば失敗するので、両方を並べても integrate の直列の検証で同じ test が 2 回走る（約 100 秒）だけで検出力は増えない。llvm-cov を含めない task（docs・plugin の文書など）は、必要なら `cargo test --locked` を verification に残す。worker が手元で回す「変更後に必ず通す」の 3 本はこれと別で、変えない
 - 変更の種類で verification を軽くしてよい。条件は `--paths` で変えてよいパスを宣言すること（[ADR-0029](docs/adr/0029-task-declares-paths-and-verification-follows-the-kind-of-change.md)）。宣言外のパスを変えた run は validating で `needs_session`（`scope_violation`）になり、`integrate` も rebase 後の差分を同じく検査して着地させないので、軽い検証のまま `src/` の変更が入ることはない。`--paths` を付けない task は今までどおり制限されない。推奨の組み合わせ（glob は repository root 起点で、`*` は 1 階層、`**` は任意の深さ。詳細は dagq skill の `reference/scope.md`）:
   - docs だけ: `--paths 'docs/**' --paths '*.md' --verify 'cargo fmt --all --check'`（fmt も要らなければ検証なし）
+  - ADR を書く（docs だけ）: 上に `--verify 'sh scripts/check-adr-numbers.sh'` を足す（「文書のルール」の ADR 番号の割り当て）
   - plugin の文書・skill: `--paths 'plugins/**' --paths 'docs/**' --paths '*.md' --verify 'cargo test --locked --test plugin'`（`tests/plugin.rs` が skill の大きさと参照を検査するので test を残す。plugin の文書を読む test はこれだけ）
   - runtime（`src/`・`tests/`・`migrations/`）: `--paths` なしで fmt / clippy / `cargo llvm-cov --locked --fail-under-lines 80` と `--evidence e2e`（上の llvm-cov の規則どおり `cargo test --locked` は重ねない）
   - 種類が混ざる task は重い方の検証にする。task が宣言外のパスを本当に必要とするなら、worker は `failed` の receipt に必要なパスを書き、planner が `--paths` を広げて登録し直す（draft / ready のうちは `set-paths TASK --paths ...` / `--none` で変えられる）
@@ -45,6 +46,11 @@ cargo clippy --locked --all-targets -- -D warnings
 - 実装を変えたら `docs/design/` の該当文書と `updated` / `last_verified` を更新する
 - ステップの状態が変わったら `docs/plans/current.md` を更新する
 - frontmatter は [docs/frontmatter.md](docs/frontmatter.md) に従う
+- ADR の番号は task の登録時に planner が割り当てる。並行する run が同じ番号を取ると、slug が違うので git では衝突せずに両方着地し、後続 task の番号参照もずれる（2026-09-24 に ADR-0035 が重なり、task 214 で 0036 に付け替えた）
+  - ADR を書く task を登録するときは、planner が main の `docs/adr/` と、未完了の task の中ですでに割り当てた番号を見て次の空きを選び、description に「ADR-NNNN（docs/adr/NNNN-slug.md）を書く」と書き、`--verify 'sh scripts/check-adr-numbers.sh'` を付ける。plan review はその番号が main と未完了の task の割り当てと重ならないかを検査する（plan review が入る前は planner だけが見る）
+  - 後続 task は ADR を番号と path で参照する
+  - worker は割り当てられた番号を使う。main でその番号がすでに埋まっていれば、自分で振り直さず `dagq ask` にする
+  - `scripts/check-adr-numbers.sh` は `docs/adr/` の番号の重複と、frontmatter の `id` が `adr-<ファイルの番号>` と食い違う ADR を検出して exit 1 にする（CI も実行する）。重複で `integrate` が落ちた run は resume され、worker が番号を振り直し、振り直した番号を receipt の summary に書く
 
 ## タスクを閉じるとき
 

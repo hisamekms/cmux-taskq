@@ -38,6 +38,9 @@ jobs:
       - name: cargo fmt
         run: cargo fmt --all --check
 
+      - name: ADR numbers
+        run: sh scripts/check-adr-numbers.sh
+
       - name: cargo clippy
         run: cargo clippy --locked --all-targets -- -D warnings
 
