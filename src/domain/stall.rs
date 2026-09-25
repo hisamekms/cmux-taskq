@@ -1,6 +1,8 @@
 //! The thresholds of the stalled-session checks (ADR-0043 decision 4): the
 //! `[stall]` table of the repository's `dagq.toml`, each a positive number
 //! of seconds, with the defaults a person chose (2026-09-25).
+use std::collections::HashMap;
+
 use serde::Serialize;
 use serde_json::Value;
 
@@ -85,6 +87,34 @@ impl StallConfig {
     }
 }
 
+/// The file the agent's `Stop` hook appends each idle marker to, one line
+/// per marker (`<unix seconds>\t<marker>`), next to the marker: the
+/// history a background task's first appearance is read from (the marker
+/// itself is replaced each turn and carries no start time).
+pub const IDLE_LOG: &str = "idle.log";
+
+/// When each background task of the last of `markers` (oldest first, each
+/// with its time and the tasks it lists as running) was first listed in
+/// the unbroken streak of markers that lead up to it. A marker that does
+/// not list a task ends its streak, so a task ID a later session reuses is
+/// timed from its own first appearance.
+pub fn background_first_seen<I>(markers: I) -> HashMap<String, i64>
+where
+    I: IntoIterator<Item = (i64, Vec<BackgroundTask>)>,
+{
+    let mut seen: HashMap<String, i64> = HashMap::new();
+    for (at, tasks) in markers {
+        seen = tasks
+            .into_iter()
+            .map(|task| {
+                let first = seen.get(&task.id).map_or(at, |&first| first.min(at));
+                (task.id, first)
+            })
+            .collect();
+    }
+    seen
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -123,5 +153,31 @@ mod tests {
             })
         );
         assert_eq!(StallConfig::default().set("other", 1), None);
+    }
+
+    fn task(id: &str) -> BackgroundTask {
+        BackgroundTask {
+            id: id.to_owned(),
+            ..BackgroundTask::default()
+        }
+    }
+
+    #[test]
+    fn a_background_task_is_timed_from_the_first_marker_of_its_streak() {
+        assert!(background_first_seen([]).is_empty());
+        let seen = background_first_seen([
+            (10, vec![task("b1")]),
+            // b1 ended here: its ID listed again later starts a new streak.
+            (20, vec![task("b2")]),
+            (30, vec![task("b1"), task("b2")]),
+            (40, vec![task("b1"), task("b2"), task("b3")]),
+        ]);
+        assert_eq!(
+            seen,
+            HashMap::from([("b1".into(), 30), ("b2".into(), 20), ("b3".into(), 40)])
+        );
+        // A task the last marker does not list is not running.
+        let seen = background_first_seen([(10, vec![task("b1")]), (20, vec![])]);
+        assert!(seen.is_empty());
     }
 }

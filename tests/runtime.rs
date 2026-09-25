@@ -2438,6 +2438,15 @@ fn claude_stop_hook_settings_publish_the_idle_marker() {
         payload
     );
     assert!(!run_dir.join("idle.json.tmp").exists());
+    // Each marker is also appended, with the time, to the log next to it.
+    let log = fs::read_to_string(run_dir.join("idle.log")).unwrap();
+    let (secs, marker) = log.strip_suffix('\n').unwrap().split_once('\t').unwrap();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    assert!(now.abs_diff(secs.parse().unwrap()) < 60, "{log}");
+    assert_eq!(marker, payload);
 }
 
 #[test]
@@ -3818,6 +3827,93 @@ fn stats_raise_running_alerts_for_a_worker_idle_without_a_receipt() {
     let stats = one_shot(700).stats(&db, &Default::default(), None).unwrap();
     assert_eq!(stats["running_alerts"], json!([]), "{stats}");
     assert_eq!(stats["workspace_check"]["status"], "unavailable");
+}
+
+/// Task 331 (ADR-0043 decision 5): background work is timed from the first
+/// idle marker that listed it as running, from the hook's log, so a session
+/// that keeps taking turns does not restart the count.
+#[test]
+fn stats_time_background_work_from_its_first_marker() {
+    let (_dir, repo, db) = fixture();
+    let run = orphan_run(&repo, &db, "owner", dead_pid(), dead_pid());
+    let run_dir = PathBuf::from(run.run_dir().unwrap());
+    let running = |ids: &[&str]| {
+        let tasks: Vec<Value> = ids
+            .iter()
+            .map(|id| json!({"id": id, "status": "running", "description": id, "command": "sleep"}))
+            .collect();
+        json!({"hook_event_name": "Stop", "background_tasks": tasks}).to_string()
+    };
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    fs::write(run_dir.join("idle.json"), running(&["b1", "b2"])).unwrap();
+    let background = |log: String| {
+        fs::write(run_dir.join("idle.log"), log).unwrap();
+        let stats = runtime::OneShot::new(Generators {
+            clock: Arc::new(ManualClock::at(now + 60)),
+            ids: Arc::new(FixedIds(Mutex::new(vec![]))),
+        })
+        .stats(&db, &Default::default(), None)
+        .unwrap();
+        stats["running_alerts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|alert| alert["kind"] == "long_background")
+            .cloned()
+    };
+
+    // b1 first listed 50 minutes ago, through turns taken since; a line
+    // that is not a marker is skipped.
+    let alert = background(format!(
+        "{}\t{}\nnot a marker\n{}\t{}\n{now}\t{}\n",
+        now - 3000,
+        running(&["b1"]),
+        now - 100,
+        running(&["b1", "b2"]),
+        running(&["b1", "b2"]),
+    ))
+    .expect("long_background");
+    assert_eq!(alert["run_id"], run.id().as_str());
+    assert_eq!(alert["threshold"], 1800);
+    assert!(
+        (3060..3065).contains(&alert["value"].as_i64().unwrap()),
+        "{alert}"
+    );
+    assert_eq!(alert["background_tasks"][1]["id"], "b2");
+
+    // A marker without b1 ended it: the b1 listed since started later.
+    assert!(
+        background(format!(
+            "{}\t{}\n{}\t{}\n{}\t{}\n",
+            now - 3000,
+            running(&["b1"]),
+            now - 1000,
+            running(&[]),
+            now - 900,
+            running(&["b1", "b2"]),
+        ))
+        .is_none()
+    );
+    // Without a log (a session started before the hook kept one), the
+    // marker's time is all there is.
+    fs::remove_file(run_dir.join("idle.log")).unwrap();
+    let stats = runtime::OneShot::new(Generators {
+        clock: Arc::new(ManualClock::at(now + 1900)),
+        ids: Arc::new(FixedIds(Mutex::new(vec![]))),
+    })
+    .stats(&db, &Default::default(), None)
+    .unwrap();
+    assert!(
+        stats["running_alerts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|alert| alert["kind"] == "long_background"),
+        "{stats}"
+    );
 }
 
 #[test]

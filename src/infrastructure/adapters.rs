@@ -4,7 +4,7 @@ use crate::{
         Repository, SupervisorEnvironment, WorkspaceBackend, WorkspaceTags,
         stats::WorkspaceListing,
     },
-    domain::{CommitSha, Task, TaskId, TaskRun, stats::ListedWorkspace},
+    domain::{CommitSha, Task, TaskId, TaskRun, stall::IDLE_LOG, stats::ListedWorkspace},
 };
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::Value;
@@ -1654,17 +1654,27 @@ pub fn claude_trusts_repository(config: &Path, root: &Path) -> Result<bool> {
 /// as the idle marker. Each finished response replaces the marker
 /// atomically, so its modification time tells the supervisor whether the
 /// agent went idle after writing the receipt. `SessionEnd` is not used:
-/// session exit is confirmed by the wrapper's exit code instead.
+/// session exit is confirmed by the wrapper's exit code instead. Before the
+/// marker is replaced, the hook appends it with the time to the
+/// [`IDLE_LOG`] next to it, so `stats` can time background work from the
+/// first marker that listed it; a log that cannot be written does not keep
+/// the marker from being published. The append runs in its own `sh`, so
+/// the command itself stays a plain `&&` chain whatever shell runs hooks.
 ///
 /// `autoMode.environment: ["$defaults"]` keeps the built-in classifier
 /// environment and, being a non-empty environment from flag settings, keeps
 /// the "Teach auto mode about your environment?" dialog from opening in a
 /// run session (docs/design/provider-lifecycle.md).
 pub fn stop_hook_settings(idle_marker: &Path) -> Result<String> {
+    let log = path_text(&idle_marker.with_file_name(IDLE_LOG))?;
     let marker = path_text(idle_marker)?;
     let command = format!(
-        "cat > {tmp} && mv -f {tmp} {marker}",
+        "cat > {tmp} && sh -c {append} sh {tmp} {log} && mv -f {tmp} {marker}",
+        append = shell_quote(
+            r#"{ printf '%s\t' "$(date +%s)" && tr -d '\r\n' < "$1" && echo; } >> "$2"; exit 0"#
+        ),
         tmp = shell_quote(&format!("{marker}.tmp")),
+        log = shell_quote(&log),
         marker = shell_quote(&marker),
     );
     Ok(serde_json::to_string_pretty(&serde_json::json!({

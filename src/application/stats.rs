@@ -11,7 +11,7 @@ use anyhow::Result;
 use super::{AgentSignals, ProcessControl, Queue, RunFiles, StatusFilter, TaskQuery};
 use crate::domain::{
     GoalStatus, RunStatus, SessionRole, SupervisorPulse, TaskRun, TaskStatus,
-    stall::StallConfig,
+    stall::{BackgroundTask, IDLE_LOG, StallConfig, background_first_seen},
     stats::{
         ListedWorkspace, LiveRun, LiveSnapshot, SlotSnapshot, StallConfigReport, Stats, StatsQuery,
         Workspaces, stats as aggregate,
@@ -163,7 +163,7 @@ fn live_run(run: &TaskRun, sources: &StatsSources<'_>) -> Result<LiveRun> {
             .then(|| sources.files.modified(path).ok().map(millis))
             .flatten()
     };
-    let (idle, input) = match run.run_dir() {
+    let (idle, background_since, input) = match run.run_dir() {
         Some(dir) => {
             let idle = sources
                 .files
@@ -174,9 +174,19 @@ fn live_run(run: &TaskRun, sources: &StatsSources<'_>) -> Result<LiveRun> {
                         sources.signals.idle_hook(&bytes).background_tasks,
                     )
                 });
-            (idle, modified(&Path::new(dir).join(PROMPT_SUBMIT_MARKER)))
+            let since = match &idle {
+                Some((at, tasks)) if !tasks.is_empty() => {
+                    background_since(sources, &Path::new(dir).join(IDLE_LOG), *at, tasks)?
+                }
+                _ => None,
+            };
+            (
+                idle,
+                since,
+                modified(&Path::new(dir).join(PROMPT_SUBMIT_MARKER)),
+            )
         }
-        None => (None, None),
+        None => (None, None, None),
     };
     Ok(LiveRun {
         run_id: run.id().clone(),
@@ -188,5 +198,45 @@ fn live_run(run: &TaskRun, sources: &StatsSources<'_>) -> Result<LiveRun> {
             .receipt_path()
             .and_then(|path| modified(Path::new(path))),
         input,
+        background_since,
     })
+}
+
+/// When the longest running of the marker's background `tasks` was first
+/// listed: the earliest of their first appearances in the unbroken streak
+/// of markers in the hook's `log` that ends with the marker written `at`.
+/// A task the log does not show (no log, as from a session started before
+/// the hook wrote one) is timed from the marker. `None` when the log shows
+/// none earlier than the marker.
+fn background_since(
+    sources: &StatsSources<'_>,
+    log: &Path,
+    at: i64,
+    tasks: &[BackgroundTask],
+) -> Result<Option<i64>> {
+    let Some((_, bytes)) = sources.files.read_stamped(log)? else {
+        return Ok(None);
+    };
+    let history = String::from_utf8_lossy(&bytes)
+        .lines()
+        .filter_map(|line| {
+            let (secs, marker) = line.split_once('\t')?;
+            let secs: i64 = secs.trim().parse().ok()?;
+            Some((
+                secs.saturating_mul(1000),
+                sources
+                    .signals
+                    .idle_hook(marker.as_bytes())
+                    .background_tasks,
+            ))
+        })
+        // The marker itself ends the streak, whether or not its line made it.
+        .chain([(at, tasks.to_vec())])
+        .collect::<Vec<_>>();
+    let seen = background_first_seen(history);
+    Ok(tasks
+        .iter()
+        .filter_map(|task| seen.get(&task.id).copied())
+        .min()
+        .filter(|&since| since < at))
 }

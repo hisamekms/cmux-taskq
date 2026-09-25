@@ -291,6 +291,10 @@ pub struct LiveRun {
     /// The last input the session took (the agent's prompt-submit
     /// marker), for an agent that writes one.
     pub input: Option<i64>,
+    /// When the longest running of the idle marker's background tasks was
+    /// first listed, when the hook's history shows it earlier than the
+    /// marker; the marker's time otherwise.
+    pub background_since: Option<i64>,
 }
 
 /// The state `running_alerts` are judged on.
@@ -727,7 +731,8 @@ fn running_alerts(
             && !background.is_empty()
             && !ended(*idle)
         {
-            let running = (now_ms - idle) / 1000;
+            let since = run.background_since.map_or(*idle, |since| since.min(*idle));
+            let running = (now_ms - since) / 1000;
             if running > config.background_alert_secs {
                 let mut alert = RunningAlert::new(
                     "long_background",
@@ -1178,6 +1183,7 @@ mod tests {
             idle: None,
             receipt: None,
             input: None,
+            background_since: None,
         }
     }
 
@@ -1357,6 +1363,29 @@ mod tests {
         let mut answered = revise.to_vec();
         answered.push(run_event(3, R1, "revise_finished", json!({}), T + 30));
         assert!(running(&answered, &live, now).is_empty());
+    }
+
+    #[test]
+    fn background_work_is_timed_from_when_it_was_first_listed() {
+        let mut run = live_run(R1, RunStatus::Running);
+        run.idle = Some((T * 1000, cargo_test()));
+        run.background_since = Some((T - 1000) * 1000);
+        let live = snapshot(vec![run.clone()], Workspaces::Unavailable("none".into()));
+        let alerts = running(&[], &live, T + 1000);
+        let background: Vec<_> = alerts
+            .iter()
+            .filter(|alert| alert.kind == "long_background")
+            .collect();
+        assert_eq!(background.len(), 1, "{alerts:?}");
+        assert_eq!(background[0].value, Some(2000));
+        // Timed from the marker alone, it is under the threshold.
+        run.background_since = None;
+        let live = snapshot(vec![run], Workspaces::Unavailable("none".into()));
+        assert!(
+            !running(&[], &live, T + 1000)
+                .iter()
+                .any(|alert| alert.kind == "long_background")
+        );
     }
 
     #[test]
