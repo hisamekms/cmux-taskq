@@ -47,7 +47,6 @@ ADRは、将来の実装や運用に大きな影響を与える決定の理由�
 | [ADR-0008](0008-merge-queue-squash-landing.md) | runtimeのmerge queueが最新mainへrebase・再検証し、1 task = 1 commitにsquashしてmainへ着地させる |  |
 | [ADR-0010](0010-maintainer-and-resident-supervisor.md) | 役割名をsupervisor / maintainer / workerに統一し、supervisorをlaunchdで常駐させてupとdownで起動・停止する |  |
 | [ADR-0011](0011-cmux-socket-password-and-in-cmux-fallback.md) | launchd常駐のsupervisorにはcmuxのsocket passwordを前提とし、up --in-cmuxをlaunchdなしのfallbackにする |  |
-| [ADR-0012](0012-adopt-stale-lease-of-live-wrapper.md) | supervisorが死んだrunは、wrapperが生きていれば次のsupervisorが引き継ぐ |  |
 | [ADR-0013](0013-layered-architecture-and-type-function-style.md) | domain / application / infrastructureのレイヤーと「型＋関数」でruntimeを構成する |  |
 | [ADR-0015](0015-rename-to-dagq.md) | cmux-taskqをdagqに改名する |  |
 | [ADR-0016](0016-maintainer-notification-and-compact-output.md) | maintainerを使い捨てのsessionにし、status / watch / doctorの通知経路と圧縮出力、pluginの起き直しhookを持たせる |  |
@@ -66,6 +65,7 @@ ADRは、将来の実装や運用に大きな影響を与える決定の理由�
 | [ADR-0031](0031-color-pill-and-pin-for-inbox-and-planner-and-unpin-before-close.md) | upがinbox / plannerのworkspaceに役割の色・status pill・ピンを当て、dagqのworkspace closeはピンを外してから閉じる |  |
 | [ADR-0036](0036-delete-frozen-work-records.md) | 凍結済みのdocs/journal/を削除し、今も効く手順と観測事実だけをdesign文書へ移す | 2026-09-25 |
 | [ADR-0038](0038-task-depends-on-a-goal-until-it-is-achieved.md) | taskがgoalに依存でき、依存先のgoalがachievedで閉じるまでclaimされない | 2026-09-25 |
+| [ADR-0039](0039-adopt-stale-lease-of-live-wrapper-and-renew-own-stale-lease.md) | supervisorが死んだrunは、wrapperが生きていれば次のsupervisorが引き継ぎ、自分のtokenのままstaleになったleaseは更新して続ける | 2026-09-25 |
 | [ADR-0040](0040-verify-once-review-run-env-graph-stats-and-task-priority-in-claim-order.md) | 検証をintegrateの1回にし、reviewをsupervisorの工程にし、dagq.tomlでrunのenvを渡し、taskの5段階の優先度と解放数でclaim順を決め、statsで詰まりを数える | 2026-09-25 |
 | [ADR-0041](0041-on-demand-planners-proposals-submitted-and-plan-review-job.md) | 役割を5つにし、plannerをproposalごとのオンデマンドのworkspaceにし、taskにsubmitted状態を足し、supervisorが起動するplan review jobだけがreadyにし、follow_upのdraftもruntimeが立てるplannerのproposalとして同じgateを通す | 2026-09-25 |
 | [ADR-0042](0042-adr-is-superseded-whole-and-deprecation-date-is-deprecated-on.md) | ADRは丸ごと置き換え、置き換えの日付はsuperseded_on、廃止の日付はdeprecated_onに分けてfrontmatterと本文冒頭の注記に残す | 2026-09-25 |
@@ -79,6 +79,7 @@ ADRは、将来の実装や運用に大きな影響を与える決定の理由�
 
 | ADR | Status | superseded_by | superseded_on / deprecated_on |
 | --- | --- | --- | --- |
+| [ADR-0012](0012-adopt-stale-lease-of-live-wrapper.md) | superseded | [ADR-0039](0039-adopt-stale-lease-of-live-wrapper-and-renew-own-stale-lease.md) | 2026-09-25 |
 | [ADR-0014](0014-up-replaces-a-supervisor-of-another-binary-version.md) | superseded | [ADR-0045](0045-build-identifier-explicit-migrate-schema-compat-handoff-and-auto-update.md) | 2026-09-25 |
 | [ADR-0023](0023-verify-once-review-in-supervisor-run-env-graph-and-stats.md) | superseded | [ADR-0040](0040-verify-once-review-run-env-graph-stats-and-task-priority-in-claim-order.md) | 2026-09-25 |
 | [ADR-0024](0024-retire-maintainer-into-jobs-and-observer.md) | superseded | [ADR-0041](0041-on-demand-planners-proposals-submitted-and-plan-review-job.md) | 2026-09-25 |

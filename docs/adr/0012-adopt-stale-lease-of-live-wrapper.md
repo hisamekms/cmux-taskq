@@ -2,9 +2,12 @@
 id: adr-0012
 type: adr
 title: supervisorが死んだrunは、wrapperが生きていれば次のsupervisorが引き継ぐ
-status: accepted
+status: superseded
 created: 2026-09-22
 updated: 2026-09-22
+accepted_on: 2026-09-22
+superseded_by: adr-0039
+superseded_on: 2026-09-25
 owners:
   - hisamekms
 tags:
@@ -20,6 +23,8 @@ related:
 ---
 
 # ADR-0012: supervisorが死んだrunは、wrapperが生きていれば次のsupervisorが引き継ぐ
+
+> **置き換え済み（2026-09-25）**: このADRの決定は現在有効ではない。現行の決定は[ADR-0039](0039-adopt-stale-lease-of-live-wrapper-and-renew-own-stale-lease.md)を読む。
 
 ## Context
 
