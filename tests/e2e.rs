@@ -268,6 +268,21 @@ fn dagq(env: &Env, args: &[&str]) -> Value {
     dagq_with(env, &[], args)
 }
 
+/// `dagq status` once `condition` holds of it: what `status` reports of
+/// processes that just exited or were just killed is waited for rather than
+/// judged on the first look. Past the deadline the last status is returned,
+/// for the caller's assertions to show.
+fn status_when(env: &Env, condition: impl Fn(&Value) -> bool) -> Value {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let status = dagq(env, &["status"]);
+        if condition(&status) || Instant::now() >= deadline {
+            return status;
+        }
+        thread::sleep(Duration::from_millis(200));
+    }
+}
+
 fn dagq_with(env: &Env, extra: &[(&str, &Path)], args: &[&str]) -> Value {
     let mut command = Command::new(BIN);
     command
@@ -1036,10 +1051,8 @@ fn happy_path_runs_a_stub_agent_through_cmux_and_lands_on_main() {
     );
     assert_eq!(run["branch"], format!("dagq/{run_id}"));
     assert!(run["workspace_closed_at"].is_number(), "{run}");
-    assert!(
-        !workspace_listed(cmux, &workspace),
-        "workspace {workspace} is still open after the run landed"
-    );
+    // cmux accepted the close; its list can lag behind it for a moment.
+    wait_until_not_listed(cmux, &workspace);
     assert!(stderr.contains("review 1: pass"), "{stderr}");
     assert!(stderr.contains("integrated"), "{stderr}");
 
@@ -1603,7 +1616,12 @@ fn killed_supervisor_run_is_adopted_by_the_next_supervisor_and_lands() {
 
     // What the inbox sees before anyone adopts: the registration and
     // the lease are stale by pid, the wrapper is alive, and the run keeps going.
-    let status = dagq(env, &["status"]);
+    let status = status_when(env, |status| {
+        status["supervisors"]
+            .as_array()
+            .is_some_and(|s| s.len() == 1 && s[0]["stale"] == true)
+            && status["runs"][0]["lease"]["alive"] == false
+    });
     let supervisors = status["supervisors"].as_array().unwrap();
     assert_eq!(supervisors.len(), 1, "{status}");
     assert_eq!(supervisors[0]["pid"], victim_pid);
@@ -1681,7 +1699,11 @@ fn killed_supervisor_run_is_adopted_by_the_next_supervisor_and_lands() {
         "{kinds:?}"
     );
     // The adopter deregistered on exit; the killed one's row stays for `up` to prune.
-    let status = dagq(env, &["status"]);
+    let status = status_when(env, |status| {
+        status["supervisors"].as_array().is_some_and(|s| {
+            s.len() == 1 && s[0]["pid"] == victim_pid && s[0]["run_ids"] == Value::Array(vec![])
+        }) && status["runs"] == Value::Array(vec![])
+    });
     let supervisors = status["supervisors"].as_array().unwrap();
     let diagnosis = format!(
         "victim pid {victim_pid}; supervisors {supervisors:#?}; adopter stderr:\n{}",

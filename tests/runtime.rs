@@ -7,9 +7,9 @@ use dagq::{
         dependency_graph,
     },
     domain::{
-        AskId, AskKind, CommitSha, EventId, EvidenceCheck, GoalEdit, GoalId, NewAsk, NewGoal,
-        NewTask, Priority, ReasonCode, RunId, RunStatus, SessionRole, Task, TaskAction, TaskId,
-        TaskRun, TaskStatus,
+        AskId, AskKind, CommitSha, EventId, EvidenceCheck, GoalEdit, GoalId, MAX_RESUME_ATTEMPTS,
+        NewAsk, NewGoal, NewTask, Priority, ReasonCode, RunId, RunStatus, SessionRole, Task,
+        TaskAction, TaskId, TaskRun, TaskStatus,
     },
     infrastructure::{
         adapters::{GitRepository, shell_join, workspace_handle},
@@ -350,9 +350,10 @@ await_message() {
   while [ ! -f "$MESSAGE" ]; do sleep 0.05; done
   MAIN=$(sed -n 's/.*main is now \([0-9a-f]*\) .*/\1/p' "$MESSAGE" | head -n 1)
 }
-# The supervisor polls `git status` in the worktree, which holds its
-# index.lock for a moment and may write back an index it read before our
-# `git add`. `resolve` therefore looks at the rebase after every step, as a
+# The supervisor polls `git status` in the worktree. It runs with
+# GIT_OPTIONAL_LOCKS=0 now, but a git that took index.lock for a moment
+# there made a session's `git add` or `git commit` fail (and failed tests
+# under load), so the scripts still guard against the lock. `resolve` therefore looks at the rebase after every step, as a
 # person would: it resolves the conflict while the file or the index needs
 # it, skips a pick that is already in HEAD, and continues until the rebase
 # is over. A command that only found the lock is retried.
@@ -5838,11 +5839,25 @@ fn a_run_parked_again_after_a_skip_is_resumed_not_skipped() {
         )
         .unwrap();
 
-    let outcome = supervise(&db, &repo, &backend).unwrap();
     // The resumes after the second park fail (the backend has no script)
-    // until the attempts are used up; none is skipped.
-    assert_eq!(outcome["errors"].as_array().unwrap().len(), 2, "{outcome}");
+    // until the attempts are used up; none is skipped. Whether one pass of
+    // `--once` makes both depends on whether it reads the run parked again
+    // before it reaps the landing's slot, so passes are run until the last
+    // attempt started (each pass makes at least one).
     let mut queue = SqliteQueue::open(&db).unwrap();
+    let mut errors = Vec::new();
+    for _ in 0..MAX_RESUME_ATTEMPTS {
+        let outcome = supervise(&db, &repo, &backend).unwrap();
+        errors.extend(outcome["errors"].as_array().unwrap().iter().cloned());
+        let detail = queue.show(TaskId::new(2)).unwrap();
+        if payloads(&detail, "resume_started")
+            .last()
+            .is_some_and(|p| p["attempt"] == MAX_RESUME_ATTEMPTS)
+        {
+            break;
+        }
+    }
+    assert_eq!(errors.len(), 2, "{errors:?}");
     let detail = queue.show(TaskId::new(2)).unwrap();
     assert_eq!(detail.runs[0].status(), RunStatus::NeedsSession);
     assert_eq!(git_out(&repo, &["rev-parse", "main"]), first_landed);
@@ -10427,7 +10442,7 @@ fn a_concern_sent_back_is_resumed_reviewed_again_and_landed() {
     queue.answer(ask.id, "send_back").unwrap();
     backend.resume_script_for(
         1,
-        "await_message; printf 'narrowed\\n' > change.txt; git commit -q -am narrowed; receipt \"$(git rev-parse HEAD)\"; idle; await_exit",
+        "await_message; printf 'narrowed\\n' > change.txt; unlocked git commit -q -am narrowed; receipt \"$(git rev-parse HEAD)\"; idle; await_exit",
     );
     let outcome = supervise_reviewed(&db, &repo, &backend, &reviewer);
     assert_eq!(outcome["errors"], json!([]), "{outcome}");
