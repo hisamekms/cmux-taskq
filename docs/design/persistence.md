@@ -200,6 +200,32 @@ SQLiteはCHECK制約を変更できないため、statusの追加はtableの作�
 - **問い合わせ**: 語は空白で区切り、`"..."`で空白を含む句にし、`AND` / `OR` / `NOT` / 括弧はFTS5の構文としてそのまま渡す。3文字以上の語はそれぞれ`"..."`で囲んで`MATCH`に渡す（`/`や`.`を含むpathが構文エラーにならず、trigramの句として部分一致する）。3文字未満の語はすべて含むこと（AND）を`LIKE`で足すので、`OR` / `NOT` / 括弧とは組み合わせられず、そのときはerrorにする。`--kind` / `--status` / `--goal`は`UNINDEXED`の列への条件。`MATCH`があれば`bm25`の昇順、3文字未満の語だけなら`updated_at`の新しい順（同じならrowidの大きい順）に`LIMIT`件を返し、`total`は同じ条件の件数。
 - **抜粋**: 語（3文字以上、3文字未満の順）が現れる最初の列（`title` → `description` → `acceptance` → `context` → `text`）の、最初の出現の前後24文字を切り出して`«` `»`で囲む（`field`はその列の名前で、goalの`context`は`constraints`、commitの`text`は`message`）。FTS5の`snippet`はtrigramの語の数で窓を取るので一致した句の途中で切れることがあり、どの語も文字どおりには現れないとき（大文字小文字の畳み込みがASCII外で違うなど）の予備にだけ使う。`title`はtask・goalはそのtitle、noteとcommitは本文の最初の空でない行（80文字で切る）。`--full`は検索した列の全文（`fields`）と`bm25`の値（`score`）を足す。
 
+## 関連（related）
+
+`dagq related TASK`（[ADR-0046](../adr/0046-full-text-search-related-and-duplicate-of.md)の決定4）は、表を足さずに既存の表と`search_index`を読む。読むのは`src/infrastructure/related.rs`、手がかりの取り出しと点数は`src/domain/related.rs`。
+
+- **読むもの**: すべての状態のtaskの`title` / `description` / `acceptance` / `context` / `goal_id` / `paths`、`landed_commits`の`message`（completedのtaskの本文に足す）、`run_events`のkind `follow_up_registered`（行の`run_id`と`task_id`が提案したrunとそのtask、payloadの`task_id`が登録されたtask）、今`canceled`のtaskの最後の`task_status_changed`（`to: canceled`）のpayloadの`duplicate_of`（決定5。無ければ出さない）。
+- **本文の手がかり**: ASCIIの英数字と`_-./*`の連なりを語として取り出す。ファイル名は拡張子が`rs` / `md` / `sql` / `toml` / `sh` / `json` / `yml` / `yaml`の語（前の`./`と後ろの`.`を除き、書かれたとおりの文字列で比べる。`tests/runtime.rs`と`runtime.rs`は別の手がかり）。テスト名は英小文字・数字の3語以上のsnake_case（`resume_prompt_delay`のような識別子も同じ形なので拾う）と、`--test NAME`の`NAME`。ADR番号は`ADR-NNNN` / `adr-NNNN` / `docs/adr/NNNN-`の4桁。task番号は`task` / `tasks` / `タスク`の後の数字で、`task 203,164`、`task 178 と 179`のような列挙も読む（自分の番号は除く）。
+- **点数**: 手がかりごとの重みの和。重みは全体で共有するtaskの数`df`（taskの総数`n`）で`rarity = ln((n+1)/df) / ln((n+1)/2)`（2件だけが共有すれば1、全件なら0）を掛けて割り引く。
+
+  | 手がかり | `clue` | 重み |
+  |---|---|---|
+  | 宣言したglobが同じか一方が他方に一致する（`src/**`と`src/domain/*.rs`） | `path` | 1.0 × rarity（対象のglobごとに1回、2つのglobのうち多く使われる方のdf） |
+  | 同じファイル名 | `file` | 2.0 × rarity |
+  | 同じテスト名 | `test` | 3.0 × rarity |
+  | 同じADR番号 | `adr` | 2.0 × rarity |
+  | 対象が候補の番号を書いている / 候補が対象の番号を書いている | `mentions` / `mentioned_by` | 3.0 |
+  | 両方が同じ別のtaskの番号を書いている | `shared_mention` | 2.0 × rarity |
+  | 一方が他方のrunのfollow_upとして登録された | `follow_up_of` | 3.0 |
+  | 両方が同じrunのfollow_upとして登録された | `same_run` | 2.0 |
+  | 同じgoal | `goal` | 1.5 × rarity（goalのtaskの数） |
+  | 対象のtitleの検索の一致の強さ | `search` | 4.0 × 強さ（0.1未満は数えない） |
+
+- **検索の一致の強さ**: 対象のtitleを小文字にした3文字の窓のうち、空白と`"`を含まず英数字か文字を含むもの（重複を除き最大200個）を`OR`でつなぎ、`search_index`の`{title description}`の列に`MATCH`する（kindは`task`）。各taskの`bm25`を対象自身の`bm25`で割った比（0〜1）を強さにする。対象自身も索引にあるので、draftのtaskにも使える。
+- **出力**: 点数が0より大きい他のtaskを点数の高い順（同じならIDの大きい順）に並べ、`--status`で絞り、`--limit`（既定10）で切る。`total`は絞った後、切る前の件数。各候補は`id` / `status` / `title` / `score`と、点数に効いた手がかり`clues`（`{"clue","value","weight"}`）、重複でcancelされていれば`duplicate_of`を持つ。
+- **確かめ**: `tests/related.rs`は2026-09-25の重複の組（179/302、203/230、313/247、316/320/311、323/280、289/285、324/317）を実データのtitleとdescriptionの要約で作り、同じgoal・ファイル・ADR・pathsを共有する他のtaskの中で、少なくとも半分の組が一方の上位5件に出ることを確かめる（このfixtureではすべて出る）。本番のqueueの複製（2026-09-26、396件）では9組中8組が上位5件に出た（289/285だけが出ない。共有するのは`task 205`と文言だけで、289は同じgoal 30とADR-0043のtaskが上位を占める）。
+- 重みはADR-0046を置き換えずに変えてよい（決定4）。変えたらこの表と`tests/related.rs`を合わせる。
+
 ## Planned runtime persistence
 
 receipt検証結果はイベントとtask_runsの列で足りたため、`run_artifacts`テーブルは追加しなかった。成果物hashが必要になった時点で検討する。一定時間heartbeatが更新されないrunは自動再実行せず、`doctor`で確認して`recover`で明示的に閉じる。`interrupted`は最初からCHECK制約に含まれていたため、復旧のためのmigrationは不要だった。leaseの列を`task_runs`に足す案は、解放済みをnullで表すことになり実行の記録と揮発する所有権が混ざるため採らなかった（[ADR-0007](../adr/0007-run-level-leases-parallel-execution.md)）。

@@ -9,6 +9,7 @@ mod plan_reviews;
 mod planners;
 pub mod process;
 mod proposals;
+pub mod related;
 pub mod run_env;
 pub mod run_files;
 pub mod runtime_store;

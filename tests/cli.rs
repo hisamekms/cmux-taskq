@@ -2832,3 +2832,70 @@ fn search_prints_hits_with_excerpts_and_checks_its_filters() {
     ok_as("observer", &db, &["search", "全文検索"]);
     ok_as("reviewer", &db, &["search", "全文検索"]);
 }
+
+#[test]
+fn related_prints_candidates_with_their_clues() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("queue.db");
+    ok(&db, &["init"]);
+    ok(
+        &db,
+        &[
+            "add",
+            "test: a_run_parked_again_after_a_skip が負荷下で落ちる",
+            "--description",
+            "tests/runtime.rs の assert が落ちた",
+        ],
+    );
+    ok(
+        &db,
+        &[
+            "add",
+            "test: a_run_parked_again_after_a_skip fails under load",
+            "--description",
+            "tests/runtime.rs again",
+        ],
+    );
+    ok(&db, &["add", "unrelated"]);
+    // A title with FTS5's syntax in it still makes a valid query.
+    ok(&db, &["add", "fix: (a*b) ^c \"d\" NOT x OR y:z"]);
+    assert_eq!(ok(&db, &["related", "4"])["total"], 0);
+    let related = ok(&db, &["related", "1"]);
+    assert_eq!(related["task_id"], 1);
+    assert_eq!(related["total"], 1, "{related}");
+    let candidate = &related["related"][0];
+    assert_eq!(candidate["id"], 2);
+    assert_eq!(candidate["status"], "draft");
+    assert!(candidate["score"].as_f64().unwrap() > 0.0);
+    let clues: Vec<(&str, &str)> = candidate["clues"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| (c["clue"].as_str().unwrap(), c["value"].as_str().unwrap()))
+        .collect();
+    assert!(
+        clues.contains(&("test", "a_run_parked_again_after_a_skip")),
+        "{clues:?}"
+    );
+    assert!(clues.contains(&("file", "tests/runtime.rs")), "{clues:?}");
+    let none = ok(
+        &db,
+        &[
+            "related",
+            "1",
+            "--status",
+            "ready,completed",
+            "--limit",
+            "1",
+        ],
+    );
+    assert_eq!(none["related"], serde_json::json!([]));
+    assert!(
+        !invoke(&db, &["related", "1", "--status", "closed"])
+            .status
+            .success()
+    );
+    assert_eq!(refused(&db, &["related", "9"]), "task 9 does not exist");
+    ok_as("observer", &db, &["related", "1"]);
+    ok_as("reviewer", &db, &["related", "1"]);
+}

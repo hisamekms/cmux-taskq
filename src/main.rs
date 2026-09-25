@@ -321,6 +321,23 @@ enum Command {
         #[arg(long)]
         full: bool,
     },
+    /// The tasks most related to TASK (any status, drafts included), scored by fixed rules
+    /// (ADR-0046 decision 4): declared paths that overlap; file names, test names (snake_case of
+    /// three or more words, `--test NAME`), ADR numbers and task numbers in the texts and landed
+    /// commit messages; follow-ups of the same run; the same goal; and how strongly the search
+    /// index matches TASK's title against the other task. A clue many tasks share counts less.
+    /// Prints {"task_id", "related", "total"}, best first: per task its id, status, title, score,
+    /// the clues that scored it ({"clue", "value", "weight"}) and `duplicate_of` when it was
+    /// canceled as a duplicate.
+    Related {
+        task_id: i64,
+        /// Only these statuses (comma-separated): draft, submitted, ready, in_progress,
+        /// completed, canceled.
+        #[arg(long, value_delimiter = ',')]
+        status: Vec<TaskStatus>,
+        #[arg(long, default_value_t = 10, value_parser = clap::value_parser!(u32).range(1..))]
+        limit: u32,
+    },
     /// List ready tasks whose prerequisites are all completed, whose goal dependencies are all
     /// closed as achieved and whose goal is not a draft, in claim order (highest
     /// `effective_priority`, then most `unblocks`, then lowest ID); does not claim.
@@ -786,6 +803,7 @@ fn reads_only(command: &Command) -> bool {
             | Command::Doctor { .. }
             | Command::Notes { .. }
             | Command::Search { .. }
+            | Command::Related { .. }
             | Command::Proposal {
                 command: ProposalCommand::List { .. } | ProposalCommand::Show { .. },
             }
@@ -834,6 +852,7 @@ fn observer_access(command: &Command) -> ObserverAccess {
         | Command::Note { .. }
         | Command::Notes { .. }
         | Command::Search { .. }
+        | Command::Related { .. }
         | Command::Proposal {
             command: ProposalCommand::List { .. } | ProposalCommand::Show { .. },
         }
@@ -1261,6 +1280,20 @@ fn execute(cli: Cli) -> Result<Value> {
                 limit: usize::try_from(limit)?,
                 full,
             })?,
+        )?,
+        Command::Related {
+            task_id,
+            status,
+            limit,
+        } => serde_json::to_value(
+            queue.related(
+                task_id,
+                &status
+                    .iter()
+                    .map(|status| status.as_str().to_owned())
+                    .collect::<Vec<_>>(),
+                usize::try_from(limit)?,
+            )?,
         )?,
         Command::Candidates => {
             let graph = dependency_graph(queue.graph_input()?, None);

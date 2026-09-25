@@ -386,6 +386,7 @@ pub mod plan_review;
 pub mod planner;
 pub mod proposal;
 pub mod reason;
+pub mod related;
 pub mod run;
 pub mod scope;
 pub mod search;
