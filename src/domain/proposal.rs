@@ -225,6 +225,43 @@ pub fn accept(mut proposal: Proposal, now: String) -> Result<Proposal, DomainErr
     Ok(proposal)
 }
 
+/// Plan review takes a submitted proposal it held (its job failed, or its
+/// concern was not answered with one of the options) again, as it is, in
+/// the order of this new submission.
+pub fn retry(mut proposal: Proposal, now: String) -> Result<Proposal, DomainError> {
+    require_status(&proposal, ProposalStatus::Submitted)?;
+    proposal.submitted_at = now.clone();
+    proposal.updated_at = now;
+    Ok(proposal)
+}
+
+/// A person answered the plan review's `approve_plan` ask with `cancel`
+/// (decision 11): the proposal ends with its tasks canceled.
+pub fn cancel(mut proposal: Proposal, now: String) -> Result<Proposal, DomainError> {
+    require_status(&proposal, ProposalStatus::Submitted)?;
+    proposal.status = ProposalStatus::Canceled;
+    proposal.updated_at = now;
+    Ok(proposal)
+}
+
+/// A proposal of its own for ready tasks plan review found have to change
+/// (decision 14): it starts out sent back, owned by the runtime's planner
+/// that will fix and submit it, with no revise counted against it.
+pub fn reopen(id: ProposalId, task_ids: Vec<TaskId>, now: String) -> Result<Proposal, DomainError> {
+    let mut proposal = Proposal::submit(
+        id,
+        PlannerOwner {
+            origin: PlannerOrigin::Runtime,
+            workspace_id: None,
+        },
+        task_ids,
+        Vec::new(),
+        now,
+    )?;
+    proposal.status = ProposalStatus::Revising;
+    Ok(proposal)
+}
+
 /// Plan review sent the proposal back to its planner (decision 11): its
 /// tasks return to draft until the planner submits it again.
 pub fn send_back(mut proposal: Proposal, now: String) -> Result<Proposal, DomainError> {
@@ -400,6 +437,24 @@ mod tests {
             .unwrap_err(),
             DomainError::EmptyProposal
         );
+    }
+
+    #[test]
+    fn a_person_cancels_a_submitted_proposal_and_a_reopened_one_starts_sent_back() {
+        let retried = retry(submitted(), "t9".into()).unwrap();
+        assert_eq!(retried.submitted_at(), "t9");
+        assert_eq!(retried.status(), ProposalStatus::Submitted);
+        assert!(retry(accept(submitted(), "t1".into()).unwrap(), "t2".into()).is_err());
+        let canceled = cancel(submitted(), "t1".into()).unwrap();
+        assert_eq!(canceled.status(), ProposalStatus::Canceled);
+        assert!(cancel(canceled, "t2".into()).is_err());
+        let reopened = reopen(ProposalId::new(7), vec![TaskId::new(4)], "t3".into()).unwrap();
+        assert_eq!(reopened.status(), ProposalStatus::Revising);
+        assert_eq!(reopened.revise_count(), 0);
+        assert_eq!(reopened.owner().origin, PlannerOrigin::Runtime);
+        assert_eq!(reopened.owner().workspace_id, None);
+        assert_eq!(reopened.task_ids(), [TaskId::new(4)]);
+        assert!(reopen(ProposalId::new(7), Vec::new(), "t3".into()).is_err());
     }
 
     #[test]

@@ -361,6 +361,17 @@ enum Command {
         /// Also run the daily observation of the last 24 hours once a day.
         #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
         observe_daily: bool,
+        /// Maximum number of planners the runtime opens at once for proposals plan review sent
+        /// back (apart from --parallel; planners a person opened do not count).
+        #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u16).range(1..))]
+        runtime_planners: u16,
+        /// Seconds a planner may take to submit a proposal sent back to it before the inbox is
+        /// told.
+        #[arg(long, default_value_t = 3600)]
+        planner_timeout: u64,
+        /// Claude Code plugin directory the planners the runtime opens load.
+        #[arg(long)]
+        plugin_dir: Option<PathBuf>,
     },
     /// Run the observer job once: headless Claude under DAGQ_ROLE=observer reads stats past the
     /// cursor, the latest notes, the open asks and the graph, and writes notes, blocked asks and
@@ -1257,6 +1268,9 @@ fn execute(cli: Cli) -> Result<Value> {
             log_dir: _,
             observe_interval,
             observe_daily,
+            runtime_planners,
+            planner_timeout,
+            plugin_dir,
         } => {
             use dagq::compose::SuperviseOptions;
             use dagq::infrastructure::adapters::{Cmux, executable};
@@ -1270,6 +1284,9 @@ fn execute(cli: Cli) -> Result<Value> {
                 })),
                 observe_daily,
                 generators,
+                runtime_planners: usize::from(runtime_planners),
+                planner_timeout: Duration::from_secs(planner_timeout),
+                plugin_dir,
                 ..SuperviseOptions::new(usize::from(parallel), once)
             };
             dagq::compose::supervise(

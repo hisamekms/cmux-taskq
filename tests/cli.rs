@@ -2275,7 +2275,8 @@ fn migrate_is_explicit_and_older_binaries_keep_working_within_the_floor() {
         serde_json::json!([
             {"version": 24, "compatible": false},
             {"version": 25, "compatible": false},
-            {"version": 26, "compatible": true}
+            {"version": 26, "compatible": true},
+            {"version": 27, "compatible": false}
         ])
     );
     assert_eq!(version(), 23);

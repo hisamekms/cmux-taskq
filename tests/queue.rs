@@ -720,7 +720,7 @@ fn opening_or_initializing_an_older_queue_never_migrates_it() {
             .iter()
             .map(|m| (m.version, m.compatible))
             .collect::<Vec<_>>(),
-        vec![(24, false), (25, false), (26, true)]
+        vec![(24, false), (25, false), (26, true), (27, false)]
     );
     let raw = Connection::open(&path).unwrap();
     assert_eq!(
@@ -733,7 +733,7 @@ fn opening_or_initializing_an_older_queue_never_migrates_it() {
     std::fs::write(dir.path().join("backups/queue-23-5.sqlite3"), "earlier").unwrap();
     let report = SqliteQueue::migrate(&path, Some(&|_| false), 5).unwrap();
     assert_eq!(report.floor, floor_for(SqliteQueue::SCHEMA_VERSION));
-    assert_eq!(report.applied.len(), 3);
+    assert_eq!(report.applied.len(), 4);
     let backup = report.backup.unwrap();
     assert!(
         backup.ends_with("backups/queue-23-5-1.sqlite3"),
@@ -768,7 +768,7 @@ fn a_breaking_migration_waits_for_an_idle_queue() {
         .unwrap()
         .to_string();
     assert!(
-        error.contains("breaking migration(s) 24")
+        error.contains("breaking migration(s) 24, 25, 27")
             && error.contains("supervisor live (pid 101)")
             && !error.contains("dead")
             && error.contains("run run-live (running)")
@@ -1256,9 +1256,10 @@ fn migration_from_v6_adds_goals_and_keeps_tasks_runs_and_events() {
     // (goal dependencies), 0020 (task priority), 0021 (proposals) and 0022
     // (follow-up triage: task leases, follow_up_depth, the follow_up ask),
     // 0023 (planner sessions), 0024 (the schema floor), 0025 (the stalled
-    // ask) and 0026 (the search index) are applied together.
-    assert_eq!(SqliteQueue::SCHEMA_VERSION, 26);
-    assert_eq!(queue.schema_version().unwrap(), 26);
+    // ask), 0026 (the search index) and 0027 (plan review) are applied
+    // together.
+    assert_eq!(SqliteQueue::SCHEMA_VERSION, 27);
+    assert_eq!(queue.schema_version().unwrap(), 27);
     assert_eq!(
         queue
             .session_workspace(dagq::domain::SessionRole::Inbox)
@@ -2920,11 +2921,12 @@ fn migration_indexes_the_existing_rows_and_landings_record_their_message() {
             .iter()
             .map(|m| (m.version, m.compatible))
             .collect::<Vec<_>>(),
-        [(26, true)]
+        [(26, true), (27, false)]
     );
-    // A compatible migration alone takes no copy and keeps the floor.
-    assert!(report.backup.is_none());
-    assert_eq!(report.floor, 25);
+    // 0027 (plan review) is applied with it and is breaking: a copy is
+    // taken and the floor rises to it.
+    assert!(report.backup.is_some());
+    assert_eq!(report.floor, 27);
     let mut queue = SqliteQueue::open(&path).unwrap();
     assert_eq!(
         search(&queue, "古い", |_| {}),

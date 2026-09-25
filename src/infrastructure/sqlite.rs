@@ -1642,7 +1642,7 @@ pub(super) fn read_task(conn: &Connection, task_id: TaskId) -> Result<Task> {
         .with_context(|| format!("task {task_id} does not exist"))
 }
 
-fn insert_dependency(
+pub(super) fn insert_dependency(
     conn: &Connection,
     task_id: TaskId,
     predecessor_id: TaskId,

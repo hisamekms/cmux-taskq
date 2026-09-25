@@ -45,7 +45,10 @@ use crate::{
             path_text,
         },
         clock,
-        location::{QueueLocation, REPOSITORY_FILE_NAME, data_home, planners_dir, runs_dir},
+        location::{
+            QueueLocation, REPOSITORY_FILE_NAME, data_home, plan_reviews_dir, planners_dir,
+            runs_dir,
+        },
         process::LocalSpawner,
         run_env::{ShellVerifier, load_stall_config},
         run_files::LocalRunFiles,
@@ -58,6 +61,9 @@ const IDLE_POLL: Duration = Duration::from_secs(2);
 const TICK: Duration = Duration::from_secs(1);
 /// How often the supervisor sweeps the workspaces of ended runs.
 const SWEEP_INTERVAL: Duration = Duration::from_secs(60);
+/// The default planner timeout: an hour, like a run's resume timeout
+/// (ADR-0041 decision 13).
+pub const PLANNER_TIMEOUT: Duration = Duration::from_secs(3600);
 
 /// How the supervisor loop is driven. `stop` is the graceful drain switch
 /// (SIGINT in the CLI): no more claims, exit once every active run rests.
@@ -88,6 +94,14 @@ pub struct SuperviseOptions {
     /// from the `dagq.toml` of the repository's main checkout (ADR-0043
     /// decision 4). Tests set them.
     pub stall: Option<StallConfig>,
+    /// Upper bound on the planners the runtime has open at once (ADR-0041
+    /// decision 12); a person's planners do not count.
+    pub runtime_planners: usize,
+    /// How long a planner may take to submit a proposal sent back to it
+    /// before the inbox is told (ADR-0041 decision 13).
+    pub planner_timeout: Duration,
+    /// The plugin directory the planners the runtime opens load.
+    pub plugin_dir: Option<PathBuf>,
 }
 
 impl SuperviseOptions {
@@ -103,6 +117,9 @@ impl SuperviseOptions {
             sweep_interval: SWEEP_INTERVAL,
             generators: clock::system(),
             stall: None,
+            runtime_planners: 1,
+            planner_timeout: PLANNER_TIMEOUT,
+            plugin_dir: None,
         }
     }
 
@@ -117,6 +134,8 @@ impl SuperviseOptions {
             idle_poll: self.idle_poll,
             sweep_interval: self.sweep_interval,
             stall,
+            runtime_planners: self.runtime_planners,
+            planner_timeout: self.planner_timeout,
         }
     }
 }
@@ -175,6 +194,16 @@ pub fn supervise_with_reviewer(
             (QUEUE_ENV.to_owned(), path_text(&db)?),
         ],
         observer_env_remove: vec![ROLE_ENV.to_owned()],
+        planners_dir: planners_dir(&db),
+        plugin_dir: options
+            .plugin_dir
+            .as_deref()
+            .map(|dir| {
+                dir.canonicalize()
+                    .with_context(|| format!("plugin directory {}", dir.display()))
+            })
+            .transpose()?,
+        plan_reviews_dir: plan_reviews_dir(&db),
         db: db.clone(),
     };
     let agent = ClaudeCode {

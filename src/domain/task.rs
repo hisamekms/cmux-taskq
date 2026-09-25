@@ -28,6 +28,9 @@ pub enum TaskAction {
     Approve,
     /// `ready --bypass-review`: a person skips plan review.
     BypassReview,
+    /// Plan review found that a ready task has to change (ADR-0041
+    /// decision 14): it goes back to submitted, out of the claim.
+    Reopen,
 }
 
 impl TaskStatus {
@@ -37,6 +40,7 @@ impl TaskStatus {
     pub fn transition(self, action: TaskAction, unfinished_run: bool) -> Result<Self, DomainError> {
         match (self, action) {
             (Self::Draft, TaskAction::Submit) => Ok(Self::Submitted),
+            (Self::Ready, TaskAction::Reopen) => Ok(Self::Submitted),
             (Self::Submitted, TaskAction::Approve)
             | (Self::Draft | Self::Submitted, TaskAction::BypassReview) => Ok(Self::Ready),
             (Self::Draft | Self::Submitted, TaskAction::Ready) => {
@@ -600,7 +604,15 @@ mod tests {
             "cannot apply Submit to task in submitted state"
         );
         let ready = Task::restore(record(TaskStatus::Ready)).unwrap();
-        assert!(transition(ready, TaskAction::Submit, false).is_err());
+        assert!(transition(ready.clone(), TaskAction::Submit, false).is_err());
+        // Plan review takes a ready task back to submitted to change it.
+        assert_eq!(
+            transition(ready, TaskAction::Reopen, false)
+                .unwrap()
+                .status(),
+            TaskStatus::Submitted
+        );
+        assert!(transition(draft(), TaskAction::Reopen, false).is_err());
         // Nothing claims a submitted task.
         let waiting = Task::restore(record(TaskStatus::Submitted)).unwrap();
         assert!(claim(waiting.clone()).is_err());

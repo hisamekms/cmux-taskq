@@ -18,10 +18,10 @@ use crate::domain::{
     Ask, AskId, AskKind, AskOutcome, ClaimOutcome, CommitSha, EventId, EvidenceCheck,
     FollowUpAction, FollowUpVerdict, Goal, GoalDetail, GoalEdit, GoalId, GoalPredecessor,
     GoalSummary, GoalVerdict, LintInput, NewAsk, NewGoal, NewNote, NewTask, NotePage, NoteQuery,
-    PlannerId, PlannerOrigin, PlannerSession, Predecessor, Priority, Proposal, ProposalId, Reason,
-    ReasonCode, RunEvent, RunId, RunLease, RunPlan, RunProcess, RunStatus, SessionRole, Submission,
-    SupervisorMode, SupervisorRegistration, Task, TaskAction, TaskDetail, TaskEdit, TaskId,
-    TaskRun,
+    PlanReviewCandidate, PlanReviewDecision, PlanReviewVerdict, PlannerId, PlannerOrigin,
+    PlannerSession, Predecessor, Priority, Proposal, ProposalId, Reason, ReasonCode, RunEvent,
+    RunId, RunLease, RunPlan, RunProcess, RunStatus, SessionRole, Submission, SupervisorMode,
+    SupervisorRegistration, Task, TaskAction, TaskDetail, TaskEdit, TaskId, TaskRun,
 };
 
 pub trait TaskStore {
@@ -1155,10 +1155,178 @@ pub trait FollowUpStore {
     fn set_follow_up_depth(&mut self, task: TaskId, depth: i64) -> Result<()>;
 }
 
-/// The queue a use case works on: its tasks and goals, its runs and its asks.
-pub trait Queue: TaskStore + RunStore + AskStore + FollowUpStore {}
+/// A plan review job the queue recorded (ADR-0041 decision 11): the
+/// proposal it reviews, its attempt at that proposal, the first task of the
+/// proposal (where its events are recorded) and its directory.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PlanReviewJob {
+    pub id: i64,
+    pub proposal_id: ProposalId,
+    pub attempt: usize,
+    pub anchor: TaskId,
+    pub dir: PathBuf,
+}
 
-impl<T: TaskStore + RunStore + AskStore + FollowUpStore + ?Sized> Queue for T {}
+/// What the runtime makes of a plan review's verdict before it is applied:
+/// the decision it acts on (a `revise` past [`crate::domain::MAX_PLAN_REVISES`]
+/// is a `concern`, `overridden` saying why), the reasons a revise carries to
+/// the planner (the verdict's, then the precedents it named), and the
+/// `approve_plan` ask a concern opens.
+#[derive(Debug, Clone)]
+pub struct PlanReviewApply {
+    pub verdict: PlanReviewVerdict,
+    pub decision: PlanReviewDecision,
+    pub overridden: Option<String>,
+    pub revise_reasons: Vec<String>,
+    pub ask: Option<NewAsk>,
+    pub duration_secs: u64,
+}
+
+/// A ready task a verdict took back to submitted, with the proposal of its
+/// own a planner fixes it in (ADR-0041 decision 14).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ReopenedTask {
+    pub task_id: TaskId,
+    pub proposal_id: ProposalId,
+}
+
+/// What applying a verdict did. `stale`: nothing, because the job's row or
+/// its proposal moved on meanwhile (the job is finished as `interrupted`).
+#[derive(Debug, Clone, Default)]
+pub struct PlanReviewApplied {
+    pub stale: bool,
+    pub reopened: Vec<ReopenedTask>,
+    /// The `approve_plan` ask a concern opened; `created: false` when an
+    /// open one already stood.
+    pub ask: Option<AskOutcome>,
+}
+
+/// A proposal sent back to its planner (`revising`), with where its revise
+/// stands: the reasons, when and to which planner they went (`None`: the
+/// supervisor still has to deliver them), and when the inbox was told the
+/// planner did not answer.
+#[derive(Debug, Clone)]
+pub struct RevisingProposal {
+    pub proposal: Proposal,
+    pub reasons: Vec<String>,
+    /// Since when the revise waits (Unix seconds).
+    pub revised_at: Option<i64>,
+    pub sent_at: Option<i64>,
+    pub planner_id: Option<PlannerId>,
+    pub unresponsive_at: Option<i64>,
+}
+
+/// A proposal that waits for a person outside an ask: its plan review
+/// failed (`plan_review_failed`), or its planner did not answer a revise
+/// (`planner_unresponsive`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlanReviewHold {
+    pub proposal_id: ProposalId,
+    pub anchor: TaskId,
+    pub kind: &'static str,
+    pub error: Option<String>,
+}
+
+/// What a person's `approve_plan` answer did to the proposal.
+#[derive(Debug, Clone)]
+pub struct PlanDecided {
+    pub proposal: Proposal,
+    pub answer: String,
+}
+
+/// Plan review (ADR-0041 decisions 11-15, 17): the submitted proposals it
+/// takes, its one job at a time, the verdicts and answers the runtime
+/// applies (each in one transaction), and the revises it delivers.
+pub trait PlanReviewStore {
+    /// Submitted proposals plan review may take now: not held, with a
+    /// submitted task, and whether one of those has the interrupt priority.
+    fn plan_review_candidates(&self) -> Result<Vec<PlanReviewCandidate>>;
+    /// Record the start of a plan review of `proposal` by `token`, in the
+    /// directory named by its row's ID under `plan_reviews_dir`
+    /// (`plan_review_started`). Rows of gone supervisors are finished as
+    /// `interrupted` first. `None`: another supervisor's job runs, or the
+    /// proposal is no longer a candidate.
+    fn begin_plan_review(
+        &mut self,
+        proposal: ProposalId,
+        token: &str,
+        plan_reviews_dir: &Path,
+    ) -> Result<Option<PlanReviewJob>>;
+    /// Apply what the runtime made of the verdict and finish the job
+    /// (`plan_review_finished`); an action the job may not take is an
+    /// error, and nothing is applied.
+    fn finish_plan_review(
+        &mut self,
+        job: &PlanReviewJob,
+        token: &str,
+        apply: &PlanReviewApply,
+    ) -> Result<PlanReviewApplied>;
+    /// Record the job's failure (`plan_review_failed`, the inbox's) and
+    /// hold the proposal as `failed`, unless the job moved on.
+    fn fail_plan_review(
+        &mut self,
+        job: &PlanReviewJob,
+        token: &str,
+        error: &str,
+        duration_secs: u64,
+    ) -> Result<()>;
+    /// Every proposal sent back to its planner, oldest first.
+    fn revising_proposals(&self) -> Result<Vec<RevisingProposal>>;
+    /// Claim the delivery of the revise of `proposal` (it records when):
+    /// `false` when another process claimed it, or it is no longer waiting.
+    fn claim_revise(&mut self, proposal: ProposalId) -> Result<bool>;
+    /// The claimed revise of `proposal` went to `planner`
+    /// (`plan_revise_sent`); `opened` when the runtime opened that planner
+    /// for it.
+    fn revise_sent(
+        &mut self,
+        proposal: ProposalId,
+        planner: PlannerId,
+        workspace: &str,
+        opened: bool,
+    ) -> Result<()>;
+    /// Take the revise of `proposal` back for another delivery: the
+    /// planner it went to is gone before it submitted again
+    /// (`plan_revise_lost`), or the delivery failed (`planner` `None`).
+    fn revise_lost(
+        &mut self,
+        proposal: ProposalId,
+        planner: Option<PlannerId>,
+        why: &str,
+    ) -> Result<()>;
+    /// No planner submitted the proposal again within the timeout
+    /// (`planner_unresponsive`, the inbox's), once per revise; `planner`
+    /// is `None` when none took the revise yet.
+    fn planner_unresponsive(
+        &mut self,
+        proposal: ProposalId,
+        planner: Option<PlannerId>,
+        waited_secs: i64,
+    ) -> Result<()>;
+    /// End the submitted proposals none of whose tasks waits for plan
+    /// review any more (a person readied them with the bypass or canceled
+    /// them): `accepted` when a task is left, `canceled` otherwise
+    /// (`proposal_settled`).
+    fn settle_proposals(&mut self) -> Result<Vec<(ProposalId, crate::domain::ProposalStatus)>>;
+    /// Answered `approve_plan` asks nobody closed, oldest first.
+    fn plan_answers(&self) -> Result<Vec<Ask>>;
+    /// Apply a person's answer to an `approve_plan` ask and close it.
+    /// `None` when the answer is not one the runtime applies (left to the
+    /// inbox), or the proposal no longer waits for it (the ask is closed).
+    fn decide_plan(&mut self, ask: AskId) -> Result<Option<PlanDecided>>;
+    /// Whether the supervisor applies the answer the `approve_plan` ask has.
+    fn applies_plan_answer(&self, ask: &Ask) -> Result<bool>;
+    /// The proposals held for a person outside an ask.
+    fn plan_review_holds(&self) -> Result<Vec<PlanReviewHold>>;
+    /// Asks a person answered, newest first, at most `limit`: the
+    /// precedents plan review may cite.
+    fn answered_asks(&self, limit: usize) -> Result<Vec<Ask>>;
+}
+
+/// The queue a use case works on: its tasks and goals, its runs and its asks.
+pub trait Queue: TaskStore + RunStore + AskStore + FollowUpStore + PlanReviewStore {}
+
+impl<T: TaskStore + RunStore + AskStore + FollowUpStore + PlanReviewStore + ?Sized> Queue for T {}
 
 /// The Git operations `integrate` and the supervisor use on the repository
 /// the queue is bound to and on its run worktrees. Commits are named by

@@ -20,6 +20,9 @@ pub const DATA_DIR_NAME: &str = "dagq";
 pub const DB_FILE_NAME: &str = "queue.db";
 pub const RUNS_DIR_NAME: &str = "runs";
 pub const PLANNERS_DIR_NAME: &str = "planners";
+/// The directory next to the database with one directory per plan review
+/// job (ADR-0041 decision 11), named by its row's ID.
+pub const PLAN_REVIEWS_DIR_NAME: &str = "plan-reviews";
 /// Supervisor logs (`supervisor-<started_at>-<pid>.log`, `launchd.log`).
 pub const LOGS_DIR_NAME: &str = "logs";
 /// LaunchAgent labels are `com.dagq.<queue hash>`.
@@ -161,6 +164,14 @@ pub fn planners_dir(db: &Path) -> PathBuf {
     QueueLocation::explicit(db)
         .queue_dir
         .join(PLANNERS_DIR_NAME)
+}
+
+/// `plan-reviews/` next to the database: the prompt and output of each
+/// plan review job.
+pub fn plan_reviews_dir(db: &Path) -> PathBuf {
+    QueueLocation::explicit(db)
+        .queue_dir
+        .join(PLAN_REVIEWS_DIR_NAME)
 }
 
 /// The canonical form of `path` when it exists, else of its nearest existing

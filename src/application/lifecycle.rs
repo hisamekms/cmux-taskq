@@ -886,16 +886,17 @@ pub fn supervise_command(
 }
 
 /// `<this binary> --db <db> supervise --parallel N --log-dir <queue logs>
-/// --cmux <resolved> --claude <resolved>`: what keeps a supervisor of this
-/// queue going, in either mode. The executables are absolute so neither
-/// launchd's PATH nor the terminal's decides which ones run.
+/// --cmux <resolved> --claude <resolved> [--plugin-dir <dir>]`: what keeps a
+/// supervisor of this queue going, in either mode. The executables are
+/// absolute so neither launchd's PATH nor the terminal's decides which ones
+/// run; the plugin directory is what the planners the runtime opens load.
 fn supervise_arguments(
     location: &QueuePaths,
     db: &Path,
     environment: &UpEnvironment,
     options: &UpOptions,
 ) -> Result<Vec<String>> {
-    Ok(vec![
+    let mut arguments = vec![
         path_text(&environment.current_exe)?,
         "--db".into(),
         path_text(db)?,
@@ -908,7 +909,14 @@ fn supervise_arguments(
         path_text(&options.cmux)?,
         "--claude".into(),
         path_text(&options.claude)?,
-    ])
+    ];
+    if let Some(dir) = &options.plugin_dir {
+        arguments.push("--plugin-dir".into());
+        arguments.push(path_text(
+            &dir.canonicalize().unwrap_or_else(|_| dir.clone()),
+        )?);
+    }
+    Ok(arguments)
 }
 
 fn fresh(registration: &SupervisorRegistration, processes: &dyn ProcessControl, now: i64) -> bool {

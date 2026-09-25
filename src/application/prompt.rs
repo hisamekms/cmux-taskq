@@ -12,14 +12,14 @@ use serde_json::Value;
 use std::path::{Path, PathBuf};
 
 use super::{
-    RunFiles, fenced,
+    RunFiles, TaskListItem, fenced,
     integrate::{integrate_logs, log_names},
     or_none, tail,
 };
 use crate::domain::{
-    CommitSha, Goal, GoalId, GoalPredecessor, MAX_RESUME_ATTEMPTS, MAX_REVISE_ATTEMPTS,
-    Predecessor, ProposalId, Receipt, RunStatus, TRIAGE_RETRY_FAILURES, Task, TaskDetail, TaskId,
-    TaskRun,
+    Ask, CommitSha, Goal, GoalId, GoalPredecessor, LintViolation, MAX_PLAN_REVISES,
+    MAX_RESUME_ATTEMPTS, MAX_REVISE_ATTEMPTS, Predecessor, Proposal, ProposalId, Receipt,
+    RunStatus, TRIAGE_RETRY_FAILURES, Task, TaskDetail, TaskId, TaskRun,
 };
 
 /// What the prompt says about one direct predecessor: the task, the squash
@@ -795,6 +795,204 @@ pub(crate) fn revise_request(
         "6. Do not merge or push. When done, report briefly and stop; do not run /exit.".to_owned(),
     );
     Ok(lines.join("\n"))
+}
+
+/// The tools the headless plan review may use beyond what needs no
+/// permission: reading only, like the triage.
+pub const PLAN_REVIEW_TOOLS: &[&str] = &["Read", "Grep", "Glob"];
+
+/// Characters of a precedent's question and answer the plan review prompt
+/// and the revise request quote.
+const PRECEDENT_CHARS: usize = 400;
+
+/// What the headless plan review reads (ADR-0041 decision 10): the
+/// proposal and its tasks, the goals they belong to, what `dagq lint`
+/// found, the other proposals not yet ready (oldest submission first), the
+/// ready and in-progress tasks, and the asks a person answered before.
+pub struct PlanReviewMaterial<'a> {
+    pub proposal: &'a Proposal,
+    pub tasks: &'a [TaskDetail],
+    pub goals: &'a [Goal],
+    pub lint: &'a [LintViolation],
+    /// Other submitted or revising proposals with their tasks.
+    pub others: &'a [(Proposal, Vec<Task>)],
+    /// Ready and in-progress tasks, with their long fields.
+    pub queued: &'a [TaskListItem],
+    /// Asks a person answered, newest first.
+    pub precedents: &'a [Ask],
+    pub repo_root: &'a Path,
+}
+
+/// One line quoting an answered ask as a precedent.
+pub fn precedent_line(ask: &Ask) -> String {
+    let cut = |text: &str| {
+        super::health::truncate(text, PRECEDENT_CHARS).unwrap_or_else(|| text.to_owned())
+    };
+    format!(
+        "precedent: ask {id}{task} ({kind}) asked: {question} — a person answered: {answer}",
+        id = ask.id,
+        task = ask
+            .task_id
+            .map(|task| format!(" about task {task}"))
+            .unwrap_or_default(),
+        kind = ask.kind.as_str(),
+        question = cut(&ask.question.replace('\n', " ")),
+        answer = cut(ask.answer.as_deref().unwrap_or("(none)")),
+    )
+}
+
+/// What the headless plan review is asked: the material, the checks, the
+/// fixes it may make itself and the verdict schema (ADR-0041 decisions 10,
+/// 11, 14, 15). The repository's own rules are not in the runtime: the job
+/// reads them from the repository's documents.
+pub fn plan_review_prompt(material: &PlanReviewMaterial<'_>) -> Result<String> {
+    let proposal = material.proposal;
+    let json_lines = |values: Vec<Value>| {
+        if values.is_empty() {
+            "(none)".to_owned()
+        } else {
+            fenced(
+                "json",
+                &values
+                    .iter()
+                    .map(Value::to_string)
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            )
+        }
+    };
+    let tasks = json_lines(
+        material
+            .tasks
+            .iter()
+            .map(|detail| {
+                let mut task = serde_json::to_value(&detail.task)?;
+                task["dependencies"] = serde_json::to_value(&detail.dependencies)?;
+                task["goal_dependencies"] = serde_json::to_value(&detail.goal_dependencies)?;
+                Ok(task)
+            })
+            .collect::<Result<_>>()?,
+    );
+    let goals = json_lines(
+        material
+            .goals
+            .iter()
+            .map(serde_json::to_value)
+            .collect::<serde_json::Result<_>>()?,
+    );
+    let lint = json_lines(
+        material
+            .lint
+            .iter()
+            .map(serde_json::to_value)
+            .collect::<serde_json::Result<_>>()?,
+    );
+    let others = if material.others.is_empty() {
+        "(none)".to_owned()
+    } else {
+        material
+            .others
+            .iter()
+            .map(|(other, tasks)| {
+                let earlier =
+                    (other.submitted_at(), other.id()) < (proposal.submitted_at(), proposal.id());
+                let tasks = tasks
+                    .iter()
+                    .map(|task| {
+                        serde_json::json!({
+                            "id": task.id(), "status": task.status(), "title": task.title(),
+                            "description": task.description(), "acceptance": task.acceptance(),
+                            "paths": task.paths(),
+                        })
+                        .to_string()
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                format!(
+                    "Proposal {} ({}, submitted {}, {} this one):\n{}",
+                    other.id(),
+                    other.status().as_str(),
+                    other.submitted_at(),
+                    if earlier { "before" } else { "after" },
+                    fenced("json", &tasks)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let queued = json_lines(
+        material
+            .queued
+            .iter()
+            .map(serde_json::to_value)
+            .collect::<serde_json::Result<_>>()?,
+    );
+    let precedents = if material.precedents.is_empty() {
+        "(none)".to_owned()
+    } else {
+        material
+            .precedents
+            .iter()
+            .map(|ask| format!("- {}", precedent_line(ask)))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    Ok(format!(
+        "You are the plan review of dagq proposal {id}: decide whether the queue may run its tasks as written, before they become ready.\n\
+         Read only. Do not change any file and do not run dagq commands that write.\n\n\
+         First read the repository's own rules in {repo}: AGENTS.md and CLAUDE.md, docs/adr/README.md (the ADR index) and the ADRs and design documents the tasks name. \
+         Apply what they say (the verification each kind of change needs, the declared paths, how ADR numbers are assigned, ...); the runtime has no such rules of its own.\n\n\
+         The proposal was submitted {submitted} and was sent back {revises} time(s) before (at most {max}; a revise past that goes to a person as a concern).\n\n\
+         Tasks of the proposal:\n{tasks}\n\n\
+         Goals they belong to (description, acceptance, constraints; constraints win over a task's description):\n{goals}\n\n\
+         The mechanical checks (`dagq lint`) found:\n{lint}\n\n\
+         Other proposals not ready yet:\n{others}\n\n\
+         Ready and in-progress tasks:\n{queued}\n\n\
+         Asks a person answered before (newest first):\n{precedents}\n\n\
+         Check the meaning of the plan:\n\
+         - a task that repeats another task (ready, in progress, in another proposal, or already landed on main);\n\
+         - a task whose change is already on main (read the source);\n\
+         - a contradiction with an ADR or with the goal's constraints;\n\
+         - an acceptance criterion that contradicts the task's own description or a sibling task's acceptance (for example a change of a type whose acceptance says a test file that uses the type is not changed);\n\
+         - tasks that change the same files without a dependency between them;\n\
+         - a contradiction with another proposal: with one submitted before this one, send this one back; with one submitted after, pass this one (the later one is checked against it);\n\
+         - a ready task that has to change for this proposal to hold: name it in reopen, and the runtime takes it out of the claim for a planner to fix; an in-progress task is never changed: send this proposal back asking for a task that fixes it after it lands and depends on it;\n\
+         - every finding of `dagq lint` is one to fix.\n\n\
+         Decide one verdict:\n\
+         - pass: the tasks may run as written, after the actions below.\n\
+         - revise: findings the planner can fix without a person's judgment (wording, acceptance, verification, paths, a split, a missing task or dependency). Each reason says what to change.\n\
+         - concern: findings that need a person's judgment: a doubtful duplicate, a change that looks already done, a contradiction with an ADR or the goal's constraints, a change of the plan's intent.\n\
+         When a finding is of the same kind as an answered ask above, put that ask's id in precedents and say in the reason how the person answered then.\n\n\
+         actions are the only changes you make yourself, and only with pass: add_dependency (a task of the proposal waits for another task), lower_priority (never raise one), cancel_duplicate (only an obvious duplicate; a doubtful one is a concern). Everything else is the planner's.\n\n\
+         Answer with one JSON object and nothing else, matching this schema:\n\
+         {{\"verdict\": \"pass\" | \"revise\" | \"concern\", \"reasons\": [string], \"summary\": string, \
+         \"actions\": [{{\"action\": \"add_dependency\", \"task_id\": int, \"depends_on\": int}} | {{\"action\": \"lower_priority\", \"task_id\": int, \"priority\": \"low\" | \"normal\" | \"high\" | \"urgent\"}} | {{\"action\": \"cancel_duplicate\", \"task_id\": int, \"duplicate_of\": int}}], \
+         \"reopen\": [{{\"task_id\": int, \"reason\": string}}], \"precedents\": [int]}}\n\
+         reasons lists each finding (empty for pass); summary is one or two sentences; actions, reopen and precedents may be empty.\n",
+        id = proposal.id(),
+        repo = material.repo_root.display(),
+        submitted = proposal.submitted_at(),
+        revises = proposal.revise_count(),
+        max = MAX_PLAN_REVISES,
+    ))
+}
+
+/// What the supervisor types into the live planner a revise goes back to
+/// (ADR-0041 decisions 12, 13).
+pub fn plan_revise_request(proposal: ProposalId, reasons: &[String]) -> String {
+    let reasons = if reasons.is_empty() {
+        "- (none given)".to_owned()
+    } else {
+        reasons
+            .iter()
+            .map(|reason| format!("- {reason}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    format!(
+        "Plan review sent proposal {proposal} back. Fix what these reasons point at:\n{reasons}\n\
+         Then submit it again with `dagq submit --proposal {proposal}`. A fix that changes the plan's intent (acceptance, scope, the relation to the goal) needs the person: ask them here first."
+    )
 }
 
 #[cfg(test)]

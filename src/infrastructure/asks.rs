@@ -96,6 +96,13 @@ impl SqliteQueue {
                 text.trim()
             )?);
         }
+        if ask.kind == AskKind::ApprovePlan {
+            // The supervisor readies, sends back or cancels the proposal as
+            // answered (ADR-0041 decision 11); any other answer, or one for
+            // a proposal that moved on, is a person's to read.
+            payload["runtime_delivers"] =
+                json!(super::plan_reviews::plan_answer_applies(&tx, &ask, text)?);
+        }
         ask_event(
             &tx,
             ask.task_id,

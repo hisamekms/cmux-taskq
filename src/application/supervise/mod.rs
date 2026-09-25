@@ -76,6 +76,7 @@ mod exit;
 mod idle;
 mod jobs;
 mod landing;
+mod plan_review;
 mod resume;
 mod revise;
 mod session;
@@ -133,6 +134,13 @@ pub struct LoopSettings {
     /// The thresholds of the stalled-session checks (ADR-0043 decision 4),
     /// recorded as `stall_config_loaded` when the loop starts.
     pub stall: StallConfig,
+    /// Upper bound on the planners the runtime has open at once (ADR-0041
+    /// decision 12), apart from the run slots; planners a person opened
+    /// do not count.
+    pub runtime_planners: usize,
+    /// How long a planner a revise went to may take to submit its proposal
+    /// again before the inbox is told (ADR-0041 decision 13).
+    pub planner_timeout: Duration,
 }
 
 /// Where the supervisor works and what it starts: the queue database and
@@ -166,6 +174,12 @@ pub struct Layout {
     pub job_env: Vec<(String, String)>,
     /// Variables the observer's process does not inherit (its role).
     pub observer_env_remove: Vec<String>,
+    /// `planners/` of the queue, where the planners the runtime opens keep
+    /// their files, and the plugin directory they load.
+    pub planners_dir: PathBuf,
+    pub plugin_dir: Option<PathBuf>,
+    /// `plan-reviews/` of the queue: one directory per plan review job.
+    pub plan_reviews_dir: PathBuf,
 }
 
 /// The ports the supervisor works through, and where it works.
@@ -334,6 +348,8 @@ pub fn supervise(ports: &Ports<'_>, settings: &LoopSettings) -> Result<Value> {
         triaged: Vec::new(),
         generators: ports.generators.clone(),
         stall: settings.stall,
+        plan_review: None,
+        planner_exits: Vec::new(),
     };
     let result = supervisor.run_loop(settings);
     match &result {
@@ -388,6 +404,11 @@ struct Supervisor<'a> {
     generators: Generators,
     /// The thresholds of the stalled-session checks (ADR-0043 decision 4).
     stall: StallConfig,
+    /// The plan review job running now (ADR-0041 decision 11): one at a
+    /// time, queue-wide, outside the run slots.
+    plan_review: Option<plan_review::PlanReviewWatch>,
+    /// The runtime's planners this process asked to `/exit`, and when.
+    planner_exits: Vec<(crate::domain::PlannerId, Instant)>,
 }
 
 /// One executing run between provisioning and rest.
@@ -506,21 +527,22 @@ impl Supervisor<'_> {
                 self.fill_slots(options.parallel, options.sweep_interval)?;
             }
             self.poll_observer();
-            // A supervisor that stopped claiming is draining, not observing.
+            // A supervisor that stopped claiming is draining, not observing
+            // nor starting plan reviews.
             if !stopping && self.claiming {
                 self.start_observer_when_due(options);
             }
+            // A plan review that just readied tasks is followed by one more
+            // pass, which claims them.
+            let progressed = self.plan_review_pass(options, !stopping && self.claiming);
             if self.slots.is_empty() {
-                // A running observer is waited for like a run: it is short
-                // and bounded by its own timeout.
-                if self.observer.is_none() && (options.once || stopping || !self.claiming) {
+                // A running observer or plan review is waited for like a
+                // run: it is short and bounded by its own timeout.
+                let job = self.observer.is_some() || self.plan_review.is_some();
+                if !job && !progressed && (options.once || stopping || !self.claiming) {
                     break;
                 }
-                thread::sleep(if self.observer.is_some() {
-                    options.tick
-                } else {
-                    options.idle_poll
-                });
+                thread::sleep(if job { options.tick } else { options.idle_poll });
                 continue;
             }
             self.tick();

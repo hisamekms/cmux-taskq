@@ -3,7 +3,7 @@
 //! `proposal_id`. Submitting moves the member drafts to `submitted`; the
 //! plan-review path ([`approve`]) is what makes them `ready`, and a send
 //! back returns them to `draft` for the planner.
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, OptionalExtension, Row, params};
 use serde_json::json;
 
@@ -22,10 +22,35 @@ pub(super) fn submit(conn: &Connection, submission: Submission, now: &str) -> Re
     submission.validate()?;
     let target = submission.proposal;
     let existing = target.map(|id| read(conn, id)).transpose()?;
-    // Only a proposal plan review sent back is submitted again.
+    // Only a proposal plan review sent back is submitted again, or one it
+    // holds for a person (a failed job, a concern), which goes again as it
+    // is.
     if let Some(existing) = &existing
         && existing.status() != ProposalStatus::Revising
     {
+        if existing.status() == ProposalStatus::Submitted && held(conn, existing.id())? {
+            ensure!(
+                submission.tasks.is_empty() && submission.goals.is_empty(),
+                "proposal {} waits for plan review as it is; it takes no new task or goal",
+                existing.id()
+            );
+            let retried = proposal::retry(existing.clone(), now.into())?;
+            save(conn, &retried)?;
+            conn.execute(
+                "UPDATE proposals SET review_hold=NULL WHERE id=?1",
+                [retried.id()],
+            )?;
+            for &task_id in retried.task_ids().iter().take(1) {
+                event(
+                    conn,
+                    task_id,
+                    None,
+                    "proposal_resubmitted",
+                    json!({"proposal_id": retried.id()}),
+                )?;
+            }
+            return read(conn, retried.id());
+        }
         return Err(DomainError::ProposalNotInStatus {
             proposal_id: existing.id(),
             status: existing.status(),
@@ -37,9 +62,12 @@ pub(super) fn submit(conn: &Connection, submission: Submission, now: &str) -> Re
     let mut tasks = submission.tasks;
     if let Some(existing) = &existing {
         goals.extend_from_slice(existing.goal_ids());
+        // A ready task plan review reopened into this proposal waits in
+        // `submitted` (ADR-0041 decision 14) and goes again as it is.
         tasks.extend(ids::<TaskId>(
             conn,
-            "SELECT id FROM tasks WHERE proposal_id=?1 AND status='draft' ORDER BY id",
+            "SELECT id FROM tasks WHERE proposal_id=?1 AND status IN ('draft','submitted')
+             ORDER BY id",
             existing.id().as_i64(),
         )?);
     }
@@ -86,7 +114,16 @@ pub(super) fn submit(conn: &Connection, submission: Submission, now: &str) -> Re
     };
     save(conn, &submitted)?;
     let id = submitted.id();
+    // A submission starts plan review afresh: no hold, no revise pending.
+    conn.execute(
+        "UPDATE proposals SET review_hold=NULL, revise_reasons=NULL, revise_sent_at=NULL,
+             revise_planner_id=NULL, unresponsive_at=NULL WHERE id=?1",
+        [id],
+    )?;
     for &task_id in &tasks {
+        if status(conn, task_id)? == TaskStatus::Submitted {
+            continue;
+        }
         transition_task(conn, task_id, TaskAction::Submit, now)?;
         conn.execute(
             "UPDATE tasks SET proposal_id=?1 WHERE id=?2",
@@ -209,7 +246,7 @@ fn record_row(row: &Row<'_>) -> rusqlite::Result<ProposalRecord> {
 
 /// Insert or update the proposal row; members are the tasks' and goals'
 /// `proposal_id`, written by the caller.
-fn save(conn: &Connection, proposal: &Proposal) -> Result<()> {
+pub(super) fn save(conn: &Connection, proposal: &Proposal) -> Result<()> {
     conn.execute(
         "INSERT INTO proposals(id, status, owner_origin, owner_workspace_id, submitted_at,
                                revise_count, created_at, updated_at)
@@ -248,6 +285,15 @@ fn membership(
             |row| Ok((row.get(0)?, enum_col(row, "status")?)),
         )
         .optional()?)
+}
+
+/// Whether plan review holds the proposal for a person.
+fn held(conn: &Connection, id: ProposalId) -> Result<bool> {
+    Ok(conn.query_row(
+        "SELECT review_hold IS NOT NULL FROM proposals WHERE id=?1",
+        [id],
+        |r| r.get(0),
+    )?)
 }
 
 fn status(conn: &Connection, task_id: TaskId) -> Result<TaskStatus> {

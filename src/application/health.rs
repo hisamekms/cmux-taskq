@@ -625,6 +625,26 @@ pub fn attention(
             next,
         });
     }
+    // A proposal whose plan review failed, or whose planner did not answer
+    // a revise, waits for a person outside any ask (ADR-0041 decisions 13,
+    // 17); it is shown on the proposal's first task.
+    for hold in queue.plan_review_holds()? {
+        let (status, next) = match hold.kind {
+            "plan_review_failed" => ("submitted", AttentionNext::PlanReviewByHand),
+            _ => ("revising", AttentionNext::CheckPlanner),
+        };
+        attention.push(Attention {
+            run_id: None,
+            task_id: Some(hold.anchor),
+            pid: None,
+            ask_id: None,
+            status: status.into(),
+            kind: hold.kind.into(),
+            last_error: hold.error.as_deref().map(truncate_reason),
+            last_error_code: hold.error.as_ref().map(|_| ReasonCode::JobFailed),
+            next,
+        });
+    }
     for ask in queue.asks(AskQuery::default())? {
         let (status, kind, next) = if ask.is_open() {
             (
@@ -682,6 +702,14 @@ pub fn attention(
                 .is_some_and(|answer| TRIAGE_OPTIONS.contains(&answer.trim()))
         {
             // The supervisor retries, resumes or cancels the triaged run.
+            (
+                "answered",
+                "ask_answered",
+                AttentionNext::ApplyingAnswer { ask_id: ask.id },
+            )
+        } else if ask.kind == AskKind::ApprovePlan && queue.applies_plan_answer(&ask)? {
+            // The supervisor readies, sends back or cancels the proposal
+            // (ADR-0041 decision 11).
             (
                 "answered",
                 "ask_answered",

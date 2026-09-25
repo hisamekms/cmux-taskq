@@ -585,6 +585,14 @@ fn up_starts_the_agent_and_the_sessions_once_and_reuses_them_after() {
             .join(format!("{label}.plist"))
     );
     let db = fixture.location.db.canonicalize().unwrap();
+    // The planners the runtime opens load the plugin `up` was given.
+    let plugin_dir = fixture
+        .options
+        .plugin_dir
+        .as_ref()
+        .unwrap()
+        .canonicalize()
+        .unwrap();
     let string = |text: &str| format!("<string>{text}</string>");
     assert!(contents.contains(&format!("<key>Label</key>\n\t{}", string(label))));
     let arguments = [
@@ -600,6 +608,8 @@ fn up_starts_the_agent_and_the_sessions_once_and_reuses_them_after() {
         fixture.options.cmux.to_str().unwrap(),
         "--claude",
         fixture.options.claude.to_str().unwrap(),
+        "--plugin-dir",
+        plugin_dir.to_str().unwrap(),
     ]
     .iter()
     .map(|argument| format!("\t\t{}\n", string(argument)))
@@ -1928,11 +1938,20 @@ fn up_in_cmux_starts_the_supervisor_in_a_workspace_and_leaves_launchd_alone() {
     assert_eq!(
         command,
         &format!(
-            "'/opt/bin/dagq' '--db' {} 'supervise' '--parallel' '2' '--log-dir' {} '--cmux' {} '--claude' {}",
+            "'/opt/bin/dagq' '--db' {} 'supervise' '--parallel' '2' '--log-dir' {} '--cmux' {} '--claude' {} '--plugin-dir' {}",
             quoted(&db),
             quoted(&fixture.location.log_dir),
             quoted(&fixture.options.cmux),
             quoted(&fixture.options.claude),
+            quoted(
+                &fixture
+                    .options
+                    .plugin_dir
+                    .as_ref()
+                    .unwrap()
+                    .canonicalize()
+                    .unwrap()
+            ),
         )
     );
     // The fixture's queue directory has an apostrophe: cmux types this

@@ -123,6 +123,10 @@ string_enum!(AskKind {
     // (ADR-0043 decision 1): the supervisor asks the inbox whether to wait
     // or step in, and closes the ask itself once the session moves on.
     Stalled => "stalled",
+    // A plan review that needs a person (ADR-0041 decision 11): a `concern`,
+    // or a proposal sent back too often. It belongs to the first task of
+    // the proposal and no run, and the supervisor applies its answer.
+    ApprovePlan => "approve_plan",
 });
 
 // Where a proposal (ADR-0041 decision 7) stands: `submitted` waits for plan
@@ -371,6 +375,7 @@ pub mod goal;
 pub mod ids;
 mod input;
 pub mod lint;
+pub mod plan_review;
 pub mod planner;
 pub mod proposal;
 pub mod reason;
@@ -391,6 +396,10 @@ pub use goal::Goal;
 pub use ids::{AskId, CommitSha, EventId, GoalId, PlannerId, ProposalId, RunId, TaskId};
 pub use input::{GoalEdit, GoalRecord, NewGoal, NewTask, RunPlan, RunRecord, TaskEdit, TaskRecord};
 pub use lint::{LintCode, LintInput, LintNode, LintViolation};
+pub use plan_review::{
+    MAX_PLAN_REVISES, PLAN_OPTIONS, PLAN_REVIEW_ASKER, PlanAnswer, PlanReviewAction,
+    PlanReviewCandidate, PlanReviewDecision, PlanReviewVerdict, Reopen, next_to_review,
+};
 pub use planner::{IdleProbe, PlannerProbe, PlannerSession};
 pub use proposal::{PlannerOwner, Proposal, ProposalRecord, Submission};
 pub use reason::{Reason, ReasonCode};
@@ -831,6 +840,14 @@ pub enum AttentionNext {
     /// The headless triage failed (`triage_failed`): a person decides
     /// whether to `ready` the task again, resume or cancel.
     TriageByHand,
+    /// The headless plan review of a proposal failed
+    /// (`plan_review_failed`): a person readies its tasks with the bypass
+    /// or has a planner fix and submit them again (ADR-0041 decision 17).
+    PlanReviewByHand,
+    /// The planner a revise went to did not submit its proposal again
+    /// within the planner timeout (`planner_unresponsive`, ADR-0041
+    /// decision 13): a person looks at its workspace.
+    CheckPlanner,
 }
 
 /// How many times the supervisor resumes one `needs_session` run (one
@@ -865,6 +882,8 @@ impl fmt::Display for AttentionNext {
             }
             Self::Triaging => f.write_str("triaging (runtime)"),
             Self::TriageByHand => f.write_str("triage by hand"),
+            Self::PlanReviewByHand => f.write_str("plan review by hand"),
+            Self::CheckPlanner => f.write_str("check the planner"),
         }
     }
 }
@@ -889,6 +908,8 @@ pub const ATTENTION_KINDS: &[&str] = &[
     "resume_finished",
     "review_failed",
     "triage_failed",
+    "plan_review_failed",
+    "planner_unresponsive",
     "ask_opened",
     "ask_answered",
     "ask_delivery_failed",
@@ -954,6 +975,11 @@ pub fn event_attention(kind: &str, payload: &serde_json::Value) -> Option<Attent
         // The supervisor triages a failed run and acts on the verdict
         // (ADR-0024 decision 3); only a triage that failed is a person's.
         ("triage_failed", _) => Some(AttentionNext::TriageByHand),
+        // The supervisor reviews a submitted proposal and acts on the
+        // verdict (ADR-0041 decision 11); only a plan review that failed
+        // and a planner that did not answer a revise are a person's.
+        ("plan_review_failed", _) => Some(AttentionNext::PlanReviewByHand),
+        ("planner_unresponsive", _) => Some(AttentionNext::CheckPlanner),
         ("push_failed", _) => Some(AttentionNext::PushMain),
         ("runtime_error", _)
             if payload.get("lease_released") == Some(&serde_json::Value::Bool(true)) =>
@@ -981,13 +1007,15 @@ pub fn event_attention(kind: &str, payload: &serde_json::Value) -> Option<Attent
             }
         }
         // An answer the supervisor applies itself: an `approve_landing` one,
-        // a triage's `decide` one, or a follow-up triage's `follow_up` one.
+        // a triage's `decide` one, a follow-up triage's `follow_up` one, or
+        // a plan review's `approve_plan` one.
         ("ask_answered", _)
             if matches!(
                 payload.get("kind").and_then(serde_json::Value::as_str),
                 Some(kind) if kind == AskKind::ApproveLanding.as_str()
                     || kind == AskKind::Decide.as_str()
                     || kind == AskKind::FollowUp.as_str()
+                    || kind == AskKind::ApprovePlan.as_str()
             ) && payload.get("runtime_delivers") == Some(&serde_json::Value::Bool(true)) =>
         {
             None
