@@ -270,7 +270,7 @@ impl Supervisor<'_> {
             }, verdict.reason, triaged.status().as_str());
         // The verdict is acted on: what fails from here on is logged, not
         // a failed triage.
-        if let Err(error) = self.close_triaged_workspaces(&triaged) {
+        if let Err(error) = self.close_open_workspaces(&triaged, WorkspaceCloser::Triage) {
             warn!(run_id = %run.id(), error = %format_args!("{error:#}"), "run {}: its workspaces could not all be closed: {error:#}", run.id());
         }
         if let Err(error) = self.queue.release_lease(run.id(), &self.token) {
@@ -331,68 +331,6 @@ impl Supervisor<'_> {
             .as_i64()
             .map(AskId::new)
             .context("ask returned no id")
-    }
-    /// Close the workspaces a triaged run left open: its worker workspace
-    /// (unless the runtime closed it) and the resume workspaces its
-    /// `resume_finished` events name as not closed, each only while cmux
-    /// still lists it. A close records `workspace_closed` (`by: triage`); a
-    /// cmux failure records `cleanup_failed` and the others go on. A
-    /// `stuck_exit` ask of the run is closed with its workspace.
-    pub(super) fn close_triaged_workspaces(&mut self, run: &TaskRun) -> Result<()> {
-        let mut workspaces: Vec<String> = run
-            .workspace_id()
-            .map(str::to_owned)
-            .filter(|_| run.workspace_closed_at().is_none())
-            .into_iter()
-            .collect();
-        for event in self.queue.run_events(run.id())? {
-            if event.kind == "resume_finished"
-                && event.payload["workspace_closed"] != true
-                && let Some(workspace) = event.payload.get("workspace_id").and_then(Value::as_str)
-                && !workspaces.iter().any(|w| w == workspace)
-            {
-                workspaces.push(workspace.to_owned());
-            }
-        }
-        let mut closed = false;
-        for workspace in workspaces {
-            let result = self.cmux.exists(&workspace).and_then(|open| {
-                if open {
-                    self.cmux.close(&workspace)?;
-                }
-                Ok(open)
-            });
-            match result {
-                Ok(true) => {
-                    self.queue.triage_closed_workspace(run.id(), &workspace)?;
-                    closed = true;
-                }
-                Ok(false) => {}
-                Err(error) => {
-                    let message = format!("workspace {workspace} could not be closed: {error:#}");
-                    warn!(run_id = %run.id(), "run {}: {message}", run.id());
-                    self.queue.record_runtime_event(
-                        run.id(),
-                        "cleanup_failed",
-                        reason_of_error(&error, ReasonCode::Other).on(
-                            json!({"workspace_id": workspace, "message": message, "by": "triage"}),
-                        ),
-                    )?;
-                }
-            }
-        }
-        if closed {
-            self.queue
-                .close_stuck_exit_asks(run.id(), "the triage closed the run's workspace")?;
-        }
-        // Whatever path took the run out of `running`, no dialog of it waits
-        // for an answer any more.
-        self.queue
-            .close_answer_prompt_asks(run.id(), "the run was triaged; closed by the runtime")?;
-        // Nor is its session stalled.
-        self.queue
-            .close_stalled_asks(run.id(), "the run was triaged; closed by the runtime")?;
-        Ok(())
     }
     /// Record `triage_failed` (a person triages the run) and give the lease
     /// back; the run stays as it is.

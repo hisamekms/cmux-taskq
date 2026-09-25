@@ -1125,6 +1125,13 @@ impl WorkspaceBackend for Cmux {
         Ok(workspace_listed(&self.workspace_listing()?, workspace_id))
     }
 
+    fn listed_workspace_ids(&self) -> Result<Vec<String>> {
+        Ok(listed_workspaces(&self.workspace_listing()?)?
+            .into_iter()
+            .map(|workspace| workspace.id)
+            .collect())
+    }
+
     fn create_named(
         &self,
         name: &str,

@@ -502,6 +502,10 @@ pub trait WorkspaceBackend {
     /// are found by the ID the queue recorded, never by their title, which
     /// people may rename (ADR-0026).
     fn exists(&self, workspace_id: &str) -> Result<bool>;
+    /// The stable IDs of every workspace cmux lists, in all its windows:
+    /// one listing for many checks, as the supervisor's sweep of ended
+    /// runs' workspaces makes.
+    fn listed_workspace_ids(&self) -> Result<Vec<String>>;
     /// Open a workspace that is not tied to a run (the inbox and planner
     /// sessions, the in-cmux supervisor) and return its stable ID.
     fn create_named(
@@ -681,6 +685,15 @@ pub struct Validation {
     pub scope_violation: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub allowed_paths: Vec<String>,
+}
+
+/// A workspace an ended run opened (the worker's or a resume's), which the
+/// supervisor's sweep closes while cmux still lists it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EndedRunWorkspace {
+    pub run_id: RunId,
+    pub status: RunStatus,
+    pub workspace_id: String,
 }
 
 /// A `needs_session` run as the supervisor judges it for a resume.
@@ -898,7 +911,17 @@ pub trait RunStore {
         action: &TriageAction,
         payload: serde_json::Value,
     ) -> Result<TaskRun>;
-    fn triage_closed_workspace(&mut self, id: &RunId, workspace_id: &str) -> Result<()>;
+    /// Record `workspace_closed` (`payload` and the `workspace_id`) of a
+    /// workspace the triage or the supervisor's sweep closed.
+    fn record_workspace_closed(
+        &mut self,
+        id: &RunId,
+        workspace_id: &str,
+        payload: serde_json::Value,
+    ) -> Result<()>;
+    /// The workspaces of the ended runs the triage does not take, for the
+    /// supervisor's sweep.
+    fn ended_run_workspaces(&self) -> Result<Vec<EndedRunWorkspace>>;
     /// Apply a person's answer to the triage's `decide` ask.
     fn decide_triage(
         &mut self,

@@ -206,8 +206,12 @@ fn explains_last_error(event: &RunEvent) -> bool {
         // Recovery only interrupts; one mid-integration goes back to
         // `awaiting_integration` with the `last_error` it had.
         "run_recovered" => status == Some("interrupted"),
-        // The triage's own close failure (`by: triage`) leaves `last_error`.
-        "cleanup_failed" => event.payload.get("by").and_then(Value::as_str) != Some("triage"),
+        // The triage's or the supervisor sweep's own close failure (`by:
+        // triage` / `supervisor`) leaves `last_error`.
+        "cleanup_failed" => !matches!(
+            event.payload.get("by").and_then(Value::as_str),
+            Some("triage" | "supervisor")
+        ),
         // Only a triage that sent the run back to its session (or handed
         // it to a person after its last resume) replaced `last_error`;
         // a retry or an ask left it, and those carry no code.
@@ -393,6 +397,10 @@ mod tests {
         recovered.push(event(
             "cleanup_failed",
             json!({"code": "backend_failed", "by": "triage"}),
+        ));
+        recovered.push(event(
+            "cleanup_failed",
+            json!({"code": "other", "by": "supervisor"}),
         ));
         assert_eq!(last_error_code(&recovered), Some(ReasonCode::SessionKilled));
         recovered.push(event(

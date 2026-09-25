@@ -2,6 +2,7 @@
 //! resume, the resolution request and the [`ResumeWatch`] of the session.
 
 use super::*;
+use crate::domain::run::{RunWorkspace, run_workspaces};
 
 impl Supervisor<'_> {
     /// Resume `needs_session` runs with attempts left (ADR-0019 decision 1),
@@ -272,28 +273,31 @@ impl Supervisor<'_> {
             return Ok(());
         };
         warn!(run_id = %failed.id(), task_id = %failed.task_id(), "run {} of task {} used up its resumes; it is failed and waits for ask {ask_id}", failed.id(), failed.task_id());
-        self.close_triaged_workspaces(&failed)?;
+        self.close_open_workspaces(&failed, WorkspaceCloser::Triage)?;
         self.note_triaged(&failed);
         Ok(())
     }
     /// Close the resume workspaces earlier attempts of this run left open
     /// (a session let go after the exit timeout, or one that might have
     /// lived when a resume failed), found by the IDs recorded in its
-    /// `resume_finished` events (ADR-0026). The caller checked that no
-    /// session of the run is alive.
+    /// `workspace_created` / `resume_finished` events (ADR-0026), and
+    /// record each close as `workspace_closed` (`by: supervisor`). The
+    /// caller checked that no session of the run is alive.
     pub(super) fn close_left_resume_workspaces(&mut self, run: &TaskRun) -> Result<()> {
-        let left: Vec<String> = self
-            .queue
-            .run_events(run.id())?
-            .iter()
-            .filter(|e| e.kind == "resume_finished" && e.payload["workspace_closed"] != true)
-            .filter_map(|e| e.payload.get("workspace_id").and_then(Value::as_str))
-            .map(str::to_owned)
+        let events = self.queue.run_events(run.id())?;
+        let left: Vec<RunWorkspace> = run_workspaces(run, &events)
+            .into_iter()
+            .filter(|w| w.resume_attempt.is_some() && !w.closed)
             .collect();
         for workspace in left {
-            if self.cmux.exists(&workspace)? {
-                info!(run_id = %run.id(), "run {}: closing resume workspace {workspace} left by an earlier attempt; its session has ended", run.id());
-                self.cmux.close(&workspace)?;
+            if self.cmux.exists(&workspace.workspace_id)? {
+                info!(run_id = %run.id(), "run {}: closing resume workspace {} left by an earlier attempt; its session has ended", run.id(), workspace.workspace_id);
+                self.cmux.close(&workspace.workspace_id)?;
+                self.queue.record_workspace_closed(
+                    run.id(),
+                    &workspace.workspace_id,
+                    json!({"resume_attempt": workspace.resume_attempt, "by": "supervisor"}),
+                )?;
             }
         }
         Ok(())
@@ -351,6 +355,13 @@ impl Supervisor<'_> {
             group: self.workspace_group(),
         };
         let workspace = self.cmux.create_resume(&task, run, &command, &tags)?;
+        // Every workspace of the run is recorded, so whatever ends the run
+        // finds this one to close.
+        self.queue.record_runtime_event(
+            run.id(),
+            "workspace_created",
+            json!({"workspace_id": workspace, "resume_attempt": attempt}),
+        )?;
         Ok(ResumeWatch {
             workspace,
             attempt,

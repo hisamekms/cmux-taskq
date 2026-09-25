@@ -23,7 +23,7 @@ use crate::domain::{
 };
 
 pub use crate::application::{
-    Landing, LeasedRun, ResumeCandidate, TRIAGE_ASKER, TriageAction, Validation,
+    EndedRunWorkspace, Landing, LeasedRun, ResumeCandidate, TRIAGE_ASKER, TriageAction, Validation,
 };
 pub use crate::domain::{HEARTBEAT_TIMEOUT_SECS, RunPlan};
 
@@ -1921,26 +1921,72 @@ impl SqliteQueue {
         Ok(Some(result.relocated(&self.runs_dir)))
     }
 
-    /// Record that the triage closed `workspace_id` of the run: the worker's
-    /// own (`workspace_closed_at` is set) or a resume's.
-    pub fn triage_closed_workspace(&mut self, id: &RunId, workspace_id: &str) -> Result<()> {
+    /// Record that the triage or the supervisor's sweep closed
+    /// `workspace_id` of the run as `workspace_closed` (`payload` with the
+    /// `workspace_id`): the worker's own (`workspace_closed_at` is set) or a
+    /// resume's.
+    pub fn record_workspace_closed(
+        &mut self,
+        id: &RunId,
+        workspace_id: &str,
+        mut payload: serde_json::Value,
+    ) -> Result<()> {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let now = self.generators.clock.now();
         if let Some(run) = stored_run(&tx, id)? {
             let from = run.status();
-            let run = run::triage_closed_workspace(run, workspace_id, now)?;
+            let run = run::record_closed_workspace(run, workspace_id, now)?;
             save_run(&tx, &run, from, None)?;
         }
-        run_event(
-            &tx,
-            id,
-            "workspace_closed",
-            json!({"workspace_id": workspace_id, "by": "triage"}),
-        )?;
+        payload["workspace_id"] = json!(workspace_id);
+        run_event(&tx, id, "workspace_closed", payload)?;
         tx.commit()?;
         Ok(())
+    }
+
+    /// The workspaces of the runs that ended (`integrated`, `succeeded`,
+    /// `failed`, `interrupted`) and that nobody leases, except the runs the
+    /// triage takes (the latest `failed` / `interrupted` run of an
+    /// `in_progress` task): the worker's workspace and every workspace a
+    /// `workspace_created` or `resume_finished` of the run names, whether
+    /// or not its close is recorded (cmux's list decides), ordered by run.
+    pub fn ended_run_workspaces(&self) -> Result<Vec<EndedRunWorkspace>> {
+        let mut statement = self.conn.prepare(
+            "WITH ended AS (
+               SELECT r.id, r.status, r.workspace_id, r.rowid AS run_row FROM task_runs r
+               JOIN tasks t ON t.id=r.task_id
+               WHERE r.status IN ('integrated','succeeded','failed','interrupted')
+               AND NOT (r.status IN ('failed','interrupted') AND t.status='in_progress'
+                        AND r.rowid=(SELECT MAX(rowid) FROM task_runs WHERE task_id=r.task_id))
+               AND NOT EXISTS (SELECT 1 FROM run_leases l WHERE l.run_id=r.id)
+             )
+             SELECT id, status, workspace_id, run_row, 0 AS event_id FROM ended
+             WHERE workspace_id IS NOT NULL
+             UNION ALL
+             SELECT ended.id, ended.status, json_extract(e.payload,'$.workspace_id'), ended.run_row, e.id
+             FROM run_events e JOIN ended ON ended.id=e.run_id
+             WHERE e.kind IN ('workspace_created','resume_finished')
+             AND json_extract(e.payload,'$.workspace_id') IS NOT NULL
+             ORDER BY 4, 5",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok(EndedRunWorkspace {
+                run_id: row.get(0)?,
+                status: enum_col(row, "status")?,
+                workspace_id: row.get(2)?,
+            })
+        })?;
+        let mut seen = std::collections::HashSet::new();
+        let mut workspaces: Vec<EndedRunWorkspace> = Vec::new();
+        for row in rows {
+            let row = row?;
+            if seen.insert((row.run_id.clone(), row.workspace_id.clone())) {
+                workspaces.push(row);
+            }
+        }
+        Ok(workspaces)
     }
 
     /// Apply the answer of a triage's `decide` ask to its `failed` or
@@ -2566,8 +2612,16 @@ impl RunStore for SqliteQueue {
     ) -> Result<TaskRun> {
         SqliteQueue::finish_triage(self, id, token, action, payload)
     }
-    fn triage_closed_workspace(&mut self, id: &RunId, workspace_id: &str) -> Result<()> {
-        SqliteQueue::triage_closed_workspace(self, id, workspace_id)
+    fn record_workspace_closed(
+        &mut self,
+        id: &RunId,
+        workspace_id: &str,
+        payload: serde_json::Value,
+    ) -> Result<()> {
+        SqliteQueue::record_workspace_closed(self, id, workspace_id, payload)
+    }
+    fn ended_run_workspaces(&self) -> Result<Vec<EndedRunWorkspace>> {
+        SqliteQueue::ended_run_workspaces(self)
     }
     fn decide_triage(
         &mut self,

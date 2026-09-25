@@ -440,6 +440,9 @@ mod tests {
         fn exists(&self, _: &str) -> Result<bool> {
             unimplemented!()
         }
+        fn listed_workspace_ids(&self) -> Result<Vec<String>> {
+            unimplemented!()
+        }
         fn create_named(&self, _: &str, _: &Path, _: &str, _: &WorkspaceTags) -> Result<String> {
             unimplemented!()
         }

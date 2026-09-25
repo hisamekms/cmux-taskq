@@ -80,9 +80,12 @@ mod resume;
 mod revise;
 mod session;
 mod stall;
+mod sweep;
 mod triage;
 
-use self::{deliver::*, exit::*, idle::*, jobs::*, resume::*, revise::*, session::*, stall::*};
+use self::{
+    deliver::*, exit::*, idle::*, jobs::*, resume::*, revise::*, session::*, stall::*, sweep::*,
+};
 
 /// How far back the daily observation reads.
 pub const DAILY_WINDOW_SECS: i64 = 24 * 60 * 60;
@@ -124,6 +127,9 @@ pub struct LoopSettings {
     pub tick: Duration,
     /// Pause between two looks for claimable work while no run is active.
     pub idle_poll: Duration,
+    /// Least time between two sweeps of the workspaces of ended runs; the
+    /// first pass sweeps at once.
+    pub sweep_interval: Duration,
     /// The thresholds of the stalled-session checks (ADR-0043 decision 4),
     /// recorded as `stall_config_loaded` when the loop starts.
     pub stall: StallConfig,
@@ -323,6 +329,8 @@ pub fn supervise(ports: &Ports<'_>, settings: &LoopSettings) -> Result<Value> {
         provisioning_error: None,
         observer: None,
         observers_launched: Vec::new(),
+        last_sweep: None,
+        sweep_failures: Vec::new(),
         triaged: Vec::new(),
         generators: ports.generators.clone(),
         stall: settings.stall,
@@ -368,6 +376,12 @@ struct Supervisor<'a> {
     /// When this process last launched each observation, so one that dies
     /// before it records anything is not relaunched on every pass.
     observers_launched: Vec<(ObserveMode, Instant)>,
+    /// When this process last swept the workspaces of ended runs
+    /// (`LoopSettings::sweep_interval`); `None` until the first pass sweeps.
+    last_sweep: Option<Instant>,
+    /// The workspaces the sweep could not close: retried on every sweep,
+    /// their `cleanup_failed` recorded once per process.
+    sweep_failures: Vec<String>,
     /// The runs this process triaged, with where each one went.
     triaged: Vec<Value>,
     /// The clock and IDs `queue` also uses.
@@ -489,7 +503,7 @@ impl Supervisor<'_> {
             }
             let stopping = options.stop.load(Ordering::SeqCst);
             if self.claiming && !stopping {
-                self.fill_slots(options.parallel)?;
+                self.fill_slots(options.parallel, options.sweep_interval)?;
             }
             self.poll_observer();
             // A supervisor that stopped claiming is draining, not observing.
@@ -534,7 +548,7 @@ impl Supervisor<'_> {
     /// provision candidates until every slot is taken or nothing is
     /// claimable. `main` is reread per claim so a task released by
     /// `integrate` starts from the main that contains its predecessor.
-    fn fill_slots(&mut self, parallel: usize) -> Result<()> {
+    fn fill_slots(&mut self, parallel: usize, sweep_interval: Duration) -> Result<()> {
         if self.slots.len() < parallel {
             self.adopt_stale_runs(parallel)?;
         }
@@ -549,6 +563,10 @@ impl Supervisor<'_> {
         }
         if self.slots.len() < parallel {
             self.triage_runs(parallel)?;
+        }
+        // Takes no slot: only closes what ended runs left open.
+        if let Err(error) = self.sweep_ended_workspaces(sweep_interval) {
+            warn!(error = %format_args!("{error:#}"), "the workspaces of ended runs could not all be swept: {error:#}");
         }
         while self.slots.len() < parallel {
             // Highest effective priority, then most-releasing, then lowest
@@ -601,6 +619,14 @@ impl Supervisor<'_> {
                 }
                 Ok(Step::Done(run)) => {
                     info!(run_id = %run.id(), "run {} is {}", run.id(), run.status().as_str());
+                    // A landed run needs none of its workspaces; a failed
+                    // one keeps them for its triage.
+                    if matches!(run.status(), RunStatus::Integrated | RunStatus::Succeeded)
+                        && let Err(error) =
+                            self.close_open_workspaces(&run, WorkspaceCloser::Supervisor)
+                    {
+                        warn!(run_id = %run.id(), error = %format_args!("{error:#}"), "run {}: its workspaces could not all be closed: {error:#}", run.id());
+                    }
                     self.finished.push(*run);
                 }
                 Ok(Step::Triaged(run)) => self.note_triaged(&run),

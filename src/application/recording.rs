@@ -226,6 +226,10 @@ impl WorkspaceBackend for RecordingBackend<'_> {
         let result = self.inner.exists(workspace_id);
         self.recorded("exists", Some(workspace_id), None, result)
     }
+    fn listed_workspace_ids(&self) -> Result<Vec<String>> {
+        let result = self.inner.listed_workspace_ids();
+        self.recorded("listed_workspace_ids", None, None, result)
+    }
     fn create_named(
         &self,
         name: &str,

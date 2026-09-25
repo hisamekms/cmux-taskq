@@ -56,6 +56,8 @@ use crate::{
 
 const IDLE_POLL: Duration = Duration::from_secs(2);
 const TICK: Duration = Duration::from_secs(1);
+/// How often the supervisor sweeps the workspaces of ended runs.
+const SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 
 /// How the supervisor loop is driven. `stop` is the graceful drain switch
 /// (SIGINT in the CLI): no more claims, exit once every active run rests.
@@ -77,6 +79,9 @@ pub struct SuperviseOptions {
     pub tick: Duration,
     /// Pause between two looks for claimable work while no run is active.
     pub idle_poll: Duration,
+    /// Least time between two sweeps of the workspaces of ended runs; tests
+    /// shorten it.
+    pub sweep_interval: Duration,
     /// The clock and IDs of everything the supervisor records; tests fix them.
     pub generators: Generators,
     /// The thresholds of the stalled-session checks; `None` reads `[stall]`
@@ -95,6 +100,7 @@ impl SuperviseOptions {
             observe_daily: false,
             tick: TICK,
             idle_poll: IDLE_POLL,
+            sweep_interval: SWEEP_INTERVAL,
             generators: clock::system(),
             stall: None,
         }
@@ -109,6 +115,7 @@ impl SuperviseOptions {
             observe_daily: self.observe_daily,
             tick: self.tick,
             idle_poll: self.idle_poll,
+            sweep_interval: self.sweep_interval,
             stall,
         }
     }

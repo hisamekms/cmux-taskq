@@ -14,7 +14,7 @@ cmux send --workspace <workspace_id> "<text>"            # type an answer or /ex
 ```
 
 - A dialog is answered with keys, not with text: send `down` only until the choice you want is highlighted, then `enter`.
-- The runtime closes the workspaces of accepted runs and of triaged runs itself; `cmux workspace close <workspace_id>` is only for a run whose triage failed (`triage by hand`).
+- The runtime closes the workspaces of accepted runs and of triaged runs itself, and the supervisor sweeps whatever cmux still lists of ended runs (landed by hand, superseded, or whose task moved on) within a minute; `cmux workspace close <workspace_id>` is only for a run whose triage failed (`triage by hand`) while its task is still in progress, or when no supervisor runs.
 - The folder-trust prompt is decided by the repository root, not the worktree. Running `claude` once in the repository root before the first run avoids it.
 - Never open a resume workspace yourself; only a dialog a resumed session stops at is answered here.
 

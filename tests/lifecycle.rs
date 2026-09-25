@@ -357,6 +357,16 @@ impl WorkspaceBackend for FakeCmux {
             .iter()
             .any(|(_, _, id, _)| id == workspace_id))
     }
+    fn listed_workspace_ids(&self) -> Result<Vec<String>> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(self
+            .workspaces
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, _, id, _)| id.clone())
+            .collect())
+    }
     fn ensure_group(&self, external_id: &str, name: &str) -> Result<String> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         self.groups
@@ -1813,6 +1823,9 @@ fn up_requires_cmux_claude_and_an_initialized_queue() {
             unreachable!()
         }
         fn exists(&self, _: &str) -> Result<bool> {
+            unreachable!()
+        }
+        fn listed_workspace_ids(&self) -> Result<Vec<String>> {
             unreachable!()
         }
         fn create_named(&self, _: &str, _: &Path, _: &str, _: &WorkspaceTags) -> Result<String> {

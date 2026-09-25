@@ -9,8 +9,8 @@
 use serde::Serialize;
 
 use super::{
-    CommitSha, DomainError, Provider, RunId, RunPaths, RunPlan, RunRecord, RunStatus, Task, TaskId,
-    TaskStatus, require,
+    CommitSha, DomainError, Provider, RunEvent, RunId, RunPaths, RunPlan, RunRecord, RunStatus,
+    Task, TaskId, TaskStatus, require,
 };
 
 /// A run of a task. `Serialize` is the JSON the CLI prints; there is no
@@ -532,9 +532,68 @@ pub fn workspace_closed(mut run: TaskRun, closed_at: i64) -> Result<TaskRun, Dom
     Ok(run)
 }
 
-/// The triage closed `workspace_id` at `closed_at`: the run's own workspace
-/// is recorded as closed; a resume's leaves the run as it is.
-pub fn triage_closed_workspace(
+/// A cmux workspace a run opened: the worker's own (`resume_attempt`
+/// `None`) or a resume's, and whether its close is recorded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunWorkspace {
+    pub workspace_id: String,
+    pub resume_attempt: Option<u64>,
+    pub closed: bool,
+}
+
+/// Every workspace `run` opened, from its record and `events` (the run's
+/// own, oldest first): the worker's workspace, then each resume's from its
+/// `workspace_created` (with `resume_attempt`) or, for a resume recorded
+/// before those, its `resume_finished`. A workspace is closed once a
+/// `workspace_closed` names it, its `resume_finished` says
+/// `workspace_closed`, or (the worker's) `workspace_closed_at` is set.
+pub fn run_workspaces(run: &TaskRun, events: &[RunEvent]) -> Vec<RunWorkspace> {
+    let mut workspaces: Vec<RunWorkspace> = run
+        .workspace_id
+        .iter()
+        .map(|workspace| RunWorkspace {
+            workspace_id: workspace.clone(),
+            resume_attempt: None,
+            closed: run.workspace_closed_at.is_some(),
+        })
+        .collect();
+    for event in events {
+        let Some(workspace) = event.payload.get("workspace_id").and_then(|w| w.as_str()) else {
+            continue;
+        };
+        let known = workspaces.iter().position(|w| w.workspace_id == workspace);
+        match event.kind.as_str() {
+            "workspace_created" | "resume_finished" => {
+                let closed =
+                    event.kind == "resume_finished" && event.payload["workspace_closed"] == true;
+                match known {
+                    Some(index) => workspaces[index].closed |= closed,
+                    None => workspaces.push(RunWorkspace {
+                        workspace_id: workspace.to_owned(),
+                        resume_attempt: event
+                            .payload
+                            .get("resume_attempt")
+                            .or_else(|| event.payload.get("attempt"))
+                            .and_then(|a| a.as_u64()),
+                        closed,
+                    }),
+                }
+            }
+            "workspace_closed" => {
+                if let Some(index) = known {
+                    workspaces[index].closed = true;
+                }
+            }
+            _ => {}
+        }
+    }
+    workspaces
+}
+
+/// The triage or the supervisor's sweep closed `workspace_id` at
+/// `closed_at`: the run's own workspace is recorded as closed; a resume's
+/// leaves the run as it is (its close is the `workspace_closed` event).
+pub fn record_closed_workspace(
     mut run: TaskRun,
     workspace_id: &str,
     closed_at: i64,
@@ -926,6 +985,67 @@ mod tests {
     }
 
     #[test]
+    fn run_workspaces_follow_their_events() {
+        let event = |kind: &str, payload: serde_json::Value| RunEvent {
+            id: crate::domain::EventId::new(1),
+            task_id: None,
+            goal_id: None,
+            run_id: None,
+            kind: kind.into(),
+            payload,
+            created_at: String::new(),
+        };
+        let mut open = record(RunStatus::Failed);
+        open.workspace_id = Some("ws".into());
+        let run = TaskRun::restore(open).unwrap();
+        let events = [
+            event(
+                "workspace_created",
+                serde_json::json!({"workspace_id": "ws"}),
+            ),
+            event(
+                "workspace_created",
+                serde_json::json!({"workspace_id": "r1", "resume_attempt": 1}),
+            ),
+            event(
+                "resume_finished",
+                serde_json::json!({"workspace_id": "r1", "attempt": 1, "workspace_closed": false}),
+            ),
+            // A resume recorded before `workspace_created` named them.
+            event(
+                "resume_finished",
+                serde_json::json!({"workspace_id": "r2", "attempt": 2, "workspace_closed": true}),
+            ),
+            event(
+                "workspace_closed",
+                serde_json::json!({"workspace_id": "ws"}),
+            ),
+            event(
+                "workspace_closed",
+                serde_json::json!({"workspace_id": "other"}),
+            ),
+            event("session_exited", serde_json::json!({})),
+        ];
+        let workspace = |id: &str, attempt: Option<u64>, closed: bool| RunWorkspace {
+            workspace_id: id.into(),
+            resume_attempt: attempt,
+            closed,
+        };
+        assert_eq!(
+            run_workspaces(&run, &events),
+            [
+                workspace("ws", None, true),
+                workspace("r1", Some(1), false),
+                workspace("r2", Some(2), true),
+            ]
+        );
+        assert_eq!(
+            run_workspaces(&run, &events[..1]),
+            [workspace("ws", None, false)]
+        );
+    }
+
+    #[test]
     fn triage_and_workspace_close() {
         check_triageable(&run(RunStatus::Interrupted)).unwrap();
         let resumed = resume_after_triage(run(RunStatus::Failed), "fix it".into()).unwrap();
@@ -935,11 +1055,11 @@ mod tests {
         let mut open = record(RunStatus::Failed);
         open.workspace_id = Some("ws".into());
         let open = TaskRun::restore(open).unwrap();
-        let other = triage_closed_workspace(open.clone(), "resume-ws", 5).unwrap();
+        let other = record_closed_workspace(open.clone(), "resume-ws", 5).unwrap();
         assert_eq!(other.workspace_closed_at(), None);
-        let closed = triage_closed_workspace(open, "ws", 5).unwrap();
+        let closed = record_closed_workspace(open, "ws", 5).unwrap();
         assert_eq!(closed.workspace_closed_at(), Some(5));
-        let again = triage_closed_workspace(closed, "ws", 9).unwrap();
+        let again = record_closed_workspace(closed, "ws", 9).unwrap();
         assert_eq!(again.workspace_closed_at(), Some(5));
 
         let mut resting = record(RunStatus::NeedsSession);
