@@ -5,6 +5,7 @@ title: supervisorがagentとworkspaceのライフサイクルを所有する
 status: accepted
 created: 2026-09-21
 updated: 2026-09-21
+accepted_on: 2026-09-22
 owners:
   - hisamekms
 tags:

@@ -2,9 +2,10 @@
 id: adr-0009
 type: adr
 title: 複数のtaskが解く上位の課題をgoalとして表現し、workerのpromptに流す
-status: proposed
+status: accepted
 created: 2026-09-22
 updated: 2026-09-22
+accepted_on: 2026-09-25
 owners:
   - hisamekms
 tags:

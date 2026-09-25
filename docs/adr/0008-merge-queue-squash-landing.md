@@ -5,6 +5,7 @@ title: runtimeのmerge queueが最新mainへrebase・再検証し、1 task = 1 c
 status: accepted
 created: 2026-09-22
 updated: 2026-09-22
+accepted_on: 2026-09-22
 owners:
   - hisamekms
 tags:

@@ -5,6 +5,7 @@ title: leaseをrun単位にし、依存が解けたtaskを上限付きで並列�
 status: accepted
 created: 2026-09-22
 updated: 2026-09-22
+accepted_on: 2026-09-22
 owners:
   - hisamekms
 tags:

@@ -16,3 +16,4 @@ tags:
 
 - [Current plan](current.md)
 - [Milestones](milestones.md)
+- [ADR 0001〜0034の棚卸しと統合ADRの組](adr-inventory.md)

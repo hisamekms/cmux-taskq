@@ -5,6 +5,7 @@ title: upがinbox / plannerのworkspaceに役割の色・status pill・ピンを
 status: accepted
 created: 2026-09-24
 updated: 2026-09-24
+accepted_on: 2026-09-24
 owners:
   - hisamekms
 tags:

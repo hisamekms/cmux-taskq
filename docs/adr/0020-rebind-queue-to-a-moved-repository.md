@@ -5,6 +5,7 @@ title: repositoryの移動はrebindサブコマンドでqueueの束縛を付け�
 status: accepted
 created: 2026-09-23
 updated: 2026-09-23
+accepted_on: 2026-09-23
 owners:
   - hisamekms
 tags:

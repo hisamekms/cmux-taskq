@@ -5,6 +5,7 @@ title: taskが変更してよいパス（add --paths）を宣言し、validating
 status: accepted
 created: 2026-09-24
 updated: 2026-09-24
+accepted_on: 2026-09-24
 owners:
   - hisamekms
 tags:

@@ -5,6 +5,7 @@ title: cmux workspaceをtitleではなくqueue DBのUUIDで識別し、roleとqu
 status: accepted
 created: 2026-09-23
 updated: 2026-09-23
+accepted_on: 2026-09-23
 owners:
   - hisamekms
 tags:

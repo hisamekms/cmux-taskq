@@ -5,6 +5,7 @@ title: cmux-taskqをdagqに改名する
 status: accepted
 created: 2026-09-22
 updated: 2026-09-22
+accepted_on: 2026-09-22
 owners:
   - hisamekms
 tags:

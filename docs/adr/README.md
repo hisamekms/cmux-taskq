@@ -33,36 +33,37 @@ ADRは、将来の実装や運用に大きな影響を与える決定の理由�
 
 ## 有効なADR
 
-`status: accepted`のADR。`accepted_on`が空欄の行は、ADRの棚卸し（後続のtask）でgit logから確かめて埋める。棚卸しで置き換えられるADRはこの表から下の対応表に移る。
+`status: accepted`のADR。`accepted_on`はgit logで`status: accepted`が入ったcommitの日（ADR-0009はgoal 1で実装済みのため、ADRの棚卸しの変更で`accepted`にした日）。0001〜0034のうち後のADRに決定を上書きされたものと、それを丸ごと置き換える統合ADRの組は[ADRの棚卸し](../plans/adr-inventory.md)にあり、統合ADRが`accepted`になるときにこの表から下の対応表に移る。
 
 | ADR | Title | accepted_on |
 | --- | --- | --- |
-| [ADR-0001](0001-rust-runtime.md) | Rustでruntimeを実装する |  |
-| [ADR-0002](0002-cmux-first.md) | cmuxを最初のworkspace backendにする |  |
-| [ADR-0003](0003-supervisor-owns-lifecycle.md) | supervisorがagentとworkspaceのライフサイクルを所有する |  |
-| [ADR-0004](0004-agent-provider-abstraction.md) | ClaudeとCodexをagent providerとして抽象化する |  |
-| [ADR-0005](0005-binary-and-plugin-distribution.md) | runtimeをバイナリ、agent integrationをpluginとして配布する |  |
-| [ADR-0006](0006-queue-per-repository.md) | repositoryごとに1つのqueueをユーザーのデータディレクトリに置き、cwdから解決する |  |
-| [ADR-0007](0007-run-level-leases-parallel-execution.md) | leaseをrun単位にし、依存が解けたtaskを上限付きで並列に実行する |  |
-| [ADR-0008](0008-merge-queue-squash-landing.md) | runtimeのmerge queueが最新mainへrebase・再検証し、1 task = 1 commitにsquashしてmainへ着地させる |  |
-| [ADR-0010](0010-maintainer-and-resident-supervisor.md) | 役割名をsupervisor / maintainer / workerに統一し、supervisorをlaunchdで常駐させてupとdownで起動・停止する |  |
-| [ADR-0011](0011-cmux-socket-password-and-in-cmux-fallback.md) | launchd常駐のsupervisorにはcmuxのsocket passwordを前提とし、up --in-cmuxをlaunchdなしのfallbackにする |  |
-| [ADR-0013](0013-layered-architecture-and-type-function-style.md) | domain / application / infrastructureのレイヤーと「型＋関数」でruntimeを構成する |  |
-| [ADR-0015](0015-rename-to-dagq.md) | cmux-taskqをdagqに改名する |  |
-| [ADR-0016](0016-maintainer-notification-and-compact-output.md) | maintainerを使い捨てのsessionにし、status / watch / doctorの通知経路と圧縮出力、pluginの起き直しhookを持たせる |  |
-| [ADR-0017](0017-resolve-run-paths-from-the-queue-directory.md) | runのqueue配下のpathは読むたびにqueueディレクトリとrun IDから解決する |  |
-| [ADR-0018](0018-run-workspace-named-after-the-task.md) | runのcmux workspace名はtaskのtitleにし、run IDはdescriptionに置く |  |
-| [ADR-0019](0019-move-routine-maintainer-work-into-the-runtime.md) | maintainerの定型作業をruntimeに移す（needs_sessionの自動resume、exit timeoutで放棄しない、push、follow_ups、evidence、prompt待ち） |  |
-| [ADR-0020](0020-rebind-queue-to-a-moved-repository.md) | repositoryの移動はrebindサブコマンドでqueueの束縛を付け替える |  |
-| [ADR-0021](0021-maintainer-and-supervisor-workspace-names-follow-the-run-style.md) | maintainer / supervisor / resumeのcmux workspace名もrunと同じ`[<repo>]dagq <role>`にそろえる |  |
-| [ADR-0022](0022-ask-answer-inbox-planner-and-landing-on-doubt.md) | 相談をqueueのask / answerにし、upがinboxとplannerを開き、着地は疑義のあるときだけ人に聞き、cmux notifyはinbox宛てにする |  |
-| [ADR-0025](0025-leaseless-unfinished-run-is-a-recover-run-attention.md) | supervisorが手放した未完了runをattention（recover run）にする |  |
-| [ADR-0026](0026-identify-workspaces-by-uuid-env-and-queue-group.md) | cmux workspaceをtitleではなくqueue DBのUUIDで識別し、roleとqueueを--envで持たせ、queueごとのworkspace groupにまとめる |  |
-| [ADR-0027](0027-keep-worker-session-through-review-revise-verdict-and-merge-tree-precheck.md) | workerのsessionをreviewの後まで残し、機械的な指摘はrevise verdictで生きているworkerに返し、着地前にmerge-treeで衝突を事前判定する |  |
-| [ADR-0028](0028-workspace-titles-are-repo-and-role.md) | cmux workspaceのtitleを`[<repo>]<role>`にし、planner / inboxの名前とrole値を定義する |  |
-| [ADR-0029](0029-task-declares-paths-and-verification-follows-the-kind-of-change.md) | taskが変更してよいパス（add --paths）を宣言し、validatingとintegrateが宣言外の変更を拒否し、verification_commandsを変更の種類で軽くする |  |
-| [ADR-0030](0030-publish-to-crates-io-on-tag-push-with-trusted-publishing.md) | crates.ioを追加の配布経路にし、tag pushでTrusted Publishingによって自動でpublishする |  |
-| [ADR-0031](0031-color-pill-and-pin-for-inbox-and-planner-and-unpin-before-close.md) | upがinbox / plannerのworkspaceに役割の色・status pill・ピンを当て、dagqのworkspace closeはピンを外してから閉じる |  |
+| [ADR-0001](0001-rust-runtime.md) | Rustでruntimeを実装する | 2026-09-22 |
+| [ADR-0002](0002-cmux-first.md) | cmuxを最初のworkspace backendにする | 2026-09-22 |
+| [ADR-0003](0003-supervisor-owns-lifecycle.md) | supervisorがagentとworkspaceのライフサイクルを所有する | 2026-09-22 |
+| [ADR-0004](0004-agent-provider-abstraction.md) | ClaudeとCodexをagent providerとして抽象化する | 2026-09-22 |
+| [ADR-0005](0005-binary-and-plugin-distribution.md) | runtimeをバイナリ、agent integrationをpluginとして配布する | 2026-09-22 |
+| [ADR-0006](0006-queue-per-repository.md) | repositoryごとに1つのqueueをユーザーのデータディレクトリに置き、cwdから解決する | 2026-09-22 |
+| [ADR-0007](0007-run-level-leases-parallel-execution.md) | leaseをrun単位にし、依存が解けたtaskを上限付きで並列に実行する | 2026-09-22 |
+| [ADR-0008](0008-merge-queue-squash-landing.md) | runtimeのmerge queueが最新mainへrebase・再検証し、1 task = 1 commitにsquashしてmainへ着地させる | 2026-09-22 |
+| [ADR-0009](0009-goal-groups-tasks.md) | 複数のtaskが解く上位の課題をgoalとして表現し、workerのpromptに流す | 2026-09-25 |
+| [ADR-0010](0010-maintainer-and-resident-supervisor.md) | 役割名をsupervisor / maintainer / workerに統一し、supervisorをlaunchdで常駐させてupとdownで起動・停止する | 2026-09-22 |
+| [ADR-0011](0011-cmux-socket-password-and-in-cmux-fallback.md) | launchd常駐のsupervisorにはcmuxのsocket passwordを前提とし、up --in-cmuxをlaunchdなしのfallbackにする | 2026-09-22 |
+| [ADR-0013](0013-layered-architecture-and-type-function-style.md) | domain / application / infrastructureのレイヤーと「型＋関数」でruntimeを構成する | 2026-09-22 |
+| [ADR-0015](0015-rename-to-dagq.md) | cmux-taskqをdagqに改名する | 2026-09-22 |
+| [ADR-0016](0016-maintainer-notification-and-compact-output.md) | maintainerを使い捨てのsessionにし、status / watch / doctorの通知経路と圧縮出力、pluginの起き直しhookを持たせる | 2026-09-23 |
+| [ADR-0017](0017-resolve-run-paths-from-the-queue-directory.md) | runのqueue配下のpathは読むたびにqueueディレクトリとrun IDから解決する | 2026-09-23 |
+| [ADR-0018](0018-run-workspace-named-after-the-task.md) | runのcmux workspace名はtaskのtitleにし、run IDはdescriptionに置く | 2026-09-23 |
+| [ADR-0019](0019-move-routine-maintainer-work-into-the-runtime.md) | maintainerの定型作業をruntimeに移す（needs_sessionの自動resume、exit timeoutで放棄しない、push、follow_ups、evidence、prompt待ち） | 2026-09-23 |
+| [ADR-0020](0020-rebind-queue-to-a-moved-repository.md) | repositoryの移動はrebindサブコマンドでqueueの束縛を付け替える | 2026-09-23 |
+| [ADR-0021](0021-maintainer-and-supervisor-workspace-names-follow-the-run-style.md) | maintainer / supervisor / resumeのcmux workspace名もrunと同じ`[<repo>]dagq <role>`にそろえる | 2026-09-23 |
+| [ADR-0022](0022-ask-answer-inbox-planner-and-landing-on-doubt.md) | 相談をqueueのask / answerにし、upがinboxとplannerを開き、着地は疑義のあるときだけ人に聞き、cmux notifyはinbox宛てにする | 2026-09-23 |
+| [ADR-0025](0025-leaseless-unfinished-run-is-a-recover-run-attention.md) | supervisorが手放した未完了runをattention（recover run）にする | 2026-09-23 |
+| [ADR-0026](0026-identify-workspaces-by-uuid-env-and-queue-group.md) | cmux workspaceをtitleではなくqueue DBのUUIDで識別し、roleとqueueを--envで持たせ、queueごとのworkspace groupにまとめる | 2026-09-23 |
+| [ADR-0027](0027-keep-worker-session-through-review-revise-verdict-and-merge-tree-precheck.md) | workerのsessionをreviewの後まで残し、機械的な指摘はrevise verdictで生きているworkerに返し、着地前にmerge-treeで衝突を事前判定する | 2026-09-23 |
+| [ADR-0028](0028-workspace-titles-are-repo-and-role.md) | cmux workspaceのtitleを`[<repo>]<role>`にし、planner / inboxの名前とrole値を定義する | 2026-09-23 |
+| [ADR-0029](0029-task-declares-paths-and-verification-follows-the-kind-of-change.md) | taskが変更してよいパス（add --paths）を宣言し、validatingとintegrateが宣言外の変更を拒否し、verification_commandsを変更の種類で軽くする | 2026-09-24 |
+| [ADR-0030](0030-publish-to-crates-io-on-tag-push-with-trusted-publishing.md) | crates.ioを追加の配布経路にし、tag pushでTrusted Publishingによって自動でpublishする | 2026-09-24 |
+| [ADR-0031](0031-color-pill-and-pin-for-inbox-and-planner-and-unpin-before-close.md) | upがinbox / plannerのworkspaceに役割の色・status pill・ピンを当て、dagqのworkspace closeはピンを外してから閉じる | 2026-09-24 |
 | [ADR-0036](0036-delete-frozen-work-records.md) | 凍結済みのdocs/journal/を削除し、今も効く手順と観測事実だけをdesign文書へ移す | 2026-09-25 |
 | [ADR-0038](0038-task-depends-on-a-goal-until-it-is-achieved.md) | taskがgoalに依存でき、依存先のgoalがachievedで閉じるまでclaimされない | 2026-09-25 |
 | [ADR-0039](0039-adopt-stale-lease-of-live-wrapper-and-renew-own-stale-lease.md) | supervisorが死んだrunは、wrapperが生きていれば次のsupervisorが引き継ぎ、自分のtokenのままstaleになったleaseは更新して続ける | 2026-09-25 |

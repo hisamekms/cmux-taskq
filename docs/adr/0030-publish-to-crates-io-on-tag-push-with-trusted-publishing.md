@@ -5,6 +5,7 @@ title: crates.ioを追加の配布経路にし、tag pushでTrusted Publishing�
 status: accepted
 created: 2026-09-24
 updated: 2026-09-24
+accepted_on: 2026-09-24
 owners:
   - hisamekms
 tags:
