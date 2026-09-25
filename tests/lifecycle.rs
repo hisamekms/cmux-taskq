@@ -309,6 +309,9 @@ impl WorkspaceBackend for FakeCmux {
     fn send_text(&self, _: &str, _: &str) -> Result<()> {
         bail!("up never types into a terminal")
     }
+    fn send_enter(&self, _: &str) -> Result<()> {
+        bail!("up never types into a terminal")
+    }
     fn capture(&self, _: &str) -> Result<String> {
         bail!("not used")
     }
@@ -1856,6 +1859,9 @@ fn up_requires_cmux_claude_and_an_initialized_queue() {
             unreachable!()
         }
         fn send_text(&self, _: &str, _: &str) -> Result<()> {
+            unreachable!()
+        }
+        fn send_enter(&self, _: &str) -> Result<()> {
             unreachable!()
         }
         fn capture(&self, _: &str) -> Result<String> {

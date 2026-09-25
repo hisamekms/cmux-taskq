@@ -69,6 +69,7 @@ use crate::domain::{
 };
 
 mod adopt;
+mod deliver;
 mod exit;
 mod idle;
 mod jobs;
@@ -78,7 +79,7 @@ mod revise;
 mod session;
 mod triage;
 
-use self::{exit::*, idle::*, jobs::*, resume::*, revise::*, session::*};
+use self::{deliver::*, exit::*, idle::*, jobs::*, resume::*, revise::*, session::*};
 
 /// How far back the daily observation reads.
 pub const DAILY_WINDOW_SECS: i64 = 24 * 60 * 60;
@@ -1044,9 +1045,22 @@ impl Supervisor<'_> {
                         let message = revise_mismatch_request(&slot.run, &label, &why)?;
                         // Only what the session writes after this counts.
                         let sent_at = self.files.now();
-                        match self.cmux.send_text(&session.workspace, &message) {
-                            Ok(()) => {
+                        let run = slot.run.clone();
+                        match submit(
+                            self,
+                            &run,
+                            &session.workspace,
+                            Input::Text(&message),
+                            "receipt fix request",
+                        ) {
+                            Ok(submission) => {
                                 watch.sent_at = sent_at;
+                                watch.start = Some(StartCheck::new(
+                                    "receipt fix request",
+                                    &message,
+                                    sent_at,
+                                    &submission,
+                                ));
                                 let kind = match watch.fix {
                                     Fix::Revise(_) => "revise_receipt_rejected",
                                     Fix::Conflict(_) => "conflict_receipt_rejected",

@@ -175,6 +175,7 @@ impl Supervisor<'_> {
                     // Only a run whose wrapper heartbeats is adopted.
                     silent: false,
                     exit_for_silence: false,
+                    answer_start: None,
                 })
             }
         })
@@ -280,6 +281,8 @@ impl Supervisor<'_> {
                                 anchor.payload["sent_at"].as_u64().unwrap_or_default(),
                             ),
                         sent: Instant::now(),
+                        // An adopted request is not checked for a start.
+                        start: None,
                     }));
                 }
                 None
@@ -301,6 +304,8 @@ impl Supervisor<'_> {
                                 anchor.payload["sent_at"].as_u64().unwrap_or_default(),
                             ),
                         sent: Instant::now(),
+                        // An adopted request is not checked for a start.
+                        start: None,
                     }));
                 }
                 None

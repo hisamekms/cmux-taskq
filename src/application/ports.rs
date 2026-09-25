@@ -312,6 +312,13 @@ pub trait AgentSignals {
     /// What the idle marker's content says. A content the adapter cannot
     /// read still marks a stop.
     fn idle_hook(&self, content: &[u8]) -> IdleHook;
+    /// Whether the agent's input box is drawn with no dialog over it: text
+    /// typed now reaches the agent (a booting session drops it).
+    fn input_ready(&self, screen: &str) -> bool;
+    /// Whether the input box still holds `text` after it was submitted.
+    fn input_pending(&self, screen: &str, text: &str) -> bool;
+    /// Whether the screen shows the agent at work on a turn.
+    fn working(&self, screen: &str) -> bool;
 }
 
 /// The content of an idle marker, as [`AgentSignals::idle_hook`] read it.
@@ -410,8 +417,13 @@ pub trait WorkspaceBackend {
     ) -> Result<String>;
     /// Type one line at the session's prompt and submit it: the resolution
     /// request to a resumed session, the only text besides `/exit` the
-    /// supervisor sends (ADR-0019).
+    /// supervisor sends (ADR-0019). A long text is given time to be pasted
+    /// before the Enter. Whether it was submitted is the caller's to read
+    /// from the screen (task 285).
     fn send_text(&self, workspace_id: &str, text: &str) -> Result<()>;
+    /// Press Enter alone: a text or `/exit` left in the input box after its
+    /// submit is submitted again without being typed twice (task 285).
+    fn send_enter(&self, workspace_id: &str) -> Result<()>;
     fn capture(&self, workspace_id: &str) -> Result<String>;
     /// Close the workspace; the worktree and branch are not touched. A
     /// pinned workspace is unpinned first, since cmux refuses to close one
@@ -478,6 +490,16 @@ pub trait WorkspaceBackend {
     /// without going idle before the supervisor asks it to exit.
     fn resume_timeout(&self) -> std::time::Duration {
         std::time::Duration::from_secs(3600)
+    }
+    /// How long after a submit (and between the Enters sent again) the
+    /// screen is read for the text left in the input box.
+    fn submit_check_interval(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(1)
+    }
+    /// How long a session sent a request or an answer may show no sign of
+    /// work before the supervisor sends it again or asks the inbox.
+    fn start_wait(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(60)
     }
 }
 

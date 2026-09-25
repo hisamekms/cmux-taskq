@@ -82,6 +82,10 @@ if [ -n "$resume" ]; then
   grep -q '"Stop"' "$settings" || { printf 'stub: settings lack a Stop hook\n' >&2; exit 64; }
   printf 'argv: --resume %s --debug-file %s --add-dir %s --settings %s\n' "$resume" "$debug_file" "$add_dir" "$settings" > "$debug_file"
   printf 'resumed %s; waiting for the resolution request\n' "$resume"
+  # Claude Code's input box: the supervisor types the request only once it
+  # is drawn (task 285).
+  rule=──────────────────────────────────────────────────
+  printf '%s\n\342\235\257 \n%s\n  ? for shortcuts\n' "$rule" "$rule"
   stty -icanon min 1
   IFS= read -r request
   stty icanon

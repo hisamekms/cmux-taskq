@@ -194,6 +194,10 @@ impl WorkspaceBackend for RecordingBackend<'_> {
         let result = self.inner.send_text(workspace_id, text);
         self.recorded("send_text", Some(workspace_id), None, result)
     }
+    fn send_enter(&self, workspace_id: &str) -> Result<()> {
+        let result = self.inner.send_enter(workspace_id);
+        self.recorded("send_enter", Some(workspace_id), None, result)
+    }
     fn capture(&self, workspace_id: &str) -> Result<String> {
         let result = self.inner.capture(workspace_id);
         self.recorded("capture", Some(workspace_id), None, result)
@@ -257,6 +261,12 @@ impl WorkspaceBackend for RecordingBackend<'_> {
     }
     fn resume_timeout(&self) -> Duration {
         self.inner.resume_timeout()
+    }
+    fn submit_check_interval(&self) -> Duration {
+        self.inner.submit_check_interval()
+    }
+    fn start_wait(&self) -> Duration {
+        self.inner.start_wait()
     }
 }
 

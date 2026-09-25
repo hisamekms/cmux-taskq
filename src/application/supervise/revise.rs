@@ -13,6 +13,8 @@ pub(super) struct ReviseWatch {
     /// A receipt or idle marker no newer than this predates the request.
     pub(super) sent_at: SystemTime,
     pub(super) sent: Instant,
+    /// Whether the session took the request (task 285).
+    pub(super) start: Option<StartCheck>,
 }
 
 /// What the live session was asked to fix (ADR-0027 decisions 2 and 4).
@@ -150,6 +152,10 @@ impl ReviseWatch {
             return Ok(Some(ReviseOutcome::Ended(
                 "went idle without rewriting the receipt".to_owned(),
             )));
+        }
+        if let Some(start) = &mut self.start {
+            let workspace = self.session.workspace.clone();
+            start.poll(sv, run, &workspace, &run.idle_marker_path()?)?;
         }
         if self.sent.elapsed() >= sv.cmux.resume_timeout() {
             return Ok(Some(ReviseOutcome::Ended(format!(

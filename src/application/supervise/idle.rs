@@ -118,6 +118,18 @@ mod tests {
                 evidence: vec![("hook_event_name", json!("Stop"))],
             }
         }
+
+        fn input_ready(&self, _: &str) -> bool {
+            true
+        }
+
+        fn input_pending(&self, _: &str, _: &str) -> bool {
+            false
+        }
+
+        fn working(&self, _: &str) -> bool {
+            false
+        }
     }
 
     fn idle_after_receipt(files: &MemoryFiles, receipt: &Path, marker: &Path) -> Option<Value> {

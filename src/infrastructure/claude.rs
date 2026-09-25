@@ -1,9 +1,11 @@
 //! What Claude Code shows and writes that the supervisor reads of a live
 //! session ([`AgentSignals`]): the dialogs of its TUI on the screen
 //! (ADR-0019 decision 6) and the input its `Stop` hook writes to the idle
-//! marker (ADR-0016, task 147). The formats are Claude Code's own; the
-//! supervisor only learns the kind of a dialog, an excerpt of the screen
-//! and whether background work was left running.
+//! marker (ADR-0016, task 147), and its input box (task 285). The formats
+//! are Claude Code's own; the supervisor only learns the kind of a dialog,
+//! an excerpt of the screen, whether background work was left running,
+//! whether the input box is drawn, what it still holds and whether the
+//! agent works.
 
 use serde_json::Value;
 
@@ -19,6 +21,16 @@ const PROMPT_SCAN_LINES: usize = 30;
 
 /// Another numbered option counts within this many lines of the `❯` one.
 const OPTION_REACH: usize = 3;
+
+/// The input box closes within this many non-empty lines of the bottom:
+/// under it Claude Code draws only its hints, the status line and the menu
+/// of slash commands a `/` opens.
+const INPUT_FOOTER_LINES: usize = 14;
+
+/// This many last letters and digits of a text typed into the input box
+/// are looked for in it: wrapping and `cmux send`'s rewriting of the text
+/// (one line, slashes for backslashes) change the rest.
+const INPUT_TAIL_CHARS: usize = 24;
 
 /// Which dialog of the agent's TUI holds the session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -86,6 +98,89 @@ fn option_text(line: &str) -> Option<&str> {
     (digits > 0).then_some(rest)
 }
 
+/// A horizontal rule or the top or bottom border of a box, which Claude
+/// Code draws above and below its input box.
+fn is_rule(line: &str) -> bool {
+    let mut chars = line.chars();
+    matches!(
+        (chars.next(), chars.next()),
+        (
+            Some('─' | '━' | '═' | '╭' | '╰' | '┌' | '└'),
+            Some('─' | '━' | '═')
+        )
+    )
+}
+
+/// The lines of the input box at the bottom of a screen, the prompt line
+/// (`❯`, `>` or the shell mode's `!`, frame stripped) first: the lines
+/// between the last rule within [`INPUT_FOOTER_LINES`] of the bottom and
+/// the rule above it, the first of them a prompt line. `None` while the
+/// TUI is not drawn yet (the shell's own `❯` line has no rule above it),
+/// when a dialog replaced the box, or once Claude Code exited and left its
+/// last frame above `Resume this session with:`.
+fn input_box(screen: &str) -> Option<Vec<&str>> {
+    let lines: Vec<&str> = screen
+        .lines()
+        .map(strip_frame)
+        .filter(|line| !line.is_empty())
+        .collect();
+    let close = (lines.len().saturating_sub(INPUT_FOOTER_LINES + 1)..lines.len())
+        .rev()
+        .find(|&i| is_rule(lines[i]))?;
+    if lines[close + 1..]
+        .iter()
+        .any(|line| line.contains("Resume this session with"))
+    {
+        return None;
+    }
+    let open = (0..close).rev().find(|&i| is_rule(lines[i]))? + 1;
+    let prompt = lines.get(open).filter(|_| open < close)?;
+    (prompt.starts_with(['❯', '>', '!']) && option_text(prompt).is_none())
+        .then(|| lines[open..close].to_vec())
+}
+
+/// Whether Claude Code's input box is drawn and no dialog is on the
+/// screen: the session takes what is typed now. A booting session (the
+/// shell's line, the welcome banner alone) is not ready.
+pub fn input_ready(screen: &str) -> bool {
+    input_box(screen).is_some() && detect_prompt(screen).is_none()
+}
+
+/// Whether the input box still holds `text` typed into it (its last
+/// letters and digits, however wrapped), or a paste Claude Code collapsed
+/// to `[Pasted text #N ...]`: Enter did not submit it. A screen without the
+/// box holds nothing.
+pub fn input_pending(screen: &str, text: &str) -> bool {
+    let Some(lines) = input_box(screen) else {
+        return false;
+    };
+    let content = lines.join(" ");
+    let content = content.trim_start_matches(['❯', '>', '!']).trim();
+    if content.contains("[Pasted text") {
+        return true;
+    }
+    let alnum =
+        |text: &str| -> Vec<char> { text.chars().filter(|c| c.is_alphanumeric()).collect() };
+    let typed = alnum(text);
+    let tail: String = typed[typed.len().saturating_sub(INPUT_TAIL_CHARS)..]
+        .iter()
+        .collect();
+    !tail.is_empty()
+        && alnum(content)
+            .into_iter()
+            .collect::<String>()
+            .contains(&tail)
+}
+
+/// Whether the agent is at work: Claude Code shows `esc to interrupt`
+/// next to its spinner while it runs a turn.
+pub fn agent_working(screen: &str) -> bool {
+    let lines: Vec<&str> = screen.lines().filter(|l| !l.trim().is_empty()).collect();
+    lines[lines.len().saturating_sub(PROMPT_SCAN_LINES)..]
+        .iter()
+        .any(|line| line.to_lowercase().contains("esc to interrupt"))
+}
+
 /// The last `count` non-empty lines of a screen, right-trimmed.
 fn screen_tail(screen: &str, count: usize) -> String {
     let lines: Vec<&str> = screen
@@ -131,6 +226,18 @@ impl AgentSignals for ClaudeCode {
 
     fn idle_hook(&self, content: &[u8]) -> IdleHook {
         idle_hook(content)
+    }
+
+    fn input_ready(&self, screen: &str) -> bool {
+        input_ready(screen)
+    }
+
+    fn input_pending(&self, screen: &str, text: &str) -> bool {
+        input_pending(screen, text)
+    }
+
+    fn working(&self, screen: &str) -> bool {
+        agent_working(screen)
     }
 }
 
@@ -208,6 +315,138 @@ mod tests {
 ╰──────────────────────────────────────────────────────────────────────╯
   ? for shortcuts
 ";
+
+    /// The runner's shell line before Claude Code draws anything: the
+    /// shell's own `❯` has no rule above it.
+    const BOOT: &str = "\
+Last login: Thu Sep 24 22:27:53 on ttys008
+worktree on  dagq/f8f7c65d is 📦 v0.3.0 via 🦀 v1.93.0
+❯ '/runs/f8f7c65d/runner' '--db' '/queue.db' 'session' '--run' 'f8f7c65d' '--resume'
+";
+
+    /// The welcome banner of a session still loading its conversation.
+    const BOOT_BANNER: &str = "\
+❯ '/runs/f8f7c65d/runner' '--db' '/queue.db' 'session' '--run' 'f8f7c65d' '--resume'
+╭───────────────────────────────────────────────────╮
+│ ✻ Welcome to Claude Code!                         │
+│                                                   │
+│   cwd: /runs/f8f7c65d/worktree                    │
+╰───────────────────────────────────────────────────╯
+";
+
+    const READY: &str = "\
+⏺ The receipt is written; the run is ready for review.
+
+──────────────────────────────────────────────────────────────────────
+❯\u{a0}
+──────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle)
+";
+
+    /// Claude Code 1.x draws the input box as a box.
+    const READY_BOXED: &str = "\
+╭──────────────────────────────────────────────────────────────────────╮
+│ >                                                                    │
+╰──────────────────────────────────────────────────────────────────────╯
+  ? for shortcuts
+";
+
+    /// The resolution request, pasted and wrapped, with Enter taken as part
+    /// of the paste.
+    const LONG_PENDING: &str = "\
+──────────────────────────────────────────────────────────────────────
+❯ dagq: integrate could not land run f8f7c65d (task 221) and returned n
+  eeds_session. Reason: rebase conflicted in src/runtime.rs ... Do not m
+  erge or push. When done, report briefly and stop; do not run /exit.
+──────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle)
+";
+
+    const PASTED: &str = "\
+──────────────────────────────────────────────────────────────────────
+❯ [Pasted text #1 +3 lines]
+──────────────────────────────────────────────────────────────────────
+";
+
+    /// `/exit` typed after the paste, and the menu of slash commands.
+    const EXIT_PENDING: &str = "\
+──────────────────────────────────────────────────────────────────────
+❯ /exit
+──────────────────────────────────────────────────────────────────────
+  /exit                 Exit the REPL
+  /export               Export the current conversation
+";
+
+    /// Claude Code exited on `/exit`: its last frame stays above the
+    /// shell's lines.
+    const EXITED: &str = "\
+──────────────────────────────────────────────────────────────────────
+❯ /exit
+──────────────────────────────────────────────────────────────────────
+
+Resume this session with:
+claude --resume 68a96a60-1826-461e-8002-40690588884d
+worktree on  dagq/68a96a60 took 8h32m49s
+❯
+";
+
+    const REQUEST: &str = "dagq: integrate could not land run f8f7c65d (task 221) and returned needs_session.\nReason: rebase conflicted in src/runtime.rs ...\nDo not merge or push. When done, report briefly and stop; do not run /exit.";
+
+    #[test]
+    fn input_ready_waits_for_the_input_box_without_a_dialog() {
+        assert!(!input_ready(BOOT));
+        assert!(!input_ready(BOOT_BANNER));
+        assert!(!input_ready(""));
+        assert!(input_ready(READY));
+        assert!(input_ready(READY_BOXED));
+        assert!(input_ready(LONG_PENDING));
+        assert!(input_ready(EXIT_PENDING));
+        // A working session takes input too.
+        assert!(input_ready(WORK));
+        for dialog in [TRUST, LSP_PLUGIN, AUTO_MODE] {
+            assert!(!input_ready(dialog), "{dialog}");
+        }
+        assert!(!input_ready(EXITED));
+        // A quote under a rule in the transcript is not the input box.
+        let quoted = format!("{}\n> quoted\n{READY}", "─".repeat(70));
+        assert_eq!(input_box(&quoted).unwrap(), ["❯"]);
+        // A box scrolled far above the bottom is not the input box.
+        let scrolled = format!("{READY}{}", "output line\n".repeat(INPUT_FOOTER_LINES));
+        assert!(!input_ready(&scrolled));
+    }
+
+    #[test]
+    fn input_pending_finds_the_typed_text_left_in_the_box() {
+        assert!(input_pending(LONG_PENDING, REQUEST));
+        assert!(input_pending(PASTED, REQUEST));
+        assert!(input_pending(EXIT_PENDING, "/exit"));
+        assert!(input_pending(WORK, "run the tests again"));
+        for screen in [READY, READY_BOXED, BOOT, BOOT_BANNER, TRUST, AUTO_MODE] {
+            assert!(!input_pending(screen, REQUEST), "{screen}");
+            assert!(!input_pending(screen, "/exit"), "{screen}");
+        }
+        assert!(!input_pending(EXITED, "/exit"));
+        // A typed `/exit` is not the request. (A request left in the box
+        // counts for `/exit` too, which its own `/exit` ends: one Enter
+        // submits both.)
+        assert!(!input_pending(EXIT_PENDING, REQUEST));
+        assert!(!input_pending(LONG_PENDING, "answer to ask 3: yes"));
+        assert!(!input_pending(READY, ""));
+    }
+
+    #[test]
+    fn agent_working_reads_the_spinner() {
+        assert!(agent_working(WORK));
+        for screen in [READY, BOOT, LONG_PENDING, TRUST] {
+            assert!(!agent_working(screen), "{screen}");
+        }
+        let claude = ClaudeCode {
+            executable: "claude".into(),
+        };
+        assert!(claude.working("✻ Thinking… (3s · Esc to interrupt)\n"));
+        assert!(claude.input_ready(READY));
+        assert!(claude.input_pending(EXIT_PENDING, "/exit"));
+    }
 
     #[test]
     fn detect_prompt_finds_the_three_dialogs() {

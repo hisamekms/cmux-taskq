@@ -139,6 +139,7 @@ so the run workspace opens outside it: {error:#}", self.layout.queue_hash);
             exit_asked: false,
             silent: false,
             exit_for_silence: false,
+            answer_start: None,
         })
     }
 }
@@ -175,6 +176,8 @@ pub(super) struct SessionWatch {
     pub(super) silent: bool,
     /// The `/exit` was sent because of that silence.
     pub(super) exit_for_silence: bool,
+    /// Whether the session took the last answer delivered (task 285).
+    pub(super) answer_start: Option<StartCheck>,
 }
 
 impl SessionWatch {
@@ -277,7 +280,8 @@ impl SessionWatch {
                         "exit_requested",
                         json!({"workspace_id": self.workspace, "timeout_secs": timeout.as_secs()}),
                     )?;
-                    sv.cmux.send_exit(&self.workspace)?;
+                    let workspace = self.workspace.clone();
+                    submit(sv, run, &workspace, Input::Exit, "/exit")?;
                     info!(run_id = %run.id(), "exit requested for {} after its wrapper went silent; waiting for session exit", run.id());
                     self.exit_requested = Some(Instant::now());
                     self.exit_for_silence = true;
@@ -287,6 +291,11 @@ impl SessionWatch {
                 WrapperPulse::Fresh => {
                     if self.exit_requested.is_none() {
                         self.deliver_answers(sv, run)?;
+                        if !self.receipt_seen
+                            && let Some(start) = &mut self.answer_start
+                        {
+                            start.poll(sv, run, &self.workspace, &self.idle_marker)?;
+                        }
                     }
                     if let Some(agent) = processes.iter().find(|p| p.role == "agent") {
                         self.watch_prompt(sv, run, agent)?;
@@ -479,17 +488,23 @@ impl SessionWatch {
                 ask.id,
                 ask.answer.as_deref().unwrap_or_default()
             );
-            match sv.cmux.send_text(&self.workspace, &text) {
+            let what = format!("answer of ask {}", ask.id);
+            let sent_at = sv.files.now();
+            let workspace = self.workspace.clone();
+            match submit(sv, run, &workspace, Input::Text(&text), &what) {
                 // Sent: failing to record it must not cost the live run its
                 // lease, so it is only noted (the ask then shows unclosed).
-                Ok(()) => match sv.queue.ask_delivered(ask.id, &self.workspace) {
-                    Ok(_) => {
-                        info!(ask_id = %ask.id, run_id = %run.id(), "answer of ask {} sent to run {} in workspace {}", ask.id, run.id(), self.workspace)
+                Ok(submission) => {
+                    self.answer_start = Some(StartCheck::new(&what, &text, sent_at, &submission));
+                    match sv.queue.ask_delivered(ask.id, &self.workspace) {
+                        Ok(_) => {
+                            info!(ask_id = %ask.id, run_id = %run.id(), "answer of ask {} sent to run {} in workspace {}", ask.id, run.id(), self.workspace)
+                        }
+                        Err(error) => {
+                            warn!(ask_id = %ask.id, run_id = %run.id(), error = %format_args!("{error:#}"), "answer of ask {} was sent to run {} but could not be recorded: {error:#}", ask.id, run.id())
+                        }
                     }
-                    Err(error) => {
-                        warn!(ask_id = %ask.id, run_id = %run.id(), error = %format_args!("{error:#}"), "answer of ask {} was sent to run {} but could not be recorded: {error:#}", ask.id, run.id())
-                    }
-                },
+                }
                 Err(error) => {
                     sv.queue.record_runtime_event(
                         run.id(),
@@ -576,6 +591,9 @@ pub(super) const PROMPT_CLEARED_CLOSED: &str = "the dialog is gone; closed by th
 pub(super) const PROMPT_RECEIPT_CLOSED: &str = "the receipt arrived; closed by the runtime";
 
 pub(super) const PROMPT_EXITED_CLOSED: &str = "the session exited; closed by the runtime";
+
+pub(super) const INPUT_READY_CLOSED: &str =
+    "the input box got ready and the request was sent; closed by the runtime";
 
 /// A session's screen is read for a dialog at most this often.
 pub(super) const PROMPT_CHECK_INTERVAL: Duration = Duration::from_secs(10);

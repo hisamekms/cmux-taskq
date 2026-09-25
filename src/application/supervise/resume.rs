@@ -361,7 +361,10 @@ impl Supervisor<'_> {
             startup: Instant::now(),
             message,
             agent_seen: None,
+            ready_since: None,
+            not_ready_asked: false,
             message_sent: None,
+            start: None,
             exit_requested: None,
             required_evidence: task.required_evidence().to_vec(),
             approved: self.queue.has_run_event(run.id(), "integration_approved")?,
@@ -547,9 +550,10 @@ pub(super) fn landed_since(
 /// subset of [`TRIAGE_OPTIONS`], applied the same way.
 pub(super) const EXHAUSTED_OPTIONS: &[&str] = &["retry", "cancel"];
 
-/// Watches one resumed session: its wrapper registration, the single
-/// resolution request once its agent is up, the rewritten receipt and the
-/// idle marker, the single `/exit`, and the wrapper's exit.
+/// Watches one resumed session: its wrapper registration, the resolution
+/// request once its input box is ready and whether the session took it
+/// (task 285), the rewritten receipt and the idle marker, the single
+/// `/exit`, and the wrapper's exit.
 pub(super) struct ResumeWatch {
     pub(super) workspace: String,
     pub(super) attempt: usize,
@@ -564,9 +568,15 @@ pub(super) struct ResumeWatch {
     pub(super) startup: Instant,
     pub(super) message: String,
     pub(super) agent_seen: Option<Instant>,
+    /// Since when every screen read showed the input box ready (task 285).
+    pub(super) ready_since: Option<Instant>,
+    /// `input_not_ready` is recorded and the inbox asked.
+    pub(super) not_ready_asked: bool,
     /// When the resolution request was sent (for its timeout, and for the
     /// idle marker of the response to it).
     pub(super) message_sent: Option<(Instant, SystemTime)>,
+    /// Whether the session took the request (task 285).
+    pub(super) start: Option<StartCheck>,
     pub(super) exit_requested: Option<Instant>,
     /// The task's required checks: a rewritten receipt still without them
     /// has not resolved the run.
@@ -647,6 +657,96 @@ impl ResumeWatch {
         }
     }
 
+    /// Send the resolution request once the agent's input box has shown
+    /// ready on every screen read for `resume_prompt_delay` (task 285): a
+    /// request typed while Claude Code boots is lost. A box not ready
+    /// within the registration timeout of the agent is recorded as
+    /// `input_not_ready` and raised to the inbox once; the request still
+    /// goes when it gets ready, and past the resume timeout the session is
+    /// asked to exit like one that did not finish.
+    fn send_when_ready(&mut self, sv: &mut Supervisor<'_>, run: &TaskRun) -> Result<()> {
+        let seen = *self.agent_seen.get_or_insert_with(Instant::now);
+        let timed_out = seen.elapsed() >= sv.cmux.resume_timeout();
+        let screen = match sv.cmux.capture(&self.workspace) {
+            Ok(screen) => screen,
+            // Past the resume timeout an unreadable screen still ends it.
+            Err(_) if timed_out => String::new(),
+            Err(error) => {
+                warn!(run_id = %run.id(), error = %format_args!("{error:#}"), "screen of {} could not be read for its input box: {error:#}", run.id());
+                return Ok(());
+            }
+        };
+        if timed_out {
+            // The Enter of a /exit typed over a dialog would pick its
+            // option: then nothing is typed, and the exit timeout lets the
+            // session go with a stuck_exit ask.
+            if sv.signals.detect_prompt(&screen).is_none() {
+                submit(sv, run, &self.workspace, Input::Exit, "/exit")?;
+            }
+            info!(run_id = %run.id(), "resumed session of {} did not get ready for the resolution request within the resume timeout; exit requested", run.id());
+            self.exit_requested = Some(Instant::now());
+            return Ok(());
+        }
+        if !sv.signals.input_ready(&screen) {
+            self.ready_since = None;
+            let timeout = sv.cmux.registration_timeout();
+            if !self.not_ready_asked && seen.elapsed() >= timeout {
+                self.not_ready_asked = true;
+                let excerpt = sv.signals.screen_excerpt(&screen);
+                let prompt = sv.signals.detect_prompt(&screen);
+                sv.queue.record_runtime_event(
+                    run.id(),
+                    "input_not_ready",
+                    json!({
+                        "workspace_id": self.workspace,
+                        "waited_secs": timeout.as_secs(),
+                        "prompt": prompt,
+                        "excerpt": excerpt,
+                    }),
+                )?;
+                warn!(run_id = %run.id(), "resumed session of {} shows no ready input box {}s after its agent registered; asking the inbox", run.id(), timeout.as_secs());
+                let situation = match prompt {
+                    Some(kind) => format!(
+                        "a {kind} dialog holds the resumed session, so the resolution request is not sent"
+                    ),
+                    None => format!(
+                        "the resumed session's input box is not ready {}s after its agent registered, so the resolution request is not sent yet",
+                        timeout.as_secs()
+                    ),
+                };
+                ask_unsubmitted(sv, run, &self.workspace, &situation, &excerpt);
+            }
+            return Ok(());
+        }
+        let ready = *self.ready_since.get_or_insert_with(Instant::now);
+        if ready.elapsed() < sv.cmux.resume_prompt_delay() {
+            return Ok(());
+        }
+        // The ask of a box that was not ready is answered by its getting
+        // ready (before the send, which may ask anew).
+        if self.not_ready_asked {
+            close_answer_prompt_asks(sv, run, INPUT_READY_CLOSED)?;
+        }
+        let sent_at = sv.files.now();
+        let message = self.message.clone();
+        let submission = submit(
+            sv,
+            run,
+            &self.workspace,
+            Input::Text(&message),
+            "resolution request",
+        )?;
+        self.message_sent = Some((Instant::now(), sent_at));
+        self.start = Some(StartCheck::new(
+            "resolution request",
+            &message,
+            sent_at,
+            &submission,
+        ));
+        info!(run_id = %run.id(), "resolution request sent to run {} in workspace {}", run.id(), self.workspace);
+        Ok(())
+    }
+
     /// One observation; `Some` once the wrapper exited.
     pub(super) fn poll(
         &mut self,
@@ -665,6 +765,8 @@ impl ResumeWatch {
         };
         let worktree = Path::new(run.worktree_path().context("missing worktree")?);
         if wrapper.exited_at.is_some() {
+            // Nobody needs to send anything to a session that exited.
+            close_answer_prompt_asks(sv, run, PROMPT_EXITED_CLOSED)?;
             match sv.cmux.capture(&self.workspace) {
                 Ok(screen) => sv.files.write(
                     &self
@@ -704,7 +806,7 @@ impl ResumeWatch {
         }
         if matches!(pulse, WrapperPulse::Silent) && self.exit_requested.is_none() {
             // Ask once, the way a person would; never kill the session.
-            sv.cmux.send_exit(&self.workspace)?;
+            submit(sv, run, &self.workspace, Input::Exit, "/exit")?;
             warn!(run_id = %run.id(), "resumed session of {} lost its wrapper heartbeat; exit requested", run.id());
             self.exit_requested = Some(Instant::now());
             self.exit_for_silence = true;
@@ -739,15 +841,13 @@ impl ResumeWatch {
         }
         let Some((sent, sent_at)) = self.message_sent else {
             if processes.iter().any(|p| p.role == "agent") {
-                let seen = *self.agent_seen.get_or_insert_with(Instant::now);
-                if seen.elapsed() >= sv.cmux.resume_prompt_delay() {
-                    sv.cmux.send_text(&self.workspace, &self.message)?;
-                    self.message_sent = Some((Instant::now(), sv.files.now()));
-                    info!(run_id = %run.id(), "resolution request sent to run {} in workspace {}", run.id(), self.workspace);
-                }
+                self.send_when_ready(sv, run)?;
             }
             return Ok(None);
         };
+        if let Some(start) = &mut self.start {
+            start.poll(sv, run, &self.workspace, &self.idle_marker)?;
+        }
         // The idle marker is read before the receipt and the
         // worktree: a receipt rewritten after this read is judged
         // at the next poll, never as idle without it.
@@ -791,7 +891,7 @@ impl ResumeWatch {
         });
         if let Some(why) = why {
             // Ask once, the way a person would; never kill the session.
-            sv.cmux.send_exit(&self.workspace)?;
+            submit(sv, run, &self.workspace, Input::Exit, "/exit")?;
             info!(run_id = %run.id(), "resumed session of {} {why} (head {head}); exit requested", run.id());
             self.exit_requested = Some(Instant::now());
         }

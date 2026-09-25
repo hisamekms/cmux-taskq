@@ -202,11 +202,20 @@ impl Supervisor<'_> {
                     message.as_bytes(),
                 )?;
                 let sent_at = self.files.now();
-                if let Err(error) = self.cmux.send_text(&live.workspace, &message) {
-                    let why = format!("the revise request could not be sent: {error:#}");
-                    warn!(run_id = %run.id(), "run {}: {why}", run.id());
-                    return Ok(ask(Some(why), verdict, session));
-                }
+                let submission = match submit(
+                    self,
+                    run,
+                    &live.workspace,
+                    Input::Text(&message),
+                    "revise request",
+                ) {
+                    Ok(submission) => submission,
+                    Err(error) => {
+                        let why = format!("the revise request could not be sent: {error:#}");
+                        warn!(run_id = %run.id(), "run {}: {why}", run.id());
+                        return Ok(ask(Some(why), verdict, session));
+                    }
+                };
                 self.queue.record_runtime_event(
                     run.id(),
                     "revise_requested",
@@ -219,6 +228,12 @@ impl Supervisor<'_> {
                     fix: Fix::Revise(verdict.reasons),
                     sent_at,
                     sent: Instant::now(),
+                    start: Some(StartCheck::new(
+                        "revise request",
+                        &message,
+                        sent_at,
+                        &submission,
+                    )),
                 }))
             }
         }
@@ -316,14 +331,24 @@ impl Supervisor<'_> {
                     message.as_bytes(),
                 )?;
                 let sent_at = self.files.now();
-                self.cmux
-                    .send_text(&live.workspace, &message)
-                    .map(|()| sent_at)
-                    .map_err(|error| format!("the request could not be sent: {error:#}"))
+                submit(
+                    self,
+                    run,
+                    &live.workspace,
+                    Input::Text(&message),
+                    "conflict request",
+                )
+                .map(|submission| {
+                    (
+                        sent_at,
+                        StartCheck::new("conflict request", &message, sent_at, &submission),
+                    )
+                })
+                .map_err(|error| format!("the request could not be sent: {error:#}"))
             }
             None => Err("the session had ended".to_owned()),
         };
-        let (Some(live), Ok(sent_at)) = (live, &sent) else {
+        let (Some(live), Ok((sent_at, start))) = (live, sent.clone()) else {
             let error = sent.err().unwrap_or_default();
             payload["error"] = json!(error);
             self.queue
@@ -332,7 +357,7 @@ impl Supervisor<'_> {
             return Ok(land(session));
         };
         payload["requested"] = json!(true);
-        payload["sent_at"] = json!(unix_seconds(*sent_at));
+        payload["sent_at"] = json!(unix_seconds(sent_at));
         self.queue
             .record_runtime_event(run.id(), "conflict_precheck", payload)?;
         info!(run_id = %run.id(), "run {}: {why}; asked its live session in workspace {} to rebase (request {attempt})", run.id(), live.workspace);
@@ -340,8 +365,9 @@ impl Supervisor<'_> {
             session: live,
             attempt,
             fix: Fix::Conflict(verdict),
-            sent_at: *sent_at,
+            sent_at,
             sent: Instant::now(),
+            start: Some(start),
         }))
     }
     /// Close the session's workspace after it exited: the worker's own

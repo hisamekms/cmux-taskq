@@ -93,7 +93,9 @@ impl ExitWatch {
                     )?,
                 }
             }
-            // Nobody needs to send /exit to a session that exited.
+            // Nobody needs to send /exit to a session that exited, nor
+            // anything else.
+            close_answer_prompt_asks(sv, run, PROMPT_EXITED_CLOSED)?;
             for ask in sv
                 .queue
                 .close_stuck_exit_asks(run.id(), STUCK_EXIT_CLOSED)?
@@ -136,7 +138,8 @@ impl ExitWatch {
                     json!({"workspace_id": session.workspace, "timeout_secs": timeout.as_secs()}),
                 )?;
                 // Ask once, the way a person would; never kill the session.
-                sv.cmux.send_exit(&session.workspace)?;
+                let workspace = session.workspace.clone();
+                submit(sv, run, &workspace, Input::Exit, "/exit")?;
                 info!(run_id = %run.id(), "exit requested for {}; waiting for session exit", run.id());
                 self.requested = Some(Instant::now());
                 self.exit_for_silence = matches!(pulse, WrapperPulse::Silent);

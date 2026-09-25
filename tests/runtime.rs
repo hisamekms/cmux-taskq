@@ -251,6 +251,43 @@ impl AgentProvider for TestProvider {
     }
 }
 
+/// Claude Code's empty input box, the screen `capture` returns unless a
+/// test sets another: the session takes input, and what the supervisor
+/// typed left the box.
+const READY_SCREEN: &str = "\
+⏺ Done.
+
+──────────────────────────────────────────────────────────────────────
+❯ 
+──────────────────────────────────────────────────────────────────────
+  ? for shortcuts
+";
+
+/// [`READY_SCREEN`] once the session took a text: at work on it.
+const WORKING_SCREEN: &str = "\
+⏺ Done.
+
+✻ Working… (3s · esc to interrupt)
+
+──────────────────────────────────────────────────────────────────────
+❯ 
+──────────────────────────────────────────────────────────────────────
+  ? for shortcuts
+";
+
+/// Claude Code's input box still holding `text` after its Enter.
+fn pending_screen(text: &str) -> String {
+    format!(
+        "⏺ Done.\n\n{rule}\n❯ {}\n{rule}\n  ? for shortcuts\n",
+        dagq::infrastructure::adapters::single_line(text),
+        rule = "─".repeat(70)
+    )
+}
+
+/// The runner's shell line before Claude Code draws its input box.
+const BOOT_SCREEN: &str =
+    "worktree on dagq/run\n❯ '/run/runner' '--db' '/queue.db' 'session' '--resume'\n";
+
 /// The test backend delivers an exit request as a file the fake agent polls for.
 fn exit_request_path(run_dir: &str) -> PathBuf {
     Path::new(run_dir).join("exit-requested")
@@ -289,6 +326,15 @@ struct TestWorkspace {
     /// What `capture` returns, and how often it was asked.
     screen: Mutex<String>,
     captures: AtomicUsize,
+    /// `send_enter` calls: Enters sent again after a submit (task 285).
+    enters: AtomicUsize,
+    /// This many Enters leave a typed text in the input box (the screen
+    /// shows it there until the last one), as a long paste does.
+    swallowed_enters: AtomicUsize,
+    /// This many texts are typed but never reach the session, as one typed
+    /// before Claude Code's input box is drawn.
+    dropped_texts: AtomicUsize,
+    start_wait: Duration,
     exits_sent: AtomicUsize,
     sessions: Mutex<Vec<(String, TestSession)>>,
     closed: Mutex<Vec<String>>,
@@ -330,8 +376,12 @@ impl TestWorkspace {
             resume_timeout: Duration::from_secs(120),
             exit_returns_after_session: false,
             prompt_wait: Duration::from_secs(90),
-            screen: Mutex::new("fixture terminal screen".into()),
+            screen: Mutex::new(READY_SCREEN.into()),
             captures: AtomicUsize::new(0),
+            enters: AtomicUsize::new(0),
+            swallowed_enters: AtomicUsize::new(0),
+            dropped_texts: AtomicUsize::new(0),
+            start_wait: Duration::from_secs(60),
             exits_sent: AtomicUsize::new(0),
             sessions: Mutex::new(Vec::new()),
             closed: Mutex::new(Vec::new()),
@@ -531,13 +581,46 @@ impl WorkspaceBackend for TestWorkspace {
         if self.text_fails {
             bail!("injected cmux send failure");
         }
+        if self.swallowed_enters.load(Ordering::SeqCst) > 0 {
+            *self.screen.lock().unwrap() = pending_screen(text);
+        }
+        if self
+            .dropped_texts
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+            .is_ok()
+        {
+            return Ok(());
+        }
+        // The session got it and works on it.
+        let mut screen = self.screen.lock().unwrap();
+        if *screen == READY_SCREEN {
+            *screen = WORKING_SCREEN.into();
+        }
+        drop(screen);
         let path = resume_message_path(&self.session_run_dir(workspace_id));
         fs::write(path.with_extension("tmp"), text)?;
         fs::rename(path.with_extension("tmp"), path)?;
         Ok(())
     }
+    fn send_enter(&self, _: &str) -> Result<()> {
+        self.enters.fetch_add(1, Ordering::SeqCst);
+        if self
+            .swallowed_enters
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+            == Ok(1)
+        {
+            *self.screen.lock().unwrap() = READY_SCREEN.into();
+        }
+        Ok(())
+    }
     fn resume_prompt_delay(&self) -> Duration {
         Duration::ZERO
+    }
+    fn submit_check_interval(&self) -> Duration {
+        Duration::from_millis(10)
+    }
+    fn start_wait(&self) -> Duration {
+        self.start_wait
     }
     fn resume_timeout(&self) -> Duration {
         self.resume_timeout
@@ -5684,6 +5767,250 @@ fn resuming_stops_after_three_attempts() {
 /// supervisor's slot and a drain are not held forever. While it runs, the run
 /// is the supervisor's (`resuming (runtime)`) and is not resumed again; once it
 /// ended, the next pass closes the workspace it left and resumes the run.
+/// Task 285: the resolution request waits for Claude Code's input box. A
+/// booting session's screen gets nothing; past the registration timeout
+/// the run records `input_not_ready` and asks the inbox once, and the
+/// request goes as soon as the box is drawn. The ask closes when the
+/// session exits.
+#[test]
+fn a_resumed_session_gets_its_request_only_once_its_input_box_is_ready() {
+    let (_dir, repo, db) = fixture();
+    let mut backend = TestWorkspace::new(&db, false, VALID_AGENT);
+    let (run, first_landed) = parked_conflict(&repo, &db, &backend);
+    backend.registration_timeout = Duration::from_secs(2);
+    *backend.screen.lock().unwrap() = BOOT_SCREEN.into();
+    let mut queue = SqliteQueue::open(&db).unwrap();
+    backend.resume_script_for(
+        2,
+        "await_message; resolve; receipt \"$(git rev-parse HEAD)\"; idle; await_exit",
+    );
+    let outcome = thread::scope(|scope| {
+        scope.spawn(|| {
+            let started = Instant::now();
+            // Nothing is typed while the session boots.
+            while started.elapsed() < Duration::from_secs(4) {
+                assert!(backend.texts().is_empty());
+                thread::sleep(Duration::from_millis(20));
+            }
+            *backend.screen.lock().unwrap() = READY_SCREEN.into();
+        });
+        supervise(&db, &repo, &backend).unwrap()
+    });
+    backend.join();
+    assert_eq!(outcome["errors"], json!([]), "{outcome}");
+    let detail = queue.show(TaskId::new(2)).unwrap();
+    assert_landed(&repo, &detail.runs[0], "second", &first_landed);
+    assert_eq!(backend.texts().len(), 1);
+    let not_ready = payloads(&detail, "input_not_ready");
+    assert_eq!(not_ready.len(), 1, "{:?}", event_kinds(&detail));
+    assert_eq!(not_ready[0]["waited_secs"], 2);
+    assert_eq!(not_ready[0]["prompt"], Value::Null);
+    assert!(
+        not_ready[0]["excerpt"]
+            .as_str()
+            .unwrap()
+            .contains("'session'")
+    );
+    let asks = queue
+        .asks(AskQuery {
+            all: true,
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(asks.len(), 1, "{asks:?}");
+    assert_eq!(asks[0].kind, AskKind::AnswerPrompt);
+    assert_eq!(asks[0].run_id.as_ref(), Some(run.id()));
+    assert!(
+        asks[0].question.contains("input box is not ready"),
+        "{}",
+        asks[0].question
+    );
+    assert_eq!(
+        asks[0].answer.as_deref(),
+        Some("the input box got ready and the request was sent; closed by the runtime")
+    );
+    assert!(payloads(&detail, "submit_retried").is_empty());
+}
+
+/// Task 285: a request whose Enter a long paste swallowed stays in the
+/// input box; Enter alone goes again, the text is typed once, and the run
+/// goes on as usual.
+#[test]
+fn a_request_left_in_the_input_box_gets_enter_again_not_the_text() {
+    let (_dir, repo, db) = fixture();
+    let backend = TestWorkspace::new(&db, false, VALID_AGENT);
+    let (_run, first_landed) = parked_conflict(&repo, &db, &backend);
+    backend.swallowed_enters.store(2, Ordering::SeqCst);
+    let mut queue = SqliteQueue::open(&db).unwrap();
+    backend.resume_script_for(
+        2,
+        "await_message; resolve; receipt \"$(git rev-parse HEAD)\"; idle; await_exit",
+    );
+    let outcome = supervise(&db, &repo, &backend).unwrap();
+    backend.join();
+    assert_eq!(outcome["errors"], json!([]), "{outcome}");
+    let detail = queue.show(TaskId::new(2)).unwrap();
+    assert_landed(&repo, &detail.runs[0], "second", &first_landed);
+    assert_eq!(backend.texts().len(), 1);
+    assert_eq!(backend.enters.load(Ordering::SeqCst), 2);
+    let retried = payloads(&detail, "submit_retried");
+    assert_eq!(retried.len(), 1, "{:?}", event_kinds(&detail));
+    assert_eq!(retried[0]["what"], "resolution request");
+    assert_eq!(retried[0]["input"], "text");
+    assert_eq!(retried[0]["retries"], 2);
+    assert_eq!(retried[0]["submitted"], true);
+    assert!(payloads(&detail, "submit_unconfirmed").is_empty());
+    assert!(
+        queue
+            .asks(AskQuery {
+                all: true,
+                ..Default::default()
+            })
+            .unwrap()
+            .is_empty()
+    );
+}
+
+/// Task 285: a request still in the input box after the Enters sent again
+/// is recorded and raised to the inbox as an `answer_prompt` ask; `/exit`
+/// left there gets Enter again too but is never typed twice.
+#[test]
+fn a_request_stuck_in_the_input_box_is_asked_to_the_inbox() {
+    let (_dir, repo, db) = fixture();
+    let backend = TestWorkspace::new(&db, false, VALID_AGENT);
+    let (run, _) = parked_conflict(&repo, &db, &backend);
+    backend.swallowed_enters.store(1000, Ordering::SeqCst);
+    let mut queue = SqliteQueue::open(&db).unwrap();
+    // The fake session still reads the request, so the run resolves.
+    backend.resume_script_for(
+        2,
+        "await_message; resolve; receipt \"$(git rev-parse HEAD)\"; idle; await_exit",
+    );
+    let outcome = supervise(&db, &repo, &backend).unwrap();
+    backend.join();
+    assert_eq!(outcome["errors"], json!([]), "{outcome}");
+    let detail = queue.show(TaskId::new(2)).unwrap();
+    let unconfirmed = payloads(&detail, "submit_unconfirmed");
+    assert_eq!(unconfirmed.len(), 2, "{:?}", event_kinds(&detail));
+    assert_eq!(unconfirmed[0]["input"], "text");
+    assert_eq!(unconfirmed[0]["retries"], 3);
+    assert!(
+        unconfirmed[0]["excerpt"]
+            .as_str()
+            .unwrap()
+            .contains("do not run /exit")
+    );
+    assert_eq!(unconfirmed[1]["input"], "exit");
+    // Three Enters after the request and three after /exit, sent once.
+    assert_eq!(backend.enters.load(Ordering::SeqCst), 6);
+    assert_eq!(backend.texts().len(), 1);
+    assert_eq!(backend.exits_sent.load(Ordering::SeqCst), 1);
+    let asks = queue
+        .asks(AskQuery {
+            all: true,
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(asks.len(), 1, "{asks:?}");
+    assert_eq!(asks[0].kind, AskKind::AnswerPrompt);
+    assert_eq!(asks[0].run_id.as_ref(), Some(run.id()));
+    assert!(
+        asks[0].question.contains(
+            "resolution request the supervisor typed stays in the input box after 4 Enters"
+        ),
+        "{}",
+        asks[0].question
+    );
+    assert!(asks[0].closed_at.is_some());
+}
+
+/// Task 285: a request the session never got (typed into a box that lost
+/// it) shows no sign of work within `start_wait`; with the input box empty
+/// it is sent once more, and the run goes on without waiting out the
+/// resume timeout.
+#[test]
+fn a_lost_request_is_sent_again_after_no_sign_of_work() {
+    let (_dir, repo, db) = fixture();
+    let mut backend = TestWorkspace::new(&db, false, VALID_AGENT);
+    let (_run, first_landed) = parked_conflict(&repo, &db, &backend);
+    backend.start_wait = Duration::from_secs(1);
+    backend.dropped_texts.store(1, Ordering::SeqCst);
+    let mut queue = SqliteQueue::open(&db).unwrap();
+    backend.resume_script_for(
+        2,
+        "await_message; resolve; receipt \"$(git rev-parse HEAD)\"; idle; await_exit",
+    );
+    let outcome = supervise(&db, &repo, &backend).unwrap();
+    backend.join();
+    assert_eq!(outcome["errors"], json!([]), "{outcome}");
+    let detail = queue.show(TaskId::new(2)).unwrap();
+    assert_landed(&repo, &detail.runs[0], "second", &first_landed);
+    let texts = backend.texts();
+    assert_eq!(texts.len(), 2);
+    assert_eq!(texts[0], texts[1]);
+    let resent = payloads(&detail, "submit_resent");
+    assert_eq!(resent.len(), 1, "{:?}", event_kinds(&detail));
+    assert_eq!(resent[0]["what"], "resolution request");
+    assert_eq!(resent[0]["waited_secs"], 1);
+    assert!(payloads(&detail, "submit_not_started").is_empty());
+    assert!(
+        queue
+            .asks(AskQuery {
+                all: true,
+                ..Default::default()
+            })
+            .unwrap()
+            .is_empty()
+    );
+}
+
+/// Task 285: a request lost twice is not sent a third time: the run
+/// records `submit_not_started` and asks the inbox.
+#[test]
+fn a_request_lost_twice_is_asked_to_the_inbox() {
+    let (_dir, repo, db) = fixture();
+    let mut backend = TestWorkspace::new(&db, false, VALID_AGENT);
+    let (run, _) = parked_conflict(&repo, &db, &backend);
+    backend.start_wait = Duration::from_secs(1);
+    backend.resume_timeout = Duration::from_secs(4);
+    backend.dropped_texts.store(usize::MAX, Ordering::SeqCst);
+    let mut queue = SqliteQueue::open(&db).unwrap();
+    // It never gets the request, and exits at the /exit of the resume timeout.
+    backend.resume_script_for(2, "await_exit");
+    let outcome = supervise(&db, &repo, &backend).unwrap();
+    backend.join();
+    assert_eq!(outcome["errors"], json!([]), "{outcome}");
+    let detail = queue.show(TaskId::new(2)).unwrap();
+    // Each resume (three, all unresolved) sends it twice and asks once.
+    let resumes = payloads(&detail, "resume_started").len();
+    assert_eq!(resumes, 3, "{:?}", event_kinds(&detail));
+    assert_eq!(backend.texts().len(), 2 * resumes);
+    let not_started = payloads(&detail, "submit_not_started");
+    assert_eq!(not_started.len(), resumes, "{:?}", event_kinds(&detail));
+    assert!(not_started.iter().all(|p| p["resent"] == true));
+    assert_eq!(payloads(&detail, "submit_resent").len(), resumes);
+    let asks = queue
+        .asks(AskQuery {
+            all: true,
+            ..Default::default()
+        })
+        .unwrap()
+        .into_iter()
+        .filter(|a| a.kind == AskKind::AnswerPrompt)
+        .collect::<Vec<_>>();
+    assert_eq!(asks.len(), resumes, "{asks:?}");
+    assert_eq!(asks[0].run_id.as_ref(), Some(run.id()));
+    // Each closes once its session exited.
+    assert!(asks.iter().all(|a| a.closed_at.is_some()));
+    assert!(
+        asks[0].question.contains(
+            "showed no sign of work within 1s of the resolution request the supervisor sent twice"
+        ),
+        "{}",
+        asks[0].question
+    );
+}
+
 #[test]
 fn a_resumed_session_that_ignores_exit_is_let_go() {
     let (_dir, repo, db) = fixture();
@@ -9720,7 +10047,7 @@ fn a_concern_sent_back_is_resumed_reviewed_again_and_landed() {
     // The resumed session stayed open through the review: validation,
     // review, then /exit and the close of its workspace, then the landing.
     let finished = payloads(&detail, "resume_finished");
-    assert_eq!(finished.len(), 1);
+    assert_eq!(finished.len(), 1, "{finished:?} {:?}", event_kinds(&detail));
     assert_eq!(finished[0]["outcome"], "resolved");
     assert_eq!(finished[0]["status"], "validating");
     assert_eq!(finished[0]["workspace_closed"], false);
