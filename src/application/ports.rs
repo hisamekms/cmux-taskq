@@ -346,6 +346,8 @@ pub struct IdleHook {
     /// Background work the agent left running when it stopped: a `/exit`
     /// sent now stops at the agent's own dialog.
     pub background_running: bool,
+    /// The background tasks still `running` when it stopped.
+    pub background_tasks: Vec<crate::domain::stall::BackgroundTask>,
     /// The fields of the hook input recorded with the evidence of a stop,
     /// by name.
     pub evidence: Vec<(&'static str, serde_json::Value)>,

@@ -10,7 +10,10 @@
 use serde_json::Value;
 
 use super::adapters::ClaudeCode;
-use crate::application::{AgentSignals, IdleHook};
+use crate::{
+    application::{AgentSignals, IdleHook},
+    domain::stall::BackgroundTask,
+};
 
 /// `prompt_waiting` carries this many last non-empty lines of the screen.
 const PROMPT_EXCERPT_LINES: usize = 15;
@@ -200,13 +203,23 @@ fn screen_tail(screen: &str, count: usize) -> String {
 /// or one that is not JSON, counts as idle.
 pub fn idle_hook(content: &[u8]) -> IdleHook {
     let hook: Value = serde_json::from_slice(content).unwrap_or(Value::Null);
-    let background_running = hook
+    let text = |task: &Value, name: &str| task[name].as_str().unwrap_or_default().to_owned();
+    let background_tasks: Vec<BackgroundTask> = hook
         .get("background_tasks")
         .and_then(Value::as_array)
-        .is_some_and(|tasks| tasks.iter().any(|task| task["status"] == "running"));
+        .into_iter()
+        .flatten()
+        .filter(|task| task["status"] == "running")
+        .map(|task| BackgroundTask {
+            id: text(task, "id"),
+            description: text(task, "description"),
+            command: text(task, "command"),
+        })
+        .collect();
     let field = |name: &'static str| (name, hook.get(name).cloned().unwrap_or(Value::Null));
     IdleHook {
-        background_running,
+        background_running: !background_tasks.is_empty(),
+        background_tasks,
         evidence: vec![
             field("hook_event_name"),
             field("session_id"),
@@ -506,7 +519,23 @@ worktree on  dagq/68a96a60 took 8h32m49s
         ] {
             let idle = claude.idle_hook(hook.to_string().as_bytes());
             assert_eq!(idle.background_running, running, "{hook}");
+            assert_eq!(idle.background_tasks.len(), usize::from(running), "{hook}");
         }
+        let idle = claude.idle_hook(
+            json!({"background_tasks": [
+                {"id": "b2", "status": "running", "description": "cargo test", "command": "cargo test --locked"}
+            ]})
+            .to_string()
+            .as_bytes(),
+        );
+        assert_eq!(
+            idle.background_tasks,
+            [BackgroundTask {
+                id: "b2".into(),
+                description: "cargo test".into(),
+                command: "cargo test --locked".into(),
+            }]
+        );
         let idle = claude.idle_hook(
             json!({"hook_event_name": "Stop", "session_id": "s1", "stop_hook_active": false})
                 .to_string()

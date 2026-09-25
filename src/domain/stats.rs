@@ -3,14 +3,15 @@
 //! thresholds it crossed. Everything is derived from `run_events`; this
 //! module is a pure function of the events, the task → goal map and a
 //! snapshot of the supervisors' free slots.
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use serde::Serialize;
 use serde_json::Value;
 
 use super::{
-    EventId, GoalId, RunEvent, RunId, TaskId,
+    EventId, GoalId, RunEvent, RunId, RunStatus, TaskId,
     reason::{REPEATED_CODE_KINDS, event_code},
+    stall::{BackgroundTask, StallConfig},
 };
 
 /// Runs returned without `--full`.
@@ -151,19 +152,166 @@ pub struct Stats {
     pub backend_failures: BackendFailures,
     /// The reason codes recorded in the same window as `backend_failures`.
     pub reason_codes: ReasonCodes,
+    /// The runs not finished yet that look stalled now (ADR-0043 decision
+    /// 5), whatever `--since` says; with `--goal`, only that goal's.
+    pub running_alerts: Vec<RunningAlert>,
+    /// Whether `workspace_mismatch` could be judged: cmux's workspaces
+    /// were listed, or why not.
+    pub workspace_check: WorkspaceCheck,
+    /// The thresholds `running_alerts` were judged by, and where they came from.
+    pub stall_config: StallConfigReport,
     /// Pass it to `--since` to read only runs that finish later.
     pub next_cursor: EventId,
 }
 
+/// An alert about a run still in flight (ADR-0043 decision 5): its
+/// `value` and `threshold` are seconds, except for `workspace_mismatch`,
+/// which has neither.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RunningAlert {
+    /// `idle_without_receipt`, `long_background`, `running_outlier` or
+    /// `workspace_mismatch`.
+    pub kind: &'static str,
+    pub task_id: Option<TaskId>,
+    pub run_id: Option<RunId>,
+    /// The watched session (`session`, `resume` or `revise`) of an
+    /// `idle_without_receipt`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub phase: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub value: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub threshold: Option<i64>,
+    /// `run_without_workspace` or `workspace_without_run` for a
+    /// `workspace_mismatch`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<&'static str>,
+    /// The worker workspace no unfinished run owns.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workspace_id: Option<String>,
+    /// For `idle_without_receipt`: whether the supervisor nudged this
+    /// session (`stall_nudged`) and has a `stalled` ask open for the run.
+    /// Neither means the supervisor missed it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub nudged: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub asked: Option<bool>,
+    /// The background tasks the idle marker lists as running.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub background_tasks: Vec<BackgroundTask>,
+}
+
+impl RunningAlert {
+    fn new(kind: &'static str, task_id: Option<TaskId>, run_id: Option<RunId>) -> Self {
+        Self {
+            kind,
+            task_id,
+            run_id,
+            phase: None,
+            value: None,
+            threshold: None,
+            reason: None,
+            workspace_id: None,
+            nudged: None,
+            asked: None,
+            background_tasks: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum WorkspaceCheck {
+    /// cmux listed this many workspaces.
+    Checked { workspaces: usize },
+    /// cmux could not be asked; no `workspace_mismatch` is judged.
+    Unavailable { reason: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct StallConfigReport {
+    #[serde(flatten)]
+    pub config: StallConfig,
+    /// `supervisor` (the latest `stall_config_loaded`), `file` (the
+    /// `[stall]` of `dagq.toml`) or `default`.
+    pub source: &'static str,
+}
+
+/// A workspace cmux lists: its stable ID and its description.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListedWorkspace {
+    pub id: String,
+    pub description: Option<String>,
+}
+
+/// cmux's workspaces, or why they could not be listed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Workspaces {
+    Listed(Vec<ListedWorkspace>),
+    Unavailable(String),
+}
+
+/// What `stats` reads of a run not finished yet outside the queue: the
+/// files in its run directory, as unix milliseconds of their last write.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiveRun {
+    pub run_id: RunId,
+    pub task_id: TaskId,
+    pub status: RunStatus,
+    /// The worker workspace the run was given.
+    pub workspace_id: Option<String>,
+    /// The idle marker, with the background tasks it lists as running.
+    pub idle: Option<(i64, Vec<BackgroundTask>)>,
+    pub receipt: Option<i64>,
+    /// The last input the session took (the agent's prompt-submit
+    /// marker), for an agent that writes one.
+    pub input: Option<i64>,
+}
+
+/// The state `running_alerts` are judged on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiveSnapshot {
+    /// The queue's runs not finished yet.
+    pub runs: Vec<LiveRun>,
+    /// Every run of the queue, with its task: a workspace naming one of
+    /// them belongs to this queue.
+    pub known_runs: HashMap<RunId, TaskId>,
+    /// The inbox's, planner's and supervisor's workspaces (`session_workspaces`).
+    pub session_workspaces: Vec<String>,
+    pub workspaces: Workspaces,
+    /// The queue's hash, which its worker workspaces' descriptions carry.
+    pub queue_hash: String,
+    pub config: StallConfigReport,
+}
+
+impl Default for LiveSnapshot {
+    /// No run in flight, no workspace listed, the default thresholds.
+    fn default() -> Self {
+        Self {
+            runs: Vec::new(),
+            known_runs: HashMap::new(),
+            session_workspaces: Vec::new(),
+            workspaces: Workspaces::Unavailable("not listed".to_owned()),
+            queue_hash: String::new(),
+            config: StallConfigReport {
+                config: StallConfig::default(),
+                source: "default",
+            },
+        }
+    }
+}
+
 /// Aggregate `events` (every `run_events` row, ascending id). `goals` maps a
 /// task to its goal, `now` is the unix second the open waits are measured
-/// to, and `slots` is the supervisors' snapshot for the idle alert.
+/// to, `slots` is the supervisors' snapshot for the idle alert and `live`
+/// what the running alerts are judged on.
 pub fn stats(
     events: &[RunEvent],
     goals: &HashMap<TaskId, Option<GoalId>>,
     now: i64,
     slots: SlotSnapshot,
     query: &StatsQuery,
+    live: &LiveSnapshot,
 ) -> Stats {
     let latest = events.iter().map(|e| e.id).max().unwrap_or(EventId::new(0));
     let in_goal = |task_id: TaskId| {
@@ -172,6 +320,18 @@ pub fn stats(
             .is_none_or(|goal| goals.get(&task_id).copied().flatten() == Some(goal))
     };
     let tracks = runs(events, goals);
+    let running_alerts = running_alerts(events, &tracks, now, live)
+        .into_iter()
+        .filter(|alert| alert.task_id.is_none_or(in_goal))
+        .collect();
+    let workspace_check = match &live.workspaces {
+        Workspaces::Listed(workspaces) => WorkspaceCheck::Checked {
+            workspaces: workspaces.len(),
+        },
+        Workspaces::Unavailable(reason) => WorkspaceCheck::Unavailable {
+            reason: reason.clone(),
+        },
+    };
     let mut first_event: HashMap<&str, EventId> = HashMap::new();
     for event in events {
         if let Some(run_id) = &event.run_id {
@@ -344,8 +504,275 @@ pub fn stats(
         alerts,
         backend_failures,
         reason_codes,
+        running_alerts,
+        workspace_check,
+        stall_config: live.config.clone(),
         next_cursor,
     }
+}
+
+/// The session the supervisor watches for a run in `status` now, by its
+/// events: `session` (the worker's own, from its latest `agent_started`),
+/// `resume` (a `resume_started` with no end yet) or `revise` (a
+/// `revise_requested` the session has not answered), with the unix
+/// millisecond it started. `None` when no session is watched.
+fn watched_phase(status: RunStatus, events: &[&RunEvent]) -> Option<(&'static str, i64)> {
+    let latest = |kinds: &[&str]| {
+        events
+            .iter()
+            .rev()
+            .find(|event| kinds.contains(&event.kind.as_str()))
+            .copied()
+    };
+    let at = |event: &RunEvent| timestamp_millis(&event.created_at);
+    match status {
+        RunStatus::Running => {
+            let start = latest(&["agent_started"]).or_else(|| latest(&["run_claimed"]))?;
+            Some(("session", at(start)?))
+        }
+        RunStatus::NeedsSession => {
+            let event = latest(&["resume_started", "resume_finished", "resume_skipped"])?;
+            (event.kind == "resume_started")
+                .then(|| at(event).map(|start| ("resume", start)))
+                .flatten()
+        }
+        RunStatus::Validating | RunStatus::AwaitingIntegration => {
+            let event = latest(&[
+                "validation_finished",
+                "review_started",
+                "review_finished",
+                "revise_requested",
+                "revise_finished",
+                "revise_receipt_rejected",
+                "conflict_precheck",
+                "conflict_resolved",
+            ])?;
+            (event.kind == "revise_requested")
+                .then(|| at(event).map(|start| ("revise", start)))
+                .flatten()
+        }
+        _ => None,
+    }
+}
+
+/// The run a worker workspace's description names, with the queue hash it
+/// names: `dagq role=worker queue=<hash> run=<id> task=<id>` for the
+/// worker's own workspace, `run <id> resume` (no hash) for a resume's.
+fn described_run(description: &str) -> Option<(Option<&str>, &str)> {
+    let words: Vec<&str> = description.split_whitespace().collect();
+    match words.as_slice() {
+        ["run", run, "resume"] => Some((None, run)),
+        ["dagq", fields @ ..] => {
+            let field = |name: &str| {
+                fields
+                    .iter()
+                    .find_map(|field| field.strip_prefix(name)?.strip_prefix('='))
+            };
+            (field("role")? == "worker").then_some((field("queue"), field("run")?))
+        }
+        _ => None,
+    }
+}
+
+/// The alerts about runs still in flight (ADR-0043 decision 5), judged at
+/// `now` (unix seconds) on `live`.
+fn running_alerts(
+    events: &[RunEvent],
+    tracks: &[Track],
+    now: i64,
+    live: &LiveSnapshot,
+) -> Vec<RunningAlert> {
+    let now_ms = now * 1000;
+    let config = &live.config.config;
+    let asks = open_asks(events);
+    // The work medians over every finished run, per goal.
+    let mut works: HashMap<Option<GoalId>, Vec<i64>> = HashMap::new();
+    for track in tracks
+        .iter()
+        .filter(|t| t.stats.finished_event_id.is_some())
+    {
+        if let Some(work) = track.stats.work {
+            works.entry(track.stats.goal_id).or_default().push(work);
+        }
+    }
+    let medians: HashMap<Option<GoalId>, i64> = works
+        .into_iter()
+        .filter_map(|(goal, mut works)| Some((goal, median(&mut works)?)))
+        .collect();
+    let listed: Option<Vec<(&ListedWorkspace, Option<&str>)>> = match &live.workspaces {
+        Workspaces::Listed(workspaces) => Some(
+            workspaces
+                .iter()
+                .map(|workspace| {
+                    let run = workspace
+                        .description
+                        .as_deref()
+                        .and_then(described_run)
+                        .filter(|(queue, run)| match queue {
+                            Some(queue) => *queue == live.queue_hash,
+                            None => live.known_runs.keys().any(|known| known.as_str() == *run),
+                        })
+                        .map(|(_, run)| run);
+                    (workspace, run)
+                })
+                .collect(),
+        ),
+        Workspaces::Unavailable(_) => None,
+    };
+    let mut alerts = Vec::new();
+    for run in &live.runs {
+        let run_events: Vec<&RunEvent> = events
+            .iter()
+            .filter(|event| event.run_id.as_ref() == Some(&run.run_id))
+            .collect();
+        let since = |start: i64, kind: &str| {
+            run_events.iter().any(|event| {
+                event.kind == kind
+                    && timestamp_millis(&event.created_at).is_some_and(|at| at >= start)
+            })
+        };
+        let open_ask = |kinds: &[&str]| {
+            asks.iter().any(|ask| {
+                ask.run_id.as_ref() == Some(&run.run_id)
+                    && ask
+                        .kind
+                        .as_deref()
+                        .is_some_and(|kind| kinds.contains(&kind))
+            })
+        };
+        let phase = watched_phase(run.status, &run_events);
+        if let (Some((phase, start)), Some((idle, background))) = (phase, &run.idle) {
+            let dialog = run_events
+                .iter()
+                .rev()
+                .find(|event| matches!(event.kind.as_str(), "prompt_waiting" | "prompt_cleared"))
+                .is_some_and(|event| {
+                    event.kind == "prompt_waiting"
+                        && timestamp_millis(&event.created_at).is_some_and(|at| at >= start)
+                });
+            let idle_secs = (now_ms - idle) / 1000;
+            if *idle > start
+                && run.receipt.is_none_or(|receipt| receipt <= start)
+                && run.input.is_none_or(|input| input <= *idle)
+                && !dialog
+                && !open_ask(&["worker_question", "answer_prompt"])
+                && idle_secs > config.idle_without_receipt_secs
+            {
+                let mut alert = RunningAlert::new(
+                    "idle_without_receipt",
+                    Some(run.task_id),
+                    Some(run.run_id.clone()),
+                );
+                alert.phase = Some(phase);
+                alert.value = Some(idle_secs);
+                alert.threshold = Some(config.idle_without_receipt_secs);
+                alert.nudged = Some(since(start, "stall_nudged"));
+                alert.asked = Some(open_ask(&["stalled"]));
+                alert.background_tasks.clone_from(background);
+                alerts.push(alert);
+            }
+        }
+        // Background work of a session that has not ended since the marker.
+        // A session handed to validation alive (`session_live`, or a resume
+        // finished into `validating`) has not ended (ADR-0027).
+        let ended = |idle: i64| {
+            run_events.iter().any(|event| {
+                timestamp_millis(&event.created_at).is_some_and(|at| at >= idle)
+                    && match event.kind.as_str() {
+                        "workspace_closed" => true,
+                        "supervision_finished" => event.payload["session_live"] != true,
+                        "resume_finished" => {
+                            event.payload["status"] != RunStatus::Validating.as_str()
+                        }
+                        _ => false,
+                    }
+            })
+        };
+        if let Some((idle, background)) = &run.idle
+            && !background.is_empty()
+            && !ended(*idle)
+        {
+            let running = (now_ms - idle) / 1000;
+            if running > config.background_alert_secs {
+                let mut alert = RunningAlert::new(
+                    "long_background",
+                    Some(run.task_id),
+                    Some(run.run_id.clone()),
+                );
+                alert.value = Some(running);
+                alert.threshold = Some(config.background_alert_secs);
+                alert.background_tasks.clone_from(background);
+                alerts.push(alert);
+            }
+        }
+        if run.status == RunStatus::Running
+            && let Some(track) = tracks.iter().find(|t| t.stats.run_id == run.run_id)
+            && let Some(claimed) = track.claimed
+            && let Some(&median) = medians.get(&track.stats.goal_id)
+            && median > 0
+        {
+            let running = (now_ms - claimed) / 1000;
+            if running > median * WORK_MEDIAN_FACTOR {
+                let mut alert = RunningAlert::new(
+                    "running_outlier",
+                    Some(run.task_id),
+                    Some(run.run_id.clone()),
+                );
+                alert.value = Some(running);
+                alert.threshold = Some(median * WORK_MEDIAN_FACTOR);
+                alerts.push(alert);
+            }
+        }
+        if let (Some(listed), Some(_)) = (&listed, phase) {
+            let known: HashSet<&str> = run
+                .workspace_id
+                .iter()
+                .map(String::as_str)
+                .chain(
+                    run_events
+                        .iter()
+                        .filter(|event| event.kind == "resume_finished")
+                        .filter_map(|event| event.payload["workspace_id"].as_str()),
+                )
+                .collect();
+            let open = listed.iter().any(|(workspace, owner)| {
+                *owner == Some(run.run_id.as_str())
+                    || known
+                        .iter()
+                        .any(|id| id.eq_ignore_ascii_case(&workspace.id))
+            });
+            if !open {
+                let mut alert = RunningAlert::new(
+                    "workspace_mismatch",
+                    Some(run.task_id),
+                    Some(run.run_id.clone()),
+                );
+                alert.reason = Some("run_without_workspace");
+                alert.workspace_id.clone_from(&run.workspace_id);
+                alerts.push(alert);
+            }
+        }
+    }
+    for (workspace, owner) in listed.iter().flatten() {
+        let Some(owner) = owner else { continue };
+        if live
+            .session_workspaces
+            .iter()
+            .any(|id| id.eq_ignore_ascii_case(&workspace.id))
+            || live.runs.iter().any(|run| run.run_id.as_str() == *owner)
+        {
+            continue;
+        }
+        let run_id = RunId::new(*owner).ok();
+        let task_id = run_id
+            .as_ref()
+            .and_then(|run_id| live.known_runs.get(run_id).copied());
+        let mut alert = RunningAlert::new("workspace_mismatch", task_id, run_id);
+        alert.reason = Some("workspace_without_run");
+        alert.workspace_id = Some(workspace.id.clone());
+        alerts.push(alert);
+    }
+    alerts
 }
 
 /// Count the reason codes of the events with `after < id <= upto` whose
@@ -567,6 +994,8 @@ fn runs(events: &[RunEvent], goals: &HashMap<TaskId, Option<GoalId>>) -> Vec<Tra
 struct OpenAsk {
     task_id: Option<TaskId>,
     run_id: Option<RunId>,
+    /// The ask's kind, as `ask_opened` recorded it.
+    kind: Option<String>,
     opened_ms: i64,
 }
 
@@ -592,6 +1021,11 @@ fn open_asks(events: &[RunEvent]) -> Vec<OpenAsk> {
                         OpenAsk {
                             task_id: event.task_id,
                             run_id: event.run_id.clone(),
+                            kind: event
+                                .payload
+                                .get("kind")
+                                .and_then(Value::as_str)
+                                .map(str::to_owned),
                             opened_ms,
                         },
                     ));
@@ -650,6 +1084,408 @@ mod tests {
             payload,
             created_at: String::new(),
         }
+    }
+
+    const T: i64 = 1_800_000_000;
+    const R1: &str = "11111111-1111-4111-8111-111111111111";
+    const R2: &str = "22222222-2222-4222-8222-222222222222";
+    const R3: &str = "33333333-3333-4333-8333-333333333333";
+
+    fn at(secs: i64) -> String {
+        crate::application::timestamp(
+            std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs as u64),
+        )
+    }
+
+    fn run_event(id: i64, run: &str, kind: &str, payload: Value, secs: i64) -> RunEvent {
+        RunEvent {
+            run_id: Some(RunId::new(run).unwrap()),
+            created_at: at(secs),
+            ..event(id, 1, kind, payload)
+        }
+    }
+
+    fn live_run(run: &str, status: RunStatus) -> LiveRun {
+        LiveRun {
+            run_id: RunId::new(run).unwrap(),
+            task_id: TaskId::new(1),
+            status,
+            workspace_id: Some(format!("ws-{run}")),
+            idle: None,
+            receipt: None,
+            input: None,
+        }
+    }
+
+    fn snapshot(runs: Vec<LiveRun>, workspaces: Workspaces) -> LiveSnapshot {
+        LiveSnapshot {
+            known_runs: [R1, R2, R3]
+                .iter()
+                .map(|run| (RunId::new(*run).unwrap(), TaskId::new(1)))
+                .collect(),
+            runs,
+            session_workspaces: vec!["WS-INBOX".to_owned()],
+            workspaces,
+            queue_hash: "hash".to_owned(),
+            config: StallConfigReport {
+                config: StallConfig::default(),
+                source: "default",
+            },
+        }
+    }
+
+    fn running(events: &[RunEvent], live: &LiveSnapshot, now: i64) -> Vec<RunningAlert> {
+        stats(
+            events,
+            &HashMap::new(),
+            now,
+            SlotSnapshot::default(),
+            &StatsQuery::default(),
+            live,
+        )
+        .running_alerts
+    }
+
+    fn cargo_test() -> Vec<BackgroundTask> {
+        vec![BackgroundTask {
+            id: "b1".into(),
+            description: "cargo test".into(),
+            command: "cargo test --locked".into(),
+        }]
+    }
+
+    /// Task 182: the worker stopped waiting for a background `cargo test`
+    /// that never came back, with no receipt.
+    #[test]
+    fn an_idle_session_without_a_receipt_is_an_alert_with_its_background_work() {
+        let events = [
+            run_event(1, R1, "run_claimed", json!({}), T),
+            run_event(2, R1, "agent_started", json!({}), T + 10),
+        ];
+        let mut run = live_run(R1, RunStatus::Running);
+        run.idle = Some(((T + 60) * 1000, cargo_test()));
+        let live = snapshot(vec![run.clone()], Workspaces::Unavailable("none".into()));
+        // Under the threshold: nothing yet.
+        assert!(running(&events, &live, T + 60 + 1200).is_empty());
+        let alerts = running(&events, &live, T + 60 + 1300);
+        assert_eq!(alerts.len(), 1, "{alerts:?}");
+        let alert = &alerts[0];
+        assert_eq!(alert.kind, "idle_without_receipt");
+        assert_eq!(alert.phase, Some("session"));
+        assert_eq!((alert.value, alert.threshold), (Some(1300), Some(1200)));
+        assert_eq!((alert.nudged, alert.asked), (Some(false), Some(false)));
+        assert_eq!(alert.background_tasks, cargo_test());
+        // 10.5 hours later the background work is an alert of its own.
+        let kinds: Vec<_> = running(&events, &live, T + 60 + 37_800)
+            .iter()
+            .map(|alert| alert.kind)
+            .collect();
+        assert_eq!(kinds, ["idle_without_receipt", "long_background"]);
+
+        // A nudge and an open `stalled` ask show the supervisor saw it.
+        let mut seen = events.to_vec();
+        seen.push(run_event(3, R1, "stall_nudged", json!({}), T + 1300));
+        seen.push(run_event(
+            4,
+            R1,
+            "ask_opened",
+            json!({"ask_id": 7, "kind": "stalled"}),
+            T + 2600,
+        ));
+        let alert = &running(&seen, &live, T + 2700)[0];
+        assert_eq!((alert.nudged, alert.asked), (Some(true), Some(true)));
+    }
+
+    #[test]
+    fn a_receipt_an_input_a_question_or_a_dialog_is_not_a_stall() {
+        let now = T + 5000;
+        let events = [run_event(1, R1, "agent_started", json!({}), T)];
+        let idle = |run: &mut LiveRun| run.idle = Some(((T + 60) * 1000, Vec::new()));
+        let alerts = |events: &[RunEvent], run: LiveRun| {
+            running(
+                events,
+                &snapshot(vec![run], Workspaces::Unavailable("none".into())),
+                now,
+            )
+        };
+        let mut run = live_run(R1, RunStatus::Running);
+        idle(&mut run);
+        assert_eq!(alerts(&events, run.clone()).len(), 1);
+        // No marker, no idle.
+        assert!(alerts(&events, live_run(R1, RunStatus::Running)).is_empty());
+        // A receipt of this session.
+        let mut with_receipt = run.clone();
+        with_receipt.receipt = Some((T + 50) * 1000);
+        assert!(alerts(&events, with_receipt).is_empty());
+        // An input taken after the marker: it works again.
+        let mut with_input = run.clone();
+        with_input.input = Some((T + 70) * 1000);
+        assert!(alerts(&events, with_input).is_empty());
+        // A marker of an earlier session.
+        let mut earlier = run.clone();
+        earlier.idle = Some(((T - 60) * 1000, Vec::new()));
+        assert!(alerts(&events, earlier).is_empty());
+        // A question to the inbox, or a dialog, waits for a person.
+        for (kind, payload) in [
+            (
+                "ask_opened",
+                json!({"ask_id": 1, "kind": "worker_question"}),
+            ),
+            ("ask_opened", json!({"ask_id": 1, "kind": "answer_prompt"})),
+            ("prompt_waiting", json!({"prompt": "choice"})),
+        ] {
+            let mut held = events.to_vec();
+            held.push(run_event(2, R1, kind, payload, T + 30));
+            assert!(alerts(&held, run.clone()).is_empty(), "{kind}");
+        }
+        // Once the dialog is cleared or the question answered, it is one again.
+        let mut cleared = events.to_vec();
+        cleared.push(run_event(2, R1, "prompt_waiting", json!({}), T + 30));
+        cleared.push(run_event(3, R1, "prompt_cleared", json!({}), T + 40));
+        cleared.push(run_event(
+            4,
+            R1,
+            "ask_opened",
+            json!({"ask_id": 2, "kind": "worker_question"}),
+            T + 41,
+        ));
+        cleared.push(run_event(
+            5,
+            R1,
+            "ask_answered",
+            json!({"ask_id": 2}),
+            T + 42,
+        ));
+        assert_eq!(alerts(&cleared, run).len(), 1);
+    }
+
+    #[test]
+    fn resumed_and_revised_sessions_are_watched_from_their_request() {
+        let now = T + 5000;
+        let resume = [
+            run_event(1, R1, "agent_started", json!({}), T - 9000),
+            run_event(2, R1, "resume_started", json!({"attempt": 1}), T),
+        ];
+        let mut run = live_run(R1, RunStatus::NeedsSession);
+        run.idle = Some(((T + 60) * 1000, Vec::new()));
+        // An older receipt does not answer the resume.
+        run.receipt = Some((T - 100) * 1000);
+        let live = snapshot(vec![run.clone()], Workspaces::Unavailable("none".into()));
+        let alerts = running(&resume, &live, now);
+        assert_eq!(alerts[0].phase, Some("resume"), "{alerts:?}");
+        let mut finished = resume.to_vec();
+        finished.push(run_event(
+            3,
+            R1,
+            "resume_finished",
+            json!({"status": "needs_session"}),
+            T + 30,
+        ));
+        assert!(running(&finished, &live, now).is_empty());
+
+        let revise = [
+            run_event(1, R1, "validation_finished", json!({}), T - 100),
+            run_event(2, R1, "revise_requested", json!({"attempt": 1}), T),
+        ];
+        run.status = RunStatus::AwaitingIntegration;
+        let live = snapshot(vec![run], Workspaces::Unavailable("none".into()));
+        assert_eq!(running(&revise, &live, now)[0].phase, Some("revise"));
+        let mut answered = revise.to_vec();
+        answered.push(run_event(3, R1, "revise_finished", json!({}), T + 30));
+        assert!(running(&answered, &live, now).is_empty());
+    }
+
+    #[test]
+    fn background_work_of_an_ended_session_is_no_alert() {
+        let mut run = live_run(R1, RunStatus::AwaitingIntegration);
+        run.idle = Some((T * 1000, cargo_test()));
+        run.receipt = Some((T - 10) * 1000);
+        let live = snapshot(vec![run], Workspaces::Unavailable("none".into()));
+        let events = [run_event(1, R1, "validation_finished", json!({}), T - 5)];
+        let alerts = running(&events, &live, T + 1801);
+        assert_eq!(alerts.len(), 1);
+        assert_eq!(alerts[0].kind, "long_background");
+        assert_eq!(alerts[0].phase, None);
+        // Handed to validation with the session alive (the B type of task 242):
+        // still running.
+        let mut live_session = events.to_vec();
+        live_session.push(run_event(
+            2,
+            R1,
+            "supervision_finished",
+            json!({"session_live": true}),
+            T + 5,
+        ));
+        live_session.push(run_event(
+            3,
+            R1,
+            "resume_finished",
+            json!({"status": "validating"}),
+            T + 6,
+        ));
+        assert_eq!(running(&live_session, &live, T + 1801).len(), 1);
+        for (kind, payload) in [
+            ("supervision_finished", json!({"exit_code": 0})),
+            ("resume_finished", json!({"status": "needs_session"})),
+            ("workspace_closed", json!({})),
+        ] {
+            let mut ended = events.to_vec();
+            ended.push(run_event(2, R1, kind, payload, T + 5));
+            assert!(running(&ended, &live, T + 1801).is_empty(), "{kind}");
+        }
+    }
+
+    #[test]
+    fn a_running_run_past_twice_its_goals_median_is_an_outlier() {
+        let mut goals = HashMap::new();
+        goals.insert(TaskId::new(1), Some(GoalId::new(9)));
+        let mut events = Vec::new();
+        for (index, run) in [R2, R3].iter().enumerate() {
+            let base = index as i64 * 10;
+            events.push(run_event(base + 1, run, "run_claimed", json!({}), T));
+            events.push(run_event(
+                base + 2,
+                run,
+                "receipt_observed",
+                json!({}),
+                T + 100,
+            ));
+            events.push(run_event(
+                base + 3,
+                run,
+                "run_integrated",
+                json!({}),
+                T + 200,
+            ));
+        }
+        events.push(run_event(30, R1, "run_claimed", json!({}), T + 1000));
+        let live = snapshot(
+            vec![live_run(R1, RunStatus::Running)],
+            Workspaces::Unavailable("none".into()),
+        );
+        let alerts = |now| {
+            stats(
+                &events,
+                &goals,
+                now,
+                SlotSnapshot::default(),
+                &StatsQuery::default(),
+                &live,
+            )
+            .running_alerts
+        };
+        assert!(alerts(T + 1200).is_empty());
+        let outlier = alerts(T + 1300);
+        assert_eq!(outlier.len(), 1);
+        assert_eq!(outlier[0].kind, "running_outlier");
+        assert_eq!(
+            (outlier[0].value, outlier[0].threshold),
+            (Some(300), Some(200))
+        );
+        // `--goal` of another goal leaves it out.
+        let other = StatsQuery {
+            goal_id: Some(GoalId::new(1)),
+            ..StatsQuery::default()
+        };
+        assert!(
+            stats(
+                &events,
+                &goals,
+                T + 1300,
+                SlotSnapshot::default(),
+                &other,
+                &live
+            )
+            .running_alerts
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn workspaces_and_unfinished_runs_that_do_not_match_are_alerts() {
+        let workspace = |id: &str, description: Option<String>| ListedWorkspace {
+            id: id.to_owned(),
+            description,
+        };
+        let listed = vec![
+            // R1 runs in its own workspace (listed in another case).
+            workspace(&format!("WS-{R1}"), None),
+            // R2 is resumed: its workspace is known by its description.
+            workspace("WS-RESUME", Some(format!("run {R2} resume"))),
+            // R3 finished, and its worker workspace is still open.
+            workspace(
+                "WS-LEFT",
+                Some(format!("dagq role=worker queue=hash run={R3} task=1")),
+            ),
+            // Another queue's worker, the inbox, a person's own workspace.
+            workspace(
+                "WS-OTHER",
+                Some(format!("dagq role=worker queue=other run={R3} task=1")),
+            ),
+            workspace("ws-inbox", Some("dagq role=inbox queue=hash".into())),
+            workspace("WS-MINE", None),
+        ];
+        let events = [
+            run_event(1, R1, "agent_started", json!({}), T),
+            run_event(2, R2, "resume_started", json!({}), T),
+        ];
+        let runs = vec![
+            live_run(R1, RunStatus::Running),
+            live_run(R2, RunStatus::NeedsSession),
+        ];
+        let result = stats(
+            &events,
+            &HashMap::new(),
+            T + 10,
+            SlotSnapshot::default(),
+            &StatsQuery::default(),
+            &snapshot(runs.clone(), Workspaces::Listed(listed.clone())),
+        );
+        assert_eq!(
+            result.workspace_check,
+            WorkspaceCheck::Checked { workspaces: 6 }
+        );
+        let alerts = result.running_alerts;
+        assert_eq!(alerts.len(), 1, "{alerts:?}");
+        assert_eq!(alerts[0].kind, "workspace_mismatch");
+        assert_eq!(alerts[0].reason, Some("workspace_without_run"));
+        assert_eq!(alerts[0].workspace_id.as_deref(), Some("WS-LEFT"));
+        assert_eq!(alerts[0].run_id.as_ref().map(RunId::as_str), Some(R3));
+        assert_eq!(alerts[0].task_id, Some(TaskId::new(1)));
+
+        // Neither workspace of R1 and R2 is open any more.
+        let alerts = running(
+            &events,
+            &snapshot(runs.clone(), Workspaces::Listed(listed[2..].to_vec())),
+            T + 10,
+        );
+        let missing: Vec<_> = alerts
+            .iter()
+            .filter(|alert| alert.reason == Some("run_without_workspace"))
+            .map(|alert| alert.run_id.as_ref().unwrap().as_str())
+            .collect();
+        assert_eq!(missing, [R1, R2]);
+
+        // Without cmux, nothing is judged about workspaces.
+        let result = stats(
+            &events,
+            &HashMap::new(),
+            T + 10,
+            SlotSnapshot::default(),
+            &StatsQuery::default(),
+            &snapshot(runs, Workspaces::Unavailable("cmux is gone".into())),
+        );
+        assert!(result.running_alerts.is_empty());
+        assert_eq!(
+            serde_json::to_value(&result.workspace_check).unwrap(),
+            json!({"status": "unavailable", "reason": "cmux is gone"})
+        );
+        assert_eq!(
+            serde_json::to_value(&result.stall_config).unwrap(),
+            json!({"idle_without_receipt_secs": 1200, "send_confirm_secs": 60, "background_alert_secs": 1800, "source": "default"})
+        );
+        assert_eq!(described_run("dagq role=worker queue=hash"), None);
+        assert_eq!(described_run("run x"), None);
     }
 
     #[test]

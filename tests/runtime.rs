@@ -3488,6 +3488,142 @@ fn orphan_run(repo: &Path, db: &Path, token: &str, wrapper: u32, agent: u32) -> 
     run
 }
 
+/// Workspaces as the test lists them, or a failing cmux.
+struct Listing(Result<Vec<(&'static str, String)>, &'static str>);
+
+impl dagq::application::stats::WorkspaceListing for Listing {
+    fn list_workspaces(&self) -> Result<Vec<dagq::domain::stats::ListedWorkspace>> {
+        match &self.0 {
+            Ok(workspaces) => Ok(workspaces
+                .iter()
+                .map(|(id, description)| dagq::domain::stats::ListedWorkspace {
+                    id: (*id).to_owned(),
+                    description: Some(description.clone()),
+                })
+                .collect()),
+            Err(message) => bail!("{message}"),
+        }
+    }
+}
+
+/// Task 182 (ADR-0043 decision 5): a running worker that stopped with a
+/// background `cargo test` left running and no receipt is in `stats`'s
+/// `running_alerts`, judged by the `[stall]` of the main checkout's
+/// `dagq.toml`, with the cmux workspaces that do not match the runs.
+#[test]
+fn stats_raise_running_alerts_for_a_worker_idle_without_a_receipt() {
+    let (_dir, repo, db) = fixture();
+    fs::write(
+        repo.join("dagq.toml"),
+        "[stall]\nidle_without_receipt_secs = 600\nbackground_alert_secs = 3600\n",
+    )
+    .unwrap();
+    let run = orphan_run(&repo, &db, "owner", dead_pid(), dead_pid());
+    let run_dir = PathBuf::from(run.run_dir().unwrap());
+    fs::write(
+        run_dir.join("idle.json"),
+        r#"{"hook_event_name":"Stop","background_tasks":[{"id":"b1","type":"shell","status":"running","description":"cargo test","command":"cargo test --locked"}]}"#,
+    )
+    .unwrap();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let one_shot = |late: i64| {
+        runtime::OneShot::new(Generators {
+            clock: Arc::new(ManualClock::at(now + late)),
+            ids: Arc::new(FixedIds(Mutex::new(vec![]))),
+        })
+    };
+    let hash = QueueLocation::explicit(&db).hash();
+    let left = Listing(Ok(vec![
+        (
+            "WS-LEFT",
+            format!(
+                "dagq role=worker queue={hash} run=99999999-9999-4999-8999-999999999999 task=7"
+            ),
+        ),
+        (
+            "WS-OTHER",
+            "dagq role=worker queue=other run=x task=1".to_owned(),
+        ),
+    ]));
+
+    // Past 600 seconds of idle, under the hour of background work.
+    let stats = one_shot(700)
+        .stats(&db, &Default::default(), Some(&left))
+        .unwrap();
+    assert_eq!(stats["stall_config"]["source"], "file", "{stats}");
+    assert_eq!(stats["stall_config"]["idle_without_receipt_secs"], 600);
+    assert_eq!(
+        stats["workspace_check"],
+        json!({"status": "checked", "workspaces": 2})
+    );
+    let alerts = stats["running_alerts"].as_array().unwrap();
+    let idle = &alerts[0];
+    assert_eq!(idle["kind"], "idle_without_receipt", "{stats}");
+    assert_eq!(idle["run_id"], run.id().as_str());
+    assert_eq!(idle["phase"], "session");
+    assert_eq!(idle["threshold"], 600);
+    assert!(idle["value"].as_i64().unwrap() >= 699, "{idle}");
+    assert_eq!(idle["nudged"], false);
+    assert_eq!(idle["asked"], false);
+    assert_eq!(
+        idle["background_tasks"][0]["command"],
+        "cargo test --locked"
+    );
+    let mismatches: Vec<_> = alerts
+        .iter()
+        .filter(|alert| alert["kind"] == "workspace_mismatch")
+        .map(|alert| (alert["reason"].clone(), alert["workspace_id"].clone()))
+        .collect();
+    assert_eq!(
+        mismatches,
+        [
+            (json!("run_without_workspace"), json!("ws-1")),
+            (json!("workspace_without_run"), json!("WS-LEFT")),
+        ]
+    );
+    assert!(
+        !alerts
+            .iter()
+            .any(|alert| alert["kind"] == "long_background")
+    );
+    // The finished-run alerts are where they were.
+    assert!(stats["alerts"].as_array().unwrap().is_empty(), "{stats}");
+
+    // Hours later the background work is an alert too; a cmux that cannot
+    // be asked leaves only the workspaces unjudged.
+    let stats = one_shot(4 * 3600)
+        .stats(
+            &db,
+            &Default::default(),
+            Some(&Listing(Err("cmux is gone"))),
+        )
+        .unwrap();
+    let kinds: Vec<_> = stats["running_alerts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|alert| alert["kind"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(kinds, ["idle_without_receipt", "long_background"]);
+    assert_eq!(stats["workspace_check"]["status"], "unavailable");
+    assert!(
+        stats["workspace_check"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("cmux is gone")
+    );
+
+    // A receipt of the session ends the idle alert; without cmux nothing
+    // is said about the workspaces.
+    fs::write(run_dir.join("receipt.json"), "{}").unwrap();
+    let stats = one_shot(700).stats(&db, &Default::default(), None).unwrap();
+    assert_eq!(stats["running_alerts"], json!([]), "{stats}");
+    assert_eq!(stats["workspace_check"]["status"], "unavailable");
+}
+
 #[test]
 fn recover_requires_dead_processes_and_stale_lease_then_allows_a_new_run() {
     let (_dir, repo, db) = fixture();

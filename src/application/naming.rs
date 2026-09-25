@@ -22,8 +22,10 @@ pub fn shell_quote(arg: &str) -> String {
 
 /// `dagq role=<role> queue=<queue hash>[ run=<run-id>][ task=<id>]`: the one
 /// machine-readable description line every workspace of a queue carries,
-/// for people reading `cmux workspace list`; the runtime never reads it back
-/// (ADR-0026).
+/// for people reading `cmux workspace list`. The runtime finds a workspace
+/// by its stable ID, never by this line (ADR-0026); only `stats` reads it
+/// back, to tell which open worker workspaces belong to the queue
+/// (`workspace_mismatch`, ADR-0043 decision 5).
 pub fn workspace_description(
     role: SessionRole,
     queue_hash: &str,

@@ -1246,7 +1246,7 @@ mod stats {
 
     use dagq::domain::{
         EventId, GoalId, RunEvent, RunId, TaskId,
-        stats::{SlotSnapshot, StatsQuery, stats, timestamp_millis},
+        stats::{LiveSnapshot, SlotSnapshot, StatsQuery, stats, timestamp_millis},
     };
     use serde_json::{Value, json};
 
@@ -1388,6 +1388,7 @@ mod stats {
             at(120),
             slots,
             &StatsQuery::default(),
+            &LiveSnapshot::default(),
         ));
         let runs = report["runs"].as_array().unwrap();
         let ids = runs.iter().map(|r| r["run_id"].clone()).collect::<Vec<_>>();
@@ -1463,6 +1464,7 @@ mod stats {
                 goal_id: Some(GoalId::new(7)),
                 ..Default::default()
             },
+            &LiveSnapshot::default(),
         ));
         assert_eq!(goal["runs"].as_array().unwrap().len(), 2);
         assert_eq!(goal["goals"].as_array().unwrap().len(), 1);
@@ -1484,6 +1486,7 @@ mod stats {
                 since: Some(EventId::new(runs[1]["finished_event_id"].as_i64().unwrap())),
                 ..Default::default()
             },
+            &LiveSnapshot::default(),
         ));
         let ids = since["runs"]
             .as_array()
@@ -1506,6 +1509,7 @@ mod stats {
                 )),
                 ..Default::default()
             },
+            &LiveSnapshot::default(),
         ));
         assert_eq!(later["runs"].as_array().unwrap().len(), 1);
         assert!(later["alerts"].as_array().unwrap().contains(&json!({
@@ -1563,6 +1567,7 @@ mod stats {
                 at(8),
                 SlotSnapshot::default(),
                 &query,
+                &LiveSnapshot::default(),
             ))
         };
         let alert = json!({"kind": "backend_failures", "task_id": null, "run_id": null,
@@ -1646,6 +1651,7 @@ mod stats {
             at(60),
             SlotSnapshot::default(),
             &StatsQuery::default(),
+            &LiveSnapshot::default(),
         ));
         assert_eq!(
             report["alerts"],
@@ -1670,6 +1676,7 @@ mod stats {
                 at(2),
                 SlotSnapshot::default(),
                 &query,
+                &LiveSnapshot::default(),
             ))
         };
         let latest = run(StatsQuery::default());

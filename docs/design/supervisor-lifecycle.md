@@ -36,6 +36,7 @@ related:
   - adr-0028
   - adr-0029
   - adr-0031
+  - adr-0043
   - design-persistence
   - design-provider-lifecycle
   - design-plugin-integration
@@ -236,6 +237,19 @@ repository rootの`dagq.toml`の`[run.env]`（[ADR-0040](../adr/0040-verify-once
 - 渡し先: (a) `provision`がworkerのworkspaceを作るとき、`DAGQ_ROLE` / `DAGQ_QUEUE`の後ろに`--env KEY=VALUE`で並べる（ADR-0026の仕組み）。worktreeを作る前に読むので、壊れた`dagq.toml`はprovisioningの失敗になり、workspaceは開かずsupervisorはclaimを止める。(b) `integrate`の`verification_commands`を`Command`のenvに足す（validatingは検証コマンドを実行しない）。読めないファイルは着地処理のエラーで、runは元の状態に戻る。(c) reviewのheadless実行（ADR-0040の決定2）のコマンドのenvに足す。needs_sessionのresumeが開くworkspaceには今は渡していない。
 - `dagq.toml`はrepositoryにcommitされ、値はworkspaceを開く`cmux`のargvに出るので、secretは入れない。
 - この repositoryではtargetを共有せず、`dagq.toml`も置かない（ADR-0040の決定3。ADR-0023の決定3は`CARGO_TARGET_DIR = "${DAGQ_QUEUE_DIR}/target"`を置くとしたが、task 91の着地前のreviewの指摘を受けて2026-09-23にユーザーが決めた）。理由: (a) cargoのlockはbuildだけを直列化し、その後のtest実行は分離されないので、`CARGO_BIN_EXE_dagq`をexecするtest（`tests/cli.rs`・`runtime.rs`・`location.rs`・`plugin.rs`・`e2e.rs`）が、並行する別のrunのbuildが上書きした`target/debug/dagq`を実行しうる。(b) 同時の`cargo llvm-cov`が共有の`llvm-cov-target`のprofrawを消し合い・混ぜ合い、coverageの関門が誤る。buildの共有はsccacheなど安全な方法を別途検討する。
+
+### Stall thresholds
+
+`dagq.toml`の`[stall]`（[ADR-0043](../adr/0043-detect-stalled-worker-sessions-nudge-once-then-ask.md)の決定4）が、止まったworkerのsessionの検知の閾値を秒で持つ。読み込みは`[run.env]`と同じ`src/infrastructure/run_env.rs`（`parse_config`と、fileを読む`load_stall_config`）で、型と既定値は`src/domain/stall.rs`の`StallConfig`。
+
+| 設定名 | 既定値 | 意味 |
+| --- | --- | --- |
+| `idle_without_receipt_secs` | 1200（20分） | receiptの無いidleが促しまで続く時間と、促しの後にaskまで続く時間。`stats`の`idle_without_receipt`の閾値 |
+| `send_confirm_secs` | 60 | 送った文が処理されるのを待つ時間と、Enterの送り直しの後に待つ時間 |
+| `background_alert_secs` | 1800（30分） | `stats`の`long_background`の閾値 |
+
+- 書式は`KEY = 秒`（正の整数。`_`の桁区切りと`#`以降のcommentを許す）。未知のkey、整数でない値、0以下、重複したkeyはエラー。表もkeyも無ければ既定値。
+- `stats`は、supervisorが起動時に記録した最新の`stall_config_loaded`（payloadは3つの値）があればその値を使い（出力の`stall_config.source`が`supervisor`）、無ければmain checkoutの`dagq.toml`（`file`）、それも無ければ既定値（`default`）で判定する。main checkoutはqueueが束縛されたGit common directoryが`.git`ならその親で、そうでなければ既定値。supervisorが`[stall]`を読んで`stall_config_loaded`を記録し、検知に使う部分はgoal 30の後続taskで入る（ADR-0043の決定1〜3）。
 
 ### Prompt
 
@@ -517,7 +531,7 @@ attentionイベントの判定は`domain::event_attention(kind, payload)`（候�
 
 ### `stats`
 
-`dagq stats [--since <event id>] [--goal ID] [--full]`は、run_eventsから時間と閾値超えを導出して返す読むだけのコマンド（[ADR-0040](../adr/0040-verify-once-review-run-env-graph-stats-and-task-priority-in-claim-order.md)の決定5）。新しい表は持たず、集計は`domain::stats::stats`（events、task→goalの対応、今の時刻、supervisorの空きslotのsnapshotを受ける純粋関数）が行い、application層の`application::stats::stats`が`Queue`（`RunStore`の`all_events`・`task_goals`・`supervisors`・`active_runs`と`TaskStore`の`list`・`list_goals`・`candidates`）とsupervisorの生死を見る`ProcessControl`越しに読んで渡すだけ。`src/compose.rs`の`OneShot::stats(db, query)`がqueueを開き、注入された`Clock`で今の時刻を1回読んで呼ぶ入口で、systemの`Generators`で呼ぶ自由関数`stats`を`runtime::stats`として再公開する（observerは自分のqueueの`Generators`で作った`OneShot`から呼ぶ）。
+`dagq stats [--since <event id>] [--goal ID] [--full] [--cmux PATH]`は、run_eventsから時間と閾値超えを導出して返す読むだけのコマンド（[ADR-0040](../adr/0040-verify-once-review-run-env-graph-stats-and-task-priority-in-claim-order.md)の決定5）。走っているrunのalert（ADR-0043の決定5）も返す。新しい表は持たず、集計は`domain::stats::stats`（events、task→goalの対応、今の時刻、supervisorの空きslotのsnapshot、走っているrunのsnapshot`LiveSnapshot`を受ける純粋関数）が行い、application層の`application::stats::stats`が`Queue`（`RunStore`の`all_events`・`task_goals`・`supervisors`・`active_runs`・`all_runs`・`session_workspace`と`TaskStore`の`list`・`list_goals`・`candidates`）、supervisorの生死を見る`ProcessControl`、`StatsSources`（run directoryを読む`RunFiles`、idle markerを読む`AgentSignals`、cmuxのworkspaceを並べる`WorkspaceListing`、queueのhash、`[stall]`を読む関数）越しに読んで渡すだけ。`src/compose.rs`の`OneShot::stats(db, query, workspaces)`がqueueを開き、注入された`Clock`で今の時刻を1回読んで呼ぶ入口で、systemの`Generators`でcmuxを渡さずに呼ぶ自由関数`stats`を`runtime::stats`として再公開する（observerは自分のqueueの`Generators`で作った`OneShot`から、PATHのcmuxを渡して呼ぶ）。
 
 - **対象のrun**: 終わったrun。終わりのイベントは`run_integrated`か、payloadの`status`が`failed` / `interrupted`になった最初のイベントで、そのidが`finished_event_id`。既定は終わった順の直近50件、`--full`で全件。`--since`はそのidがcursorより大きいrunだけにし、50件を超えるときは古い方から50件を返して`next_cursor`をその最後の`finished_event_id`にする（続きは同じ`--since next_cursor`で読める）。それ以外の`next_cursor`は読んだ時点のrun_eventsの最新id（`status`の`cursor`と同じ値）。`--goal`はそのgoalのtaskのrunだけに絞る（alertsも同じ）。
 - **`runs`**: runごとに`run_id`、`task_id`、`goal_id`、`status`（`integrated` / `failed` / `interrupted`）、`finished_event_id`と、秒の区間と回数。区間は端のイベントが無ければnull。
@@ -536,6 +550,14 @@ attentionイベントの判定は`domain::event_attention(kind, payload)`（候�
   - `idle_slots`: staleでないsupervisorの`parallel`の合計から実行中（`integrating`以外の未完了）runを引いた空きslotがあるのに、candidatesがゼロで`ready`のtaskが残っている（依存で詰まっている）。`value`は空きslot数で、`task_id` / `run_id`はnull。readyのtaskが無い空のqueueは詰まりではないので出さない。draftのgoalに属するreadyのtaskは`goal ready`を待っているだけなので数えない。`stats`を読んだ時点のsnapshotで判定し、時間帯の履歴は持たない
   - `backend_failures`: 同じwindowの`backend_call_failed`が2件以上。`value`は件数、`task_id` / `run_id`はnull
 - **`backend_failures`**: `{count, by_op, max_load_avg, max_slots}`。`backend_call_failed`の件数、`op`ごとの件数、記録された`load_avg`の最大（無ければnull）、`slots`の最大（無ければnull）。windowは`--since`があればcursorより後から`next_cursor`まで、無ければ対象のrunの最初のイベントのうち最も古いもの以降（`--full`か対象のrunが無ければ全件）。`--goal`はそのgoalのrunの失敗だけを数える（runの無い失敗は数えない）
+- **`running_alerts`**: まだ終わっていない（`integrated` / `succeeded` / `failed` / `interrupted`以外の）runの、今の状態から導くalert（ADR-0043の決定5、task 290）。`--since`に関係なく毎回出し、`--goal`はそのgoalのtaskのものだけにする。run_events・askに加えて、run directoryの`idle.json`（idle marker。`background_tasks`の`running`の処理）、`prompt-submit.json`（sessionが入力を受けた印。書くhookはgoal 30の後続taskで入り、無ければ見ない）、`receipt_path`のmtimeと、`cmux --json --id-format uuids workspace list`を読む。新しい表は持たない。各要素は`{kind, task_id, run_id, …}`で、`value`と`threshold`は秒。
+  - 見ているsession（`phase`）: `running`のrunは`session`（最新の`agent_started`から。無ければ`run_claimed`）、`needs_session`で最後のresumeのeventが`resume_started`なら`resume`（その時刻から）、`validating` / `awaiting_integration`でreviewの流れの最後のeventが`revise_requested`なら`revise`（その時刻から）。それ以外は見ているsessionが無い。
+  - `idle_without_receipt`: 見ているsessionがあり、idle markerがその開始より新しく、開始より新しいreceiptが無く、markerより新しい`prompt-submit.json`が無く、そのrunに閉じていない`worker_question` / `answer_prompt`のaskも、開始以降の解消していない`prompt_waiting`も無いまま、markerのmtimeから`idle_without_receipt_secs`を超えた。`phase`、`nudged`（開始以降の`stall_nudged`の有無）、`asked`（開いている`stalled`のaskの有無）、`background_tasks`（`id` / `description` / `command`）を添える。`nudged`も`asked`もfalseならsupervisorの検知の漏れ（task 182の型）。
+  - `long_background`: idle markerに`running`の処理があり、markerのmtimeから`background_alert_secs`を超えた。receiptの前後を問わない（receiptの後はtask 242の対象で、ここは観測だけ）。markerより後に`workspace_closed`、`session_live: true`でない`supervision_finished`、`validating`以外への`resume_finished`があれば、sessionは終わっているので出さない（sessionを生かしたままvalidationに渡したrunは、ADR-0027のとおりsessionが続いているので出す）。Claude Codeはmarkerを上書きし処理の開始時刻を書かないので、経過は「最後にturnを閉じてからずっと動いている」下限になる。
+  - `running_outlier`: `running`のrunのclaimからの経過が、そのgoal（goalの無いrunはgoalの無いrun同士）の終わったrun全体（pageに関係なく）の`work`の中央値の2倍を超えた。`threshold`は中央値の2倍。
+  - `workspace_mismatch`: `reason`が`run_without_workspace`なら、見ているsessionのあるrunのworkspace（runの`workspace_id`、`resume_finished`の`workspace_id`、descriptionがそのrunを指すworkspaceのどれか）がlistに無い。`workspace_without_run`なら、このqueueのworkerのworkspace（descriptionが`dagq role=worker queue=<このqueueのhash> run=<id> …`か、queueのrunを指す`run <id> resume`）が、終わっていないrunに対応しない（`workspace_id`を添える）。`session_workspaces`のworkspaceは数えない。cmuxのworkspace groupはlistに出ないので、groupではなくdescriptionで判定する。
+- **`workspace_check`**: `{status: "checked", workspaces}`か`{status: "unavailable", reason}`。`dagq stats`は`--cmux`（既定`cmux`をPATHで探す）で、observerはPATHの`cmux`でlistし、cmuxが無いかlistが失敗したときは`workspace_mismatch`だけを判定せず、他のalertは返す。`stats`自体は失敗しない。
+- **`stall_config`**: 判定に使った閾値3つと`source`（[Stall thresholds](#stall-thresholds)）。
 - **`reason_codes`**: `{count, by_code, by_kind}`（ADR-0034の決定1、task 195）。`backend_failures`と同じwindowと`--goal`の絞り込みで、payloadに`code`を持つイベントの件数、コードごとの件数、kindごと・コードごとの件数。`validation_finished`に添える`evidence_missing` / `scope_violation`のイベントと、失敗した工程のイベントに添える`backend_call_failed`（`backend_failures`が数える）は同じ失敗を2回数えないよう除く。コードの無い古いイベントは数えない（[domain-model](domain-model.md#理由の分類コードcode)）
 
 ### `doctor`

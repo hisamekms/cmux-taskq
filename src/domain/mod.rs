@@ -350,6 +350,7 @@ pub mod proposal;
 pub mod reason;
 pub mod run;
 pub mod scope;
+pub mod stall;
 pub mod stats;
 pub mod task;
 mod views;

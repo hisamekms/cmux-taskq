@@ -483,6 +483,10 @@ enum Command {
         /// Every finished run instead of the latest 50 (or the next 50 past --since).
         #[arg(long)]
         full: bool,
+        /// cmux executable, used to list the workspaces for `workspace_mismatch`; a bare name is
+        /// resolved on PATH.
+        #[arg(long, default_value = "cmux")]
+        cmux: PathBuf,
     },
     /// Report every unfinished run and supervisor, one line's worth each, without changing state.
     Doctor {
@@ -1235,14 +1239,22 @@ fn execute(cli: Cli) -> Result<Value> {
             since,
             goal_id,
             full,
-        } => one_shot.stats(
-            &db,
-            &dagq::domain::stats::StatsQuery {
-                since: since.map(EventId::new),
-                goal_id: goal_id.map(GoalId::new),
-                full,
-            },
-        )?,
+            cmux,
+        } => {
+            use dagq::infrastructure::adapters::{Cmux, executable};
+            // A missing cmux leaves only `workspace_mismatch` unjudged.
+            let cmux = executable(&cmux).ok().map(|executable| Cmux { executable });
+            one_shot.stats(
+                &db,
+                &dagq::domain::stats::StatsQuery {
+                    since: since.map(EventId::new),
+                    goal_id: goal_id.map(GoalId::new),
+                    full,
+                },
+                cmux.as_ref()
+                    .map(|cmux| cmux as &dyn dagq::application::stats::WorkspaceListing),
+            )?
+        }
         Command::Observe {
             since,
             dry_run,

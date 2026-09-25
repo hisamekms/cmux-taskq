@@ -1,9 +1,9 @@
 use crate::{
     application::{
         AgentProvider, CommandSpec, DetachedRefusal, MainRemote, ProcessControl, Repository,
-        SupervisorEnvironment, WorkspaceBackend, WorkspaceTags,
+        SupervisorEnvironment, WorkspaceBackend, WorkspaceTags, stats::WorkspaceListing,
     },
-    domain::{CommitSha, Task, TaskId, TaskRun},
+    domain::{CommitSha, Task, TaskId, TaskRun, stats::ListedWorkspace},
 };
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::Value;
@@ -1106,16 +1106,7 @@ impl WorkspaceBackend for Cmux {
     }
 
     fn exists(&self, workspace_id: &str) -> Result<bool> {
-        let listing = output(Command::new(&self.executable).args([
-            "--json",
-            "--id-format",
-            "uuids",
-            "workspace",
-            "list",
-        ]))?;
-        let listing: Value =
-            serde_json::from_str(&listing).context("decode cmux workspace list")?;
-        Ok(workspace_listed(&listing, workspace_id))
+        Ok(workspace_listed(&self.workspace_listing()?, workspace_id))
     }
 
     fn create_named(
@@ -1157,7 +1148,25 @@ impl WorkspaceBackend for Cmux {
     }
 }
 
+impl WorkspaceListing for Cmux {
+    fn list_workspaces(&self) -> Result<Vec<ListedWorkspace>> {
+        listed_workspaces(&self.workspace_listing()?)
+    }
+}
+
 impl Cmux {
+    /// `cmux --json --id-format uuids workspace list`, decoded.
+    fn workspace_listing(&self) -> Result<Value> {
+        let listing = output(Command::new(&self.executable).args([
+            "--json",
+            "--id-format",
+            "uuids",
+            "workspace",
+            "list",
+        ]))?;
+        serde_json::from_str(&listing).context("decode cmux workspace list")
+    }
+
     /// The detached ping with an explicit deadline. cmux admits a client by
     /// its ancestry, not its environment: a child of one of its terminals
     /// gets through however its variables look, a process under launchd
@@ -1292,6 +1301,30 @@ pub fn workspace_listed(listing: &Value, id: &str) -> bool {
                     .is_some_and(|listed| listed.eq_ignore_ascii_case(id))
             })
         })
+}
+
+/// Every workspace of a `cmux --json --id-format uuids workspace list`
+/// reply, with its description.
+pub fn listed_workspaces(listing: &Value) -> Result<Vec<ListedWorkspace>> {
+    listing
+        .get("workspaces")
+        .and_then(Value::as_array)
+        .context("cmux workspace list has no workspaces")?
+        .iter()
+        .map(|workspace| {
+            Ok(ListedWorkspace {
+                id: workspace
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .context("cmux listed a workspace without an ID")?
+                    .to_owned(),
+                description: workspace
+                    .get("description")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+            })
+        })
+        .collect()
 }
 
 /// The group's UUID in a `cmux --json --id-format uuids workspace-group
@@ -1832,6 +1865,29 @@ mod tests {
         ));
         assert!(!workspace_listed(&listing, "[dagq]inbox"));
         assert!(!workspace_listed(&serde_json::json!({}), "x"));
+    }
+
+    #[test]
+    fn listed_workspaces_read_the_ids_and_descriptions() {
+        let listing = serde_json::json!({"workspaces": [
+            {"id": "A", "description": "dagq role=worker queue=q run=r task=1"},
+            {"id": "B", "description": null}
+        ]});
+        assert_eq!(
+            listed_workspaces(&listing).unwrap(),
+            [
+                ListedWorkspace {
+                    id: "A".into(),
+                    description: Some("dagq role=worker queue=q run=r task=1".into()),
+                },
+                ListedWorkspace {
+                    id: "B".into(),
+                    description: None,
+                },
+            ]
+        );
+        assert!(listed_workspaces(&serde_json::json!({})).is_err());
+        assert!(listed_workspaces(&serde_json::json!({"workspaces": [{}]})).is_err());
     }
 
     #[test]

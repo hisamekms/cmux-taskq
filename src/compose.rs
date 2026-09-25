@@ -31,7 +31,7 @@ use crate::{
         recording::RecordingBackend,
         review::{self as reviewing, Review},
         session::{self as wrapper, Session},
-        stats as statistics,
+        stats::{self as statistics, StatsSources, WorkspaceListing},
         supervise::{self as supervisor, Heartbeat, Layout, LoopSettings, Ports},
     },
     domain::{
@@ -46,7 +46,7 @@ use crate::{
         clock,
         location::{QueueLocation, REPOSITORY_FILE_NAME, data_home, runs_dir},
         process::LocalSpawner,
-        run_env::ShellVerifier,
+        run_env::{ShellVerifier, load_stall_config},
         run_files::LocalRunFiles,
         runtime_store::SqliteOpener,
         sqlite::SqliteQueue,
@@ -332,15 +332,48 @@ impl OneShot {
         )
     }
 
-    /// `stats`: see [`statistics::stats`], measured to these generators' now.
-    pub fn stats(&self, db: &Path, query: &StatsQuery) -> Result<Value> {
+    /// `stats`: see [`statistics::stats`], measured to these generators'
+    /// now. The run directories are read from disk as Claude Code writes
+    /// them, `[stall]` from the `dagq.toml` of the main checkout of the
+    /// repository the queue is bound to, and the workspaces from
+    /// `workspaces` (`None`: `workspace_mismatch` is not judged).
+    pub fn stats(
+        &self,
+        db: &Path,
+        query: &StatsQuery,
+        workspaces: Option<&dyn WorkspaceListing>,
+    ) -> Result<Value> {
         let queue = self.open(db)?;
         let now = self.generators.clock.now();
+        let checkout = queue
+            .repository_binding()?
+            .map(PathBuf::from)
+            .and_then(|common_dir| {
+                (common_dir.file_name() == Some(".git".as_ref()))
+                    .then(|| common_dir.parent().map(Path::to_path_buf))
+                    .flatten()
+            });
+        let config_file = || match &checkout {
+            Some(checkout) => load_stall_config(checkout),
+            None => Ok(None),
+        };
+        let signals = ClaudeCode {
+            executable: PathBuf::from("claude"),
+        };
+        let queue_hash = QueueLocation::explicit(db).hash();
+        let sources = StatsSources {
+            files: &LocalRunFiles,
+            signals: &signals,
+            workspaces,
+            queue_hash: &queue_hash,
+            config_file: &config_file,
+        };
         Ok(serde_json::to_value(statistics::stats(
             &queue,
             &SystemProcesses,
             now,
             query,
+            &sources,
         )?)?)
     }
 
@@ -644,7 +677,7 @@ pub fn rebind(db: &Path, repo: &Path) -> Result<Value> {
     OneShot::system().rebind(db, repo)
 }
 
-/// `stats` on the system clock: see [`OneShot::stats`].
+/// `stats` on the system clock without cmux: see [`OneShot::stats`].
 pub fn stats(db: &Path, query: &StatsQuery) -> Result<Value> {
-    OneShot::system().stats(db, query)
+    OneShot::system().stats(db, query, None)
 }

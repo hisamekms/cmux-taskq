@@ -86,12 +86,19 @@ pub fn observe(db: &Path, provider: &dyn AgentProvider, options: &ObserveOptions
         (None, ObserveMode::Hourly) => read_cursor(&db)?,
         (None, ObserveMode::Daily) => Some(queue.event_id_before(started - DAILY_WINDOW_SECS)?),
     };
+    // The cmux on PATH lists the workspaces for `workspace_mismatch`;
+    // without one, only that alert is left unjudged.
+    let cmux = crate::infrastructure::adapters::executable(Path::new("cmux"))
+        .ok()
+        .map(|executable| crate::infrastructure::adapters::Cmux { executable });
     let stats = crate::compose::OneShot::new(queue.generators().clone()).stats(
         &db,
         &StatsQuery {
             since,
             ..StatsQuery::default()
         },
+        cmux.as_ref()
+            .map(|cmux| cmux as &dyn crate::application::stats::WorkspaceListing),
     )?;
     let cursor = EventId::new(stats["next_cursor"].as_i64().unwrap_or_default());
     let notes = queue.notes(&NoteQuery {

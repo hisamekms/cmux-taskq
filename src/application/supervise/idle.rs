@@ -115,6 +115,7 @@ mod tests {
         fn idle_hook(&self, content: &[u8]) -> IdleHook {
             IdleHook {
                 background_running: content == b"running",
+                background_tasks: Vec::new(),
                 evidence: vec![("hook_event_name", json!("Stop"))],
             }
         }
