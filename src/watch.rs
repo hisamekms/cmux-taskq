@@ -58,7 +58,7 @@ fn read_events(
 
 /// `events --after`: the events after `after`, oldest first.
 pub fn events(db: &Path, after: EventId, limit: usize, all: bool) -> Result<Value> {
-    let queue = SqliteQueue::open(db)?;
+    let queue = SqliteQueue::open_read_only(db)?;
     let upto = queue.latest_event_id()?;
     let (events, cursor) = read_events(&queue, after, upto, limit.max(1), all, None)?;
     Ok(json!({"events": events, "cursor": cursor}))

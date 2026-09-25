@@ -749,6 +749,84 @@ fn opening_or_initializing_an_older_queue_never_migrates_it() {
 }
 
 #[test]
+fn a_read_only_open_never_writes_and_reads_an_older_queue_in_memory() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = queue_before_the_floor(&dir);
+    let raw = Connection::open(&path).unwrap();
+    // A live queue is in WAL mode, with rows not yet checkpointed.
+    raw.pragma_update(None, "journal_mode", "WAL").unwrap();
+    raw.pragma_update(None, "wal_autocheckpoint", 0).unwrap();
+    raw.execute_batch(
+        "INSERT INTO tasks(title,description,acceptance,verification_commands,status)
+         VALUES ('old','','','[]','ready');",
+    )
+    .unwrap();
+    let version = || -> i64 {
+        raw.pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap()
+    };
+    let tables = || -> i64 {
+        raw.query_row("SELECT count(*) FROM sqlite_master", [], |r| r.get(0))
+            .unwrap()
+    };
+    let before = tables();
+    // The older queue is read as migrated, from a copy: the file is left at
+    // schema 23 with its tables as they were (ADR-0045 decision 18).
+    let mut queue = SqliteQueue::open_read_only(&path).unwrap();
+    assert_eq!(queue.schema_version().unwrap(), SqliteQueue::SCHEMA_VERSION);
+    let listed = queue.list(&TaskQuery::default()).unwrap();
+    assert_eq!(listed.total, 1);
+    assert_eq!(queue.show(TaskId::new(1)).unwrap().task.title(), "old");
+    dependency_graph(queue.graph_input().unwrap(), None);
+    // A write reaches only the copy.
+    queue.add(new_task("in memory")).unwrap();
+    drop(queue);
+    assert_eq!((version(), tables()), (23, before));
+    assert_eq!(
+        raw.query_row("SELECT count(*) FROM tasks", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+    assert!(!dir.path().join("backups").exists());
+
+    // At this binary's schema the file itself is opened, and read-only.
+    SqliteQueue::migrate(&path, None, 0).unwrap();
+    let mut queue = SqliteQueue::open_read_only(&path).unwrap();
+    assert_eq!(queue.list(&TaskQuery::default()).unwrap().total, 1);
+    let error = queue.add(new_task("refused")).err().unwrap();
+    assert!(format!("{error:#}").contains("readonly"), "{error:#}");
+    drop(queue);
+
+    // A newer queue within the floor is read as it is.
+    apply_future_compatible_migration(&raw);
+    let mut queue = SqliteQueue::open_read_only(&path).unwrap();
+    assert_eq!(
+        queue.schema_version().unwrap(),
+        SqliteQueue::SCHEMA_VERSION + 1
+    );
+    assert_eq!(queue.show(TaskId::new(1)).unwrap().task.title(), "old");
+    drop(queue);
+
+    // Above the floor, or not a queue at all, it is refused like `open`.
+    raw.execute("UPDATE schema_floor SET floor = 99", [])
+        .unwrap();
+    let error = SqliteQueue::open_read_only(&path)
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(error.contains("install a newer dagq"), "{error}");
+    let empty = dir.path().join("empty.db");
+    drop(Connection::open(&empty).unwrap());
+    let error = SqliteQueue::open_read_only(&empty)
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(error.contains("use init first"), "{error}");
+    assert!(SqliteQueue::open_read_only(dir.path().join("missing.db")).is_err());
+    assert!(!dir.path().join("missing.db").exists());
+}
+
+#[test]
 fn a_breaking_migration_waits_for_an_idle_queue() {
     let dir = tempfile::tempdir().unwrap();
     let path = queue_before_the_floor(&dir);

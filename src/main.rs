@@ -731,28 +731,39 @@ const OBSERVER_DENIED: &str = "observer may not change queue state";
 /// The error of a command the headless reviewer may not run.
 const REVIEWER_DENIED: &str = "reviewer may not change queue state";
 
+/// The commands that only read the queue. They open it on a read-only
+/// connection (ADR-0045 decision 18), and the supervisor's headless review
+/// may run them and nothing else (ADR-0027).
+fn reads_only(command: &Command) -> bool {
+    matches!(
+        command,
+        Command::Locate
+            | Command::List { .. }
+            | Command::Show { .. }
+            | Command::Candidates
+            | Command::Graph { .. }
+            | Command::Status { .. }
+            | Command::Asks { .. }
+            | Command::Events { .. }
+            | Command::Stats { .. }
+            | Command::Doctor { .. }
+            | Command::Notes { .. }
+            | Command::Search { .. }
+            | Command::Proposal { .. }
+            | Command::Planners { .. }
+            | Command::Lint { .. }
+            | Command::Goal {
+                command: GoalCommand::List | GoalCommand::Show { .. },
+            }
+    )
+}
+
 /// What the supervisor's headless review may run (ADR-0027): reads only.
 fn reviewer_access(command: &Command) -> ObserverAccess {
-    match command {
-        Command::Locate
-        | Command::List { .. }
-        | Command::Show { .. }
-        | Command::Candidates
-        | Command::Graph { .. }
-        | Command::Status { .. }
-        | Command::Asks { .. }
-        | Command::Events { .. }
-        | Command::Stats { .. }
-        | Command::Doctor { .. }
-        | Command::Notes { .. }
-        | Command::Search { .. }
-        | Command::Proposal { .. }
-        | Command::Planners { .. }
-        | Command::Lint { .. }
-        | Command::Goal {
-            command: GoalCommand::List | GoalCommand::Show { .. },
-        } => ObserverAccess::Allowed,
-        _ => ObserverAccess::Denied,
+    if reads_only(command) {
+        ObserverAccess::Allowed
+    } else {
+        ObserverAccess::Denied
     }
 }
 
@@ -886,7 +897,12 @@ fn execute(cli: Cli) -> Result<Value> {
     if let Command::Rebind { repo } = cli.command {
         return one_shot.rebind(&db, &checkout(repo));
     }
-    let mut queue = SqliteQueue::open(&db)?.with_generators(generators.clone());
+    let mut queue = if reads_only(&cli.command) {
+        SqliteQueue::open_read_only(&db)?
+    } else {
+        SqliteQueue::open(&db)?
+    }
+    .with_generators(generators.clone());
     if let Some(common_dir) = &common_dir {
         queue.assert_repository(common_dir)?;
     }

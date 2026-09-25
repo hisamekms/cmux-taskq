@@ -109,6 +109,42 @@ impl SqliteQueue {
         Ok(queue)
     }
 
+    /// Opens an initialized queue for a command that only reads (`status`,
+    /// `show`, `list`, `graph`, `stats` and the like, ADR-0045 decision 18):
+    /// the connection is read-only, so opening writes no pragma, event or
+    /// schema, and a write through it fails. A queue at this binary's schema
+    /// or a newer one within the floor is read as it is. An older queue is
+    /// read from an in-memory copy with the pending migrations applied, so a
+    /// newer binary (a development build) reads it and the file, the
+    /// supervisor and the runs on it are left as they are; even a breaking
+    /// migration only rewrites the copy. The copy is a snapshot: a command
+    /// that polls, like `watch`, opens the queue itself.
+    pub fn open_read_only(path: impl AsRef<Path>) -> Result<Self> {
+        let queue = Self::connect_with(
+            path.as_ref(),
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        let state = queue
+            .state()?
+            .context("queue is not initialized; use init first")?;
+        state.check_floor()?;
+        if state.version >= BINARY_SCHEMA {
+            return Ok(queue);
+        }
+        let mut memory = Connection::open_in_memory()?;
+        rusqlite::backup::Backup::new(&queue.conn, &mut memory)?
+            .run_to_completion(i32::MAX, Duration::from_millis(10), None)
+            .context("copy the queue into memory")?;
+        memory.pragma_update(None, "foreign_keys", true)?;
+        let mut copy = Self {
+            conn: memory,
+            runs_dir: queue.runs_dir.clone(),
+            generators: queue.generators.clone(),
+        };
+        copy.apply(state.version, None)?;
+        Ok(copy)
+    }
+
     /// The schema of the queue at `path` as this binary sees it, without
     /// changing it.
     pub fn schema(path: impl AsRef<Path>) -> Result<SchemaState> {
@@ -206,6 +242,10 @@ impl SqliteQueue {
         if create {
             flags |= OpenFlags::SQLITE_OPEN_CREATE;
         }
+        Self::connect_with(path, flags)
+    }
+
+    fn connect_with(path: &Path, flags: OpenFlags) -> Result<Self> {
         let conn = Connection::open_with_flags(path, flags)
             .with_context(|| format!("open queue at {} (use init to create it)", path.display()))?;
         conn.busy_timeout(Duration::from_secs(5))?;

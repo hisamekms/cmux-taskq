@@ -2331,9 +2331,28 @@ fn migrate_is_explicit_and_older_binaries_keep_working_within_the_floor() {
     }
     raw.execute_batch("PRAGMA application_id = 1129599281; PRAGMA user_version = 23;")
         .unwrap();
-    for args in [&["list"][..], &["status"], &["init"]] {
+    raw.execute_batch(
+        "INSERT INTO tasks(title,description,acceptance,verification_commands,status)
+         VALUES ('old task','','','[]','draft');",
+    )
+    .unwrap();
+    // Commands that change the queue need `migrate` first.
+    for args in [&["add", "new task"][..], &["ready", "1"], &["init"]] {
         let error = refused(&db, args);
         assert!(error.contains("run `dagq migrate`"), "{args:?}: {error}");
+    }
+    // Commands that only read open it read-only and see it as migrated in
+    // memory; the file stays at schema 23 (ADR-0045 decision 18).
+    assert_eq!(ok(&db, &["list"])["total"], 1);
+    assert_eq!(ok(&db, &["show", "1"])["task"]["title"], "old task");
+    for args in [
+        &["status"][..],
+        &["graph"],
+        &["stats"],
+        &["doctor"],
+        &["goal", "list"],
+    ] {
+        ok(&db, args);
     }
     assert_eq!(version(), 23);
     let check = ok(&db, &["migrate", "--check"]);
@@ -2389,7 +2408,7 @@ fn migrate_is_explicit_and_older_binaries_keep_working_within_the_floor() {
             String::from_utf8_lossy(&output.stderr)
         );
     }
-    assert_eq!(ok(&db, &["list"])["total"], 2);
+    assert_eq!(ok(&db, &["list"])["total"], 3);
     assert_eq!(version(), SqliteQueue::SCHEMA_VERSION + 1);
 
     // A later breaking migration raises the floor: the older binaries stop

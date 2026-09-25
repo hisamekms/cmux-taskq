@@ -279,6 +279,12 @@ impl OneShot {
         Ok(SqliteQueue::open(db)?.with_generators(self.generators.clone()))
     }
 
+    /// The queue at `db` on a read-only connection, for a command that only
+    /// reads (ADR-0045 decision 18, [`SqliteQueue::open_read_only`]).
+    fn open_read_only(&self, db: &Path) -> Result<SqliteQueue> {
+        Ok(SqliteQueue::open_read_only(db)?.with_generators(self.generators.clone()))
+    }
+
     /// Land one validated run on `main`: take the single integration slot,
     /// rebase the run worktree onto the current `refs/heads/main`, re-validate
     /// (receipt, descent from main, clean tree) and run the verification
@@ -351,13 +357,13 @@ impl OneShot {
     /// `status --role`: see [`health::status`], measured to these
     /// generators' now.
     pub fn status_for(&self, db: &Path, role: Option<SessionRole>) -> Result<Value> {
-        let queue = self.open(db)?;
+        let queue = self.open_read_only(db)?;
         health::status(&queue, &SystemProcesses, &*self.generators.clock, role)
     }
 
     /// `doctor`: see [`health::doctor`].
     pub fn doctor(&self, db: &Path, full: bool) -> Result<Value> {
-        let queue = self.open(db)?;
+        let queue = self.open_read_only(db)?;
         health::doctor(
             &queue,
             &SystemProcesses,
@@ -390,7 +396,7 @@ impl OneShot {
         query: &StatsQuery,
         workspaces: Option<&dyn WorkspaceListing>,
     ) -> Result<Value> {
-        let queue = self.open(db)?;
+        let queue = self.open_read_only(db)?;
         let now = self.generators.clock.now();
         let checkout = queue
             .repository_binding()?
@@ -549,7 +555,7 @@ impl OneShot {
     /// `planners`: every planner not closed (with `all`, every one), with
     /// its state judged by [`planner::planner_views`].
     pub fn planners(&self, db: &Path, cmux: &dyn WorkspaceBackend, all: bool) -> Result<Value> {
-        let queue = self.open(db)?;
+        let queue = self.open_read_only(db)?;
         // Claude Code's signals only read what its hook and screen show.
         let signals = ClaudeCode {
             executable: PathBuf::from("claude"),
