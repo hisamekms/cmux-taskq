@@ -1,8 +1,8 @@
 use std::fmt;
 
 use super::{
-    AskKind, CheckStatus, GoalId, GoalVerdict, ProposalId, ProposalStatus, ReceiptResult, RunId,
-    RunStatus, TaskAction, TaskId, TaskStatus,
+    AskKind, AskReason, CheckStatus, GoalId, GoalVerdict, ProposalId, ProposalStatus,
+    ReceiptResult, RunId, RunStatus, TaskAction, TaskId, TaskStatus,
 };
 
 /// A business rejection by the domain: an invalid value, a transition the
@@ -163,6 +163,16 @@ pub enum DomainError {
     AskWithoutTarget {
         kind: AskKind,
     },
+    /// An authentication or cost ask registered like any other: those are
+    /// one per queue, opened by the runtime (ADR-0047 decision 42).
+    AskHoldsTheQueue {
+        /// The reason it was registered with.
+        reason: AskReason,
+    },
+    /// A queue-wide ask with a reason other than authentication or cost.
+    HoldWithoutQueueReason {
+        reason: AskReason,
+    },
     /// A claim of a task that is not ready.
     TaskNotClaimable {
         task_id: TaskId,
@@ -291,6 +301,16 @@ impl fmt::Display for DomainError {
                 f,
                 "a {} ask needs a task or a run; only a blocked ask may have neither",
                 kind.as_str()
+            ),
+            Self::AskHoldsTheQueue { reason } => write!(
+                f,
+                "authentication and cost asks are queue_hold asks the runtime opens, one per queue (ADR-0047 decision 42; this one is for {}); ask with --because scope, discard or recovery_failed, or leave a note",
+                reason.as_str()
+            ),
+            Self::HoldWithoutQueueReason { reason } => write!(
+                f,
+                "a queue_hold ask is for authentication or cost, not {}",
+                reason.as_str()
             ),
             Self::NonPositiveId { field } => write!(f, "{field} must be positive"),
             Self::GoalAlreadyClosed { goal_id, verdict } => write!(

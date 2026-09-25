@@ -202,6 +202,7 @@ pub(super) fn ask_stuck_exit(
             question,
             options: vec!["exit".into(), "wait".into()],
             asked_by: SessionRole::Supervisor.as_str().into(),
+            reason_category: AskReason::RecoveryFailed,
         },
         sv.cmux,
     )?;

@@ -412,6 +412,8 @@ fn session_start_hook_prints_status_only_in_the_sessions_up_opens() {
             "ask",
             "--kind",
             "blocked",
+            "--because",
+            "scope",
             "--question",
             "stuck?",
             "--cmux",

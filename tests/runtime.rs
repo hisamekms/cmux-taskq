@@ -427,7 +427,7 @@ impl AgentProvider for TestProvider {
         assert!(prompt.contains("Sibling tasks in progress"));
         // A question goes to the queue as an ask, not to the terminal.
         assert!(prompt.contains(&format!(
-            "`dagq ask --run {} --kind worker_question --question '...'`",
+            "`dagq ask --run {} --kind worker_question --because scope --question '...'`",
             run.id()
         )));
         // Background work is stopped before the receipt, or /exit stalls.
@@ -1974,11 +1974,132 @@ fn a_dialog_on_the_screen_is_asked_once_and_cleared() {
     );
 }
 
+/// A session stopped at a login that ran out (task 266).
+const LOGIN_SCREEN: &str = "\
+⏺ Bash(cargo test)
+  ⎿  API Error: 401 {\"type\":\"error\",\"error\":{\"type\":\"authentication_error\",\"message\":\"OAuth token has expired.\"}} · Please run /login
+
+│ ❯ 
+  ? for shortcuts
+";
+
+/// Two sessions that stop at the same login that ran out are one
+/// `authentication` ask for the inbox (ADR-0047 decision 42): the first
+/// opens it with one notification, the second joins its `affected`, each
+/// records `auth_required`, and neither is an `answer_prompt` ask. `status`
+/// and `watch` show the reason.
+#[test]
+fn sessions_stopped_at_the_same_login_share_one_authentication_ask() {
+    let (_dir, repo, db) = fixture();
+    {
+        let mut queue = SqliteQueue::open(&db).unwrap();
+        add_ready_task(&mut queue, "second task", &[]);
+    }
+    let mut backend = TestWorkspace::new(&db, false, PROMPTED_AGENT);
+    backend.prompt_wait = Duration::from_millis(300);
+    *backend.screen.lock().unwrap() = LOGIN_SCREEN.into();
+    let backend = Arc::new(backend);
+    let supervisor = {
+        let (db, repo, backend) = (db.clone(), repo.clone(), backend.clone());
+        thread::spawn(move || supervise(&db, &repo, &backend))
+    };
+    let auth_events = |queue: &mut SqliteQueue| {
+        [TaskId::new(1), TaskId::new(2)]
+            .iter()
+            .map(|id| {
+                event_kinds(&queue.show(*id).unwrap())
+                    .iter()
+                    .filter(|k| **k == "auth_required")
+                    .count()
+            })
+            .collect::<Vec<_>>()
+    };
+    wait_until(&db, Duration::from_secs(30), |queue| {
+        auth_events(queue) == [1, 1]
+    });
+    let mut queue = SqliteQueue::open(&db).unwrap();
+    let open = queue
+        .asks(dagq::infrastructure::asks::AskQuery {
+            open: true,
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(open.len(), 1, "{open:?}");
+    let ask = &open[0];
+    assert_eq!(ask.kind, dagq::domain::AskKind::QueueHold);
+    assert_eq!(ask.reason_category, dagq::domain::AskReason::Authentication);
+    assert_eq!((ask.task_id, ask.run_id.as_ref()), (None, None));
+    let runs: Vec<String> = [TaskId::new(1), TaskId::new(2)]
+        .iter()
+        .map(|id| queue.show(*id).unwrap().runs[0].id().as_str().to_owned())
+        .collect();
+    let mut affected = ask.affected.clone();
+    affected.sort();
+    let mut expected = runs.clone();
+    expected.sort();
+    assert_eq!(affected, expected);
+    for run in &runs {
+        assert!(ask.question.contains(run.as_str()), "{}", ask.question);
+    }
+    assert_eq!(ask.options, ["done", "cancel_affected"]);
+    // One notification for both runs.
+    assert_eq!(backend.notifications.lock().unwrap().len(), 1);
+    let status = runtime::status_for(&db, Some(dagq::domain::SessionRole::Inbox)).unwrap();
+    let entry = status["asks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["id"] == ask.id.as_i64())
+        .unwrap()
+        .clone();
+    assert_eq!(entry["reason_category"], "authentication");
+    assert_eq!(entry["affected"].as_array().unwrap().len(), 2);
+    let attention = ask_attention(&status, ask.id);
+    assert_eq!(attention.len(), 1, "{status}");
+    assert_eq!(attention[0]["reason_category"], "authentication");
+    let events = dagq::watch::events(&db, EventId::new(0), 100, false).unwrap();
+    let opened: Vec<&Value> = events["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["kind"] == "ask_opened")
+        .collect();
+    assert_eq!(opened.len(), 1, "{events}");
+    assert_eq!(opened[0]["reason_category"], "authentication");
+    // A login is no dialog to answer.
+    for id in [TaskId::new(1), TaskId::new(2)] {
+        assert!(
+            !event_kinds(&queue.show(id).unwrap()).contains(&"prompt_waiting"),
+            "{id}"
+        );
+    }
+
+    // The person logs in; the sessions go back to work and finish.
+    *backend.screen.lock().unwrap() = WORK_SCREEN.into();
+    let answered = queue.answer(ask.id, "done").unwrap();
+    assert_eq!(
+        answered.reason_category,
+        dagq::domain::AskReason::Authentication
+    );
+    for id in [TaskId::new(1), TaskId::new(2)] {
+        let run = queue.show(id).unwrap().runs[0].clone();
+        fs::write(
+            exit_request_path(run.run_dir().unwrap()).with_extension("go"),
+            "",
+        )
+        .unwrap();
+    }
+    let outcome = supervisor.join().unwrap().unwrap();
+    backend.join();
+    assert_eq!(outcome["errors"], json!([]), "{outcome}");
+    assert_eq!(auth_events(&mut queue), [1, 1]);
+}
+
 /// A worker that registers a `worker_question` ask, goes idle once
 /// `$EXIT.idle` exists and then waits for the answer in `$MESSAGE` (the
 /// test backend's terminal); it commits the answer it got.
 const ASKING_AGENT: &str = r#"
-"$DAGQ" --db "$DB" ask --run "$RUN_ID" --kind worker_question --question 'Which word?' --cmux /usr/bin/true > /dev/null || exit 70
+"$DAGQ" --db "$DB" ask --run "$RUN_ID" --kind worker_question --because scope --question 'Which word?' --cmux /usr/bin/true > /dev/null || exit 70
 while [ ! -f "$EXIT.idle" ]; do sleep 0.05; done
 idle
 while [ ! -f "$MESSAGE" ]; do sleep 0.05; done
@@ -2116,7 +2237,7 @@ fn a_failed_answer_delivery_is_left_to_the_inbox() {
         &db,
         false,
         &format!(
-            "\"$DAGQ\" --db \"$DB\" ask --run \"$RUN_ID\" --kind worker_question --question 'Which?' --cmux /usr/bin/true >/dev/null; idle; {HOLD}; commit work; receipt \"$(git rev-parse HEAD)\"; idle; await_exit"
+            "\"$DAGQ\" --db \"$DB\" ask --run \"$RUN_ID\" --kind worker_question --because scope --question 'Which?' --cmux /usr/bin/true >/dev/null; idle; {HOLD}; commit work; receipt \"$(git rev-parse HEAD)\"; idle; await_exit"
         ),
     );
     backend.text_fails = true;
@@ -2198,6 +2319,7 @@ fn a_failed_answer_delivery_is_left_to_the_inbox() {
             question: "Late?".into(),
             options: vec![],
             asked_by: "worker".into(),
+            reason_category: dagq::domain::AskReason::Scope,
         })
         .unwrap()
         .ask;
@@ -8191,6 +8313,7 @@ fn adopted_run_does_not_ask_about_its_exit_twice() {
             question: "send /exit".into(),
             options: Vec::new(),
             asked_by: "supervisor".into(),
+            reason_category: dagq::domain::AskReason::RecoveryFailed,
         })
         .unwrap()
         .ask;
@@ -8548,6 +8671,7 @@ fn only_a_new_ask_notifies_and_it_goes_to_the_inbox() {
         question: question.into(),
         options: vec!["land".into()],
         asked_by: "worker".into(),
+        reason_category: dagq::domain::AskReason::Scope,
     };
     // Without an inbox the notification names no workspace; the bound
     // repository's main checkout names the queue.
@@ -8585,6 +8709,7 @@ fn only_a_new_ask_notifies_and_it_goes_to_the_inbox() {
             question: "which?".into(),
             options: Vec::new(),
             asked_by: "worker".into(),
+            reason_category: dagq::domain::AskReason::RecoveryFailed,
         },
         &backend,
     )
@@ -8610,6 +8735,7 @@ fn only_a_new_ask_notifies_and_it_goes_to_the_inbox() {
             question: "slots idle".into(),
             options: Vec::new(),
             asked_by: "observer".into(),
+            reason_category: dagq::domain::AskReason::Scope,
         },
         &backend,
     )
@@ -8649,6 +8775,7 @@ fn asks_of_a_run_are_attention_for_the_inbox_until_closed() {
         question: question.into(),
         options: vec!["land".into(), "send back".into()],
         asked_by: "worker".into(),
+        reason_category: dagq::domain::AskReason::RecoveryFailed,
     };
 
     // An inbox watch started before the ask wakes on ask_opened alone.
@@ -8671,6 +8798,7 @@ fn asks_of_a_run_are_attention_for_the_inbox_until_closed() {
         woke["events"],
         json!([{"id": before + 1, "kind": "ask_opened", "task_id": 1, "run_id": run.id(),
                 "ask_id": opened.ask.id, "next": format!("answer ask {}", opened.ask.id),
+                "reason_category": "recovery_failed",
                 "created_at": woke["events"][0]["created_at"]}])
     );
     assert_eq!(woke["supervisors_changed"], false);
@@ -8693,7 +8821,7 @@ fn asks_of_a_run_are_attention_for_the_inbox_until_closed() {
         ask_attention,
         [
             &json!({"run_id": run.id(), "task_id": 1, "ask_id": opened.ask.id, "status": "open",
-                "kind": "ask_opened", "last_error": null,
+                "kind": "ask_opened", "last_error": null, "reason_category": "recovery_failed",
                 "next": format!("answer ask {}", opened.ask.id)})
         ]
     );
@@ -8822,6 +8950,7 @@ fn attention_events_are_read_past_a_cursor_and_wake_watch() {
             == &json!({
                 "run_id": run.id(), "task_id": 1, "ask_id": ask, "status": "open",
                 "kind": "ask_opened", "last_error": null, "next": format!("answer ask {ask}"),
+                "reason_category": "scope",
             })),
         "{status}"
     );
@@ -9047,6 +9176,7 @@ fn status_reports_failed_runs_and_unanswered_exit_requests() {
             question: "send /exit".into(),
             options: Vec::new(),
             asked_by: "supervisor".into(),
+            reason_category: dagq::domain::AskReason::RecoveryFailed,
         })
         .unwrap();
     let woke = watcher.join().unwrap();
@@ -10075,11 +10205,11 @@ set -e
 printf '%s' "$DAGQ_ROLE" > role.txt
 q() { dagq --db "$DAGQ_QUEUE" "$@" > /dev/null; }
 q note --task 1 --kind stall --text 'task 1 waits for a slot'
-q ask --kind blocked --question 'slots idle while task 1 is ready' --option 'leave it' --cmux /usr/bin/true
-q ask --kind blocked --question 'the same alert again' --cmux /usr/bin/true
+q ask --kind blocked --because recovery_failed --question 'slots idle while task 1 is ready' --option 'leave it' --cmux /usr/bin/true
+q ask --kind blocked --because recovery_failed --question 'the same alert again' --cmux /usr/bin/true
 q goal add --draft 'claim faster' --description 'evidence: the stall note'
 if q ready 1 2> ready.err; then exit 3; fi
-if q ask --kind decide --task 1 --question 'decide?' 2> ask.err; then exit 4; fi
+if q ask --kind decide --because recovery_failed --task 1 --question 'decide?' 2> ask.err; then exit 4; fi
 if q goal ready 1 2> goal.err; then exit 5; fi
 echo 'wrote 1 note, 1 ask, 1 draft goal'
 "#
@@ -12083,6 +12213,7 @@ fn triage_answers_resume_the_run_or_ready_the_task() {
                 question: "what now?".into(),
                 options: vec!["retry".into(), "resume".into(), "cancel".into()],
                 asked_by: "supervisor".into(),
+                reason_category: dagq::domain::AskReason::RecoveryFailed,
             })
             .unwrap()
             .ask
@@ -12882,6 +13013,7 @@ fn status_and_doctor_measure_to_the_injected_clock() {
             question: "which way?".into(),
             options: vec![],
             asked_by: "planner".into(),
+            reason_category: dagq::domain::AskReason::Scope,
         })
         .unwrap()
         .ask;
@@ -12995,6 +13127,7 @@ fn a_follow_up_draft_records_its_origin_and_its_planner_question_is_delivered_by
                 .map(|o| (*o).into())
                 .collect(),
             asked_by: "planner".into(),
+            reason_category: dagq::domain::AskReason::Scope,
         })
         .unwrap()
         .ask;
@@ -13144,6 +13277,68 @@ receipt "$(git rev-parse HEAD)"; idle; await_exit
     assert_eq!(configs[0]["background_alert_secs"], 1800);
 }
 
+/// A session idle without a receipt because its login ran out is neither
+/// nudged nor raised as `stalled`: it joins the authentication ask
+/// (ADR-0047 decision 42). Once that is answered, the idle counts again and
+/// the nudge tells the session to go on.
+#[test]
+fn an_idle_session_at_a_login_that_ran_out_waits_in_the_authentication_ask() {
+    let (_dir, repo, db) = fixture();
+    let backend = TestWorkspace::new(
+        &db,
+        false,
+        r#"
+commit work; idle
+while [ ! -f "$MESSAGE" ]; do sleep 0.05; done
+receipt "$(git rev-parse HEAD)"; idle; await_exit
+"#,
+    );
+    *backend.screen.lock().unwrap() = LOGIN_SCREEN.into();
+    let backend = Arc::new(backend);
+    let supervisor = {
+        let (db, repo, backend) = (db.clone(), repo.clone(), backend.clone());
+        thread::spawn(move || supervise_with(&db, &repo, &backend, &stall_options()))
+    };
+    wait_until(&db, Duration::from_secs(30), |queue| {
+        event_kinds(&queue.show(TaskId::new(1)).unwrap()).contains(&"auth_required")
+    });
+    let mut queue = SqliteQueue::open(&db).unwrap();
+    // Well past the threshold, still no nudge and no stalled ask.
+    thread::sleep(Duration::from_millis(1500));
+    assert!(backend.texts().is_empty());
+    assert!(stalled_asks(&queue).is_empty());
+    let hold = queue
+        .asks(AskQuery {
+            open: true,
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(hold.len(), 1, "{hold:?}");
+    assert_eq!(
+        hold[0].reason_category,
+        dagq::domain::AskReason::Authentication
+    );
+    // The error stays on the screen after the person logged in: the
+    // answered ask is not opened again, and the nudge goes out.
+    queue.answer(hold[0].id, "done").unwrap();
+    let outcome = supervisor.join().unwrap().unwrap();
+    backend.join();
+    assert_eq!(outcome["errors"], json!([]), "{outcome}");
+    assert_eq!(outcome["runs"][0]["status"], "awaiting_integration");
+    assert_eq!(backend.texts().len(), 1);
+    let detail = queue.show(TaskId::new(1)).unwrap();
+    assert_eq!(payloads(&detail, "auth_required").len(), 1);
+    assert_eq!(payloads(&detail, "stall_nudged").len(), 1);
+    let asks = queue
+        .asks(AskQuery {
+            all: true,
+            ..Default::default()
+        })
+        .unwrap();
+    let holds = asks.iter().filter(|a| a.kind == AskKind::QueueHold).count();
+    assert_eq!(holds, 1, "{asks:?}");
+}
+
 /// Task 182 to the end: the session takes the nudge and stops again with
 /// its background work still running, so one `stalled` ask opens with the
 /// background work and the screen. `wait` closes it and counts again, so
@@ -13248,7 +13443,7 @@ fn a_worker_idle_at_its_question_is_not_nudged() {
         &db,
         false,
         r#"
-"$DAGQ" --db "$DB" ask --run "$RUN_ID" --kind worker_question --question 'Which word?' --cmux /usr/bin/true > /dev/null || exit 70
+"$DAGQ" --db "$DB" ask --run "$RUN_ID" --kind worker_question --because scope --question 'Which word?' --cmux /usr/bin/true > /dev/null || exit 70
 idle
 while [ ! -f "$MESSAGE" ]; do sleep 0.05; done
 commit work; receipt "$(git rev-parse HEAD)"; idle; await_exit
@@ -13318,6 +13513,7 @@ receipt "$(git rev-parse HEAD)"; idle; await_exit
             question: "the session is idle without a receipt".into(),
             options: vec!["wait".into(), "intervene".into()],
             asked_by: "supervisor".into(),
+            reason_category: dagq::domain::AskReason::RecoveryFailed,
         })
         .unwrap()
         .ask;

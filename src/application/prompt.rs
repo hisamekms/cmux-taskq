@@ -262,7 +262,7 @@ pub fn prompt(
          follow_ups is optional: an array of work you found outside this task, each with a title and a description, for the planner to decide on; omit it when there is none.\n\
          You may write this receipt outside the worktree. Keep the worktree clean after committing.\n\
          The supervisor rejects the run unless the commit is the clean head of your branch on top of the base commit, and integrate reruns the verification commands itself after rebasing onto main.\n\
-         When you need a decision you cannot make from the task and the repository, do not write the question to the terminal and wait: run `dagq ask --run {run_id} --kind worker_question --question '...'` in the worktree (one ask at a time, with everything you need decided in its question), report briefly that you asked, and stop. The answer arrives in this terminal as `answer to ask <id>: ...`; continue from it.\n\
+         When you need a decision you cannot make from the task and the repository, do not write the question to the terminal and wait: run `dagq ask --run {run_id} --kind worker_question --because scope --question '...'` in the worktree (one ask at a time, with everything you need decided in its question), report briefly that you asked, and stop. `--because` says why a person is needed: `scope` (the acceptance or the scope changes) or `discard` (whether to throw work away); a question that fits neither is yours to decide and record in the receipt's summary, or, when it leads outside the task, a failed receipt saying why. The answer arrives in this terminal as `answer to ask <id>: ...`; continue from it.\n\
          {stop_background}\n\
          After submitting, report the outcome briefly and stop; do not run /exit yourself. Once you are idle the supervisor ends the session, and a person can still send /exit. A receipt does not itself end the session.\n",
         task_id = task.id(),
@@ -345,7 +345,7 @@ pub fn runtime_planner_prompt(
          Plan review sent the proposal back. Its reasons:\n{reasons}\n\
          Its tasks:\n{tasks}\n\
          Follow the dagq-planner skill of the dagq plugin: read the proposal with `dagq proposal show {proposal}` and each task with `dagq show ID`, fix what the reasons point at, and submit it again with `dagq submit --proposal {proposal}`.\n\
-         A fix that changes the plan's intent (acceptance, scope, the relation to the goal) needs a person: raise it to the inbox with `dagq ask --task ID --kind planner_question` as the skill describes, stop, and continue from the answer typed into this terminal.\n\
+         A fix that changes the plan's intent (acceptance, scope, the relation to the goal) needs a person: raise it to the inbox with `dagq ask --task ID --kind planner_question --because scope` as the skill describes, stop, and continue from the answer typed into this terminal.\n\
          Never open the queue database directly; use the dagq CLI only.\n",
         db = super::path_text(db)?,
     ))
@@ -477,7 +477,7 @@ pub fn draft_planner_prompt(material: &DraftPlannerMaterial<'_>) -> Result<Strin
          Follow the dagq-planner skill of the dagq plugin. Read the repository's AGENTS.md (or CLAUDE.md) for its rules on verification, paths, evidence and ADR numbers. Look for tasks that already cover the draft or code that already does it (`dagq search '<words>'`, `dagq show ID`, the source) before you decide. Then do exactly one of these three:\n\
          1. Adopt: complete the draft with `dagq edit {id}` (acceptance, `--verify`, `--paths`, `--evidence`, and `--context` beginning with `{context_head}`), add its dependencies with `dagq dependency add`, check it with `dagq lint {id}` and submit it with `dagq submit {id}`. Plan review checks it before it becomes ready.\n\
          2. Drop: when it is already done, duplicated or not worth doing, cancel it with `dagq cancel {id}` and record why with `dagq note --task {id} --text '<why>'`.\n\
-         3. Ask: when you cannot decide without a person (the plan's intent, its scope, whether it belongs to this goal or a new one), run `dagq ask --task {id} --kind planner_question --question '<everything the person needs, with your recommendation>' --option adopt --option cancel --option keep_draft`, report briefly and stop. The answer arrives in this terminal as `answer to ask <id>: ...`: on adopt do 1, on cancel do 2 (the note names the ask), on keep_draft leave the draft as it is and stop.\n\
+         3. Ask: when you cannot decide without a person (the plan's intent, its scope, whether it belongs to this goal or a new one), run `dagq ask --task {id} --kind planner_question --because scope --question '<everything the person needs, with your recommendation>' --option adopt --option cancel --option keep_draft`, report briefly and stop. The answer arrives in this terminal as `answer to ask <id>: ...`: on adopt do 1, on cancel do 2 (the note names the ask), on keep_draft leave the draft as it is and stop.\n\
          The runtime refuses your submit of a follow_up draft whose goal is closed or that is two follow-ups from a person's judgement unless a person answered adopt: ask then.\n\
          When you are done, report the outcome in one or two sentences and stop; the runtime ends this session. Do not work on anything but this draft. Never open the queue database directly; use the dagq CLI only.\n",
         context_head = match target.origin {
@@ -704,7 +704,7 @@ pub(crate) fn stall_nudge(
         "1. If the work is done, commit it and write the receipt at {receipt} (a temporary file in the same directory, then rename)."
     ));
     lines.push(format!(
-        "2. If you need a decision, run `dagq ask --run {} --kind worker_question --question '...'` and stop.",
+        "2. If you need a decision, run `dagq ask --run {} --kind worker_question --because scope --question '...'` (or `--because discard` for whether to throw work away) and stop.",
         run.id()
     ));
     lines.push(

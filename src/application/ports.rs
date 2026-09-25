@@ -379,6 +379,11 @@ pub trait AgentSignals {
     /// The kind of dialog at the bottom of `screen` that holds the session
     /// (recorded as `prompt` of `prompt_waiting`), or `None` while it works.
     fn detect_prompt(&self, screen: &str) -> Option<&'static str>;
+    /// Whether the bottom of `screen` shows the agent stopped at a login
+    /// that ran out (ADR-0047 decision 42): only a person can log in again.
+    fn auth_required(&self, _screen: &str) -> bool {
+        false
+    }
     /// The last lines of `screen` an ask and `prompt_waiting` carry.
     fn screen_excerpt(&self, screen: &str) -> String;
     /// What the idle marker's content says. A content the adapter cannot
@@ -1078,6 +1083,12 @@ pub trait AskStore {
     fn has_unclosed_ask(&self, run_id: &RunId, kind: AskKind) -> Result<bool>;
     /// Register an ask, or return the open one it repeats.
     fn ask(&mut self, ask: NewAsk) -> Result<AskOutcome>;
+    /// Open the authentication or cost ask of the hold with its run, or add
+    /// the run to the open one (ADR-0047 decision 42).
+    fn hold(&mut self, hold: crate::domain::NewHold) -> Result<crate::domain::HoldOutcome>;
+    /// The open `queue_hold` ask that holds the run, if any.
+    fn hold_of(&self, run_id: &RunId) -> Result<Option<Ask>>;
+    fn read_ask(&self, id: AskId) -> Result<Ask>;
     fn answer(&mut self, id: AskId, text: &str) -> Result<Ask>;
     fn close_ask(&mut self, id: AskId) -> Result<Ask>;
     /// Answered `approve_landing` asks nobody closed.

@@ -262,6 +262,8 @@ pub fn status(
                 "task_id": ask.task_id,
                 "run_id": ask.run_id,
                 "asked_by": ask.asked_by,
+                "reason_category": ask.reason_category,
+                "affected": ask.affected,
                 "age_secs": now - ask.created_at,
             })
         })
@@ -496,6 +498,9 @@ pub fn compact_event(event: &RunEvent) -> Value {
     if let Some(ask_id) = payload.get("ask_id") {
         object.insert("ask_id".into(), ask_id.clone());
     }
+    if let Some(reason) = payload.get("reason_category") {
+        object.insert("reason_category".into(), reason.clone());
+    }
     if let Some(code) = payload.get(reason::CODE_KEY) {
         object.insert(reason::CODE_KEY.into(), code.clone());
     }
@@ -594,6 +599,7 @@ pub fn attention(
             task_id: Some(run.task_id()),
             pid: None,
             ask_id: None,
+            reason_category: None,
             status: run.status().as_str().into(),
             kind,
             last_error: run.last_error().map(truncate_reason),
@@ -621,6 +627,7 @@ pub fn attention(
             task_id: Some(run.task_id()),
             pid: None,
             ask_id: None,
+            reason_category: None,
             status: run.status().as_str().into(),
             kind: "push_failed".into(),
             last_error_code: error.as_ref().map(|_| ReasonCode::PushFailed),
@@ -639,6 +646,7 @@ pub fn attention(
             task_id: Some(draft.id()),
             pid: None,
             ask_id: None,
+            reason_category: None,
             status: draft.status().as_str().into(),
             kind: "draft_planner_exhausted".into(),
             last_error: None,
@@ -656,6 +664,7 @@ pub fn attention(
             task_id: Some(hold.anchor),
             pid: None,
             ask_id: None,
+            reason_category: None,
             status: status.into(),
             kind: hold.kind.into(),
             last_error: hold.error.as_deref().map(truncate_reason),
@@ -791,6 +800,7 @@ pub fn attention(
             task_id: ask.task_id,
             pid: None,
             ask_id: Some(ask.id),
+            reason_category: Some(ask.reason_category),
             status: status.into(),
             kind: kind.into(),
             last_error: None,

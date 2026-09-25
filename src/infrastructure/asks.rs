@@ -7,8 +7,8 @@ use serde_json::json;
 
 use super::sqlite::{SqliteQueue, enum_col, json_col};
 use crate::domain::{
-    Ask, AskId, AskKind, AskOutcome, LANDING_OPTIONS, NewAsk, RunId, RunStatus, TRIAGE_OPTIONS,
-    TaskId,
+    Ask, AskId, AskKind, AskOutcome, HOLD_AFFECTED_HEADING, HoldOutcome, LANDING_OPTIONS, NewAsk,
+    NewHold, RunId, RunStatus, TRIAGE_OPTIONS, TaskId,
 };
 
 pub use crate::application::AskQuery;
@@ -28,6 +28,127 @@ impl SqliteQueue {
         Ok(outcome)
     }
 
+    /// Open the `queue_hold` ask of the hold's reason and subject with its
+    /// run, or add the run to the open one (ADR-0047 decision 42). A new
+    /// ask writes `ask_opened` on the queue; a run that joins an open one
+    /// rewrites its question's list of runs and writes `ask_updated` on
+    /// that run. A run already in it changes nothing.
+    pub fn hold(&mut self, hold: NewHold) -> Result<HoldOutcome> {
+        hold.validate()?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let task_id: TaskId = tx
+            .query_row(
+                "SELECT task_id FROM task_runs WHERE id=?1",
+                [&hold.run_id],
+                |r| r.get(0),
+            )
+            .optional()?
+            .with_context(|| format!("run {} does not exist", hold.run_id))?;
+        let open = tx
+            .query_row(
+                "SELECT * FROM asks WHERE kind='queue_hold' AND reason_category=?1
+                 AND ifnull(subject,'')=ifnull(?2,'')
+                 AND answered_at IS NULL AND closed_at IS NULL",
+                params![hold.reason_category.as_str(), hold.subject],
+                ask_row,
+            )
+            .optional()?;
+        let run = hold.run_id.as_str().to_owned();
+        let outcome = match open {
+            Some(ask) if ask.affected.contains(&run) => HoldOutcome {
+                ask,
+                created: false,
+                joined: false,
+            },
+            Some(ask) => {
+                let mut affected = ask.affected.clone();
+                affected.push(run);
+                let base = ask
+                    .question
+                    .rsplit_once(&format!("\n\n{HOLD_AFFECTED_HEADING}"))
+                    .map_or(ask.question.as_str(), |(base, _)| base);
+                tx.execute(
+                    "UPDATE asks SET affected=?2, question=?3 WHERE id=?1",
+                    params![
+                        ask.id,
+                        serde_json::to_string(&affected)?,
+                        NewHold::question_for(base, &affected)
+                    ],
+                )?;
+                ask_event(
+                    &tx,
+                    Some(task_id),
+                    Some(&hold.run_id),
+                    "ask_updated",
+                    json!({
+                        "ask_id": ask.id,
+                        "kind": ask.kind,
+                        "reason_category": ask.reason_category,
+                        "affected": affected,
+                    }),
+                )?;
+                HoldOutcome {
+                    ask: read_ask(&tx, ask.id)?,
+                    created: false,
+                    joined: true,
+                }
+            }
+            None => {
+                let affected = vec![run];
+                tx.execute(
+                    "INSERT INTO asks(kind,question,options,asked_by,reason_category,subject,affected)
+                     VALUES ('queue_hold',?1,?2,?3,?4,?5,?6)",
+                    params![
+                        NewHold::question_for(&hold.question, &affected),
+                        serde_json::to_string(&hold.options)?,
+                        hold.asked_by,
+                        hold.reason_category.as_str(),
+                        hold.subject,
+                        serde_json::to_string(&affected)?,
+                    ],
+                )?;
+                let id = AskId::new(tx.last_insert_rowid());
+                ask_event(
+                    &tx,
+                    None,
+                    None,
+                    "ask_opened",
+                    json!({
+                        "ask_id": id,
+                        "kind": AskKind::QueueHold,
+                        "asked_by": hold.asked_by,
+                        "reason_category": hold.reason_category,
+                        "affected": affected,
+                    }),
+                )?;
+                HoldOutcome {
+                    ask: read_ask(&tx, id)?,
+                    created: true,
+                    joined: true,
+                }
+            }
+        };
+        tx.commit()?;
+        Ok(outcome)
+    }
+
+    /// The open `queue_hold` ask that holds the run, if any.
+    pub fn hold_of(&self, run_id: &RunId) -> Result<Option<Ask>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT * FROM asks WHERE kind='queue_hold'
+                 AND answered_at IS NULL AND closed_at IS NULL
+                 AND EXISTS (SELECT 1 FROM json_each(asks.affected) WHERE value=?1)
+                 ORDER BY id LIMIT 1",
+                [run_id],
+                ask_row,
+            )
+            .optional()?)
+    }
+
     /// Write the answer of an open ask and record `ask_answered` (with the
     /// run when the ask has one).
     pub fn answer(&mut self, id: AskId, text: &str) -> Result<Ask> {
@@ -41,7 +162,8 @@ impl SqliteQueue {
             "UPDATE asks SET answer=?2, answered_at=?3 WHERE id=?1",
             params![id, text, self.generators.clock.now()],
         )?;
-        let mut payload = json!({"ask_id": id, "kind": ask.kind});
+        let mut payload =
+            json!({"ask_id": id, "kind": ask.kind, "reason_category": ask.reason_category});
         if ask.kind == AskKind::WorkerQuestion
             && let Some(run_id) = ask.run_id.as_ref()
         {
@@ -370,15 +492,16 @@ pub(super) fn insert_ask(tx: &Connection, ask: &NewAsk) -> Result<AskOutcome> {
             });
         }
     tx.execute(
-        "INSERT INTO asks(kind,task_id,run_id,question,options,asked_by)
-             VALUES (?1,?2,?3,?4,?5,?6)",
+        "INSERT INTO asks(kind,task_id,run_id,question,options,asked_by,reason_category)
+             VALUES (?1,?2,?3,?4,?5,?6,?7)",
         params![
             ask.kind.as_str(),
             task_id,
             ask.run_id,
             ask.question,
             serde_json::to_string(&ask.options)?,
-            ask.asked_by
+            ask.asked_by,
+            ask.reason_category.as_str()
         ],
     )?;
     let id = AskId::new(tx.last_insert_rowid());
@@ -387,7 +510,12 @@ pub(super) fn insert_ask(tx: &Connection, ask: &NewAsk) -> Result<AskOutcome> {
         task_id,
         ask.run_id.as_ref(),
         "ask_opened",
-        json!({"ask_id": id, "kind": ask.kind, "asked_by": ask.asked_by}),
+        json!({
+            "ask_id": id,
+            "kind": ask.kind,
+            "asked_by": ask.asked_by,
+            "reason_category": ask.reason_category,
+        }),
     )?;
     let created = read_ask(tx, id)?;
     Ok(AskOutcome {
@@ -428,6 +556,9 @@ pub(super) fn ask_row(row: &Row<'_>) -> rusqlite::Result<Ask> {
         options: json_col(row, "options")?,
         answer: row.get("answer")?,
         asked_by: row.get("asked_by")?,
+        reason_category: enum_col(row, "reason_category")?,
+        subject: row.get("subject")?,
+        affected: json_col(row, "affected")?,
         created_at: row.get("created_at")?,
         answered_at: row.get("answered_at")?,
         closed_at: row.get("closed_at")?,

@@ -654,6 +654,8 @@ fn ask_answer_asks_and_close_through_the_cli() {
             "ask",
             "--kind",
             "decide",
+            "--because",
+            "recovery_failed",
             "--question",
             "Which ADR number?",
             "--option",
@@ -675,6 +677,7 @@ fn ask_answer_asks_and_close_through_the_cli() {
         format!("notify\n--title\n[{repo}] ask #1 decide\n--body\nWhich ADR number?\ntask 1\n")
     );
     assert_eq!(asked["kind"], "decide");
+    assert_eq!(asked["reason_category"], "recovery_failed");
     assert_eq!(asked["task_id"], 1);
     assert_eq!(asked["options"], serde_json::json!(["0029", "0030"]));
     assert!(asked["answer"].is_null());
@@ -687,6 +690,8 @@ fn ask_answer_asks_and_close_through_the_cli() {
             "ask",
             "--kind",
             "decide",
+            "--because",
+            "recovery_failed",
             "--question",
             "again",
             "--task",
@@ -700,14 +705,54 @@ fn ask_answer_asks_and_close_through_the_cli() {
     assert_eq!(again["question"], "Which ADR number?");
     // Missing target, unknown kind, unknown task and a blank question fail.
     for args in [
-        &["ask", "--kind", "decide", "--question", "q"][..],
-        &["ask", "--kind", "bogus", "--question", "q", "--task", "1"],
-        &["ask", "--kind", "decide", "--question", "q", "--task", "9"],
-        &["ask", "--kind", "decide", "--question", " ", "--task", "1"],
         &[
             "ask",
             "--kind",
             "decide",
+            "--because",
+            "recovery_failed",
+            "--question",
+            "q",
+        ][..],
+        &[
+            "ask",
+            "--kind",
+            "bogus",
+            "--because",
+            "recovery_failed",
+            "--question",
+            "q",
+            "--task",
+            "1",
+        ],
+        &[
+            "ask",
+            "--kind",
+            "decide",
+            "--because",
+            "recovery_failed",
+            "--question",
+            "q",
+            "--task",
+            "9",
+        ],
+        &[
+            "ask",
+            "--kind",
+            "decide",
+            "--because",
+            "recovery_failed",
+            "--question",
+            " ",
+            "--task",
+            "1",
+        ],
+        &[
+            "ask",
+            "--kind",
+            "decide",
+            "--because",
+            "recovery_failed",
             "--question",
             "q",
             "--run",
@@ -717,14 +762,63 @@ fn ask_answer_asks_and_close_through_the_cli() {
     ] {
         assert!(!invoke(&db, args).status.success(), "{args:?}");
     }
+    // Every ask says why a person is needed (ADR-0047 decision 41): none,
+    // an unknown reason, or authentication and cost (the runtime's one
+    // queue_hold ask per queue) fail, and nothing is registered.
+    for because in [None, Some("bogus"), Some("authentication"), Some("cost")] {
+        let mut args = vec![
+            "ask",
+            "--kind",
+            "decide",
+            "--question",
+            "why?",
+            "--task",
+            "1",
+        ];
+        if let Some(because) = because {
+            args.extend(["--because", because]);
+        }
+        let output = invoke(&db, &args);
+        assert!(!output.status.success(), "{because:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        match because {
+            None => assert!(stderr.contains("--because"), "{stderr}"),
+            Some("authentication") => {
+                assert!(
+                    stderr.contains("queue_hold asks the runtime opens"),
+                    "{stderr}"
+                )
+            }
+            _ => {}
+        }
+    }
+    assert!(
+        !invoke(
+            &db,
+            &[
+                "ask",
+                "--kind",
+                "queue_hold",
+                "--because",
+                "authentication",
+                "--question",
+                "q"
+            ]
+        )
+        .status
+        .success()
+    );
+    assert_eq!(notifications(&db).matches("notify\n").count(), 1);
 
     let status = ok(&db, &["status", "--role", "inbox"]);
     assert_eq!(status["asks"][0]["id"], id);
     assert_eq!(status["asks"][0]["question"], "Which ADR number?");
+    assert_eq!(status["asks"][0]["reason_category"], "recovery_failed");
     // All attention is the inbox's (ADR-0024 decision 6), the stopped
     // supervisor included; none is the planner's.
     assert_eq!(status["attention"][0]["kind"], "supervisor_stopped");
     assert_eq!(status["attention"][1]["kind"], "ask_opened");
+    assert_eq!(status["attention"][1]["reason_category"], "recovery_failed");
     assert_eq!(status["attention"].as_array().unwrap().len(), 2);
     let planner = ok(&db, &["status", "--role", "planner"]);
     assert_eq!(planner["attention"], serde_json::json!([]));
@@ -797,6 +891,8 @@ fn ask_answer_asks_and_close_through_the_cli() {
             "ask",
             "--kind",
             "decide",
+            "--because",
+            "recovery_failed",
             "--question",
             "next",
             "--task",
@@ -822,6 +918,8 @@ fn ask_answer_asks_and_close_through_the_cli() {
             "ask",
             "--kind",
             "answer_prompt",
+            "--because",
+            "recovery_failed",
             "--question",
             "q",
             "--task",
@@ -1404,7 +1502,17 @@ fn observer_may_note_and_propose_but_not_change_queue_state() {
         &["down"],
         &["plan"],
         &["planner-session", "--planner", "1", "--claude", "claude"],
-        &["ask", "--kind", "decide", "--question", "q", "--task", "1"],
+        &[
+            "ask",
+            "--kind",
+            "decide",
+            "--because",
+            "recovery_failed",
+            "--question",
+            "q",
+            "--task",
+            "1",
+        ],
         &["answer", "1", "--text", "x"],
         &["ask", "close", "1"],
         // The observer does not start another observer.
@@ -1443,6 +1551,8 @@ fn observer_may_note_and_propose_but_not_change_queue_state() {
             "ask",
             "--kind",
             "blocked",
+            "--because",
+            "scope",
             "--question",
             "stuck",
             "--task",
@@ -1458,6 +1568,8 @@ fn observer_may_note_and_propose_but_not_change_queue_state() {
             "ask",
             "--kind",
             "blocked",
+            "--because",
+            "scope",
             "--question",
             "slots idle",
             "--option",
@@ -1484,7 +1596,15 @@ fn observer_may_note_and_propose_but_not_change_queue_state() {
     let again = ok_as(
         "observer",
         &db,
-        &["ask", "--kind", "blocked", "--question", "slots idle again"],
+        &[
+            "ask",
+            "--kind",
+            "blocked",
+            "--because",
+            "scope",
+            "--question",
+            "slots idle again",
+        ],
     );
     assert_eq!(
         (again["id"].clone(), again["created"].clone()),
@@ -2361,7 +2481,17 @@ fn reviewer_may_only_read_the_queue() {
     for args in [
         &["ready", "1", "--bypass-review"][..],
         &["note", "--task", "1", "--text", "x"],
-        &["ask", "--kind", "decide", "--question", "q", "--task", "1"],
+        &[
+            "ask",
+            "--kind",
+            "decide",
+            "--because",
+            "recovery_failed",
+            "--question",
+            "q",
+            "--task",
+            "1",
+        ],
         &["integrate", "1"],
         &["review", "1"],
         &["goal", "add", "draft", "--draft"],
@@ -2610,7 +2740,8 @@ fn migrate_is_explicit_and_older_binaries_keep_working_within_the_floor() {
             {"version": 25, "compatible": false},
             {"version": 26, "compatible": true},
             {"version": 27, "compatible": false},
-            {"version": 28, "compatible": false}
+            {"version": 28, "compatible": false},
+            {"version": 29, "compatible": false}
         ])
     );
     assert_eq!(version(), 23);

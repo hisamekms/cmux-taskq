@@ -288,7 +288,7 @@ pub fn observer_prompt(
          \n\
          Do:\n\
          - Record what is not going well as a note on the task, run or goal it concerns: `{dagq} note --task ID|--run ID|--goal ID --kind <slug> --text '...'` (a lowercase slug such as stall, failure, wait, capacity).\n\
-         - Raise each alert of the stats to the inbox as a blocked ask: `{dagq} ask --kind blocked --question '...' --option '...' [--task ID | --run ID]`, with your reading of it and the next moves a person can choose as options (leave it, act from the inbox or planner, register a goal). \
+         - Raise each alert of the stats to the inbox as a blocked ask: `{dagq} ask --kind blocked --because <scope|discard|recovery_failed> --question '...' --option '...' [--task ID | --run ID]` (`--because` is why a person is needed: the scope or a decision changes, work may be thrown away, or what should have fixed it did not; an alert that needs none of them is a note, not an ask), with your reading of it and the next moves a person can choose as options (leave it, act from the inbox or planner, register a goal). \
            An alert with no task (idle_slots, backend_failures) is an ask without --task and --run; put every such alert in its question. \
            Raise the same alert only once: do not ask when an open ask below already covers it or a note shows you raised it before.\n\
          - For a problem that recurs, register an improvement as a draft goal: `{dagq} goal add --draft 'title' --description '...' --acceptance '...'`, and cite the ids of the observations (note event ids) that are its evidence in the description. \

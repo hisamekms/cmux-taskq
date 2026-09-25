@@ -465,6 +465,7 @@ fn a_revise_goes_to_the_live_planner_with_the_precedents_and_times_out_to_the_in
                 .into(),
             options: Vec::new(),
             asked_by: "observer".into(),
+            reason_category: dagq::domain::AskReason::Scope,
         })
         .unwrap()
         .ask
@@ -1178,7 +1179,7 @@ fn drafts_of_the_runtime_get_planners_within_the_limit_and_a_persons_draft_none(
         format!("- task {gap} (draft): gap"),
         format!("dagq submit {follow_up}"),
         format!("dagq cancel {follow_up}"),
-        format!("dagq ask --task {follow_up} --kind planner_question"),
+        format!("dagq ask --task {follow_up} --kind planner_question --because scope"),
         "follow-up draft（task".to_owned(),
     ] {
         assert!(prompt.contains(&expected), "{expected}\n{prompt}");
@@ -1296,6 +1297,7 @@ fn a_planner_question_answer_is_typed_into_its_planner_or_carried_by_a_new_one()
             question: "is this in the goal?".into(),
             options: vec!["adopt".into(), "cancel".into(), "keep_draft".into()],
             asked_by: "planner".into(),
+            reason_category: dagq::domain::AskReason::Scope,
         })
         .unwrap()
         .ask;
@@ -1335,6 +1337,7 @@ fn a_planner_question_answer_is_typed_into_its_planner_or_carried_by_a_new_one()
             question: "split it?".into(),
             options: vec!["adopt".into(), "cancel".into(), "keep_draft".into()],
             asked_by: "planner".into(),
+            reason_category: dagq::domain::AskReason::Scope,
         })
         .unwrap()
         .ask;
@@ -1369,6 +1372,7 @@ fn a_planner_question_answer_is_typed_into_its_planner_or_carried_by_a_new_one()
             question: "keep it?".into(),
             options: vec!["adopt".into(), "cancel".into(), "keep_draft".into()],
             asked_by: "planner".into(),
+            reason_category: dagq::domain::AskReason::Scope,
         })
         .unwrap()
         .ask;

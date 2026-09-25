@@ -162,7 +162,7 @@ case "$prompt" in
     # A question: register it as a worker_question ask, go idle, and wait
     # for the supervisor to type the answer into this terminal.
     "$add_dir/runner" --db "$DAGQ_QUEUE" ask --run "$session_id" --kind worker_question \
-      --question 'Which word goes into answer.txt?' > "$add_dir/ask.json"
+      --because scope --question 'Which word goes into answer.txt?' > "$add_dir/ask.json"
     # The new ask notified a person through the real cmux.
     grep -Eq '"notified": *true' "$add_dir/ask.json" || { printf 'stub: ask did not notify\n' >&2; exit 66; }
     idle="$add_dir/idle.json"

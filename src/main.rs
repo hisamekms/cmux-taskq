@@ -17,9 +17,9 @@ use serde_json::{Value, json};
 use dagq::{
     application::{StatusFilter, TaskQuery, TaskStore, claim_candidates, dependency_graph},
     domain::{
-        AskId, AskKind, EventId, GoalEdit, GoalId, GoalVerdict, NewAsk, NewGoal, NewNote, NewTask,
-        NoteQuery, NoteTarget, PlannerOrigin, PlannerOwner, ProposalId, RunId, SessionRole,
-        Submission, TaskAction, TaskEdit, TaskId, TaskStatus,
+        AskId, AskKind, AskReason, EventId, GoalEdit, GoalId, GoalVerdict, NewAsk, NewGoal,
+        NewNote, NewTask, NoteQuery, NoteTarget, PlannerOrigin, PlannerOwner, ProposalId, RunId,
+        SessionRole, Submission, TaskAction, TaskEdit, TaskId, TaskStatus,
         search::{self, SearchQuery},
     },
     infrastructure::{adapters::path_text, location::QueueLocation, sqlite::SqliteQueue},
@@ -524,6 +524,11 @@ enum Command {
         /// A choice to offer; repeat for several.
         #[arg(long = "option")]
         options: Vec<String>,
+        /// Why a person is needed (ADR-0047 decision 41): scope (the acceptance, the scope, an ADR or a goal's decision), discard (whether to throw work away) or recovery_failed.
+        /// Authentication and cost asks are the runtime's, one per queue.
+        /// A question that fits none of them is no ask: decide it yourself, or leave it as a note (`dagq note`).
+        #[arg(long = "because", required = true, value_parser = ["scope", "discard", "recovery_failed", "authentication", "cost"])]
+        because: Option<String>,
         /// Task the ask is about. Only a blocked ask may name neither a task nor a run.
         #[arg(long = "task", conflicts_with = "run")]
         task_id: Option<i64>,
@@ -1313,6 +1318,7 @@ fn execute(cli: Cli) -> Result<Value> {
             kind,
             question,
             options,
+            because,
             task_id,
             run,
             cmux,
@@ -1330,6 +1336,7 @@ fn execute(cli: Cli) -> Result<Value> {
                     options,
                     // The session's role; a person at a plain terminal has none.
                     asked_by: role.unwrap_or_else(|| "human".into()),
+                    reason_category: because.unwrap_or_default().parse::<AskReason>()?,
                 },
                 &Cmux {
                     executable: executable(&cmux).unwrap_or(cmux),

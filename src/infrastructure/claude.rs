@@ -89,6 +89,35 @@ pub fn detect_prompt(screen: &str) -> Option<PromptKind> {
         .then_some(PromptKind::Confirm)
 }
 
+/// How Claude Code reports a login that ran out or was never there (task
+/// 266): its error line, under the tool call or the prompt it failed, starts
+/// with one of these. Text that merely contains them (a grep, a test's
+/// output, this file on the screen) does not count.
+const AUTH_ERRORS: &[&str] = &[
+    "API Error: 401",
+    "Invalid API key",
+    "OAuth token has expired",
+    "OAuth token revoked",
+];
+
+/// Whether the bottom of a screen shows the session stopped at a login
+/// that ran out (ADR-0047 decision 42): one of the last lines, box borders
+/// and the `⎿` of a result ignored, starts with one of [`AUTH_ERRORS`] and
+/// asks for `/login`.
+pub fn auth_required(screen: &str) -> bool {
+    let lines: Vec<&str> = screen
+        .lines()
+        .map(strip_frame)
+        .filter(|line| !line.is_empty())
+        .collect();
+    lines[lines.len().saturating_sub(PROMPT_SCAN_LINES)..]
+        .iter()
+        .map(|line| line.trim_start_matches(['⎿', '⏺', ' ']))
+        .any(|line| {
+            AUTH_ERRORS.iter().any(|error| line.starts_with(error)) && line.contains("/login")
+        })
+}
+
 fn strip_frame(line: &str) -> &str {
     line.trim_matches(|c: char| c.is_whitespace() || matches!(c, '│' | '┃' | '║' | '|'))
 }
@@ -231,6 +260,10 @@ pub fn idle_hook(content: &[u8]) -> IdleHook {
 impl AgentSignals for ClaudeCode {
     fn detect_prompt(&self, screen: &str) -> Option<&'static str> {
         detect_prompt(screen).map(PromptKind::as_str)
+    }
+
+    fn auth_required(&self, screen: &str) -> bool {
+        auth_required(screen)
     }
 
     fn screen_excerpt(&self, screen: &str) -> String {
@@ -558,5 +591,32 @@ worktree on  dagq/68a96a60 took 8h32m49s
             Some("confirm")
         );
         assert_eq!(claude.screen_excerpt("a\n\nb\n"), "a\nb");
+    }
+
+    #[test]
+    fn auth_required_reads_a_login_that_ran_out() {
+        let expired = "\
+⏺ Bash(cargo test)
+  ⎿  API Error: 401 {\"type\":\"error\",\"error\":{\"type\":\"authentication_error\",\"message\":\"OAuth token has expired.\"}} · Please run /login
+
+│ ❯ 
+  ? for shortcuts
+";
+        assert!(auth_required(expired));
+        let claude = ClaudeCode {
+            executable: "claude".into(),
+        };
+        assert!(claude.auth_required("│ Invalid API key · Please run /login │\n"));
+        assert!(!auth_required(WORK));
+        assert!(!auth_required(READY));
+        // Text that only mentions the error is the work.
+        assert!(!auth_required(
+            "src/claude.rs:12: \"API Error: 401\" · Please run /login\n"
+        ));
+        assert!(!auth_required("  ⎿  API Error: 401 (retrying)\n"));
+        // A phrase far above the bottom is the work, not the session's state.
+        let mut old = String::from("Please run /login\n");
+        old.push_str(&"line\n".repeat(PROMPT_SCAN_LINES));
+        assert!(!auth_required(&old));
     }
 }

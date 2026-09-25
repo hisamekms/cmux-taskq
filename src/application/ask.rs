@@ -7,7 +7,7 @@ use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 
 use super::{Queue, WorkspaceBackend, naming::ask_notification_title};
-use crate::domain::{AskOutcome, NewAsk, SessionRole};
+use crate::domain::{AskOutcome, HoldOutcome, NewAsk, NewHold, SessionRole};
 
 /// Characters of an ask's question the notification keeps before `…`.
 const NOTIFY_QUESTION_CHARS: usize = 200;
@@ -25,6 +25,29 @@ pub fn ask(
 ) -> Result<Value> {
     let outcome = queue.ask(ask)?;
     notify(queue, checkout, &outcome, cmux)
+}
+
+/// Open the authentication or cost ask of `hold` with its run, or add the
+/// run to the open one (ADR-0047 decision 42), and notify the inbox only
+/// when the ask is new: a run that joins it notifies nobody.
+pub fn hold(
+    queue: &mut dyn Queue,
+    checkout: &Path,
+    hold: NewHold,
+    cmux: &dyn WorkspaceBackend,
+) -> Result<(HoldOutcome, Value)> {
+    let outcome = queue.hold(hold)?;
+    let mut value = notify(
+        queue,
+        checkout,
+        &AskOutcome {
+            ask: outcome.ask.clone(),
+            created: outcome.created,
+        },
+        cmux,
+    )?;
+    value["joined"] = json!(outcome.joined);
+    Ok((outcome, value))
 }
 
 /// Notify the inbox of an ask registered elsewhere (the `follow_up` ask a

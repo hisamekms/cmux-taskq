@@ -466,7 +466,7 @@ pub(super) fn check_adoptions(
             })
         {
             anyhow::bail!(
-                "task {task_id} is a follow_up draft a planner of the runtime's may not submit without a person: {why}. Ask with `dagq ask --task {task_id} --kind planner_question` and submit it once the answer is adopt"
+                "task {task_id} is a follow_up draft a planner of the runtime's may not submit without a person: {why}. Ask with `dagq ask --task {task_id} --kind planner_question --because scope` and submit it once the answer is adopt"
             );
         }
         adoptions.push(Adoption {
@@ -577,6 +577,7 @@ mod tests {
                 question: "q".into(),
                 options: Vec::new(),
                 asked_by: "planner".into(),
+                reason_category: crate::domain::AskReason::Scope,
             })
             .unwrap()
             .ask

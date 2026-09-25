@@ -132,7 +132,36 @@ string_enum!(AskKind {
     // The supervisor types the answer into that planner's workspace, as it
     // does a `worker_question`'s into a worker's.
     PlannerQuestion => "planner_question",
+    // An authentication or cost ask (ADR-0047 decision 42): one open per
+    // queue, reason and subject, about no task or run. The runs it holds
+    // are its `affected`; a run that hits the same wall joins it.
+    QueueHold => "queue_hold",
 });
+
+// Why an ask needs a person (ADR-0047 decision 41). Every ask carries one;
+// what fits none of them is no ask (a note, a receipt or a finding).
+// Adding a value needs an ADR.
+string_enum!(AskReason {
+    // A login or an authentication that ran out.
+    Authentication => "authentication",
+    // Cost and resources: a usage limit, the free disk space.
+    Cost => "cost",
+    // Disagrees with or changes the acceptance, the scope, an ADR or a
+    // goal's decision.
+    Scope => "scope",
+    // Whether to throw work away.
+    Discard => "discard",
+    // The recovery job (or another job) could not fix it, or was unsure.
+    RecoveryFailed => "recovery_failed",
+});
+
+impl AskReason {
+    /// The reasons of a [`AskKind::QueueHold`] ask, one per queue and
+    /// subject; every other ask has one of the rest.
+    pub const fn holds_the_queue(self) -> bool {
+        matches!(self, Self::Authentication | Self::Cost)
+    }
+}
 
 // Where a proposal (ADR-0041 decision 7) stands: `submitted` waits for plan
 // review, `revising` was sent back to its planner (its tasks are drafts
@@ -435,6 +464,15 @@ pub struct Ask {
     pub answer: Option<String>,
     /// The role of the session that registered it (`DAGQ_ROLE`).
     pub asked_by: String,
+    /// Why a person is needed (ADR-0047 decision 41).
+    pub reason_category: AskReason,
+    /// What a `queue_hold` ask is about within its reason (the usage limit
+    /// or the disk for `cost`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject: Option<String>,
+    /// The runs a `queue_hold` ask holds, in the order they joined it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub affected: Vec<String>,
     pub created_at: i64,
     pub answered_at: Option<i64>,
     pub closed_at: Option<i64>,
@@ -464,6 +502,9 @@ pub struct NewAsk {
     pub question: String,
     pub options: Vec<String>,
     pub asked_by: String,
+    /// Why a person is needed (ADR-0047 decision 41): `scope`, `discard`
+    /// or `recovery_failed`. Authentication and cost are [`NewHold`]s.
+    pub reason_category: AskReason,
 }
 
 impl NewAsk {
@@ -481,10 +522,79 @@ impl NewAsk {
             DomainError::NonPositiveId { field: "task ID" }
         })?;
         require(
+            self.kind != AskKind::QueueHold && !self.reason_category.holds_the_queue(),
+            || DomainError::AskHoldsTheQueue {
+                reason: self.reason_category,
+            },
+        )?;
+        require(
             self.task_id.is_some() || self.run_id.is_some() || self.kind == AskKind::Blocked,
             || DomainError::AskWithoutTarget { kind: self.kind },
         )
     }
+}
+
+/// An authentication or cost ask to open, or to add a run to
+/// (ADR-0047 decision 42): at most one `queue_hold` ask is open per
+/// reason and subject, and a run that hits the same wall joins its
+/// `affected` instead of opening another.
+#[derive(Debug, Clone)]
+pub struct NewHold {
+    /// `authentication` or `cost`.
+    pub reason_category: AskReason,
+    pub subject: Option<String>,
+    /// The run that hit it.
+    pub run_id: RunId,
+    /// What the person is asked, without the list of runs: the ask's
+    /// question ends with the runs it holds, rewritten as runs join.
+    pub question: String,
+    pub options: Vec<String>,
+    pub asked_by: String,
+}
+
+impl NewHold {
+    pub fn validate(&self) -> Result<(), DomainError> {
+        require(!self.question.trim().is_empty(), || DomainError::Blank {
+            field: "question",
+        })?;
+        require(self.options.iter().all(|o| !o.trim().is_empty()), || {
+            DomainError::Blank { field: "options" }
+        })?;
+        require(!self.asked_by.trim().is_empty(), || DomainError::Blank {
+            field: "asked_by",
+        })?;
+        require(self.reason_category.holds_the_queue(), || {
+            DomainError::HoldWithoutQueueReason {
+                reason: self.reason_category,
+            }
+        })
+    }
+
+    /// The question of the ask holding `affected`.
+    pub fn question_for(question: &str, affected: &[String]) -> String {
+        format!(
+            "{question}\n\n{HOLD_AFFECTED_HEADING}{}",
+            affected.join(", ")
+        )
+    }
+}
+
+/// Where the question of a `queue_hold` ask lists the runs it holds.
+pub const HOLD_AFFECTED_HEADING: &str = "Affected runs: ";
+
+/// The options of an authentication or usage-limit ask (ADR-0047
+/// decision 42): `done` once the person logged in or the limit is back,
+/// `cancel_affected` to throw the held runs away.
+pub const HOLD_OPTIONS: &[&str] = &["done", "cancel_affected"];
+
+/// What [`NewHold`] did: opened the ask (`created`), added the run to the
+/// open one (`joined`), or found the run already in it (neither).
+#[derive(Debug, Clone, Serialize)]
+pub struct HoldOutcome {
+    #[serde(flatten)]
+    pub ask: Ask,
+    pub created: bool,
+    pub joined: bool,
 }
 
 /// What `ask` returns: the open ask of the same (task, run, kind) when one
@@ -1136,6 +1246,9 @@ pub struct Attention {
     /// The ask of an `ask_opened` / `ask_answered` attention.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ask_id: Option<AskId>,
+    /// Why that ask needs a person (ADR-0047 decision 41).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason_category: Option<AskReason>,
     pub status: String,
     pub kind: String,
     pub last_error: Option<String>,
@@ -1180,6 +1293,7 @@ pub fn supervisor_attention(pulses: &[SupervisorPulse]) -> Vec<Attention> {
         task_id: None,
         pid,
         ask_id: None,
+        reason_category: None,
         status: status.into(),
         kind: kind.into(),
         last_error: None,
@@ -1215,6 +1329,9 @@ mod attention_tests {
             options: vec![],
             answer: None,
             asked_by: "supervisor".into(),
+            reason_category: AskReason::RecoveryFailed,
+            subject: None,
+            affected: Vec::new(),
             created_at: 0,
             answered_at: None,
             closed_at: None,
@@ -1246,6 +1363,7 @@ mod attention_tests {
             question: "q".into(),
             options: vec!["a".into()],
             asked_by: "worker".into(),
+            reason_category: crate::domain::AskReason::Scope,
         };
         assert!(valid.validate().is_ok());
         for broken in [
@@ -1291,6 +1409,79 @@ mod attention_tests {
         );
         assert_eq!("decide".parse::<AskKind>().unwrap(), AskKind::Decide);
         assert!("bogus".parse::<AskKind>().is_err());
+        // Authentication and cost are queue_hold asks, one per queue
+        // (ADR-0047 decision 42), and a queue_hold is nothing else.
+        for broken in [
+            NewAsk {
+                reason_category: AskReason::Authentication,
+                ..valid.clone()
+            },
+            NewAsk {
+                reason_category: AskReason::Cost,
+                ..valid.clone()
+            },
+            NewAsk {
+                kind: AskKind::QueueHold,
+                ..valid.clone()
+            },
+        ] {
+            assert!(
+                matches!(broken.validate(), Err(DomainError::AskHoldsTheQueue { .. })),
+                "{broken:?}"
+            );
+        }
+        assert!("because".parse::<AskReason>().is_err());
+        assert_eq!(
+            "recovery_failed".parse::<AskReason>().unwrap(),
+            AskReason::RecoveryFailed
+        );
+    }
+
+    #[test]
+    fn a_hold_is_for_authentication_or_cost_and_lists_its_runs() {
+        let hold = NewHold {
+            reason_category: AskReason::Authentication,
+            subject: None,
+            run_id: RunId::new("run-1").unwrap(),
+            question: "Log in.".into(),
+            options: HOLD_OPTIONS.iter().map(|o| (*o).to_owned()).collect(),
+            asked_by: "supervisor".into(),
+        };
+        assert!(hold.validate().is_ok());
+        for broken in [
+            NewHold {
+                reason_category: AskReason::Scope,
+                ..hold.clone()
+            },
+            NewHold {
+                question: " ".into(),
+                ..hold.clone()
+            },
+            NewHold {
+                options: vec![" ".into()],
+                ..hold.clone()
+            },
+            NewHold {
+                asked_by: "".into(),
+                ..hold.clone()
+            },
+        ] {
+            assert!(broken.validate().is_err(), "{broken:?}");
+        }
+        assert_eq!(
+            NewHold {
+                reason_category: AskReason::Discard,
+                ..hold.clone()
+            }
+            .validate()
+            .unwrap_err()
+            .to_string(),
+            "a queue_hold ask is for authentication or cost, not discard"
+        );
+        assert_eq!(
+            NewHold::question_for("Log in.", &["a".into(), "b".into()]),
+            "Log in.\n\nAffected runs: a, b"
+        );
     }
 
     #[test]

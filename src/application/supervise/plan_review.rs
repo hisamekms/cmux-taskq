@@ -305,6 +305,7 @@ impl Supervisor<'_> {
             question: plan_question(job, &verdict, overridden.as_deref(), &precedents),
             options: PLAN_OPTIONS.iter().map(|o| (*o).to_owned()).collect(),
             asked_by: PLAN_REVIEW_ASKER.to_owned(),
+            reason_category: AskReason::Scope,
         });
         let applied = self.queue.finish_plan_review(
             job,

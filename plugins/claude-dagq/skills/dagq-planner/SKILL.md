@@ -29,7 +29,7 @@ Leave the traffic control to plan review: it checks the proposal against the oth
 The supervisor types "Plan review sent proposal N back" with the reasons into this terminal (a runtime planner gets them in its initial prompt). The proposal's drafts are `draft` again (tasks plan review reopened stay `submitted` and go again as they are). Fix what the reasons point at with `edit`, `dependency`, `add` or `cancel`, `lint --proposal N`, then `"$DAGQ" submit --proposal N`. A fix that changes the plan's intent (acceptance, scope, the relation to the goal):
 
 - **Opened by a person**: ask the person here before changing it. If you leave a revise unanswered, the inbox is told after a while (`check the planner`); nothing closes this workspace.
-- **Opened by the runtime**: `"$DAGQ" ask --task ID --kind planner_question --question '...'` (everything the person needs, your recommendation), report briefly and stop. The answer arrives here as `answer to ask <id>: ...`; apply it.
+- **Opened by the runtime**: `"$DAGQ" ask --task ID --kind planner_question --because scope --question '...'` (everything the person needs, your recommendation), report briefly and stop. The answer arrives here as `answer to ask <id>: ...`; apply it.
 
 A ready task plan review must change is moved back to `submitted` (never claimed) into a proposal of its own for a runtime planner, with the reasons: fix it and `submit --proposal N`. A person's concern about a proposal goes to the inbox as an `approve_plan` ask, never here; its `send_back` answer returns as a revise.
 

@@ -725,7 +725,8 @@ fn opening_or_initializing_an_older_queue_never_migrates_it() {
             (25, false),
             (26, true),
             (27, false),
-            (28, false)
+            (28, false),
+            (29, false)
         ]
     );
     let raw = Connection::open(&path).unwrap();
@@ -739,7 +740,7 @@ fn opening_or_initializing_an_older_queue_never_migrates_it() {
     std::fs::write(dir.path().join("backups/queue-23-5.sqlite3"), "earlier").unwrap();
     let report = SqliteQueue::migrate(&path, Some(&|_| false), 5).unwrap();
     assert_eq!(report.floor, floor_for(SqliteQueue::SCHEMA_VERSION));
-    assert_eq!(report.applied.len(), 5);
+    assert_eq!(report.applied.len(), 6);
     let backup = report.backup.unwrap();
     assert!(
         backup.ends_with("backups/queue-23-5-1.sqlite3"),
@@ -1342,9 +1343,9 @@ fn migration_from_v6_adds_goals_and_keeps_tasks_runs_and_events() {
     // 0023 (planner sessions), 0024 (the schema floor), 0025 (the stalled
     // ask), 0026 (the search index), 0027 (plan review) and 0028 (draft
     // planners: draft origins, the planner_question ask, no task leases)
-    // are applied together.
-    assert_eq!(SqliteQueue::SCHEMA_VERSION, 28);
-    assert_eq!(queue.schema_version().unwrap(), 28);
+    // and 0029 (ask reasons, the queue_hold ask) are applied together.
+    assert_eq!(SqliteQueue::SCHEMA_VERSION, 29);
+    assert_eq!(queue.schema_version().unwrap(), 29);
     assert_eq!(
         queue
             .session_workspace(dagq::domain::SessionRole::Inbox)
@@ -1420,21 +1421,52 @@ fn migration_from_v6_adds_goals_and_keeps_tasks_runs_and_events() {
     }
     // Only a blocked ask may belong to no task, and then to no run either.
     raw.execute(
-        "INSERT INTO asks(kind,question,asked_by) VALUES ('blocked','slots idle','observer')",
+        "INSERT INTO asks(kind,question,asked_by,reason_category)
+         VALUES ('blocked','slots idle','observer','scope')",
         [],
     )
     .unwrap();
     assert!(
         raw.execute(
-            "INSERT INTO asks(kind,question,asked_by) VALUES ('decide','x','observer')",
+            "INSERT INTO asks(kind,question,asked_by,reason_category)
+             VALUES ('decide','x','observer','recovery_failed')",
+            []
+        )
+        .is_err()
+    );
+    // 0029: every ask has a reason, and authentication and cost are the
+    // queue_hold asks' alone, about no task or run.
+    raw.execute(
+        "INSERT INTO asks(kind,question,asked_by,reason_category,affected)
+         VALUES ('queue_hold','log in','supervisor','authentication','[\"run-landed\"]')",
+        [],
+    )
+    .unwrap();
+    for (kind, reason) in [
+        ("queue_hold", "scope"),
+        ("blocked", "cost"),
+        ("blocked", "bogus"),
+    ] {
+        assert!(
+            raw.execute(
+                "INSERT INTO asks(kind,question,asked_by,reason_category) VALUES (?1,'x','observer',?2)",
+                [kind, reason]
+            )
+            .is_err(),
+            "{kind} {reason}"
+        );
+    }
+    assert!(
+        raw.execute(
+            "INSERT INTO asks(kind,question,asked_by) VALUES ('blocked','x','observer')",
             []
         )
         .is_err()
     );
     // 0017: the supervisor's stuck_exit ask about a run.
     raw.execute(
-        "INSERT INTO asks(kind,task_id,run_id,question,asked_by)
-         VALUES ('stuck_exit',1,'run-landed','session did not exit','supervisor')",
+        "INSERT INTO asks(kind,task_id,run_id,question,asked_by,reason_category)
+         VALUES ('stuck_exit',1,'run-landed','session did not exit','supervisor','recovery_failed')",
         [],
     )
     .unwrap();
@@ -3164,12 +3196,13 @@ fn migration_indexes_the_existing_rows_and_landings_record_their_message() {
             .iter()
             .map(|m| (m.version, m.compatible))
             .collect::<Vec<_>>(),
-        [(26, true), (27, false), (28, false)]
+        [(26, true), (27, false), (28, false), (29, false)]
     );
-    // 0027 (plan review) and 0028 (draft planners) are applied with it and
-    // are breaking: a copy is taken and the floor rises to the last.
+    // 0027 (plan review), 0028 (draft planners) and 0029 (ask reasons) are
+    // applied with it and are breaking: a copy is taken and the floor rises
+    // to the last.
     assert!(report.backup.is_some());
-    assert_eq!(report.floor, 28);
+    assert_eq!(report.floor, 29);
     let mut queue = SqliteQueue::open(&path).unwrap();
     assert_eq!(
         search(&queue, "古い", |_| {}),
@@ -3227,5 +3260,179 @@ fn migration_indexes_the_existing_rows_and_landings_record_their_message() {
     assert_eq!(
         search(&queue, "新しい着地", |_| {}),
         ["commit cccc completed message: feat: «新しい着地»"]
+    );
+}
+
+#[test]
+fn migration_to_v29_gives_every_ask_the_reason_of_its_kind() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("queue.db");
+    let raw = Connection::open(&path).unwrap();
+    for migration in &MIGRATIONS[..28] {
+        raw.execute_batch(migration).unwrap();
+    }
+    raw.execute_batch(&format!(
+        "PRAGMA application_id = 1129599281; PRAGMA user_version = 28;
+         INSERT INTO schema_floor(singleton, floor) VALUES (1, 28);
+         INSERT INTO tasks(title,description,acceptance,verification_commands,status,updated_at)
+         VALUES ('t','','a','[]','in_progress','2026-09-02T00:00:00.000Z');
+         INSERT INTO task_runs(id,task_id,status,requested_provider,actual_provider,base_commit)
+         VALUES ('run-1',1,'running','claude','claude','{BASE}');
+         INSERT INTO asks(kind,task_id,run_id,question,asked_by) VALUES
+           ('approve_landing',1,'run-1','land?','supervisor'),
+           ('worker_question',1,'run-1','which?','worker'),
+           ('stalled',1,'run-1','idle','supervisor'),
+           ('decide',1,NULL,'retry?','supervisor');
+         INSERT INTO asks(kind,question,asked_by) VALUES ('blocked','slots idle','observer');"
+    ))
+    .unwrap();
+    SqliteQueue::migrate(&path, None, 0).unwrap();
+    let queue = SqliteQueue::open(&path).unwrap();
+    let reasons: Vec<(String, String)> = queue
+        .asks(dagq::infrastructure::asks::AskQuery {
+            all: true,
+            ..Default::default()
+        })
+        .unwrap()
+        .iter()
+        .map(|a| {
+            (
+                a.kind.as_str().to_owned(),
+                a.reason_category.as_str().to_owned(),
+            )
+        })
+        .collect();
+    let pairs: Vec<(&str, &str)> = reasons
+        .iter()
+        .map(|(k, r)| (k.as_str(), r.as_str()))
+        .collect();
+    assert_eq!(
+        pairs,
+        [
+            ("approve_landing", "scope"),
+            ("worker_question", "scope"),
+            ("stalled", "recovery_failed"),
+            ("decide", "recovery_failed"),
+            ("blocked", "scope"),
+        ]
+    );
+}
+
+/// Authentication and cost asks are one per queue, reason and subject
+/// (ADR-0047 decision 42): a second run that hits the same login joins the
+/// open ask, which lists both runs and records `ask_updated` on the one that
+/// joined; the same run joining again changes nothing; another subject or an
+/// answered ask opens a new one.
+#[test]
+fn a_login_that_stops_several_runs_is_one_ask_that_lists_them() {
+    use dagq::domain::{AskKind, AskReason, HOLD_OPTIONS, NewAsk, NewHold};
+    let (_dir, mut queue) = fixture();
+    let mut runs = Vec::new();
+    for title in ["one", "two"] {
+        let task = queue.add(new_task(title)).unwrap();
+        queue
+            .transition(task.id(), TaskAction::BypassReview)
+            .unwrap();
+        let ClaimOutcome::Claimed { run } = queue.claim(&base()).unwrap() else {
+            panic!()
+        };
+        runs.push(run.id().clone());
+    }
+    let hold = |run: &RunId| NewHold {
+        reason_category: AskReason::Authentication,
+        subject: None,
+        run_id: run.clone(),
+        question: "Log in again.".into(),
+        options: HOLD_OPTIONS.iter().map(|o| (*o).to_owned()).collect(),
+        asked_by: "supervisor".into(),
+    };
+    let first = queue.hold(hold(&runs[0])).unwrap();
+    assert!(first.created && first.joined);
+    assert_eq!(first.ask.kind, AskKind::QueueHold);
+    assert_eq!(first.ask.task_id, None);
+    assert_eq!(first.ask.run_id, None);
+    assert_eq!(first.ask.affected, [runs[0].as_str()]);
+    let second = queue.hold(hold(&runs[1])).unwrap();
+    assert!(!second.created && second.joined);
+    assert_eq!(second.ask.id, first.ask.id);
+    assert_eq!(second.ask.affected, [runs[0].as_str(), runs[1].as_str()]);
+    assert_eq!(
+        second.ask.question,
+        format!("Log in again.\n\nAffected runs: {}, {}", runs[0], runs[1])
+    );
+    let again = queue.hold(hold(&runs[0])).unwrap();
+    assert!(!again.created && !again.joined);
+    assert_eq!(queue.hold_of(&runs[1]).unwrap().unwrap().id, first.ask.id);
+    let open = queue
+        .asks(dagq::infrastructure::asks::AskQuery {
+            open: true,
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(open.len(), 1, "{open:?}");
+    // One ask_opened on the queue, one ask_updated on the run that joined.
+    let events = queue
+        .events_between(
+            EventId::new(0),
+            queue.latest_event_id().unwrap(),
+            &dagq::domain::EventFilter::default(),
+            100,
+        )
+        .unwrap();
+    let opened: Vec<_> = events.iter().filter(|e| e.kind == "ask_opened").collect();
+    assert_eq!(opened.len(), 1);
+    assert_eq!(opened[0].payload["reason_category"], "authentication");
+    assert_eq!(opened[0].task_id, None);
+    let updated: Vec<_> = events.iter().filter(|e| e.kind == "ask_updated").collect();
+    assert_eq!(updated.len(), 1);
+    assert_eq!(updated[0].run_id.as_ref(), Some(&runs[1]));
+    assert_eq!(updated[0].payload["affected"].as_array().unwrap().len(), 2);
+    // A cost ask is another hold, and so is the usage limit's next to the disk's.
+    let usage = queue
+        .hold(NewHold {
+            reason_category: AskReason::Cost,
+            subject: Some("usage_limit".into()),
+            ..hold(&runs[0])
+        })
+        .unwrap();
+    assert!(usage.created);
+    let disk = queue
+        .hold(NewHold {
+            reason_category: AskReason::Cost,
+            subject: Some("disk".into()),
+            ..hold(&runs[0])
+        })
+        .unwrap();
+    assert!(disk.created && disk.ask.id != usage.ask.id);
+    // Once answered, the next login that runs out opens a new ask.
+    let answered = queue.answer(first.ask.id, "done").unwrap();
+    assert_eq!(answered.reason_category, AskReason::Authentication);
+    assert!(queue.hold_of(&runs[1]).unwrap().is_none());
+    assert!(queue.hold(hold(&runs[1])).unwrap().created);
+    // A hold is for authentication or cost only, and those are no other ask.
+    assert!(
+        queue
+            .hold(NewHold {
+                reason_category: AskReason::Scope,
+                ..hold(&runs[0])
+            })
+            .is_err()
+    );
+    let error = queue
+        .ask(NewAsk {
+            kind: AskKind::WorkerQuestion,
+            task_id: None,
+            run_id: Some(runs[0].clone()),
+            question: "logged out?".into(),
+            options: Vec::new(),
+            asked_by: "worker".into(),
+            reason_category: AskReason::Authentication,
+        })
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("queue_hold asks the runtime opens"),
+        "{error}"
     );
 }

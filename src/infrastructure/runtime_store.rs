@@ -2851,6 +2851,15 @@ impl AskStore for SqliteQueue {
     fn ask(&mut self, ask: crate::domain::NewAsk) -> Result<crate::domain::AskOutcome> {
         SqliteQueue::ask(self, ask)
     }
+    fn hold(&mut self, hold: crate::domain::NewHold) -> Result<crate::domain::HoldOutcome> {
+        SqliteQueue::hold(self, hold)
+    }
+    fn hold_of(&self, run_id: &RunId) -> Result<Option<crate::domain::Ask>> {
+        SqliteQueue::hold_of(self, run_id)
+    }
+    fn read_ask(&self, id: AskId) -> Result<crate::domain::Ask> {
+        SqliteQueue::read_ask(self, id)
+    }
     fn answer(&mut self, id: AskId, text: &str) -> Result<crate::domain::Ask> {
         SqliteQueue::answer(self, id, text)
     }

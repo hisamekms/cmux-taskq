@@ -195,6 +195,7 @@ pub(super) fn ask_unsubmitted(
             question,
             options: Vec::new(),
             asked_by: SessionRole::Supervisor.as_str().into(),
+            reason_category: AskReason::RecoveryFailed,
         },
         sv.cmux,
     );

@@ -341,6 +341,18 @@ impl StallWatch {
         {
             return Ok(None);
         }
+        // A session stopped at a login that ran out waits for a person to
+        // log in, in the queue's one authentication ask (ADR-0047 decision
+        // 42), not for a nudge or a stalled ask of its own.
+        if sv.queue.hold_of(run.id())?.is_some() {
+            return Ok(None);
+        }
+        if let Ok(screen) = sv.cmux.capture(workspace)
+            && sv.signals.auth_required(&screen)
+            && raise_auth(sv, run, workspace, &screen)?
+        {
+            return Ok(None);
+        }
         let idle_secs = secs_between(modified, now);
         match self.nudge {
             None => self.send_nudge(sv, run, workspace, &idle, idle_secs, now),
@@ -440,6 +452,7 @@ impl StallWatch {
                 question,
                 options: STALLED_OPTIONS.iter().map(|o| (*o).to_owned()).collect(),
                 asked_by: SessionRole::Supervisor.as_str().into(),
+                reason_category: AskReason::RecoveryFailed,
             },
             sv.cmux,
         )?;
