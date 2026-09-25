@@ -41,7 +41,7 @@ cargo clippy --locked --all-targets -- -D warnings
 
 - 人の判断は ADR・Goal の記述・`Task.context`・receipt の `summary` に残す（作業記録のジャーナルは [ADR-0036](docs/adr/0036-delete-frozen-work-records.md) で削除した）
 - 決定は `docs/adr/` に追加する。既存 ADR は書き換えない
-- ADR は `accepted` だけが現在の決定で、`superseded` なら `superseded_by` を辿る。決定を変えるときは古い ADR を丸ごと置き換える統合 ADR を書く（[ADR-0035](docs/adr/0035-adr-is-superseded-whole-with-dates-and-banner.md)、索引は [docs/adr/README.md](docs/adr/README.md)）
+- ADR は `accepted` だけが現在の決定で、`superseded` なら `superseded_by` を辿り、`deprecated` は後継なしの廃止（日付は `superseded_on` ではなく `deprecated_on`）。決定を変えるときは古い ADR を丸ごと置き換える統合 ADR を書く（[ADR-0042](docs/adr/0042-adr-is-superseded-whole-and-deprecation-date-is-deprecated-on.md)、索引は [docs/adr/README.md](docs/adr/README.md)）
 - 実装を変えたら `docs/design/` の該当文書と `updated` / `last_verified` を更新する
 - ステップの状態が変わったら `docs/plans/current.md` を更新する
 - frontmatter は [docs/frontmatter.md](docs/frontmatter.md) に従う

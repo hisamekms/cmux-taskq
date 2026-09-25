@@ -2,10 +2,12 @@
 id: adr-0035
 type: adr
 title: ADRは丸ごと置き換え、置き換え・廃止の日付とstatusをfrontmatterと本文冒頭の注記に残す
-status: accepted
+status: superseded
 created: 2026-09-24
 updated: 2026-09-24
 accepted_on: 2026-09-24
+superseded_by: adr-0042
+superseded_on: 2026-09-25
 owners:
   - hisamekms
 tags:
@@ -19,6 +21,8 @@ related:
 ---
 
 # ADR-0035: ADRは丸ごと置き換え、置き換え・廃止の日付とstatusをfrontmatterと本文冒頭の注記に残す
+
+> **置き換え済み（2026-09-25）**: このADRの決定は現在有効ではない。現行の決定は[ADR-0042](0042-adr-is-superseded-whole-and-deprecation-date-is-deprecated-on.md)を読む。
 
 ## Context
 

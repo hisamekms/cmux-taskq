@@ -13,12 +13,12 @@ tags:
 
 # Architecture decision records
 
-ADRは、将来の実装や運用に大きな影響を与える決定の理由を残す。規則は[ADR-0035](0035-adr-is-superseded-whole-with-dates-and-banner.md)に従う。
+ADRは、将来の実装や運用に大きな影響を与える決定の理由を残す。規則は[ADR-0042](0042-adr-is-superseded-whole-and-deprecation-date-is-deprecated-on.md)に従う。
 
 - `accepted`のADRだけが現在の決定で、本文の決定はすべて現在有効である。`superseded`のADRは`superseded_by`を辿り、`accepted`に着くまで読む。
 - 決定を1つでも変えるときは、古いADRのまだ生きている決定も書き直して引き継ぐ統合ADRを書き、古いADRを丸ごと置き換える。「ADR-XXXXの決定Nを上書きする」だけの部分的なADRは書かない。
 - 置き換えは後継を`accepted`にする変更と同じ変更で行う。`proposed`の後継は何も置き換えない。
-- 本文はappend-onlyで、後から変えてよいのはstatus・`accepted_on`・`superseded_by`・`superseded_on`とH1直後の注記1行だけ。欄と注記の書式は[frontmatter仕様](../frontmatter.md)と[template](0000-template.md)にある。
+- 本文はappend-onlyで、後から変えてよいのはstatus・`accepted_on`・`superseded_by`・`superseded_on`・`deprecated_on`とH1直後の注記1行だけ（`supersedes`は置き換える側のADRを書くときに本文と一緒に書く）。`superseded_on`は`superseded`にした日（後継の`accepted_on`と同じ）、`deprecated_on`は`deprecated`にした日。欄と注記の書式は[frontmatter仕様](../frontmatter.md)と[template](0000-template.md)にある。
 - ADRのstatusを変える変更は、同じ変更でこの索引の2つの表も更新する。
 
 ## Status
@@ -64,21 +64,22 @@ ADRは、将来の実装や運用に大きな影響を与える決定の理由�
 | [ADR-0029](0029-task-declares-paths-and-verification-follows-the-kind-of-change.md) | taskが変更してよいパス（add --paths）を宣言し、validatingとintegrateが宣言外の変更を拒否し、verification_commandsを変更の種類で軽くする |  |
 | [ADR-0030](0030-publish-to-crates-io-on-tag-push-with-trusted-publishing.md) | crates.ioを追加の配布経路にし、tag pushでTrusted Publishingによって自動でpublishする |  |
 | [ADR-0031](0031-color-pill-and-pin-for-inbox-and-planner-and-unpin-before-close.md) | upがinbox / plannerのworkspaceに役割の色・status pill・ピンを当て、dagqのworkspace closeはピンを外してから閉じる |  |
-| [ADR-0035](0035-adr-is-superseded-whole-with-dates-and-banner.md) | ADRは丸ごと置き換え、置き換え・廃止の日付とstatusをfrontmatterと本文冒頭の注記に残す | 2026-09-24 |
 | [ADR-0036](0036-delete-frozen-work-records.md) | 凍結済みのdocs/journal/を削除し、今も効く手順と観測事実だけをdesign文書へ移す | 2026-09-25 |
 | [ADR-0038](0038-task-depends-on-a-goal-until-it-is-achieved.md) | taskがgoalに依存でき、依存先のgoalがachievedで閉じるまでclaimされない | 2026-09-25 |
 | [ADR-0040](0040-verify-once-review-run-env-graph-stats-and-task-priority-in-claim-order.md) | 検証をintegrateの1回にし、reviewをsupervisorの工程にし、dagq.tomlでrunのenvを渡し、taskの5段階の優先度と解放数でclaim順を決め、statsで詰まりを数える | 2026-09-25 |
 | [ADR-0041](0041-on-demand-planners-proposals-submitted-and-plan-review-job.md) | 役割を5つにし、plannerをproposalごとのオンデマンドのworkspaceにし、taskにsubmitted状態を足し、supervisorが起動するplan review jobだけがreadyにし、follow_upのdraftもruntimeが立てるplannerのproposalとして同じgateを通す | 2026-09-25 |
+| [ADR-0042](0042-adr-is-superseded-whole-and-deprecation-date-is-deprecated-on.md) | ADRは丸ごと置き換え、置き換えの日付はsuperseded_on、廃止の日付はdeprecated_onに分けてfrontmatterと本文冒頭の注記に残す | 2026-09-25 |
 | [ADR-0043](0043-detect-stalled-worker-sessions-nudge-once-then-ask.md) | supervisorが止まったworkerのsessionを決まった規則で検知し、一度促すかEnterを一度送り直してからinboxのaskにし、statsが走っているrunのalertと閾値ごとの結果を返す | 2026-09-25 |
 | [ADR-0045](0045-build-identifier-explicit-migrate-schema-compat-handoff-and-auto-update.md) | 固定バイナリをbuild識別子で見分け、queueを開いただけではmigrateせず、互換の範囲のschemaを受け入れ、supervisorを待たずに引き継ぎで入れ替え、up --auto-updateで着地のたびに自動で更新する | 2026-09-25 |
 
 ## 置き換え・廃止されたADR
 
-`status: superseded` / `deprecated`のADRと後継の対応。`deprecated`の行は`superseded_by`を空にする。0001〜0034の棚卸し（後続のtask）で統合ADRが`accepted`になるときにも行が加わる。
+`status: superseded` / `deprecated`のADRと後継の対応。`deprecated`の行は`superseded_by`を空にし、日付の列に`deprecated_on`を書く。0001〜0034の棚卸し（後続のtask）で統合ADRが`accepted`になるときにも行が加わる。
 
-| ADR | Status | superseded_by | superseded_on |
+| ADR | Status | superseded_by | superseded_on / deprecated_on |
 | --- | --- | --- | --- |
 | [ADR-0014](0014-up-replaces-a-supervisor-of-another-binary-version.md) | superseded | [ADR-0045](0045-build-identifier-explicit-migrate-schema-compat-handoff-and-auto-update.md) | 2026-09-25 |
 | [ADR-0023](0023-verify-once-review-in-supervisor-run-env-graph-and-stats.md) | superseded | [ADR-0040](0040-verify-once-review-run-env-graph-stats-and-task-priority-in-claim-order.md) | 2026-09-25 |
 | [ADR-0024](0024-retire-maintainer-into-jobs-and-observer.md) | superseded | [ADR-0041](0041-on-demand-planners-proposals-submitted-and-plan-review-job.md) | 2026-09-25 |
+| [ADR-0035](0035-adr-is-superseded-whole-with-dates-and-banner.md) | superseded | [ADR-0042](0042-adr-is-superseded-whole-and-deprecation-date-is-deprecated-on.md) | 2026-09-25 |
 | [ADR-0037](0037-follow-up-triage-job-decides-follow-up-drafts.md) | superseded | [ADR-0041](0041-on-demand-planners-proposals-submitted-and-plan-review-job.md) | 2026-09-25 |
