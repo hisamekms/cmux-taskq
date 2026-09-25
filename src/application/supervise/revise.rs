@@ -84,10 +84,12 @@ impl ReviseWatch {
             )));
         };
         if sv.generators.clock.now() - wrapper.heartbeat_at > HEARTBEAT_TIMEOUT_SECS {
-            ensure!(
-                sv.processes.alive(wrapper.pid),
-                "wrapper heartbeat expired; session may still be alive"
-            );
+            // A session that died will not rewrite it either (task 236).
+            if !sv.processes.alive(wrapper.pid) {
+                return Ok(Some(ReviseOutcome::Ended(
+                    "died without recording its exit".to_owned(),
+                )));
+            }
             // The exit that follows records `wrapper_heartbeat_expired` and
             // sends the /exit.
             return Ok(Some(ReviseOutcome::Ended(

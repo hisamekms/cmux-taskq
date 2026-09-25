@@ -368,8 +368,12 @@ pub fn abandon(mut run: TaskRun, message: String) -> Result<TaskRun, DomainError
 
 /// Take back a run whose processes are gone: an executing run becomes
 /// `interrupted`, one left mid-integration goes back to
-/// `awaiting_integration`, since its validated result is intact.
+/// `awaiting_integration`, since its validated result is intact, and one
+/// awaiting integration (whose supervisor died during its review) stays so.
 pub fn interrupt(mut run: TaskRun) -> Result<TaskRun, DomainError> {
+    if run.status == RunStatus::AwaitingIntegration {
+        return Ok(run);
+    }
     require_status(&run, &UNFINISHED, "recover")?;
     run.status = if run.status == RunStatus::Integrating {
         RunStatus::AwaitingIntegration
@@ -864,6 +868,12 @@ mod tests {
         );
         assert_eq!(
             interrupt(run(RunStatus::Integrating)).unwrap().status(),
+            RunStatus::AwaitingIntegration
+        );
+        assert_eq!(
+            interrupt(run(RunStatus::AwaitingIntegration))
+                .unwrap()
+                .status(),
             RunStatus::AwaitingIntegration
         );
         let deferred = defer_integration(run(RunStatus::Integrating), "conflict".into()).unwrap();

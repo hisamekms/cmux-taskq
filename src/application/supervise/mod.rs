@@ -45,7 +45,7 @@ use super::{
     ProcessControl, Queue, QueueOpener, Repository, ResumeCandidate, RunFiles, Spawned, Spawner,
     Streams, TRIAGE_ASKER, TriageAction, Validation, Verifier, WorkspaceBackend, WorkspaceTags,
     ask, dependency_graph,
-    health::run_health,
+    health::{lease_health, run_health},
     integrate::{self as integration, Integration, check_receipt, resume_attempts},
     naming::{
         resume_workspace_description, shell_join, workspace_description, workspace_group_name,
@@ -1152,12 +1152,22 @@ fn stop_job(slot: &mut Slot) {
     }
 }
 
-/// Whether the run's session wrapper is registered and has not exited.
-fn session_alive(queue: &dyn Queue, run_id: &RunId) -> Result<bool> {
-    Ok(queue
+/// Whether the run's session wrapper is registered, has not exited and has
+/// not died without recording its exit (its heartbeat expired and its
+/// process is gone): a session that died is one that ended (task 236).
+fn session_alive(sv: &Supervisor<'_>, run_id: &RunId) -> Result<bool> {
+    let now = sv.generators.clock.now();
+    Ok(sv
+        .queue
         .processes(run_id)?
         .iter()
-        .any(|p| p.role == "wrapper" && p.exited_at.is_none()))
+        .any(|p| p.role == "wrapper" && p.exited_at.is_none() && !wrapper_dead(sv, p, now)))
+}
+
+/// Whether a wrapper that has not recorded its exit died: its heartbeat is
+/// older than `HEARTBEAT_TIMEOUT_SECS` and its process is gone.
+fn wrapper_dead(sv: &Supervisor<'_>, wrapper: &RunProcess, now: i64) -> bool {
+    now - wrapper.heartbeat_at > HEARTBEAT_TIMEOUT_SECS && !sv.processes.alive(wrapper.pid)
 }
 
 /// The `reasons` of the run's latest `review_finished`.

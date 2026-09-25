@@ -63,15 +63,20 @@ impl ExitWatch {
         )
     }
 
-    /// Whether the session is gone (or there was none). A session that
-    /// exited has its `stuck_exit` asks closed.
+    /// Whether the session is gone (or there was none): it exited, or its
+    /// wrapper died without recording its exit. A session that is gone has
+    /// its `stuck_exit` asks closed.
     pub(super) fn poll(&mut self, sv: &mut Supervisor<'_>, run: &TaskRun) -> Result<bool> {
         let Some(session) = &self.session else {
             return Ok(true);
         };
         let processes = sv.queue.processes(run.id())?;
         let wrapper = processes.iter().find(|p| p.role == "wrapper");
-        let Some(wrapper) = wrapper.filter(|w| w.exited_at.is_none()) else {
+        let now = sv.generators.clock.now();
+        // A wrapper that died without recording its exit left no session to
+        // ask (task 236): the run goes on as if it had exited.
+        let Some(wrapper) = wrapper.filter(|w| w.exited_at.is_none() && !wrapper_dead(sv, w, now))
+        else {
             if self.requested.is_some() {
                 let name = match session.resume {
                     Some(attempt) => format!("terminal-resume-{attempt}.txt"),

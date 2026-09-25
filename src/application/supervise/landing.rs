@@ -71,7 +71,7 @@ impl Supervisor<'_> {
             .count()
             + 1;
         let live = match &session {
-            Some(_) => session_alive(&*self.queue, run.id())?,
+            Some(_) => session_alive(self, run.id())?,
             None => false,
         };
         self.queue.record_runtime_event(
@@ -188,7 +188,7 @@ impl Supervisor<'_> {
                 }
                 let Some(live) = session
                     .clone()
-                    .filter(|_| session_alive(&*self.queue, run.id()).unwrap_or(false))
+                    .filter(|_| session_alive(self, run.id()).unwrap_or(false))
                 else {
                     let why = "the session had ended, so nobody could revise the run".to_owned();
                     return Ok(ask(Some(why), verdict, session));
@@ -293,7 +293,7 @@ impl Supervisor<'_> {
         }
         let live = session
             .clone()
-            .filter(|_| session_alive(&*self.queue, run.id()).unwrap_or(false));
+            .filter(|_| session_alive(self, run.id()).unwrap_or(false));
         let sent = match &live {
             Some(live) => {
                 let task = self.queue.show(run.task_id())?.task;

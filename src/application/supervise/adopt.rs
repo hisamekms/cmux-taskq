@@ -6,11 +6,15 @@ use super::*;
 impl Supervisor<'_> {
     /// Take over `running` / `validating` runs whose lease went stale under
     /// another token while their wrapper is alive (heartbeat within the
-    /// lease TTL) or has already reported its exit (ADR-0012). A wrapper
-    /// that is dead or silent is `recover`'s business; a run without a
-    /// lease was abandoned or recovered on purpose and is never adopted.
-    /// The staleness is judged here and again inside `adopt_run`, so two
-    /// supervisors racing for one run take it exactly once.
+    /// lease TTL) or has already reported its exit (ADR-0012), and every
+    /// `awaiting_integration` run whose lease went stale, whatever its
+    /// wrapper: its review is headless and needs no session, and a session
+    /// that died is handled as one that ended (task 236). A `running` /
+    /// `validating` run whose wrapper is dead or silent is `recover`'s
+    /// business; a run without a lease was abandoned or recovered on
+    /// purpose and is never adopted. The staleness is judged here and again
+    /// inside `adopt_run`, so two supervisors racing for one run take it
+    /// exactly once.
     pub(super) fn adopt_stale_runs(&mut self, parallel: usize) -> Result<()> {
         for candidate in self.queue.runs_leased_by_others(&self.token)? {
             if self.slots.len() >= parallel {
@@ -25,19 +29,10 @@ impl Supervisor<'_> {
             if !self.lease_stale(&lease, now) {
                 continue;
             }
-            // A run moved on by `resume_skipped` has no session of its own
-            // since: its supervisor alone owned it, whatever the wrapper of
-            // an earlier session left behind.
-            let skipped = self.skipped_resume(run.id())?;
-            let alive = wrapper.as_ref().and_then(|wrapper| {
-                wrapper.exited_at.is_none().then(|| {
-                    self.processes.alive(wrapper.pid)
-                        && now - wrapper.heartbeat_at <= HEARTBEAT_TIMEOUT_SECS
-                })
-            });
-            if !skipped && (wrapper.is_none() || alive == Some(false)) {
+            if !self.adoptable(&run, wrapper.as_ref(), now)? {
                 continue;
             }
+            let alive = self.wrapper_alive(wrapper.as_ref(), now);
             let observed = match &wrapper {
                 Some(wrapper) => json!({
                     "pid": wrapper.pid,
@@ -58,7 +53,7 @@ impl Supervisor<'_> {
                     Some(Some(at)) => format!("exited at {at}"),
                     Some(None) if alive == Some(true) => "alive".to_owned(),
                     Some(None) => "gone".to_owned(),
-                    None => "none since resume_skipped".to_owned(),
+                    None => "none".to_owned(),
                 }, run.task_id(), run.workspace_id().unwrap_or("?"));
             let phase = if run.status() == RunStatus::AwaitingIntegration {
                 self.adopt_review(&run)
@@ -77,6 +72,42 @@ impl Supervisor<'_> {
             }
         }
         Ok(())
+    }
+    /// Whether a run whose lease went stale is taken over by
+    /// [`Self::adopt_stale_runs`] rather than recovered: an
+    /// `awaiting_integration` run always; a run moved on by `resume_skipped`
+    /// (it has no session of its own since: its supervisor alone owned it,
+    /// whatever the wrapper of an earlier session left behind); otherwise
+    /// only one whose wrapper is alive or has reported its exit. Never a
+    /// run outside `running` / `validating` / `awaiting_integration`
+    /// (`claimed` / `starting` need the claimer's token).
+    pub(super) fn adoptable(
+        &self,
+        run: &TaskRun,
+        wrapper: Option<&RunProcess>,
+        now: i64,
+    ) -> Result<bool> {
+        if !matches!(
+            run.status(),
+            RunStatus::Running | RunStatus::Validating | RunStatus::AwaitingIntegration
+        ) {
+            return Ok(false);
+        }
+        if run.status() == RunStatus::AwaitingIntegration || self.skipped_resume(run.id())? {
+            return Ok(true);
+        }
+        Ok(wrapper.is_some() && self.wrapper_alive(wrapper, now) != Some(false))
+    }
+    /// Whether the wrapper that has not reported its exit is alive (its
+    /// process lives and its heartbeat is within the lease TTL); `None`
+    /// when there is no wrapper or it reported its exit.
+    fn wrapper_alive(&self, wrapper: Option<&RunProcess>, now: i64) -> Option<bool> {
+        wrapper.and_then(|wrapper| {
+            wrapper.exited_at.is_none().then(|| {
+                self.processes.alive(wrapper.pid)
+                    && now - wrapper.heartbeat_at <= HEARTBEAT_TIMEOUT_SECS
+            })
+        })
     }
     /// Rebuild the slot of an adopted run from what the queue and the run
     /// directory hold: the planned paths, whether the receipt is already on
@@ -235,7 +266,7 @@ impl Supervisor<'_> {
         let then = match anchor.kind.as_str() {
             "revise_requested" => {
                 if let Some(live) = session.clone()
-                    && session_alive(&*self.queue, run.id())?
+                    && session_alive(self, run.id())?
                 {
                     return Ok(Phase::Revise(ReviseWatch {
                         session: live,
@@ -259,7 +290,7 @@ impl Supervisor<'_> {
                 let passed = passed_before(&events, anchor.id);
                 if let Some(live) = session.clone()
                     && let Some(verdict) = passed
-                    && session_alive(&*self.queue, run.id())?
+                    && session_alive(self, run.id())?
                 {
                     return Ok(Phase::Revise(ReviseWatch {
                         session: live,

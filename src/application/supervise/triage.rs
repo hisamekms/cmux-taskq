@@ -5,28 +5,47 @@
 use super::*;
 
 impl Supervisor<'_> {
-    /// Recover the unfinished runs nobody leases whose wrapper exited or
-    /// died (ADR-0024 decision 3, amending ADR-0012): `recover`'s own check
-    /// (no live process of the run; `doctor`'s blockers empty) on
-    /// `claimed` / `starting` / `running` / `validating` runs without a
-    /// lease row. They become `interrupted` with `run_recovered` (`by:
-    /// supervisor`) and go to the triage, never straight to `ready`. A run
-    /// that changed meanwhile is left for a later pass.
+    /// Recover the unfinished runs whose wrapper exited or died and whose
+    /// supervisor is gone (ADR-0024 decision 3, amending ADR-0012):
+    /// `recover`'s own check (no live process of the run; `doctor`'s
+    /// blockers empty) on `claimed` / `starting` / `running` / `validating`
+    /// runs without a lease row, or with a stale lease whose pid is dead
+    /// that [`Self::adopt_stale_runs`] would not take (task 236: a run the
+    /// dead supervisor left behind with its session). They become
+    /// `interrupted` with `run_recovered` (`by: supervisor`) and go to the
+    /// triage, never straight to `ready`. A run that changed meanwhile is
+    /// left for a later pass.
     pub(super) fn recover_dead_runs(&mut self) -> Result<()> {
         let now = self.generators.clock.now();
         for run in self.queue.active_runs()? {
-            if run.status() == RunStatus::Integrating || self.queue.run_lease(run.id())?.is_some() {
+            if run.status() == RunStatus::Integrating {
                 continue;
             }
             let processes = self.queue.processes(run.id())?;
-            let health = run_health(&run, &processes, None, now, &*self.processes, &*self.files);
+            let lease = match self.queue.run_lease(run.id())? {
+                None => None,
+                Some(lease) => {
+                    let wrapper = processes.iter().find(|p| p.role == "wrapper");
+                    if self.processes.alive(lease.pid) || self.adoptable(&run, wrapper, now)? {
+                        continue;
+                    }
+                    Some(lease_health(&lease, now, &*self.processes))
+                }
+            };
+            let leased = lease.is_some();
+            let health = run_health(&run, &processes, lease, now, &*self.processes, &*self.files);
             if !health.recoverable {
                 continue;
             }
             let report = json!({"run": health, "by": "supervisor"});
             match self.queue.recover_run(run.id(), processes.len(), report) {
                 Ok(recovered) => {
-                    info!(run_id = %recovered.id(), task_id = %recovered.task_id(), "run {} of task {} recovered from {}: nobody leases it and its session is gone; it goes to triage", recovered.id(), recovered.task_id(), run.status().as_str())
+                    let whose = if leased {
+                        "its supervisor died"
+                    } else {
+                        "nobody leases it"
+                    };
+                    info!(run_id = %recovered.id(), task_id = %recovered.task_id(), "run {} of task {} recovered from {}: {whose} and its session is gone; it goes to triage", recovered.id(), recovered.task_id(), run.status().as_str())
                 }
                 Err(error) => {
                     warn!(run_id = %run.id(), error = %format_args!("{error:#}"), "run {} could not be recovered: {error:#}", run.id())

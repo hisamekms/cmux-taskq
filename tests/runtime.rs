@@ -547,21 +547,34 @@ impl WorkspaceBackend for TestWorkspace {
         Ok(self.screen.lock().unwrap().clone())
     }
     fn close(&self, workspace_id: &str) -> Result<()> {
-        // The session must have exited before the supervisor gives up the workspace.
+        // The session must have exited (or died, its wrapper's pid gone)
+        // before the supervisor gives up the workspace. A workspace this
+        // backend did not create (an orphan's) has no session here.
         let run_id = self
             .sessions
             .lock()
             .unwrap()
             .iter()
             .find(|(id, _)| id == workspace_id)
-            .map(|(_, s)| s.run_id.clone())
-            .expect("workspace was created");
-        let exited: bool = Connection::open(&self.db)?.query_row(
-            "SELECT EXISTS(SELECT 1 FROM run_processes WHERE run_id=?1 AND role='wrapper' AND exited_at IS NOT NULL)",
-            [&run_id],
-            |r| r.get(0),
-        )?;
-        assert!(exited);
+            .map(|(_, s)| s.run_id.clone());
+        let connection = Connection::open(&self.db)?;
+        if let Some(run_id) = &run_id {
+            let exited: bool = connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM run_processes WHERE run_id=?1 AND role='wrapper' AND exited_at IS NOT NULL)",
+                [run_id],
+                |r| r.get(0),
+            )?;
+            assert!(exited);
+        } else {
+            let live: Vec<u32> = connection
+                .prepare(
+                    "SELECT p.pid FROM run_processes p JOIN task_runs r ON r.id=p.run_id
+                     WHERE r.workspace_id=?1 AND p.role='wrapper' AND p.exited_at IS NULL",
+                )?
+                .query_map([workspace_id], |r| r.get(0))?
+                .collect::<rusqlite::Result<_>>()?;
+            assert!(live.into_iter().all(|pid| !pid_alive(pid)));
+        }
         if self.close_fail {
             bail!("injected workspace close failure");
         }
@@ -3110,6 +3123,16 @@ fn killed_supervisor_registration_is_reported_stale_and_never_deleted() {
             .len(),
         3
     );
+}
+
+/// Whether a process with `pid` exists.
+fn pid_alive(pid: u32) -> bool {
+    Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .stderr(std::process::Stdio::null())
+        .status()
+        .unwrap()
+        .success()
 }
 
 /// A PID that certainly belonged to a process that has already exited.
@@ -6678,10 +6701,13 @@ fn dead_supervisor_pid_with_a_fresh_heartbeat_is_adopted() {
 }
 
 /// Everything adoption must leave alone: a fresh lease; a stale lease whose
-/// wrapper is dead or silent (that is `recover`'s case, and `doctor` still
-/// says so); `claimed` / `starting` runs; runs without a lease row; and an
-/// `integrating` run. A supervisor pass over them adopts nothing and writes
-/// no `run_adopted` event.
+/// wrapper is dead or silent (that is `recover`'s case); `claimed` /
+/// `starting` runs; runs without a lease row; and an `integrating` run. A
+/// supervisor pass over them adopts nothing and writes no `run_adopted`
+/// event. The runs whose dead supervisor's lease is stale and whose
+/// processes are all gone (the dead wrapper, `starting`, `claimed`) it
+/// recovers itself (task 236); the silent wrapper's live process and the
+/// fresh lease still block that.
 #[test]
 fn fresh_leases_dead_wrappers_early_runs_leaseless_and_integrating_runs_are_not_adopted() {
     let (_dir, repo, db) = fixture();
@@ -6744,6 +6770,18 @@ fn fresh_leases_dead_wrappers_early_runs_leaseless_and_integrating_runs_are_not_
             },
         )
         .unwrap();
+    // Its wrapper exited before the agent registered: still `starting`,
+    // which only `recover` handles (task 236).
+    let early_wrapper = dead_pid();
+    queue
+        .workspace_created(starting.id(), "gone-early", "ws-starting")
+        .unwrap();
+    queue
+        .register_wrapper(starting.id(), "gone-early", early_wrapper)
+        .unwrap();
+    queue
+        .wrapper_exited(starting.id(), early_wrapper, 1)
+        .unwrap();
     let starting = queue.run(starting.id()).unwrap();
     assert_eq!(starting.status(), RunStatus::Starting);
     // `running` without a lease: abandoned by a runtime error or recovered.
@@ -6788,7 +6826,6 @@ fn fresh_leases_dead_wrappers_early_runs_leaseless_and_integrating_runs_are_not_
     let backend = TestWorkspace::new(&db, true, VALID_AGENT);
     let outcome = supervise(&db, &repo, &backend).unwrap();
     assert_eq!(outcome["outcome"], "finished", "{outcome}");
-    assert_eq!(outcome["runs"], json!([]));
     assert_eq!(outcome["errors"], json!([]));
     for run in [
         &fresh,
@@ -6805,32 +6842,39 @@ fn fresh_leases_dead_wrappers_early_runs_leaseless_and_integrating_runs_are_not_
             run.id(),
             run.task_id()
         );
-        assert_eq!(queue.run(run.id()).unwrap().status(), run.status());
     }
-    // Leases, tokens and doctor's verdicts are exactly as before the pass.
+    for run in [&fresh, &silent_wrapper, &leaseless] {
+        assert_eq!(queue.run(run.id()).unwrap().status(), run.status());
+        assert!(
+            payloads(&queue.show(run.task_id()).unwrap(), "run_recovered").is_empty(),
+            "run {} was recovered",
+            run.id()
+        );
+    }
+    for run in [&dead_wrapper, &starting, &claimed] {
+        assert_ne!(queue.run(run.id()).unwrap().status(), run.status());
+        let detail = queue.show(run.task_id()).unwrap();
+        let recovered = payloads(&detail, "run_recovered");
+        assert_eq!(recovered.len(), 1, "run {}", run.id());
+        assert_eq!(recovered[0]["by"], "supervisor");
+        assert_eq!(recovered[0]["previous_status"], json!(run.status()));
+        assert_eq!(recovered[0]["status"], "interrupted");
+        assert_eq!(recovered[0]["lease_deleted"], true);
+        assert!(queue.run_lease(run.id()).unwrap().is_none());
+    }
+    // Leases, tokens and doctor's verdicts of the rest are exactly as
+    // before the pass.
     assert_eq!(
         queue.run_lease(fresh.id()).unwrap().unwrap().token,
         "fresh-owner"
     );
     assert_eq!(
-        queue.run_lease(dead_wrapper.id()).unwrap().unwrap().token,
-        "gone"
-    );
-    assert_eq!(
         queue.run_lease(silent_wrapper.id()).unwrap().unwrap().token,
         "gone"
     );
-    assert_eq!(
-        queue.run_lease(starting.id()).unwrap().unwrap().token,
-        "gone-early"
-    );
-    assert_eq!(
-        queue.run_lease(claimed.id()).unwrap().unwrap().token,
-        "gone-early"
-    );
     assert!(queue.run_lease(leaseless.id()).unwrap().is_none());
     let after = runtime::doctor(&db, true).unwrap();
-    for run in [&fresh, &dead_wrapper, &silent_wrapper, &starting, &claimed] {
+    for run in [&fresh, &silent_wrapper] {
         assert_eq!(
             health(&after, run)["recoverable"],
             health(&before, run)["recoverable"]
@@ -6840,11 +6884,6 @@ fn fresh_leases_dead_wrappers_early_runs_leaseless_and_integrating_runs_are_not_
             health(&before, run)["lease"]["stale"]
         );
     }
-    assert_eq!(health(&after, &dead_wrapper)["recoverable"], true);
-    assert_eq!(
-        runtime::recover(&db, dead_wrapper.id()).unwrap()["run"]["status"],
-        "interrupted"
-    );
     for child in &mut children {
         child.kill().unwrap();
         child.wait().unwrap();
@@ -10945,6 +10984,198 @@ fn a_dead_run_nobody_leases_is_recovered_triaged_and_retried() {
     assert!(!kinds.contains(&"cleanup_failed"));
     let (prompt, _) = &reviewer.triage_prompts()[0];
     assert!(prompt.contains("which ended interrupted"), "{prompt}");
+}
+
+/// A run whose supervisor and wrapper both died keeps the dead supervisor's
+/// stale lease. Nobody adopts it (its wrapper is dead), so the next
+/// supervisor recovers it itself as it does a run nobody leases (task 236),
+/// triages it as `interrupted`, and `retry` runs the task again to landing.
+#[test]
+fn a_dead_run_whose_dead_supervisor_still_leases_it_is_recovered_and_retried() {
+    let (_dir, repo, db) = fixture();
+    let orphan = orphan_run(&repo, &db, "dead-supervisor", dead_pid(), dead_pid());
+    Connection::open(&db)
+        .unwrap()
+        .execute(
+            "UPDATE run_leases SET pid=?1, heartbeat_at=unixepoch()-31",
+            [dead_pid()],
+        )
+        .unwrap();
+    let base = git_out(&repo, &["rev-parse", "main"]);
+    let backend = TestWorkspace::new(&db, false, IDLE_AGENT);
+    let reviewer = TestReviewer::new(&[verdict("pass", &[], "meets the acceptance")])
+        .with_triages(&[triage("retry", "the machine restarted", "")]);
+    let outcome = supervise_reviewed(&db, &repo, &backend, &reviewer);
+    assert_eq!(outcome["errors"], json!([]), "{outcome}");
+    let mut queue = SqliteQueue::open(&db).unwrap();
+    let detail = queue.show(TaskId::new(1)).unwrap();
+    assert_eq!(detail.runs.len(), 2);
+    assert_eq!(detail.runs[0].id(), orphan.id());
+    assert_eq!(detail.runs[0].status(), RunStatus::Interrupted);
+    assert_landed_run(&detail.runs[1], &repo, &base);
+    let events = queue.run_events(orphan.id()).unwrap();
+    let kinds: Vec<&str> = events.iter().map(|e| e.kind.as_str()).collect();
+    assert!(!kinds.contains(&"run_adopted"), "{kinds:?}");
+    let recovered = &events[position(&kinds, "run_recovered")].payload;
+    assert_eq!(recovered["by"], "supervisor");
+    assert_eq!(recovered["previous_status"], "running");
+    assert_eq!(recovered["lease_deleted"], true);
+    assert_eq!(recovered["run"]["lease"]["alive"], false);
+    assert_eq!(
+        events[position(&kinds, "triage_finished")].payload["action"],
+        "retry"
+    );
+}
+
+/// Commit a change in the worktree of `run` (a `running` orphan), write its
+/// receipt and move it to `awaiting_integration` the way validation does,
+/// leaving its lease and wrapper registration as they are: a run whose
+/// supervisor died during its review.
+fn validated_orphan(db: &Path, run: &TaskRun) -> String {
+    let worktree = Path::new(run.worktree_path().unwrap());
+    fs::write(
+        worktree.join("change.txt"),
+        format!("change by {}\n", run.id()),
+    )
+    .unwrap();
+    git(worktree, &["add", "change.txt"]);
+    git(worktree, &["commit", "-q", "-m", "work"]);
+    let head = git_out(worktree, &["rev-parse", "HEAD"]);
+    write_receipt(run, &head, "succeeded", "done");
+    Connection::open(db)
+        .unwrap()
+        .execute(
+            "UPDATE task_runs SET status='awaiting_integration', result_commit=?2 WHERE id=?1",
+            rusqlite::params![run.id(), head],
+        )
+        .unwrap();
+    SqliteQueue::open(db)
+        .unwrap()
+        .record_runtime_event(
+            run.id(),
+            "validation_finished",
+            json!({"status": "awaiting_integration"}),
+        )
+        .unwrap();
+    head
+}
+
+/// Make the wrapper of `run` one that died without recording its exit (a
+/// dead pid and a heartbeat past the TTL) and the lease one a dead
+/// supervisor left behind.
+fn kill_supervisor_and_wrapper(db: &Path, run: &TaskRun) {
+    let raw = Connection::open(db).unwrap();
+    raw.execute(
+        "UPDATE run_processes SET pid=?2, heartbeat_at=unixepoch()-31 WHERE run_id=?1",
+        rusqlite::params![run.id(), dead_pid()],
+    )
+    .unwrap();
+    raw.execute(
+        "UPDATE run_leases SET pid=?2, heartbeat_at=unixepoch()-31 WHERE run_id=?1",
+        rusqlite::params![run.id(), dead_pid()],
+    )
+    .unwrap();
+}
+
+/// The supervisor and the session's wrapper both died while an
+/// `awaiting_integration` run was under review (task 236): the next
+/// supervisor adopts it all the same, since its review needs no session,
+/// reviews it with the session taken for ended, sends no `/exit` and lands
+/// it, with nobody touching the queue.
+#[test]
+fn an_awaiting_run_whose_supervisor_and_wrapper_died_is_adopted_reviewed_and_landed() {
+    let (_dir, repo, db) = fixture();
+    let base = git_out(&repo, &["rev-parse", "main"]);
+    let run = orphan_run(&repo, &db, "dead-supervisor", dead_pid(), dead_pid());
+    validated_orphan(&db, &run);
+    kill_supervisor_and_wrapper(&db, &run);
+    let backend = TestWorkspace::new(&db, false, VALID_AGENT);
+    let reviewer = TestReviewer::new(&[verdict("pass", &[], "meets the acceptance")]);
+    let outcome = supervise_reviewed(&db, &repo, &backend, &reviewer);
+    assert_eq!(outcome["errors"], json!([]), "{outcome}");
+    let mut queue = SqliteQueue::open(&db).unwrap();
+    let detail = queue.show(TaskId::new(1)).unwrap();
+    assert_eq!(detail.runs.len(), 1);
+    assert_landed_run(&detail.runs[0], &repo, &base);
+    let adopted = adoption_events(&detail);
+    assert_eq!(adopted.len(), 1, "{adopted:?}");
+    assert_eq!(adopted[0]["previous_token"], "dead-supervisor");
+    assert_eq!(adopted[0]["wrapper"]["alive"], false);
+    let kinds = event_kinds(&detail);
+    assert!(!kinds.contains(&"run_recovered"), "{kinds:?}");
+    assert!(!kinds.contains(&"runtime_error"), "{kinds:?}");
+    assert!(!kinds.contains(&"exit_requested"), "{kinds:?}");
+    assert_eq!(
+        payloads(&detail, "review_started")[0]["session_live"],
+        false
+    );
+    assert_eq!(backend.exits_sent.load(Ordering::SeqCst), 0);
+    assert!(queue.run_leases().unwrap().is_empty());
+}
+
+/// A `revise` verdict for such a run has no session to revise it: the run
+/// is asked about (`approve_landing`) instead of being given up.
+#[test]
+fn a_revise_for_an_adopted_run_whose_wrapper_died_asks_a_person() {
+    let (_dir, repo, db) = fixture();
+    let run = orphan_run(&repo, &db, "dead-supervisor", dead_pid(), dead_pid());
+    validated_orphan(&db, &run);
+    kill_supervisor_and_wrapper(&db, &run);
+    let backend = TestWorkspace::new(&db, false, VALID_AGENT);
+    let reviewer = TestReviewer::new(&[verdict("revise", &["add a test"], "one gap")]);
+    let outcome = supervise_reviewed(&db, &repo, &backend, &reviewer);
+    assert_eq!(outcome["errors"], json!([]), "{outcome}");
+    let queue = SqliteQueue::open(&db).unwrap();
+    assert_eq!(
+        queue.run(run.id()).unwrap().status(),
+        RunStatus::AwaitingIntegration
+    );
+    let asks = queue.asks(AskQuery::default()).unwrap();
+    assert_eq!(asks.len(), 1, "{asks:?}");
+    assert_eq!(asks[0].kind, AskKind::ApproveLanding);
+    assert!(
+        asks[0]
+            .question
+            .contains("the session had ended, so nobody could revise the run"),
+        "{}",
+        asks[0].question
+    );
+    assert!(backend.texts().is_empty());
+    assert!(queue.run_leases().unwrap().is_empty());
+}
+
+/// Without a supervisor, `recover` takes the stale lease of an
+/// `awaiting_integration` run whose supervisor and wrapper died (task 236):
+/// the run stays `awaiting_integration` and `integrate` lands it. A run
+/// awaiting integration that nobody leases has nothing to recover, and a
+/// live supervisor's lease is refused as before.
+#[test]
+fn recover_releases_the_stale_lease_of_an_awaiting_run_for_integrate() {
+    let (_dir, repo, db) = fixture();
+    let base = git_out(&repo, &["rev-parse", "main"]);
+    let run = orphan_run(&repo, &db, "dead-supervisor", dead_pid(), dead_pid());
+    validated_orphan(&db, &run);
+    let refused = runtime::recover(&db, run.id()).unwrap_err().to_string();
+    assert!(refused.contains("lease heartbeat is"), "{refused}");
+    kill_supervisor_and_wrapper(&db, &run);
+    let error = integrate(&db, 1, &repo).unwrap_err().to_string();
+    assert!(error.contains("run is still leased"), "{error}");
+    let recovered = runtime::recover(&db, run.id()).unwrap();
+    assert_eq!(recovered["run"]["status"], "awaiting_integration");
+    let mut queue = SqliteQueue::open(&db).unwrap();
+    assert!(queue.run_lease(run.id()).unwrap().is_none());
+    let recovered = payloads(&queue.show(TaskId::new(1)).unwrap(), "run_recovered")[0].clone();
+    assert_eq!(recovered["previous_status"], "awaiting_integration");
+    assert_eq!(recovered["status"], "awaiting_integration");
+    assert_eq!(recovered["lease_deleted"], true);
+    let again = runtime::recover(&db, run.id()).unwrap_err().to_string();
+    assert!(
+        again.contains("only unfinished runs, or a run awaiting integration that is still leased"),
+        "{again}"
+    );
+    assert_eq!(integrate(&db, 1, &repo).unwrap()["outcome"], "integrated");
+    let detail = queue.show(TaskId::new(1)).unwrap();
+    assert_landed_run(&detail.runs[0], &repo, &base);
 }
 
 /// Make the live wrapper of `run_id` go silent the way a wrapper whose

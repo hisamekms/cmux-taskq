@@ -321,9 +321,11 @@ pub fn doctor(
 
 /// Mark an orphaned run `interrupted` (or a run whose `integrate` process
 /// died `awaiting_integration` again) and drop its lease, after checking that
-/// nothing registered for it is still alive. Never reruns, never deletes the
-/// worktree or workspace, leaves the task `in_progress`, and does not touch
-/// any other run.
+/// nothing registered for it is still alive. An `awaiting_integration` run
+/// that a dead supervisor still leases (it died during the review) keeps its
+/// status and loses the stale lease, so that it can be integrated (task
+/// 236). Never reruns, never deletes the worktree or workspace, leaves the
+/// task `in_progress`, and does not touch any other run.
 pub fn recover(
     queue: &mut dyn Queue,
     control: &dyn ProcessControl,
@@ -332,6 +334,7 @@ pub fn recover(
     id: &RunId,
 ) -> Result<Value> {
     let run = queue.run(id)?;
+    let lease = queue.run_lease(id)?;
     ensure!(
         matches!(
             run.status(),
@@ -340,12 +343,12 @@ pub fn recover(
                 | RunStatus::Running
                 | RunStatus::Validating
                 | RunStatus::Integrating
-        ),
-        "run {id} is {}; only unfinished runs can be recovered",
+        ) || (run.status() == RunStatus::AwaitingIntegration && lease.is_some()),
+        "run {id} is {}; only unfinished runs, or a run awaiting integration that is still leased, can be recovered",
         run.status().as_str()
     );
     let now = clock.now();
-    let lease = queue.run_lease(id)?.map(|l| lease_health(&l, now, control));
+    let lease = lease.map(|l| lease_health(&l, now, control));
     let processes = queue.processes(run.id())?;
     let health = run_health(&run, &processes, lease, now, control, files);
     ensure!(
