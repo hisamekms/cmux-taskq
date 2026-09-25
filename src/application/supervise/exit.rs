@@ -50,7 +50,9 @@ impl ExitWatch {
         let next = match &self.then {
             AfterExit::Land => "lands on main",
             AfterExit::Ask { .. } => "opens an approve_landing ask for the person",
-            AfterExit::ReviewFailed { .. } => "waits for a review by hand",
+            AfterExit::ReviewFailed { .. } => {
+                "opens an approve_landing ask for the person about its failed review"
+            }
             AfterExit::Rest { close: true } => "is resumed in a session of its own",
             AfterExit::Rest { close: false } => "is left to the person",
         };

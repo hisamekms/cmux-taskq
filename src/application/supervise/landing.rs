@@ -4,6 +4,11 @@
 
 use super::*;
 
+/// The answer the supervisor closes an earlier, unclosed `approve_landing`
+/// ask of a run with when a later review of the run fails (task 328).
+const STALE_LANDING_ASK_CLOSED: &str =
+    "a later review of the run failed and asks again; closed by the runtime";
+
 impl Supervisor<'_> {
     /// Land `run`, which holds the integration slot under this token, on a
     /// thread (`previous` is where an error before `main` moved returns it).
@@ -63,6 +68,33 @@ impl Supervisor<'_> {
         run: &TaskRun,
         session: Option<SessionRef>,
     ) -> Result<Phase> {
+        self.begin_review(run, session, false)
+    }
+    /// Review the run once more with the same input after review `attempt`
+    /// printed no readable verdict (task 328): record `review_retried` with
+    /// why, then start the next review, whose own unreadable verdict is not
+    /// retried again.
+    pub(super) fn retry_review(
+        &mut self,
+        run: &TaskRun,
+        session: Option<SessionRef>,
+        attempt: usize,
+        error: &str,
+    ) -> Result<Phase> {
+        self.queue.record_runtime_event(
+            run.id(),
+            "review_retried",
+            json!({"attempt": attempt, "error": error}),
+        )?;
+        warn!(run_id = %run.id(), error = %error, "run {} review {attempt} printed no readable verdict: {error}; reviewing it once more", run.id());
+        self.begin_review(run, session, true)
+    }
+    fn begin_review(
+        &mut self,
+        run: &TaskRun,
+        session: Option<SessionRef>,
+        retried: bool,
+    ) -> Result<Phase> {
         let attempt = self
             .queue
             .run_events(run.id())?
@@ -89,6 +121,7 @@ impl Supervisor<'_> {
                 Phase::Review(ReviewWatch {
                     session,
                     attempt,
+                    retried,
                     job: HeadlessJob {
                         what: "review",
                         child,
@@ -429,6 +462,43 @@ impl Supervisor<'_> {
         question.push_str(
             "\nland: land it as it is. send_back: resume the session with these reasons. cancel: fail the run and cancel the task.",
         );
+        self.ask_approve_landing(run, question)
+    }
+    /// Open the `approve_landing` ask of a run whose headless review failed
+    /// (task 328), with why and where the review's material and output
+    /// are, so that the failure reaches the inbox in the step that records
+    /// `review_failed`; returns its ID.
+    pub(super) fn open_failed_review_ask(
+        &mut self,
+        run: &TaskRun,
+        attempt: usize,
+        error: &str,
+    ) -> Result<AskId> {
+        // An earlier ask of the run is about an earlier review (the run was
+        // sent back or landed by hand since): it would hold the new one back
+        // as a repeat, and its answer no longer fits.
+        for stale in self
+            .queue
+            .close_approve_landing_asks(run.id(), STALE_LANDING_ASK_CLOSED)?
+        {
+            info!(run_id = %run.id(), ask_id = %stale.id, "run {}: closed its earlier approve_landing ask {}", run.id(), stale.id);
+        }
+        let mut question = format!(
+            "The supervisor's headless review of run {} (task {}) failed and gave no verdict (review {attempt}): {error}",
+            run.id(),
+            run.task_id(),
+        );
+        if let Some(run_dir) = &run.run_dir() {
+            question.push_str(&format!(
+                "\nReview material: {run_dir}/review.md\nReview output: {run_dir}/review-{attempt}.out, {run_dir}/review-{attempt}.err"
+            ));
+        }
+        question.push_str(
+            "\nReview the material by hand, then answer. land: land it as it is. send_back: resume the session with this failure as the reason. cancel: fail the run and cancel the task.",
+        );
+        self.ask_approve_landing(run, question)
+    }
+    fn ask_approve_landing(&mut self, run: &TaskRun, question: String) -> Result<AskId> {
         // Through `ask`, like the CLI: a new ask notifies the inbox.
         let outcome = ask::ask(
             &mut *self.queue,

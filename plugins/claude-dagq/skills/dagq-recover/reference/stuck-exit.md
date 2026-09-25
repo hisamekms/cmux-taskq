@@ -29,7 +29,7 @@ Do only what the answer says, on the person's word. `wait` means: leave the sess
 Once the session exits, the supervisor moves the run on by its status (the question says which):
 
 - `running` (the older path): `validating`, then the supervisor's review.
-- `awaiting_integration` after a `pass`: the workspace is closed and the run lands on `main`; after a `concern` (or a third review that does not pass): an `approve_landing` ask for the inbox; after a failed review: `review_failed`, a review by hand (`reference/review-by-hand.md`).
+- `awaiting_integration` after a `pass`: the workspace is closed and the run lands on `main`; after a `concern` (or a third review that does not pass): an `approve_landing` ask for the inbox; after a failed review: `review_failed` and an `approve_landing` ask with the failure for the inbox (a review by hand, `reference/review-by-hand.md`, only when no ask could be opened).
 - `needs_session` (evidence missing): the workspace is closed and the runtime resumes the run in a workspace of its own.
 - `failed`: the supervisor triages the run and closes its workspace.
 - A resumed session (its question says `stays needs_session`): the supervisor let it go at the timeout, so the run is `needs_session` without a lease and `status` shows `resuming (runtime)`. Once the session exits, the supervisor's next pass closes the ask; with attempts left it also closes the workspace it left and resumes the run again, and after the last attempt it makes the run `failed`, opens a `decide` ask (`retry` / `cancel`) and closes the workspaces.

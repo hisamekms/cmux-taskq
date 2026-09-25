@@ -1052,6 +1052,21 @@ fn supervise_with(
     )
 }
 
+/// The asks other than `approve_landing`: those the supervisor opens for a
+/// run whose stand-in review printed no verdict (task 328) go with every
+/// run these tests leave awaiting integration.
+fn other_asks(queue: &mut SqliteQueue, all: bool) -> Vec<dagq::domain::Ask> {
+    queue
+        .asks(AskQuery {
+            all,
+            ..Default::default()
+        })
+        .unwrap()
+        .into_iter()
+        .filter(|ask| ask.kind != AskKind::ApproveLanding)
+        .collect()
+}
+
 /// Poll the queue until `condition` holds or the deadline passes.
 fn wait_until(db: &Path, timeout: Duration, mut condition: impl FnMut(&mut SqliteQueue) -> bool) {
     let started = Instant::now();
@@ -1111,8 +1126,23 @@ fn run_agent_with(script: &str, close_fail: bool) -> (Fixture, PathBuf, dagq::do
         assert!(!kinds.contains(&"workspace_closed"));
     }
     assert_eq!(kinds.contains(&"cleanup_failed"), close_fail);
-    // A run at rest is reported through `watch`, not a notification (ADR-0022).
-    assert!(backend.notifications.lock().unwrap().is_empty());
+    // A run at rest is reported through `watch`, not a notification
+    // (ADR-0022); only the `approve_landing` ask of an accepted run whose
+    // stand-in review printed no verdict notifies (task 328).
+    assert_eq!(
+        backend.notifications.lock().unwrap().len(),
+        usize::from(run.status() == RunStatus::AwaitingIntegration),
+        "{:?}",
+        backend.notifications.lock().unwrap()
+    );
+    assert!(
+        backend
+            .notifications
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|n| n.0.ends_with("approve_landing"))
+    );
     // The run workspace carries its role and queue in its environment, a
     // description naming the run and task, and the queue's group.
     let canonical = db.canonicalize().unwrap();
@@ -2268,7 +2298,7 @@ fn unanswered_exit_request_times_out_and_keeps_the_run() {
     assert!(ask.question.ends_with("  2. Cancel"), "{}", ask.question);
     assert!(
         ask.question.contains(
-            "The run stays awaiting_integration under the supervisor after its validation and review, and waits for a review by hand once the session exits"
+            "The run stays awaiting_integration under the supervisor after its validation and review, and opens an approve_landing ask for the person about its failed review once the session exits"
         ),
         "{}",
         ask.question
@@ -2350,8 +2380,13 @@ fn unanswered_exit_request_times_out_and_keeps_the_run() {
     assert!(position("session_exited") < position("ask_answered"));
     assert!(position("ask_answered") < position("workspace_closed"));
     assert!(position("ask_answered") < position("review_failed"));
-    assert!(queue.asks(AskQuery::default()).unwrap().is_empty());
-    assert_eq!(backend.notifications.lock().unwrap().len(), 1);
+    // The only open ask is the one of the failed review, the only other
+    // notification.
+    let open = queue.asks(AskQuery::default()).unwrap();
+    assert_eq!(open.len(), 1, "{open:?}");
+    assert_eq!(open[0].kind, AskKind::ApproveLanding);
+    assert!(position("review_retried") < position("review_failed"));
+    assert_eq!(backend.notifications.lock().unwrap().len(), 2);
     let events = dagq::watch::events(&db, EventId::new(0), 100, false).unwrap();
     assert!(
         events["events"]
@@ -2361,11 +2396,16 @@ fn unanswered_exit_request_times_out_and_keeps_the_run() {
             .all(|e| e["kind"] != "ask_answered"),
         "{events}"
     );
-    // The session exited, so the attention is the failed review now.
+    // The session exited, so the attention is the ask of the failed review.
     let status = runtime::status(&db).unwrap();
-    assert_eq!(
-        run_attention_of(&status, run.id()).unwrap()["next"],
-        "review by hand"
+    assert!(run_attention_of(&status, run.id()).is_none(), "{status}");
+    assert!(
+        status["attention"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|a| a["ask_id"] == json!(open[0].id)),
+        "{status}"
     );
 }
 
@@ -5805,8 +5845,8 @@ fn approved_needs_session_run_is_resumed_until_the_runtime_lands_it() {
 /// validation's `evidence_missing`) is resumed with the evidence request
 /// and, resolved, keeps its resumed session open through validation and the
 /// supervisor's review like the worker's (ADR-0027 decision 3). The
-/// stand-in `claude` prints no verdict, so the review fails and the run
-/// waits for a review by hand.
+/// stand-in `claude` prints no verdict, so the review is retried, fails,
+/// and the run waits in an `approve_landing` ask.
 #[test]
 fn unapproved_resumed_run_is_validated_and_reviewed_with_its_session_open() {
     let (_dir, repo, db) = fixture();
@@ -5860,6 +5900,7 @@ fn unapproved_resumed_run_is_validated_and_reviewed_with_its_session_open() {
                 **k,
                 "validation_finished"
                     | "review_started"
+                    | "review_retried"
                     | "exit_requested"
                     | "session_exited"
                     | "workspace_closed"
@@ -5872,6 +5913,8 @@ fn unapproved_resumed_run_is_validated_and_reviewed_with_its_session_open() {
         after,
         [
             "validation_finished",
+            "review_started",
+            "review_retried",
             "review_started",
             "exit_requested",
             "session_exited",
@@ -5902,15 +5945,12 @@ fn unapproved_resumed_run_is_validated_and_reviewed_with_its_session_open() {
     );
     assert!(!text.contains("git rebase"), "{text}");
     assert!(text.contains(runtime::STOP_BACKGROUND), "{text}");
-    // The inbox is woken only by the failed review.
+    // The inbox is woken only by the ask of the failed review (task 328).
     let events = dagq::watch::events(&db, EventId::new(cursor), 100, false).unwrap();
     assert_eq!(events["events"].as_array().unwrap().len(), 1, "{events}");
-    assert_eq!(events["events"][0]["kind"], "review_failed", "{events}");
-    assert_eq!(events["events"][0]["next"], "review by hand");
+    assert_eq!(events["events"][0]["kind"], "ask_opened", "{events}");
     let status = runtime::status(&db).unwrap();
-    let attention = run_attention_of(&status, run.id()).unwrap();
-    assert_eq!(attention["kind"], "review_failed");
-    assert_eq!(attention["next"], "review by hand");
+    assert!(run_attention_of(&status, run.id()).is_none(), "{status}");
     // Integrating it now is the approval.
     assert_eq!(
         integrate(&db, 2, &repo).unwrap()["outcome"],
@@ -6033,7 +6073,8 @@ fn an_approved_run_resolved_by_an_earlier_resume_lands_without_a_session() {
 
 /// The same run without an approving `integrate` is validated and reviewed
 /// without a session: the stand-in `claude` prints no verdict, so it waits
-/// for a review by hand in `awaiting_integration`.
+/// in `awaiting_integration` for a person's answer to the `approve_landing`
+/// ask of its failed review.
 #[test]
 fn an_unapproved_run_resolved_by_an_earlier_resume_is_validated_without_a_session() {
     let (_dir, repo, db) = fixture();
@@ -6077,16 +6118,23 @@ fn an_unapproved_run_resolved_by_an_earlier_resume_is_validated_without_a_sessio
         .filter(|k| {
             matches!(
                 **k,
-                "resume_skipped" | "validation_finished" | "review_started" | "review_failed"
+                "resume_skipped"
+                    | "validation_finished"
+                    | "review_started"
+                    | "review_retried"
+                    | "review_failed"
             )
         })
         .copied()
         .collect();
+    // The unreadable verdict is reviewed once more (task 328).
     assert_eq!(
         after,
         [
             "resume_skipped",
             "validation_finished",
+            "review_started",
+            "review_retried",
             "review_started",
             "review_failed"
         ]
@@ -6401,7 +6449,7 @@ fn resuming_stops_after_three_attempts() {
     assert_eq!(backend.closed().len(), 2 + 2); // two workers, two resumes
     // The used-up run goes to the inbox as the triage's `decide` ask, and
     // no headless triage runs for it.
-    let asks = queue.asks(AskQuery::default()).unwrap();
+    let asks = other_asks(&mut queue, false);
     assert_eq!(asks.len(), 1, "{asks:?}");
     let ask = asks[0].clone();
     assert_eq!(ask.kind, AskKind::Decide);
@@ -6438,7 +6486,7 @@ fn resuming_stops_after_three_attempts() {
         payloads(&queue.show(TaskId::new(2)).unwrap(), "resume_started").len(),
         3
     );
-    assert_eq!(queue.asks(AskQuery::default()).unwrap().len(), 1);
+    assert_eq!(other_asks(&mut queue, false).len(), 1);
 
     // The person cancels the task; the supervisor applies it.
     queue.answer(ask.id, "cancel").unwrap();
@@ -6502,12 +6550,7 @@ fn a_resumed_session_gets_its_request_only_once_its_input_box_is_ready() {
             .unwrap()
             .contains("'session'")
     );
-    let asks = queue
-        .asks(AskQuery {
-            all: true,
-            ..Default::default()
-        })
-        .unwrap();
+    let asks = other_asks(&mut queue, true);
     assert_eq!(asks.len(), 1, "{asks:?}");
     assert_eq!(asks[0].kind, AskKind::AnswerPrompt);
     assert_eq!(asks[0].run_id.as_ref(), Some(run.id()));
@@ -6551,15 +6594,7 @@ fn a_request_left_in_the_input_box_gets_enter_again_not_the_text() {
     assert_eq!(retried[0]["retries"], 2);
     assert_eq!(retried[0]["submitted"], true);
     assert!(payloads(&detail, "submit_unconfirmed").is_empty());
-    assert!(
-        queue
-            .asks(AskQuery {
-                all: true,
-                ..Default::default()
-            })
-            .unwrap()
-            .is_empty()
-    );
+    assert!(other_asks(&mut queue, true).is_empty());
 }
 
 /// Task 285: a request still in the input box after the Enters sent again
@@ -6596,12 +6631,7 @@ fn a_request_stuck_in_the_input_box_is_asked_to_the_inbox() {
     assert_eq!(backend.enters.load(Ordering::SeqCst), 6);
     assert_eq!(backend.texts().len(), 1);
     assert_eq!(backend.exits_sent.load(Ordering::SeqCst), 1);
-    let asks = queue
-        .asks(AskQuery {
-            all: true,
-            ..Default::default()
-        })
-        .unwrap();
+    let asks = other_asks(&mut queue, true);
     assert_eq!(asks.len(), 1, "{asks:?}");
     assert_eq!(asks[0].kind, AskKind::AnswerPrompt);
     assert_eq!(asks[0].run_id.as_ref(), Some(run.id()));
@@ -6644,15 +6674,7 @@ fn a_lost_request_is_sent_again_after_no_sign_of_work() {
     assert_eq!(resent[0]["what"], "resolution request");
     assert_eq!(resent[0]["waited_secs"], 1);
     assert!(payloads(&detail, "submit_not_started").is_empty());
-    assert!(
-        queue
-            .asks(AskQuery {
-                all: true,
-                ..Default::default()
-            })
-            .unwrap()
-            .is_empty()
-    );
+    assert!(other_asks(&mut queue, true).is_empty());
 }
 
 /// Task 285: a request lost twice is not sent a third time: the run
@@ -6728,7 +6750,7 @@ fn a_resumed_session_that_ignores_exit_is_let_go() {
     );
     // Its dialog does not go away by itself: one stuck_exit ask goes to the
     // inbox (task 147), as for the worker's session.
-    let asks = queue.asks(AskQuery::default()).unwrap();
+    let asks = other_asks(&mut queue, false);
     assert_eq!(asks.len(), 1, "{asks:?}");
     let ask = asks[0].clone();
     assert_eq!(ask.kind, AskKind::StuckExit);
@@ -6745,7 +6767,7 @@ fn a_resumed_session_that_ignores_exit_is_let_go() {
     // again, nor closes the ask.
     let outcome = supervise(&db, &repo, &backend).unwrap();
     assert_eq!(outcome["runs"], json!([]), "{outcome}");
-    assert_eq!(queue.asks(AskQuery::default()).unwrap().len(), 1);
+    assert_eq!(other_asks(&mut queue, false).len(), 1);
     assert!(queue.read_ask(ask.id).unwrap().is_open());
 
     // Its session ends; the workspace it left no longer blocks the run.
@@ -6773,12 +6795,14 @@ fn a_resumed_session_that_ignores_exit_is_let_go() {
         closed.answer.as_deref(),
         Some("the session exited; closed by the runtime")
     );
-    assert!(queue.asks(AskQuery::default()).unwrap().is_empty());
-    let kinds = event_kinds(&detail);
-    assert!(
-        kinds.iter().filter(|k| **k == "ask_opened").count() == 1,
-        "{kinds:?}"
-    );
+    assert!(other_asks(&mut queue, false).is_empty());
+    // One ask about the session, besides the one of the run's failed
+    // stand-in review before it was integrated by hand (task 328).
+    let opened: Vec<&Value> = payloads(&detail, "ask_opened")
+        .into_iter()
+        .filter(|p| p["kind"] != "approve_landing")
+        .collect();
+    assert_eq!(opened.len(), 1, "{opened:?}");
 }
 
 /// The supervisor never resumes a run next to the live session of a
@@ -8133,7 +8157,10 @@ fn adopted_run_does_not_record_an_exit_timeout_twice() {
     );
     assert!(!kinds.contains(&"runtime_error"));
     assert!(queue.read_ask(asks[0].id).unwrap().closed_at.is_some());
-    assert_eq!(backend.notifications.lock().unwrap().len(), 1);
+    // The other notification is the ask of its stand-in review.
+    let notifications = backend.notifications.lock().unwrap();
+    assert_eq!(notifications.len(), 2, "{notifications:?}");
+    assert!(notifications[1].0.ends_with("approve_landing"));
 }
 
 /// An adopted run whose timeout already has a stuck_exit ask (answered by
@@ -8198,7 +8225,10 @@ fn adopted_run_does_not_ask_about_its_exit_twice() {
     let detail = queue.show(TaskId::new(1)).unwrap();
     let kinds = event_kinds(&detail);
     assert_eq!(kinds.iter().filter(|k| **k == "ask_answered").count(), 1);
-    assert!(backend.notifications.lock().unwrap().is_empty());
+    // Only the ask of its stand-in review notifies.
+    let notifications = backend.notifications.lock().unwrap();
+    assert_eq!(notifications.len(), 1, "{notifications:?}");
+    assert!(notifications[0].0.ends_with("approve_landing"));
 }
 
 /// The supervisor died after the wrapper reported its exit but before
@@ -8496,8 +8526,20 @@ fn only_a_new_ask_notifies_and_it_goes_to_the_inbox() {
     let outcome = supervise(&db, &repo, &backend).unwrap();
     backend.join();
     assert_eq!(outcome["runs"][0]["status"], "awaiting_integration");
-    assert!(backend.notifications.lock().unwrap().is_empty());
     let run_id = outcome["runs"][0]["id"].as_str().unwrap().to_owned();
+    // The supervisor's own ask #1, of the failed stand-in review (task
+    // 328), notified; it is closed so that the run can be asked again.
+    {
+        let mut notifications = backend.notifications.lock().unwrap();
+        assert_eq!(notifications.len(), 1, "{notifications:?}");
+        assert!(notifications[0].0.ends_with("ask #1 approve_landing"));
+        notifications.clear();
+    }
+    let mut queue = SqliteQueue::open(&db).unwrap();
+    queue
+        .answer(dagq::domain::AskId::new(1), "withdrawn")
+        .unwrap();
+    queue.close_ask(dagq::domain::AskId::new(1)).unwrap();
 
     let new_ask = |question: &str| NewAsk {
         kind: AskKind::ApproveLanding,
@@ -8517,7 +8559,7 @@ fn only_a_new_ask_notifies_and_it_goes_to_the_inbox() {
     assert_eq!(
         *backend.notifications.lock().unwrap(),
         vec![(
-            format!("[{repo_name}] ask #1 approve_landing"),
+            format!("[{repo_name}] ask #2 approve_landing"),
             format!("{}…\ntask 1 run {run_id}", "長".repeat(200)),
             None
         )]
@@ -8529,7 +8571,7 @@ fn only_a_new_ask_notifies_and_it_goes_to_the_inbox() {
     assert_eq!(backend.notifications.lock().unwrap().len(), 1);
 
     // With the inbox recorded, a new ask goes to its workspace.
-    let queue = SqliteQueue::open(&db).unwrap();
+    let queue = queue;
     queue
         .register_session_workspace(SessionRole::Inbox, "INBOX-UUID")
         .unwrap();
@@ -8551,7 +8593,7 @@ fn only_a_new_ask_notifies_and_it_goes_to_the_inbox() {
     assert_eq!(
         backend.notifications.lock().unwrap()[1],
         (
-            format!("[{repo_name}] ask #2 decide"),
+            format!("[{repo_name}] ask #3 decide"),
             "which?\ntask 1".into(),
             Some("INBOX-UUID".into())
         )
@@ -8577,7 +8619,7 @@ fn only_a_new_ask_notifies_and_it_goes_to_the_inbox() {
     assert_eq!(
         backend.notifications.lock().unwrap()[2],
         (
-            format!("[{repo_name}] ask #3 blocked"),
+            format!("[{repo_name}] ask #4 blocked"),
             "slots idle".into(),
             Some("INBOX-UUID".into())
         )
@@ -8590,6 +8632,13 @@ fn asks_of_a_run_are_attention_for_the_inbox_until_closed() {
     use dagq::domain::{AskKind, NewAsk, SessionRole};
     let (_dir, _repo, db, run) = awaiting_run();
     let mut queue = SqliteQueue::open(&db).unwrap();
+    // The ask of the failed stand-in review, closed unanswered: the run
+    // falls back to a review by hand (task 328).
+    let failed_review = queue.asks(AskQuery::default()).unwrap();
+    assert_eq!(failed_review.len(), 1);
+    assert_eq!(failed_review[0].kind, AskKind::ApproveLanding);
+    queue.answer(failed_review[0].id, "withdrawn").unwrap();
+    queue.close_ask(failed_review[0].id).unwrap();
     let before = queue.latest_event_id().unwrap().as_i64();
     // A `decide` ask: the supervisor applies an `approve_landing` answer
     // itself (see a_third_review_that_does_not_pass_asks_a_person_and_land_lands_it).
@@ -8660,10 +8709,15 @@ fn asks_of_a_run_are_attention_for_the_inbox_until_closed() {
         "200 characters and the ellipsis"
     );
     // The run's own attention keeps the event that brought it there (the
-    // stand-in `claude` printed no verdict, so its review failed).
+    // stand-in `claude` printed no verdict, so its review failed, and its
+    // ask was closed).
     assert_eq!(
         run_attention_of(&status, run.id()).unwrap()["kind"],
         "review_failed"
+    );
+    assert_eq!(
+        run_attention_of(&status, run.id()).unwrap()["next"],
+        "review by hand"
     );
     assert!(
         runtime::status_for(&db, Some(SessionRole::Planner)).unwrap()["attention"]
@@ -8757,15 +8811,19 @@ fn attention_events_are_read_past_a_cursor_and_wake_watch() {
 
     // `status` derives the attention from the queue as it is now. The
     // accepted run is the supervisor's to review; the stand-in `claude`
-    // printed no verdict, so the review failed and it waits for a person.
+    // printed no verdict, so the review failed and the run waits for a
+    // person in the `approve_landing` ask opened with the failure.
     let status = runtime::status(&db).unwrap();
     assert_eq!(status["cursor"], json!(latest));
-    assert_eq!(
-        run_attention_of(&status, run.id()).unwrap(),
-        &json!({
-            "run_id": run.id(), "task_id": 1, "status": "awaiting_integration",
-            "kind": "review_failed", "last_error": null, "next": "review by hand",
-        })
+    assert!(run_attention_of(&status, run.id()).is_none(), "{status}");
+    let ask = queue.asks(AskQuery::default()).unwrap()[0].id;
+    assert!(
+        status["attention"].as_array().unwrap().iter().any(|a| a
+            == &json!({
+                "run_id": run.id(), "task_id": 1, "ask_id": ask, "status": "open",
+                "kind": "ask_opened", "last_error": null, "next": format!("answer ask {ask}"),
+            })),
+        "{status}"
     );
     // `supervise --once` exited, so nothing supervises the queue.
     assert_eq!(status["attention"][0]["kind"], "supervisor_stopped");
@@ -8776,9 +8834,9 @@ fn attention_events_are_read_past_a_cursor_and_wake_watch() {
     assert_eq!(events["cursor"], json!(latest));
     let listed = events["events"].as_array().unwrap();
     assert_eq!(listed.len(), 1, "{events}");
-    assert_eq!(listed[0]["kind"], "review_failed");
-    assert_eq!(listed[0]["status"], "awaiting_integration");
-    assert_eq!(listed[0]["next"], "review by hand");
+    assert_eq!(listed[0]["kind"], "ask_opened");
+    assert_eq!(listed[0]["ask_id"], json!(ask));
+    assert_eq!(listed[0]["next"], format!("answer ask {ask}"));
     assert_eq!(listed[0]["run_id"], json!(run.id()));
     let all = dagq::watch::events(&db, EventId::new(0), 1000, true).unwrap();
     let all_events = all["events"].as_array().unwrap();
@@ -10819,24 +10877,42 @@ fn a_concern_canceled_fails_the_run_and_cancels_the_task() {
 }
 
 /// A headless review that fails (a non-zero exit, stdout without a verdict,
-/// or the timeout) exits and closes the session, records `review_failed`
-/// and leaves the run `awaiting_integration` for a review by hand.
+/// or the timeout) exits and closes the session, and in the step that
+/// records `review_failed` opens an `approve_landing` ask with the failure
+/// and where the review material is (task 328). Stdout without a readable
+/// verdict (here an unescaped quote, or prose) is reviewed
+/// once more first; a job that failed is not. The ask, not the failure, is
+/// the attention, and its answer is applied by the supervisor: `land`
+/// lands the run, `cancel` fails it and cancels the task.
 #[test]
-fn a_failed_review_closes_the_session_and_waits_for_a_review_by_hand() {
-    for (script, timeout, expected) in [
+fn a_failed_review_closes_the_session_and_asks_a_person_in_the_same_step() {
+    let unquoted = r#"printf '%s\n' '{"verdict":"pass","reasons":[],"summary":"says "fine""}'"#;
+    for (script, timeout, expected, reviews, answer) in [
         (
             "echo broken >&2; exit 3",
             60,
             "exited with exit status: 3: broken",
+            1,
+            "land",
         ),
         (
             "echo 'no verdict here'",
             60,
             "the review printed no verdict JSON",
+            2,
+            "cancel",
         ),
-        ("sleep 30", 1, "did not finish within 1 seconds"),
+        (
+            unquoted,
+            60,
+            "the review printed no verdict JSON",
+            2,
+            "land",
+        ),
+        ("sleep 30", 1, "did not finish within 1 seconds", 1, "land"),
     ] {
         let (_dir, repo, db) = fixture();
+        let base = git_out(&repo, &["rev-parse", "main"]);
         let backend = TestWorkspace::new(&db, false, IDLE_AGENT);
         let mut reviewer = TestReviewer::new(&[script.to_owned()]);
         reviewer.timeout = Duration::from_secs(timeout);
@@ -10855,24 +10931,131 @@ fn a_failed_review_closes_the_session_and_waits_for_a_review_by_hand() {
         assert_eq!(backend.closed(), vec![WORKSPACE_ID.to_owned()]);
         let kinds = event_kinds(&detail);
         assert!(!kinds.contains(&"review_finished"), "{kinds:?}");
-        assert!(position(&kinds, "workspace_closed") < position(&kinds, "review_failed"));
+        assert_eq!(reviewer.prompts().len(), reviews, "{script}");
+        assert_eq!(payloads(&detail, "review_started").len(), reviews);
+        let retried = payloads(&detail, "review_retried");
+        assert_eq!(retried.len(), reviews - 1, "{kinds:?}");
+        if let Some(retried) = retried.first() {
+            assert_eq!(retried["attempt"], 1);
+            assert!(retried["error"].as_str().unwrap().contains(expected));
+        }
+        assert!(position(&kinds, "workspace_closed") < position(&kinds, "ask_opened"));
+        assert!(position(&kinds, "ask_opened") < position(&kinds, "review_failed"));
         let failed = payloads(&detail, "review_failed");
-        assert_eq!(failed[0]["attempt"], 1);
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0]["attempt"], reviews);
         assert_eq!(failed[0]["status"], "awaiting_integration");
         let error = failed[0]["error"].as_str().unwrap();
         assert!(error.contains(expected), "{error}");
+        // The ask carries the failure and the material.
+        let asks = queue.asks(Default::default()).unwrap();
+        assert_eq!(asks.len(), 1, "{asks:?}");
+        let ask = &asks[0];
+        assert_eq!(failed[0]["ask_id"], ask.id.as_i64());
+        assert_eq!(ask.kind, dagq::domain::AskKind::ApproveLanding);
+        assert_eq!(ask.run_id.as_ref(), Some(run.id()));
+        assert_eq!(ask.options, ["land", "send_back", "cancel"]);
+        assert_eq!(ask.asked_by, "supervisor");
+        let run_dir = run.run_dir().unwrap();
+        for part in [
+            format!("failed and gave no verdict (review {reviews}): "),
+            expected.to_owned(),
+            format!("Review material: {run_dir}/review.md"),
+            format!("{run_dir}/review-{reviews}.out"),
+        ] {
+            assert!(ask.question.contains(&part), "{part} in {}", ask.question);
+        }
+        {
+            let notifications = backend.notifications.lock().unwrap();
+            assert_eq!(notifications.len(), 1, "{notifications:?}");
+            assert!(notifications[0].0.ends_with("approve_landing"));
+        }
+        // The ask is the attention, and the only event that wakes the inbox.
         let status = runtime::status(&db).unwrap();
-        let attention = run_attention_of(&status, run.id()).unwrap();
-        assert_eq!(attention["kind"], "review_failed");
-        assert_eq!(attention["next"], "review by hand");
+        assert!(run_attention_of(&status, run.id()).is_none(), "{status}");
+        assert!(
+            status["attention"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|a| a["ask_id"] == json!(ask.id)
+                    && a["next"] == format!("answer ask {}", ask.id)),
+            "{status}"
+        );
         let events = dagq::watch::events(&db, EventId::new(cursor), 100, false).unwrap();
         let events = events["events"].as_array().unwrap();
         assert_eq!(events.len(), 1, "{events:?}");
-        assert_eq!(events[0]["kind"], "review_failed");
-        assert_eq!(events[0]["next"], "review by hand");
-        // By hand it lands as before.
-        assert_eq!(integrate(&db, 1, &repo).unwrap()["outcome"], "integrated");
+        assert_eq!(events[0]["kind"], "ask_opened");
+        // The supervisor applies the answer.
+        queue.answer(ask.id, answer).unwrap();
+        let outcome = supervise_reviewed(&db, &repo, &backend, &reviewer);
+        assert_eq!(outcome["errors"], json!([]), "{outcome}");
+        let detail = queue.show(TaskId::new(1)).unwrap();
+        assert!(queue.read_ask(ask.id).unwrap().closed_at.is_some());
+        if answer == "land" {
+            assert_landed_run(&detail.runs[0], &repo, &base);
+            assert_eq!(detail.task.status(), TaskStatus::Completed);
+            assert_eq!(
+                payloads(&detail, "integration_approved")[0]["ask_id"],
+                ask.id.as_i64()
+            );
+        } else {
+            assert_eq!(detail.runs[0].status(), RunStatus::Failed);
+            assert_eq!(detail.task.status(), TaskStatus::Canceled);
+        }
+        // No review after the answer.
+        assert_eq!(reviewer.prompts().len(), reviews);
     }
+}
+
+/// A review whose stdout holds no readable verdict is reviewed once more
+/// with the same input (task 328); a verdict from the retry goes on as
+/// usual, here a pass that lands without anyone asked.
+#[test]
+fn an_unreadable_verdict_is_reviewed_again_and_a_readable_one_lands() {
+    let (_dir, repo, db) = fixture();
+    let base = git_out(&repo, &["rev-parse", "main"]);
+    let backend = TestWorkspace::new(&db, false, IDLE_AGENT);
+    let reviewer = TestReviewer::new(&[
+        r#"printf '%s\n' '{"verdict":"pass","reasons":[],"summary":"says "fine""}'"#.to_owned(),
+        verdict("pass", &[], "meets the acceptance"),
+    ]);
+    let outcome = supervise_reviewed(&db, &repo, &backend, &reviewer);
+    assert_eq!(outcome["errors"], json!([]), "{outcome}");
+    let mut queue = SqliteQueue::open(&db).unwrap();
+    let detail = queue.show(TaskId::new(1)).unwrap();
+    assert_landed_run(&detail.runs[0], &repo, &base);
+    assert_eq!(detail.task.status(), TaskStatus::Completed);
+    let prompts = reviewer.prompts();
+    assert_eq!(prompts.len(), 2);
+    // The same input, so the same prompt.
+    assert_eq!(prompts[0], prompts[1]);
+    let kinds = event_kinds(&detail);
+    assert!(!kinds.contains(&"review_failed"), "{kinds:?}");
+    let retried = payloads(&detail, "review_retried");
+    assert_eq!(retried.len(), 1);
+    assert_eq!(retried[0]["attempt"], 1);
+    assert!(
+        retried[0]["error"]
+            .as_str()
+            .unwrap()
+            .contains("the review printed no verdict JSON")
+    );
+    let finished = payloads(&detail, "review_finished");
+    assert_eq!(finished.len(), 1);
+    assert_eq!(finished[0]["attempt"], 2);
+    assert_eq!(finished[0]["verdict"], "pass");
+    assert!(position(&kinds, "review_retried") < position(&kinds, "review_finished"));
+    assert!(
+        queue
+            .asks(AskQuery {
+                all: true,
+                ..Default::default()
+            })
+            .unwrap()
+            .is_empty()
+    );
+    assert!(backend.notifications.lock().unwrap().is_empty());
 }
 
 /// A revise whose rewritten receipt does not name the clean worktree HEAD
@@ -12456,7 +12639,7 @@ fn a_resumed_session_with_a_silent_wrapper_is_asked_to_exit_then_let_go() {
     assert_eq!(finished[0]["outcome"], "unresolved");
     assert_eq!(finished[0]["exit_timed_out"], true);
     assert_eq!(backend.exits_sent.load(Ordering::SeqCst), 1);
-    let asks = queue.asks(AskQuery::default()).unwrap();
+    let asks = other_asks(&mut queue, false);
     assert_eq!(asks.len(), 1, "{asks:?}");
     assert_eq!(asks[0].kind, AskKind::StuckExit);
     assert!(

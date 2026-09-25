@@ -2899,6 +2899,13 @@ impl AskStore for SqliteQueue {
     ) -> Result<Vec<crate::domain::Ask>> {
         SqliteQueue::close_stalled_asks(self, run_id, answer)
     }
+    fn close_approve_landing_asks(
+        &mut self,
+        run_id: &RunId,
+        answer: &str,
+    ) -> Result<Vec<crate::domain::Ask>> {
+        SqliteQueue::close_approve_landing_asks(self, run_id, answer)
+    }
 }
 
 /// Opens the queue at `db` with `generators` for each connection the

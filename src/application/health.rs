@@ -572,6 +572,9 @@ pub fn attention(
                     e.payload.get("status").and_then(Value::as_str)
                         == Some(RunStatus::NeedsSession.as_str())
                 }
+                // A failed review whose `approve_landing` ask was closed
+                // without moving the run (task 328) is reviewed by hand.
+                AttentionNext::ReviewAndIntegrate if e.kind == "review_failed" => true,
                 // An ask about the run is its own attention, not the run's.
                 _ => {
                     !ASK_EVENT_KINDS.contains(&e.kind.as_str())

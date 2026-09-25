@@ -87,7 +87,7 @@ fi
 if [ -n "$headless" ]; then
   # The supervisor's headless review (ADR-0027): read review.md, print the
   # verdict JSON on stdout. Only a task that says E2E-REVIEW-PASS passes;
-  # any other review fails, and its run waits for a review by hand.
+  # any other review fails, and its run waits in an approve_landing ask.
   [ -z "$session_id" ] && [ -n "$debug_file" ] && [ -n "$add_dir" ] && [ -n "$settings" ] && [ -n "$prompt" ] \
     && [ "$tools" = "Read,Grep,Glob" ] && [ "$denied" = "Bash,Edit,Write,NotebookEdit" ] || { printf 'stub: bad review arguments\n' >&2; exit 64; }
   ! grep -q '"Stop"' "$settings" || { printf 'stub: review settings would write the idle marker\n' >&2; exit 64; }
@@ -1350,7 +1350,11 @@ fn a_worker_question_is_answered_through_the_worker_terminal() {
     assert_eq!(delivered[0]["payload"]["ask_id"], ask_id);
     let asks = dagq(env, &["asks", "--all"]);
     assert!(asks["asks"][0]["closed_at"].is_number(), "{asks}");
-    assert!(dagq(env, &["asks"])["asks"].as_array().unwrap().is_empty());
+    // The only open ask is the one of the failed stub review (task 328).
+    let open = dagq(env, &["asks"]);
+    let open = open["asks"].as_array().unwrap();
+    assert_eq!(open.len(), 1, "{open:?}");
+    assert_eq!(open[0]["kind"], "approve_landing");
 }
 
 /// Two independent tasks run in two cmux workspaces at once; the task that

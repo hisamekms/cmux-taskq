@@ -58,20 +58,32 @@ impl HeadlessJob {
 pub(super) struct ReviewWatch {
     pub(super) session: Option<SessionRef>,
     pub(super) attempt: usize,
+    /// Whether this review is the retry of one whose stdout held no
+    /// readable verdict: another unreadable one is not retried again.
+    pub(super) retried: bool,
     pub(super) job: HeadlessJob,
 }
 
+/// How a headless review ended.
+pub(super) enum ReviewEnd {
+    Verdict(ReviewVerdict),
+    /// The job ended well but its stdout held no readable verdict JSON
+    /// (task 328): worth one more review with the same input.
+    Unreadable(String),
+    /// The job itself failed: it exited non-zero or timed out.
+    Failed(String),
+}
+
 impl ReviewWatch {
-    /// `Some` once the review ended: its verdict, or why it failed (the
-    /// job's failure, or stdout without a verdict).
-    pub(super) fn poll(
-        &mut self,
-        files: &dyn RunFiles,
-    ) -> Result<Option<std::result::Result<ReviewVerdict, String>>> {
-        Ok(self
-            .job
-            .poll(files)?
-            .map(|output| output.and_then(|stdout| ReviewVerdict::parse(&stdout))))
+    /// `Some` once the review ended: its verdict, or why there is none.
+    pub(super) fn poll(&mut self, files: &dyn RunFiles) -> Result<Option<ReviewEnd>> {
+        Ok(self.job.poll(files)?.map(|output| match output {
+            Ok(stdout) => match ReviewVerdict::parse(&stdout) {
+                Ok(verdict) => ReviewEnd::Verdict(verdict),
+                Err(error) => ReviewEnd::Unreadable(error),
+            },
+            Err(error) => ReviewEnd::Failed(error),
+        }))
     }
 }
 

@@ -1056,7 +1056,7 @@ impl Supervisor<'_> {
                 let session = watch.session.take();
                 let run = self.queue.run(slot.run.id())?;
                 slot.phase = match outcome {
-                    Ok(verdict) => {
+                    ReviewEnd::Verdict(verdict) => {
                         self.queue.record_runtime_event(
                             run.id(),
                             "review_finished",
@@ -1071,8 +1071,11 @@ impl Supervisor<'_> {
                         info!(run_id = %run.id(), "run {} review {attempt}: {} ({})", run.id(), verdict.verdict.as_str(), verdict.summary);
                         self.act_on_verdict(&run, session, verdict)?
                     }
-                    Err(error) => {
-                        warn!(run_id = %run.id(), error = %error, "run {} review {attempt} failed: {error}; the run waits for a review by hand", run.id());
+                    ReviewEnd::Unreadable(error) if !watch.retried => {
+                        self.retry_review(&run, session, attempt, &error)?
+                    }
+                    ReviewEnd::Unreadable(error) | ReviewEnd::Failed(error) => {
+                        warn!(run_id = %run.id(), error = %error, "run {} review {attempt} failed: {error}; a person is asked", run.id());
                         Phase::Exiting(ExitWatch::new(
                             session,
                             AfterExit::ReviewFailed {
@@ -1200,17 +1203,32 @@ impl Supervisor<'_> {
                         error,
                         duration_secs,
                     } => {
-                        self.queue.record_runtime_event(
-                            run.id(),
-                            "review_failed",
-                            json!({
-                                "code": ReasonCode::JobFailed,
-                                "attempt": attempt,
-                                "error": error,
-                                "duration_secs": duration_secs,
-                                "status": run.status().as_str(),
-                            }),
-                        )?;
+                        // The ask goes with the failure (task 328): the
+                        // person answers it rather than finding the run in
+                        // the attention. When it cannot be opened, the
+                        // failure is the attention (review by hand).
+                        let ask = match self.open_failed_review_ask(&run, attempt, &error) {
+                            Ok(ask) => {
+                                info!(run_id = %run.id(), "run {} waits for a person in ask {ask} after its failed review", run.id());
+                                Some(ask)
+                            }
+                            Err(ask_error) => {
+                                warn!(run_id = %run.id(), error = %format_args!("{ask_error:#}"), "run {}: the approve_landing ask of its failed review could not be opened: {ask_error:#}; it waits for a review by hand", run.id());
+                                None
+                            }
+                        };
+                        let mut payload = json!({
+                            "code": ReasonCode::JobFailed,
+                            "attempt": attempt,
+                            "error": error,
+                            "duration_secs": duration_secs,
+                            "status": run.status().as_str(),
+                        });
+                        if let Some(ask) = ask {
+                            payload["ask_id"] = json!(ask);
+                        }
+                        self.queue
+                            .record_runtime_event(run.id(), "review_failed", payload)?;
                         self.queue.release_lease(run.id(), &self.token)?;
                         Ok(Step::Done(Box::new(self.queue.run(run.id())?)))
                     }
@@ -1252,14 +1270,20 @@ fn wrapper_dead(sv: &Supervisor<'_>, wrapper: &RunProcess, now: i64) -> bool {
     now - wrapper.heartbeat_at > HEARTBEAT_TIMEOUT_SECS && !sv.processes.alive(wrapper.pid)
 }
 
-/// The `reasons` of the run's latest `review_finished`.
+/// The `reasons` of the run's latest review: those of a `review_finished`,
+/// or the error of a `review_failed` after it.
 fn latest_review_reasons(queue: &dyn Queue, run_id: &RunId) -> Result<Vec<String>> {
     Ok(queue
         .run_events(run_id)?
         .into_iter()
         .rev()
-        .find(|e| e.kind == "review_finished")
-        .and_then(|e| serde_json::from_value(e.payload["reasons"].clone()).ok())
+        .find(|e| matches!(e.kind.as_str(), "review_finished" | "review_failed"))
+        .and_then(|e| match e.kind.as_str() {
+            "review_failed" => e.payload["error"]
+                .as_str()
+                .map(|error| vec![format!("the headless review failed: {error}")]),
+            _ => serde_json::from_value(e.payload["reasons"].clone()).ok(),
+        })
         .unwrap_or_default())
 }
 

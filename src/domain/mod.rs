@@ -964,7 +964,9 @@ pub const ASK_EVENT_KINDS: &[&str] = &[
 /// triages it (ADR-0024 decision 3), and only `triage_failed` is one.
 /// `validation_finished` into `awaiting_integration` is not one: the
 /// supervisor reviews the run (ADR-0027); `review_failed` is, since the
-/// run then waits for a review by hand.
+/// run then waits for a review by hand, unless it carries the `ask_id` of
+/// the `approve_landing` ask opened with it (task 328), whose
+/// `ask_opened` is the attention.
 /// `ask_opened` waits for the inbox's answer and
 /// `ask_answered` for the person to act on it through the inbox,
 /// except the answer of a `worker_question`, which the supervisor types into
@@ -984,6 +986,10 @@ pub fn event_attention(kind: &str, payload: &serde_json::Value) -> Option<Attent
         // The supervisor that validated the run reviews it and acts on the
         // verdict itself (ADR-0023 decision 2, ADR-0027).
         ("validation_finished", Some(RunStatus::AwaitingIntegration)) => None,
+        // A failed review whose `approve_landing` ask was opened with it
+        // waits in that ask (task 328); one without an ask is reviewed by
+        // hand.
+        ("review_failed", _) if payload.get("ask_id").is_some() => None,
         ("review_failed", _) => Some(AttentionNext::ReviewByHand),
         // The supervisor triages a failed run and acts on the verdict
         // (ADR-0024 decision 3); only a triage that failed is a person's.
@@ -1301,6 +1307,11 @@ mod attention_tests {
                 Some(ReviewByHand),
             ),
             (
+                "review_failed",
+                json!({"status": "awaiting_integration", "error": "x", "attempt": 2, "ask_id": 7}),
+                None,
+            ),
+            (
                 "triage_failed",
                 json!({"status": "failed", "error": "x", "attempt": 1}),
                 Some(TriageByHand),
@@ -1597,7 +1608,15 @@ mod attention_tests {
             ReviewVerdict::parse(fenced).unwrap().verdict,
             ReviewDecision::Pass
         );
+        // A trailing comment is outside the outermost object.
+        let commented = r#"{"verdict":"pass","reasons":[],"summary":"ok"} // done"#;
+        assert_eq!(
+            ReviewVerdict::parse(commented).unwrap().verdict,
+            ReviewDecision::Pass
+        );
         for bad in [
+            // An unescaped quote inside a string (task 225's review).
+            r#"{"verdict":"pass","reasons":[],"summary":"says "fine""}"#,
             "",
             "no json here",
             r#"{"verdict":"maybe","reasons":[],"summary":"x"}"#,

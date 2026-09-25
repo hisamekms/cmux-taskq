@@ -1097,6 +1097,8 @@ pub trait AskStore {
     fn unclosed_stalled_ask(&self, run_id: &RunId) -> Result<Option<Ask>>;
     /// Close the run's `stalled` asks nobody closed, with `answer`.
     fn close_stalled_asks(&mut self, run_id: &RunId, answer: &str) -> Result<Vec<Ask>>;
+    /// Close the run's `approve_landing` asks nobody closed, with `answer`.
+    fn close_approve_landing_asks(&mut self, run_id: &RunId, answer: &str) -> Result<Vec<Ask>>;
 }
 
 /// Which asks [`AskStore::asks`] lists. By default the ones nobody closed;
