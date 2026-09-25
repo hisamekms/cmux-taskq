@@ -19,7 +19,7 @@ use crate::domain::{
     GoalDetail, GoalEdit, GoalId, GoalPredecessor, GoalSummary, GoalVerdict, NewAsk, NewGoal,
     NewNote, NewTask, NotePage, NoteQuery, Predecessor, Priority, Reason, ReasonCode, RunEvent,
     RunId, RunLease, RunPlan, RunProcess, RunStatus, SessionRole, SupervisorMode,
-    SupervisorRegistration, Task, TaskAction, TaskDetail, TaskId, TaskRun,
+    SupervisorRegistration, Task, TaskAction, TaskDetail, TaskEdit, TaskId, TaskRun,
 };
 
 pub trait TaskStore {
@@ -63,6 +63,10 @@ pub trait TaskStore {
     /// Replace the globs of the paths a draft or ready task may change
     /// (ADR-0029); an empty list removes the limit.
     fn set_paths(&mut self, task_id: TaskId, paths: Vec<String>) -> Result<Task>;
+    /// Replace the given fields of a draft task (ADR-0041 decision 9),
+    /// recording `task_edited` with the fields that changed; running runs
+    /// keep their prompt snapshot.
+    fn edit_task(&mut self, task_id: TaskId, edit: TaskEdit) -> Result<Task>;
     /// Give a draft or ready task another priority (ADR-0040 decision 4);
     /// it takes effect at the next claim.
     fn set_priority(&mut self, task_id: TaskId, priority: Priority) -> Result<Task>;

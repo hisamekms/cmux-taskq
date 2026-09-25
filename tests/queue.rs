@@ -10,9 +10,9 @@ use dagq::{
         timestamp,
     },
     domain::{
-        ClaimOutcome, CommitSha, EventId, GoalEdit, GoalId, GoalStatus, GoalVerdict, NewGoal,
-        NewNote, NewTask, NotePage, NoteQuery, NoteTarget, Priority, Provider, RunId, RunStatus,
-        SupervisorMode, TaskAction, TaskId, TaskStatus,
+        ClaimOutcome, CommitSha, EventId, EvidenceCheck, GoalEdit, GoalId, GoalStatus, GoalVerdict,
+        NewGoal, NewNote, NewTask, NotePage, NoteQuery, NoteTarget, Priority, Provider, RunId,
+        RunStatus, SupervisorMode, TaskAction, TaskEdit, TaskId, TaskStatus,
     },
     infrastructure::sqlite::SqliteQueue,
 };
@@ -1574,6 +1574,128 @@ fn paths_are_stored_and_replaced_while_the_task_is_editable() {
         "the paths can only be changed for draft or ready tasks"
     );
     assert!(queue.set_paths(TaskId::new(99), Vec::new()).is_err());
+}
+
+/// `edit_task` replaces the given fields of a draft task, records
+/// `task_edited` with the old and new value of each field that changed (no
+/// event when nothing does), and refuses a task that is no longer a draft
+/// (ADR-0041 decision 9).
+#[test]
+fn edit_task_replaces_draft_fields_and_records_the_change() {
+    let (_dir, mut queue) = fixture();
+    let task = queue.add(new_task("first title")).unwrap();
+    assert_eq!(
+        queue
+            .edit_task(task.id(), TaskEdit::default())
+            .unwrap_err()
+            .to_string(),
+        "task edit changes nothing"
+    );
+    let edited = queue
+        .edit_task(
+            task.id(),
+            TaskEdit {
+                title: Some("second title".into()),
+                verification_commands: Some(vec!["cargo fmt --all --check".into()]),
+                required_evidence: Some(vec![EvidenceCheck::E2e]),
+                paths: Some(vec!["docs/**".into()]),
+                context: Some("why".into()),
+                ..TaskEdit::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(edited.title(), "second title");
+    assert_eq!(edited.description(), "A small development task");
+    let shown = queue.show(task.id()).unwrap().task;
+    assert_eq!(shown.verification_commands(), ["cargo fmt --all --check"]);
+    assert_eq!(shown.required_evidence(), [EvidenceCheck::E2e]);
+    assert_eq!(shown.paths(), ["docs/**"]);
+    assert_eq!(shown.context(), "why");
+    // The same values again change nothing and record nothing.
+    queue
+        .edit_task(
+            task.id(),
+            TaskEdit {
+                title: Some("second title".into()),
+                ..TaskEdit::default()
+            },
+        )
+        .unwrap();
+    let edits: Vec<_> = queue
+        .show(task.id())
+        .unwrap()
+        .events
+        .into_iter()
+        .filter(|e| e.kind == "task_edited")
+        .map(|e| (e.run_id, e.payload))
+        .collect();
+    assert_eq!(
+        edits,
+        [(
+            None,
+            serde_json::json!({
+                "from": {
+                    "title": "first title",
+                    "verification_commands": ["cargo test"],
+                    "required_evidence": [],
+                    "paths": [],
+                    "context": "",
+                },
+                "to": {
+                    "title": "second title",
+                    "verification_commands": ["cargo fmt --all --check"],
+                    "required_evidence": ["e2e"],
+                    "paths": ["docs/**"],
+                    "context": "why",
+                },
+            })
+        )]
+    );
+    // A bad value is refused before the task is read.
+    assert!(
+        queue
+            .edit_task(
+                TaskId::new(99),
+                TaskEdit {
+                    paths: Some(vec!["../x".into()]),
+                    ..TaskEdit::default()
+                }
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("invalid --paths glob")
+    );
+    let change = || TaskEdit {
+        description: Some("late".into()),
+        ..TaskEdit::default()
+    };
+    assert!(queue.edit_task(TaskId::new(99), change()).is_err());
+    queue.transition(task.id(), TaskAction::Ready).unwrap();
+    assert_eq!(
+        queue
+            .edit_task(task.id(), change())
+            .unwrap_err()
+            .to_string(),
+        format!(
+            "task {} is ready; only a draft task can be edited",
+            task.id()
+        )
+    );
+    queue.claim(&base()).unwrap();
+    assert_eq!(
+        queue
+            .edit_task(task.id(), change())
+            .unwrap_err()
+            .to_string(),
+        format!(
+            "task {} is in_progress; only a draft task can be edited",
+            task.id()
+        )
+    );
+    assert_eq!(
+        queue.show(task.id()).unwrap().task.description(),
+        "A small development task"
+    );
 }
 
 /// `add` stores the priority and `set_priority` changes it on a draft or

@@ -39,6 +39,12 @@ pub enum DomainError {
     TaskNotEditable {
         what: &'static str,
     },
+    /// `dagq edit` of a task whose status keeps its content (ADR-0041
+    /// decision 9): only a draft is edited.
+    TaskContentNotEditable {
+        task_id: TaskId,
+        status: TaskStatus,
+    },
     /// A dependency of a task on itself.
     SelfDependency,
     /// The predecessor already depends on the task, directly or not, where
@@ -177,6 +183,11 @@ impl fmt::Display for DomainError {
             Self::TaskNotEditable { what } => {
                 write!(f, "{what} can only be changed for draft or ready tasks")
             }
+            Self::TaskContentNotEditable { task_id, status } => write!(
+                f,
+                "task {task_id} is {}; only a draft task can be edited",
+                status.as_str()
+            ),
             Self::SelfDependency => f.write_str("a task cannot depend on itself"),
             Self::DependencyCycle {
                 task_id,

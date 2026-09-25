@@ -147,6 +147,15 @@ fn event_gist(event: &RunEvent) -> Value {
         let mut gist = pick(payload, &EVENT_GIST);
         if !gist.is_empty() {
             truncate_fields(&mut gist, &EVENT_GIST);
+            // `task_edited` keeps the old and new texts of a task under
+            // `from` / `to`; they are cut like the task's own texts.
+            for key in ["from", "to"] {
+                if let Some(Value::Object(fields)) = gist.get_mut(key) {
+                    let keys: Vec<String> = fields.keys().cloned().collect();
+                    let keys: Vec<&str> = keys.iter().map(String::as_str).collect();
+                    truncate_fields(fields, &keys);
+                }
+            }
             compact.insert("payload".into(), Value::Object(gist));
         }
     }

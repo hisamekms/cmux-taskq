@@ -18,7 +18,7 @@ use dagq::{
     application::{StatusFilter, TaskQuery, TaskStore, claim_candidates, dependency_graph},
     domain::{
         AskId, AskKind, EventId, GoalEdit, GoalId, GoalVerdict, NewAsk, NewGoal, NewNote, NewTask,
-        NoteQuery, NoteTarget, RunId, SessionRole, TaskAction, TaskId, TaskStatus,
+        NoteQuery, NoteTarget, RunId, SessionRole, TaskAction, TaskEdit, TaskId, TaskStatus,
     },
     infrastructure::{adapters::path_text, location::QueueLocation, sqlite::SqliteQueue},
 };
@@ -155,6 +155,47 @@ enum Command {
         /// Declare no paths: runs may change anything.
         #[arg(long)]
         none: bool,
+    },
+    /// Replace fields of a draft task; each given field replaces the old value, and a
+    /// repeatable flag replaces the whole list. Prints the task; `show` lists the change as
+    /// a `task_edited` event with the old and new values. Other statuses are refused: a
+    /// ready task goes back to draft (`draft ID`) first, and a running run keeps its prompt.
+    #[command(group = clap::ArgGroup::new("field").multiple(true).required(true))]
+    Edit {
+        /// Draft task.
+        task: i64,
+        #[arg(long, group = "field")]
+        title: Option<String>,
+        #[arg(long, group = "field")]
+        description: Option<String>,
+        #[arg(long, group = "field")]
+        acceptance: Option<String>,
+        /// Why the task exists and what to read first.
+        #[arg(long, group = "field")]
+        context: Option<String>,
+        /// Verification command; repeatable. Replaces every command the task had.
+        #[arg(long = "verify", group = "field", conflicts_with = "no_verify")]
+        verification_commands: Vec<String>,
+        /// Remove every verification command.
+        #[arg(long, group = "field")]
+        no_verify: bool,
+        /// Required receipt check (`add --evidence`); repeatable. Replaces every check.
+        #[arg(
+            long = "evidence",
+            group = "field",
+            conflicts_with = "no_evidence",
+            value_parser = ["tests", "e2e", "subagent_review"]
+        )]
+        required_evidence: Vec<String>,
+        /// Require no receipt check.
+        #[arg(long, group = "field")]
+        no_evidence: bool,
+        /// Glob of a path the task may change (`add --paths`); repeatable. Replaces every glob.
+        #[arg(long = "paths", group = "field", conflicts_with = "no_paths")]
+        paths: Vec<String>,
+        /// Declare no paths: runs may change anything.
+        #[arg(long, group = "field")]
+        no_paths: bool,
     },
     /// Give a draft or ready task another priority (`add --priority`); it takes effect at the
     /// next claim and never stops a running run.
@@ -844,6 +885,38 @@ fn execute(cli: Cli) -> Result<Value> {
             paths,
             none: _,
         } => serde_json::to_value(queue.set_paths(TaskId::new(task), paths)?)?,
+        Command::Edit {
+            task,
+            title,
+            description,
+            acceptance,
+            context,
+            verification_commands,
+            no_verify,
+            required_evidence,
+            no_evidence,
+            paths,
+            no_paths,
+        } => {
+            // A list flag replaces the list; its --no- flag empties it.
+            let replaced =
+                |values: Vec<String>, none: bool| (none || !values.is_empty()).then_some(values);
+            let required_evidence = replaced(required_evidence, no_evidence)
+                .map(|names| names.iter().map(|name| name.parse()).collect())
+                .transpose()?;
+            serde_json::to_value(queue.edit_task(
+                TaskId::new(task),
+                TaskEdit {
+                    title,
+                    description,
+                    acceptance,
+                    verification_commands: replaced(verification_commands, no_verify),
+                    required_evidence,
+                    paths: replaced(paths, no_paths),
+                    context,
+                },
+            )?)?
+        }
         Command::SetPriority { task, level } => {
             serde_json::to_value(queue.set_priority(TaskId::new(task), level.parse()?)?)?
         }

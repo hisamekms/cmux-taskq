@@ -5,7 +5,8 @@
 use serde::Serialize;
 
 use super::{
-    DomainError, EvidenceCheck, GoalId, NewTask, Priority, TaskId, TaskRecord, TaskStatus, require,
+    DomainError, EvidenceCheck, GoalId, NewTask, Priority, TaskEdit, TaskId, TaskRecord,
+    TaskStatus, require,
     scope::{dedup_globs, validate_path_globs},
 };
 
@@ -42,6 +43,14 @@ impl TaskStatus {
     /// Dependencies and the goal may change only before the task is claimed.
     pub fn dependencies_editable(self) -> bool {
         matches!(self, Self::Draft | Self::Ready)
+    }
+
+    /// Whether `dagq edit` may change the content of the task: a draft
+    /// only. `submitted` joins it when that status exists (ADR-0041
+    /// decision 9); a ready task goes back to submitted to be edited
+    /// (decision 14).
+    pub fn content_editable(self) -> bool {
+        matches!(self, Self::Draft)
     }
 
     pub fn is_terminal(self) -> bool {
@@ -252,6 +261,47 @@ pub fn set_paths(mut task: Task, paths: Vec<String>) -> Result<Task, DomainError
 pub fn set_priority(mut task: Task, priority: Priority) -> Result<Task, DomainError> {
     require_editable(&task, "the priority")?;
     task.priority = priority;
+    Ok(task)
+}
+
+/// `task` with the fields of `edit` replaced (`dagq edit`): only while its
+/// status keeps the content editable, with the creation rules of
+/// [`NewTask`] for what changes; the required checks and globs are kept
+/// once each.
+pub fn edit(mut task: Task, edit: TaskEdit) -> Result<Task, DomainError> {
+    edit.validate()?;
+    require(task.status.content_editable(), || {
+        DomainError::TaskContentNotEditable {
+            task_id: task.id,
+            status: task.status,
+        }
+    })?;
+    if let Some(title) = edit.title {
+        task.title = title;
+    }
+    if let Some(description) = edit.description {
+        task.description = description;
+    }
+    if let Some(acceptance) = edit.acceptance {
+        task.acceptance = acceptance;
+    }
+    if let Some(commands) = edit.verification_commands {
+        task.verification_commands = commands;
+    }
+    if let Some(checks) = edit.required_evidence {
+        task.required_evidence = Vec::new();
+        for check in checks {
+            if !task.required_evidence.contains(&check) {
+                task.required_evidence.push(check);
+            }
+        }
+    }
+    if let Some(paths) = edit.paths {
+        task.paths = dedup_globs(&paths);
+    }
+    if let Some(context) = edit.context {
+        task.context = context;
+    }
     Ok(task)
 }
 
@@ -530,6 +580,114 @@ mod tests {
                 .unwrap_err()
                 .to_string(),
             "dependencies can only be changed for draft or ready tasks"
+        );
+    }
+
+    #[test]
+    fn edit_replaces_the_given_fields_of_a_draft_only() {
+        let draft = Task::new(TaskId::new(3), new_task(), "now".into()).unwrap();
+        let kept = edit(draft.clone(), TaskEdit::default()).unwrap();
+        assert_eq!(
+            serde_json::to_value(&kept).unwrap(),
+            serde_json::to_value(&draft).unwrap()
+        );
+        let edited = edit(
+            draft,
+            TaskEdit {
+                title: Some("t2".into()),
+                description: Some("d2".into()),
+                acceptance: Some("a2".into()),
+                verification_commands: Some(Vec::new()),
+                required_evidence: Some(vec![
+                    EvidenceCheck::Tests,
+                    EvidenceCheck::E2e,
+                    EvidenceCheck::Tests,
+                ]),
+                paths: Some(vec!["src/**".into(), "src/**".into()]),
+                context: Some("c2".into()),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            (edited.title(), edited.description(), edited.acceptance()),
+            ("t2", "d2", "a2")
+        );
+        assert!(edited.verification_commands().is_empty());
+        assert_eq!(
+            edited.required_evidence(),
+            [EvidenceCheck::Tests, EvidenceCheck::E2e]
+        );
+        assert_eq!(edited.paths(), ["src/**"]);
+        assert_eq!(edited.context(), "c2");
+        assert_eq!(edited.status(), TaskStatus::Draft);
+
+        let invalid = [
+            (
+                TaskEdit {
+                    title: Some(" ".into()),
+                    ..TaskEdit::default()
+                },
+                "task title must not be blank",
+            ),
+            (
+                TaskEdit {
+                    verification_commands: Some(vec!["".into()]),
+                    ..TaskEdit::default()
+                },
+                "verification commands must not be blank",
+            ),
+        ];
+        for (change, message) in invalid {
+            assert!(!change.is_empty());
+            assert_eq!(
+                edit(edited.clone(), change).unwrap_err().to_string(),
+                message
+            );
+        }
+        assert!(matches!(
+            edit(
+                edited,
+                TaskEdit {
+                    paths: Some(vec!["/abs".into()]),
+                    ..TaskEdit::default()
+                }
+            ),
+            Err(DomainError::InvalidPathGlob { .. })
+        ));
+        assert!(TaskEdit::default().is_empty());
+
+        for status in [
+            TaskStatus::Ready,
+            TaskStatus::InProgress,
+            TaskStatus::Completed,
+            TaskStatus::Canceled,
+        ] {
+            assert!(!status.content_editable());
+            let task = Task::restore(record(status)).unwrap();
+            let change = TaskEdit {
+                context: Some("x".into()),
+                ..TaskEdit::default()
+            };
+            assert_eq!(
+                edit(task, change).unwrap_err(),
+                DomainError::TaskContentNotEditable {
+                    task_id: TaskId::new(5),
+                    status,
+                }
+            );
+        }
+        let ready = Task::restore(record(TaskStatus::Ready)).unwrap();
+        assert_eq!(
+            edit(
+                ready,
+                TaskEdit {
+                    title: Some("x".into()),
+                    ..TaskEdit::default()
+                }
+            )
+            .unwrap_err()
+            .to_string(),
+            "task 5 is ready; only a draft task can be edited"
         );
     }
 

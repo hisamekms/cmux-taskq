@@ -21,8 +21,8 @@ use crate::{
         ClaimOutcome, CommitSha, DomainError, EventId, Goal, GoalDetail, GoalEdit, GoalId,
         GoalPredecessor, GoalRecord, GoalSummary, GoalTask, GoalVerdict, NewGoal, NewNote, NewTask,
         NotePage, NoteQuery, NoteTarget, OBSERVATION_KIND, Predecessor, Priority, Provider,
-        RunEvent, RunId, RunRecord, Task, TaskAction, TaskDetail, TaskId, TaskRecord, TaskRun,
-        TaskStatus, TaskStatusCounts, goal, scope::validate_path_globs, task,
+        RunEvent, RunId, RunRecord, Task, TaskAction, TaskDetail, TaskEdit, TaskId, TaskRecord,
+        TaskRun, TaskStatus, TaskStatusCounts, goal, scope::validate_path_globs, task,
     },
     infrastructure::{clock, location::runs_dir},
 };
@@ -846,6 +846,55 @@ impl TaskStore for SqliteQueue {
         Ok(result)
     }
 
+    fn edit_task(&mut self, task_id: TaskId, edit: TaskEdit) -> Result<Task> {
+        ensure!(!edit.is_empty(), "task edit changes nothing");
+        // Checked before the task is read, so a bad value is reported first.
+        edit.validate()?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let old = read_task(&tx, task_id)?;
+        // The event keeps the fields before the edit, which consumes the task.
+        let old_json = serde_json::to_value(&old)?;
+        let new = task::edit(old, edit)?;
+        let new_json = serde_json::to_value(&new)?;
+        let (mut from, mut to) = (serde_json::Map::new(), serde_json::Map::new());
+        for field in EDITABLE_TASK_FIELDS {
+            if old_json[field] != new_json[field] {
+                from.insert(field.to_owned(), old_json[field].clone());
+                to.insert(field.to_owned(), new_json[field].clone());
+            }
+        }
+        if !to.is_empty() {
+            tx.execute(
+                "UPDATE tasks SET title=?1, description=?2, acceptance=?3,
+                 verification_commands=?4, required_evidence=?5, paths=?6, context=?7,
+                 updated_at=?8 WHERE id=?9",
+                params![
+                    new.title(),
+                    new.description(),
+                    new.acceptance(),
+                    serde_json::to_string(new.verification_commands())?,
+                    serde_json::to_string(new.required_evidence())?,
+                    serde_json::to_string(new.paths())?,
+                    new.context(),
+                    self.generators.clock.timestamp(),
+                    task_id
+                ],
+            )?;
+            event(
+                &tx,
+                task_id,
+                None,
+                "task_edited",
+                json!({"from": from, "to": to}),
+            )?;
+        }
+        let result = read_task(&tx, task_id)?;
+        tx.commit()?;
+        Ok(result)
+    }
+
     fn set_priority(&mut self, task_id: TaskId, priority: Priority) -> Result<Task> {
         let tx = self
             .conn
@@ -875,6 +924,18 @@ impl TaskStore for SqliteQueue {
         Ok(result)
     }
 }
+
+/// The fields `dagq edit` replaces, as the task JSON names them; `task_edited`
+/// records the ones that changed.
+const EDITABLE_TASK_FIELDS: [&str; 7] = [
+    "title",
+    "description",
+    "acceptance",
+    "verification_commands",
+    "required_evidence",
+    "paths",
+    "context",
+];
 
 fn read_goal(conn: &Connection, goal_id: GoalId) -> Result<Goal> {
     conn.query_row("SELECT * FROM goals WHERE id=?1", [goal_id], goal_row)

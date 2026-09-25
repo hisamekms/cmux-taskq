@@ -1872,6 +1872,129 @@ fn priority_is_named_changed_while_editable_and_orders_candidates() {
     );
 }
 
+/// `edit` replaces the given fields of a draft task, a repeatable flag the
+/// whole list (`--no-*` empties it); `show` prints the change as
+/// `task_edited`, and a ready task is refused (ADR-0041 decision 9).
+#[test]
+fn edit_replaces_fields_of_a_draft_task_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("queue.db");
+    ok(&db, &["init"]);
+    let id = ok(
+        &db,
+        &[
+            "add",
+            "old",
+            "--verify",
+            "cargo test",
+            "--evidence",
+            "tests",
+            "--paths",
+            "src/**",
+        ],
+    )["id"]
+        .to_string();
+    let edited = ok(
+        &db,
+        &[
+            "edit",
+            &id,
+            "--title",
+            "new",
+            "--description",
+            "d",
+            "--acceptance",
+            "a",
+            "--context",
+            "c",
+            "--verify",
+            "cargo fmt --all --check",
+            "--verify",
+            "cargo test --locked --test plugin",
+            "--evidence",
+            "e2e",
+            "--paths",
+            "docs/**",
+        ],
+    );
+    assert_eq!(
+        (
+            &edited["title"],
+            &edited["description"],
+            &edited["acceptance"],
+            &edited["context"]
+        ),
+        (
+            &serde_json::json!("new"),
+            &serde_json::json!("d"),
+            &serde_json::json!("a"),
+            &serde_json::json!("c")
+        )
+    );
+    assert_eq!(
+        edited["verification_commands"],
+        serde_json::json!([
+            "cargo fmt --all --check",
+            "cargo test --locked --test plugin"
+        ])
+    );
+    assert_eq!(edited["required_evidence"], serde_json::json!(["e2e"]));
+    assert_eq!(edited["paths"], serde_json::json!(["docs/**"]));
+    let cleared = ok(
+        &db,
+        &["edit", &id, "--no-verify", "--no-evidence", "--no-paths"],
+    );
+    for field in ["verification_commands", "required_evidence", "paths"] {
+        assert_eq!(cleared[field], serde_json::json!([]), "{field}");
+    }
+    assert_eq!(cleared["title"], "new");
+    let shown = ok(&db, &["show", &id, "--full"]);
+    let edits: Vec<&Value> = shown["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["kind"] == "task_edited")
+        .collect();
+    assert_eq!(edits.len(), 2);
+    assert_eq!(edits[0]["payload"]["from"]["title"], "old");
+    assert_eq!(edits[0]["payload"]["to"]["title"], "new");
+    assert_eq!(
+        edits[1]["payload"]["to"],
+        serde_json::json!({"verification_commands": [], "required_evidence": [], "paths": []})
+    );
+    // The compact `show` cuts the long texts inside `from` / `to`.
+    let long = "x".repeat(400);
+    ok(&db, &["edit", &id, "--description", &long]);
+    let compact = ok(&db, &["show", &id]);
+    let latest = compact["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .rfind(|e| e["kind"] == "task_edited")
+        .unwrap();
+    let to = &latest["payload"]["to"];
+    assert!(to["description"].as_str().unwrap().ends_with('…'));
+    assert_eq!(to["truncated"], true);
+    assert_eq!(latest["payload"]["from"]["description"], "d");
+    for args in [
+        &["edit", &id][..],
+        &["edit", &id, "--verify", "x", "--no-verify"][..],
+        &["edit", &id, "--evidence", "coverage"][..],
+        &["edit", &id, "--paths", "/abs"][..],
+        &["edit", &id, "--title", " "][..],
+    ] {
+        assert!(!invoke(&db, args).status.success(), "{args:?}");
+    }
+    ok(&db, &["ready", &id]);
+    assert_eq!(
+        refused(&db, &["edit", &id, "--title", "late"]),
+        format!("task {id} is ready; only a draft task can be edited")
+    );
+    // Back to draft, it can be edited again.
+    ok(&db, &["draft", &id]);
+    assert_eq!(ok(&db, &["edit", &id, "--title", "late"])["title"], "late");
+}
+
 #[test]
 fn add_evidence_is_stored_and_shown() {
     let dir = tempfile::tempdir().unwrap();

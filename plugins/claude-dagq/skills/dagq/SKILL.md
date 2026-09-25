@@ -55,7 +55,7 @@ Split the goal into tasks one session can finish in one worktree. Collect per ta
 "$DAGQ" candidates
 ```
 
-A one-shot task omits `--goal`. `add` registers a `draft`, `ready` makes it runnable, `candidates` lists ready tasks whose dependencies are all `completed`. A ready task missing from `candidates` is blocked: show the blocking IDs from `show ID`'s `dependencies`. `draft ID` takes a task back for editing, `cancel ID` drops it, `dependency add|remove TASK PREDECESSOR` changes prerequisites of a draft or ready task (cycles are rejected). `set-goal` and `goal edit` are in `reference/inspect.md`, `set-paths` in `reference/scope.md`.
+A one-shot task omits `--goal`. `add` registers a `draft`, `ready` makes it runnable, `candidates` lists ready tasks whose dependencies are all `completed`. A ready task missing from `candidates` is blocked: show the blocking IDs from `show ID`'s `dependencies`. `draft ID` takes a task back for editing, `cancel ID` drops it, `dependency add|remove TASK PREDECESSOR` changes prerequisites of a draft or ready task (cycles are rejected). `set-goal`, `goal edit`, `edit` (a draft) are in `reference/inspect.md`, `set-paths` in `reference/scope.md`.
 
 `--priority LEVEL` (default `normal`; `set-priority TASK LEVEL` while `draft` or `ready`) orders claiming: `interrupt` (a rare cut-in, never routine), `urgent` (a defect stopping operation), `high` (a prerequisite of other work), `normal`, `low` (deferred). Claim order: effective priority (own, or higher from ready tasks waiting on it), `unblocks`, ID. Mark urgency this way, never by drafting other tasks or bending dependencies; see `reference/inspect.md`.
 

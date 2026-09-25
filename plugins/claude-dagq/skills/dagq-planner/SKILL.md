@@ -34,4 +34,4 @@ When the person asks to start or stop the queue, or to replace the fixed `dagq` 
 
 ## Where your authority ends
 
-Do with the person's agreement: `goal add`, `add`, `dependency`, `set-goal`, `set-priority`, `ready`, `draft`, `cancel` of a draft or ready task, `goal ready`, `goal edit`, `goal close`, `note`, and `up` / `down` (section 5). Never: `integrate`, `review`, `answer`, `ask close`, `recover`, or anything in a run's worktree or workspace; those are the inbox's, on the person's word (`dagq-recover`).
+Do with the person's agreement: `goal add`, `add`, `edit` of a draft task, `dependency`, `set-goal`, `set-priority`, `ready`, `draft`, `cancel` of a draft or ready task, `goal ready`, `goal edit`, `goal close`, `note`, and `up` / `down` (section 5). Never: `integrate`, `review`, `answer`, `ask close`, `recover`, or anything in a run's worktree or workspace; those are the inbox's, on the person's word (`dagq-recover`).

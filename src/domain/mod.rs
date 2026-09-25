@@ -334,7 +334,7 @@ pub use error::DomainError;
 use error::require;
 pub use goal::Goal;
 pub use ids::{AskId, CommitSha, EventId, GoalId, RunId, TaskId};
-pub use input::{GoalEdit, GoalRecord, NewGoal, NewTask, RunPlan, RunRecord, TaskRecord};
+pub use input::{GoalEdit, GoalRecord, NewGoal, NewTask, RunPlan, RunRecord, TaskEdit, TaskRecord};
 pub use reason::{Reason, ReasonCode};
 pub use run::TaskRun;
 pub use task::{Task, TaskAction};

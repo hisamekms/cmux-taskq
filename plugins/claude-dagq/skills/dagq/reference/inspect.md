@@ -1,6 +1,6 @@
 # Inspect commands and their fields
 
-Read this when you need a field of `list`, `show`, `goal show`, `graph`, `status`, `stats` or `doctor`, the meaning of a task or run status, or how priority orders claiming.
+Read this when you need a field of `list`, `show`, `goal show`, `graph`, `status`, `stats` or `doctor`, the meaning of a task or run status, how priority orders claiming, or how to edit a draft task.
 
 | Command | Use |
 | --- | --- |
@@ -62,6 +62,21 @@ Every task has one of five priorities. Pick it by what waiting costs, not by how
 - **When it can change.** Only while the task is `draft` or `ready`; `set-priority` on a claimed (`in_progress`) or finished task is refused. It takes effect at the next claim and never stops a run already running. A change is recorded as a `task_priority_changed` event (`from`, `to`).
 - **Express urgency with priority only.** Do not move other tasks back to `draft`, and do not add or remove dependencies that are not real, to get one task claimed first; give it a higher priority instead.
 - **No aging.** A `low` task waits as long as higher ones keep arriving; nothing raises it over time. Check `graph` for ready tasks that never reach the front and raise them by hand.
+
+## Edit a draft task
+
+Fix a draft task in place instead of canceling it and registering it again (that changes its ID and its dependents' edges):
+
+```sh
+"$DAGQ" edit TASK --description "..." --acceptance "..."   # also --title, --context
+"$DAGQ" edit TASK --verify 'cargo fmt --all --check' --verify 'cargo test --locked --test plugin'
+"$DAGQ" edit TASK --evidence e2e --paths 'src/**'          # --no-verify / --no-evidence / --no-paths empty a list
+```
+
+- Each given field replaces the old value; a repeatable flag (`--verify`, `--evidence`, `--paths`) replaces the whole list, so pass every value it should keep. At least one field is required. The values follow the `add` rules (no blank title or command, valid globs).
+- **When it can change.** Only a `draft` task. A `ready` task is refused: take it back with `draft ID`, edit it, and `ready` it again. An `in_progress` or finished task is refused; a run already claimed keeps the prompt it started with.
+- The change is recorded as a `task_edited` event whose `from` and `to` hold only the fields that changed (under their task JSON names); `show ID` lists it with long texts cut to 300 characters, `show ID --full` has the whole values. Nothing changed, nothing recorded.
+- Priority, goal and dependencies have their own commands: `set-priority`, `set-goal`, `dependency add|remove`.
 
 ## Change a goal or a task's goal
 

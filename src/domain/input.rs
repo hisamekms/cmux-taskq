@@ -125,6 +125,52 @@ impl GoalEdit {
     }
 }
 
+/// Fields of a draft task to replace (`dagq edit`, ADR-0041 decision 9);
+/// `None` keeps the current value. The lists replace the whole list: an
+/// empty one removes every command, check or glob.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TaskEdit {
+    pub title: Option<String>,
+    pub description: Option<String>,
+    pub acceptance: Option<String>,
+    pub verification_commands: Option<Vec<String>>,
+    pub required_evidence: Option<Vec<EvidenceCheck>>,
+    pub paths: Option<Vec<String>>,
+    pub context: Option<String>,
+}
+
+impl TaskEdit {
+    pub fn is_empty(&self) -> bool {
+        self.title.is_none()
+            && self.description.is_none()
+            && self.acceptance.is_none()
+            && self.verification_commands.is_none()
+            && self.required_evidence.is_none()
+            && self.paths.is_none()
+            && self.context.is_none()
+    }
+
+    /// The rules of [`NewTask::validate`] for the fields it replaces.
+    pub fn validate(&self) -> Result<(), DomainError> {
+        if let Some(title) = &self.title {
+            require(!title.trim().is_empty(), || DomainError::Blank {
+                field: "task title",
+            })?;
+        }
+        if let Some(commands) = &self.verification_commands {
+            require(commands.iter().all(|s| !s.trim().is_empty()), || {
+                DomainError::Blank {
+                    field: "verification commands",
+                }
+            })?;
+        }
+        match &self.paths {
+            Some(paths) => scope::validate_path_globs(paths),
+            None => Ok(()),
+        }
+    }
+}
+
 /// A task as the store saved it, for [`super::Task::restore`].
 #[derive(Debug, Clone)]
 pub struct TaskRecord {
