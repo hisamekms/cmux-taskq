@@ -1016,6 +1016,75 @@ fn ready_tasks_of_a_draft_goal_do_not_raise_idle_slots() {
 }
 
 #[test]
+fn cancel_duplicate_of_is_recorded_shown_listed_and_counted() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("queue.db");
+    ok(&db, &["init"]);
+    for title in ["original", "copy", "another copy", "unrelated", "plain"] {
+        ok(&db, &["add", title]);
+    }
+    // Invalid targets: none, itself, a canceled task and one canceled as a duplicate.
+    assert!(
+        refused(&db, &["cancel", "2", "--duplicate-of", "99"]).contains("task 99 does not exist")
+    );
+    assert!(refused(&db, &["cancel", "2", "--duplicate-of", "2"]).contains("itself"));
+    ok(&db, &["cancel", "5"]);
+    assert!(refused(&db, &["cancel", "2", "--duplicate-of", "5"]).contains("task 5 is canceled"));
+    let canceled = ok(&db, &["cancel", "2", "--duplicate-of", "1"]);
+    assert_eq!(canceled["status"], "canceled");
+    let chained = refused(&db, &["cancel", "3", "--duplicate-of", "2"]);
+    assert!(
+        chained.contains("duplicate of task 1") && chained.contains("--duplicate-of 1"),
+        "{chained}"
+    );
+    // The duplicate cannot point back: task 1 is refused as a duplicate of its duplicate.
+    assert!(refused(&db, &["cancel", "1", "--duplicate-of", "2"]).contains("task 2 is canceled"));
+    ok(&db, &["cancel", "3", "--duplicate-of", "1"]);
+
+    let copy = ok(&db, &["show", "2"]);
+    assert_eq!(copy["duplicate_of"], 1);
+    assert_eq!(copy["duplicates"], serde_json::json!([]));
+    let original = ok(&db, &["show", "1"]);
+    assert_eq!(original["duplicate_of"], Value::Null);
+    assert_eq!(original["duplicates"], serde_json::json!([2, 3]));
+    assert_eq!(ok(&db, &["show", "2", "--full"])["duplicate_of"], 1);
+    assert_eq!(ok(&db, &["show", "5"])["duplicate_of"], Value::Null);
+
+    let listed = ok(&db, &["list", "--all"]);
+    let row = |id: i64| {
+        listed["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|task| task["id"] == id)
+            .unwrap()
+            .clone()
+    };
+    assert_eq!(row(2)["duplicate_of"], 1);
+    assert_eq!(row(3)["duplicate_of"], 1);
+    assert!(row(5).get("duplicate_of").is_none());
+    assert!(row(1).get("duplicate_of").is_none());
+
+    let stats = ok(&db, &["stats", "--full"]);
+    assert_eq!(stats["duplicate_cancels"]["count"], 2);
+    assert_eq!(
+        stats["duplicate_cancels"]["tasks"],
+        serde_json::json!([
+            {"task_id": 2, "duplicate_of": 1},
+            {"task_id": 3, "duplicate_of": 1},
+        ])
+    );
+    // Past the cursor, nothing new was canceled as a duplicate.
+    let cursor = stats["next_cursor"].as_i64().unwrap().to_string();
+    let later = ok(&db, &["stats", "--since", &cursor]);
+    assert_eq!(later["duplicate_cancels"]["count"], 0);
+    ok(&db, &["cancel", "4", "--duplicate-of", "1"]);
+    let later = ok(&db, &["stats", "--since", &cursor]);
+    assert_eq!(later["duplicate_cancels"]["count"], 1);
+    assert_eq!(later["duplicate_cancels"]["tasks"][0]["task_id"], 4);
+}
+
+#[test]
 fn notes_are_observations_read_by_notes_show_and_goal_show() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("queue.db");

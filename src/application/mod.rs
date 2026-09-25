@@ -102,6 +102,9 @@ pub struct TaskListItem {
     pub goal_dependencies: Vec<GoalId>,
     /// The most recently created run, if any.
     pub latest_run: Option<LatestRun>,
+    /// For a task canceled as a duplicate, the task it duplicates (ADR-0046 decision 5).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duplicate_of: Option<TaskId>,
     #[serde(flatten)]
     pub details: Option<TaskListDetails>,
 }
@@ -130,6 +133,7 @@ impl TaskListItem {
         dependencies: Vec<TaskId>,
         goal_dependencies: Vec<GoalId>,
         latest_run: Option<LatestRun>,
+        duplicate_of: Option<TaskId>,
         full: bool,
     ) -> Self {
         let details = full.then_some(TaskListDetails {
@@ -151,6 +155,7 @@ impl TaskListItem {
             dependencies,
             goal_dependencies,
             latest_run,
+            duplicate_of,
             details,
         }
     }

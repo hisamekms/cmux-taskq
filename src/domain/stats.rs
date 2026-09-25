@@ -137,6 +137,20 @@ pub struct ReasonCodes {
     pub by_kind: BTreeMap<String, BTreeMap<String, i64>>,
 }
 
+/// The tasks canceled as duplicates in the window (ADR-0046 decision 5):
+/// how many, and which task each duplicates, in event order.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct DuplicateCancels {
+    pub count: i64,
+    pub tasks: Vec<DuplicateCancel>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DuplicateCancel {
+    pub task_id: TaskId,
+    pub duplicate_of: TaskId,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Stats {
     /// Finished runs, oldest finish first.
@@ -152,6 +166,8 @@ pub struct Stats {
     pub backend_failures: BackendFailures,
     /// The reason codes recorded in the same window as `backend_failures`.
     pub reason_codes: ReasonCodes,
+    /// The tasks canceled as duplicates in the same window as `backend_failures`.
+    pub duplicate_cancels: DuplicateCancels,
     /// The runs not finished yet that look stalled now (ADR-0043 decision
     /// 5), whatever `--since` says; with `--goal`, only that goal's.
     pub running_alerts: Vec<RunningAlert>,
@@ -478,6 +494,7 @@ pub fn stats(
     let counts = |task_id: Option<TaskId>| query.goal_id.is_none() || task_id.is_some_and(in_goal);
     let backend_failures = backend_failures(events, window_start, next_cursor, counts);
     let reason_codes = reason_codes(events, window_start, next_cursor, counts);
+    let duplicate_cancels = duplicate_cancels(events, window_start, next_cursor, counts);
     if backend_failures.count >= BACKEND_FAILURES {
         alerts.push(Alert {
             kind: "backend_failures",
@@ -504,6 +521,7 @@ pub fn stats(
         alerts,
         backend_failures,
         reason_codes,
+        duplicate_cancels,
         running_alerts,
         workspace_check,
         stall_config: live.config.clone(),
@@ -803,6 +821,35 @@ fn reason_codes(
             .or_default() += 1;
     }
     codes
+}
+
+/// The `task_status_changed` events with `after < id <= upto` that
+/// canceled a task as a duplicate, whose task `counts` accepts.
+fn duplicate_cancels(
+    events: &[RunEvent],
+    after: EventId,
+    upto: EventId,
+    counts: impl Fn(Option<TaskId>) -> bool,
+) -> DuplicateCancels {
+    let mut cancels = DuplicateCancels::default();
+    for event in events.iter().filter(|event| {
+        event.kind == "task_status_changed"
+            && event.id > after
+            && event.id <= upto
+            && counts(event.task_id)
+    }) {
+        if let (Some(task_id), Some(duplicate_of)) = (
+            event.task_id,
+            event.payload.get("duplicate_of").and_then(Value::as_i64),
+        ) {
+            cancels.count += 1;
+            cancels.tasks.push(DuplicateCancel {
+                task_id,
+                duplicate_of: TaskId::new(duplicate_of),
+            });
+        }
+    }
+    cancels
 }
 
 /// Aggregate the `backend_call_failed` events with `after < id <= upto`

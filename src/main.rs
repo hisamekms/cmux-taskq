@@ -170,7 +170,14 @@ enum Command {
         command: ProposalCommand,
     },
     /// Cancel a draft, submitted or ready task. Does not satisfy its dependents.
-    Cancel { id: i64 },
+    Cancel {
+        id: i64,
+        /// Record the task as a duplicate of this one (ADR-0046): another task that exists and is
+        /// not canceled; a completed one means it is already implemented there. `show`, `list`
+        /// and `stats` report it.
+        #[arg(long = "duplicate-of")]
+        duplicate_of: Option<i64>,
+    },
     /// Manage prerequisites; TASK depends on PREDECESSOR, or with --goal on a goal
     /// that must be closed as achieved first.
     Dependency {
@@ -1009,9 +1016,10 @@ fn execute(cli: Cli) -> Result<Value> {
         Command::Draft { id } => {
             serde_json::to_value(queue.transition(TaskId::new(id), TaskAction::Draft)?)?
         }
-        Command::Cancel { id } => {
-            serde_json::to_value(queue.transition(TaskId::new(id), TaskAction::Cancel)?)?
-        }
+        Command::Cancel { id, duplicate_of } => serde_json::to_value(match duplicate_of {
+            Some(target) => queue.cancel_duplicate(TaskId::new(id), TaskId::new(target))?,
+            None => queue.transition(TaskId::new(id), TaskAction::Cancel)?,
+        })?,
         Command::Dependency { command } => {
             let id =
                 match command {

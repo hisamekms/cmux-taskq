@@ -104,6 +104,10 @@ pub struct TaskDetail {
     pub dependencies: Vec<TaskId>,
     /// Goals the task depends on (ADR-0038), ascending.
     pub goal_dependencies: Vec<GoalId>,
+    /// The task this one was canceled as a duplicate of (ADR-0046 decision 5).
+    pub duplicate_of: Option<TaskId>,
+    /// The canceled tasks recorded as duplicates of this one, ascending.
+    pub duplicates: Vec<TaskId>,
     pub runs: Vec<TaskRun>,
     pub events: Vec<RunEvent>,
     pub processes: Vec<RunProcess>,

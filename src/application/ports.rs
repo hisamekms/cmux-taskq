@@ -30,6 +30,10 @@ pub trait TaskStore {
     fn list(&self, query: &TaskQuery) -> Result<TaskPage>;
     fn show(&mut self, task_id: TaskId) -> Result<TaskDetail>;
     fn transition(&mut self, task_id: TaskId, action: TaskAction) -> Result<Task>;
+    /// Cancel a task as a duplicate of another (ADR-0046 decision 5),
+    /// recording which in its `task_status_changed`. The other task must
+    /// exist, differ and not be canceled.
+    fn cancel_duplicate(&mut self, task_id: TaskId, duplicate_of: TaskId) -> Result<Task>;
     fn add_dependency(&mut self, task_id: TaskId, predecessor_id: TaskId) -> Result<()>;
     fn remove_dependency(&mut self, task_id: TaskId, predecessor_id: TaskId) -> Result<()>;
     /// Make a draft or ready task wait until `goal_id` is closed as achieved

@@ -4,8 +4,8 @@ type: design
 title: Supervisor and workspace lifecycle
 status: current
 created: 2026-09-21
-updated: 2026-09-25
-last_verified: 2026-09-25
+updated: 2026-09-26
+last_verified: 2026-09-26
 scope: runtime
 related:
   - adr-0041
@@ -641,6 +641,7 @@ attentionイベントの判定は`domain::event_attention(kind, payload)`（候�
 - **`workspace_check`**: `{status: "checked", workspaces}`か`{status: "unavailable", reason}`。`dagq stats`は`--cmux`（既定`cmux`をPATHで探す）で、observerはPATHの`cmux`でlistし、cmuxが無いかlistが失敗したときは`workspace_mismatch`だけを判定せず、他のalertは返す。`stats`自体は失敗しない。
 - **`stall_config`**: 判定に使った閾値3つと`source`（[Stall thresholds](#stall-thresholds)）。
 - **`reason_codes`**: `{count, by_code, by_kind}`（ADR-0034の決定1、task 195）。`backend_failures`と同じwindowと`--goal`の絞り込みで、payloadに`code`を持つイベントの件数、コードごとの件数、kindごと・コードごとの件数。`validation_finished`に添える`evidence_missing` / `scope_violation`のイベントと、失敗した工程のイベントに添える`backend_call_failed`（`backend_failures`が数える）は同じ失敗を2回数えないよう除く。コードの無い古いイベントは数えない（[domain-model](domain-model.md#理由の分類コードcode)）
+- **`duplicate_cancels`**: `{count, tasks: [{task_id, duplicate_of}]}`（[ADR-0046](../adr/0046-full-text-search-related-and-duplicate-of.md)の決定5）。`backend_failures`と同じwindowと`--goal`の絞り込みで、`duplicate_of`を持つ`task_status_changed`（`cancel --duplicate-of`）の件数と、イベント順のtaskと重複先
 
 ### `doctor`
 

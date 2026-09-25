@@ -571,11 +571,17 @@ impl TaskStore for SqliteQueue {
                         })
                     })
                     .optional()?;
+                let duplicate_of = if task.status() == TaskStatus::Canceled {
+                    duplicate_target(&tx, task.id())?
+                } else {
+                    None
+                };
                 Ok(TaskListItem::new(
                     task,
                     dependencies,
                     goal_dependencies,
                     latest_run,
+                    duplicate_of,
                     query.full,
                 ))
             })
@@ -607,11 +613,15 @@ impl TaskStore for SqliteQueue {
             .query_map([task_id], event_row)?
             .collect::<rusqlite::Result<_>>()?;
         let processes = super::runtime_store::processes_for_task(&tx, task_id)?;
+        let duplicate_of = duplicate_target(&tx, task_id)?;
+        let duplicates = duplicates_of(&tx, task_id)?;
         tx.commit()?;
         Ok(TaskDetail {
             task,
             dependencies,
             goal_dependencies,
+            duplicate_of,
+            duplicates,
             runs,
             events,
             processes,
@@ -623,6 +633,20 @@ impl TaskStore for SqliteQueue {
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let result = transition_task(&tx, task_id, action, &self.generators.clock.timestamp())?;
+        tx.commit()?;
+        Ok(result)
+    }
+
+    fn cancel_duplicate(&mut self, task_id: TaskId, duplicate_of: TaskId) -> Result<Task> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let result = cancel_as_duplicate(
+            &tx,
+            task_id,
+            duplicate_of,
+            &self.generators.clock.timestamp(),
+        )?;
         tx.commit()?;
         Ok(result)
     }
@@ -1591,6 +1615,88 @@ pub(super) fn transition_task(
     action: TaskAction,
     now: &str,
 ) -> Result<Task> {
+    apply_transition(conn, task_id, action, now, None)
+}
+
+/// Cancel `task_id` as a duplicate of `duplicate_of` inside the caller's
+/// transaction (ADR-0046 decision 5), recording `duplicate_of` in the
+/// payload of its `task_status_changed`: what `cancel --duplicate-of` does,
+/// and what plan review and the follow-up triage share to close a
+/// duplicate. The target must be another task that exists and is not
+/// canceled; a completed one means the task was already implemented there.
+/// A target canceled as a duplicate itself is refused with its own target,
+/// so the records never chain nor loop.
+pub(super) fn cancel_as_duplicate(
+    conn: &Connection,
+    task_id: TaskId,
+    duplicate_of: TaskId,
+    now: &str,
+) -> Result<Task> {
+    ensure!(
+        task_id != duplicate_of,
+        "task {task_id} cannot be a duplicate of itself"
+    );
+    let target = read_task(conn, duplicate_of)?;
+    if target.status() == TaskStatus::Canceled {
+        match duplicate_target(conn, duplicate_of)? {
+            Some(original) => anyhow::bail!(
+                "task {duplicate_of} is canceled as a duplicate of task {original}; pass --duplicate-of {original}"
+            ),
+            None => anyhow::bail!(
+                "task {duplicate_of} is canceled; a duplicate needs a task that is not"
+            ),
+        }
+    }
+    apply_transition(conn, task_id, TaskAction::Cancel, now, Some(duplicate_of))
+}
+
+/// The task `task_id` was canceled as a duplicate of (ADR-0046 decision 5):
+/// the `duplicate_of` of its latest `task_status_changed`, while that event
+/// canceled it.
+pub(super) fn duplicate_target(conn: &Connection, task_id: TaskId) -> Result<Option<TaskId>> {
+    Ok(conn
+        .query_row(
+            "SELECT json_extract(payload,'$.to'), json_extract(payload,'$.duplicate_of')
+             FROM run_events WHERE task_id=?1 AND kind='task_status_changed'
+             ORDER BY id DESC LIMIT 1",
+            [task_id],
+            |r| Ok((r.get::<_, Option<String>>(0)?, r.get::<_, Option<i64>>(1)?)),
+        )
+        .optional()?
+        .and_then(|(to, target)| {
+            (to.as_deref() == Some(TaskStatus::Canceled.as_str()))
+                .then_some(target)
+                .flatten()
+        })
+        .map(TaskId::new))
+}
+
+/// The canceled tasks recorded as duplicates of `task_id`, ascending.
+fn duplicates_of(conn: &Connection, task_id: TaskId) -> Result<Vec<TaskId>> {
+    let candidates: Vec<TaskId> = conn
+        .prepare(
+            "SELECT DISTINCT e.task_id FROM run_events e JOIN tasks t ON t.id=e.task_id
+             WHERE e.kind='task_status_changed' AND t.status='canceled'
+             AND json_extract(e.payload,'$.duplicate_of')=?1 ORDER BY e.task_id",
+        )?
+        .query_map([task_id], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    let mut duplicates = Vec::with_capacity(candidates.len());
+    for candidate in candidates {
+        if duplicate_target(conn, candidate)? == Some(task_id) {
+            duplicates.push(candidate);
+        }
+    }
+    Ok(duplicates)
+}
+
+fn apply_transition(
+    conn: &Connection,
+    task_id: TaskId,
+    action: TaskAction,
+    now: &str,
+    duplicate_of: Option<TaskId>,
+) -> Result<Task> {
     let task = read_task(conn, task_id)?;
     let from = task.status();
     let task = task::transition(task, action, has_unfinished_run(conn, task_id)?)?;
@@ -1611,7 +1717,10 @@ pub(super) fn transition_task(
         task_id,
         None,
         "task_status_changed",
-        json!({"from": from, "to": task.status()}),
+        match duplicate_of {
+            Some(target) => json!({"from": from, "to": task.status(), "duplicate_of": target}),
+            None => json!({"from": from, "to": task.status()}),
+        },
     )?;
     // A person skipped plan review (ADR-0041 decision 8).
     if action == TaskAction::BypassReview {

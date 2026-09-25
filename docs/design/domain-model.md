@@ -4,8 +4,8 @@ type: design
 title: Domain model
 status: current
 created: 2026-09-21
-updated: 2026-09-25
-last_verified: 2026-09-25
+updated: 2026-09-26
+last_verified: 2026-09-26
 scope: domain
 related:
   - adr-0046
@@ -59,6 +59,7 @@ related:
   - `BypassReview`（`draft / submitted → ready`）: 人の`ready --bypass-review`。`task_status_changed`に加えて`review_bypassed`（`from`）を記録する。
   - `Ready`: 失敗・中断したrunだけを持つ`in_progress`のtaskを`ready`に戻す再試行（triageの`retry`、人の`ready`）。中身が変わらないのでplan reviewを通さない。`draft`と`submitted`には`ReadyNeedsPlanReview`で拒否する（bypassの無い`ready`はどのroleから打たれても通らない）。
   - `Draft`（`ready / submitted → draft`）、`Cancel`（`draft / submitted / ready → canceled`）: 手動。
+  - `cancel TASK --duplicate-of X`（[ADR-0046](../adr/0046-full-text-search-related-and-duplicate-of.md)の決定5、`TaskStore::cancel_duplicate`）は`Cancel`と同じ遷移で、`task_status_changed`のpayloadに`duplicate_of`（X）を書く。Xは存在し、TASKと違い、`canceled`でないこと（`completed`なら「Xで実装済み」）。Xが重複としてcancelされていれば、その重複先を示して拒否する。重複先は`canceled`でないので、記録が連鎖も循環もしない。`show`は`duplicate_of`（TASKの重複先、無ければnull）と`duplicates`（TASKを重複先とするcanceledのtask、昇順）を、`list`はcancelされたtaskの行に`duplicate_of`を出す。
   - supervisorは`submitted`のtaskをclaimしない（`READY_QUERY`は`ready`だけを見る）。`list`の既定（未完了）、`graph`、goalの件数（`TaskStatusCounts.submitted`）は`submitted`を含み、`goal close --verdict achieved`は`submitted`のtaskが残っていれば拒否する。
   - migration 0021は既存のtaskのstatusを変えない。既存のdraftはdraftのまま残り、submitしない限りreadyにならない。
 - `submit [TASK...] [--goal GOAL...] [--proposal ID]`は、与えたdraftのtaskと、与えたgoal（閉じていないもの）とそのdraftのtaskを1つのproposalにしてsubmitする（`TaskStore::submit`、入力は`Submission`）。memberのtaskは`submitted`になり、`task_status_changed`と`task_submitted`（`proposal_id`）を、goalは`goal_submitted`を記録する。持ち主はsubmitしたsessionの`CMUX_WORKSPACE_ID`（無ければnull）と`DAGQ_PLANNER_ORIGIN`（`person` | `runtime`、無ければ`person`）。draftが1件も無ければ`EmptyProposal`、draftでないtaskは`TransitionNotAllowed`（`cannot apply Submit to task in ready state`）、他のactiveなproposalのmemberは`TaskInOtherProposal` / `GoalInOtherProposal`で拒否する。`--proposal ID`は差し戻された（`revising`の）proposalを出し直し、それが持つdraftのtaskと新しく与えたものをsubmitする（持ち主はsubmitしたsessionに替わる。`revising`でなければ`ProposalNotInStatus`）。`submit`は機械的な検査（`lint`）をまだ行わない。observerとreviewerの環境からは拒否する。

@@ -4,8 +4,8 @@ type: design
 title: SQLite persistence
 status: current
 created: 2026-09-21
-updated: 2026-09-25
-last_verified: 2026-09-25
+updated: 2026-09-26
+last_verified: 2026-09-26
 scope: persistence
 related:
   - adr-0041
@@ -70,6 +70,7 @@ planners             -- 0023: plannerのsession 1つに1行（origin、proposal_
 - `approve_proposal`（plan reviewの経路）: `proposal::accept`、memberの`submitted`のtaskを`TaskAction::Approve`で`ready`に、draftで閉じていないmemberのgoalを`goal::ready`で`open`にして`goal_status_changed`を記録する。`send_back_proposal`: `proposal::send_back`（`revising`、`revise_count`+1）、memberの`submitted`のtaskを`draft`に戻す。
 - `proposals(all)`はactive（`submitted` / `revising`）なもの（`all`なら全部）を`submitted_at, id`の順に、`show_proposal`は1件を、memberのtask / goal IDの昇順とともに返す。`status`は`proposals(false)`を`proposals`に載せる。
 - bypassの`ready`（`TaskAction::BypassReview`）は`transition_task`が`task_status_changed`に続けて`review_bypassed`（`from`）を書く。
+- 重複としてのcancel（[ADR-0046](../adr/0046-full-text-search-related-and-duplicate-of.md)の決定5）はschemaを変えない。`cancel_as_duplicate`（`src/infrastructure/sqlite.rs`、呼び出し側のトランザクションの中で動く）が重複先を検査して`TaskAction::Cancel`を適用し、`task_status_changed`のpayloadに`duplicate_of`を足す。plan reviewやfollow-upのtriageが重複を閉じるときも同じ関数を使う。読み出しは、taskの最新の`task_status_changed`が`to: canceled`で`duplicate_of`を持てばそれ（`duplicate_target`）、逆向きは`duplicate_of`がそのtaskを指すcanceledのtask（`duplicates_of`）。
 
 `tasks.follow_up_depth`（0022、ADR-0037の決定6）は人の判断を経ずに続いたfollow-upの段数（`INTEGER NOT NULL DEFAULT 0`）。domainの`Task`には載せず、storeの`follow_up_depth` / `set_follow_up_depth`が読み書きする。`integrate`の`register_follow_ups`はdraftに元のtaskの値+1を書き、`transition_task`は`TaskAction::BypassReview`（`ready --bypass-review`）で0に戻す（人の判断。adoptはその後にdraftの深さを書く）。migrationは既存のtaskを0にし、`follow_up_registered`の`task_id`が指すtaskのうちまだ`draft`のものを1にする。
 
