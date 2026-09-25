@@ -23,7 +23,8 @@ use crate::domain::{
 };
 
 pub use crate::application::{
-    EndedRunWorkspace, Landing, LeasedRun, ResumeCandidate, TRIAGE_ASKER, TriageAction, Validation,
+    EndedRunWorkspace, EndedRunWorktree, Landing, LeasedRun, ResumeCandidate, TRIAGE_ASKER,
+    TriageAction, Validation,
 };
 pub use crate::domain::{HEARTBEAT_TIMEOUT_SECS, RunPlan};
 
@@ -1989,6 +1990,39 @@ impl SqliteQueue {
         Ok(workspaces)
     }
 
+    /// The worktrees of the runs nobody leases that ended (`integrated`,
+    /// `succeeded`, `failed`, `interrupted`), or of any status once their
+    /// task is `completed` or `canceled`, by run; each is where the run's
+    /// worktree lives under the run directory, whether or not it is still
+    /// there.
+    pub fn ended_run_worktrees(&self) -> Result<Vec<EndedRunWorktree>> {
+        let mut statement = self.conn.prepare(
+            "SELECT r.id, r.task_id, r.status AS run_status, t.status AS task_status, r.branch
+             FROM task_runs r
+             JOIN tasks t ON t.id=r.task_id
+             WHERE r.worktree_path IS NOT NULL
+             AND (r.status IN ('integrated','succeeded','failed','interrupted')
+                  OR t.status IN ('completed','canceled'))
+             AND NOT EXISTS (SELECT 1 FROM run_leases l WHERE l.run_id=r.id)
+             ORDER BY r.rowid",
+        )?;
+        let rows = statement.query_map([], |row| {
+            let run_id: RunId = row.get(0)?;
+            Ok(EndedRunWorktree {
+                worktree: RunPaths::new(&self.runs_dir, &run_id)
+                    .worktree
+                    .to_string_lossy()
+                    .into_owned(),
+                run_id,
+                task_id: row.get(1)?,
+                status: enum_col(row, "run_status")?,
+                task_status: enum_col(row, "task_status")?,
+                branch: row.get(4)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
     /// Apply the answer of a triage's `decide` ask to its `failed` or
     /// `interrupted` run that nobody leases and that is still its task's
     /// latest run, and close the ask, in one transaction (an ask closed
@@ -2622,6 +2656,9 @@ impl RunStore for SqliteQueue {
     }
     fn ended_run_workspaces(&self) -> Result<Vec<EndedRunWorkspace>> {
         SqliteQueue::ended_run_workspaces(self)
+    }
+    fn ended_run_worktrees(&self) -> Result<Vec<EndedRunWorktree>> {
+        SqliteQueue::ended_run_worktrees(self)
     }
     fn decide_triage(
         &mut self,

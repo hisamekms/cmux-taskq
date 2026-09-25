@@ -102,7 +102,8 @@ impl Supervisor<'_> {
             let reason = format!("{reason} (a person chose {answer} in ask {})", ask.id);
             match self.queue.decide_triage(run.id(), ask.id, &answer, &reason) {
                 Ok(decided) => {
-                    info!(run_id = %decided.id(), task_id = %decided.task_id(), ask_id = %ask.id, "run {} of task {}: {answer} as ask {} answered; the run is {}", decided.id(), decided.task_id(), ask.id, decided.status().as_str())
+                    info!(run_id = %decided.id(), task_id = %decided.task_id(), ask_id = %ask.id, "run {} of task {}: {answer} as ask {} answered; the run is {}", decided.id(), decided.task_id(), ask.id, decided.status().as_str());
+                    self.clean_task_worktrees(decided.task_id());
                 }
                 Err(error) => {
                     warn!(run_id = %run.id(), ask_id = %ask.id, error = %format_args!("{error:#}"), "run {}: the answer {answer:?} of ask {} could not be applied: {error:#}", run.id(), ask.id)
@@ -366,6 +367,7 @@ impl Supervisor<'_> {
         }
     }
     pub(super) fn note_triaged(&mut self, run: &TaskRun) {
+        self.clean_task_worktrees(run.task_id());
         let task = self
             .queue
             .show(run.task_id())

@@ -540,6 +540,7 @@ impl Supervisor<'_> {
                 self.queue.transition(run.task_id(), TaskAction::Cancel)?;
                 self.queue.close_ask(ask_id)?;
                 info!(run_id = %run.id(), task_id = %run.task_id(), "run {} failed and task {} was canceled by ask {ask_id}", run.id(), run.task_id());
+                self.clean_task_worktrees(run.task_id());
             }
         }
         Ok(())

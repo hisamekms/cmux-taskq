@@ -84,6 +84,12 @@ impl RunFiles for MemoryFiles {
     fn remove_file(&self, _: &Path) -> io::Result<()> {
         unimplemented!("no test removes a run file")
     }
+    fn tree_size(&self, _: &Path) -> io::Result<Option<u64>> {
+        Ok(None)
+    }
+    fn remove_dir_all(&self, _: &Path) -> io::Result<()> {
+        unimplemented!("no test removes a run directory")
+    }
     fn append_line(&self, _: &Path, _: &str) -> io::Result<()> {
         unimplemented!("no test appends to a run file")
     }

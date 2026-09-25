@@ -1,8 +1,10 @@
 //! The run directory on the local file system ([`RunFiles`]).
 
 use std::{
+    collections::HashSet,
     fs,
     io::{self, BufWriter, Read, Write},
+    os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
     time::SystemTime,
 };
@@ -66,6 +68,37 @@ impl RunFiles for LocalRunFiles {
     }
     fn remove_file(&self, path: &Path) -> io::Result<()> {
         fs::remove_file(path)
+    }
+    fn tree_size(&self, dir: &Path) -> io::Result<Option<u64>> {
+        match fs::symlink_metadata(dir) {
+            Ok(metadata) if metadata.is_dir() => {}
+            Ok(_) => return Ok(None),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        }
+        let mut seen = HashSet::new();
+        let mut bytes = 0;
+        let mut pending = vec![dir.to_owned()];
+        while let Some(path) = pending.pop() {
+            let metadata = match fs::symlink_metadata(&path) {
+                Ok(metadata) => metadata,
+                // Gone meanwhile: nothing to count.
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error),
+            };
+            if seen.insert((metadata.dev(), metadata.ino())) {
+                bytes += metadata.blocks() * 512;
+            }
+            if metadata.is_dir() {
+                for entry in fs::read_dir(&path)? {
+                    pending.push(entry?.path());
+                }
+            }
+        }
+        Ok(Some(bytes))
+    }
+    fn remove_dir_all(&self, dir: &Path) -> io::Result<()> {
+        fs::remove_dir_all(dir)
     }
     fn append_line(&self, path: &Path, line: &str) -> io::Result<()> {
         let mut file = fs::OpenOptions::new()

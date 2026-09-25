@@ -586,9 +586,9 @@ impl Supervisor<'_> {
         if self.slots.len() < parallel {
             self.triage_runs(parallel)?;
         }
-        // Takes no slot: only closes what ended runs left open.
-        if let Err(error) = self.sweep_ended_workspaces(sweep_interval) {
-            warn!(error = %format_args!("{error:#}"), "the workspaces of ended runs could not all be swept: {error:#}");
+        // Takes no slot: only closes and frees what ended runs left.
+        if let Err(error) = self.sweep_ended_runs(sweep_interval) {
+            warn!(error = %format_args!("{error:#}"), "the workspaces and worktrees of ended runs could not all be swept: {error:#}");
         }
         while self.slots.len() < parallel {
             // Highest effective priority, then most-releasing, then lowest
@@ -649,6 +649,7 @@ impl Supervisor<'_> {
                     {
                         warn!(run_id = %run.id(), error = %format_args!("{error:#}"), "run {}: its workspaces could not all be closed: {error:#}", run.id());
                     }
+                    self.clean_task_worktrees(run.task_id());
                     self.finished.push(*run);
                 }
                 Ok(Step::Triaged(run)) => self.note_triaged(&run),

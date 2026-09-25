@@ -1170,6 +1170,9 @@ mod tests {
         fn repair_worktree(&self, _: &Path) -> Result<()> {
             unimplemented!()
         }
+        fn tracks(&self, _: &Path, _: &str) -> Result<bool> {
+            unimplemented!()
+        }
         fn remove_worktree_and_branch(&self, _: &Path, _: &str) -> Result<()> {
             unimplemented!()
         }

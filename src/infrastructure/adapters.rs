@@ -807,8 +807,9 @@ impl GitRepository {
         Ok(())
     }
 
-    /// Remove a landed run's worktree and branch. Administered from the
-    /// main working tree, since `root` may be the worktree being removed.
+    /// Remove a run's worktree and branch. Administered from the main
+    /// working tree, since `root` may be the worktree being removed. A
+    /// branch already gone is left at that.
     pub fn remove_worktree_and_branch(&self, worktree: &Path, branch: &str) -> Result<()> {
         let primary = self.primary_worktree()?;
         output(
@@ -818,13 +819,35 @@ impl GitRepository {
                 .args(["worktree", "remove", "--force"])
                 .arg(worktree),
         )?;
-        output(
+        let reference = format!("refs/heads/{}", branch.trim_start_matches("refs/heads/"));
+        let (status, _, _) = capture(
             Command::new(&self.git)
                 .arg("-C")
                 .arg(&primary)
-                .args(["branch", "-D", branch]),
+                .args(["show-ref", "--verify", "--quiet", &reference]),
+            OUTPUT_TIMEOUT,
         )?;
+        if status.success() {
+            output(
+                Command::new(&self.git)
+                    .arg("-C")
+                    .arg(&primary)
+                    .args(["branch", "-D", branch]),
+            )?;
+        }
         Ok(())
+    }
+
+    /// Whether Git tracks any file at or under `path` in `worktree`.
+    pub fn tracks(&self, worktree: &Path, path: &str) -> Result<bool> {
+        let listed = output(
+            Command::new(&self.git)
+                .arg("-C")
+                .arg(worktree)
+                .args(["ls-files", "--"])
+                .arg(path),
+        )?;
+        Ok(!listed.trim().is_empty())
     }
 }
 
@@ -884,6 +907,9 @@ impl Repository for GitRepository {
     }
     fn remove_worktree_and_branch(&self, worktree: &Path, branch: &str) -> Result<()> {
         GitRepository::remove_worktree_and_branch(self, worktree, branch)
+    }
+    fn tracks(&self, worktree: &Path, path: &str) -> Result<bool> {
+        GitRepository::tracks(self, worktree, path)
     }
     fn main_checkout(&self) -> Result<Option<PathBuf>> {
         GitRepository::main_checkout(self)

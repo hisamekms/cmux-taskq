@@ -21,7 +21,7 @@ use crate::domain::{
     PlanReviewCandidate, PlanReviewDecision, PlanReviewVerdict, PlannerId, PlannerOrigin,
     PlannerSession, Predecessor, Priority, Proposal, ProposalId, Reason, ReasonCode, RunEvent,
     RunId, RunLease, RunPlan, RunProcess, RunStatus, SessionRole, Submission, SupervisorMode,
-    SupervisorRegistration, Task, TaskAction, TaskDetail, TaskEdit, TaskId, TaskRun,
+    SupervisorRegistration, Task, TaskAction, TaskDetail, TaskEdit, TaskId, TaskRun, TaskStatus,
 };
 
 pub trait TaskStore {
@@ -257,6 +257,12 @@ pub trait RunFiles: Send + Sync {
     fn read_dir(&self, dir: &Path) -> io::Result<Vec<PathBuf>>;
     fn rename(&self, from: &Path, to: &Path) -> io::Result<()>;
     fn remove_file(&self, path: &Path) -> io::Result<()>;
+    /// The bytes the directory `dir` takes on disk, each file counted once
+    /// however many links it has, without following links; `None` when
+    /// `dir` is not a directory (missing, a file or a link).
+    fn tree_size(&self, dir: &Path) -> io::Result<Option<u64>>;
+    /// Remove the directory `dir` and everything under it.
+    fn remove_dir_all(&self, dir: &Path) -> io::Result<()>;
     /// Append `line` and a newline to `path`, creating it if missing.
     fn append_line(&self, path: &Path, line: &str) -> io::Result<()>;
     /// The absolute path with every link resolved; an error when it does
@@ -711,6 +717,19 @@ pub struct EndedRunWorkspace {
     pub workspace_id: String,
 }
 
+/// The worktree of a run that nobody leases and that either ended or
+/// belongs to a task that is over, for the supervisor's clean-up of the
+/// disk (task 376).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EndedRunWorktree {
+    pub run_id: RunId,
+    pub task_id: TaskId,
+    pub status: RunStatus,
+    pub task_status: TaskStatus,
+    pub worktree: String,
+    pub branch: Option<String>,
+}
+
 /// A `needs_session` run as the supervisor judges it for a resume.
 #[derive(Debug, Clone)]
 pub struct ResumeCandidate {
@@ -937,6 +956,9 @@ pub trait RunStore {
     /// The workspaces of the ended runs the triage does not take, for the
     /// supervisor's sweep.
     fn ended_run_workspaces(&self) -> Result<Vec<EndedRunWorkspace>>;
+    /// The worktrees of the runs nobody leases that ended or whose task is
+    /// `completed` / `canceled`, for the supervisor's clean-up of the disk.
+    fn ended_run_worktrees(&self) -> Result<Vec<EndedRunWorktree>>;
     /// Apply a person's answer to the triage's `decide` ask.
     fn decide_triage(
         &mut self,
@@ -1361,7 +1383,12 @@ pub trait Repository {
     fn advance_main(&self, from: &str, to: &str) -> Result<()>;
     /// Point the repository's record of a moved worktree at it again.
     fn repair_worktree(&self, worktree: &Path) -> Result<()>;
+    /// Remove the worktree and its branch; a branch already gone is not
+    /// an error.
     fn remove_worktree_and_branch(&self, worktree: &Path, branch: &str) -> Result<()>;
+    /// Whether Git tracks any file at or under `path` (relative to the
+    /// worktree) in `worktree`.
+    fn tracks(&self, worktree: &Path, path: &str) -> Result<bool>;
     /// The worktree that has `main` checked out, if any.
     fn main_checkout(&self) -> Result<Option<std::path::PathBuf>>;
     /// Add the run's worktree on its new branch from its base commit; Git's
