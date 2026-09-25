@@ -2724,6 +2724,38 @@ fn a_withdrawn_proposal_releases_its_goals_and_tasks_as_drafts() {
     assert!(queue.withdraw_proposal(ProposalId::new(9)).is_err());
 }
 
+/// A goal abandoned while its task waits for plan review keeps the task
+/// out of `ready`: approving the proposal returns it to draft instead, so
+/// it is never claimed.
+#[test]
+fn approving_a_proposal_withholds_the_tasks_of_a_closed_goal() {
+    let (_dir, mut queue) = fixture();
+    let goal = queue.add_goal(new_goal("dropped")).unwrap().id();
+    let mut in_goal = new_task("in goal");
+    in_goal.goal_id = Some(goal);
+    let a = queue.add(in_goal).unwrap().id();
+    let b = queue.add(new_task("alone")).unwrap().id();
+    let proposal = queue.submit(submission(&[a, b], &[], None)).unwrap();
+    queue.close_goal(goal, GoalVerdict::Abandoned).unwrap();
+
+    let accepted = queue.approve_proposal(proposal.id()).unwrap();
+    assert_eq!(accepted.status(), ProposalStatus::Accepted);
+    assert_eq!(status_of(&mut queue, a), TaskStatus::Draft);
+    assert_eq!(status_of(&mut queue, b), TaskStatus::Ready);
+    let ready: Vec<TaskId> = queue
+        .candidates()
+        .unwrap()
+        .iter()
+        .map(|task| task.id())
+        .collect();
+    assert_eq!(ready, [b]);
+    assert!(queue.show(a).unwrap().events.iter().any(|e| {
+        e.kind == "approve_withheld"
+            && e.payload
+                == serde_json::json!({"proposal_id": 1, "goal_id": goal, "verdict": "abandoned"})
+    }));
+}
+
 #[test]
 fn submit_needs_a_draft_task_and_an_open_goal() {
     let (_dir, mut queue) = fixture();

@@ -154,13 +154,31 @@ pub(super) fn submit(conn: &Connection, submission: Submission, now: &str) -> Re
 
 /// The plan-review path to `ready` (ADR-0041 decisions 8, 11): the
 /// proposal is accepted, its submitted tasks become ready and its draft
-/// goals open, in the caller's transaction.
+/// goals open, in the caller's transaction. A submitted task whose goal was
+/// closed meanwhile (`abandoned` leaves unstarted tasks as they are) does
+/// not become ready: it returns to `draft`, recording `approve_withheld`,
+/// so a closed goal's task is never claimed.
 pub(super) fn approve(conn: &Connection, id: ProposalId, now: &str) -> Result<Proposal> {
     let accepted = proposal::accept(read(conn, id)?, now.into())?;
     save(conn, &accepted)?;
     for &task_id in accepted.task_ids() {
-        if status(conn, task_id)? == TaskStatus::Submitted {
-            transition_task(conn, task_id, TaskAction::Approve, now)?;
+        if status(conn, task_id)? != TaskStatus::Submitted {
+            continue;
+        }
+        match closed_goal(conn, task_id)? {
+            Some((goal_id, verdict)) => {
+                transition_task(conn, task_id, TaskAction::Draft, now)?;
+                event(
+                    conn,
+                    task_id,
+                    None,
+                    "approve_withheld",
+                    json!({"proposal_id": id, "goal_id": goal_id, "verdict": verdict}),
+                )?;
+            }
+            None => {
+                transition_task(conn, task_id, TaskAction::Approve, now)?;
+            }
         }
     }
     for &goal_id in accepted.goal_ids() {
@@ -180,6 +198,18 @@ pub(super) fn approve(conn: &Connection, id: ProposalId, now: &str) -> Result<Pr
         }
     }
     read(conn, id)
+}
+
+/// The task's goal and its verdict when that goal is closed.
+fn closed_goal(conn: &Connection, task_id: TaskId) -> Result<Option<(i64, String)>> {
+    Ok(conn
+        .query_row(
+            "SELECT g.id, g.verdict FROM tasks t JOIN goals g ON g.id = t.goal_id
+             WHERE t.id=?1 AND g.closed_at IS NOT NULL",
+            [task_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?)
 }
 
 /// Plan review sent the proposal back to its planner (ADR-0041 decision
