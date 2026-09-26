@@ -328,7 +328,8 @@ pub fn status(
 /// `waiting` (`count` of `limit`, with the `returning` among them), and the
 /// runs that wait for a person or for a slot to go back to (ADR-0071
 /// decision 12), from the leases and the run events. `used` counts the
-/// leased runs that are not integrating and do not wait; `count` is what
+/// leased runs that do not wait, landing ones included, as the supervisor
+/// counts its slots (ADR-t610-1); `count` is what
 /// `--max-waiting` bounds (ADR-0071 (f2)): the runs that wait and those
 /// that wait to go back (`state: returning` in `waiting`). A supervisor that holds its claims
 /// has `claim_hold`: its latest `claim_held` payload and `since` (task
@@ -348,9 +349,7 @@ fn slots_and_waits(
         let run = queue.run(&lease.run_id)?;
         let entry = counts.entry(lease.token.as_str()).or_default();
         let Some(state) = WaitState::of(&queue.run_events(run.id())?) else {
-            if run.status() != RunStatus::Integrating {
-                entry.0 += 1;
-            }
+            entry.0 += 1;
             continue;
         };
         let since = state.since_ms.div_euclid(1000);

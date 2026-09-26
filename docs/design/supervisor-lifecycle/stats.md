@@ -21,6 +21,7 @@ related:
   - adr-0046
   - adr-0044
   - design-domain-model
+  - adr-t610-1
 ---
 
 # `stats`
@@ -54,7 +55,7 @@ related:
   - `ask_unanswered`: `ask_opened`から60分答えられていないask（ADR-0022。`ask_answered`とはpayloadの`ask_id`（無ければ`id`）とrun・taskで対にする）
   - `task_failed`: 同じtaskのrunの`failed`が合わせて2回。回数はpageに関係なく全runで数え、`run_id`はその最後に失敗したrunで、そのrunが対象に入るときに出す（`--since`で2回目だけが新しくても出る）
   - `work_over_median`: `work`がそのgoal（goalの無いrunはgoalの無いrun同士）の中央値の2倍を超えたrun
-  - `idle_slots`: staleでないsupervisorの`parallel`の合計から実行中（`integrating`以外の未完了で、人の答えを待つ・slotへ戻るのを待つrunを除く。[ADR-0062](../../adr/0062-runs-waiting-for-a-person-leave-the-slot.md)の決定13）runを引いた空きslotがあるのに、candidatesがゼロで`ready`のtaskが残っている（依存で詰まっている）。`value`は空きslot数で、`task_id` / `run_id`はnull。readyのtaskが無い空のqueueは詰まりではないので出さない。draftのgoalに属するreadyのtaskは`goal ready`を待っているだけなので数えない。`stats`を読んだ時点のsnapshotで判定し、時間帯の履歴は持たない
+  - `idle_slots`: staleでないsupervisorの`parallel`の合計から実行中（`integrating`以外の未完了のrunと、登録されたsupervisorのtokenのleaseを持つrun（`integrating`、reviewや着地の順番を待つ`awaiting_integration`、resume中の`needs_session`などstatusを問わない）の和から、人の答えを待つ・slotへ戻るのを待つrunを除いたもの。登録の無いtokenのlease（人が手で打った`integrate`など）で着地中のrunは数えない。登録されたsupervisorについてはその`used_slots()`と同じ集合。[ADR-0071](../../adr/0071-runs-waiting-in-revise-and-resume-leave-the-slot.md)の決定13、[ADR-t610-1](../../adr/2026-09-27-t610-1-landing-runs-fill-the-slot-in-status-and-stats.md)）runを引いた空きslotがあるのに、candidatesがゼロで`ready`のtaskが残っている（依存で詰まっている）。`value`は空きslot数で、`task_id` / `run_id`はnull。readyのtaskが無い空のqueueは詰まりではないので出さない。draftのgoalに属するreadyのtaskは`goal ready`を待っているだけなので数えない。`stats`を読んだ時点のsnapshotで判定し、時間帯の履歴は持たない
   - `claim_held`: supervisorがclaimを控えている（`claim_holds.held`がある）間に空きslotがある。`value`は空きslot数（`idle_slots`と同じ数え方）で、`task_id` / `run_id`はnull。これが出るときは`idle_slots`を出さない（[claimを控える](claim-hold.md)。task 327）
   - `claim_deferred`: `claim_held`が出ていないときに、空きslotがあり、衝突の多いファイルでclaimを控えているtask（`claim_deferrals.deferred`）がある。`value`は控えているtaskの数、`task_id` / `run_id`はnull。これが出るときは`idle_slots`を出さない（[claimを控える（衝突の多いファイル）](claim-defer.md)。ADR-0069）
   - `backend_failures`: 同じwindowの`backend_call_failed`が2件以上。`value`は件数、`task_id` / `run_id`はnull

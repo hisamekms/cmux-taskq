@@ -4,8 +4,8 @@ type: design
 title: "人の答えを待つrun（slotの外の待ち）"
 status: current
 created: 2026-09-26
-updated: 2026-09-26
-last_verified: 2026-09-26
+updated: 2026-09-27
+last_verified: 2026-09-27
 scope: runtime
 related:
   - design-supervisor-lifecycle
@@ -20,6 +20,7 @@ related:
   - adr-0039
   - adr-0045
   - design-persistence
+  - adr-t610-1
 ---
 
 # 人の答えを待つrun（slotの外の待ち）
@@ -28,7 +29,7 @@ related:
 
 ## 待ちの出入り
 
-- **印**: `Slot`は`waiting: Option<Waiting>`を持つ。`Waiting`は待ちが持つaskのIDとkind、始めた時刻（queueの時計）、sessionが動いたかを比べる基準の時刻（最初のaskを開いた秒の次の秒と待ちを始めた時刻の早い方。askの時刻は秒なので、askと同じ秒のmarkerは古いとみなす。run filesの時計）、画面を最後に読んだ時刻、終わった時刻と理由（戻り待ち）。runのstatusとphase（`SessionWatch` / `ExitWatch` / `ReviseWatch` / `ResumeWatch`）は変えないので、戻ればphaseの続きから進む（`Revise` / `Resume`の段の計時だけは戻るときにやり直す。下の「段の計時」）。`used_slots()`は印の無いslotの数で、`fill_slots`・adopt・landingの答え・resume・triage・claimの空きの判定はこれを使う。待ちのrunも`slots`に居るので、ループはそれが残っていれば続く（drainも待つ）。
+- **印**: `Slot`は`waiting: Option<Waiting>`を持つ。`Waiting`は待ちが持つaskのIDとkind、始めた時刻（queueの時計）、sessionが動いたかを比べる基準の時刻（最初のaskを開いた秒の次の秒と待ちを始めた時刻の早い方。askの時刻は秒なので、askと同じ秒のmarkerは古いとみなす。run filesの時計）、画面を最後に読んだ時刻、終わった時刻と理由（戻り待ち）。runのstatusとphase（`SessionWatch` / `ExitWatch` / `ReviseWatch` / `ResumeWatch`）は変えないので、戻ればphaseの続きから進む（`Revise` / `Resume`の段の計時だけは戻るときにやり直す。下の「段の計時」）。`used_slots()`は印の無いslotの数（着地中のrunも数える）で、`fill_slots`・adopt・landingの答え・resume・triage・claimの空きの判定はこれを使う。`status`の`slots.used`と`stats`の`idle_slots`も同じ集合で数える（[ADR-t610-1](../../adr/2026-09-27-t610-1-landing-runs-fill-the-slot-in-status-and-stats.md)）。待ちのrunも`slots`に居るので、ループはそれが残っていれば続く（drainも待つ）。
 - **始める**（`start_waits`、tickの先頭。`tick(true)`の引き継ぎ待ちでは行わない）: 印の無いslotのうち、phaseが`Session`で`/exit`を送っておらずwrapperが黙っておらず復旧jobが走っていないもの、`Exiting`でsessionを持つもの、`Revise`でwrapperが黙っておらず（`live.silent`）復旧jobが走っていないもの、または`Resume`で`/exit`を送っておらず（`exit_requested`が無い）wrapperが黙っておらず復旧job（`stuck_exit`のものも、ダイアログのものも）が走っていないもので、sessionが生きていて（wrapperが`exited_at`を記録しておらず死んでいない）、queue_holdに入っておらず、ADR-0071の決定1の表のkind（`domain::waiting::waits_for`。`Session`: `worker_question` / `answer_prompt` / `stalled`、`Exiting`: `stuck_exit` / `answer_prompt`、`Revise` / `Resume`: `worker_question` / `answer_prompt`）の未回答でcloseされていないaskを持ち、そのaskが終わった待ちのものでない（`consumed`）run。askのIDの古い順に、slotの外のrun（待ちと戻り待ち。どちらもsessionを開いたまま）の数が`--max-waiting`未満のあいだ`run_waiting_started`を記録して待ちにする。上限に達していれば`run_waiting_deferred`をaskごとに1回だけ記録し、slotに居たまま今のphaseで進む（上限が空けば次のtickで待ちに移る）。`--max-waiting 0`は待ちを使わない。
 - **見張り**（`watch_waiting`。待ちのslotでは`step`を呼ばない）: sessionに何も送らず、runのstatusも変えない。
   1. leaseが自分のtokenでなければ、他のslotと同じく退く（DBには書かない。引き継いだ側がイベントから待ちを組み立てる）。

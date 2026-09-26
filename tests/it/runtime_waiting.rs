@@ -763,3 +763,67 @@ await_exit
     let outcome = joined(supervisor, "the supervisor thread to return").unwrap();
     assert_eq!(outcome["errors"][0]["run_id"], json!(run.id()), "{outcome}");
 }
+
+/// A landing run holds its supervisor's slot as the supervisor counts it
+/// (ADR-t610-1): `status`'s `slots.used` counts it and `stats`'s
+/// `idle_slots` has one free slot fewer, and so does the run back in review
+/// under that lease. A landing under a token no supervisor
+/// registered (a person's `integrate`) holds none.
+#[test]
+fn a_landing_run_fills_its_supervisors_slot_in_status_and_stats() {
+    let idle_slots = |db: &Path| {
+        runtime::stats(db, &Default::default()).unwrap()["alerts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|alert| alert["kind"] == "idle_slots")
+            .map(|alert| alert["value"].clone())
+    };
+    for (token, used, free) in [("live", 1, 1), ("by-hand", 0, 2)] {
+        let (_dir, repo, db, run) = awaiting_run();
+        let mut queue = SqliteQueue::open(&db).unwrap();
+        queue
+            .register_supervisor("live", std::process::id(), 2, "0.0.1")
+            .unwrap();
+        let main = git_out(&repo, &["rev-parse", "main"]);
+        let landing = queue
+            .begin_integration(run.id(), token, &sha(&main))
+            .unwrap();
+        assert_eq!(landing.status(), RunStatus::Integrating);
+        let status = runtime::status(&db).unwrap();
+        assert_eq!(
+            status["supervisors"][0]["slots"],
+            json!({"used": used, "parallel": 2}),
+            "{token}: {status}"
+        );
+        // The dependent task is ready but blocked by the landing one.
+        assert_eq!(idle_slots(&db), Some(json!(free)), "{token}");
+        // Back in review under the same lease, as the supervisor holds a run
+        // it reviews or that waits its turn to land, the run still holds the
+        // slot: it is no longer unfinished, but leased.
+        let back = queue
+            .abort_integration(
+                run.id(),
+                token,
+                "awaiting_integration",
+                "back to review",
+                &dagq::domain::Reason::new(ReasonCode::Other),
+            )
+            .unwrap();
+        assert_eq!(back.status(), RunStatus::AwaitingIntegration);
+        Connection::open(&db)
+            .unwrap()
+            .execute(
+                "INSERT INTO run_leases(run_id,token,pid,heartbeat_at) VALUES (?1,?2,?3,unixepoch())",
+                rusqlite::params![run.id().to_string(), token, std::process::id()],
+            )
+            .unwrap();
+        let status = runtime::status(&db).unwrap();
+        assert_eq!(
+            status["supervisors"][0]["slots"],
+            json!({"used": used, "parallel": 2}),
+            "{token}: {status}"
+        );
+        assert_eq!(idle_slots(&db), Some(json!(free)), "{token}");
+    }
+}

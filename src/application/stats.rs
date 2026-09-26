@@ -4,13 +4,13 @@
 //! decision 5) read outside the queue: the run directories' markers and
 //! cmux's workspaces; and main's Git history for `conflict_hotspots`.
 
-use std::{path::Path, time::SystemTime};
+use std::{collections::HashSet, path::Path, time::SystemTime};
 
 use anyhow::Result;
 
 use super::{AgentSignals, ProcessControl, Queue, RunFiles, StatusFilter, TaskQuery};
 use crate::domain::{
-    GoalStatus, RunStatus, SessionRole, SupervisorPulse, TaskRun, TaskStatus,
+    GoalStatus, RunId, RunStatus, SessionRole, SupervisorPulse, TaskRun, TaskStatus,
     stall::{BackgroundTask, IDLE_LOG, StallConfig, background_first_seen},
     stats::{
         ConflictConfig, ConflictConfigReport, History, ListedWorkspace, LiveRun, LiveSnapshot,
@@ -102,12 +102,31 @@ pub fn stats(
         .map(|registration| i64::from(registration.parallel))
         .sum();
     // A run that waits for a person, or waits to go back to its slot,
-    // holds no slot (ADR-0062 decision 13).
+    // holds no slot (ADR-0071 decision 13). Every other run a registered
+    // supervisor leases holds its slot as the supervisor counts it, landing,
+    // in review or resumed alike; an unfinished run under no such lease holds
+    // one unless it is landed under a token no supervisor registered (a
+    // person's `integrate`) (ADR-t610-1).
+    let supervisor_leases: HashSet<RunId> = queue
+        .run_leases()?
+        .into_iter()
+        .filter(|lease| {
+            registrations
+                .iter()
+                .any(|registration| registration.token == lease.token)
+        })
+        .map(|lease| lease.run_id)
+        .collect();
+    let mut holding: HashSet<RunId> = queue
+        .active_runs()?
+        .into_iter()
+        .filter(|run| run.status() != RunStatus::Integrating)
+        .map(|run| run.id().clone())
+        .collect();
+    holding.extend(supervisor_leases);
     let mut executing: i64 = 0;
-    for run in queue.active_runs()? {
-        if run.status() != RunStatus::Integrating
-            && crate::domain::waiting::WaitState::of(&queue.run_events(run.id())?).is_none()
-        {
+    for run in &holding {
+        if crate::domain::waiting::WaitState::of(&queue.run_events(run)?).is_none() {
             executing += 1;
         }
     }

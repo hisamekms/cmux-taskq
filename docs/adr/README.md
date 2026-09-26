@@ -4,8 +4,8 @@ type: design
 title: Architecture decision records
 status: current
 created: 2026-09-21
-updated: 2026-09-26
-last_verified: 2026-09-26
+updated: 2026-09-27
+last_verified: 2026-09-27
 tags:
   - architecture
   - documentation
@@ -75,6 +75,7 @@ ADRは、将来の実装や運用に大きな影響を与える決定の理由�
 | [ADR-0078](0078-one-integration-test-binary.md) | e2eとplugin以外のintegration testを1つのtest binary（tests/it）にまとめ、testファイルの行数の制約はファイル単位のまま残す | 2026-09-26 |
 | [ADR-0079](0079-record-task-weight-predictions-and-trial-model-effort-selection.md) | plan reviewでtaskの重さの予測を記録し、限定の試しでworkerのmodel / effortを選び、taskに由来する失敗で段上げする | 2026-09-26 |
 | [ADR-t598-1](2026-09-26-t598-1-adr-id-is-task-id-small-adrs-and-design-holds-current-state.md) | ADRのIDを書くtaskのIDにし、1 ADR 1決定・記載の粒度・今の姿はdesign・大きなADRはamendsで直すと決める（ADR-0042を置き換え） | 2026-09-26 |
+| [ADR-t610-1](2026-09-27-t610-1-landing-runs-fill-the-slot-in-status-and-stats.md) | statusのslots.usedとstatsのidle_slotsを、supervisorがclaimと戻りの判定に使うslotと同じ集合で数え、着地中のrunも埋まったslotに数える（ADR-0071決定12・13をamends） | 2026-09-27 |
 
 ## 置き換え・廃止されたADR
 
