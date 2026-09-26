@@ -382,6 +382,51 @@ pub enum TriageState {
 /// the answer.
 pub const RECOVER_AGAIN: &str = "recover";
 
+/// The last of the events that move the review of a run awaiting
+/// integration along (ADR-0027): where a supervisor that adopts the run
+/// picks the review up, and whether its live session was asked to fix
+/// something ([`fix_requested`]).
+pub fn review_anchor(events: &[RunEvent]) -> Option<&RunEvent> {
+    events.iter().rev().find(|e| {
+        matches!(
+            e.kind.as_str(),
+            "validation_finished"
+                | "review_started"
+                | "review_finished"
+                | "revise_requested"
+                | "revise_unsent"
+                | "revise_finished"
+                | "conflict_precheck"
+                | "conflict_resolved"
+        )
+    })
+}
+
+/// Whether the live session of a run awaiting integration was sent a
+/// `revise` verdict or a conflict request it has not answered yet
+/// (ADR-0027 decisions 2 and 4), and not asked to `/exit` since (a
+/// request it will not fix ends in the `/exit`). Its worker may stop at a
+/// `worker_question` there, whose answer the supervisor types as it does a
+/// running worker's (task 238).
+pub fn fix_requested(events: &[RunEvent]) -> bool {
+    review_anchor(events).is_some_and(|anchor| {
+        (anchor.kind == "revise_requested"
+            || (anchor.kind == "conflict_precheck" && anchor.payload["requested"] == true))
+            && !events
+                .iter()
+                .any(|e| e.id > anchor.id && e.kind == "exit_requested")
+    })
+}
+
+/// Whether the supervisor types the answer of a run's `worker_question`
+/// into its worker's terminal: the run is `running`, or awaiting
+/// integration while its live session fixes what it was asked to
+/// ([`fix_requested`]). The caller checks that a supervisor leases it.
+pub fn session_takes_answers(status: RunStatus, events: &[RunEvent]) -> bool {
+    status == RunStatus::Running
+        || (status == RunStatus::AwaitingIntegration && fix_requested(events))
+}
+
 pub fn triage_state(events: &[RunEvent]) -> TriageState {
     let last = events.iter().rev().find(|e| {
         matches!(
@@ -2408,6 +2453,40 @@ mod attention_tests {
         events.push(event(5, "resume_started"));
         events.push(event(6, "resume_finished"));
         assert_eq!(triage_state(&events), TriageState::Pending);
+    }
+
+    #[test]
+    fn answers_are_the_sessions_while_it_runs_or_fixes_a_request() {
+        let event = |id: i64, kind: &str, payload: serde_json::Value| RunEvent {
+            id: EventId::new(id),
+            task_id: Some(TaskId::new(1)),
+            goal_id: None,
+            run_id: Some(RunId::new("r").unwrap()),
+            kind: kind.into(),
+            payload,
+            created_at: String::new(),
+        };
+        let waiting = RunStatus::AwaitingIntegration;
+        assert!(session_takes_answers(RunStatus::Running, &[]));
+        assert!(!session_takes_answers(waiting, &[]));
+        let mut events = vec![
+            event(1, "validation_finished", serde_json::json!({})),
+            event(2, "revise_requested", serde_json::json!({"attempt": 1})),
+            // Not a step of the review: the revise still waits.
+            event(3, "ask_opened", serde_json::json!({})),
+        ];
+        assert!(session_takes_answers(waiting, &events));
+        assert!(!session_takes_answers(RunStatus::NeedsSession, &events));
+        events.push(event(4, "revise_finished", serde_json::json!({})));
+        assert!(!session_takes_answers(waiting, &events));
+        events.push(event(5, "conflict_precheck", json!({"requested": false})));
+        assert!(!session_takes_answers(waiting, &events));
+        events.push(event(6, "conflict_precheck", json!({"requested": true})));
+        assert!(session_takes_answers(waiting, &events));
+        assert_eq!(review_anchor(&events).map(|e| e.id), Some(EventId::new(6)));
+        // A request the session did not fix ends in its `/exit`.
+        events.push(event(7, "exit_requested", serde_json::json!({})));
+        assert!(!session_takes_answers(waiting, &events));
     }
 
     #[test]

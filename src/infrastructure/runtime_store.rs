@@ -2849,7 +2849,7 @@ fn lease_parked_run(
     Ok(Some(lease.map(|l| l.token)))
 }
 
-fn run_events_of(conn: &Connection, id: &RunId) -> Result<Vec<RunEvent>> {
+pub(super) fn run_events_of(conn: &Connection, id: &RunId) -> Result<Vec<RunEvent>> {
     Ok(conn
         .prepare("SELECT * FROM run_events WHERE run_id=?1 ORDER BY id")?
         .query_map([id], event_row)?
@@ -3403,6 +3403,9 @@ impl AskStore for SqliteQueue {
     }
     fn has_stuck_exit_ask(&self, run_id: &RunId) -> Result<bool> {
         SqliteQueue::has_stuck_exit_ask(self, run_id)
+    }
+    fn last_worker_question_closed(&self, run_id: &RunId) -> Result<Option<i64>> {
+        SqliteQueue::last_worker_question_closed(self, run_id)
     }
     fn has_unclosed_worker_question(&self, run_id: &RunId) -> Result<bool> {
         SqliteQueue::has_unclosed_worker_question(self, run_id)

@@ -180,6 +180,7 @@ so the run workspace opens outside it: {error:#}", self.layout.queue_hash);
             stall: StallWatch::default(),
             stale: None,
             recovery: RecoveryWatch::default(),
+            input_at: None,
         })
     }
 }
@@ -228,9 +229,59 @@ pub(super) struct SessionWatch {
     /// Background work past its threshold: the recovery job (ADR-0047
     /// decision 39).
     pub(super) recovery: RecoveryWatch,
+    /// The last input typed into a session that had gone idle before (a
+    /// revise request, or an answer typed during it): an idle marker no
+    /// newer than this is from before it, so the session works (task 238).
+    /// `None` for a worker's own session, where any idle marker counts.
+    pub(super) input_at: Option<SystemTime>,
 }
 
 impl SessionWatch {
+    /// The watch of a live session asked at `input_at` to fix what its
+    /// review or a conflict named ([`ReviseWatch`]): only the answers of its
+    /// `worker_question`s and its dialogs are followed (task 238).
+    pub(super) fn revising(
+        run: &TaskRun,
+        session: &SessionRef,
+        input_at: SystemTime,
+    ) -> Result<Self> {
+        Ok(SessionWatch {
+            workspace: session.workspace.clone(),
+            run_dir: PathBuf::from(run.run_dir().context("missing run directory")?),
+            receipt_path: PathBuf::from(run.receipt_path().context("missing receipt path")?),
+            idle_marker: run.idle_marker_path()?,
+            startup: Instant::now(),
+            receipt_seen: false,
+            receipt_seen_at: None,
+            exit_requested: None,
+            exit_timed_out: false,
+            first_commit_seen: true,
+            agent_seen: None,
+            prompt_checked: None,
+            prompt_hash: None,
+            exit_asked: false,
+            silent: false,
+            exit_for_silence: false,
+            answer_start: None,
+            stall: StallWatch::default(),
+            stale: None,
+            recovery: RecoveryWatch::default(),
+            input_at: Some(input_at),
+        })
+    }
+
+    /// Whether the session is idle: an idle marker exists, written after
+    /// the last input typed when one is known.
+    fn idle(&self, sv: &Supervisor<'_>) -> bool {
+        match self.input_at {
+            Some(at) => sv
+                .files
+                .modified(&self.idle_marker)
+                .is_ok_and(|modified| modified > at),
+            None => sv.files.exists(&self.idle_marker),
+        }
+    }
+
     /// One observation. `Some` once supervision finished (`validating` or
     /// `failed`): the wrapper exited, or the session went idle after its
     /// receipt and stays open for the review; an error means the run must
@@ -520,7 +571,7 @@ impl SessionWatch {
             }
             return Ok(());
         }
-        if sv.files.exists(&self.idle_marker)
+        if self.idle(sv)
             || !sv.processes.alive(agent.pid)
             || sv.queue.has_unclosed_worker_question(run.id())?
         {
@@ -591,18 +642,24 @@ impl SessionWatch {
     /// the second), then close the ask and record `ask_delivered` (ADR-0022
     /// decision 2). Each answer is sent at most once: a failed send records
     /// `ask_delivery_failed` and leaves the ask unclosed for the inbox.
-    pub(super) fn deliver_answers(&mut self, sv: &mut Supervisor<'_>, run: &TaskRun) -> Result<()> {
+    /// Returns when the last answer sent was typed, if one was.
+    pub(super) fn deliver_answers(
+        &mut self,
+        sv: &mut Supervisor<'_>,
+        run: &TaskRun,
+    ) -> Result<Option<SystemTime>> {
         let answers = sv.queue.undelivered_answers(run.id())?;
         if answers.is_empty() {
-            return Ok(());
+            return Ok(None);
         }
         // Background work does not hold an answer back: typing into the
         // prompt opens no dialog, only /exit does.
         let idle_at = match sv.files.modified(&self.idle_marker) {
             Ok(modified) => unix_seconds(modified),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error).context("inspect idle marker"),
         };
+        let mut typed = None;
         let failed: Vec<AskId> = sv
             .queue
             .run_events(run.id())?
@@ -627,6 +684,7 @@ impl SessionWatch {
                 // Sent: failing to record it must not cost the live run its
                 // lease, so it is only noted (the ask then shows unclosed).
                 Ok(submission) => {
+                    typed = Some(sent_at);
                     self.stall.input_sent(sent_at);
                     self.answer_start = Some(StartCheck::new(&what, &text, sent_at, &submission));
                     match sv.queue.ask_delivered(ask.id, &self.workspace) {
@@ -652,7 +710,7 @@ impl SessionWatch {
                 }
             }
         }
-        Ok(())
+        Ok(typed)
     }
 
     /// Record `prompt_cleared` if a dialog is recorded and not cleared yet;

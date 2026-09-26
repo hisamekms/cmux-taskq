@@ -10,7 +10,7 @@ use crate::domain::Ask;
 use crate::domain::{
     ANSWERED_BY_PERSON, ANSWERED_BY_RUNTIME, AskId, AskKind, AskOutcome, AskReason,
     HOLD_AFFECTED_HEADING, HoldOutcome, LANDING_OPTIONS, NewAsk, NewHold, RunId, RunStatus, TaskId,
-    UPDATE_FAILED_OPTIONS, check_ask_kind, check_event_target, option_index,
+    UPDATE_FAILED_OPTIONS, check_ask_kind, check_event_target, option_index, session_takes_answers,
 };
 
 pub use crate::application::AskQuery;
@@ -183,13 +183,27 @@ impl SqliteQueue {
         if ask.kind == AskKind::WorkerQuestion
             && let Some(run_id) = ask.run_id.as_ref()
         {
-            // The supervisor types it into a running worker's terminal; the
-            // answer of a run that stopped running is the inbox's.
+            // The supervisor types it into a running worker's terminal, or
+            // into a live session it asked to revise (task 238); the answer
+            // of a run that stopped running is the inbox's.
             let status: String =
                 tx.query_row("SELECT status FROM task_runs WHERE id=?1", [run_id], |r| {
                     r.get(0)
                 })?;
-            payload["runtime_delivers"] = json!(status == RunStatus::Running.as_str());
+            let status: RunStatus = status.parse()?;
+            let leased: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM run_leases WHERE run_id=?1)",
+                [run_id],
+                |r| r.get(0),
+            )?;
+            payload["runtime_delivers"] = json!(
+                status == RunStatus::Running
+                    || (leased
+                        && session_takes_answers(
+                            status,
+                            &super::runtime_store::run_events_of(&tx, run_id)?
+                        ))
+            );
         }
         if ask.kind == AskKind::ApproveLanding
             && let Some(run_id) = ask.run_id.as_ref()
@@ -419,6 +433,16 @@ impl SqliteQueue {
     /// not: its worker stopped at the ask and waits for the answer.
     pub fn has_unclosed_worker_question(&self, run_id: &RunId) -> Result<bool> {
         self.has_unclosed_ask(run_id, AskKind::WorkerQuestion)
+    }
+
+    /// When the run's `worker_question` closed last (unix seconds): its
+    /// answer was delivered, by the supervisor or by hand.
+    pub fn last_worker_question_closed(&self, run_id: &RunId) -> Result<Option<i64>> {
+        Ok(self.conn.query_row(
+            "SELECT MAX(closed_at) FROM asks WHERE run_id=?1 AND kind='worker_question'",
+            [run_id],
+            |r| r.get(0),
+        )?)
     }
 
     /// Whether the run has an ask of `kind` nobody closed, answered or not.

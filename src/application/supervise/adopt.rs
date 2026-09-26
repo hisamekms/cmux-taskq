@@ -186,6 +186,7 @@ impl Supervisor<'_> {
                     stall: StallWatch::adopt(&*self.queue, run)?,
                     stale: adopted_stale_nudge(&*self.queue, run, SESSION_PHASE, None)?,
                     recovery: RecoveryWatch::adopt(&*self.queue, run)?,
+                    input_at: None,
                 })
             }
         })
@@ -261,19 +262,7 @@ impl Supervisor<'_> {
     pub(super) fn adopt_review(&mut self, run: &TaskRun) -> Result<Phase> {
         let session = self.session_of(run)?;
         let events = self.queue.run_events(run.id())?;
-        let Some(anchor) = events.iter().rev().find(|e| {
-            matches!(
-                e.kind.as_str(),
-                "validation_finished"
-                    | "review_started"
-                    | "review_finished"
-                    | "revise_requested"
-                    | "revise_unsent"
-                    | "revise_finished"
-                    | "conflict_precheck"
-                    | "conflict_resolved"
-            )
-        }) else {
+        let Some(anchor) = crate::domain::review_anchor(&events) else {
             return self.start_review(run, session);
         };
         let then = match anchor.kind.as_str() {
@@ -281,21 +270,21 @@ impl Supervisor<'_> {
                 if let Some(live) = session.clone()
                     && session_alive(self, run.id())?
                 {
-                    return Ok(Phase::Revise(ReviseWatch {
-                        session: live,
-                        attempt: anchor.payload["attempt"].as_u64().unwrap_or(1) as usize,
-                        fix: Fix::Revise(
+                    return Ok(Phase::Revise(ReviseWatch::new(
+                        run,
+                        live,
+                        anchor.payload["attempt"].as_u64().unwrap_or(1) as usize,
+                        Fix::Revise(
                             serde_json::from_value(anchor.payload["reasons"].clone())
                                 .unwrap_or_default(),
                         ),
-                        sent_at: UNIX_EPOCH
+                        UNIX_EPOCH
                             + Duration::from_secs(
                                 anchor.payload["sent_at"].as_u64().unwrap_or_default(),
                             ),
-                        sent: Instant::now(),
                         // An adopted request is not checked for a start.
-                        start: None,
-                    }));
+                        None,
+                    )?));
                 }
                 None
             }
@@ -307,18 +296,18 @@ impl Supervisor<'_> {
                     && let Some(verdict) = passed
                     && session_alive(self, run.id())?
                 {
-                    return Ok(Phase::Revise(ReviseWatch {
-                        session: live,
-                        attempt: anchor.payload["attempt"].as_u64().unwrap_or(1) as usize,
-                        fix: Fix::Conflict(verdict),
-                        sent_at: UNIX_EPOCH
+                    return Ok(Phase::Revise(ReviseWatch::new(
+                        run,
+                        live,
+                        anchor.payload["attempt"].as_u64().unwrap_or(1) as usize,
+                        Fix::Conflict(verdict),
+                        UNIX_EPOCH
                             + Duration::from_secs(
                                 anchor.payload["sent_at"].as_u64().unwrap_or_default(),
                             ),
-                        sent: Instant::now(),
                         // An adopted request is not checked for a start.
-                        start: None,
-                    }));
+                        None,
+                    )?));
                 }
                 None
             }

@@ -13,8 +13,12 @@ pub(super) struct ReviseWatch {
     /// A receipt or idle marker no newer than this predates the request.
     pub(super) sent_at: SystemTime,
     pub(super) sent: Instant,
-    /// Whether the session took the request (task 285).
+    /// Whether the session took the request, or the last answer typed
+    /// (task 285).
     pub(super) start: Option<StartCheck>,
+    /// The answers of the session's `worker_question`s and the dialogs it
+    /// stops at, followed as a worker's own session's are (task 238).
+    pub(super) live: Box<SessionWatch>,
 }
 
 /// What the live session was asked to fix (ADR-0027 decisions 2 and 4).
@@ -71,11 +75,53 @@ pub(super) enum ReviseOutcome {
 }
 
 impl ReviseWatch {
+    pub(super) fn new(
+        run: &TaskRun,
+        session: SessionRef,
+        attempt: usize,
+        fix: Fix,
+        sent_at: SystemTime,
+        start: Option<StartCheck>,
+    ) -> Result<Self> {
+        let live = Box::new(SessionWatch::revising(run, &session, sent_at)?);
+        Ok(ReviseWatch {
+            session,
+            attempt,
+            fix,
+            sent_at,
+            sent: Instant::now(),
+            start,
+            live,
+        })
+    }
+
+    /// Another request typed at `sent_at` (a receipt to fix): only what the
+    /// session does after it counts.
+    pub(super) fn requested(&mut self, sent_at: SystemTime, start: StartCheck) {
+        self.sent_at = sent_at;
+        self.live.input_at = Some(sent_at);
+        self.start = Some(start);
+    }
+
     pub(super) fn poll(
         &mut self,
         sv: &mut Supervisor<'_>,
         run: &TaskRun,
     ) -> Result<Option<ReviseOutcome>> {
+        let outcome = self.observe(sv, run)?;
+        if matches!(
+            outcome,
+            Some(ReviseOutcome::Rewritten(_) | ReviseOutcome::Ended(_))
+        ) {
+            // The revise ends here: a dialog recorded during it is no
+            // attention any more.
+            self.live.clear_prompt(sv, run)?;
+            self.live.recovery.stop(sv, run);
+        }
+        Ok(outcome)
+    }
+
+    fn observe(&mut self, sv: &mut Supervisor<'_>, run: &TaskRun) -> Result<Option<ReviseOutcome>> {
         let processes = sv.queue.processes(run.id())?;
         let Some(wrapper) = processes
             .iter()
@@ -99,11 +145,49 @@ impl ReviseWatch {
                     .to_owned(),
             )));
         }
+        // An answer to a question the session asked during the revise is
+        // typed once it went idle at it: the session works again, and gets
+        // the resume timeout again (task 238).
+        if let Some(typed) = self.live.deliver_answers(sv, run)? {
+            self.live.input_at = Some(typed);
+            self.sent = Instant::now();
+            self.start = self.live.answer_start.take();
+        }
+        if let Some(agent) = processes
+            .iter()
+            .find(|p| p.role == "agent" && p.exited_at.is_none())
+        {
+            self.live.watch_prompt(sv, run, agent)?;
+        }
+        if let Some(start) = &mut self.start {
+            let workspace = self.session.workspace.clone();
+            start.poll(sv, run, &workspace, &run.idle_marker_path()?)?;
+        }
+        // A session stopped at its own question waits for its answer, however
+        // long a person takes: it neither went idle without rewriting the
+        // receipt nor ran out of time.
+        if sv.queue.has_unclosed_worker_question(run.id())? {
+            return Ok(None);
+        }
+        // An answer delivered by hand (or by the supervisor this one
+        // adopted the run from) is input too: the idle marker of the stop at
+        // the question is older than it. Its close is known to the second: a
+        // close in a later second than the last input moves it there (one
+        // this watch typed closes in the second it was typed).
+        let input_at = self.live.input_at.unwrap_or(self.sent_at);
+        if let Some(closed) = sv.queue.last_worker_question_closed(run.id())?
+            && closed > unix_seconds(input_at)
+        {
+            self.live.input_at = Some(UNIX_EPOCH + Duration::from_secs(closed.max(0) as u64));
+            self.sent = Instant::now();
+        }
         let receipt = Path::new(run.receipt_path().context("missing receipt path")?);
         // The idle marker is read before the receipt: a receipt rewritten
         // after this read is judged at the next poll, never as idle without
-        // it.
-        let idle = IdleMarker::read(&*sv.files, sv.signals, &run.idle_marker_path()?)?;
+        // it. A marker from before the last input typed is not this turn's.
+        let input_at = self.live.input_at.unwrap_or(self.sent_at);
+        let idle = IdleMarker::read(&*sv.files, sv.signals, &run.idle_marker_path()?)?
+            .filter(|idle| idle.modified() > input_at);
         let rewritten = sv
             .files
             .modified(receipt)
@@ -148,14 +232,10 @@ impl ReviseWatch {
                 ),
             }));
         }
-        if !rewritten && idle.is_some_and(|idle| idle.idle_since(self.sent_at)) {
+        if !rewritten && idle.is_some_and(|idle| idle.idle_since(input_at)) {
             return Ok(Some(ReviseOutcome::Ended(
                 "went idle without rewriting the receipt".to_owned(),
             )));
-        }
-        if let Some(start) = &mut self.start {
-            let workspace = self.session.workspace.clone();
-            start.poll(sv, run, &workspace, &run.idle_marker_path()?)?;
         }
         if self.sent.elapsed() >= sv.cmux.resume_timeout() {
             return Ok(Some(ReviseOutcome::Ended(format!(

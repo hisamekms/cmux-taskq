@@ -1335,6 +1335,8 @@ pub trait AskStore {
     fn ask_delivered(&mut self, id: AskId, workspace_id: &str) -> Result<Ask>;
     fn has_stuck_exit_ask(&self, run_id: &RunId) -> Result<bool>;
     fn has_unclosed_worker_question(&self, run_id: &RunId) -> Result<bool>;
+    /// When the run's `worker_question` closed last (unix seconds).
+    fn last_worker_question_closed(&self, run_id: &RunId) -> Result<Option<i64>>;
     /// Close the run's `stuck_exit` asks nobody closed, with `answer`.
     fn close_stuck_exit_asks(&mut self, run_id: &RunId, answer: &str) -> Result<Vec<Ask>>;
     /// Close the run's `answer_prompt` asks nobody closed, with `answer`.

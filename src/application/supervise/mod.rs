@@ -1588,13 +1588,15 @@ impl Supervisor<'_> {
                             "receipt fix request",
                         ) {
                             Ok(submission) => {
-                                watch.sent_at = sent_at;
-                                watch.start = Some(StartCheck::new(
-                                    "receipt fix request",
-                                    &message,
+                                watch.requested(
                                     sent_at,
-                                    &submission,
-                                ));
+                                    StartCheck::new(
+                                        "receipt fix request",
+                                        &message,
+                                        sent_at,
+                                        &submission,
+                                    ),
+                                );
                                 let kind = match watch.fix {
                                     Fix::Revise(_) => "revise_receipt_rejected",
                                     Fix::Conflict(_) => "conflict_receipt_rejected",

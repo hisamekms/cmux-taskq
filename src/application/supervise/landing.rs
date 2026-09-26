@@ -280,19 +280,19 @@ impl Supervisor<'_> {
                     }
                 };
                 info!(run_id = %run.id(), "revise {attempt} of {MAX_REVISE_ATTEMPTS} sent to run {} in workspace {}", run.id(), live.workspace);
-                Ok(Phase::Revise(ReviseWatch {
-                    session: live,
+                Ok(Phase::Revise(ReviseWatch::new(
+                    run,
+                    live,
                     attempt,
-                    fix: Fix::Revise(verdict.reasons),
+                    Fix::Revise(verdict.reasons),
                     sent_at,
-                    sent: Instant::now(),
-                    start: Some(StartCheck::new(
+                    Some(StartCheck::new(
                         "revise request",
                         &message,
                         sent_at,
                         &submission,
                     )),
-                }))
+                )?))
             }
         }
     }
@@ -429,14 +429,14 @@ impl Supervisor<'_> {
             return Ok(land(session));
         };
         info!(run_id = %run.id(), "run {}: {why}; asked its live session in workspace {} to rebase (request {attempt})", run.id(), live.workspace);
-        Ok(Phase::Revise(ReviseWatch {
-            session: live,
+        Ok(Phase::Revise(ReviseWatch::new(
+            run,
+            live,
             attempt,
-            fix: Fix::Conflict(verdict),
+            Fix::Conflict(verdict),
             sent_at,
-            sent: Instant::now(),
-            start: Some(start),
-        }))
+            Some(start),
+        )?))
     }
     /// Close the session's workspace after it exited: the worker's own
     /// through [`close_workspace`], a resume's by recording

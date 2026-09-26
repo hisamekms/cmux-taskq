@@ -17,7 +17,7 @@ use crate::domain::{
     SupervisorMode, SupervisorPulse, SupervisorRegistration, TaskId, TaskRun, TriageState,
     UPDATE_FAILED_OPTIONS, event_attention, heartbeat_stale, reason, recheck, run_attention,
     run_env::{RUN_ENV_PROGRAM_KINDS, RUN_ENV_PROGRAM_MISSING, RunEnvCheck},
-    supervisor_attention, triage_state,
+    session_takes_answers, supervisor_attention, triage_state,
     waiting::WaitState,
 };
 
@@ -874,8 +874,9 @@ pub fn attention(
             && let Some(run_id) = ask.run_id.as_ref()
         {
             // The supervisor holding a running worker's lease types the
-            // answer into its terminal; a failed send, a run no longer
-            // running or one nobody supervises leaves it to the inbox.
+            // answer into its terminal, also while it revises (task 238); a
+            // failed send, a run no longer running or one nobody supervises
+            // leaves it to the inbox.
             let failed = queue.run_events(run_id)?.iter().any(|e| {
                 e.kind == "ask_delivery_failed"
                     && e.payload
@@ -890,7 +891,7 @@ pub fn attention(
                     "ask_delivery_failed",
                     AttentionNext::DeliverAnswer { ask_id: ask.id },
                 )
-            } else if queue.run(run_id)?.status() == RunStatus::Running
+            } else if session_takes_answers(queue.run(run_id)?.status(), &queue.run_events(run_id)?)
                 && queue
                     .run_lease(run_id)?
                     .is_some_and(|lease| !lease_is_stale(&lease, now, control))

@@ -2144,3 +2144,157 @@ fn an_adopted_run_with_a_withdrawn_revise_asks_a_person_without_sending_it() {
     );
     assert_eq!(detail.runs[0].status(), RunStatus::AwaitingIntegration);
 }
+
+/// A worker that asks a `worker_question` while it revises: once the revise
+/// request arrives it asks, goes idle, waits for the answer in `$MESSAGE`
+/// and commits it.
+const REVISE_ASKING_AGENT: &str = r#"
+commit work; receipt "$(git rev-parse HEAD)"; idle
+while [ ! -f "$MESSAGE" ]; do sleep 0.05; done; rm "$MESSAGE"
+"$DAGQ" --db "$DB" ask --run "$RUN_ID" --kind worker_question --because scope --question 'Which line?' --cmux /usr/bin/true > /dev/null || exit 70
+idle
+while [ ! -f "$MESSAGE" ]; do sleep 0.05; done
+cp "$MESSAGE" answer.txt; rm "$MESSAGE"
+git add answer.txt; git commit -q -m answer
+receipt "$(git rev-parse HEAD)"; idle; await_exit
+"#;
+
+/// A session that stops at its own `worker_question` while it revises is not
+/// taken for one that went idle without rewriting its receipt: the answer is
+/// the runtime's to type (`runtime_delivers`), it is typed into the session
+/// once answered, and the revise goes on to its review and landing (task
+/// 238).
+#[test]
+fn a_worker_question_asked_while_revising_is_answered_and_the_run_lands() {
+    let (_dir, repo, db) = fixture();
+    let base = git_out(&repo, &["rev-parse", "main"]);
+    let backend = Arc::new(TestWorkspace::new(&db, false, REVISE_ASKING_AGENT));
+    let reviewer = Arc::new(TestReviewer::new(&[
+        verdict("revise", &["say which line"], "one gap"),
+        verdict("pass", &[], "fixed"),
+    ]));
+    let supervisor = {
+        let (db, repo, backend, reviewer) =
+            (db.clone(), repo.clone(), backend.clone(), reviewer.clone());
+        thread::spawn(move || supervise_reviewed(&db, &repo, &backend, &reviewer))
+    };
+    wait_until(&db, Duration::from_secs(30), |queue| {
+        !queue.asks(AskQuery::default()).unwrap().is_empty()
+    });
+    let mut queue = SqliteQueue::open(&db).unwrap();
+    let ask = queue.asks(AskQuery::default()).unwrap().remove(0);
+    assert_eq!(ask.kind, AskKind::WorkerQuestion);
+    // Idle at its question for a while: the revise waits for the answer.
+    thread::sleep(HOLD_PERIOD);
+    let detail = queue.show(TaskId::new(1)).unwrap();
+    let kinds = event_kinds(&detail);
+    assert!(kinds.contains(&"revise_requested"), "{kinds:?}");
+    assert!(!kinds.contains(&"exit_requested"), "{kinds:?}");
+    assert!(!kinds.contains(&"revise_finished"), "{kinds:?}");
+    assert_eq!(queue.asks(AskQuery::default()).unwrap().len(), 1);
+
+    queue.answer(ask.id, "the second").unwrap();
+    let detail = queue.show(TaskId::new(1)).unwrap();
+    let answered = payloads(&detail, "ask_answered");
+    assert_eq!(answered.len(), 1);
+    assert_eq!(answered[0]["runtime_delivers"], true, "{}", answered[0]);
+    let outcome = joined(supervisor, "the supervisor thread to return");
+    assert_eq!(outcome["errors"], json!([]), "{outcome}");
+    assert_eq!(outcome["runs"][0]["status"], "integrated", "{outcome}");
+    let detail = queue.show(TaskId::new(1)).unwrap();
+    assert_landed(&repo, &detail.runs[0], "test task", &base);
+    let texts = backend.texts();
+    assert_eq!(texts.len(), 2, "{texts:?}");
+    let answer = format!("answer to ask {}: the second", ask.id);
+    assert_eq!(texts[1], (WORKSPACE_ID.to_owned(), answer.clone()));
+    assert_eq!(fs::read_to_string(repo.join("answer.txt")).unwrap(), answer);
+    assert!(queue.read_ask(ask.id).unwrap().closed_at.is_some());
+    assert_eq!(
+        payloads(&detail, "ask_delivered"),
+        vec![&json!({"ask_id": ask.id, "workspace_id": WORKSPACE_ID})]
+    );
+    assert_eq!(payloads(&detail, "revise_finished").len(), 1);
+    // Nothing waits for a person.
+    assert!(queue.asks(AskQuery::default()).unwrap().is_empty());
+}
+
+/// A dialog screen as Claude Code draws it.
+const REVISE_DIALOG_SCREEN: &str = "\
+ Auto mode is available
+
+ ❯ 1. Yes, turn on auto mode
+   2. No, keep asking
+
+ Esc to cancel
+";
+
+/// A session that stops at a dialog while it revises records
+/// `prompt_waiting` and raises it (through its recovery job) as an
+/// `answer_prompt` ask, as a worker's own session does, instead of waiting
+/// out the resume timeout; the dialog gone, `prompt_cleared` closes the ask
+/// and the revise goes on (task 238).
+#[test]
+fn a_dialog_while_revising_is_recorded_as_prompt_waiting() {
+    let (_dir, repo, db) = fixture();
+    let base = git_out(&repo, &["rev-parse", "main"]);
+    let mut backend = TestWorkspace::new(
+        &db,
+        false,
+        "commit work; receipt \"$(git rev-parse HEAD)\"; idle; \
+         while [ ! -f \"$MESSAGE\" ]; do sleep 0.05; done; rm \"$MESSAGE\"; \
+         while [ ! -f \"$EXIT.go\" ]; do sleep 0.05; done; \
+         printf 'fix\\n' >> change.txt; git commit -q -am fix; \
+         receipt \"$(git rev-parse HEAD)\"; idle; await_exit",
+    );
+    backend.prompt_wait = Duration::from_millis(300);
+    let backend = Arc::new(backend);
+    let reviewer = Arc::new(TestReviewer::new(&[
+        verdict("revise", &["add a line"], "one gap"),
+        verdict("pass", &[], "fixed"),
+    ]));
+    let supervisor = {
+        let (db, repo, backend, reviewer) =
+            (db.clone(), repo.clone(), backend.clone(), reviewer.clone());
+        thread::spawn(move || supervise_reviewed(&db, &repo, &backend, &reviewer))
+    };
+    wait_until(&db, Duration::from_secs(30), |queue| {
+        event_kinds(&queue.show(TaskId::new(1)).unwrap()).contains(&"revise_requested")
+    });
+    *backend.screen.lock().unwrap() = REVISE_DIALOG_SCREEN.into();
+    wait_until(&db, Duration::from_secs(30), |queue| {
+        !queue.asks(AskQuery::default()).unwrap().is_empty()
+    });
+    let mut queue = SqliteQueue::open(&db).unwrap();
+    let detail = queue.show(TaskId::new(1)).unwrap();
+    let kinds = event_kinds(&detail);
+    assert!(position(&kinds, "revise_requested") < position(&kinds, "prompt_waiting"));
+    let waiting = payloads(&detail, "prompt_waiting");
+    assert_eq!(waiting.len(), 1);
+    assert_eq!(waiting[0]["workspace_id"], WORKSPACE_ID);
+    assert_eq!(waiting[0]["prompt"], "choice");
+    let asks = queue.asks(AskQuery::default()).unwrap();
+    assert_eq!(asks.len(), 1, "{asks:?}");
+    assert_eq!(asks[0].kind, AskKind::AnswerPrompt);
+    assert!(!kinds.contains(&"exit_requested"), "{kinds:?}");
+
+    // Someone answers the dialog: the screen goes back to work.
+    *backend.screen.lock().unwrap() = WORK_SCREEN.into();
+    wait_until(&db, Duration::from_secs(30), |queue| {
+        event_kinds(&queue.show(TaskId::new(1)).unwrap()).contains(&"prompt_cleared")
+    });
+    assert!(queue.read_ask(asks[0].id).unwrap().closed_at.is_some());
+    let run = queue.show(TaskId::new(1)).unwrap().runs[0].clone();
+    fs::write(
+        exit_request_path(run.run_dir().unwrap()).with_extension("go"),
+        "",
+    )
+    .unwrap();
+    let outcome = joined(supervisor, "the supervisor thread to return");
+    assert_eq!(outcome["errors"], json!([]), "{outcome}");
+    assert_eq!(outcome["runs"][0]["status"], "integrated", "{outcome}");
+    let detail = queue.show(TaskId::new(1)).unwrap();
+    assert_landed(&repo, &detail.runs[0], "test task", &base);
+    assert_eq!(payloads(&detail, "revise_finished").len(), 1);
+    assert_eq!(payloads(&detail, "prompt_waiting").len(), 1);
+    assert!(queue.asks(AskQuery::default()).unwrap().is_empty());
+}
