@@ -47,16 +47,16 @@ use super::{
     Spawner, Streams, TRIAGE_ASKER, TriageAction, Validation, Verifier, WorkspaceBackend,
     WorkspaceTags, ask, dependency_graph,
     health::{lease_health, run_health},
-    integrate::{self as integration, Integration, check_receipt, resume_attempts},
+    integrate::{self as integration, Integration, check_receipt},
     naming::{
         resume_workspace_description, shell_join, workspace_description, workspace_group_name,
     },
     or_none, path_text,
     prompt::{
         GoalPredecessorSummary, Inheritance, PredecessorSummary, RecoveryMaterial, ResumeKind,
-        ResumeRequest, TRIAGE_TOOLS, prompt, recovery_prompt, resume_request, review_prompt,
-        revise_mismatch_request, revise_request, siblings_in_progress, stale_receipt_nudge,
-        stall_nudge, triage_prompt,
+        ResumeRequest, TRIAGE_TOOLS, ended_run_material, prompt, recovery_prompt, resume_request,
+        review_prompt, revise_mismatch_request, revise_request, siblings_in_progress,
+        stale_receipt_nudge, stall_nudge,
     },
     recording::{
         RecordingBackend, exit_unsent, reason_of_error, text_on_screen, timed_out_maybe_sent,
@@ -69,10 +69,10 @@ use crate::domain::{
     MAX_REVISE_ATTEMPTS, NewAsk, NewHold, Predecessor, Reason, ReasonCode, Receipt, ReceiptResult,
     ReviewDecision, ReviewVerdict, RunId, RunLease, RunPaths, RunPlan, RunProcess, RunStatus,
     SessionRole, TRIAGE_OPTIONS, TRIAGE_RETRY_FAILURES, TaskAction, TaskId, TaskRun, TaskStatus,
-    TriageDecision, TriageState, TriageVerdict, heartbeat_stale,
+    TriageState, heartbeat_stale,
     marks::{RUN_ENV_CHANGED, SUPERVISOR_STARTED, SUPERVISOR_STOPPED, run_env_digest},
     measure::{ClaimAttributes, HostVersions, LoadSummary, LoadWindow},
-    recovery::RecoveryDecision,
+    recovery::{RecoveryAlert, RecoveryDecision, RecoveryVerdict, STUCK_EXIT_ACTIONS},
     resume::{ResumeCount, inherits_on_exhaustion},
     run_env::RUN_ENV_PROGRAM_KINDS,
     stall::{BackgroundTask, STALL_CONFIG_LOADED, StallConfig},
@@ -597,9 +597,9 @@ enum Phase {
     /// The run lands off the loop, like validation; the landing releases
     /// the lease itself.
     Landing(Option<thread::JoinHandle<Result<IntegrationOutcome>>>),
-    /// The headless triage of a `failed` or `interrupted` run (ADR-0024
-    /// decision 3), under a lease of its own.
-    Triage(TriageWatch),
+    /// The recovery job of a `failed` or `interrupted` run (ADR-0047
+    /// decision 39), under a lease of its own.
+    Recovery(EndedRecovery),
 }
 
 /// The session of a run the supervisor keeps open through validation,
@@ -1021,13 +1021,13 @@ impl Supervisor<'_> {
                 {
                     self.disown(&slot)
                 }
-                Err(error) if matches!(slot.phase, Phase::Triage(_)) => {
+                Err(error) if matches!(slot.phase, Phase::Recovery(_)) => {
                     stop_job(&mut slot);
-                    let attempt = match &slot.phase {
-                        Phase::Triage(watch) => watch.attempt,
-                        _ => unreachable!("matched a triage"),
+                    let (round, alert, attempt) = match &slot.phase {
+                        Phase::Recovery(watch) => (watch.round, watch.alert, watch.attempt),
+                        _ => unreachable!("matched a recovery"),
                     };
-                    self.fail_triage(&slot.run, attempt, format!("{error:#}"), 0);
+                    self.fail_recovery(&slot.run, round, alert, attempt, format!("{error:#}"), 0);
                     let run = self.queue.run(slot.run.id()).unwrap_or(slot.run);
                     self.note_triaged(&run);
                 }
@@ -1366,23 +1366,33 @@ impl Supervisor<'_> {
                 Ok(Step::Continue)
             }
             Phase::Landing(_) => unreachable!("joined above"),
-            Phase::Triage(watch) => {
+            Phase::Recovery(watch) => {
                 let Some(outcome) = watch.poll(&*self.files)? else {
                     return Ok(Step::Continue);
                 };
-                let attempt = watch.attempt;
+                let (round, alert, attempt) = (watch.round, watch.alert, watch.attempt);
                 let duration_secs = watch.job.started.elapsed().as_secs();
                 let run = self.queue.run(slot.run.id())?;
-                let acted = outcome
-                    .map_err(|error| anyhow!(error))
-                    .and_then(|verdict| self.act_on_triage(&run, attempt, duration_secs, verdict));
+                let acted = match outcome {
+                    Ok(verdict) => {
+                        self.act_on_recovery(&run, round, alert, attempt, duration_secs, verdict)
+                    }
+                    Err(error) => Err(anyhow!("{error}")),
+                };
                 if let Err(error) = acted {
                     // Another process took the run's lease meanwhile: its
-                    // triage is the record.
+                    // round is the record.
                     if !self.queue.holds_lease(run.id(), &self.token)? {
                         return Ok(Step::Disowned);
                     }
-                    self.fail_triage(&run, attempt, format!("{error:#}"), duration_secs);
+                    self.fail_recovery(
+                        &run,
+                        round,
+                        alert,
+                        attempt,
+                        format!("{error:#}"),
+                        duration_secs,
+                    );
                 }
                 Ok(Step::Triaged(Box::new(self.queue.run(run.id())?)))
             }
@@ -1646,13 +1656,22 @@ impl Supervisor<'_> {
     }
 }
 
-/// Kill the headless job (a review or a triage) of a slot the supervisor
-/// stops watching.
+/// Kill the headless job (a review or a recovery job) of a slot the
+/// supervisor stops watching.
 fn stop_job(slot: &mut Slot) {
     match &mut slot.phase {
         Phase::Review(watch) => watch.job.stop(),
-        Phase::Triage(watch) => watch.job.stop(),
+        Phase::Recovery(watch) => watch.job.stop(),
+        _ => stop_recovery(slot),
+    }
+}
+
+/// Kill the recovery job of a live session's alert the slot's watch runs.
+fn stop_recovery(slot: &mut Slot) {
+    match &mut slot.phase {
         Phase::Session(watch) => watch.recovery.stop_job(),
+        Phase::Exiting(watch) => watch.recovery.stop_job(),
+        Phase::Resume(watch) => watch.recovery.stop_job(),
         _ => {}
     }
 }

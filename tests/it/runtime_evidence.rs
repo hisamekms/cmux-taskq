@@ -186,7 +186,9 @@ fn required_evidence_present_in_the_receipt_awaits_integration() {
 
 /// A resumed session that comes back without the evidence has not resolved
 /// the run: every attempt is `unresolved`, and once the resumes are used up
-/// the run is `failed` and waits for a person's `decide` ask. An `integrate`
+/// the run is `failed` and goes to its recovery job (`resume_exhausted`),
+/// which this provider cannot run: it waits to be recovered by hand. An
+/// `integrate`
 /// of such a run does not land either: it defers the run with the missing
 /// `checks`.
 #[test]
@@ -206,9 +208,12 @@ fn a_resume_or_integrate_without_the_required_evidence_does_not_land() {
     let finished = payloads(&detail, "resume_finished");
     assert_eq!(finished.len(), 3);
     assert!(finished.iter().all(|f| f["outcome"] == "unresolved"));
-    let asks = queue.asks(AskQuery::default()).unwrap();
-    assert_eq!(asks.len(), 1, "{asks:?}");
-    assert_eq!(asks[0].kind, AskKind::Decide);
+    assert_eq!(
+        payloads(&detail, "recovery_requested")[0]["alert"],
+        "resume_exhausted"
+    );
+    assert_eq!(payloads(&detail, "triage_failed").len(), 1);
+    assert!(queue.asks(AskQuery::default()).unwrap().is_empty());
     // Parked for a session again (as an older runtime left it), the run is
     // still not landed by `integrate`.
     Connection::open(&db)

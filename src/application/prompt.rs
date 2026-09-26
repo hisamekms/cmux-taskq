@@ -898,19 +898,19 @@ const TRIAGE_TAIL_BYTES: usize = 3000;
 /// `verify-N.log`, at most this many.
 const TRIAGE_LOGS: usize = 8;
 
-/// What the headless triage is asked (ADR-0024 decision 3): the task, the
-/// run's error, receipt, verification logs, final screen and events, the
-/// task's earlier runs, the verdict schema and the rule that a task with
-/// [`TRIAGE_RETRY_FAILURES`] failed or interrupted runs is not retried.
-/// `dir` is where the run's files are.
-pub fn triage_prompt(
+/// What the recovery job of a run that ended `failed` or `interrupted`
+/// reads beyond a live session's material (ADR-0047 decision 39, as the
+/// triage read it before): the run's error, receipt, verification logs,
+/// final screen and events, the task's earlier runs with their rounds, and
+/// the rules the runtime holds `retry` and `resume` to. `dir` is where the
+/// run's files are.
+pub fn ended_run_material(
     files: &dyn RunFiles,
     detail: &TaskDetail,
     run: &TaskRun,
-    resumes: usize,
+    resumes: crate::domain::resume::ResumeCount,
     dir: &Path,
-) -> Result<String> {
-    let task = &detail.task;
+) -> String {
     let failures = detail
         .runs
         .iter()
@@ -922,7 +922,10 @@ pub fn triage_prompt(
             .ok()
             .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
     };
-    let mut material = String::new();
+    let mut material = format!(
+        "Last error of the run:\n{}\n\n",
+        or_none(run.last_error().unwrap_or_default())
+    );
     let receipt = run.receipt_path().map(Path::new).and_then(read);
     material.push_str(&format!(
         "Receipt ({}):\n{}\n",
@@ -1002,7 +1005,7 @@ pub fn triage_prompt(
         .iter()
         .filter(|r| *r.id() != *run.id())
         .map(|r| {
-            let verdicts: Vec<String> = detail
+            let actions: Vec<String> = detail
                 .events
                 .iter()
                 .filter(|e| e.run_id.as_ref() == Some(r.id()) && e.kind == "triage_finished")
@@ -1013,67 +1016,54 @@ pub fn triage_prompt(
                 r.id(),
                 r.status().as_str(),
                 or_none(tail(r.last_error().unwrap_or_default(), 300)),
-                if verdicts.is_empty() {
+                if actions.is_empty() {
                     String::new()
                 } else {
-                    format!(" (triaged: {})", verdicts.join(", "))
+                    format!(" (recovered: {})", actions.join(", "))
                 }
             )
         })
         .collect();
-    let retry_rule = if failures >= TRIAGE_RETRY_FAILURES {
-        format!(
-            "This task has {failures} failed or interrupted runs, this one included: do not answer retry (the supervisor turns it into ask)."
-        )
-    } else {
-        format!(
-            "This task has {failures} failed or interrupted run(s), this one included; from {TRIAGE_RETRY_FAILURES} on, retry is not allowed and the supervisor turns it into ask."
-        )
-    };
-    let resume_rule = if resumes >= MAX_RESUME_ATTEMPTS {
-        format!("The run was resumed {resumes} times already: do not answer resume.")
-    } else {
-        format!(
-            "The run was resumed {resumes} time(s) (at most {MAX_RESUME_ATTEMPTS}); resume needs the run's worktree."
-        )
-    };
-    Ok(format!(
-        "You triage run {run_id} of dagq task {task_id} ({title}), which ended {status}. Decide what the supervisor does next.\n\
-         Read only: the material below, and the files it names if you need more (the run directory is {dir}, the worktree {worktree}). Do not change any file.\n\n\
-         Task description:\n{description}\n\n\
-         Acceptance criteria:\n{acceptance}\n\n\
-         Last error of the run:\n{last_error}\n\n\
-         {material}\n\
-         Earlier runs of the task:\n{earlier}\n\n\
-         Decide one verdict:\n\
-         - retry: the failure is transient or came from the environment (the machine slept, a process was killed, the session never started, an outage), and a new run from the current main is likely to succeed. The task goes back to ready and a new run starts from scratch; this run's work is not reused.\n\
-         - resume: this run's worktree holds useful work that its own session can finish with a concrete instruction (fix the failing test, commit and rewrite the receipt, rebase). instruction is what the session must do, written to it.\n\
-         - ask: a person has to decide: the task's instructions or acceptance look wrong or impossible, the same failure repeats, the work is no longer needed, or you cannot tell. instruction is the question for the person.\n\
-         Rules: {retry_rule} {resume_rule}\n\n\
-         Answer with one JSON object and nothing else, matching this schema:\n\
-         {{\"verdict\": \"retry\" | \"resume\" | \"ask\", \"reason\": string, \"instruction\": string}}\n\
-         reason is one or two sentences on why; instruction may be empty for retry.\n",
-        run_id = run.id(),
-        task_id = task.id(),
-        title = task.title(),
-        status = run.status().as_str(),
-        dir = dir.display(),
-        worktree = run.worktree_path().unwrap_or("none"),
-        description = or_none(task.description()),
-        acceptance = or_none(task.acceptance()),
-        last_error = or_none(run.last_error().unwrap_or_default()),
-        earlier = if earlier.is_empty() {
+    material.push_str(&format!(
+        "\nEarlier runs of the task:\n{}\n\n",
+        if earlier.is_empty() {
             "none".to_owned()
         } else {
             earlier.join("\n")
-        },
-    ))
+        }
+    ));
+    let retry_rule = if failures >= TRIAGE_RETRY_FAILURES {
+        format!(
+            "This task has {failures} failed or interrupted runs, this one included: do not choose retry (the runtime escalates it)."
+        )
+    } else {
+        format!(
+            "This task has {failures} failed or interrupted run(s), this one included; from {TRIAGE_RETRY_FAILURES} on, the runtime does not apply retry."
+        )
+    };
+    let resume_rule = if resumes.exhausted() {
+        format!(
+            "The run was resumed {} time(s) and its resumes are used up: do not choose resume.",
+            resumes.total()
+        )
+    } else {
+        format!(
+            "The run was resumed {} time(s) ({} of at most {MAX_RESUME_ATTEMPTS} counted); resume needs the run's worktree.",
+            resumes.total(),
+            resumes.counted
+        )
+    };
+    material.push_str(&format!("Rules: {retry_rule} {resume_rule}\n"));
+    material
 }
 
-/// What the runtime read for a recovery job of a live session's alert
-/// (ADR-0047 decision 39), at the time of the alert.
+/// What the runtime read for a recovery job (ADR-0047 decision 39), at the
+/// time of the alert.
 pub struct RecoveryMaterial<'a> {
     pub alert: RecoveryAlert,
+    /// For a run that ended: [`ended_run_material`]. `None` for a live
+    /// session.
+    pub ended: Option<String>,
     /// The alert's own facts (`recovery_requested`'s payload).
     pub facts: &'a Value,
     pub workspace: &'a str,
@@ -1103,16 +1093,32 @@ fn recovery_action_help(action: &str) -> &'static str {
             "{\"action\": \"send_instruction\", \"instruction\": string}: type this instruction into the session once (it must be idle at its prompt), for example to stop a background command it waits for and rerun the tests."
         }
         "wait" => {
-            "{\"action\": \"wait\", \"recheck_after_secs\": n}: do nothing now; if the alert still holds after n seconds (at most 3600), another recovery job runs. The work looks healthy and is only slow."
+            "{\"action\": \"wait\", \"recheck_after_secs\": n}: do nothing now; if the alert still holds after n seconds (at most 3600), another recovery job runs. The work looks healthy and is only slow, or what holds it passes by itself."
+        }
+        "retry" => {
+            "{\"action\": \"retry\"}: make the task ready again for a new run from the current main. Only for a run whose branch holds no commit of its own (nothing is thrown away); a run with commits needs retry_inherit or a person. Use it when the failure came from the environment (the machine slept, a process was killed, the session never started, an outage)."
+        }
+        "retry_inherit" => {
+            "{\"action\": \"retry_inherit\"}: make the task ready again for a new run that carries this run's branch over onto the current main. Only for a run whose branch has commits, and once per task."
+        }
+        "resume" => {
+            "{\"action\": \"resume\", \"instruction\": string}: send the run back to a session of its own in its worktree, with the instruction (what to do: fix the failing test, commit and rewrite the receipt, rebase) added to the resolution request. Only while its resumes are not used up."
+        }
+        "answer_known_dialog" => {
+            "{\"action\": \"answer_known_dialog\", \"dialog\": \"background_work\" | \"settings_panel\"}: send the fixed keys to one of the known dialogs on the screen (Background work is running, only after the supervisor's /exit with a clean worktree and the receipt at HEAD; the Settings / Usage panel). Never another dialog."
+        }
+        "close_and_proceed" => {
+            "{\"action\": \"close_and_proceed\"}: close the session's workspace and go on to land. Only when the review passed, the worktree is clean and the receipt names its HEAD, the reviewed commit."
         }
         _ => "",
     }
 }
 
-/// What the recovery job of a live session's alert is asked (ADR-0047
-/// decisions 39 and 40): the alert, the task, the screen, the run's
-/// processes, the worktree's state and the run's earlier repairs, the
-/// allowed actions and the verdict schema.
+/// What the recovery job of an alert is asked (ADR-0047 decisions 39 and
+/// 40): the alert, the task, the screen, the run's processes, the
+/// worktree's state and the run's earlier repairs, for a run that ended
+/// also its error, receipt, logs and events, then the allowed actions and
+/// the verdict schema.
 pub fn recovery_prompt(
     task: &Task,
     run: &TaskRun,
@@ -1154,30 +1160,48 @@ pub fn recovery_prompt(
         .collect::<Vec<_>>()
         .join("\n");
     Ok(format!(
-        "You are dagq's recovery job (attempt {attempt}) for run {run_id} of task {task_id} ({title}), whose session in workspace {workspace} is still running. The supervisor raised the alert {alert}: {meaning}\n\
+        "You are dagq's recovery job (attempt {attempt}) for run {run_id} of task {task_id} ({title}), {state}. The supervisor raised the alert {alert}: {meaning}\n\
          Decide whether the runtime can repair it with one of the allowed actions below, or whether a person has to look.\n\
          Read only: the material below, and the files it names if you need more (the worktree is {worktree}). Do not change any file and do not run commands; the runtime applies your verdict.\n\n\
          Task description:\n{description}\n\n\
          Acceptance criteria:\n{acceptance}\n\n\
          Alert facts:\n{facts}\n\n\
+         {ended}\
          Last lines of the session's screen:\n{screen}\n\n\
          Processes of the run (working directory in the worktree, or under the session's wrapper; the wrapper and the agent themselves are not listed):\n{processes}\n\n\
          Worktree: HEAD {head}, receipt commit {receipt}, git status:\n{status}\n\n\
          Earlier recovery verdicts and repairs of this run:\n{history}\n\n\
          Allowed actions:\n{actions}\n\
-         Not allowed, ever: cancelling the task, retrying a run that has commits, editing the task, landing without review, writing to main, pushing, deleting branches or worktrees, touching anything outside this run's worktree and workspace, writing the queue database, sending keys to a dialog. If the repair needs any of these, escalate.\n\n\
+         Not allowed, ever: cancelling the task, retrying a run that has commits, editing the task, landing without review, writing to main, pushing, deleting branches or worktrees, touching anything outside this run's worktree and workspace, writing the queue database, sending keys to a dialog that is not a known one. If the repair needs any of these, escalate.\n\n\
          Answer with one JSON object and nothing else, matching this schema:\n\
          {{\"verdict\": \"repair\" | \"escalate\", \"confidence\": \"high\" | \"low\", \"diagnosis\": string, \"actions\": [action, ...], \"question\": string, \"options\": [string, ...], \"reason_category\": \"recovery_failed\" | \"discard\" | \"scope\"}}\n\
          diagnosis says what you found in one or two sentences. repair needs at least one action and is applied only with confidence high; with confidence low, or with escalate, a person is asked, with your actions as the recommendation, question as the question and options added to theirs. reason_category says why a person is needed: recovery_failed when you cannot repair it or are not sure, discard when the work would be thrown away, scope when it needs a permission you do not have.\n",
         run_id = run.id(),
         task_id = task.id(),
         title = task.title(),
-        workspace = material.workspace,
+        state = match &material.ended {
+            Some(_) => format!("which ended {}; its session is gone", run.status().as_str()),
+            None => format!(
+                "whose session in workspace {} is still running",
+                material.workspace
+            ),
+        },
+        ended = material.ended.as_deref().unwrap_or_default(),
         alert = material.alert.as_str(),
         meaning = match material.alert {
             RecoveryAlert::LongBackground =>
                 "background work the session started has run longer than the threshold, and the session waits for it.",
-            _ => "the session looks stuck.",
+            RecoveryAlert::Failed =>
+                "the run failed (its receipt said failed, its validation or landing failed, or its session exited without finishing).",
+            RecoveryAlert::Interrupted =>
+                "the run's session died and the supervisor recovered the run as interrupted.",
+            RecoveryAlert::ResumeExhausted =>
+                "the run still needed a session after its last resume, so the supervisor stopped resuming it.",
+            RecoveryAlert::StuckExit =>
+                "the session did not exit after the supervisor's /exit (or the /exit never reached it), and the runtime's own repairs did not apply.",
+            RecoveryAlert::PromptWaiting =>
+                "the session waits at a dialog the runtime does not answer by itself.",
+            RecoveryAlert::Stalled => "the session looks stuck.",
         },
         worktree = run.worktree_path().unwrap_or("none"),
         description = or_none(task.description()),

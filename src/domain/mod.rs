@@ -323,37 +323,6 @@ pub const MAX_REVISE_ATTEMPTS: usize = 2;
 /// supervisor acts on once answered (ADR-0027, ADR-0022 decision 3).
 pub const LANDING_OPTIONS: &[&str] = &["land", "send_back", "cancel"];
 
-// The verdict of the supervisor's headless triage of a `failed` or
-// `interrupted` run (ADR-0024 decision 3): `retry` makes the task `ready`
-// for a new run, `resume` sends the run to a session of its own as
-// `needs_session`, `ask` waits for a person in a `decide` ask.
-string_enum!(TriageDecision {
-    Retry => "retry",
-    Resume => "resume",
-    Ask => "ask",
-});
-
-/// What the headless triage prints on stdout: one JSON object. `instruction`
-/// is what the resumed session is asked to do for `resume`, the question for
-/// `ask`, and may be empty for `retry`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct TriageVerdict {
-    pub verdict: TriageDecision,
-    pub reason: String,
-    #[serde(default)]
-    pub instruction: String,
-}
-
-impl TriageVerdict {
-    /// The verdict in the triage's stdout, found the way
-    /// [`ReviewVerdict::parse`] finds the review's.
-    pub fn parse(stdout: &str) -> Result<Self, String> {
-        parse_json_object(stdout)
-            .map_err(|error| format!("the triage printed no verdict JSON: {error}"))
-    }
-}
-
 /// The whole text as one JSON object of `T`, or else the outermost `{...}`
 /// in it (a model may wrap the object in a fence or a sentence).
 pub(crate) fn parse_json_object<T: serde::de::DeserializeOwned>(
@@ -366,42 +335,54 @@ pub(crate) fn parse_json_object<T: serde::de::DeserializeOwned>(
     })
 }
 
-/// The options of the `decide` ask a triage opens, which the supervisor acts
-/// on once answered: `retry` and `cancel` move the task, `resume` the run.
+/// The options of the `decide` ask the recovery job of a `failed` or
+/// `interrupted` run escalates to, which the supervisor acts on once
+/// answered: `retry` and `cancel` move the task, `resume` the run.
 pub const TRIAGE_OPTIONS: &[&str] = &["retry", "resume", "cancel"];
 
-/// A task with this many `failed` or `interrupted` runs, the triaged one
-/// included, is not retried by the triage: a `retry` verdict becomes an
+/// A task with this many `failed` or `interrupted` runs, the recovered one
+/// included, is not retried by the recovery job: its `retry` becomes an
 /// ask, so a failure that repeats reaches a person.
 pub const TRIAGE_RETRY_FAILURES: usize = 2;
 
-/// Where the triage of a `failed` or `interrupted` run stands, from the
-/// latest of its `resume_started`, `triage_finished` and `triage_failed`: a
-/// run resumed since its last triage is triaged again when it fails again.
+/// Where the recovery of a `failed` or `interrupted` run stands, from the
+/// latest of its `resume_started`, `triage_finished` and `triage_failed`
+/// (the recovery job's rounds keep the triage's event names, ADR-0047
+/// decision 40): a run resumed since its last round is taken again when it
+/// fails again.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TriageState {
-    /// Not triaged yet: the supervisor triages it.
+    /// Not taken yet: the supervisor starts its recovery job.
     Pending,
-    /// The headless triage failed: a person decides.
+    /// The job's `wait` holds it until `until` (unix seconds): then the
+    /// job runs again if the run is still where it was.
+    Waiting { until: i64 },
+    /// The recovery job failed: a person recovers the run by hand.
     Failed,
-    /// The verdict was acted on.
+    /// The verdict was acted on (or its ask waits for a person).
     Finished,
 }
 
+/// `triage_decided`'s `action` when a person chose one of the recovery
+/// job's own options: the run goes back to the job, whose next round reads
+/// the answer.
+pub const RECOVER_AGAIN: &str = "recover";
+
 pub fn triage_state(events: &[RunEvent]) -> TriageState {
-    match events
-        .iter()
-        .rev()
-        .find(|e| {
-            matches!(
-                e.kind.as_str(),
-                "resume_started" | "triage_finished" | "triage_failed"
-            )
-        })
-        .map(|e| e.kind.as_str())
-    {
-        Some("triage_finished") => TriageState::Finished,
-        Some("triage_failed") => TriageState::Failed,
+    let last = events.iter().rev().find(|e| {
+        matches!(
+            e.kind.as_str(),
+            "resume_started" | "triage_finished" | "triage_failed"
+        ) || (e.kind == "triage_decided" && e.payload["action"] == RECOVER_AGAIN)
+    });
+    match last {
+        Some(e) if e.kind == "triage_finished" && e.payload["action"] == "wait" => {
+            TriageState::Waiting {
+                until: e.payload["recheck_at"].as_i64().unwrap_or(0),
+            }
+        }
+        Some(e) if e.kind == "triage_finished" => TriageState::Finished,
+        Some(e) if e.kind == "triage_failed" => TriageState::Failed,
         _ => TriageState::Pending,
     }
 }
@@ -1150,6 +1131,10 @@ pub enum AttentionNext {
     /// The headless triage failed (`triage_failed`): a person decides
     /// whether to `ready` the task again, resume or cancel.
     TriageByHand,
+    /// The recovery job of a live session's alert failed
+    /// (`recovery_failed`, ADR-0047 decision 40): a person looks at the
+    /// session and recovers it by hand, until the session moves on.
+    RecoverByHand,
     /// The headless plan review of a proposal failed
     /// (`plan_review_failed`): a person readies its tasks with the bypass
     /// or has a planner fix and submit them again (ADR-0041 decision 17).
@@ -1201,6 +1186,7 @@ impl fmt::Display for AttentionNext {
             }
             Self::Triaging => f.write_str("triaging (runtime)"),
             Self::TriageByHand => f.write_str("triage by hand"),
+            Self::RecoverByHand => f.write_str("recover by hand"),
             Self::PlanReviewByHand => f.write_str("plan review by hand"),
             Self::CheckPlanner => f.write_str("check the planner"),
             Self::DecideDraft => f.write_str("decide the draft in a planner"),
@@ -1229,6 +1215,7 @@ pub const ATTENTION_KINDS: &[&str] = &[
     "resume_finished",
     "review_failed",
     "triage_failed",
+    "recovery_failed",
     "plan_review_failed",
     "planner_unresponsive",
     "draft_planner_exhausted",
@@ -1325,9 +1312,9 @@ pub const ASK_EVENT_KINDS: &[&str] = &[
 /// run no longer running and its `ask_delivery_failed` are the inbox's.
 /// The answer of an `approve_landing` ask the supervisor applies
 /// (`runtime_delivers: true`: one of [`LANDING_OPTIONS`] for a run awaiting
-/// integration) is not one either, nor that of a triage's `decide` ask
-/// (`runtime_delivers: true`: one of [`TRIAGE_OPTIONS`] for a `failed` or
-/// `interrupted` run).
+/// integration) is not one either, nor that of the recovery job's `decide`
+/// ask (`runtime_delivers: true`: one of the ask's options, [`TRIAGE_OPTIONS`]
+/// or the job's own, for a `failed` or `interrupted` run).
 pub fn event_attention(kind: &str, payload: &serde_json::Value) -> Option<AttentionNext> {
     let status = payload
         .get("status")
@@ -1345,6 +1332,9 @@ pub fn event_attention(kind: &str, payload: &serde_json::Value) -> Option<Attent
         // The supervisor triages a failed run and acts on the verdict
         // (ADR-0024 decision 3); only a triage that failed is a person's.
         ("triage_failed", _) => Some(AttentionNext::TriageByHand),
+        // The recovery job of a live session's alert failed (ADR-0047
+        // decision 40): the session is a person's to recover by hand.
+        ("recovery_failed", _) => Some(AttentionNext::RecoverByHand),
         // The supervisor reviews a submitted proposal and acts on the
         // verdict (ADR-0041 decision 11); only a plan review that failed
         // and a planner that did not answer a revise are a person's.
@@ -2190,6 +2180,11 @@ mod attention_tests {
         );
         assert_eq!(Triaging.to_string(), "triaging (runtime)");
         assert_eq!(TriageByHand.to_string(), "triage by hand");
+        assert_eq!(RecoverByHand.to_string(), "recover by hand");
+        assert_eq!(
+            event_attention("recovery_failed", &serde_json::json!({})),
+            Some(RecoverByHand)
+        );
         // The stuck_exit ask is the attention of a session holding `/exit`.
         assert_eq!(run_attention(RunStatus::Running, true, false, true), None);
         assert_eq!(run_attention(RunStatus::Running, false, false, true), None);
@@ -2256,26 +2251,6 @@ mod attention_tests {
     }
 
     #[test]
-    fn triage_verdict_is_read_from_the_output_and_instruction_defaults_to_empty() {
-        let verdict = TriageVerdict::parse(
-            "Here it is:\n```json\n{\"verdict\": \"resume\", \"reason\": \"r\", \"instruction\": \"fix it\"}\n```",
-        )
-        .unwrap();
-        assert_eq!(verdict.verdict, TriageDecision::Resume);
-        assert_eq!(verdict.instruction, "fix it");
-        let verdict =
-            TriageVerdict::parse("{\"verdict\": \"retry\", \"reason\": \"flaky\"}").unwrap();
-        assert_eq!(verdict.verdict, TriageDecision::Retry);
-        assert!(verdict.instruction.is_empty());
-        let error = TriageVerdict::parse("test provider").unwrap_err();
-        assert!(
-            error.starts_with("the triage printed no verdict JSON"),
-            "{error}"
-        );
-        assert!(TriageVerdict::parse("{\"verdict\": \"land\", \"reason\": \"x\"}").is_err());
-    }
-
-    #[test]
     fn triage_state_follows_the_latest_triage_or_resume() {
         let event = |id: i64, kind: &str| RunEvent {
             id: EventId::new(id),
@@ -2287,6 +2262,15 @@ mod attention_tests {
             created_at: String::new(),
         };
         assert_eq!(triage_state(&[]), TriageState::Pending);
+        let mut again = event(10, "triage_decided");
+        again.payload = serde_json::json!({"action": "recover", "answer": "split it"});
+        assert_eq!(
+            triage_state(&[event(4, "triage_finished"), again]),
+            TriageState::Pending
+        );
+        let mut wait = event(9, "triage_finished");
+        wait.payload = serde_json::json!({"action": "wait", "recheck_at": 42});
+        assert_eq!(triage_state(&[wait]), TriageState::Waiting { until: 42 });
         let mut events = vec![event(1, "validation_finished"), event(2, "triage_started")];
         assert_eq!(triage_state(&events), TriageState::Pending);
         events.push(event(3, "triage_failed"));

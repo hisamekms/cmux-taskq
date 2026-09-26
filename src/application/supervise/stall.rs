@@ -436,7 +436,7 @@ impl StallWatch {
             // A Settings panel left open would take the nudge: it is closed
             // first, and the nudge follows on a later tick (ADR-0047
             // decision 29).
-            if answer_known_dialog(sv, run, workspace, &screen, false)? {
+            if answer_known_dialog(sv, run, workspace, &screen, false, None)? {
                 return Ok(None);
             }
         }

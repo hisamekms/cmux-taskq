@@ -9,9 +9,8 @@ use super::sqlite::{SqliteQueue, enum_col, json_col};
 use crate::domain::Ask;
 use crate::domain::{
     ANSWERED_BY_PERSON, ANSWERED_BY_RUNTIME, AskId, AskKind, AskOutcome, AskReason,
-    HOLD_AFFECTED_HEADING, HoldOutcome, LANDING_OPTIONS, NewAsk, NewHold, RunId, RunStatus,
-    TRIAGE_OPTIONS, TaskId, UPDATE_FAILED_OPTIONS, UPDATE_FAILED_SUBJECT, check_ask_kind,
-    check_event_target, option_index,
+    HOLD_AFFECTED_HEADING, HoldOutcome, LANDING_OPTIONS, NewAsk, NewHold, RunId, RunStatus, TaskId,
+    UPDATE_FAILED_OPTIONS, UPDATE_FAILED_SUBJECT, check_ask_kind, check_event_target, option_index,
 };
 
 pub use crate::application::AskQuery;
@@ -211,16 +210,17 @@ impl SqliteQueue {
             && ask.asked_by == super::runtime_store::TRIAGE_ASKER
             && let Some(run_id) = ask.run_id.as_ref()
         {
-            // The supervisor retries, resumes or cancels a triaged run as
-            // answered (ADR-0024 decision 3); any other answer, or one for
-            // a run that moved on, is a person's to read.
+            // The supervisor retries, resumes or cancels a recovered run as
+            // answered, and hands any other option the ask offered (the
+            // recovery job's own) back to the recovery job (ADR-0047
+            // decision 40); a free answer, or one for a run that moved on,
+            // is a person's to read.
             let status: String =
                 tx.query_row("SELECT status FROM task_runs WHERE id=?1", [run_id], |r| {
                     r.get(0)
                 })?;
             payload["runtime_delivers"] = json!(
                 (status == RunStatus::Failed.as_str() || status == RunStatus::Interrupted.as_str())
-                    && TRIAGE_OPTIONS.contains(&text.trim())
                     && ask.options.iter().any(|option| option == text.trim())
             );
         }

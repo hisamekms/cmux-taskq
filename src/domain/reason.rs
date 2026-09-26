@@ -217,6 +217,9 @@ fn explains_last_error(event: &RunEvent) -> bool {
         // it to a person after its last resume) replaced `last_error`;
         // a retry or an ask left it, and those carry no code.
         "triage_finished" | "triage_decided" => event.payload.get(CODE_KEY).is_some(),
+        // The runtime failed the run whose resumes were used up and handed
+        // it to the recovery job (ADR-0047 decision 39).
+        "recovery_requested" => event.payload.get(CODE_KEY).is_some(),
         // A resume's own error leaves `last_error` as it was; a rewritten
         // `failed` receipt replaces it.
         "resume_finished" => status == Some("failed"),
@@ -412,6 +415,16 @@ mod tests {
         let mut asked = events.clone();
         asked.push(event("triage_finished", json!({"action": "ask"})));
         assert_eq!(last_error_code(&asked), Some(ReasonCode::SessionKilled));
+        asked.push(event(
+            "recovery_requested",
+            json!({"alert": "failed", "attempt": 2}),
+        ));
+        assert_eq!(last_error_code(&asked), Some(ReasonCode::SessionKilled));
+        asked.push(event(
+            "recovery_requested",
+            json!({"alert": "resume_exhausted", "code": "resume_exhausted"}),
+        ));
+        assert_eq!(last_error_code(&asked), Some(ReasonCode::ResumeExhausted));
         let mut failed = events.clone();
         failed.push(event(
             "resume_finished",

@@ -1143,11 +1143,12 @@ fn conflict_only_resumes_are_not_counted_and_a_used_up_run_is_retried_with_its_b
 }
 
 /// A resume that cannot start, or a session that cannot resolve the run,
-/// uses up an attempt; after the third the supervisor stops resuming it and
-/// hands it to a person (ADR-0024's Consequences): the run becomes `failed`
-/// with a `decide` ask for the inbox (`retry` or `cancel`), recorded as the
-/// runtime's `triage_finished` so no headless triage runs, and the answer is
-/// applied like a triage's. The sessions behave like Claude: they
+/// uses up an attempt; after the third the supervisor stops resuming it:
+/// the run becomes `failed` with its `resume_exhausted` alert recorded
+/// (`recovery_requested`, ADR-0047 decision 39), and the recovery job
+/// takes it. Its escalation is a `decide` ask for the inbox (`retry` or
+/// `cancel` and the job's options: resuming is no longer one), and the
+/// answer is applied like any other of the job's asks. The sessions behave like Claude: they
 /// never exit by themselves, so the supervisor sends `/exit` once when one
 /// goes idle without a resolving receipt, or when one never goes idle within
 /// the resume timeout. The conflict that parked the run is made to count
@@ -1191,8 +1192,14 @@ fn resuming_stops_after_three_attempts() {
         "await_message; mark=\"$(dirname \"$RECEIPT\")/went-idle\"; if [ ! -f \"$mark\" ]; then : > \"$mark\"; idle; fi; await_exit",
     );
     let cursor = queue.latest_event_id().unwrap().as_i64();
-    let outcome = supervise(&db, &repo, &backend).unwrap();
-    backend.join();
+    let reviewer =
+        TestReviewer::new(&[verdict("pass", &[], "unused")]).with_triages(&[recovery(json!({
+            "verdict": "escalate",
+            "confidence": "high",
+            "diagnosis": "the conflict needs a decision on the design",
+            "options": ["split the task"],
+        }))]);
+    let outcome = supervise_reviewed(&db, &repo, &backend, &reviewer);
     assert_eq!(outcome["errors"], json!([]), "{outcome}");
     let detail = queue.show(TaskId::new(2)).unwrap();
     assert_eq!(detail.runs[0].status(), RunStatus::Failed);
@@ -1219,30 +1226,45 @@ fn resuming_stops_after_three_attempts() {
     assert!(queue.run_leases().unwrap().is_empty());
     assert_eq!(backend.exits_sent.load(Ordering::SeqCst), 2);
     assert_eq!(backend.closed().len(), 2 + 2); // two workers, two resumes
-    // The used-up run goes to the inbox as the triage's `decide` ask, and
-    // no headless triage runs for it.
+    // The used-up run is the recovery job's (`resume_exhausted`), which
+    // escalates it as a `decide` ask.
+    let requested = payloads(&detail, "recovery_requested");
+    assert_eq!(requested.len(), 1, "{:?}", event_kinds(&detail));
+    assert_eq!(requested[0]["alert"], "resume_exhausted");
+    assert_eq!(requested[0]["attempt"], 1);
+    assert_eq!(requested[0]["by"], "runtime");
+    assert_eq!(requested[0]["code"], "resume_exhausted");
+    assert_eq!(requested[0]["previous_status"], "needs_session");
+    assert_eq!(requested[0]["status"], "failed");
+    assert_eq!(payloads(&detail, "triage_started").len(), 1);
+    let (prompt, _) = &reviewer.triage_prompts()[0];
+    assert!(
+        prompt.contains("raised the alert resume_exhausted"),
+        "{prompt}"
+    );
+    assert!(prompt.contains("do not choose resume"), "{prompt}");
     let asks = other_asks(&mut queue, false);
     assert_eq!(asks.len(), 1, "{asks:?}");
     let ask = asks[0].clone();
     assert_eq!(ask.kind, AskKind::Decide);
     assert_eq!(ask.run_id.as_ref(), Some(run.id()));
     assert_eq!(ask.asked_by, "supervisor");
-    assert_eq!(ask.options, ["retry", "cancel"]);
-    assert!(
-        ask.question
-            .contains("was resumed 3 times (at most 3) and still needs a session"),
-        "{}",
-        ask.question
-    );
+    assert_eq!(ask.options, ["retry", "cancel", "split the task"]);
+    for part in [
+        "alert: resume_exhausted",
+        "Diagnosis: the conflict needs a decision on the design",
+        "resumed 3 times (at most 3) and still needs a session",
+    ] {
+        assert!(ask.question.contains(part), "{part}: {}", ask.question);
+    }
     assert!(ask.question.contains(&reason), "{}", ask.question);
+    assert!(!ask.question.contains(" resume: "), "{}", ask.question);
     let finished = payloads(&detail, "triage_finished");
     assert_eq!(finished.len(), 1, "{:?}", event_kinds(&detail));
-    assert_eq!(finished[0]["by"], "runtime");
+    assert_eq!(finished[0]["alert"], "resume_exhausted");
     assert_eq!(finished[0]["action"], "ask");
     assert_eq!(finished[0]["ask_id"], json!(ask.id));
-    assert_eq!(finished[0]["previous_status"], "needs_session");
     assert_eq!(finished[0]["status"], "failed");
-    assert!(payloads(&detail, "triage_started").is_empty());
     // The ask is the one attention; the exhausted resume is none.
     let events = dagq::watch::events(&db, EventId::new(cursor), 100, false).unwrap();
     let listed = events["events"].as_array().unwrap();
@@ -1271,6 +1293,81 @@ fn resuming_stops_after_three_attempts() {
         json!("cancel")
     );
     assert!(queue.read_ask(ask.id).unwrap().closed_at.is_some());
+}
+
+/// ADR-0047 decisions 39 and 40: a run whose counted resumes are used up
+/// is not the runtime's automatic retry (its last park was not a conflict
+/// alone), so its `resume_exhausted` alert goes to the recovery job, whose
+/// `retry_inherit` holds (its branch has the reviewed commit, and the task
+/// was not retried that way before): the task is ready again and the next
+/// run carries the branch over.
+#[test]
+fn a_used_up_run_is_retried_with_its_branch_by_its_recovery_job() {
+    let (_dir, repo, db) = fixture();
+    let backend = TestWorkspace::new(&db, false, VALID_AGENT);
+    let (run, _) = parked_conflict(&repo, &db, &backend);
+    count_resumes_of_parked(&db);
+    let mut queue = SqliteQueue::open(&db).unwrap();
+    for attempt in 1..=3 {
+        queue
+            .record_runtime_event(run.id(), "resume_started", json!({"attempt": attempt}))
+            .unwrap();
+        queue
+            .record_runtime_event(
+                run.id(),
+                "resume_finished",
+                json!({"attempt": attempt, "outcome": "unresolved", "status": "needs_session"}),
+            )
+            .unwrap();
+    }
+    // The next run of the task fails at once and is left to a person.
+    backend.script_for(2, "exit 7");
+    let reviewer = TestReviewer::new(&[verdict("pass", &[], "unused")]).with_triages(&[repair(
+        json!({"action": "retry_inherit"}),
+        "the reviewed work only needs rebasing onto the new main",
+    )]);
+    let outcome = supervise_reviewed(&db, &repo, &backend, &reviewer);
+    assert_eq!(outcome["errors"], json!([]), "{outcome}");
+    let detail = queue.show(TaskId::new(2)).unwrap();
+    assert_eq!(detail.runs.len(), 2, "{:?}", event_kinds(&detail));
+    let events = queue.run_events(run.id()).unwrap();
+    let of = |kind: &str| -> Vec<Value> {
+        events
+            .iter()
+            .filter(|e| e.kind == kind)
+            .map(|e| e.payload.clone())
+            .collect()
+    };
+    let requested = of("recovery_requested");
+    assert_eq!(requested.len(), 1);
+    assert_eq!(requested[0]["alert"], "resume_exhausted");
+    let finished = of("triage_finished");
+    assert_eq!(finished.len(), 1);
+    assert_eq!(finished[0]["action"], "retry_inherit");
+    assert_eq!(finished[0]["alert"], "resume_exhausted");
+    assert_eq!(finished[0]["inherit"]["head"], json!(run.result_commit()));
+    let repaired = of("auto_repaired");
+    assert_eq!(repaired.len(), 1, "{repaired:?}");
+    assert_eq!(repaired[0]["layer"], "recovery");
+    assert_eq!(repaired[0]["repair"], "retry_inherit");
+    assert_eq!(repaired[0]["alert"], "resume_exhausted");
+    assert_eq!(
+        of("recovery_finished")[0]["applied"],
+        json!(["retry_inherit"])
+    );
+    let next = &detail.runs[1];
+    let inherited: Vec<&Value> = detail
+        .events
+        .iter()
+        .filter(|e| e.kind == "run_inherited" && e.run_id.as_ref() == Some(next.id()))
+        .map(|e| &e.payload)
+        .collect();
+    assert_eq!(inherited[0]["inherit_from_run"], json!(run.id()));
+    assert!(
+        other_asks(&mut queue, true)
+            .iter()
+            .all(|ask| ask.kind != AskKind::Decide)
+    );
 }
 
 /// A resumed session that does not exit within the exit timeout of `/exit`

@@ -208,15 +208,12 @@ impl Supervisor<'_> {
     /// End a `needs_session` run whose resumes are used up (ADR-0047
     /// decision 24). A run whose review passed and that waits only because
     /// of a conflict with main is retried with its branch carried over, once
-    /// per task ([`Self::retry_inheriting`]). Otherwise a person decides
-    /// through the triage's `decide` ask (ADR-0024's Consequences): no
-    /// headless triage runs, since resuming is no longer an option and a
-    /// run that did not resolve in its sessions is not retried without a
-    /// person. The ask (options `retry` and `cancel`, applied like a
-    /// triage's answer) is opened first, then the run becomes `failed` with
-    /// `triage_finished` naming the ask, and the workspaces it left open
-    /// are closed as after a triage. A run of a task that moved on is left
-    /// alone.
+    /// per task ([`Self::retry_inheriting`]). Otherwise the run becomes
+    /// `failed` with its `resume_exhausted` alert recorded
+    /// (`recovery_requested`), and the recovery job decides what follows
+    /// (ADR-0047 decision 39): resuming is no longer one of its options. The
+    /// workspaces it left open are closed as after a recovery round. A run
+    /// of a task that moved on is left alone.
     pub(super) fn exhaust_resumes(&mut self, run: &TaskRun, resumes: ResumeCount) -> Result<()> {
         let detail = self.queue.show(run.task_id())?;
         if detail.task.status() != TaskStatus::InProgress
@@ -237,61 +234,21 @@ impl Supervisor<'_> {
             match self.inherited_head(run) {
                 Ok(Some(head)) => return self.retry_inheriting(run, head, &reason),
                 Ok(None) => {
-                    info!(run_id = %run.id(), "run {}: its branch has no commit to carry over; asking a person", run.id());
+                    info!(run_id = %run.id(), "run {}: its branch has no commit to carry over; the recovery job takes it", run.id());
                 }
                 Err(error) => {
-                    warn!(run_id = %run.id(), error = %format_args!("{error:#}"), "run {}: its branch could not be kept for a retry: {error:#}; asking a person", run.id());
+                    warn!(run_id = %run.id(), error = %format_args!("{error:#}"), "run {}: its branch could not be kept for a retry: {error:#}; the recovery job takes it", run.id());
                 }
             }
         }
-        let mut question = format!(
-            "Run {} of task {} ({}) was {resumed} and still needs a session, so the supervisor stops resuming it.\nLast error: {}",
-            run.id(),
-            run.task_id(),
-            detail.task.title(),
-            or_none(tail(&last_error, 500))
-        );
-        if let Some(run_dir) = &run.run_dir() {
-            question.push_str(&format!("\nRun directory: {run_dir}"));
-        }
-        question.push_str(
-            "\nretry: make the task ready for a new run. cancel: cancel the task. To change the task first, answer with what to change instead.",
-        );
-        let outcome = ask::ask(
-            &mut *self.queue,
-            &self.layout.repo_root,
-            NewAsk {
-                kind: AskKind::Decide,
-                task_id: None,
-                run_id: Some(run.id().clone()),
-                question,
-                options: EXHAUSTED_OPTIONS.iter().map(|o| (*o).to_owned()).collect(),
-                asked_by: TRIAGE_ASKER.to_owned(),
-                reason_category: AskReason::RecoveryFailed,
-                finding_id: None,
-            },
-            self.cmux,
-        )?;
-        let ask_id = AskId::new(outcome["id"].as_i64().context("ask returned no id")?);
-        let Some(failed) =
-            self.queue
-                .exhaust_resumes(run.id(), &Exhaustion::Ask(ask_id), &reason)?
+        let Some(failed) = self
+            .queue
+            .exhaust_resumes(run.id(), &Exhaustion::Recover, &reason)?
         else {
-            // The run changed meanwhile (another supervisor took it): an ask
-            // this pass opened has nothing left to decide.
-            if outcome["created"] == true {
-                self.queue.answer_as(
-                    ask_id,
-                    "withdrawn: the run changed before it was handed over",
-                    crate::domain::ANSWERED_BY_RUNTIME,
-                )?;
-                self.queue.close_ask(ask_id)?;
-            }
             return Ok(());
         };
-        warn!(run_id = %failed.id(), task_id = %failed.task_id(), "run {} of task {} used up its resumes; it is failed and waits for ask {ask_id}", failed.id(), failed.task_id());
+        warn!(run_id = %failed.id(), task_id = %failed.task_id(), "run {} of task {} used up its resumes; it is failed and goes to the recovery job (resume_exhausted)", failed.id(), failed.task_id());
         self.close_open_workspaces(&failed, WorkspaceCloser::Triage)?;
-        self.note_triaged(&failed);
         Ok(())
     }
     /// The commit of the run's branch a retry carries over: its validated
@@ -299,7 +256,7 @@ impl Supervisor<'_> {
     /// worktree when no rebase is stopped half way there, kept
     /// under `refs/dagq/runs/<run-id>` so that it outlives the branch.
     /// `None` when the branch holds nothing on top of the run's base.
-    fn inherited_head(&mut self, run: &TaskRun) -> Result<Option<CommitSha>> {
+    pub(super) fn inherited_head(&mut self, run: &TaskRun) -> Result<Option<CommitSha>> {
         // The reviewed commit, not whatever an unresolved session left in
         // the worktree (a rebase stopped half way, say).
         let head = match (run.result_commit(), run.worktree_path().map(Path::new)) {
@@ -446,6 +403,7 @@ impl Supervisor<'_> {
             silent: false,
             exit_for_silence: false,
             stale: None,
+            recovery: RecoveryWatch::default(),
         })
     }
     /// The resumed session ended, or resolved the run: record
@@ -643,8 +601,9 @@ pub(super) fn landed_since(
     Ok(landed)
 }
 
-/// The options of the `decide` ask of a run whose resumes are used up: a
-/// subset of [`TRIAGE_OPTIONS`], applied the same way.
+/// The options of the `decide` ask the recovery job of a run whose resumes
+/// are used up escalates to: a subset of [`TRIAGE_OPTIONS`], applied the
+/// same way.
 pub(super) const EXHAUSTED_OPTIONS: &[&str] = &["retry", "cancel"];
 
 /// Watches one resumed session: its wrapper registration, the resolution
@@ -692,6 +651,9 @@ pub(super) struct ResumeWatch {
     /// Idle with a receipt for an older commit: the one request of this
     /// attempt to rewrite it (task 357).
     pub(super) stale: Option<StaleNudge>,
+    /// The recovery job of a session that holds the `/exit` back past the
+    /// exit timeout (`stuck_exit`, ADR-0047 decision 39).
+    pub(super) recovery: RecoveryWatch,
 }
 
 /// What a resumed session left behind when it exited.
@@ -885,6 +847,7 @@ impl ResumeWatch {
         let worktree = Path::new(run.worktree_path().context("missing worktree")?);
         if wrapper.exited_at.is_some() {
             // Nobody needs to send anything to a session that exited.
+            self.recovery.stop(sv, run);
             close_answer_prompt_asks(sv, run, PROMPT_EXITED_CLOSED)?;
             if let Some(nudge) = &mut self.stale {
                 nudge.settle(sv, run, RESUME_PHASE, Some(self.attempt), "run_ended")?;
@@ -943,7 +906,36 @@ impl ResumeWatch {
                 // again (ADR-0047 decision 29).
                 self.exit_requested = Some(Instant::now());
             } else if requested.elapsed() >= sv.cmux.exit_timeout() {
-                // /exit is not resent (it could pick a dialog's option).
+                // /exit is not resent (it could pick a dialog's option): its
+                // recovery job looks at the session first (ADR-0047
+                // decision 39).
+                let live = Live {
+                    workspace: &self.workspace,
+                    run_dir: &self.run_dir,
+                    allowed: &STUCK_EXIT_HELD_ACTIONS,
+                    exit_typed: self.exit_typed,
+                    at_prompt: false,
+                    lands: false,
+                };
+                let (timeout, attempt) = (sv.cmux.exit_timeout().as_secs(), self.attempt);
+                let step = self
+                    .recovery
+                    .follow(sv, run, &live, RecoveryAlert::StuckExit, || {
+                        json!({"timeout_secs": timeout, "exit_typed": self.exit_typed, "resume_attempt": attempt})
+                    })?;
+                let (attempt, escalation) = match step {
+                    LiveStep::Pending => return Ok(None),
+                    LiveStep::Repaired(applied) => {
+                        if applied.exit_again {
+                            self.exit_requested = Some(Instant::now());
+                        }
+                        return Ok(None);
+                    }
+                    // A failed job is the `recover by hand` attention: no
+                    // ask; the session is let go as below.
+                    LiveStep::Failed => (0, None),
+                    LiveStep::Escalate(attempt, escalation) => (attempt, Some(escalation)),
+                };
                 warn!(run_id = %run.id(), "resumed session of {} did not exit within {}s of the exit request; letting it go as unresolved (its workspace {} is kept)", run.id(), sv.cmux.exit_timeout().as_secs(), self.workspace);
                 // Its dialog stays until someone answers it: raise it to
                 // the inbox, as for the worker's session (task 104). The
@@ -952,13 +944,28 @@ impl ResumeWatch {
                 let after = stuck_exit_after(
                     self.exit_for_silence,
                     if resumes_exhausted(&*sv.queue, run.id()) {
-                        "The run stays needs_session after its last resume attempt, and is left to the person once the session exits"
+                        "The run stays needs_session after its last resume attempt, and goes to its recovery job once the session exits"
                     } else {
                         "The run stays needs_session, and the supervisor resumes it again once the session exits"
                     },
                 );
-                if let Err(error) = ask_stuck_exit(sv, run, &self.workspace, &after) {
-                    warn!(run_id = %run.id(), error = %format_args!("{error:#}"), "stuck_exit ask for {} could not be opened: {error:#}", run.id());
+                if let Some(escalation) = escalation {
+                    let note = escalation.note(run, RecoveryAlert::StuckExit, attempt);
+                    let workspace = self.workspace.clone();
+                    match ask_stuck_exit(sv, run, &workspace, &after, Some(&note)) {
+                        Ok(id) => escalation.record(
+                            sv,
+                            run,
+                            RecoveryAlert::StuckExit,
+                            attempt,
+                            &note,
+                            Some(id),
+                            json!({}),
+                        )?,
+                        Err(error) => {
+                            warn!(run_id = %run.id(), error = %format_args!("{error:#}"), "stuck_exit ask for {} could not be opened: {error:#}", run.id());
+                        }
+                    }
                 }
                 return Ok(Some(ResumeVerdict {
                     kind: ResumeOutcome::Unresolved,

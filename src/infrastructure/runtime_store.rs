@@ -2076,14 +2076,21 @@ impl SqliteQueue {
             .collect())
     }
 
-    /// Take a `failed` or `interrupted` run for its triage: in one
+    /// Take a `failed` or `interrupted` run for a recovery round: in one
     /// transaction, check that its task is `in_progress`, that it has no
-    /// lease but a stale one (which is replaced) and that it is not triaged
-    /// since its last resume ([`crate::domain::triage_state`]), and that it
-    /// is still the task's latest run, lease it to
-    /// `token` and record `lease_acquired` and `triage_started` (`attempt`,
-    /// `status`). `Ok(None)` means another process took it or it changed.
-    pub fn begin_triage(&mut self, id: &RunId, token: &str) -> Result<Option<(TaskRun, usize)>> {
+    /// lease but a stale one (which is replaced), that no round took it
+    /// since its last resume or that the `wait` of the last one is over
+    /// ([`crate::domain::triage_state`]), and that it is still the task's
+    /// latest run, lease it to `token` and record `lease_acquired`,
+    /// `request` as `recovery_requested` when given, and `triage_started`
+    /// (`attempt`, `status`). `Ok(None)` means another process took it or
+    /// it changed.
+    pub fn begin_triage(
+        &mut self,
+        id: &RunId,
+        token: &str,
+        request: Option<serde_json::Value>,
+    ) -> Result<Option<(TaskRun, usize)>> {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -2104,8 +2111,10 @@ impl SqliteQueue {
             .prepare("SELECT * FROM run_events WHERE run_id=?1 ORDER BY id")?
             .query_map([id], event_row)?
             .collect::<rusqlite::Result<_>>()?;
-        if crate::domain::triage_state(&events) != crate::domain::TriageState::Pending {
-            return Ok(None);
+        match crate::domain::triage_state(&events) {
+            crate::domain::TriageState::Pending => {}
+            crate::domain::TriageState::Waiting { until } if until <= now => {}
+            _ => return Ok(None),
         }
         let lease = tx
             .query_row(
@@ -2131,6 +2140,9 @@ impl SqliteQueue {
             "lease_acquired",
             json!({"pid": std::process::id(), "reason": "triage", "previous_token": lease.map(|l| l.token)}),
         )?;
+        if let Some(request) = request {
+            run_event(&tx, id, "recovery_requested", request)?;
+        }
         run_event(
             &tx,
             id,
@@ -2142,17 +2154,19 @@ impl SqliteQueue {
         Ok(Some((run, attempt)))
     }
 
-    /// Act on the triage's verdict under the triage's lease and record
+    /// Act on a recovery round under its lease and record
     /// `triage_finished` with `payload`, the `action` and the run's status
-    /// after it, in one transaction: `Retry` makes the task `ready`,
-    /// `Resume` the run `needs_session`, `Ask` changes nothing. The lease
-    /// stays for the workspace's close.
+    /// after it, then each of `also`, in one transaction: `Retry` makes the
+    /// task `ready`, `RetryInherit` too with the branch to carry over,
+    /// `Resume` the run `needs_session`, `Wait` and `Ask` change nothing.
+    /// The lease stays for the workspace's close.
     pub fn finish_triage(
         &mut self,
         id: &RunId,
         token: &str,
         action: &TriageAction,
         mut payload: serde_json::Value,
+        also: Vec<(&'static str, serde_json::Value)>,
     ) -> Result<TaskRun> {
         let tx = self
             .conn
@@ -2177,6 +2191,27 @@ impl SqliteQueue {
                     &self.generators.clock.timestamp(),
                 )?;
             }
+            TriageAction::RetryInherit { branch, head } => {
+                // Once per task, checked again where no other supervisor
+                // can retry it.
+                let task_events: Vec<RunEvent> = tx
+                    .prepare("SELECT * FROM run_events WHERE task_id=?1 ORDER BY id")?
+                    .query_map([run.task_id()], event_row)?
+                    .collect::<rusqlite::Result<_>>()?;
+                ensure!(
+                    !task_events.iter().any(resume::is_inherit_retry),
+                    "task {} was retried with a branch carried over already",
+                    run.task_id()
+                );
+                super::sqlite::transition_task(
+                    &tx,
+                    run.task_id(),
+                    TaskAction::Ready,
+                    &self.generators.clock.timestamp(),
+                )?;
+                payload["inherit"] = json!({"branch": branch, "head": head});
+            }
+            TriageAction::Wait { recheck_at } => payload["recheck_at"] = json!(recheck_at),
             TriageAction::Resume { instruction } => {
                 apply(
                     &tx,
@@ -2199,6 +2234,9 @@ impl SqliteQueue {
         payload["action"] = json!(action.as_str());
         payload["status"] = json!(result.status().as_str());
         run_event(&tx, id, "triage_finished", payload)?;
+        for (kind, payload) in also {
+            run_event(&tx, id, kind, payload)?;
+        }
         tx.commit()?;
         Ok(result)
     }
@@ -2208,13 +2246,13 @@ impl SqliteQueue {
     /// it is still `needs_session` with its resumes used up
     /// ([`ResumeCount::exhausted`]), the latest run of an `in_progress`
     /// task, and not leased but stale; make it `failed` with `reason` as
-    /// `last_error`, and record `triage_finished` (`by: runtime`), so the
-    /// triage takes it as decided. [`Exhaustion::Ask`] names the ask a
-    /// person answers like a triage's (action `ask`);
-    /// [`Exhaustion::Inherit`] makes the task `ready` again for a run that
-    /// carries this run's branch over (action `retry_inherit`, with
-    /// `auto_repaired` `repair: inherit_retry`). `Ok(None)` means it
-    /// changed.
+    /// `last_error`. [`Exhaustion::Recover`] records `recovery_requested`
+    /// (`alert: resume_exhausted`, `by: runtime`), which the next recovery
+    /// round of the run takes; [`Exhaustion::Inherit`] makes the task
+    /// `ready` again for a run that carries this run's branch over, recorded
+    /// as `triage_finished` (action `retry_inherit`, `by: runtime`) with
+    /// `auto_repaired` (`repair: inherit_retry`), so no round takes it.
+    /// `Ok(None)` means it changed.
     pub fn exhaust_resumes(
         &mut self,
         id: &RunId,
@@ -2281,10 +2319,23 @@ impl SqliteQueue {
             "status": result.status().as_str(),
         });
         match exhaustion {
-            Exhaustion::Ask(ask_id) => {
-                payload["verdict"] = json!("ask");
-                payload["action"] = json!("ask");
-                payload["ask_id"] = json!(ask_id);
+            Exhaustion::Recover => {
+                let resumed = events
+                    .iter()
+                    .rev()
+                    .find(|e| e.kind == "resume_finished")
+                    .map(|e| e.id);
+                payload["alert"] = json!(crate::domain::recovery::RecoveryAlert::ResumeExhausted);
+                payload["attempt"] = json!(
+                    crate::domain::recovery::attempts(
+                        &events,
+                        crate::domain::recovery::RecoveryAlert::ResumeExhausted
+                    ) + 1
+                );
+                payload["evidence"] = json!(resumed.into_iter().collect::<Vec<_>>());
+                run_event(&tx, id, "recovery_requested", payload)?;
+                tx.commit()?;
+                return Ok(Some(result.relocated(&self.runs_dir)));
             }
             Exhaustion::Inherit { branch, head } => {
                 super::sqlite::transition_task(
@@ -2511,7 +2562,20 @@ impl SqliteQueue {
                     &self.generators.clock.timestamp(),
                 )?;
             }
-            other => bail!("{other:?} is not an answer the triage applies"),
+            // Another option the ask offered is the recovery job's own: it
+            // goes back to the job, whose next round reads the answer
+            // (ADR-0047 decision 40). Nothing moves here.
+            other => {
+                let options: String =
+                    tx.query_row("SELECT options FROM asks WHERE id=?1", [ask_id], |r| {
+                        r.get(0)
+                    })?;
+                let options: Vec<String> = serde_json::from_str(&options)?;
+                ensure!(
+                    options.iter().any(|option| option == other),
+                    "{other:?} is not an answer the recovery applies"
+                );
+            }
         }
         tx.execute(
             "UPDATE asks SET closed_at=?2 WHERE id=?1 AND closed_at IS NULL",
@@ -2525,6 +2589,9 @@ impl SqliteQueue {
         let mut payload = json!({"ask_id": ask_id, "answer": answer, "reason": reason, "status": result.status().as_str()});
         if answer == "resume" {
             payload["code"] = json!(ReasonCode::TriageResume);
+        }
+        if !matches!(answer, "retry" | "resume" | "cancel") {
+            payload["action"] = json!(crate::domain::RECOVER_AGAIN);
         }
         run_event(&tx, id, "triage_decided", payload)?;
         tx.commit()?;
@@ -3109,8 +3176,13 @@ impl RunStore for SqliteQueue {
     fn runs_to_triage(&self) -> Result<Vec<TaskRun>> {
         SqliteQueue::runs_to_triage(self)
     }
-    fn begin_triage(&mut self, id: &RunId, token: &str) -> Result<Option<(TaskRun, usize)>> {
-        SqliteQueue::begin_triage(self, id, token)
+    fn begin_triage(
+        &mut self,
+        id: &RunId,
+        token: &str,
+        request: Option<serde_json::Value>,
+    ) -> Result<Option<(TaskRun, usize)>> {
+        SqliteQueue::begin_triage(self, id, token, request)
     }
     fn finish_triage(
         &mut self,
@@ -3118,8 +3190,9 @@ impl RunStore for SqliteQueue {
         token: &str,
         action: &TriageAction,
         payload: serde_json::Value,
+        also: Vec<(&'static str, serde_json::Value)>,
     ) -> Result<TaskRun> {
-        SqliteQueue::finish_triage(self, id, token, action, payload)
+        SqliteQueue::finish_triage(self, id, token, action, payload, also)
     }
     fn record_workspace_closed(
         &mut self,

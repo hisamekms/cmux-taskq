@@ -75,12 +75,21 @@ ready task (dependencies completed)
         integrate was called, or validates and reviews it with the resumed session open
         (failed receipt → run failed)
   → dependents become candidates; the resident loop claims them from the landed main
-failed / interrupted run (a dead run nobody leases is recovered to interrupted first)
-  → headless triage (claude -p) → verdict, then close its workspaces
-      retry  → task ready → a new run
-      resume → needs_session → resumed like above
-      ask    → decide ask (retry / resume / cancel), applied once answered
-      triage failed → triage_failed (triage by hand)
+failed / interrupted run (a dead run nobody leases is recovered to interrupted first;
+a run whose resumes are used up is failed with its resume_exhausted alert)
+  → headless recovery job (claude -p) → verdict; the runtime checks the action again,
+    then closes its workspaces
+      retry          → task ready → a new run (only without commits of its own)
+      retry_inherit  → task ready → a new run carrying the branch over (once per task)
+      resume         → needs_session → resumed like above (while resumes are left)
+      wait           → the job runs again after recheck_after_secs
+      escalate / low confidence / refused / 3 jobs used → decide ask
+                       (retry / resume / cancel + the job's options), applied once answered;
+                       a job's option goes back to the job
+      job failed → triage_failed (triage by hand, read as recover by hand)
+live session alert (long_background, stuck_exit, prompt_waiting)
+  → the same recovery job in the session's slot → repair applied, or the alert's ask;
+    a failed job → recovery_failed (recover by hand)
 ```
 
 各節は`supervisor-lifecycle/`の下の別のファイルにある。下の見出しは各ファイルへの目次で、以前この文書の中にあった節へのリンク（見出しのanchor）もここに届く。
@@ -195,7 +204,7 @@ failed / interrupted run (a dead run nobody leases is recovered to interrupted f
 
 ### backgroundの処理が終わらないときの復旧job
 
-- [backgroundの処理が終わらないときの復旧job](supervisor-lifecycle/background-recovery-job.md)
+- [生きているsessionの復旧job](supervisor-lifecycle/background-recovery-job.md)（`long_background`、`stuck_exit`、`prompt_waiting`）
 
 ### workerの質問への回答の送信
 
@@ -223,7 +232,7 @@ failed / interrupted run (a dead run nobody leases is recovered to interrupted f
 
 ## Triage (supervisor)
 
-- [Triage (supervisor)](supervisor-lifecycle/triage.md)
+- [Triage (supervisor)](supervisor-lifecycle/triage.md)（終わったrunの復旧job）
 
 ## Draft planners (supervisor)
 

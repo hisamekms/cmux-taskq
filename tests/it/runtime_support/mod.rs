@@ -996,7 +996,15 @@ impl WorkspaceBackend for TestWorkspace {
 /// /bin/sh --version is not portable; a tiny standalone provider preflight stub.
 pub fn claude_stub(db: &Path) -> PathBuf {
     let stub = db.parent().unwrap().join("claude-stub");
-    fs::write(&stub, "#!/bin/sh\nprintf 'test provider\\n'\n").unwrap();
+    // A live session's recovery job escalates (so the alert's ask opens);
+    // anything else prints no verdict.
+    fs::write(
+        &stub,
+        format!(
+            "#!/bin/sh\ncase \"$*\" in *\"{LIVE_RECOVERY}\"*) printf '%s\\n' '{ESCALATE}' ;; *) printf 'test provider\\n' ;; esac\n"
+        ),
+    )
+    .unwrap();
     use std::os::unix::fs::PermissionsExt;
     fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).unwrap();
     stub
@@ -1662,10 +1670,10 @@ pub struct TestReviewer {
     pub scripts: Mutex<Vec<String>>,
     pub prompts: Mutex<Vec<String>>,
     pub timeout: Duration,
-    /// Scripts of the headless triage, one per triage in order; without
-    /// one left, a triage cannot start.
+    /// Scripts of the headless recovery jobs, one per job in order; without
+    /// one left, a job cannot start.
     pub triages: Mutex<Vec<String>>,
-    /// The triage prompts and the directories they ran in.
+    /// The recovery job prompts and the directories they ran in.
     pub triage_prompts: Mutex<Vec<(String, PathBuf)>>,
 }
 
@@ -1701,13 +1709,19 @@ impl AgentProvider for TestReviewer {
     fn resume_command(&self, _: &TaskRun) -> Result<CommandSpec> {
         unreachable!("the reviewer starts no session")
     }
-    // A run that fails under these tests is triaged by this provider too:
-    // with no triage script left, the triage fails and the run waits for a
-    // person.
+    // A run that fails under these tests is recovered by this provider too:
+    // with no script left, a live session's recovery job escalates, and one
+    // for a run that ended cannot start (it waits to be recovered by hand).
     fn headless_command(&self, cwd: &Path, prompt: &str, tools: &[&str]) -> Result<CommandSpec> {
         assert_eq!(tools, runtime::TRIAGE_TOOLS);
         let mut triages = self.triages.lock().unwrap();
-        ensure!(!triages.is_empty(), "the test reviewer has no triage left");
+        if triages.is_empty() && prompt.contains(LIVE_RECOVERY) {
+            triages.push(format!("printf '%s\\n' '{ESCALATE}'"));
+        }
+        ensure!(
+            !triages.is_empty(),
+            "the test reviewer has no recovery job left"
+        );
         self.triage_prompts
             .lock()
             .unwrap()
@@ -1775,11 +1789,28 @@ pub fn assert_landed_run(run: &TaskRun, repo: &Path, base: &str) {
     assert_landed(repo, run, "test task", base);
 }
 
-/// A triage script that prints the verdict JSON (no apostrophes in the
+/// What a live session's recovery prompt says, for the stand-ins whose
+/// default job for it escalates.
+pub const LIVE_RECOVERY: &str = "is still running. The supervisor raised";
+
+/// The default verdict of a live session's recovery job in these tests.
+pub const ESCALATE: &str = r#"{"verdict": "escalate", "confidence": "high", "diagnosis": "the test provider does not repair"}"#;
+
+/// A recovery job's script that prints `verdict` (no apostrophes in the
 /// texts: the script quotes the JSON with them).
-pub fn triage(decision: &str, reason: &str, instruction: &str) -> String {
-    let json = json!({"verdict": decision, "reason": reason, "instruction": instruction});
-    format!("printf '%s\\n' '{json}'")
+pub fn recovery(verdict: Value) -> String {
+    format!("printf '%s\\n' '{verdict}'")
+}
+
+/// A recovery job's script whose verdict is a `repair` of high confidence
+/// with the one `action`.
+pub fn repair(action: Value, diagnosis: &str) -> String {
+    recovery(json!({
+        "verdict": "repair",
+        "confidence": "high",
+        "diagnosis": diagnosis,
+        "actions": [action],
+    }))
 }
 
 pub fn stalled_asks(queue: &SqliteQueue) -> Vec<dagq::domain::Ask> {

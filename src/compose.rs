@@ -1026,15 +1026,15 @@ fn main_checkout(repository: &GitRepository) -> PathBuf {
     }
 }
 
-/// What the headless triage is asked about a run (see
-/// [`prompt::triage_prompt`]), its files read from `dir`.
-pub fn triage_prompt(
+/// What the recovery job of a run that ended reads about it (see
+/// [`prompt::ended_run_material`]), its files read from `dir`.
+pub fn ended_run_material(
     detail: &TaskDetail,
     run: &TaskRun,
-    resumes: usize,
+    resumes: crate::domain::resume::ResumeCount,
     dir: &Path,
-) -> Result<String> {
-    prompt::triage_prompt(&LocalRunFiles, detail, run, resumes, dir)
+) -> String {
+    prompt::ended_run_material(&LocalRunFiles, detail, run, resumes, dir)
 }
 
 /// Run from cmux, not from a pipe; stdout must remain a terminal for Claude.

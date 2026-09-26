@@ -358,6 +358,13 @@ impl SessionWatch {
                     info!(run_id = %run.id(), "exit requested for {} after its wrapper went silent; waiting for session exit", run.id());
                     self.exit_requested = Some(Instant::now());
                     self.exit_for_silence = true;
+                    // Background work is followed only before the /exit.
+                    self.recovery.stop_for(
+                        sv,
+                        run,
+                        Some(RecoveryAlert::LongBackground),
+                        "exit_requested",
+                    );
                 }
                 WrapperPulse::Silent => (),
                 WrapperPulse::Exited => return Ok(None),
@@ -383,7 +390,7 @@ impl SessionWatch {
                         {
                             self.answer_start = Some(start);
                         }
-                        self.watch_background(sv, run, &processes)?;
+                        self.watch_background(sv, run)?;
                     }
                     if let Some(agent) = processes.iter().find(|p| p.role == "agent") {
                         self.watch_prompt(sv, run, agent)?;
@@ -411,27 +418,19 @@ impl SessionWatch {
                 // Something in the session (for example a dialog) held the
                 // /exit back. Keep the lease and keep watching: the run
                 // proceeds to validation once the session exits. /exit is not
-                // sent again, since it could pick another option of a dialog.
+                // sent again, since it could pick another option of a dialog;
+                // the recovery job looks at it (ADR-0047 decision 39).
                 sv.queue.record_runtime_event(
                     run.id(),
                     "exit_request_timed_out",
                     json!({"code": ReasonCode::ExitTimeout, "workspace_id": self.workspace, "timeout_secs": timeout.as_secs()}),
                 )?;
-                warn!(run_id = %run.id(), "session for {} did not exit within {}s of the exit request; keeping the run and asking the inbox to send /exit in workspace {}", run.id(), timeout.as_secs(), self.workspace);
+                warn!(run_id = %run.id(), "session for {} did not exit within {}s of the exit request in workspace {}; keeping the run for its recovery job", run.id(), timeout.as_secs(), self.workspace);
                 self.exit_timed_out = true;
             }
         }
         if self.exit_timed_out && !self.exit_asked {
-            ask_stuck_exit(
-                sv,
-                run,
-                &self.workspace,
-                &stuck_exit_after(
-                    self.exit_for_silence,
-                    "The run stays running, and goes on to validating once the session exits",
-                ),
-            )?;
-            self.exit_asked = true;
+            self.recover_stuck_exit(sv, run)?;
         }
         Ok(None)
     }
@@ -556,7 +555,7 @@ impl SessionWatch {
         // A known dialog is answered by rule once its conditions hold
         // (ADR-0047 decision 29); otherwise, or once answered in vain, it is
         // raised like any other.
-        if answer_known_dialog(sv, run, &workspace, &screen, false)? {
+        if answer_known_dialog(sv, run, &workspace, &screen, false, None)? {
             return Ok(());
         }
         match sv.signals.detect_prompt(&screen) {
@@ -574,13 +573,12 @@ impl SessionWatch {
                             "prompt": kind,
                         }),
                     )?;
-                    info!(run_id = %run.id(), "run {} waits at a {} dialog in workspace {}; asking the inbox", run.id(), kind, self.workspace);
-                    // A changed screen under an open ask keeps that ask (the
-                    // open ask of the run is returned, and nobody is notified
-                    // again), so a ticking line cannot flood the inbox.
+                    info!(run_id = %run.id(), "run {} waits at a {} dialog in workspace {}; its recovery job looks at it", run.id(), kind, self.workspace);
                     self.prompt_hash = Some(hash);
-                    ask_answer_prompt(sv, run, &self.workspace, kind, &excerpt)?;
                 }
+                // A changed screen under an open ask keeps that ask, so a
+                // ticking line cannot flood the inbox.
+                self.recover_prompt(sv, run, kind, &excerpt)?;
             }
             None => self.clear_prompt(sv, run)?,
         }
@@ -657,9 +655,16 @@ impl SessionWatch {
         Ok(())
     }
 
-    /// Record `prompt_cleared` if a dialog is recorded and not cleared yet.
+    /// Record `prompt_cleared` if a dialog is recorded and not cleared yet;
+    /// its recovery job, if one runs, has nothing left to do.
     pub(super) fn clear_prompt(&mut self, sv: &mut Supervisor<'_>, run: &TaskRun) -> Result<()> {
         if self.prompt_hash.take().is_some() {
+            self.recovery.stop_for(
+                sv,
+                run,
+                Some(RecoveryAlert::PromptWaiting),
+                "dialog_cleared",
+            );
             sv.queue.record_runtime_event(
                 run.id(),
                 "prompt_cleared",
@@ -673,21 +678,28 @@ impl SessionWatch {
 }
 
 /// Raise a dialog a worker's session stopped at as an `answer_prompt` ask
-/// to the inbox (ADR-0024's Consequences, in place of the attention of
-/// ADR-0019 decision 6): the question names the run, the workspace and the
-/// kind of dialog and carries the screen's excerpt. An open ask of the run
-/// is not registered twice. The runtime sends no key: the person answers
-/// the dialog, and the ask closes itself once the dialog is gone.
-#[allow(clippy::too_many_arguments)]
+/// to the inbox once its recovery job escalated (ADR-0047 decision 40):
+/// the question names the run, the workspace and the kind of dialog, the
+/// job's `note`, and carries the screen's excerpt; the job's options are
+/// the ask's and its reason category the ask's. An open ask of the run is
+/// not registered twice. The runtime sends no key: the person answers the
+/// dialog, and the ask closes itself once the dialog is gone.
 pub(super) fn ask_answer_prompt(
     sv: &mut Supervisor<'_>,
     run: &TaskRun,
     workspace: &str,
     prompt: &str,
     excerpt: &str,
-) -> Result<()> {
+    note: Option<&Note>,
+) -> Result<AskId> {
+    let recovery = note.map_or_else(String::new, |note| {
+        format!(
+            "\n\nIts recovery job looked first, and {}.\n{}",
+            note.why, note.text
+        )
+    });
     let question = format!(
-        "The session of run {run_id} (task {task_id}) waits at a {prompt} dialog in workspace {workspace}. Answer with the choice to send to it (or what to do instead); the dialog is answered in that workspace, and this ask closes itself once the dialog is gone.\n\nLast lines of the screen:\n{excerpt}",
+        "The session of run {run_id} (task {task_id}) waits at a {prompt} dialog in workspace {workspace}. Answer with the choice to send to it (or what to do instead); the dialog is answered in that workspace, and this ask closes itself once the dialog is gone.{recovery}\n\nLast lines of the screen:\n{excerpt}",
         run_id = run.id(),
         task_id = run.task_id(),
     );
@@ -699,15 +711,17 @@ pub(super) fn ask_answer_prompt(
             task_id: Some(run.task_id()),
             run_id: Some(run.id().clone()),
             question,
-            options: Vec::new(),
+            options: note.map(|note| note.options.clone()).unwrap_or_default(),
             asked_by: SessionRole::Supervisor.as_str().into(),
-            reason_category: AskReason::RecoveryFailed,
+            reason_category: note.map_or(AskReason::RecoveryFailed, |note| note.category),
             finding_id: None,
         },
         sv.cmux,
     )?;
     info!(ask_id = %outcome["id"], run_id = %run.id(), "answer_prompt ask {} for {} (notified: {})", outcome["id"], run.id(), outcome["notified"]);
-    Ok(())
+    Ok(AskId::new(
+        outcome["id"].as_i64().context("ask returned no id")?,
+    ))
 }
 
 /// Raise a worker's session stopped at a login that ran out (ADR-0047

@@ -1748,9 +1748,10 @@ fn failing_verification_command_passes_validation_and_needs_a_session_at_integra
         json!(second.to_str().unwrap())
     );
 
-    // The triage reads the latest attempt's log and names the earlier one.
+    // The recovery job reads the latest attempt's log and names the
+    // earlier one.
     let run = &detail.runs[0];
-    let prompt = runtime::triage_prompt(&detail, run, 0, run_dir).unwrap();
+    let prompt = runtime::ended_run_material(&detail, run, Default::default(), run_dir);
     assert!(
         prompt.contains(&format!("Verification log {} (end)", second.display())),
         "{prompt}"

@@ -61,7 +61,9 @@ impl Slot {
             {
                 Some(WaitPhase::Session)
             }
-            Phase::Exiting(watch) if watch.session.is_some() => Some(WaitPhase::Exit),
+            Phase::Exiting(watch) if watch.session.is_some() && !watch.recovery.running() => {
+                Some(WaitPhase::Exit)
+            }
             _ => None,
         }
     }

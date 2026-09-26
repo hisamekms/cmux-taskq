@@ -700,6 +700,123 @@ fn a_dialog_on_the_screen_is_asked_once_and_cleared() {
     );
 }
 
+/// ADR-0047 decisions 39 and 40: a dialog the runtime does not answer is
+/// the `prompt_waiting` alert's recovery job's first. Its `wait` is applied
+/// (no ask while it holds); once it is over and the dialog is still there,
+/// another job runs, and its escalation is the `answer_prompt` ask with the
+/// job's diagnosis, options and reason category, closed once the dialog
+/// is gone.
+#[test]
+fn a_dialog_goes_to_its_recovery_job_before_the_inbox() {
+    let (_dir, repo, db) = fixture();
+    let mut backend = TestWorkspace::new(&db, false, PROMPTED_AGENT);
+    backend.prompt_wait = Duration::from_millis(300);
+    *backend.screen.lock().unwrap() = DIALOG_SCREEN.into();
+    let backend = Arc::new(backend);
+    let reviewer = Arc::new(
+        TestReviewer::new(&[verdict("pass", &[], "meets the acceptance")]).with_triages(&[
+            repair(
+                json!({"action": "wait", "recheck_after_secs": 1}),
+                "the dialog may go by itself",
+            ),
+            recovery(json!({
+                "verdict": "escalate",
+                "confidence": "high",
+                "diagnosis": "an auto mode offer only a person may accept",
+                "question": "Turn auto mode on?",
+                "options": ["2"],
+                "reason_category": "scope",
+            })),
+        ]),
+    );
+    let supervisor = {
+        let (db, repo, backend, reviewer) =
+            (db.clone(), repo.clone(), backend.clone(), reviewer.clone());
+        thread::spawn(move || {
+            let _waiting = common::within(common::STEP_LIMIT, "supervise to return");
+            runtime::supervise_with_reviewer(
+                &db,
+                &repo,
+                &*backend,
+                &claude_stub(&db),
+                &*reviewer,
+                Path::new(env!("CARGO_BIN_EXE_dagq")),
+                &supervise_options(4, true),
+            )
+        })
+    };
+    let open_asks = |queue: &SqliteQueue| {
+        queue
+            .asks(dagq::infrastructure::asks::AskQuery {
+                open: true,
+                ..Default::default()
+            })
+            .unwrap()
+    };
+    wait_until(&db, Duration::from_secs(30), |queue| {
+        !payloads(&queue.show(TaskId::new(1)).unwrap(), "recovery_finished").is_empty()
+    });
+    let mut queue = SqliteQueue::open(&db).unwrap();
+    let detail = queue.show(TaskId::new(1)).unwrap();
+    let finished = payloads(&detail, "recovery_finished");
+    assert_eq!(finished[0]["alert"], "prompt_waiting");
+    assert_eq!(finished[0]["applied"], json!(["wait"]));
+    assert!(finished[0]["recheck_at_ms"].as_i64().is_some());
+    assert!(open_asks(&queue).is_empty());
+
+    wait_until(&db, Duration::from_secs(30), |queue| {
+        !open_asks(queue).is_empty()
+    });
+    let ask = open_asks(&queue).remove(0);
+    assert_eq!(ask.kind, dagq::domain::AskKind::AnswerPrompt);
+    assert_eq!(ask.options, ["2"]);
+    assert_eq!(ask.reason_category, dagq::domain::AskReason::Scope);
+    for part in [
+        "waits at a choice dialog",
+        "Its recovery job looked first, and the recovery job could not repair it",
+        "Diagnosis: an auto mode offer only a person may accept",
+        "Question: Turn auto mode on?",
+        "recovery-prompt_waiting-2.prompt.txt",
+    ] {
+        assert!(ask.question.contains(part), "{part}: {}", ask.question);
+    }
+    let detail = queue.show(TaskId::new(1)).unwrap();
+    let waiting = detail
+        .events
+        .iter()
+        .find(|e| e.kind == "prompt_waiting")
+        .unwrap();
+    let requested = payloads(&detail, "recovery_requested");
+    assert_eq!(requested.len(), 2, "{requested:?}");
+    assert!(requested.iter().all(|p| p["alert"] == "prompt_waiting"));
+    assert_eq!(requested[0]["evidence"], json!([waiting.id]));
+    assert_eq!(requested[0]["prompt"], "choice");
+    assert_eq!(requested[1]["attempt"], 2);
+    let finished = payloads(&detail, "recovery_finished");
+    assert_eq!(finished[1]["escalated"], true);
+    assert_eq!(finished[1]["ask_id"], json!(ask.id));
+    assert!(payloads(&detail, "auto_repaired").is_empty());
+    assert_eq!(backend.notifications.lock().unwrap().len(), 1);
+    assert_eq!(reviewer.triage_prompts().len(), 2);
+
+    // Someone answers the dialog: the ask closes, and the run goes on.
+    *backend.screen.lock().unwrap() = WORK_SCREEN.into();
+    wait_until(&db, Duration::from_secs(30), |queue| {
+        event_kinds(&queue.show(TaskId::new(1)).unwrap()).contains(&"prompt_cleared")
+    });
+    assert!(queue.read_ask(ask.id).unwrap().closed_at.is_some());
+    let run = queue.show(TaskId::new(1)).unwrap().runs[0].clone();
+    fs::write(
+        exit_request_path(run.run_dir().unwrap()).with_extension("go"),
+        "",
+    )
+    .unwrap();
+    let outcome = joined(supervisor, "the supervisor thread to return").unwrap();
+    backend.join();
+    assert_eq!(outcome["errors"], json!([]), "{outcome}");
+    assert_eq!(outcome["runs"][0]["status"], "integrated", "{outcome}");
+}
+
 /// Two sessions that stop at the same login that ran out are one
 /// `authentication` ask for the inbox (ADR-0047 decision 42): the first
 /// opens it with one notification, the second joins its `affected`, each

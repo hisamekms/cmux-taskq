@@ -887,8 +887,9 @@ pub struct ResumeCandidate {
 /// How a run whose resumes are used up ends (ADR-0047 decision 24).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Exhaustion {
-    /// A person decides in this `decide` ask (`retry` / `cancel`).
-    Ask(AskId),
+    /// The run becomes `failed` and its `resume_exhausted` alert goes to
+    /// the recovery job (ADR-0047 decision 39).
+    Recover,
     /// The task is ready again, and its next run carries this run's
     /// `branch` over from `head` (its review passed; only conflicts kept
     /// it from landing).
@@ -898,16 +899,25 @@ pub enum Exhaustion {
     },
 }
 
-/// What the triage does to a run once it has its verdict (ADR-0024
-/// decision 3), after the runtime's own rules (no retry of a task that
-/// failed twice, no resume past the attempts or without a worktree).
+/// What a recovery round of a `failed` or `interrupted` run does to it
+/// (ADR-0047 decision 40), recorded as `triage_finished`'s `action`: the
+/// job's action once its preconditions held, or the ask it escalated to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TriageAction {
     /// The task goes back to `ready`; the next claim makes a new run.
     Retry,
+    /// The task goes back to `ready`, and its next run carries this run's
+    /// `branch` over from `head` (ADR-0047 decision 24).
+    RetryInherit {
+        branch: Option<String>,
+        head: CommitSha,
+    },
     /// The run becomes `needs_session` with `instruction` as `last_error`,
     /// and the supervisor resumes it (ADR-0019 decision 1).
     Resume { instruction: String },
+    /// Nothing moves; the job runs again from `recheck_at` (unix seconds)
+    /// if the run is still where it was.
+    Wait { recheck_at: i64 },
     /// The run stays; the `decide` ask `ask_id` waits for a person.
     Ask { ask_id: AskId },
 }
@@ -916,7 +926,9 @@ impl TriageAction {
     pub const fn as_str(&self) -> &'static str {
         match self {
             Self::Retry => "retry",
+            Self::RetryInherit { .. } => crate::domain::resume::RETRY_INHERIT,
             Self::Resume { .. } => "resume",
+            Self::Wait { .. } => "wait",
             Self::Ask { .. } => "ask",
         }
     }
@@ -1143,15 +1155,24 @@ pub trait RunStore {
     ) -> Result<Option<TaskRun>>;
     /// The latest `failed` / `interrupted` run of every task in progress.
     fn runs_to_triage(&self) -> Result<Vec<TaskRun>>;
-    /// Take the run's lease for its triage; the attempt, or `None` when
-    /// another process has it.
-    fn begin_triage(&mut self, id: &RunId, token: &str) -> Result<Option<(TaskRun, usize)>>;
+    /// Take the run's lease for a recovery round, recording `request` as
+    /// its `recovery_requested` first when there is one; the round, or
+    /// `None` when another process has it.
+    fn begin_triage(
+        &mut self,
+        id: &RunId,
+        token: &str,
+        request: Option<serde_json::Value>,
+    ) -> Result<Option<(TaskRun, usize)>>;
+    /// Act on the round's outcome and record `triage_finished`, then each
+    /// of `also` (kind, payload), in one transaction.
     fn finish_triage(
         &mut self,
         id: &RunId,
         token: &str,
         action: &TriageAction,
         payload: serde_json::Value,
+        also: Vec<(&'static str, serde_json::Value)>,
     ) -> Result<TaskRun>;
     /// Record `workspace_closed` (`payload` and the `workspace_id`) of a
     /// workspace the triage or the supervisor's sweep closed.

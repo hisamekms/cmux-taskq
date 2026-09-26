@@ -107,15 +107,18 @@ impl Supervisor<'_> {
         let mut kept = 0;
         for mut slot in std::mem::take(&mut self.slots) {
             let run = slot.run.clone();
+            // A live session's recovery job does not outlive this process;
+            // its alert starts another once the run is rebuilt.
+            stop_recovery(&mut slot);
             let snapshot = match &mut slot.phase {
                 Phase::Review(watch) => {
                     watch.job.stop();
                     info!(run_id = %run.id(), "run {}: review {} stopped for the handoff; it is reviewed again", run.id(), watch.attempt);
                     None
                 }
-                Phase::Triage(watch) => {
+                Phase::Recovery(watch) => {
                     watch.job.stop();
-                    info!(run_id = %run.id(), "run {}: triage {} stopped for the handoff; it is triaged again", run.id(), watch.attempt);
+                    info!(run_id = %run.id(), "run {}: recovery round {} stopped for the handoff; it is taken again", run.id(), watch.round);
                     if let Err(error) = self.queue.release_lease(run.id(), &self.token) {
                         warn!(run_id = %run.id(), error = %format_args!("{error:#}"), "run {}: could not release the lease: {error:#}", run.id());
                     }
@@ -322,6 +325,9 @@ impl Supervisor<'_> {
                     silent: false,
                     exit_for_silence,
                     stale: adopted_stale_nudge(&*self.queue, run, RESUME_PHASE, Some(attempt))?,
+                    // A recovery job the previous process ran is gone: the
+                    // exit timeout starts another (counted as an attempt).
+                    recovery: RecoveryWatch::default(),
                 })
             }
             Snapshot::Exit {

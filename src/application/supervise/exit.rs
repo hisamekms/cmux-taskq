@@ -26,6 +26,12 @@ pub(super) struct ExitWatch {
     pub(super) silent: bool,
     /// The `/exit` was sent because of that silence.
     pub(super) exit_for_silence: bool,
+    /// Why a `/exit` that never reached the session (task 354) could not
+    /// close and land instead: the `stuck_exit` ask says so first.
+    pub(super) unsent: Option<String>,
+    /// The recovery job of a session that holds the `/exit` back
+    /// (`stuck_exit`, ADR-0047 decision 39).
+    pub(super) recovery: RecoveryWatch,
     pub(super) then: AfterExit,
 }
 
@@ -40,6 +46,8 @@ impl ExitWatch {
             exit_asked: false,
             silent: false,
             exit_for_silence: false,
+            unsent: None,
+            recovery: RecoveryWatch::default(),
             then,
         }
     }
@@ -100,6 +108,7 @@ impl ExitWatch {
             }
             // Nobody needs to send /exit to a session that exited, nor
             // anything else.
+            self.recovery.stop(sv, run);
             close_answer_prompt_asks(sv, run, PROMPT_EXITED_CLOSED)?;
             for ask in sv
                 .queue
@@ -171,17 +180,94 @@ impl ExitWatch {
                     "exit_request_timed_out",
                     json!({"code": ReasonCode::ExitTimeout, "workspace_id": session.workspace, "timeout_secs": timeout.as_secs()}),
                 )?;
-                warn!(run_id = %run.id(), "session for {} did not exit within {}s of the exit request; keeping the run and asking the inbox to send /exit in workspace {}", run.id(), timeout.as_secs(), session.workspace);
+                warn!(run_id = %run.id(), "session for {} did not exit within {}s of the exit request in workspace {}; keeping the run for its recovery job", run.id(), timeout.as_secs(), session.workspace);
                 self.timed_out = true;
             }
             Some(_) => (),
         }
         if self.timed_out && !self.exit_asked {
-            let workspace = session.workspace.clone();
-            ask_stuck_exit(sv, run, &workspace, &self.after(run))?;
-            self.exit_asked = true;
+            return self.recover(sv, run, &session.workspace);
         }
         Ok(false)
+    }
+
+    /// The session holds its `/exit` back (or the `/exit` never reached
+    /// it): its recovery job (`stuck_exit`, ADR-0047 decision 39), and the
+    /// `stuck_exit` ask once it escalates. A repair that answered a dialog
+    /// or stopped processes gives the session the exit timeout again; one
+    /// that closed the workspace of a run that lands goes on as if the
+    /// session had exited (`true`).
+    fn recover(&mut self, sv: &mut Supervisor<'_>, run: &TaskRun, workspace: &str) -> Result<bool> {
+        let lands = matches!(self.then, AfterExit::Land);
+        let run_dir = PathBuf::from(run.run_dir().context("missing run directory")?);
+        let live = Live {
+            workspace,
+            run_dir: &run_dir,
+            allowed: if lands {
+                &STUCK_EXIT_ACTIONS
+            } else {
+                &STUCK_EXIT_HELD_ACTIONS
+            },
+            exit_typed: self.requested.is_some() && self.unsent.is_none(),
+            at_prompt: false,
+            lands,
+        };
+        let timeout = sv.cmux.exit_timeout().as_secs();
+        let unsent = self.unsent.clone();
+        let step = self
+            .recovery
+            .follow(sv, run, &live, RecoveryAlert::StuckExit, || {
+                json!({"timeout_secs": timeout, "unsent": unsent, "then": if lands { "land" } else { "rest" }})
+            })?;
+        match step {
+            LiveStep::Pending => Ok(false),
+            // A person recovers it by hand from the attention: asked.
+            LiveStep::Failed => {
+                self.exit_asked = true;
+                Ok(false)
+            }
+            LiveStep::Repaired(applied) if applied.closed => {
+                match self.session.take().and_then(|session| session.resume) {
+                    None => {
+                        sv.queue.workspace_closed(run.id(), &sv.token)?;
+                    }
+                    Some(attempt) => sv.queue.record_runtime_event(
+                        run.id(),
+                        "workspace_closed",
+                        json!({"workspace_id": workspace, "resume_attempt": attempt}),
+                    )?,
+                }
+                close_answer_prompt_asks(sv, run, PROMPT_EXITED_CLOSED)?;
+                info!(run_id = %run.id(), "the recovery job closed workspace {workspace} of {}, whose receipt holds against its clean worktree; it goes on to land", run.id());
+                Ok(true)
+            }
+            LiveStep::Repaired(applied) => {
+                if applied.exit_again {
+                    self.requested = Some(Instant::now());
+                    self.timed_out = false;
+                }
+                Ok(false)
+            }
+            LiveStep::Escalate(attempt, escalation) => {
+                let note = escalation.note(run, RecoveryAlert::StuckExit, attempt);
+                let after = match &self.unsent {
+                    Some(why) => format!("{EXIT_UNSENT} ({why}). {}", self.after(run)),
+                    None => self.after(run),
+                };
+                let id = ask_stuck_exit(sv, run, workspace, &after, Some(&note))?;
+                escalation.record(
+                    sv,
+                    run,
+                    RecoveryAlert::StuckExit,
+                    attempt,
+                    &note,
+                    Some(id),
+                    json!({}),
+                )?;
+                self.exit_asked = true;
+                Ok(false)
+            }
+        }
     }
 }
 
@@ -208,7 +294,7 @@ impl ExitWatch {
             "code": ReasonCode::BackendTimeout,
             "workspace_id": workspace,
             "attempts": sv.cmux.call_attempts().max(1),
-            "action": if held.is_none() { "close_and_land" } else { "ask" },
+            "action": if held.is_none() { "close_and_land" } else { "recover" },
         });
         if let Some(why) = &held {
             payload["held"] = json!(why);
@@ -254,7 +340,7 @@ impl ExitWatch {
             info!(run_id = %run.id(), "/exit could not be sent to {} in workspace {workspace}; it lands and its receipt still holds against its clean worktree, so its workspace was closed and it goes on to land", run.id());
             return Ok(true);
         };
-        warn!(run_id = %run.id(), "/exit could not be sent to {} in workspace {workspace} and the run cannot land without its exit ({why}); asking the inbox", run.id());
+        warn!(run_id = %run.id(), "/exit could not be sent to {} in workspace {workspace} and the run cannot land without its exit ({why}); its recovery job looks at it", run.id());
         let timeout = sv.cmux.exit_timeout();
         sv.queue.record_runtime_event(
             run.id(),
@@ -262,10 +348,8 @@ impl ExitWatch {
             json!({"code": ReasonCode::ExitTimeout, "workspace_id": workspace, "timeout_secs": timeout.as_secs(), "unsent": true}),
         )?;
         self.timed_out = true;
-        let after = format!("{EXIT_UNSENT} ({why}). {}", self.after(run));
-        ask_stuck_exit(sv, run, workspace, &after)?;
-        self.exit_asked = true;
-        Ok(false)
+        self.unsent = Some(why);
+        self.recover(sv, run, workspace)
     }
 }
 
@@ -296,30 +380,45 @@ pub(super) fn landable_without_exit(sv: &mut Supervisor<'_>, run: &TaskRun) -> O
 }
 
 /// Raise a session that held `/exit` back as a `stuck_exit` ask to the
-/// inbox, with the last lines of its screen, through the ask path that
-/// notifies once when the ask is new (ADR-0022 decision 5). An open ask of
-/// the run is not registered twice. A screen that cannot be read leaves the
-/// ask without an excerpt. `after` says where the run stands and what
-/// follows once the session exits: a `running` run goes on to validating,
-/// one the supervisor holds after its review (ADR-0027) to its landing, its
-/// ask or its rest. The inbox shows the ask to the person, who acts on the
-/// answer through it (the `dagq-recover` skill).
+/// inbox once its recovery job escalated (ADR-0047 decision 40), with the
+/// job's `note` and the last lines of its screen, through the ask path that
+/// notifies once when the ask is new (ADR-0022 decision 5); the options are
+/// `exit` and `wait` and the job's, the reason category the job's. An open
+/// ask of the run is not registered twice. A screen that cannot be read
+/// leaves the ask without an excerpt. `after` says where the run stands and
+/// what follows once the session exits: a `running` run goes on to
+/// validating, one the supervisor holds after its review (ADR-0027) to its
+/// landing, its ask or its rest. The inbox shows the ask to the person, who
+/// acts on the answer through it (the `dagq-recover` skill).
 pub(super) fn ask_stuck_exit(
     sv: &mut Supervisor<'_>,
     run: &TaskRun,
     workspace: &str,
     after: &str,
-) -> Result<()> {
+    note: Option<&Note>,
+) -> Result<AskId> {
     let screen = match sv.cmux.capture(workspace) {
         Ok(screen) => sv.signals.screen_excerpt(&screen),
         Err(error) => format!("(the screen could not be read: {error:#})"),
     };
+    let recovery = note.map_or_else(String::new, |note| {
+        format!(
+            "\n\nIts recovery job looked first, and {}.\n{}",
+            note.why, note.text
+        )
+    });
     let question = format!(
-        "The session of run {run_id} (task {task_id}) did not exit within {timeout}s of the supervisor's /exit (exit_request_timed_out): something on its screen, usually one of Claude Code's own dialogs such as \"Background work is running\", holds the exit back. {after}; this ask then closes itself. Answer `exit` to have the dialog answered so that the session exits and /exit sent in workspace {workspace}, or `wait` to leave the session as it is (or write what to do instead).\n\nLast lines of the screen:\n{screen}",
+        "The session of run {run_id} (task {task_id}) did not exit within {timeout}s of the supervisor's /exit (exit_request_timed_out): something on its screen, usually one of Claude Code's own dialogs such as \"Background work is running\", holds the exit back. {after}; this ask then closes itself. Answer `exit` to have the dialog answered so that the session exits and /exit sent in workspace {workspace}, or `wait` to leave the session as it is (or write what to do instead).{recovery}\n\nLast lines of the screen:\n{screen}",
         run_id = run.id(),
         task_id = run.task_id(),
         timeout = sv.cmux.exit_timeout().as_secs(),
     );
+    let mut options: Vec<String> = vec!["exit".into(), "wait".into()];
+    for option in note.map(|note| note.options.as_slice()).unwrap_or_default() {
+        if !options.contains(option) {
+            options.push(option.clone());
+        }
+    }
     let outcome = ask::ask(
         &mut *sv.queue,
         &sv.layout.repo_root,
@@ -328,15 +427,17 @@ pub(super) fn ask_stuck_exit(
             task_id: Some(run.task_id()),
             run_id: Some(run.id().clone()),
             question,
-            options: vec!["exit".into(), "wait".into()],
+            options,
             asked_by: SessionRole::Supervisor.as_str().into(),
-            reason_category: AskReason::RecoveryFailed,
+            reason_category: note.map_or(AskReason::RecoveryFailed, |note| note.category),
             finding_id: None,
         },
         sv.cmux,
     )?;
     info!(ask_id = %outcome["id"], run_id = %run.id(), "stuck_exit ask {} for {} (notified: {})", outcome["id"], run.id(), outcome["notified"]);
-    Ok(())
+    Ok(AskId::new(
+        outcome["id"].as_i64().context("ask returned no id")?,
+    ))
 }
 
 /// How a registered wrapper that has not recorded its exit stands. Its

@@ -4,8 +4,8 @@ type: design
 title: Manual smoke of the paths that include real Claude
 status: current
 created: 2026-09-25
-updated: 2026-09-25
-last_verified: 2026-09-25
+updated: 2026-09-26
+last_verified: 2026-09-26
 scope: operations
 related:
   - adr-0036
@@ -46,7 +46,7 @@ related:
 
 | # | 起こすこと | agent | 確認点 |
 | --- | --- | --- | --- |
-| 1 | Claude の異常終了: commit した直後・receipt の前に、`doctor` の agent pid を `kill -KILL` | 実 Claude | wrapper が `session_exited`（signal 終了は exit 128）を記録し run は `failed`。worktree・branch・run dir が残る。triage が retry / resume / ask を決める。並行する run と、空いた slot の次の claim に影響しない |
+| 1 | Claude の異常終了: commit した直後・receipt の前に、`doctor` の agent pid を `kill -KILL` | 実 Claude | wrapper が `session_exited`（signal 終了は exit 128）を記録し run は `failed`。worktree・branch・run dir が残る。復旧 job が retry / retry_inherit / resume / wait か escalate（`decide` の ask）を決める。並行する run と、空いた slot の次の claim に影響しない |
 | 2 | supervisor の再起動: 2 run が `running` の間に supervisor を `kill -KILL` し、同じ workspace で新しい supervisor を起動 | stub | 新しい supervisor は wrapper が生きている run の stale lease を引き継ぎ（[ADR-0012](../adr/0012-adopt-stale-lease-of-live-wrapper.md)）、run は receipt → 検証 → review まで進む。同じ task に 2 本目の run が立たない |
 | 3 | 検証の失敗: `[break]` の task に `--verify 'test -f seed.txt'` | stub | 検証は `integrate` の 1 回だけで、失敗すると run は `needs_session` になり、supervisor が resume する（[`needs_session`](supervisor-lifecycle/needs-session.md#needs_session)）。3 回で解消しなければ `failed` と `decide` の ask。`main` は進まない。`tests/e2e.rs` の stub の resume は `set -eu` の下で `test -f seed.txt` を実行して非0で終わるので、拡張した stub の resume では `[break]` のときに `seed.txt` を戻す（解消を見る）か、壊したまま receipt を書き直す（回数上限を見る）かを決めておく |
 | 4 | cleanup の失敗: review が pass して session が終わった（`session_exited`）後、supervisor が workspace を閉じる前に `cmux workspace close <uuid>` で閉じる | stub | supervisor の close は `not_found` で `cleanup_failed` イベントと `last_error` になり、run の状態は変わらず、着地も通る。supervisor は落ちない。worker の session は review の後まで開いたままなので（[ADR-0027](../adr/0027-keep-worker-session-through-review-revise-verdict-and-merge-tree-precheck.md)）、それより前に閉じると wrapper が死んでシナリオ 5 と同じ abandon の経路になる。窓は短いので、コマンド終了後に cmux が workspace を自動で閉じる環境（[観測済みの環境依存](#観測済みの環境依存)）ではこれが自然に起きる |

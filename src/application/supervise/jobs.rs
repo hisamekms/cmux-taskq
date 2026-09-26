@@ -1,12 +1,13 @@
-//! The headless jobs of a run: the review (ADR-0027) and the triage
-//! (ADR-0024 decision 3), each a process waited for with a timeout.
+//! The headless jobs of a run: the review (ADR-0027) and the recovery job
+//! (ADR-0047 decisions 39 and 40), each a process waited for with a
+//! timeout.
 
 use super::*;
 
-/// A headless job's process (a review or a triage) whose stdout and stderr
+/// A headless job's process (a review or a recovery job) whose stdout and stderr
 /// go to files, waited for at most `timeout`.
 pub(super) struct HeadlessJob {
-    /// What the job is, for its failure messages: `review`, `triage`.
+    /// What the job is, for its failure messages: `review`, `recovery job`.
     pub(super) what: &'static str,
     pub(super) child: Box<dyn Spawned>,
     pub(super) started: Instant,
@@ -87,21 +88,25 @@ impl ReviewWatch {
     }
 }
 
-/// The headless triage in progress, with its output in `triage-N.out` /
-/// `triage-N.err` next to the run.
-pub(super) struct TriageWatch {
+/// The recovery job of a `failed` or `interrupted` run in progress, with
+/// its output next to the run (see [`job_file`]).
+pub(super) struct EndedRecovery {
+    /// The round (`triage_started`'s `attempt`).
+    pub(super) round: usize,
+    pub(super) alert: RecoveryAlert,
+    /// The job's number for its alert (`recovery_requested`'s `attempt`).
     pub(super) attempt: usize,
     pub(super) job: HeadlessJob,
 }
 
-impl TriageWatch {
+impl EndedRecovery {
     pub(super) fn poll(
         &mut self,
         files: &dyn RunFiles,
-    ) -> Result<Option<std::result::Result<TriageVerdict, String>>> {
+    ) -> Result<Option<std::result::Result<RecoveryVerdict, String>>> {
         Ok(self
             .job
             .poll(files)?
-            .map(|output| output.and_then(|stdout| TriageVerdict::parse(&stdout))))
+            .map(|output| output.and_then(|stdout| RecoveryVerdict::parse(&stdout))))
     }
 }

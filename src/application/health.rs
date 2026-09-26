@@ -14,9 +14,9 @@ use super::{AskQuery, Clock, PlannerAnswerRoute, ProcessControl, Queue, RunFiles
 use crate::domain::{
     ASK_EVENT_KINDS, AskId, AskKind, Attention, AttentionNext, HEARTBEAT_TIMEOUT_SECS,
     LANDING_OPTIONS, ReasonCode, RunEvent, RunId, RunLease, RunProcess, RunStatus, SessionRole,
-    SupervisorMode, SupervisorPulse, SupervisorRegistration, TRIAGE_OPTIONS, TaskId, TaskRun,
-    TriageState, UPDATE_FAILED_OPTIONS, UPDATE_FAILED_SUBJECT, event_attention, heartbeat_stale,
-    reason, recheck, run_attention,
+    SupervisorMode, SupervisorPulse, SupervisorRegistration, TaskId, TaskRun, TriageState,
+    UPDATE_FAILED_OPTIONS, UPDATE_FAILED_SUBJECT, event_attention, heartbeat_stale, reason,
+    recheck, run_attention,
     run_env::{RUN_ENV_PROGRAM_KINDS, RUN_ENV_PROGRAM_MISSING, RunEnvCheck},
     supervisor_attention, triage_state,
     waiting::WaitState,
@@ -678,6 +678,23 @@ pub fn attention(
             continue;
         }
         let events = queue.run_events(run.id())?;
+        // A live session whose recovery job failed waits for a person to
+        // recover it by hand (ADR-0047 decision 40), whatever its status.
+        if let Some(failed) = crate::domain::recovery::failed_live(&events, None) {
+            attention.push(Attention {
+                run_id: Some(run.id().clone()),
+                task_id: Some(run.task_id()),
+                pid: None,
+                ask_id: None,
+                reason_category: Some(crate::domain::AskReason::RecoveryFailed),
+                status: run.status().as_str().into(),
+                kind: failed.kind.clone(),
+                last_error: failed.payload["error"].as_str().map(truncate_reason),
+                last_error_code: Some(ReasonCode::JobFailed),
+                next: AttentionNext::RecoverByHand,
+            });
+            continue;
+        }
         let exit_pending = events
             .iter()
             .rev()
@@ -877,9 +894,10 @@ pub fn attention(
             && ask
                 .answer
                 .as_deref()
-                .is_some_and(|answer| TRIAGE_OPTIONS.contains(&answer.trim()))
+                .is_some_and(|answer| ask.options.iter().any(|option| option == answer.trim()))
         {
-            // The supervisor retries, resumes or cancels the triaged run.
+            // The supervisor retries, resumes or cancels the recovered run,
+            // or hands another option of the ask back to the recovery job.
             (
                 "answered",
                 "ask_answered",

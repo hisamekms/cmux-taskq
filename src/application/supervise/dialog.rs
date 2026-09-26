@@ -27,19 +27,29 @@ const STAGE_EVENTS: &[&str] = &[
 /// conditions that do not hold, or keys that could not be sent, as
 /// `known_dialog_unanswered`. Returns whether the keys were sent: the
 /// caller then waits for the dialog to go, and a dialog already answered
-/// or recorded in this stage gets nothing more (`false`).
+/// or recorded in this stage gets nothing more (`false`). `recovery` names
+/// the recovery job whose `answer_known_dialog` this is (its alert and
+/// attempt): its answer is recorded as `layer: recovery`, `repair:
+/// answer_known_dialog`, and a dialog the runtime only recorded unanswered
+/// in the stage may get it, since its conditions were checked again.
 pub(super) fn answer_known_dialog(
     sv: &mut Supervisor<'_>,
     run: &TaskRun,
     workspace: &str,
     screen: &str,
     exit_requested: bool,
+    recovery: Option<(RecoveryAlert, usize)>,
 ) -> Result<bool> {
     let Some(answer) = sv.signals.known_dialog(screen) else {
         return Ok(false);
     };
     let dialog = answer.dialog.as_str();
-    if handled_in_stage(&sv.queue.run_events(run.id())?, dialog) {
+    let events = sv.queue.run_events(run.id())?;
+    let handled = match recovery {
+        None => handled_in_stage(&events, dialog),
+        Some(_) => answered_in_stage(&events, dialog),
+    };
+    if handled {
         return Ok(false);
     }
     let excerpt = sv.signals.screen_excerpt(screen);
@@ -57,18 +67,22 @@ pub(super) fn answer_known_dialog(
     };
     match sent {
         Ok(()) if ok => {
-            sv.queue.record_runtime_event(
-                run.id(),
-                "auto_repaired",
-                json!({
-                    "layer": "runtime",
-                    "repair": "dialog_answered",
-                    "dialog": dialog,
-                    "keys": answer.keys,
-                    "conditions": conditions,
-                    "detail": {"workspace_id": workspace, "excerpt": excerpt},
-                }),
-            )?;
+            let mut payload = json!({
+                "layer": "runtime",
+                "repair": DIALOG_ANSWERED,
+                "dialog": dialog,
+                "keys": answer.keys,
+                "conditions": conditions,
+                "detail": {"workspace_id": workspace, "excerpt": excerpt},
+            });
+            if let Some((alert, attempt)) = recovery {
+                payload["layer"] = json!("recovery");
+                payload["repair"] = json!(RECOVERY_DIALOG_ANSWERED);
+                payload["alert"] = json!(alert);
+                payload["attempt"] = json!(attempt);
+            }
+            sv.queue
+                .record_runtime_event(run.id(), "auto_repaired", payload)?;
             info!(run_id = %run.id(), "run {} was held by the {dialog} dialog in workspace {workspace}; answered it with {:?}", run.id(), answer.keys);
             Ok(true)
         }
@@ -111,7 +125,7 @@ pub(super) fn answer_exit_dialog(
                 .known_dialog(&screen)
                 .is_some_and(|answer| answer.dialog == KnownDialog::BackgroundWork) =>
         {
-            answer_known_dialog(sv, run, workspace, &screen, exit_typed)
+            answer_known_dialog(sv, run, workspace, &screen, exit_typed, None)
         }
         Ok(_) => Ok(false),
         Err(error) => {
@@ -121,19 +135,82 @@ pub(super) fn answer_exit_dialog(
     }
 }
 
+/// `auto_repaired`'s `repair` of a dialog the runtime answered by rule.
+const DIALOG_ANSWERED: &str = "dialog_answered";
+
+/// `auto_repaired`'s `repair` of a dialog a recovery job's verdict answered.
+const RECOVERY_DIALOG_ANSWERED: &str = "answer_known_dialog";
+
 /// Whether `dialog` was answered or recorded unanswered since the last
 /// event that began a stage.
 fn handled_in_stage(events: &[RunEvent], dialog: &str) -> bool {
+    in_stage(events, dialog, true)
+}
+
+/// Whether keys were sent to `dialog` (by rule or by a recovery job) since
+/// the last event that began a stage: at most once per stage.
+fn answered_in_stage(events: &[RunEvent], dialog: &str) -> bool {
+    in_stage(events, dialog, false)
+}
+
+fn in_stage(events: &[RunEvent], dialog: &str, unanswered: bool) -> bool {
     events
         .iter()
         .rev()
         .take_while(|e| !STAGE_EVENTS.contains(&e.kind.as_str()))
         .any(|e| {
             let answered = e.kind == "auto_repaired"
-                && e.payload.get("repair").and_then(Value::as_str) == Some("dialog_answered");
-            (answered || e.kind == "known_dialog_unanswered")
+                && matches!(
+                    e.payload.get("repair").and_then(Value::as_str),
+                    Some(DIALOG_ANSWERED | RECOVERY_DIALOG_ANSWERED)
+                );
+            (answered || (unanswered && e.kind == "known_dialog_unanswered"))
                 && e.payload.get("dialog").and_then(Value::as_str) == Some(dialog)
         })
+}
+
+/// Whether a recovery job's `answer_known_dialog` holds now (ADR-0047
+/// decision 40: the preconditions of decision 29): the screen shows a
+/// known dialog (the one named, when `want` names one), no keys went to it
+/// in this stage, and its conditions hold. `Err` says why not.
+pub(super) fn known_dialog_ready(
+    sv: &mut Supervisor<'_>,
+    run: &TaskRun,
+    workspace: &str,
+    exit_typed: bool,
+    want: &str,
+) -> std::result::Result<(), String> {
+    let screen = sv
+        .cmux
+        .capture(workspace)
+        .map_err(|error| format!("the screen could not be read: {error:#}"))?;
+    let answer = sv
+        .signals
+        .known_dialog(&screen)
+        .ok_or("no known dialog is on the screen")?;
+    let dialog = answer.dialog.as_str();
+    if !want.trim().is_empty() && want.trim() != dialog {
+        return Err(format!("the dialog on the screen is {dialog}, not {want}"));
+    }
+    let events = sv
+        .queue
+        .run_events(run.id())
+        .map_err(|error| format!("{error:#}"))?;
+    if answered_in_stage(&events, dialog) {
+        return Err(format!(
+            "the {dialog} dialog was answered once in this stage already"
+        ));
+    }
+    let (ok, conditions) = match answer.dialog {
+        KnownDialog::BackgroundWork => background_work_conditions(sv, run, exit_typed),
+        KnownDialog::SettingsPanel => (true, json!({})),
+    };
+    if !ok {
+        return Err(format!(
+            "the conditions of the {dialog} dialog do not hold: {conditions}"
+        ));
+    }
+    Ok(())
 }
 
 /// Whether "Exit and stop tasks" may stop the session's background work:
@@ -211,6 +288,22 @@ mod tests {
             "background_work"
         ));
         assert!(handled_in_stage(&[exit, unanswered], "background_work"));
+        // A recovery job's answer counts as one; an unanswered record only
+        // for the runtime's own rule.
+        let recovered = event(
+            "auto_repaired",
+            json!({"repair": "answer_known_dialog", "dialog": "background_work"}),
+        );
+        assert!(handled_in_stage(
+            std::slice::from_ref(&recovered),
+            "background_work"
+        ));
+        assert!(answered_in_stage(&[recovered], "background_work"));
+        let unanswered = event(
+            "known_dialog_unanswered",
+            json!({"dialog": "background_work"}),
+        );
+        assert!(!answered_in_stage(&[unanswered], "background_work"));
         // Another repair is not a dialog answered.
         let other = event(
             "auto_repaired",

@@ -160,7 +160,7 @@ fn an_exit_that_never_got_there_asks_for_a_run_that_cannot_land() {
         payloads(&detail, "exit_unsent"),
         [&json!({
             "code": "backend_timeout", "workspace_id": WORKSPACE_ID, "attempts": 3,
-            "action": "ask", "held": "the run does not land after its exit",
+            "action": "recover", "held": "the run does not land after its exit",
         })]
     );
     assert_eq!(
@@ -228,7 +228,7 @@ fn an_exit_that_never_got_there_asks_when_the_workspace_cannot_be_closed() {
     let detail = queue.show(TaskId::new(1)).unwrap();
     let run = detail.runs[0].clone();
     let unsent = payloads(&detail, "exit_unsent");
-    assert_eq!(unsent[0]["action"], "ask", "{unsent:?}");
+    assert_eq!(unsent[0]["action"], "recover", "{unsent:?}");
     assert!(
         unsent[0]["held"]
             .as_str()
@@ -271,7 +271,7 @@ fn an_exit_that_never_got_there_asks_for_a_passed_run_whose_worktree_changed() {
     let run = detail.runs[0].clone();
     let unsent = payloads(&detail, "exit_unsent");
     assert_eq!(unsent.len(), 1, "{unsent:?}");
-    assert_eq!(unsent[0]["action"], "ask");
+    assert_eq!(unsent[0]["action"], "recover");
     let held = unsent[0]["held"].as_str().unwrap();
     assert!(
         held.starts_with("its receipt no longer holds: worktree is not clean"),
@@ -950,6 +950,261 @@ fn a_revise_receipt_for_another_commit_is_sent_back_to_the_session_until_it_name
     );
     assert!(texts[1].1.contains("git rev-parse HEAD"), "{}", texts[1].1);
     assert_eq!(backend.exits_sent.load(Ordering::SeqCst), 1);
+}
+
+/// A run whose session held the `/exit` after its passing review back past
+/// the exit timeout, left by a supervisor that died before it did anything
+/// about it: validated, reviewed, `/exit` sent and timed out.
+fn stuck_exit_after_a_pass(repo: &Path, db: &Path, backend: &TestWorkspace) -> TaskRun {
+    let run = start_run_under_dead_supervisor(repo, db, backend, "dead-supervisor");
+    let idle = run.idle_marker_path().unwrap();
+    wait_until(db, Duration::from_secs(20), |_| idle.is_file());
+    let head = git_out(
+        Path::new(run.worktree_path().unwrap()),
+        &["rev-parse", "HEAD"],
+    );
+    Connection::open(db)
+        .unwrap()
+        .execute(
+            "UPDATE task_runs SET status='awaiting_integration', result_commit=?2 WHERE id=?1",
+            rusqlite::params![run.id(), head],
+        )
+        .unwrap();
+    let queue = SqliteQueue::open(db).unwrap();
+    for (kind, payload) in [
+        (
+            "validation_finished",
+            json!({"status": "awaiting_integration"}),
+        ),
+        ("review_started", json!({"attempt": 1})),
+        (
+            "review_finished",
+            json!({"verdict": "pass", "reasons": [], "summary": "ok", "attempt": 1}),
+        ),
+        (
+            "exit_requested",
+            json!({"workspace_id": WORKSPACE_ID, "timeout_secs": 120}),
+        ),
+        (
+            "exit_request_timed_out",
+            json!({"workspace_id": WORKSPACE_ID, "timeout_secs": 120}),
+        ),
+    ] {
+        queue.record_runtime_event(run.id(), kind, payload).unwrap();
+    }
+    age_lease(db, &run, 31);
+    run
+}
+
+/// Supervise with `recovery` as the only recovery job's script, on a
+/// thread.
+fn supervise_recovering(
+    db: &Path,
+    repo: &Path,
+    backend: &Arc<TestWorkspace>,
+    recovery: String,
+) -> (Arc<TestReviewer>, thread::JoinHandle<Result<Value>>) {
+    let reviewer = Arc::new(
+        TestReviewer::new(&[verdict("concern", &["x"], "never")]).with_triages(&[recovery]),
+    );
+    let supervisor = {
+        let (db, repo, backend, reviewer) = (
+            db.to_owned(),
+            repo.to_owned(),
+            backend.clone(),
+            reviewer.clone(),
+        );
+        thread::spawn(move || {
+            runtime::supervise_with_reviewer(
+                &db,
+                &repo,
+                &*backend,
+                &claude_stub(&db),
+                &*reviewer,
+                Path::new(env!("CARGO_BIN_EXE_dagq")),
+                &supervise_options(4, true),
+            )
+        })
+    };
+    (reviewer, supervisor)
+}
+
+/// ADR-0047 decisions 39 and 40: a session that holds the `/exit` after a
+/// passing review back is the `stuck_exit` alert's recovery job's. Its
+/// `close_and_proceed` holds (the review passed, the worktree is clean and
+/// the receipt names its HEAD, the reviewed commit), so the runtime closes
+/// the workspace and lands the run, with no ask and no second `/exit`.
+#[test]
+fn a_stuck_exit_after_a_pass_is_closed_and_landed_by_its_recovery_job() {
+    let (_dir, repo, db) = fixture();
+    let base = git_out(&repo, &["rev-parse", "main"]);
+    let mut backend = TestWorkspace::new(&db, false, IDLE_AGENT);
+    backend.close_ends_session = true;
+    let backend = Arc::new(backend);
+    let run = stuck_exit_after_a_pass(&repo, &db, &backend);
+    let (reviewer, supervisor) = supervise_recovering(
+        &db,
+        &repo,
+        &backend,
+        repair(
+            json!({"action": "close_and_proceed"}),
+            "a dialog holds the exit of a finished session",
+        ),
+    );
+    let outcome = joined(supervisor, "the supervisor thread to return").unwrap();
+    backend.join();
+    assert_eq!(outcome["errors"], json!([]), "{outcome}");
+    let mut queue = SqliteQueue::open(&db).unwrap();
+    let detail = queue.show(TaskId::new(1)).unwrap();
+    assert_landed(&repo, &detail.runs[0], "test task", &base);
+    assert!(
+        queue
+            .asks(AskQuery {
+                all: true,
+                ..Default::default()
+            })
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(backend.exits_sent.load(Ordering::SeqCst), 0);
+    assert!(backend.closed().contains(&WORKSPACE_ID.to_owned()));
+    let events = queue.run_events(run.id()).unwrap();
+    let timed_out = events
+        .iter()
+        .find(|e| e.kind == "exit_request_timed_out")
+        .unwrap();
+    let requested = payloads(&detail, "recovery_requested");
+    assert_eq!(requested.len(), 1, "{requested:?}");
+    assert_eq!(requested[0]["alert"], "stuck_exit");
+    assert_eq!(requested[0]["evidence"], json!([timed_out.id]));
+    assert_eq!(requested[0]["then"], "land");
+    let repaired = payloads(&detail, "auto_repaired");
+    assert_eq!(repaired.len(), 1, "{repaired:?}");
+    assert_eq!(repaired[0]["layer"], "recovery");
+    assert_eq!(repaired[0]["repair"], "close_and_proceed");
+    assert_eq!(repaired[0]["alert"], "stuck_exit");
+    let finished = payloads(&detail, "recovery_finished");
+    assert_eq!(finished[0]["applied"], json!(["close_and_proceed"]));
+    let kinds = event_kinds(&detail);
+    assert!(position(&kinds, "recovery_finished") < position(&kinds, "run_integrated"));
+    let (prompt, _) = &reviewer.triage_prompts()[0];
+    for part in [
+        "raised the alert stuck_exit",
+        "close_and_proceed",
+        "is still running",
+    ] {
+        assert!(prompt.contains(part), "{part}: {prompt}");
+    }
+}
+
+/// A live session's recovery job that fails (here it exits non-zero) is
+/// no ask: it is `recovery_failed`, the `recover by hand` attention
+/// (ADR-0047 decision 40), and no other job starts for the alert. Once the
+/// person has the session exit, the attention is gone and the run lands.
+#[test]
+fn a_failed_stuck_exit_job_is_recovered_by_hand() {
+    let (_dir, repo, db) = fixture();
+    let base = git_out(&repo, &["rev-parse", "main"]);
+    let backend = Arc::new(TestWorkspace::new(&db, false, IDLE_AGENT));
+    let run = stuck_exit_after_a_pass(&repo, &db, &backend);
+    let (reviewer, supervisor) =
+        supervise_recovering(&db, &repo, &backend, "echo broken >&2; exit 3".to_owned());
+    wait_until(&db, Duration::from_secs(30), |queue| {
+        !events_of(&db, run.id(), "recovery_failed").is_empty()
+            && queue.asks(AskQuery::default()).unwrap().is_empty()
+    });
+    let failed = events_of(&db, run.id(), "recovery_failed");
+    assert_eq!(failed[0]["alert"], "stuck_exit");
+    assert_eq!(failed[0]["code"], "job_failed");
+    assert_eq!(failed[0]["reason_category"], "recovery_failed");
+    assert!(
+        failed[0]["error"].as_str().unwrap().contains("broken"),
+        "{failed:?}"
+    );
+    let finished = events_of(&db, run.id(), "recovery_finished");
+    assert_eq!(finished[0]["outcome"], "job_failed");
+    let status = runtime::status(&db).unwrap();
+    let attention = run_attention_of(&status, run.id()).unwrap();
+    assert_eq!(attention["next"], "recover by hand", "{status}");
+    assert_eq!(attention["kind"], "recovery_failed");
+    assert_eq!(attention["reason_category"], "recovery_failed");
+    // No other job, and no ask, while it waits for the person.
+    thread::sleep(Duration::from_millis(500));
+    assert_eq!(reviewer.triage_prompts().len(), 1);
+    let mut queue = SqliteQueue::open(&db).unwrap();
+    assert!(queue.asks(AskQuery::default()).unwrap().is_empty());
+    // The person has the session exit; the run lands.
+    fs::write(exit_request_path(run.run_dir().unwrap()), "").unwrap();
+    let outcome = joined(supervisor, "the supervisor thread to return").unwrap();
+    backend.join();
+    assert_eq!(outcome["errors"], json!([]), "{outcome}");
+    assert_landed(
+        &repo,
+        &queue.show(TaskId::new(1)).unwrap().runs[0],
+        "test task",
+        &base,
+    );
+    let status = runtime::status(&db).unwrap();
+    assert!(run_attention_of(&status, run.id()).is_none(), "{status}");
+}
+
+/// A `stuck_exit` repair the runtime cannot apply (a key to a dialog that
+/// is not a known one) is not applied at all: the `stuck_exit` ask opens
+/// with the job's diagnosis, its options added to `exit` and `wait`, and
+/// its reason category.
+#[test]
+fn a_stuck_exit_repair_that_does_not_hold_becomes_the_stuck_exit_ask() {
+    let (_dir, repo, db) = fixture();
+    let base = git_out(&repo, &["rev-parse", "main"]);
+    let backend = Arc::new(TestWorkspace::new(&db, false, IDLE_AGENT));
+    let run = stuck_exit_after_a_pass(&repo, &db, &backend);
+    let (_reviewer, supervisor) = supervise_recovering(
+        &db,
+        &repo,
+        &backend,
+        recovery(json!({
+            "verdict": "repair",
+            "confidence": "high",
+            "diagnosis": "an unknown dialog",
+            "actions": [{"action": "answer_known_dialog", "dialog": "background_work"}],
+            "options": ["press escape"],
+            "reason_category": "scope",
+        })),
+    );
+    wait_until(&db, Duration::from_secs(30), |queue| {
+        !queue.asks(AskQuery::default()).unwrap().is_empty()
+    });
+    let mut queue = SqliteQueue::open(&db).unwrap();
+    let ask = queue.asks(AskQuery::default()).unwrap().remove(0);
+    assert_eq!(ask.kind, AskKind::StuckExit);
+    assert_eq!(ask.options, ["exit", "wait", "press escape"]);
+    assert_eq!(ask.reason_category, dagq::domain::AskReason::Scope);
+    for part in [
+        "Its recovery job looked first, and the runtime did not apply the recovery job's repair: answer_known_dialog: no known dialog is on the screen",
+        "Why a person: scope",
+        "Diagnosis: an unknown dialog",
+        "recovery-stuck_exit-1.prompt.txt",
+        "lands on main once the session exits",
+    ] {
+        assert!(ask.question.contains(part), "{part}: {}", ask.question);
+    }
+    let detail = queue.show(TaskId::new(1)).unwrap();
+    assert!(payloads(&detail, "auto_repaired").is_empty());
+    let finished = payloads(&detail, "recovery_finished");
+    assert_eq!(finished[0]["escalated"], true);
+    assert_eq!(finished[0]["ask_id"], json!(ask.id));
+    // The person's /exit reaches the session; the run lands.
+    fs::write(exit_request_path(run.run_dir().unwrap()), "").unwrap();
+    let outcome = joined(supervisor, "the supervisor thread to return").unwrap();
+    backend.join();
+    assert_eq!(outcome["errors"], json!([]), "{outcome}");
+    assert_landed(
+        &repo,
+        &queue.show(TaskId::new(1)).unwrap().runs[0],
+        "test task",
+        &base,
+    );
+    assert!(queue.read_ask(ask.id).unwrap().closed_at.is_some());
 }
 
 /// A supervisor died while it waited for the session to exit after a
