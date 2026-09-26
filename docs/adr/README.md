@@ -37,9 +37,7 @@ ADRは、将来の実装や運用に大きな影響を与える決定の理由�
 
 | ADR | Title | accepted_on |
 | --- | --- | --- |
-| [ADR-0003](0003-supervisor-owns-lifecycle.md) | supervisorがagentとworkspaceのライフサイクルを所有する | 2026-09-22 |
 | [ADR-0004](0004-agent-provider-abstraction.md) | ClaudeとCodexをagent providerとして抽象化する | 2026-09-22 |
-| [ADR-0007](0007-run-level-leases-parallel-execution.md) | leaseをrun単位にし、依存が解けたtaskを上限付きで並列に実行する | 2026-09-22 |
 | [ADR-0008](0008-merge-queue-squash-landing.md) | runtimeのmerge queueが最新mainへrebase・再検証し、1 task = 1 commitにsquashしてmainへ着地させる | 2026-09-22 |
 | [ADR-0009](0009-goal-groups-tasks.md) | 複数のtaskが解く上位の課題をgoalとして表現し、workerのpromptに流す | 2026-09-25 |
 | [ADR-0010](0010-maintainer-and-resident-supervisor.md) | 役割名をsupervisor / maintainer / workerに統一し、supervisorをlaunchdで常駐させてupとdownで起動・停止する | 2026-09-22 |
@@ -49,7 +47,6 @@ ADRは、将来の実装や運用に大きな影響を与える決定の理由�
 | [ADR-0018](0018-run-workspace-named-after-the-task.md) | runのcmux workspace名はtaskのtitleにし、run IDはdescriptionに置く | 2026-09-23 |
 | [ADR-0021](0021-maintainer-and-supervisor-workspace-names-follow-the-run-style.md) | maintainer / supervisor / resumeのcmux workspace名もrunと同じ`[<repo>]dagq <role>`にそろえる | 2026-09-23 |
 | [ADR-0022](0022-ask-answer-inbox-planner-and-landing-on-doubt.md) | 相談をqueueのask / answerにし、upがinboxとplannerを開き、着地は疑義のあるときだけ人に聞き、cmux notifyはinbox宛てにする | 2026-09-23 |
-| [ADR-0025](0025-leaseless-unfinished-run-is-a-recover-run-attention.md) | supervisorが手放した未完了runをattention（recover run）にする | 2026-09-23 |
 | [ADR-0026](0026-identify-workspaces-by-uuid-env-and-queue-group.md) | cmux workspaceをtitleではなくqueue DBのUUIDで識別し、roleとqueueを--envで持たせ、queueごとのworkspace groupにまとめる | 2026-09-23 |
 | [ADR-0027](0027-keep-worker-session-through-review-revise-verdict-and-merge-tree-precheck.md) | workerのsessionをreviewの後まで残し、機械的な指摘はrevise verdictで生きているworkerに返し、着地前にmerge-treeで衝突を事前判定する | 2026-09-23 |
 | [ADR-0028](0028-workspace-titles-are-repo-and-role.md) | cmux workspaceのtitleを`[<repo>]<role>`にし、planner / inboxの名前とrole値を定義する | 2026-09-23 |
@@ -68,6 +65,7 @@ ADRは、将来の実装や運用に大きな影響を与える決定の理由�
 | [ADR-0051](0051-kpi-time-series-report-and-push.md) | KPIを決まった規則でrun_eventsから導き、期間・taskの種類・変更の印で比べ、目標割れを判定し、supervisorが日次のHTMLとJSONのレポートを書き、ホストの設定のコマンドにpushし、KPIのfindingから作る改善のproposalの数に上限を付ける | 2026-09-26 |
 | [ADR-0052](0052-rust-single-binary-and-plugin-with-cmux-first.md) | runtimeをRustの単一バイナリdagqとpluginで配り、cmuxを最初のworkspace backendにする（ADR-0001・ADR-0002・ADR-0005・ADR-0015を統合） | 2026-09-26 |
 | [ADR-0053](0053-queue-in-data-dir-run-paths-from-queue-and-rebind.md) | repositoryごとのqueueをデータディレクトリに置き、runのpathをqueueから解決し、repositoryとqueueの移動をrebindで扱う（ADR-0006・ADR-0017・ADR-0020を統合） | 2026-09-26 |
+| [ADR-0054](0054-run-lease-ownership-parallel-supervisors-and-recover.md) | supervisorがrun単位のleaseでrunのlifecycleを所有して並列に実行し、死んだsupervisorのrunを引き継ぎ、手放したrunをrecoverに回す（ADR-0003・ADR-0007・ADR-0025を統合） | 2026-09-26 |
 | [ADR-0062](0062-runs-waiting-for-a-person-leave-the-slot.md) | 人の答えを待つrunをslotから外し、leaseを持ったまま軽く見張り、待ちの数に上限を付け、待ちが終わったrunを新しいclaimより先にslotへ戻す | 2026-09-26 |
 | [ADR-0068](0068-recheck-waiting-runs-after-each-landing.md) | 着地のたびに着地待ちのrunをmerge-treeと軽い検査で先回りして確かめ、着地しなくなったrunは人の回答や着地の順番を待たずにresumeする | 2026-09-26 |
 | [ADR-0076](0076-run-the-coverage-gate-tests-with-nextest.md) | integrateのcoverageの関門のtestをcargo-nextestでbinaryをまたいで並列に流し（cargo llvm-cov nextest）、cargo-nextestは人がhostに入れる | 2026-09-26 |
@@ -80,8 +78,10 @@ ADRは、将来の実装や運用に大きな影響を与える決定の理由�
 | --- | --- | --- | --- |
 | [ADR-0001](0001-rust-runtime.md) | superseded | [ADR-0052](0052-rust-single-binary-and-plugin-with-cmux-first.md) | 2026-09-26 |
 | [ADR-0002](0002-cmux-first.md) | superseded | [ADR-0052](0052-rust-single-binary-and-plugin-with-cmux-first.md) | 2026-09-26 |
+| [ADR-0003](0003-supervisor-owns-lifecycle.md) | superseded | [ADR-0054](0054-run-lease-ownership-parallel-supervisors-and-recover.md) | 2026-09-26 |
 | [ADR-0005](0005-binary-and-plugin-distribution.md) | superseded | [ADR-0052](0052-rust-single-binary-and-plugin-with-cmux-first.md) | 2026-09-26 |
 | [ADR-0006](0006-queue-per-repository.md) | superseded | [ADR-0053](0053-queue-in-data-dir-run-paths-from-queue-and-rebind.md) | 2026-09-26 |
+| [ADR-0007](0007-run-level-leases-parallel-execution.md) | superseded | [ADR-0054](0054-run-lease-ownership-parallel-supervisors-and-recover.md) | 2026-09-26 |
 | [ADR-0012](0012-adopt-stale-lease-of-live-wrapper.md) | superseded | [ADR-0039](0039-adopt-stale-lease-of-live-wrapper-and-renew-own-stale-lease.md) | 2026-09-25 |
 | [ADR-0014](0014-up-replaces-a-supervisor-of-another-binary-version.md) | superseded | [ADR-0045](0045-build-identifier-explicit-migrate-schema-compat-handoff-and-auto-update.md) | 2026-09-25 |
 | [ADR-0015](0015-rename-to-dagq.md) | superseded | [ADR-0052](0052-rust-single-binary-and-plugin-with-cmux-first.md) | 2026-09-26 |
@@ -90,6 +90,7 @@ ADRは、将来の実装や運用に大きな影響を与える決定の理由�
 | [ADR-0020](0020-rebind-queue-to-a-moved-repository.md) | superseded | [ADR-0053](0053-queue-in-data-dir-run-paths-from-queue-and-rebind.md) | 2026-09-26 |
 | [ADR-0023](0023-verify-once-review-in-supervisor-run-env-graph-and-stats.md) | superseded | [ADR-0040](0040-verify-once-review-run-env-graph-stats-and-task-priority-in-claim-order.md) | 2026-09-25 |
 | [ADR-0024](0024-retire-maintainer-into-jobs-and-observer.md) | superseded | [ADR-0041](0041-on-demand-planners-proposals-submitted-and-plan-review-job.md) | 2026-09-25 |
+| [ADR-0025](0025-leaseless-unfinished-run-is-a-recover-run-attention.md) | superseded | [ADR-0054](0054-run-lease-ownership-parallel-supervisors-and-recover.md) | 2026-09-26 |
 | [ADR-0035](0035-adr-is-superseded-whole-with-dates-and-banner.md) | superseded | [ADR-0042](0042-adr-is-superseded-whole-and-deprecation-date-is-deprecated-on.md) | 2026-09-25 |
 | [ADR-0037](0037-follow-up-triage-job-decides-follow-up-drafts.md) | superseded | [ADR-0041](0041-on-demand-planners-proposals-submitted-and-plan-review-job.md) | 2026-09-25 |
 | [ADR-0040](0040-verify-once-review-run-env-graph-stats-and-task-priority-in-claim-order.md) | superseded | [ADR-0049](0049-share-compile-cache-across-runs-and-break-down-wait-to-land.md) | 2026-09-26 |

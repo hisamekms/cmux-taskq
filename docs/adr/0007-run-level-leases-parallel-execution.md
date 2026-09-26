@@ -2,10 +2,12 @@
 id: adr-0007
 type: adr
 title: leaseをrun単位にし、依存が解けたtaskを上限付きで並列に実行する
-status: accepted
+status: superseded
 created: 2026-09-22
 updated: 2026-09-22
 accepted_on: 2026-09-22
+superseded_by: adr-0054
+superseded_on: 2026-09-26
 owners:
   - hisamekms
 tags:
@@ -21,6 +23,8 @@ related:
 ---
 
 # ADR-0007: leaseをrun単位にし、依存が解けたtaskを上限付きで並列に実行する
+
+> **置き換え済み（2026-09-26）**: このADRの決定は現在有効ではない。現行の決定は[ADR-0054](0054-run-lease-ownership-parallel-supervisors-and-recover.md)を読む。
 
 ## Context
 

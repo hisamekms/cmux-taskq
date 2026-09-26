@@ -386,6 +386,8 @@ goal 1で実装済みなので、この棚卸しで`status: accepted`にした�
 
 ### C: runの所有・lease・並列・引き継ぎ・recover（0003、0007、0025）
 
+置き換え済み（→ [ADR-0054](../adr/0054-run-lease-ownership-parallel-supervisors-and-recover.md)、2026-09-26）。
+
 引き継ぐ決定:
 
 - supervisorがworkspace作成・監視・完了検証・後始末を行い、agentはworkspaceを削除せずreceiptで知らせる。同じqueueに複数のsupervisorが居てもよい（0003、0007 箇条2）。

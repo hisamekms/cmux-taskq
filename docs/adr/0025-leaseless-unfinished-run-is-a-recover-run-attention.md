@@ -2,10 +2,12 @@
 id: adr-0025
 type: adr
 title: supervisorが手放した未完了runをattention（recover run）にする
-status: accepted
+status: superseded
 created: 2026-09-23
 updated: 2026-09-23
 accepted_on: 2026-09-23
+superseded_by: adr-0054
+superseded_on: 2026-09-26
 owners:
   - hisamekms
 tags:
@@ -22,6 +24,8 @@ related:
 ---
 
 # ADR-0025: supervisorが手放した未完了runをattention（recover run）にする
+
+> **置き換え済み（2026-09-26）**: このADRの決定は現在有効ではない。現行の決定は[ADR-0054](0054-run-lease-ownership-parallel-supervisors-and-recover.md)を読む。
 
 ## Context
 
