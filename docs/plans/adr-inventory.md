@@ -363,6 +363,8 @@ goal 1で実装済みなので、この棚卸しで`status: accepted`にした�
 
 ### A: 基盤・名前・配布（0001、0002、0005、0015）
 
+置き換え済み（→ [ADR-0052](../adr/0052-rust-single-binary-and-plugin-with-cmux-first.md)、2026-09-26）。
+
 引き継ぐ決定:
 
 - runtimeとsupervisorをRustで実装し、単一のバイナリ`dagq`として配る。domain / application / infrastructureを分ける（詳細は組J）（0001）。

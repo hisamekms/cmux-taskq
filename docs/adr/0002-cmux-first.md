@@ -2,10 +2,12 @@
 id: adr-0002
 type: adr
 title: cmuxを最初のworkspace backendにする
-status: accepted
+status: superseded
 created: 2026-09-21
 updated: 2026-09-21
 accepted_on: 2026-09-22
+superseded_by: adr-0052
+superseded_on: 2026-09-26
 owners:
   - hisamekms
 tags:
@@ -16,6 +18,8 @@ related:
 ---
 
 # ADR-0002: cmuxを最初のworkspace backendにする
+
+> **置き換え済み（2026-09-26）**: このADRの決定は現在有効ではない。現行の決定は[ADR-0052](0052-rust-single-binary-and-plugin-with-cmux-first.md)を読む。
 
 ## Context
 

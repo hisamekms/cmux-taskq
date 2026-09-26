@@ -37,11 +37,8 @@ ADRは、将来の実装や運用に大きな影響を与える決定の理由�
 
 | ADR | Title | accepted_on |
 | --- | --- | --- |
-| [ADR-0001](0001-rust-runtime.md) | Rustでruntimeを実装する | 2026-09-22 |
-| [ADR-0002](0002-cmux-first.md) | cmuxを最初のworkspace backendにする | 2026-09-22 |
 | [ADR-0003](0003-supervisor-owns-lifecycle.md) | supervisorがagentとworkspaceのライフサイクルを所有する | 2026-09-22 |
 | [ADR-0004](0004-agent-provider-abstraction.md) | ClaudeとCodexをagent providerとして抽象化する | 2026-09-22 |
-| [ADR-0005](0005-binary-and-plugin-distribution.md) | runtimeをバイナリ、agent integrationをpluginとして配布する | 2026-09-22 |
 | [ADR-0006](0006-queue-per-repository.md) | repositoryごとに1つのqueueをユーザーのデータディレクトリに置き、cwdから解決する | 2026-09-22 |
 | [ADR-0007](0007-run-level-leases-parallel-execution.md) | leaseをrun単位にし、依存が解けたtaskを上限付きで並列に実行する | 2026-09-22 |
 | [ADR-0008](0008-merge-queue-squash-landing.md) | runtimeのmerge queueが最新mainへrebase・再検証し、1 task = 1 commitにsquashしてmainへ着地させる | 2026-09-22 |
@@ -49,7 +46,6 @@ ADRは、将来の実装や運用に大きな影響を与える決定の理由�
 | [ADR-0010](0010-maintainer-and-resident-supervisor.md) | 役割名をsupervisor / maintainer / workerに統一し、supervisorをlaunchdで常駐させてupとdownで起動・停止する | 2026-09-22 |
 | [ADR-0011](0011-cmux-socket-password-and-in-cmux-fallback.md) | launchd常駐のsupervisorにはcmuxのsocket passwordを前提とし、up --in-cmuxをlaunchdなしのfallbackにする | 2026-09-22 |
 | [ADR-0013](0013-layered-architecture-and-type-function-style.md) | domain / application / infrastructureのレイヤーと「型＋関数」でruntimeを構成する | 2026-09-22 |
-| [ADR-0015](0015-rename-to-dagq.md) | cmux-taskqをdagqに改名する | 2026-09-22 |
 | [ADR-0016](0016-maintainer-notification-and-compact-output.md) | maintainerを使い捨てのsessionにし、status / watch / doctorの通知経路と圧縮出力、pluginの起き直しhookを持たせる | 2026-09-23 |
 | [ADR-0017](0017-resolve-run-paths-from-the-queue-directory.md) | runのqueue配下のpathは読むたびにqueueディレクトリとrun IDから解決する | 2026-09-23 |
 | [ADR-0018](0018-run-workspace-named-after-the-task.md) | runのcmux workspace名はtaskのtitleにし、run IDはdescriptionに置く | 2026-09-23 |
@@ -73,6 +69,7 @@ ADRは、将来の実装や運用に大きな影響を与える決定の理由�
 | [ADR-0048](0048-record-claude-sessions-by-kind-with-open-and-active-time.md) | dagqが使うClaude sessionをkindごとの区間としてrun_eventsに記録し、開いている時間と、transcriptのturnから導く稼働時間をstatsで集計する | 2026-09-26 |
 | [ADR-0049](0049-share-compile-cache-across-runs-and-break-down-wait-to-land.md) | 検証をintegrateの1回にし、reviewをsupervisorの工程にし、dagq.tomlでrunのenvを渡してsccacheでcompileの結果をrun間で共有し、taskの5段階の優先度と解放数でclaim順を決め、statsで詰まりを数える（ADR-0040を統合） | 2026-09-26 |
 | [ADR-0051](0051-kpi-time-series-report-and-push.md) | KPIを決まった規則でrun_eventsから導き、期間・taskの種類・変更の印で比べ、目標割れを判定し、supervisorが日次のHTMLとJSONのレポートを書き、ホストの設定のコマンドにpushし、KPIのfindingから作る改善のproposalの数に上限を付ける | 2026-09-26 |
+| [ADR-0052](0052-rust-single-binary-and-plugin-with-cmux-first.md) | runtimeをRustの単一バイナリdagqとpluginで配り、cmuxを最初のworkspace backendにする（ADR-0001・ADR-0002・ADR-0005・ADR-0015を統合） | 2026-09-26 |
 | [ADR-0062](0062-runs-waiting-for-a-person-leave-the-slot.md) | 人の答えを待つrunをslotから外し、leaseを持ったまま軽く見張り、待ちの数に上限を付け、待ちが終わったrunを新しいclaimより先にslotへ戻す | 2026-09-26 |
 | [ADR-0068](0068-recheck-waiting-runs-after-each-landing.md) | 着地のたびに着地待ちのrunをmerge-treeと軽い検査で先回りして確かめ、着地しなくなったrunは人の回答や着地の順番を待たずにresumeする | 2026-09-26 |
 | [ADR-0076](0076-run-the-coverage-gate-tests-with-nextest.md) | integrateのcoverageの関門のtestをcargo-nextestでbinaryをまたいで並列に流し（cargo llvm-cov nextest）、cargo-nextestは人がhostに入れる | 2026-09-26 |
@@ -83,8 +80,12 @@ ADRは、将来の実装や運用に大きな影響を与える決定の理由�
 
 | ADR | Status | superseded_by | superseded_on / deprecated_on |
 | --- | --- | --- | --- |
+| [ADR-0001](0001-rust-runtime.md) | superseded | [ADR-0052](0052-rust-single-binary-and-plugin-with-cmux-first.md) | 2026-09-26 |
+| [ADR-0002](0002-cmux-first.md) | superseded | [ADR-0052](0052-rust-single-binary-and-plugin-with-cmux-first.md) | 2026-09-26 |
+| [ADR-0005](0005-binary-and-plugin-distribution.md) | superseded | [ADR-0052](0052-rust-single-binary-and-plugin-with-cmux-first.md) | 2026-09-26 |
 | [ADR-0012](0012-adopt-stale-lease-of-live-wrapper.md) | superseded | [ADR-0039](0039-adopt-stale-lease-of-live-wrapper-and-renew-own-stale-lease.md) | 2026-09-25 |
 | [ADR-0014](0014-up-replaces-a-supervisor-of-another-binary-version.md) | superseded | [ADR-0045](0045-build-identifier-explicit-migrate-schema-compat-handoff-and-auto-update.md) | 2026-09-25 |
+| [ADR-0015](0015-rename-to-dagq.md) | superseded | [ADR-0052](0052-rust-single-binary-and-plugin-with-cmux-first.md) | 2026-09-26 |
 | [ADR-0019](0019-move-routine-maintainer-work-into-the-runtime.md) | superseded | [ADR-0047](0047-irregularities-in-three-layers-recovery-job-ask-reasons-and-goal-review.md) | 2026-09-26 |
 | [ADR-0023](0023-verify-once-review-in-supervisor-run-env-graph-and-stats.md) | superseded | [ADR-0040](0040-verify-once-review-run-env-graph-stats-and-task-priority-in-claim-order.md) | 2026-09-25 |
 | [ADR-0024](0024-retire-maintainer-into-jobs-and-observer.md) | superseded | [ADR-0041](0041-on-demand-planners-proposals-submitted-and-plan-review-job.md) | 2026-09-25 |
