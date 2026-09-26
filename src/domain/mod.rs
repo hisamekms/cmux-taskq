@@ -566,6 +566,7 @@ pub mod measure;
 pub mod plan_quality;
 pub mod plan_review;
 pub mod planner;
+pub mod prediction;
 pub mod proposal;
 pub mod reason;
 pub mod recheck;

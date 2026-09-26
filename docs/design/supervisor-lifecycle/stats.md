@@ -22,6 +22,8 @@ related:
   - adr-0044
   - design-domain-model
   - adr-t610-1
+  - adr-0079
+  - design-supervisor-lifecycle-plan-review
 ---
 
 # `stats`
@@ -42,6 +44,7 @@ related:
   - `integrate_attempts` / `deferrals` / `conflict_files` / `broken_by` / `broke_runs` / `resume_attempts`: 着地の延期の中身と、崩した着地、resumeの効き目（下の[着地の延期とresume](#着地の延期とresume)）
   - `dagq_version` / `claude_version` / `rustc_release` / `rustc_host` / `claim_parallel` / `claim_slots` / `claim_load_avg`: 最初の`run_claimed`が記録したclaimの属性（goal 21、task 197。[`supervise`](supervise.md)の5）の`dagq_version` / `claude_version` / `rustc_release` / `rustc_host` / `parallel` / `slots` / `load_avg`。記録の無いrun（手の`claim`、task 197より前）はnull
   - `load`: 区間ごとの`{mean, max, band}`（`band`は`mean`の帯）。`work`は最初の`receipt_observed`、`validate`は最初の`validation_finished`の`load_avg_mean` / `load_avg_max`、`verify`は`integrate`の`verification_command`（`phase: integration`、全試行）の`load_avg_mean`を`duration_secs`で重み付けした平均（`duration_secs`の無いものは1秒）と`load_avg_max`の最大。記録の無い区間はnull
+  - `prediction` / `actual`: そのtaskの重さの予測と、runの実績を並べたもの（ADR-0079の決定2。下の[重さの予測と実績](#重さの予測と実績)）。予測の無いrunは`prediction`がnull
   - `load_band`: `load.work.band`、無ければ`claim_load_avg`の帯（どちらも無ければnull）。帯は`0-4` / `4-8` / `8-16` / `16-32` / `32-64` / `64+`（下限を含む。`domain::measure::load_band`）。集計は`domain::stats::measures`
   - `sessions`: そのrunのClaude sessionの区間のkindごとの`{count, open, active}`（下の[Claude session](#claude-session)）
 - **`goals`と`overall`**の`land_phases`: 着地したrun（`land_phases`と`wait_to_land`のあるrun）についての`{runs, tail_threshold, tail_runs, <工程>..., push}`。`tail_threshold`はそれらのrunの`wait_to_land`の90パーセンタイル（nearest-rank: 昇順でceil(0.9×n)番目。runが無ければnull）、`tail_runs`は`wait_to_land`がそれ以上のrun（長い裾）の数。工程ごとと`push`は`{count, total, median, p90, max, tail_total}`で、`count` / `total` / `median`は他の区間と同じ規則（工程は着地したrun全部を0も含めて数え、`push`は記録のあるrunだけ）、`p90`は上と同じ規則、`tail_total`は長い裾のrunだけの合計。どの工程が裾を作ったかは工程ごとの`tail_total`を比べて読む
@@ -163,6 +166,14 @@ task 199で足した集計。Claude sessionの区間が閉じるとき、runtime
 - **`goals`と`overall`の`tokens`**（`kinds`も同じ形）: `{runs, input, output, cache_read, cache_creation, total, cost_usd}`で、`input`などはrunごとの値の`{count, total, median}`、`cost_usd`はコストのあるrunの`{count, total, median}`。`runs`はトークン数のあるrunの数で、無いrunは数えない
 - **`sessions.by_kind`の`tokens`**: kindごとに、windowの中で閉じた区間の`tokens`の合計（`runs`の`tokens`から`by_kind`を除いた形）。runを持たない`observer`と`plan_review`のトークン数はここで読む
 - **`sessions.by_kind`の`models`**（task 579）: kindごとに、windowの中で閉じた区間を、`session_closed`の`model`と`effort`（[provider-lifecycle](../provider-lifecycle.md#modelとeffort)）を空白でつないだ`"<model> <effort>"`（effortの無い記録は`unknown`）ごとに数えたもの。modelを記録しなかった区間は数えない。worker以外のアクターの基準値はここで読む。計画の品質（proposalごと）は[kpi](kpi.md#計画の品質)
+
+## 重さの予測と実績
+
+[ADR-0079](../../adr/0079-record-task-weight-predictions-and-trial-model-effort-selection.md)の決定2（task 575）。plan reviewのjobがtaskごとに記録した`task_weight_predicted`（[plan review](plan-review.md)の6）を、`runs`の各runの実績と並べる。集計は`domain::stats::predictions`がrun_eventsから再導出し、新しい表は持たない。予測の精度（Spearman、下位3分の1の当たり）はこの行から計算し、runtimeは集計しない。
+
+- **`runs`の`prediction`**: `{size, nature, uncertainty, expected_output_tokens, rework_probability, reason, proposal_id, plan_review_id, model, effort, percentile, percentile_of}`。そのrunの最初のイベントより前に記録された、そのtaskの最後の`task_weight_predicted`（出し直しや`reopen`で予測が追記されていれば最後のもの。runの後に記録された予測は次のrunのもの）。`model` / `effort`は予測したplan reviewのsessionのもの（transcriptから読めなければnull）。予測の無いrun（`ready --bypass-review`、予測の失敗、task 575より前）はnull
+- **`percentile` / `percentile_of`**: `expected_output_tokens`が、そのrunの最初のイベントより前に記録された予測のうち、他のtaskの最後の予測を新しい順に最大60件（`domain::prediction::PREDICTION_WINDOW`、ADR-0079の決定4のN）並べた中のどこに入るか（0〜100。下にあるものの割合で、同じ値は半分に数え、小数1桁。`domain::prediction::percentile`）と、比べた件数。比べるものが無ければ`percentile`はnull。予測の値は2〜3倍に偏るので、値ではなくこの百分位で読む（下位3分の1は33.3以下）。試しの対象の判定（ADR-0079の決定4）も同じ関数を使う
+- **`runs`の`actual`**: `{output_tokens, model_secs, resumes, resume_reasons, review_verdict, task_rework}`。`output_tokens`はrunのsession（`worker` / `resume` / `revise`。reviewとtriageのjobは除く）の`tokens.output`の合計（記録が無ければnull）、`model_secs`は`work_breakdown`の`model`の秒（内訳が無ければnull）、`resume_reasons`は`resume_attempts`の`reason`ごとの回数、`task_rework`はtaskに由来する手戻り（ADR-0079の決定1: `integration_deferred`の`verification_failed`、`review_finished`の`concern`、`revise_requested`のどれかがrunにある。衝突とkillは数えない。`domain::plan_quality::rework`）
 
 ## draftの流入と流出
 

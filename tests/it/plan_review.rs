@@ -1681,3 +1681,105 @@ fn the_prompt_lists_each_tasks_duplicate_candidates_but_not_the_proposals_own() 
     assert_eq!(candidates[2]["related"], json!([]), "{}", candidates[2]);
     assert_eq!(candidates[2]["search"], json!([]), "{}", candidates[2]);
 }
+
+/// Plan review predicts the weight of each submitted task (ADR-0079
+/// decision 2): recorded per task, again on a later review; predictions
+/// missing, malformed or not covering the tasks are not recorded, and the
+/// verdict is applied all the same.
+#[test]
+fn plan_review_records_each_tasks_predicted_weight_and_goes_on_without_one() {
+    let fx = fixture();
+    let mut queue = SqliteQueue::open(&fx.db).unwrap();
+    let blocker = TaskId::new(1);
+    let two = add(&mut queue, "two", &[blocker], Priority::Normal);
+    let three = add(&mut queue, "three", &[blocker], Priority::Normal);
+    let proposal = submit(&mut queue, &[two, three], None);
+    let predict = |task: TaskId, tokens: u64| {
+        json!({"task_id": task, "size": "M", "nature": "implementation", "uncertainty": 0.4,
+               "expected_output_tokens": tokens, "rework_probability": 0.2, "reason": "a module"})
+    };
+    let again = |queue: &mut SqliteQueue| {
+        queue
+            .submit(Submission {
+                tasks: Vec::new(),
+                goals: Vec::new(),
+                proposal: Some(proposal),
+                owner: PlannerOwner {
+                    origin: PlannerOrigin::Runtime,
+                    workspace_id: None,
+                },
+            })
+            .unwrap();
+    };
+    let reviewer = StubReviewer::new(&[
+        json!({"verdict": "revise", "reasons": ["vague"], "summary": "vague",
+               "predictions": [predict(two, 40_000), predict(three, 9_000)]}),
+        // Task three is missing: none is recorded.
+        json!({"verdict": "revise", "reasons": ["still vague"], "summary": "vague",
+               "predictions": [predict(two, 1_000)]}),
+        // Not the shape of a prediction: none is recorded, the verdict passes.
+        json!({"verdict": "pass", "reasons": [], "summary": "sound",
+               "predictions": [{"task_id": two, "size": "XL"}]}),
+    ]);
+    let backend = PlanWorkspace::default();
+    supervise(&fx, &backend, &reviewer);
+    // The prompt asks for one prediction per submitted task.
+    let prompt = &reviewer.prompts()[0];
+    for expected in [
+        "estimate the weight of each submitted task of the proposal (tasks 2, 3)",
+        "\"predictions\": [{\"task_id\": int, \"size\": \"S\" | \"M\" | \"L\"",
+        "expected_output_tokens is the output tokens (thinking included) of one worker run",
+    ] {
+        assert!(prompt.contains(expected), "{expected:?} not in {prompt}");
+    }
+    let first = events(&mut queue, two, "plan_review_finished");
+    assert_eq!(first[0]["prediction_error"], Value::Null);
+    let recorded = events(&mut queue, two, "task_weight_predicted");
+    assert_eq!(recorded.len(), 1);
+    assert_eq!(recorded[0]["proposal_id"], json!(proposal));
+    assert_eq!(
+        recorded[0]["plan_review_id"],
+        events(&mut queue, two, "plan_review_started")[0]["plan_review_id"]
+    );
+    assert_eq!(
+        recorded[0]["prediction"],
+        json!({"size": "M", "nature": "implementation", "uncertainty": 0.4,
+               "expected_output_tokens": 40_000, "rework_probability": 0.2,
+               "reason": "a module"})
+    );
+    // The stub's session wrote no transcript naming a model.
+    assert_eq!(recorded[0]["model"], Value::Null);
+    assert_eq!(recorded[0]["effort"], Value::Null);
+    let three_recorded = events(&mut queue, three, "task_weight_predicted");
+    assert_eq!(three_recorded.len(), 1);
+    assert_eq!(
+        three_recorded[0]["prediction"]["expected_output_tokens"],
+        9_000
+    );
+
+    again(&mut queue);
+    supervise(&fx, &backend, &reviewer);
+    let finished = events(&mut queue, two, "plan_review_finished");
+    assert_eq!(finished[1]["decision"], "revise");
+    assert_eq!(finished[1]["prediction_error"], "task 3 is not predicted");
+    assert_eq!(events(&mut queue, two, "task_weight_predicted").len(), 1);
+
+    again(&mut queue);
+    supervise(&fx, &backend, &reviewer);
+    let finished = events(&mut queue, two, "plan_review_finished");
+    assert_eq!(finished[2]["decision"], "pass");
+    assert!(
+        finished[2]["prediction_error"]
+            .as_str()
+            .unwrap()
+            .starts_with("the predictions are malformed"),
+        "{}",
+        finished[2]
+    );
+    assert_eq!(status(&mut queue, two), TaskStatus::Ready);
+    assert_eq!(status(&mut queue, three), TaskStatus::Ready);
+    assert_eq!(events(&mut queue, two, "task_weight_predicted").len(), 1);
+    assert_eq!(events(&mut queue, three, "task_weight_predicted").len(), 1);
+    // No run was claimed, so nothing predicted at a claim either.
+    assert!(queue.show(two).unwrap().runs.is_empty());
+}

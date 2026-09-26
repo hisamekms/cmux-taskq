@@ -374,6 +374,13 @@ mod stats {
                     "started_at": "2026-09-23T12:13:00.000Z",
                     "secs": null, "resolved": null,
                 }],
+                // Task 575: no prediction; the actual repeats the counts.
+                "prediction": null,
+                "actual": {
+                    "output_tokens": null, "model_secs": null, "resumes": 1,
+                    "resume_reasons": {"unknown": 1}, "review_verdict": "pass",
+                    "task_rework": false,
+                },
                 // Task 197: nothing was recorded at the claim nor over
                 // the intervals.
                 "dagq_version": null, "claude_version": null,

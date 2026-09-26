@@ -20,6 +20,7 @@ pub mod conflicts;
 pub mod drafts;
 pub mod landing;
 pub mod measures;
+pub mod predictions;
 pub mod retries;
 pub mod sessions;
 pub mod thresholds;
@@ -37,6 +38,7 @@ pub use measures::{
     BandCount, CommandStats, IntervalLoad, LoadBandStats, RunLoad, RunMeasures, VersionStats,
     Versions,
 };
+pub use predictions::{RunActual, RunPrediction};
 pub use retries::{BrokenBy, ResumeAttempt, ResumeBreakdown, Retries};
 pub use sessions::{GoalKindSessions, KindSessions, RunKindSessions, SessionWindow, Sessions};
 pub use thresholds::ThresholdStats;
@@ -225,6 +227,12 @@ pub struct RunStats {
     /// The tokens its sessions used (task 199), all of them and per kind of
     /// session; null when none recorded them.
     pub tokens: Option<RunTokens>,
+    /// The last weight plan review predicted for its task before it started
+    /// (ADR-0079 decision 2), and where it fell among the latest
+    /// predictions; null without one.
+    pub prediction: Option<RunPrediction>,
+    /// What it turned out to be, to read next to `prediction`.
+    pub actual: RunActual,
     /// Each of its spans, for the per-goal summaries.
     #[serde(skip)]
     pub session_spans: Vec<sessions::RunSpan>,
@@ -701,6 +709,14 @@ pub fn stats(
         );
         track.stats.session_spans = run_spans;
     }
+    predictions::attach(
+        events,
+        &first_event,
+        &mut finished
+            .iter_mut()
+            .map(|track| &mut track.stats)
+            .collect::<Vec<_>>(),
+    );
 
     let mut by_goal: BTreeMap<(bool, Option<GoalId>), Vec<&RunStats>> = BTreeMap::new();
     for track in &finished {
@@ -1505,6 +1521,8 @@ fn runs(events: &[RunEvent], goals: &HashMap<TaskId, Option<GoalId>>) -> Vec<Tra
                     sessions: BTreeMap::new(),
                     work_breakdown: None,
                     tokens: None,
+                    prediction: None,
+                    actual: RunActual::default(),
                     session_spans: Vec::new(),
                 },
                 claimed: None,

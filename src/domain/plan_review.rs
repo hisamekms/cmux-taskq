@@ -59,7 +59,8 @@ pub struct Reopen {
 /// What the headless plan review prints on stdout: one JSON object.
 /// `actions` are applied on `pass` only; `reopen` whatever the verdict;
 /// `precedents` name asks a person answered before about the same kind of
-/// finding, which the runtime quotes to the planner or the person.
+/// finding, which the runtime quotes to the planner or the person;
+/// `predictions` are recorded, whatever their shape, apart from the rest.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PlanReviewVerdict {
@@ -72,6 +73,12 @@ pub struct PlanReviewVerdict {
     pub reopen: Vec<Reopen>,
     #[serde(default)]
     pub precedents: Vec<AskId>,
+    /// The weight of each submitted task of the proposal (ADR-0079
+    /// decision 2), kept raw: a shape that does not hold is checked by
+    /// [`super::prediction::parse_predictions`] and only leaves the
+    /// predictions unrecorded, never the verdict failed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub predictions: Option<serde_json::Value>,
 }
 
 impl PlanReviewVerdict {
@@ -195,6 +202,13 @@ mod tests {
             PlanReviewVerdict::parse(r#"{"verdict":"revise","reasons":["x"],"summary":"s"}"#)
                 .unwrap();
         assert!(bare.actions.is_empty() && bare.reopen.is_empty() && bare.precedents.is_empty());
+        assert_eq!(bare.predictions, None);
+        // Predictions of any shape leave the verdict whole.
+        let odd = PlanReviewVerdict::parse(
+            r#"{"verdict":"pass","reasons":[],"summary":"s","predictions":"soon"}"#,
+        )
+        .unwrap();
+        assert_eq!(odd.predictions, Some(serde_json::json!("soon")));
         for broken in [
             "no json",
             r#"{"verdict":"maybe","reasons":[],"summary":""}"#,

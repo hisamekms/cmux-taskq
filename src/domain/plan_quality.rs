@@ -166,7 +166,7 @@ struct TaskFate {
 /// Task-caused rework (ADR-0079 decision 1): `integrate`'s verification
 /// failed, review raised a concern, or the run was sent back to revise.
 /// Conflicts and kills are not the task's.
-fn rework(event: &RunEvent) -> bool {
+pub fn rework(event: &RunEvent) -> bool {
     match event.kind.as_str() {
         "integration_deferred" => event.payload["code"] == "verification_failed",
         "review_finished" => event.payload["verdict"] == "concern",

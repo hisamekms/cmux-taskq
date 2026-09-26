@@ -1433,6 +1433,17 @@ pub fn plan_review_prompt(material: &PlanReviewMaterial<'_>) -> Result<String> {
             .map(serde_json::to_value)
             .collect::<serde_json::Result<_>>()?,
     );
+    let predicted = material
+        .tasks
+        .iter()
+        .filter(|detail| detail.task.status() == crate::domain::TaskStatus::Submitted)
+        .map(|detail| detail.task.id().to_string())
+        .collect::<Vec<_>>();
+    let predicted = if predicted.is_empty() {
+        "(none)".to_owned()
+    } else {
+        predicted.join(", ")
+    };
     Ok(format!(
         "You are the plan review of dagq proposal {id}: decide whether the queue may run its tasks as written, before they become ready.\n\
          Read only. Do not change any file and do not run dagq commands that write.\n\n\
@@ -1462,11 +1473,18 @@ pub fn plan_review_prompt(material: &PlanReviewMaterial<'_>) -> Result<String> {
          - concern: findings that need a person's judgment: a doubtful duplicate, a change that looks already done, a contradiction with an ADR or the goal's constraints, a change of the plan's intent.\n\
          When a finding is of the same kind as an answered ask above, put that ask's id in precedents and say in the reason how the person answered then.\n\n\
          actions are the only changes you make yourself, and only with pass: add_dependency (a task of the proposal waits for another task), lower_priority (never raise one), cancel_duplicate (only an obvious duplicate; a doubtful one, or a change that looks already made, is a concern). Everything else is the planner's.\n\n\
+         Whatever the verdict, also estimate the weight of each submitted task of the proposal (tasks {predicted}), one entry per task in predictions, from what you read: \
+         a worker (one Claude Opus session in its own Git worktree) implements the task, runs fmt, clippy and the tests of the change (e2e when the runtime changes), commits and writes a receipt; \
+         then a headless review (pass / revise / concern) and `integrate`'s verification after the rebase onto main follow, and a failure, a conflict or missing evidence resumes the run. \
+         size is S, M or L; nature is mechanical, implementation, design_judgment or investigation; uncertainty is 0 to 1 (1 the least certain); \
+         expected_output_tokens is the output tokens (thinking included) of one worker run: a small one about 5000, a large one about 250000, the median about 35000; \
+         rework_probability is 0 to 1, the chance the run is resumed or review answers revise or concern; reason is one sentence. The estimate is recorded only and changes nothing of the verdict.\n\n\
          Answer with one JSON object and nothing else, matching this schema:\n\
          {{\"verdict\": \"pass\" | \"revise\" | \"concern\", \"reasons\": [string], \"summary\": string, \
          \"actions\": [{{\"action\": \"add_dependency\", \"task_id\": int, \"depends_on\": int}} | {{\"action\": \"lower_priority\", \"task_id\": int, \"priority\": \"low\" | \"normal\" | \"high\" | \"urgent\"}} | {{\"action\": \"cancel_duplicate\", \"task_id\": int, \"duplicate_of\": int}}], \
-         \"reopen\": [{{\"task_id\": int, \"reason\": string}}], \"precedents\": [int]}}\n\
-         reasons lists each finding (empty for pass); summary is one or two sentences; actions, reopen and precedents may be empty.\n",
+         \"reopen\": [{{\"task_id\": int, \"reason\": string}}], \"precedents\": [int], \
+         \"predictions\": [{{\"task_id\": int, \"size\": \"S\" | \"M\" | \"L\", \"nature\": \"mechanical\" | \"implementation\" | \"design_judgment\" | \"investigation\", \"uncertainty\": number, \"expected_output_tokens\": int, \"rework_probability\": number, \"reason\": string}}]}}\n\
+         reasons lists each finding (empty for pass); summary is one or two sentences; actions, reopen and precedents may be empty; predictions has one entry for each submitted task and no other.\n",
         id = proposal.id(),
         repo = material.repo_root.display(),
         submitted = proposal.submitted_at(),

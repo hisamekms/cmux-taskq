@@ -25,7 +25,9 @@ use crate::{
         PlanReviewCandidate, PlanReviewDecision, PlannerId, Priority, ProposalId, ProposalStatus,
         TaskAction, TaskId, TaskStatus,
         plan_quality::{self, ProposalFeatures},
-        proposal, task,
+        prediction, proposal,
+        sessions::SESSION_CLOSED,
+        task,
     },
 };
 
@@ -573,6 +575,16 @@ impl PlanReviewStore for SqliteQueue {
             });
         }
         let members = proposals::read(&tx, job.proposal_id)?.task_ids().to_vec();
+        // The tasks it predicted the weight of (ADR-0079 decision 2): those
+        // still submitted, before a pass readies or cancels them.
+        let mut submitted = Vec::new();
+        for &member in &members {
+            if read_task(&tx, member)?.status() == TaskStatus::Submitted {
+                submitted.push(member);
+            }
+        }
+        let predictions =
+            prediction::parse_predictions(apply.verdict.predictions.as_ref(), &submitted);
         if apply.decision == PlanReviewDecision::Pass {
             for action in &apply.verdict.actions {
                 check_action(&tx, &members, action)?;
@@ -665,8 +677,12 @@ impl PlanReviewStore for SqliteQueue {
                 "precedents": apply.verdict.precedents,
                 "ask_id": applied.ask.as_ref().map(|outcome| outcome.ask.id),
                 "duration_secs": apply.duration_secs,
+                "prediction_error": predictions.as_ref().err(),
             }),
         )?;
+        if let Ok(predictions) = &predictions {
+            record_predictions(&tx, job, predictions)?;
+        }
         tx.commit()?;
         Ok(applied)
     }
@@ -1042,6 +1058,51 @@ impl PlanReviewStore for SqliteQueue {
             .collect::<rusqlite::Result<_>>()?;
         ids.into_iter().map(|id| read_ask(&self.conn, id)).collect()
     }
+}
+
+/// Record `predictions` as one `task_weight_predicted` per task (ADR-0079
+/// decision 2), with the model and effort the job's session used, which the
+/// `session_closed` its `plan_review_finished` wrote carries (none when its
+/// transcript named no model). A later plan review of the task adds its own;
+/// the last one is the task's.
+fn record_predictions(
+    conn: &Connection,
+    job: &PlanReviewJob,
+    predictions: &[prediction::TaskWeightPrediction],
+) -> Result<()> {
+    let session: Option<String> = conn
+        .query_row(
+            "SELECT payload FROM run_events WHERE kind=?1 AND json_extract(payload,'$.session_id')=?2
+             ORDER BY id DESC LIMIT 1",
+            params![SESSION_CLOSED, job.session_id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let session: Value = session
+        .map(|text| serde_json::from_str(&text))
+        .transpose()?
+        .unwrap_or(Value::Null);
+    for predicted in predictions {
+        let mut body = serde_json::to_value(predicted)?;
+        if let Some(body) = body.as_object_mut() {
+            body.remove("task_id");
+        }
+        event(
+            conn,
+            predicted.task_id,
+            None,
+            "task_weight_predicted",
+            json!({
+                "proposal_id": job.proposal_id,
+                "plan_review_id": job.id,
+                "attempt": job.attempt,
+                "prediction": body,
+                "model": session.get("model"),
+                "effort": session.get("effort"),
+            }),
+        )?;
+    }
+    Ok(())
 }
 
 /// Submitted proposals with no hold and a submitted task, oldest
