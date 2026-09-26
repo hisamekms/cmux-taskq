@@ -1012,8 +1012,9 @@ pub fn claude_stub(db: &Path) -> PathBuf {
 
 /// The supervisor's pass and idle intervals and the wrapper's wait interval
 /// in these tests: short, so a run's steps follow each other without a
-/// second's pause.
-pub const TEST_TICK: Duration = Duration::from_millis(50);
+/// second's pause. A test waits some of them at every step of a run: 20 ms
+/// instead of 50 shortened most runtime tests (task 567).
+pub const TEST_TICK: Duration = Duration::from_millis(20);
 
 /// Supervisor options with the test tick and the [`SteadyClock`].
 pub fn supervise_options(parallel: usize, once: bool) -> SuperviseOptions {

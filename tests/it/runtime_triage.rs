@@ -956,7 +956,9 @@ fn silence_wrapper(db: &Path, run_id: &RunId, stand_in: u32) -> u32 {
         rusqlite::params![run_id, stand_in],
     )
     .unwrap();
-    thread::sleep(TEST_TICK * 4);
+    // How long a heartbeat already past its pid check takes to write, not
+    // a number of the supervisor's passes: fixed, whatever the test tick.
+    thread::sleep(Duration::from_millis(200));
     raw.execute(
         "UPDATE run_processes SET heartbeat_at=unixepoch()-31 WHERE run_id=?1 AND role='wrapper' AND exited_at IS NULL",
         [run_id],

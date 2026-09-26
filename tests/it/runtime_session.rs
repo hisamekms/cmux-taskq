@@ -661,8 +661,10 @@ fn a_dialog_on_the_screen_is_asked_once_and_cleared() {
 
     // Someone answers the dialog: the screen goes back to work.
     *backend.screen.lock().unwrap() = WORK_SCREEN.into();
+    // `prompt_cleared` is recorded before the ask is closed: both are
+    // waited for.
     wait_until(&db, Duration::from_secs(30), |queue| {
-        prompts(queue, "prompt_cleared") == 1
+        prompts(queue, "prompt_cleared") == 1 && queue.read_ask(ask.id).unwrap().closed_at.is_some()
     });
     assert!(run_attention_of(&runtime::status(&db).unwrap(), run.id()).is_none());
     assert_eq!(backend.exits_sent.load(Ordering::SeqCst), 0);
@@ -764,8 +766,11 @@ fn a_dialog_goes_to_its_recovery_job_before_the_inbox() {
     assert!(finished[0]["recheck_at_ms"].as_i64().is_some());
     assert!(open_asks(&queue).is_empty());
 
+    // The ask opens before the job's `recovery_finished` is recorded: both
+    // are waited for.
     wait_until(&db, Duration::from_secs(30), |queue| {
         !open_asks(queue).is_empty()
+            && payloads(&queue.show(TaskId::new(1)).unwrap(), "recovery_finished").len() == 2
     });
     let ask = open_asks(&queue).remove(0);
     assert_eq!(ask.kind, dagq::domain::AskKind::AnswerPrompt);
@@ -801,10 +806,12 @@ fn a_dialog_goes_to_its_recovery_job_before_the_inbox() {
 
     // Someone answers the dialog: the ask closes, and the run goes on.
     *backend.screen.lock().unwrap() = WORK_SCREEN.into();
+    // `prompt_cleared` is recorded before the ask is closed: both are
+    // waited for.
     wait_until(&db, Duration::from_secs(30), |queue| {
         event_kinds(&queue.show(TaskId::new(1)).unwrap()).contains(&"prompt_cleared")
+            && queue.read_ask(ask.id).unwrap().closed_at.is_some()
     });
-    assert!(queue.read_ask(ask.id).unwrap().closed_at.is_some());
     let run = queue.show(TaskId::new(1)).unwrap().runs[0].clone();
     fs::write(
         exit_request_path(run.run_dir().unwrap()).with_extension("go"),

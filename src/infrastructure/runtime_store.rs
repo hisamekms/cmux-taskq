@@ -776,7 +776,10 @@ impl SqliteQueue {
     /// observer's `observe_started` / `observe_finished`); returns its id.
     pub fn record_queue_event(&self, kind: &str, payload: serde_json::Value) -> Result<EventId> {
         crate::domain::check_event_target(kind, None, None)?;
-        let tx = self.conn.unchecked_transaction()?;
+        // Immediate like every other write: a deferred one that read first
+        // (the schema, to prepare the insert) got SQLITE_BUSY at once, past
+        // the busy timeout, when another supervisor wrote at the same time.
+        let tx = rusqlite::Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         tx.execute(
             "INSERT INTO run_events(kind,payload) VALUES (?1,?2)",
             params![kind, serde_json::to_string(&payload)?],

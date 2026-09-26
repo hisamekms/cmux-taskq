@@ -398,8 +398,18 @@ fn review_output_to(command: &mut Command, file: &fs::File) -> Result<()> {
     Ok(())
 }
 
+/// How often [`wait_with_deadline`] checks for the child's exit: every
+/// millisecond for its first [`EXIT_POLL_FAST_FOR`], then every
+/// [`EXIT_POLL`]. Most commands (Git's) exit within a few to a few tens of
+/// milliseconds, and a run makes many of them: a fixed 20 ms pause added
+/// up to most of the time they took.
+const EXIT_POLL: Duration = Duration::from_millis(20);
+const EXIT_POLL_FAST: Duration = Duration::from_millis(1);
+const EXIT_POLL_FAST_FOR: Duration = Duration::from_millis(100);
+
 fn wait_with_deadline(child: &mut Child, label: &str, timeout: Duration) -> Result<ExitStatus> {
-    let deadline = Instant::now() + timeout;
+    let started = Instant::now();
+    let deadline = started + timeout;
     loop {
         if let Some(status) = child.try_wait()? {
             return Ok(status);
@@ -409,7 +419,11 @@ fn wait_with_deadline(child: &mut Child, label: &str, timeout: Duration) -> Resu
             let _ = child.wait();
             bail!("{label} timed out; external resources may have been created");
         }
-        thread::sleep(Duration::from_millis(20));
+        thread::sleep(if started.elapsed() < EXIT_POLL_FAST_FOR {
+            EXIT_POLL_FAST
+        } else {
+            EXIT_POLL
+        });
     }
 }
 

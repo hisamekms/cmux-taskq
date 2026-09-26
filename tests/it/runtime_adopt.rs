@@ -846,6 +846,11 @@ fn adopted_run_does_not_record_an_exit_timeout_twice() {
     });
     // Well past the adopter's own timeout.
     thread::sleep(Duration::from_millis(1500));
+    // The stuck_exit ask follows once its recovery job escalated, a process
+    // of its own that may take longer than that.
+    wait_until(&db, Duration::from_secs(30), |queue| {
+        !queue.asks(AskQuery::default()).unwrap().is_empty()
+    });
     let kinds = event_kinds(&queue.show(TaskId::new(1)).unwrap())
         .into_iter()
         .map(str::to_owned)
