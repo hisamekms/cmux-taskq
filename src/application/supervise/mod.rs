@@ -645,6 +645,10 @@ enum AfterExit {
         attempt: usize,
         error: String,
         duration_secs: u64,
+        /// The attempt whose job ran and wrote `review-N.out` / `.err`:
+        /// this one when it ran, the one before when this one could not
+        /// start after it (task 426), `None` when no job ran.
+        output: Option<usize>,
     },
     /// Give the lease back: a run parked for evidence (its workspace is
     /// closed) or a failed one (its workspace is kept for inspection).
@@ -1552,6 +1556,7 @@ impl Supervisor<'_> {
                                 attempt,
                                 error,
                                 duration_secs,
+                                output: Some(attempt),
                             },
                         ))
                     }
@@ -1675,12 +1680,13 @@ impl Supervisor<'_> {
                         attempt,
                         error,
                         duration_secs,
+                        output,
                     } => {
                         // The ask goes with the failure (task 328): the
                         // person answers it rather than finding the run in
                         // the attention. When it cannot be opened, the
                         // failure is the attention (review by hand).
-                        let ask = match self.open_failed_review_ask(&run, attempt, &error) {
+                        let ask = match self.open_failed_review_ask(&run, attempt, output, &error) {
                             Ok(ask) => {
                                 info!(run_id = %run.id(), "run {} waits for a person in ask {ask} after its failed review", run.id());
                                 Some(ask)

@@ -980,7 +980,9 @@ fn a_failed_review_closes_the_session_and_asks_a_person_in_the_same_step() {
             format!("failed and gave no verdict (review {reviews}): "),
             expected.to_owned(),
             format!("Review material: {run_dir}/review.md"),
-            format!("{run_dir}/review-{reviews}.out"),
+            format!(
+                "Review output: {run_dir}/review-{reviews}.out, {run_dir}/review-{reviews}.err"
+            ),
         ] {
             assert!(ask.question.contains(&part), "{part} in {}", ask.question);
         }
@@ -1024,6 +1026,65 @@ fn a_failed_review_closes_the_session_and_asks_a_person_in_the_same_step() {
         }
         // No review after the answer.
         assert_eq!(reviewer.prompts().len(), reviews);
+    }
+}
+
+/// A review that could not start wrote no output, so its `approve_landing`
+/// ask names no `review-N.out` / `.err` of its own (task 426): only the
+/// failure and `review.md`, and, when it was the retry of a review that ran
+/// and printed an unreadable verdict, that earlier review's output.
+#[test]
+fn a_review_that_could_not_start_names_no_output_of_its_own() {
+    let unreadable = "echo 'no verdict here'".to_owned();
+    for (scripts, reviews, earlier) in [
+        (vec![UNSTARTABLE_REVIEW.to_owned()], 1, None),
+        (vec![unreadable, UNSTARTABLE_REVIEW.to_owned()], 2, Some(1)),
+    ] {
+        let (_dir, repo, db) = fixture();
+        let backend = TestWorkspace::new(&db, false, IDLE_AGENT);
+        let reviewer = TestReviewer::new(&scripts);
+        let outcome = supervise_reviewed(&db, &repo, &backend, &reviewer);
+        assert_eq!(outcome["errors"], json!([]), "{outcome}");
+        assert_eq!(outcome["runs"][0]["status"], "awaiting_integration");
+        let mut queue = SqliteQueue::open(&db).unwrap();
+        let detail = queue.show(TaskId::new(1)).unwrap();
+        let run = detail.runs[0].clone();
+        let run_dir = run.run_dir().unwrap();
+        let failed = payloads(&detail, "review_failed");
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0]["attempt"], reviews);
+        let asks = queue.asks(Default::default()).unwrap();
+        assert_eq!(asks.len(), 1, "{asks:?}");
+        let question = &asks[0].question;
+        assert_eq!(failed[0]["ask_id"], asks[0].id.as_i64());
+        for part in [
+            format!("failed and gave no verdict (review {reviews}): "),
+            "the headless review could not start".to_owned(),
+            "the test reviewer cannot start this review".to_owned(),
+            format!("Review material: {run_dir}/review.md"),
+        ] {
+            assert!(question.contains(&part), "{part} in {question}");
+        }
+        // The review that could not start wrote nothing and is not named.
+        assert!(!Path::new(&format!("{run_dir}/review-{reviews}.out")).exists());
+        assert!(
+            !question.contains(&format!("review-{reviews}.out")),
+            "{question}"
+        );
+        assert!(
+            !question.contains(&format!("review-{reviews}.err")),
+            "{question}"
+        );
+        match earlier {
+            Some(ran) => {
+                assert!(Path::new(&format!("{run_dir}/review-{ran}.out")).exists());
+                let part = format!(
+                    "Review output of the earlier review {ran}: {run_dir}/review-{ran}.out, {run_dir}/review-{ran}.err"
+                );
+                assert!(question.contains(&part), "{part} in {question}");
+            }
+            None => assert!(!question.contains("Review output"), "{question}"),
+        }
     }
 }
 

@@ -162,6 +162,10 @@ impl Supervisor<'_> {
                         attempt,
                         error,
                         duration_secs: 0,
+                        // No job ran, so this attempt wrote no output; a
+                        // retry follows a job that ran and printed an
+                        // unreadable verdict (task 426).
+                        output: retried.then(|| attempt - 1),
                     },
                 ))
             }
@@ -503,11 +507,14 @@ impl Supervisor<'_> {
     /// Open the `approve_landing` ask of a run whose headless review failed
     /// (task 328), with why and where the review's material and output
     /// are, so that the failure reaches the inbox in the step that records
-    /// `review_failed`; returns its ID.
+    /// `review_failed`; returns its ID. `output` is the attempt whose job
+    /// ran and wrote its output: a review that could not start names no
+    /// output of its own (task 426).
     pub(super) fn open_failed_review_ask(
         &mut self,
         run: &TaskRun,
         attempt: usize,
+        output: Option<usize>,
         error: &str,
     ) -> Result<AskId> {
         let mut question = format!(
@@ -516,9 +523,16 @@ impl Supervisor<'_> {
             run.task_id(),
         );
         if let Some(run_dir) = &run.run_dir() {
-            question.push_str(&format!(
-                "\nReview material: {run_dir}/review.md\nReview output: {run_dir}/review-{attempt}.out, {run_dir}/review-{attempt}.err"
-            ));
+            question.push_str(&format!("\nReview material: {run_dir}/review.md"));
+            match output {
+                Some(ran) if ran == attempt => question.push_str(&format!(
+                    "\nReview output: {run_dir}/review-{ran}.out, {run_dir}/review-{ran}.err"
+                )),
+                Some(ran) => question.push_str(&format!(
+                    "\nReview output of the earlier review {ran}: {run_dir}/review-{ran}.out, {run_dir}/review-{ran}.err"
+                )),
+                None => {}
+            }
         }
         question.push_str(
             "\nReview the material by hand, then answer. land: land it as it is. send_back: resume the session with this failure as the reason. cancel: fail the run and cancel the task.",

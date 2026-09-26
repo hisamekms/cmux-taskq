@@ -1739,6 +1739,10 @@ impl AgentProvider for TestReviewer {
         } else {
             scripts[0].clone()
         };
+        ensure!(
+            script != UNSTARTABLE_REVIEW,
+            "the test reviewer cannot start this review"
+        );
         let mut command = CommandSpec::new("/bin/sh");
         command
             .current_dir(run.worktree_path().unwrap())
@@ -1750,6 +1754,10 @@ impl AgentProvider for TestReviewer {
         self.timeout
     }
 }
+
+/// A reviewer script whose review cannot start: `review_command` fails, so
+/// no job runs and writes `review-N.out` / `.err`.
+pub const UNSTARTABLE_REVIEW: &str = "<unstartable review>";
 
 /// A reviewer script that prints the verdict JSON.
 pub fn verdict(decision: &str, reasons: &[&str], summary: &str) -> String {
