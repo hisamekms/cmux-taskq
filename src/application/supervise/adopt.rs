@@ -244,7 +244,8 @@ impl Supervisor<'_> {
     }
     /// Rebuild an adopted `awaiting_integration` run under review from its
     /// events: a `revise_requested` with nothing after it waits for the live
-    /// session again; a verdict already recorded (`review_finished` with
+    /// session again (it is recorded before it is typed, so it is never
+    /// typed a second time), and a `revise_unsent` asks a person; a verdict already recorded (`review_finished` with
     /// nothing after it), or an approved run not reviewed since its
     /// validation, goes on to its `/exit` without a second review and
     /// without a second `/exit` if one was already requested; anything else
@@ -260,6 +261,7 @@ impl Supervisor<'_> {
                     | "review_started"
                     | "review_finished"
                     | "revise_requested"
+                    | "revise_unsent"
                     | "revise_finished"
                     | "conflict_precheck"
                     | "conflict_resolved"
@@ -313,6 +315,14 @@ impl Supervisor<'_> {
                 }
                 None
             }
+            // A revise request recorded but not sent asks a person, as it
+            // did before the supervisor was replaced.
+            "revise_unsent" => passed_before(&events, anchor.id).map(|verdict| AfterExit::Ask {
+                why: anchor.payload["error"].as_str().map(str::to_owned),
+                decision: verdict.verdict,
+                reasons: verdict.reasons,
+                summary: verdict.summary,
+            }),
             "review_finished" => {
                 match serde_json::from_value::<ReviewVerdict>(json!({
                     "verdict": anchor.payload["verdict"],
@@ -396,7 +406,7 @@ impl Supervisor<'_> {
 }
 
 /// The verdict of the last `review_finished` before event `before`: the
-/// pass a conflict precheck followed.
+/// pass a conflict precheck followed, or the revise a `revise_unsent` did.
 pub(super) fn passed_before(
     events: &[crate::domain::RunEvent],
     before: EventId,

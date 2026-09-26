@@ -67,11 +67,10 @@ pub enum Scope {
 /// The scope of an event of `kind`, when it may open or close a span.
 pub fn scope(kind: &str) -> Option<Scope> {
     match kind {
-        "agent_started" | "revise_requested" | "session_exited" | "workspace_closed"
-        | "run_recovered" | "review_started" | "review_finished" | "review_failed"
-        | "review_retried" | "triage_started" | "triage_finished" | "triage_failed" => {
-            Some(Scope::Run)
-        }
+        "agent_started" | "revise_requested" | "revise_unsent" | "session_exited"
+        | "workspace_closed" | "run_recovered" | "review_started" | "review_finished"
+        | "review_failed" | "review_retried" | "triage_started" | "triage_finished"
+        | "triage_failed" => Some(Scope::Run),
         "plan_review_started" | "plan_review_finished" | "plan_review_failed" => {
             Some(Scope::Proposal)
         }
@@ -109,7 +108,8 @@ pub struct SpanContext {
     pub workspace_id: Option<String>,
     /// The `resume_started` events the run has, this one's included.
     pub resumes: i64,
-    /// The `revise_requested` events the run has, this one's included.
+    /// The `revise_requested` events the run has, this one's included, but
+    /// those a `revise_unsent` withdrew.
     pub revises: i64,
     /// The goals of the proposal's tasks (a plan review's), ascending.
     pub goal_ids: Vec<i64>,
@@ -193,6 +193,29 @@ pub fn changes(
                 "transcript_path": null,
                 "attempt": context.revises,
                 "workspace_id": text("workspace_id"),
+            })));
+            changes
+        }
+        // A revise that could not be sent never reached the session: it goes
+        // on as what it was before (the revise sent before it, else the
+        // worker or the resume).
+        "revise_unsent" => {
+            let mut changes = close(&[REVISE], NEXT_SPAN);
+            let reopened = open.iter().rev().find(|span| span.kind() == REVISE);
+            let (span, attempt) = if context.revises > 0 {
+                (REVISE, context.revises)
+            } else if context.resumes > 0 {
+                (RESUME, context.resumes)
+            } else {
+                (WORKER, 1)
+            };
+            changes.push(SpanChange::Open(json!({
+                "kind": span,
+                "session_id": reopened.and_then(OpenSpan::session_id),
+                "cwd": context.worktree,
+                "transcript_path": null,
+                "attempt": attempt,
+                "workspace_id": (span == WORKER).then_some(&context.workspace_id),
             })));
             changes
         }
@@ -350,6 +373,43 @@ mod tests {
         assert_eq!(closed_payload["opened_event_id"], 10);
         assert_eq!(closed_payload["kind"], WORKER);
         assert_eq!(closed_payload["session_id"], "run-1");
+    }
+
+    /// A revise withdrawn by `revise_unsent` never reached the session: the
+    /// revise span closes and the session goes on as the worker's.
+    #[test]
+    fn a_withdrawn_revise_goes_back_to_the_session_it_replaced() {
+        let context = SpanContext {
+            worktree: Some("/wt".into()),
+            workspace_id: Some("W".into()),
+            ..Default::default()
+        };
+        let revise = span(
+            12,
+            json!({"kind": REVISE, "session_id": "run-1", "attempt": 1}),
+        );
+        let withdrawn = changes(
+            "revise_unsent",
+            &json!({"attempt": 1}),
+            std::slice::from_ref(&revise),
+            &context,
+        );
+        assert_eq!(closed(&withdrawn[0]), (12, NEXT_SPAN));
+        let payload = opened(&withdrawn[1]);
+        assert_eq!(payload["kind"], WORKER);
+        assert_eq!(payload["session_id"], "run-1");
+        assert_eq!(payload["attempt"], 1);
+        assert_eq!(payload["workspace_id"], "W");
+        // After a revise that was sent, it goes on as that revise.
+        let after_one = SpanContext {
+            revises: 1,
+            ..context.clone()
+        };
+        let withdrawn = changes("revise_unsent", &json!({}), &[revise], &after_one);
+        let payload = opened(&withdrawn[1]);
+        assert_eq!(payload["kind"], REVISE);
+        assert_eq!(payload["attempt"], 1);
+        assert_eq!(payload["workspace_id"], json!(null));
     }
 
     /// A resume's session is `resume`; one still open when the next starts

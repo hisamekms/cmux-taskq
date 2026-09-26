@@ -64,6 +64,9 @@ pub struct Gap {
 #[derive(Debug, Default)]
 struct State {
     phase: Option<&'static str>,
+    /// The phase a revise or conflict request replaced, for a request
+    /// withdrawn because it could not be sent.
+    replaced: Option<&'static str>,
     /// The phase's receipt (or answer) was observed.
     answered: bool,
     /// The latest idle marker of the phase: `Some(background_running)`.
@@ -76,6 +79,16 @@ struct State {
 }
 
 impl State {
+    fn request(&mut self, phase: &'static str) {
+        self.replaced = self.phase;
+        self.start(phase);
+    }
+
+    fn withdraw(&mut self) {
+        self.phase = self.replaced.take();
+        self.answered = true;
+    }
+
     fn start(&mut self, phase: &'static str) {
         self.phase = Some(phase);
         self.answered = false;
@@ -93,13 +106,17 @@ impl State {
                 self.receipt = false;
                 self.accepted = false;
             }
-            "revise_requested" => self.start("revise"),
-            "conflict_precheck" if payload["requested"] == true => self.start("conflict"),
+            "revise_requested" => self.request("revise"),
+            "conflict_precheck" if payload["requested"] == true => self.request("conflict"),
             "receipt_observed" => {
                 self.receipt = true;
                 self.answered = true;
             }
             "revise_finished" | "conflict_resolved" => self.answered = true,
+            // A request that could not be sent leaves the session in the
+            // phase it replaced, after the receipt the review followed.
+            "revise_unsent" => self.withdraw(),
+            "conflict_precheck" if payload["unsent"] == true => self.withdraw(),
             "session_idle_observed" => {
                 self.idle = Some(payload["background_running"] == true);
             }
@@ -291,6 +308,35 @@ mod tests {
         assert_eq!(found[0].before_event, Some(EventId::new(3)));
         assert_eq!(found[2].phase, Some("conflict"));
         assert!(gaps(&run, 60 * 60 * 11, None).is_empty());
+    }
+
+    /// A request withdrawn because it could not be sent leaves the gap
+    /// after it in the session it replaced.
+    #[test]
+    fn a_withdrawn_request_leaves_the_session_it_replaced() {
+        for (kind, payload) in [
+            ("revise_requested", json!({})),
+            ("conflict_precheck", json!({"requested": true})),
+        ] {
+            let withdrawal = if kind == "revise_requested" {
+                ("revise_unsent", json!({}))
+            } else {
+                (
+                    "conflict_precheck",
+                    json!({"requested": false, "unsent": true}),
+                )
+            };
+            let run = events(&[
+                ("agent_started", json!({}), "00:00:00"),
+                ("receipt_observed", json!({}), "00:00:01"),
+                (kind, payload, "00:00:02"),
+                (withdrawal.0, withdrawal.1, "00:00:03"),
+                ("session_exited", json!({}), "02:00:00"),
+            ]);
+            let found = gaps(&run, DEFAULT_GAP_SECS, None);
+            assert_eq!(reasons(&found), [(4, "after_receipt")], "{kind}");
+            assert_eq!(found[0].phase, Some("session"), "{kind}");
+        }
     }
 
     #[test]

@@ -875,6 +875,7 @@ fn watched_phase(status: RunStatus, events: &[&RunEvent]) -> Option<(&'static st
                 "review_started",
                 "review_finished",
                 "revise_requested",
+                "revise_unsent",
                 "revise_finished",
                 "revise_receipt_rejected",
                 "conflict_precheck",

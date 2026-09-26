@@ -239,6 +239,8 @@ impl LandClock {
                 "review_finished" | "validation_finished" => Some(EXIT),
                 "review_failed" => Some(ASK),
                 "revise_requested" => Some(REVISE),
+                // The request could not be sent: the session is asked to exit.
+                "revise_unsent" => Some(EXIT),
                 "conflict_precheck" if event.payload["requested"] == true => Some(CONFLICT),
                 "conflict_precheck" => Some(EXIT),
                 "landing_queued" => Some(LANDING_QUEUE),

@@ -1596,3 +1596,277 @@ fn conflict_requests_past_the_limit_ask_a_person() {
         ask.question
     );
 }
+
+/// Runs task 1 under a supervisor that died after it recorded a request to
+/// the live session and typed it (the test writes the text the session
+/// reads), with `events` as what it recorded after the validation, and
+/// lets another supervisor adopt the run with `reviewer`. Returns the
+/// adopted run's detail once the supervisor returns.
+fn adopt_pending_request(
+    repo: &Path,
+    db: &Path,
+    backend: &TestWorkspace,
+    reviewer: &TestReviewer,
+    events: impl FnOnce(&str, i64) -> Vec<(&'static str, Value)>,
+    message: impl FnOnce() -> String,
+) -> dagq::domain::TaskDetail {
+    let run = start_run_under_dead_supervisor(repo, db, backend, "dead-supervisor");
+    let idle = run.idle_marker_path().unwrap();
+    wait_until(db, Duration::from_secs(20), |_| idle.is_file());
+    let head = git_out(
+        Path::new(run.worktree_path().unwrap()),
+        &["rev-parse", "HEAD"],
+    );
+    Connection::open(db)
+        .unwrap()
+        .execute(
+            "UPDATE task_runs SET status='awaiting_integration', result_commit=?2 WHERE id=?1",
+            rusqlite::params![run.id(), head],
+        )
+        .unwrap();
+    // The request is sent a second after the session's idle marker, which
+    // then predates it.
+    thread::sleep(Duration::from_millis(1100));
+    let sent_at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let mut queue = SqliteQueue::open(db).unwrap();
+    for (kind, payload) in events(&head, sent_at) {
+        queue.record_runtime_event(run.id(), kind, payload).unwrap();
+    }
+    fs::write(resume_message_path(run.run_dir().unwrap()), message()).unwrap();
+    age_lease(db, &run, 31);
+    let outcome = supervise_reviewed(db, repo, backend, reviewer);
+    assert_eq!(outcome["errors"], json!([]), "{outcome}");
+    let detail = queue.show(TaskId::new(1)).unwrap();
+    assert_eq!(adoption_events(&detail).len(), 1);
+    detail
+}
+
+/// A conflict request recorded as sent (`requested: true`, recorded before
+/// the text is typed) is not sent again by the supervisor that adopts the
+/// run: it waits for the live session to resolve it, then validates,
+/// reviews, and lands the run.
+#[test]
+fn an_adopted_run_with_a_pending_conflict_request_waits_without_sending_it_again() {
+    let (_dir, repo, db) = fixture();
+    let seed = git_out(&repo, &["rev-parse", "main"]);
+    let backend = TestWorkspace::new(&db, false, &rebasing_agent(1));
+    fs::write(repo.join("change.txt"), "main moved\n").unwrap();
+    git(&repo, &["add", "change.txt"]);
+    git(&repo, &["commit", "-q", "-m", "main moves"]);
+    let moved = git_out(&repo, &["rev-parse", "main"]);
+    let reviewer = TestReviewer::new(&[verdict("pass", &[], "still meets it")]);
+    let detail = adopt_pending_request(
+        &repo,
+        &db,
+        &backend,
+        &reviewer,
+        |head, sent_at| {
+            vec![
+                (
+                    "validation_finished",
+                    json!({"status": "awaiting_integration"}),
+                ),
+                ("review_started", json!({"attempt": 1})),
+                (
+                    "review_finished",
+                    json!({"verdict": "pass", "reasons": [], "summary": "ok", "attempt": 1}),
+                ),
+                (
+                    "conflict_precheck",
+                    json!({
+                        "code": "rebase_conflict",
+                        "main": moved,
+                        "head": head,
+                        "conflicts": ["change.txt"],
+                        "attempt": 1,
+                        "requested": true,
+                        "sent_at": sent_at,
+                    }),
+                ),
+            ]
+        },
+        || format!("main is now {moved} (your base commit was {seed})."),
+    );
+    let run = detail.runs[0].clone();
+    assert_landed(&repo, &run, "test task", &moved);
+    assert!(backend.texts().is_empty(), "{:?}", backend.texts());
+    let prechecks = payloads(&detail, "conflict_precheck");
+    assert_eq!(prechecks.len(), 1, "{prechecks:?}");
+    let head = git_out(
+        &repo,
+        &["rev-parse", &format!("refs/dagq/runs/{}", run.id())],
+    );
+    assert_eq!(
+        payloads(&detail, "conflict_resolved"),
+        [&json!({"attempt": 1, "head": head})]
+    );
+    assert_eq!(reviewer.prompts().len(), 1);
+    assert_eq!(backend.exits_sent.load(Ordering::SeqCst), 1);
+    assert!(!event_kinds(&detail).contains(&"resume_started"));
+}
+
+/// A revise request recorded as sent is not sent again by the supervisor
+/// that adopts the run either: the live session's rewritten receipt is
+/// validated, reviewed, and landed.
+#[test]
+fn an_adopted_run_with_a_pending_revise_waits_without_sending_it_again() {
+    let (_dir, repo, db) = fixture();
+    let base = git_out(&repo, &["rev-parse", "main"]);
+    let backend = TestWorkspace::new(&db, false, &revising_agent(1));
+    let reviewer = TestReviewer::new(&[verdict("pass", &[], "fixed")]);
+    let detail = adopt_pending_request(
+        &repo,
+        &db,
+        &backend,
+        &reviewer,
+        |_, sent_at| {
+            vec![
+                (
+                    "validation_finished",
+                    json!({"status": "awaiting_integration"}),
+                ),
+                ("review_started", json!({"attempt": 1})),
+                (
+                    "review_finished",
+                    json!({"verdict": "revise", "reasons": ["add a line"], "summary": "one gap", "attempt": 1}),
+                ),
+                (
+                    "revise_requested",
+                    json!({"attempt": 1, "reasons": ["add a line"], "sent_at": sent_at}),
+                ),
+            ]
+        },
+        || "dagq: the supervisor's review asks for changes (revise 1 of 2).".to_owned(),
+    );
+    let run = detail.runs[0].clone();
+    assert_landed(&repo, &run, "test task", &base);
+    assert_eq!(
+        fs::read_to_string(repo.join("change.txt")).unwrap(),
+        format!("change by {}\nfix 1\n", run.id())
+    );
+    assert!(backend.texts().is_empty(), "{:?}", backend.texts());
+    assert_eq!(payloads(&detail, "revise_requested").len(), 1);
+    assert_eq!(payloads(&detail, "revise_finished").len(), 1);
+    assert_eq!(reviewer.prompts().len(), 1);
+    assert_eq!(backend.exits_sent.load(Ordering::SeqCst), 1);
+}
+
+/// A revise request that cannot be typed is withdrawn: the
+/// `revise_requested` recorded before the send is followed by
+/// `revise_unsent`, and a person is asked after the session's `/exit`.
+#[test]
+fn a_revise_that_cannot_be_sent_is_withdrawn_and_asks_a_person() {
+    let (_dir, repo, db) = fixture();
+    let mut backend = TestWorkspace::new(&db, false, IDLE_AGENT);
+    backend.text_fails = true;
+    let reviewer = TestReviewer::new(&[verdict("revise", &["add a line"], "one gap")]);
+    let outcome = supervise_reviewed(&db, &repo, &backend, &reviewer);
+    assert_eq!(outcome["errors"], json!([]), "{outcome}");
+    assert_eq!(outcome["runs"][0]["status"], "awaiting_integration");
+    let mut queue = SqliteQueue::open(&db).unwrap();
+    let detail = queue.show(TaskId::new(1)).unwrap();
+    let kinds = event_kinds(&detail);
+    assert!(position(&kinds, "revise_requested") < position(&kinds, "revise_unsent"));
+    assert!(position(&kinds, "revise_unsent") < position(&kinds, "exit_requested"));
+    let unsent = payloads(&detail, "revise_unsent");
+    assert_eq!(unsent[0]["attempt"], 1);
+    assert!(
+        unsent[0]["error"]
+            .as_str()
+            .unwrap()
+            .starts_with("the revise request could not be sent")
+    );
+    let asks = queue.asks(Default::default()).unwrap();
+    assert_eq!(asks.len(), 1);
+    assert_eq!(asks[0].kind, dagq::domain::AskKind::ApproveLanding);
+}
+
+/// A conflict request that cannot be typed is withdrawn by a
+/// `conflict_precheck` with `unsent: true`, and the run lands as without a
+/// session to ask: the rebase conflicts and parks it for a resume.
+#[test]
+fn a_conflict_request_that_cannot_be_sent_is_withdrawn_and_the_run_lands() {
+    let (_dir, repo, db) = fixture();
+    let mut backend = TestWorkspace::new(&db, false, IDLE_AGENT);
+    backend.text_fails = true;
+    let reviewer = TestReviewer::new(&[moving_main_then_pass()]);
+    let outcome = supervise_reviewed(&db, &repo, &backend, &reviewer);
+    // The test backend has no resume script: the parked run stays parked.
+    assert_eq!(outcome["runs"][0]["status"], "needs_session", "{outcome}");
+    let mut queue = SqliteQueue::open(&db).unwrap();
+    let detail = queue.show(TaskId::new(1)).unwrap();
+    let prechecks = payloads(&detail, "conflict_precheck");
+    assert_eq!(prechecks.len(), 2, "{prechecks:?}");
+    assert_eq!(prechecks[0]["requested"], true);
+    assert_eq!(prechecks[0]["conflicts"], json!(["change.txt"]));
+    assert_eq!(prechecks[1]["requested"], false);
+    assert_eq!(prechecks[1]["unsent"], true);
+    assert_eq!(prechecks[1]["attempt"], 1);
+    assert!(prechecks[1].get("conflicts").is_none());
+    assert!(
+        prechecks[1]["error"]
+            .as_str()
+            .unwrap()
+            .starts_with("the request could not be sent")
+    );
+    let kinds = event_kinds(&detail);
+    assert!(position(&kinds, "conflict_precheck") < position(&kinds, "exit_requested"));
+    assert!(position(&kinds, "exit_requested") < position(&kinds, "integration_started"));
+    assert!(!kinds.contains(&"conflict_resolved"), "{kinds:?}");
+}
+
+/// A supervisor that adopts a run after a withdrawn revise request
+/// (`revise_unsent`) does not send it: it exits the session and asks a
+/// person, as the supervisor that could not send it was doing.
+#[test]
+fn an_adopted_run_with_a_withdrawn_revise_asks_a_person_without_sending_it() {
+    let (_dir, repo, db) = fixture();
+    let backend = TestWorkspace::new(&db, false, IDLE_AGENT);
+    let reviewer = TestReviewer::new(&[verdict("concern", &["x"], "never")]);
+    let detail = adopt_pending_request(
+        &repo,
+        &db,
+        &backend,
+        &reviewer,
+        |_, sent_at| {
+            vec![
+                (
+                    "validation_finished",
+                    json!({"status": "awaiting_integration"}),
+                ),
+                ("review_started", json!({"attempt": 1})),
+                (
+                    "review_finished",
+                    json!({"verdict": "revise", "reasons": ["add a line"], "summary": "one gap", "attempt": 1}),
+                ),
+                (
+                    "revise_requested",
+                    json!({"attempt": 1, "reasons": ["add a line"], "sent_at": sent_at}),
+                ),
+                (
+                    "revise_unsent",
+                    json!({"attempt": 1, "error": "the revise request could not be sent: injected"}),
+                ),
+            ]
+        },
+        String::new,
+    );
+    assert!(backend.texts().is_empty(), "{:?}", backend.texts());
+    assert!(reviewer.prompts().is_empty(), "reviewed again");
+    assert_eq!(backend.exits_sent.load(Ordering::SeqCst), 1);
+    let queue = SqliteQueue::open(&db).unwrap();
+    let asks = queue.asks(Default::default()).unwrap();
+    assert_eq!(asks.len(), 1);
+    assert_eq!(asks[0].kind, dagq::domain::AskKind::ApproveLanding);
+    assert!(
+        asks[0]
+            .question
+            .contains("the revise request could not be sent: injected"),
+        "{}",
+        asks[0].question
+    );
+    assert_eq!(detail.runs[0].status(), RunStatus::AwaitingIntegration);
+}

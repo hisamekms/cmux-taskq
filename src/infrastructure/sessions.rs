@@ -83,9 +83,9 @@ pub(super) fn follow(
         [event_id],
         |r| r.get(0),
     )?;
-    // A revise is typed into the session before its `revise_requested` is
-    // written: the spans switch when it was sent, so that its turn is the
-    // revise's.
+    // The spans switch when the revise was sent (`sent_at`), so that its
+    // turn is the revise's: a `revise_requested` written after the revise
+    // was typed (as before task 241) comes later than that.
     let at = payload["sent_at"]
         .as_i64()
         .filter(|_| kind == "revise_requested")
@@ -382,7 +382,7 @@ fn run_context(conn: &Connection, run_id: &RunId) -> Result<SpanContext> {
         run_dir,
         workspace_id,
         resumes: count("resume_started")?,
-        revises: count("revise_requested")?,
+        revises: count("revise_requested")? - count("revise_unsent")?,
         goal_ids: Vec::new(),
     })
 }

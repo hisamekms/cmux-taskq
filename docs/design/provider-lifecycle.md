@@ -54,9 +54,9 @@ runtimeが起動するClaude sessionは、kindごとの区間（`session_opened`
 
 | kind | 開く | 閉じる（`reason`） | session_id |
 | --- | --- | --- | --- |
-| `worker` | `resume_started`の無いrunの`agent_started` | `revise_requested`（`next_span`）、`session_exited`（`exited`） | `agent_started`の`session_id`（run ID） |
+| `worker` | `resume_started`の無いrunの`agent_started`、送れなかった最初のreviseの`revise_unsent` | `revise_requested`（`next_span`）、`session_exited`（`exited`） | `agent_started`の`session_id`（run ID） |
 | `resume` | `resume_started`の後の`agent_started` | 同上 | 同上 |
-| `revise` | `revise_requested` | 次の`revise_requested`（`next_span`）、`session_exited`（`exited`） | 閉じた`worker` / `resume` / `revise`の区間のもの |
+| `revise` | `revise_requested`、送れなかった2回目以降のreviseの`revise_unsent` | 次の`revise_requested`・`revise_unsent`（`next_span`）、`session_exited`（`exited`） | 閉じた`worker` / `resume` / `revise`の区間のもの |
 | `review` | `review_started` | `review_finished` / `review_failed` / `review_retried`（`job_finished`） | `review_started`の`session_id` |
 | `triage` | `triage_started` | `triage_finished` / `triage_failed`（`job_finished`） | `triage_started`の`session_id` |
 | `plan_review` | `plan_review_started`（proposalの最初のtaskのevent） | 同じ`plan_review_id`の`plan_review_finished` / `plan_review_failed`（`job_finished`） | `plan_review_started`の`session_id` |
@@ -80,7 +80,7 @@ requested providerとactual providerをTaskRunに保存する。Claudeが起動�
 - **レコード**: `type`・`timestamp`・`sessionId`を持つ行だけを使う。実際の入力は`type: user`のうち、sidechainでなく、`isMeta`でなく、中身が`tool_result`だけでなく、`isCompactSummary`でないもの。`assistant`と`tool_result`だけの`user`が出力。
 - **turn**: 実際の入力から、次の実際の入力の前の最後の出力まで（出力が無ければ0秒）。tool・subagent（sidechain）の時間はturnに入り、sidechainの入力はturnを区切らない。turnは入力の時刻が入っている区間に属し、区間の終わりで切る。
 - **読めない**: `Transcripts::read`は、session_idが無い（`session_unknown`）、ファイルが無い（`transcript_missing`）、どの行もJSONでない・UTF-8でない（`transcript_unparsable`）、必要なフィールドを持つレコードが無い（`transcript_unsupported`）、`sessionId`が区間のものと違う（`session_mismatch`）とき`Unreadable`を返す。JSONでない行（書きかけの最後の行など）は飛ばし、数をtracingに書く。
-- **reviseの切り替え**: reviseの文面は`revise_requested`を書く前にsessionへ送るので、`revise_requested`が閉じる区間の`session_closed`と、開く`revise`の区間の`session_opened`は、payloadの`sent_at`（送った時刻、秒）の時刻で書く（`revise_requested`より前のときだけ）。これでreviseの入力のturnは`revise`の区間に属する。
+- **reviseの切り替え**: reviseの文面はtask 241より前は`revise_requested`を書く前にsessionへ送っていた（今は送る直前に`sent_at`を取って記録してから送る）ので、`revise_requested`が閉じる区間の`session_closed`と、開く`revise`の区間の`session_opened`は、payloadの`sent_at`（送った時刻、秒）の時刻で書く（`revise_requested`より前のときだけ）。これでreviseの入力のturnは`revise`の区間に属する。送れずに`revise_unsent`で取り消したreviseは、`revise`の区間を閉じ、その前のsessionの区間（送った前のreviseがあれば`revise`、無ければ`resume`か`worker`）を同じ`session_id`で開き直す。`revise`の`attempt`は`revise_unsent`で取り消した分を数えない。
 - **閉じるとき**: `sessions::close`は区間のtranscriptを読み、まだ記録していないturn（前の`session_turns`の`through`より後に始まったもの。区間の終わりで切る）を`session_turns`（`opened_event_id`・`kind`・`session_id`・`turns: [[開始, 終了], ...]`・`through`（最後のturnの終わり））として書き、記録済みのturnと合わせた秒を`session_closed`の`active_secs`にする。読めなければ`session_turns`を書かず、`active: unavailable`とコードを書き、理由とClaude Codeのversionを`info`のtracingに書く。どちらでも区間を閉じたevent・run・jobの結果は変わらない。
 - **開いている間**: supervisorはループの各passで、前回から`SESSION_TURNS_INTERVAL`（10分）経っていれば、またobserverを起動する前に、`RunStore::record_session_turns`で開いている全区間の完了したturn（次の入力が来たもの）を`session_turns`として区間と同じtask・runに書く。transcriptは書き込みのロックの外で読み、区間ごとに`BEGIN IMMEDIATE`の中で、まだ開いているかと記録済みのturnを確かめ直してから書く（同時に区間を閉じたwrapperと同じturnを二重に書かない）。進行中のturnは書かない。読めない・書けないときはtracingにだけ書き、次の回に読み直す。
 - **headlessのjob**: runtimeが`--session-id`を付けるので、reviewとtriageとplan reviewとobserverのtranscriptも同じ規則で読む。session_idを付けられないprovider（Codex）の区間は`session_unknown`か`transcript_missing`で稼働時間を記録しない（出力形式から取る値は今は使わない）。

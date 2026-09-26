@@ -231,12 +231,7 @@ impl Supervisor<'_> {
             ReviewDecision::Pass => self.precheck(run, session, verdict),
             ReviewDecision::Concern => Ok(ask(None, verdict, session)),
             ReviewDecision::Revise => {
-                let revises = self
-                    .queue
-                    .run_events(run.id())?
-                    .iter()
-                    .filter(|e| e.kind == "revise_requested")
-                    .count();
+                let revises = sent_revises(&self.queue.run_events(run.id())?);
                 if revises >= MAX_REVISE_ATTEMPTS {
                     let why = format!("the review still asks for changes after {revises} revises");
                     return Ok(ask(Some(why), verdict, session));
@@ -257,6 +252,14 @@ impl Supervisor<'_> {
                     message.as_bytes(),
                 )?;
                 let sent_at = self.files.now();
+                // Recorded before it is typed: a supervisor that stops in
+                // between leaves an adopter that waits for the session
+                // rather than sending the request a second time.
+                self.queue.record_runtime_event(
+                    run.id(),
+                    "revise_requested",
+                    json!({"attempt": attempt, "reasons": verdict.reasons, "sent_at": unix_seconds(sent_at)}),
+                )?;
                 let submission = match submit(
                     self,
                     run,
@@ -268,14 +271,14 @@ impl Supervisor<'_> {
                     Err(error) => {
                         let why = format!("the revise request could not be sent: {error:#}");
                         warn!(run_id = %run.id(), "run {}: {why}", run.id());
+                        self.queue.record_runtime_event(
+                            run.id(),
+                            "revise_unsent",
+                            json!({"attempt": attempt, "error": why}),
+                        )?;
                         return Ok(ask(Some(why), verdict, session));
                     }
                 };
-                self.queue.record_runtime_event(
-                    run.id(),
-                    "revise_requested",
-                    json!({"attempt": attempt, "reasons": verdict.reasons, "sent_at": unix_seconds(sent_at)}),
-                )?;
                 info!(run_id = %run.id(), "revise {attempt} of {MAX_REVISE_ATTEMPTS} sent to run {} in workspace {}", run.id(), live.workspace);
                 Ok(Phase::Revise(ReviseWatch {
                     session: live,
@@ -329,10 +332,7 @@ impl Supervisor<'_> {
             return Ok(land(session));
         }
         let events = self.queue.run_events(run.id())?;
-        let requested = events
-            .iter()
-            .filter(|e| e.kind == "conflict_precheck" && e.payload["requested"] == true)
-            .count();
+        let requested = sent_conflict_requests(&events);
         // Resumes of the run parked only by a conflict after its review
         // passed are not counted (ADR-0047 decision 24).
         let resumes = ResumeCount::of(&events).counted;
@@ -388,6 +388,13 @@ impl Supervisor<'_> {
                     message.as_bytes(),
                 )?;
                 let sent_at = self.files.now();
+                // Recorded before it is typed, like a revise request; a
+                // request that could not be sent is withdrawn below.
+                let mut sending = payload.clone();
+                sending["requested"] = json!(true);
+                sending["sent_at"] = json!(unix_seconds(sent_at));
+                self.queue
+                    .record_runtime_event(run.id(), "conflict_precheck", sending)?;
                 submit(
                     self,
                     run,
@@ -405,18 +412,22 @@ impl Supervisor<'_> {
             }
             None => Err("the session had ended".to_owned()),
         };
-        let (Some(live), Ok((sent_at, start))) = (live, sent.clone()) else {
+        let (Some(live), Ok((sent_at, start))) = (live.clone(), sent.clone()) else {
             let error = sent.err().unwrap_or_default();
             payload["error"] = json!(error);
+            if live.is_some() {
+                // Withdraws the request recorded before the send; its
+                // conflicts were counted with it.
+                payload["unsent"] = json!(true);
+                if let Some(payload) = payload.as_object_mut() {
+                    payload.remove("conflicts");
+                }
+            }
             self.queue
                 .record_runtime_event(run.id(), "conflict_precheck", payload)?;
             warn!(run_id = %run.id(), error = %error, "run {}: {why}, and {error}; landing, whose rebase parks it for a resume", run.id());
             return Ok(land(session));
         };
-        payload["requested"] = json!(true);
-        payload["sent_at"] = json!(unix_seconds(sent_at));
-        self.queue
-            .record_runtime_event(run.id(), "conflict_precheck", payload)?;
         info!(run_id = %run.id(), "run {}: {why}; asked its live session in workspace {} to rebase (request {attempt})", run.id(), live.workspace);
         Ok(Phase::Revise(ReviseWatch {
             session: live,
@@ -644,4 +655,25 @@ impl Supervisor<'_> {
         }
         Ok(())
     }
+}
+
+/// The revise requests sent to the run's session: each `revise_requested`
+/// but those a `revise_unsent` withdrew (the request is recorded before it
+/// is typed).
+pub(super) fn sent_revises(events: &[crate::domain::RunEvent]) -> usize {
+    let count = |kind: &str| events.iter().filter(|e| e.kind == kind).count();
+    count("revise_requested").saturating_sub(count("revise_unsent"))
+}
+
+/// The conflict requests sent to the run's session: each
+/// `conflict_precheck` with `requested: true` but those a later one with
+/// `unsent: true` withdrew (the request is recorded before it is typed).
+pub(super) fn sent_conflict_requests(events: &[crate::domain::RunEvent]) -> usize {
+    let count = |key: &str| {
+        events
+            .iter()
+            .filter(|e| e.kind == "conflict_precheck" && e.payload[key] == true)
+            .count()
+    };
+    count("requested").saturating_sub(count("unsent"))
 }
