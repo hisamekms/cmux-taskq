@@ -1,0 +1,14 @@
+# dagq が run に渡す設定。runtime が読むのは main checkout の作業ファイルで、
+# run の worktree で変えても着地して main checkout に反映されるまで効かない。
+# 書式と渡し先は docs/design/supervisor-lifecycle/run-environment.md。
+
+[run.env]
+# 依存 crate の compile の結果を sccache で run 間に共有する（ADR-0049 の決定 6・7）。
+# target は run ごとの worktree の target/ のまま。CARGO_TARGET_DIR を run ごとの値にすると
+# sccache の鍵に入って当たらなくなり、共有すると test と coverage の関門が誤るので置かない。
+# CARGO_INCREMENTAL も変えない（切っても run 間の hit は増えず、worker の繰り返しの build が遅くなる）。
+# sccache は人が `mise use -g sccache` で入れ、~/.local/bin/sccache に mise の shim への link を置く。
+# 見つからなければ up・claim・integrate が止まり、inbox に install tool が出る（決定 8・9）。
+RUSTC_WRAPPER = "sccache"
+# server と話せないときは rustc を直接実行し、cache が効かないだけで build を失敗させない。
+SCCACHE_IGNORE_SERVER_IO_ERROR = "1"
