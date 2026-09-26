@@ -751,15 +751,13 @@ impl ResumeWatch {
 
     /// Record how the request to rewrite a stale receipt ended, once the
     /// attempt ends with the session alive: `rewritten` when the receipt
-    /// changed after it.
+    /// changed after it was typed, even while the run waited and its clock
+    /// was restarted.
     fn settle_stale(&mut self, sv: &mut Supervisor<'_>, run: &TaskRun) -> Result<()> {
         let Some(nudge) = &mut self.stale else {
             return Ok(());
         };
-        let rewritten = sv
-            .files
-            .modified(&self.receipt_path)
-            .is_ok_and(|modified| modified > nudge.at);
+        let rewritten = nudge.rewritten(&*sv.files, &self.receipt_path);
         let outcome = if rewritten { "rewritten" } else { "unchanged" };
         nudge.settle(sv, run, RESUME_PHASE, Some(self.attempt), outcome)
     }

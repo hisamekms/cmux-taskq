@@ -29,8 +29,13 @@ pub(super) struct StaleReceipt {
 #[derive(Debug, Clone, Copy)]
 pub(super) struct StaleNudge {
     /// When it was typed, on the files' wall clock: only an idle marker
-    /// newer than this answers it.
+    /// newer than this answers it. A resume that comes back from a wait
+    /// moves it to the return (ADR-0071 decision 15), so its timeout and
+    /// the idle that answers it count from there.
     pub(super) at: SystemTime,
+    /// When it was typed, never moved: the receipt counts as `rewritten`
+    /// when it changed after this, even while the run waited.
+    pub(super) typed_at: SystemTime,
     /// Its `stale_receipt_resolved` is recorded.
     pub(super) settled: bool,
 }
@@ -92,6 +97,7 @@ pub(super) fn adopted_stale_nudge(
     });
     Ok(Some(StaleNudge {
         at,
+        typed_at: at,
         settled: events
             .iter()
             .any(|e| e.kind == "stale_receipt_resolved" && of_phase(e)),
@@ -159,6 +165,7 @@ pub(super) fn nudge_stale_receipt(
             Ok(Some((
                 StaleNudge {
                     at: sent_at,
+                    typed_at: sent_at,
                     settled: false,
                 },
                 StartCheck::new("stale receipt nudge", &text, sent_at, &submission),
@@ -168,6 +175,7 @@ pub(super) fn nudge_stale_receipt(
             warn!(run_id = %run.id(), error = %format_args!("{error:#}"), "the request to rewrite the receipt of {} could not be typed into workspace {workspace}: {error:#}; going on as before", run.id());
             StaleNudge {
                 at: sent_at,
+                typed_at: sent_at,
                 settled: false,
             }
             .settle(sv, run, phase, attempt, "unsent")?;
@@ -184,6 +192,13 @@ impl StaleNudge {
             .now()
             .duration_since(self.at)
             .is_ok_and(|waited| waited >= cmux.resume_timeout())
+    }
+
+    /// The receipt at `path` changed after the request was typed.
+    pub(super) fn rewritten(&self, files: &dyn RunFiles, path: &Path) -> bool {
+        files
+            .modified(path)
+            .is_ok_and(|modified| modified > self.typed_at)
     }
 
     /// Record how the request ended, once: `rewritten`, `unchanged` or

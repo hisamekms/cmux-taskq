@@ -494,10 +494,7 @@ impl SessionWatch {
     /// how it ended is recorded and the run goes on either way.
     fn stale_receipt(&mut self, sv: &mut Supervisor<'_>, run: &TaskRun) -> Result<bool> {
         if let Some(nudge) = &mut self.stale {
-            let rewritten = sv
-                .files
-                .modified(&self.receipt_path)
-                .is_ok_and(|modified| modified > nudge.at);
+            let rewritten = nudge.rewritten(&*sv.files, &self.receipt_path);
             let outcome = if rewritten { "rewritten" } else { "unchanged" };
             nudge.settle(sv, run, SESSION_PHASE, None, outcome)?;
             return Ok(false);

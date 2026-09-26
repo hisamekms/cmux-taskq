@@ -189,3 +189,95 @@ fn a_resumed_session_that_leaves_the_old_receipt_ends_its_attempt_as_before() {
     assert_eq!(finished[0]["outcome"], "unresolved");
     assert_eq!(finished[1]["outcome"], "resolved");
 }
+
+/// A resumed session asked to rewrite its stale receipt that asks a
+/// `worker_question` right after the request and waits for the answer
+/// outside its slot. `rewrite` says whether it rewrites the receipt during
+/// that wait; left as it was, the attempt ends unresolved and the next one
+/// resolves the run. Returns the `stale_receipt_resolved` payloads of the run.
+fn stale_request_across_a_wait(rewrite: bool) -> Vec<Value> {
+    let (_dir, repo, db) = fixture();
+    let backend = TestWorkspace::new(&db, false, VALID_AGENT);
+    let (run, first_landed) = parked_conflict(&repo, &db, &backend);
+    let during_wait = if rewrite {
+        "receipt \"$(git rev-parse HEAD)\""
+    } else {
+        ":"
+    };
+    backend.resume_script_for(
+        2,
+        &format!(
+            r#"await_message; mark="$(dirname "$RECEIPT")/attempted"
+if [ -f "$mark" ]; then receipt "$(git rev-parse HEAD)"; idle; await_exit; exit 0; fi
+: > "$mark"; resolve; idle
+{AWAIT_NUDGE}
+rm "$MESSAGE"
+"$DAGQ" --db "$DB" ask --run "$RUN_ID" --kind worker_question --because scope --question 'Rewrite it?' --cmux /usr/bin/true > /dev/null || exit 70
+{during_wait}; idle
+while [ ! -f "$MESSAGE" ]; do sleep 0.05; done
+idle; await_exit"#
+        ),
+    );
+    let backend = Arc::new(backend);
+    let supervisor = {
+        let (db, repo, backend) = (db.clone(), repo.clone(), backend.clone());
+        thread::spawn(move || {
+            let _waiting = crate::common::within(crate::common::STEP_LIMIT, "supervise to return");
+            supervise_with(&db, &repo, &backend, &supervise_options(1, true))
+        })
+    };
+    wait_until(&db, Duration::from_secs(60), |_| {
+        !events_of(&db, run.id(), "run_waiting_started").is_empty()
+    });
+    // Past the second of the request and of the rewrite: the return from
+    // the wait restarts the request's clock later than both.
+    thread::sleep(Duration::from_millis(1100));
+    let mut queue = SqliteQueue::open(&db).unwrap();
+    let ask = queue
+        .asks(AskQuery::default())
+        .unwrap()
+        .into_iter()
+        .find(|ask| {
+            ask.run_id.as_ref() == Some(run.id())
+                && ask.kind == AskKind::WorkerQuestion
+                && ask.is_open()
+        })
+        .map(|ask| ask.id)
+        .unwrap();
+    queue.answer(ask, "yes").unwrap();
+    let outcome = joined(supervisor, "the supervisor thread to return").unwrap();
+    backend.join();
+    assert_eq!(outcome["errors"], json!([]), "{outcome}");
+    let detail = queue.show(TaskId::new(2)).unwrap();
+    assert_landed(&repo, &detail.runs[0], "second", &first_landed);
+    assert_eq!(nudges(&backend).len(), 1, "{:?}", backend.texts());
+    let kinds = event_kinds(&detail);
+    let regained = kinds.iter().position(|k| *k == "run_slot_regained");
+    let resolved = kinds.iter().position(|k| *k == "stale_receipt_resolved");
+    assert!(regained.is_some() && regained < resolved, "{kinds:?}");
+    payloads(&detail, "stale_receipt_resolved")
+        .into_iter()
+        .cloned()
+        .collect()
+}
+
+/// A receipt rewritten while the run waited for the answer to its
+/// question counts as `rewritten` once it is back in its slot: the return
+/// restarts the request's clock (ADR-0071 decision 15), but the outcome is
+/// judged from when the request was typed.
+#[test]
+fn a_stale_receipt_rewritten_during_a_wait_is_rewritten() {
+    assert_eq!(
+        stale_request_across_a_wait(true),
+        [json!({"phase": "resume", "attempt": 1, "outcome": "rewritten"})]
+    );
+}
+
+/// A receipt left as it was across the wait stays `unchanged`.
+#[test]
+fn a_stale_receipt_left_during_a_wait_is_unchanged() {
+    assert_eq!(
+        stale_request_across_a_wait(false),
+        [json!({"phase": "resume", "attempt": 1, "outcome": "unchanged"})]
+    );
+}
