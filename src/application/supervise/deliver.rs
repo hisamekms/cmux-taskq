@@ -65,7 +65,8 @@ impl Submission {
 /// again. An error is a failed typing of the input; an Enter that fails
 /// after it leaves the input stuck in the box. A typing that timed out
 /// with the input maybe typed (a `/exit` is never typed again, task 326)
-/// is judged from the screen like one that returned.
+/// is judged from the screen like one that returned, and so is one that
+/// failed with the input still in the box (its Enter failed, task 353).
 pub(super) fn submit_input(
     cmux: &dyn WorkspaceBackend,
     signals: &dyn AgentSignals,
@@ -77,10 +78,22 @@ pub(super) fn submit_input(
         Input::Exit => cmux.send_exit(workspace),
     };
     match typed {
+        Ok(()) => (),
         Err(error) if timed_out_maybe_sent(&error) => {
             warn!(error = %format_args!("{error:#}"), "{} for workspace {workspace} timed out and may have been typed; reading the screen for it: {error:#}", input.name());
         }
-        typed => typed?,
+        // The backend types the input and then presses Enter: an Enter
+        // that failed leaves the input in the box (task 353), where it gets
+        // Enter alone again like one the paste swallowed.
+        Err(error) => match cmux.capture(workspace) {
+            Ok(screen)
+                if signals.detect_prompt(&screen).is_none()
+                    && signals.input_pending(&screen, input.text()) =>
+            {
+                warn!(error = %format_args!("{error:#}"), "{} for workspace {workspace} failed but is in the input box; sending Enter again: {error:#}", input.name());
+            }
+            _ => return Err(error),
+        },
     }
     let mut retries = 0;
     loop {
@@ -390,6 +403,8 @@ mod tests {
         send_timeouts: AtomicUsize,
         capture_timeouts: AtomicUsize,
         exit_times_out: bool,
+        /// Every `/exit` is typed but its Enter fails, not by a timeout.
+        exit_enter_fails: bool,
     }
 
     impl Backend {
@@ -400,6 +415,7 @@ mod tests {
                 send_timeouts: AtomicUsize::new(0),
                 capture_timeouts: AtomicUsize::new(0),
                 exit_times_out: false,
+                exit_enter_fails: false,
             }
         }
 
@@ -459,6 +475,7 @@ mod tests {
         fn send_exit(&self, _: &str) -> Result<()> {
             self.sent.lock().unwrap().push("/exit".to_owned());
             ensure!(!self.exit_times_out, "cmux send failed: Command timed out");
+            ensure!(!self.exit_enter_fails, "cmux send-key failed: broken pipe");
             Ok(())
         }
         fn exists(&self, _: &str) -> Result<bool> {
@@ -671,6 +688,72 @@ mod tests {
         let (submission, retries) = submitted_through(&backend, Input::Exit).unwrap();
         assert_eq!(submission, Submission::Submitted(Some("ready".into())));
         assert_eq!((retries, backend.sent()), (0, vec!["/exit".to_owned()]));
+    }
+
+    #[test]
+    fn an_exit_whose_enter_failed_in_the_box_gets_enter_again() {
+        let mut backend = Backend::new(&["pending:/exit", "pending:/exit", "ready"]);
+        backend.exit_enter_fails = true;
+        let (submission, retries) = submitted_through(&backend, Input::Exit).unwrap();
+        assert_eq!(submission, Submission::Submitted(Some("ready".into())));
+        // `/exit` is typed once; only Enter goes again.
+        assert_eq!(
+            (retries, backend.sent()),
+            (1, vec!["/exit".into(), "<enter>".into()])
+        );
+        // Without a trace of it on the screen, or over a dialog, the
+        // failure stands and nothing more is sent.
+        for screen in ["ready", "dialog"] {
+            let mut backend = Backend::new(&[screen]);
+            backend.exit_enter_fails = true;
+            let error = submitted_through(&backend, Input::Exit).unwrap_err();
+            assert!(
+                format!("{error:#}").contains("send-key failed"),
+                "{error:#}"
+            );
+            assert_eq!(backend.sent(), ["/exit"]);
+        }
+    }
+
+    /// Every `/exit` of the supervisor, whatever the path (a finished
+    /// worker session, a resumed one, one kept through review and revise,
+    /// a silent wrapper, a runtime planner), goes through [`submit_input`]
+    /// and so gets its Enter confirmed (task 353): nothing else calls
+    /// `send_exit`.
+    #[test]
+    fn every_exit_goes_through_submit_input() {
+        fn scan(dir: &Path, found: &mut Vec<String>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    scan(&path, found);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    let source = std::fs::read_to_string(&path).unwrap();
+                    for (n, line) in source.lines().enumerate() {
+                        if line.contains(".send_exit(") {
+                            found.push(format!("{}:{}", path.display(), n + 1));
+                        }
+                    }
+                }
+            }
+        }
+        let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut found = Vec::new();
+        scan(&src, &mut found);
+        let allowed = [
+            // submit_input itself.
+            "application/supervise/deliver.rs",
+            // The recording wrapper hands it to the backend.
+            "application/recording.rs",
+        ];
+        let stray: Vec<_> = found
+            .iter()
+            .filter(|at| !allowed.iter().any(|file| at.contains(file)))
+            .collect();
+        assert!(
+            stray.is_empty(),
+            "send_exit outside submit_input: {stray:?}"
+        );
     }
 
     #[test]
