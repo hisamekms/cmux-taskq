@@ -408,6 +408,7 @@ impl std::str::FromStr for Priority {
 }
 
 mod error;
+pub mod finding;
 pub mod follow_up;
 pub mod goal;
 pub mod ids;
@@ -430,9 +431,13 @@ mod views;
 
 pub use error::DomainError;
 use error::require;
+pub use finding::{
+    Finding, FindingOutcome, FindingQuery, FindingStatus, FindingTarget, FindingUpdate,
+    FindingView, Impact, NewFinding,
+};
 pub use follow_up::{DraftOrigin, DraftTarget, MAX_DRAFT_PLANNERS, PLANNER_QUESTION_OPTIONS};
 pub use goal::Goal;
-pub use ids::{AskId, CommitSha, EventId, GoalId, PlannerId, ProposalId, RunId, TaskId};
+pub use ids::{AskId, CommitSha, EventId, FindingId, GoalId, PlannerId, ProposalId, RunId, TaskId};
 pub use input::{GoalEdit, GoalRecord, NewGoal, NewTask, RunPlan, RunRecord, TaskEdit, TaskRecord};
 pub use lint::{LintCode, LintInput, LintNode, LintViolation};
 pub use plan_review::{
@@ -479,6 +484,9 @@ pub struct Ask {
     pub created_at: i64,
     pub answered_at: Option<i64>,
     pub closed_at: Option<i64>,
+    /// The finding a `blocked` ask raises (ADR-0044 decision 23).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finding_id: Option<FindingId>,
 }
 
 impl Ask {
@@ -508,6 +516,9 @@ pub struct NewAsk {
     /// Why a person is needed (ADR-0047 decision 41): `scope`, `discard`
     /// or `recovery_failed`. Authentication and cost are [`NewHold`]s.
     pub reason_category: AskReason,
+    /// The finding a `blocked` ask raises; the one-open-ask rule then holds
+    /// per finding (ADR-0044 decision 23).
+    pub finding_id: Option<FindingId>,
 }
 
 impl NewAsk {
@@ -529,6 +540,10 @@ impl NewAsk {
             || DomainError::AskHoldsTheQueue {
                 reason: self.reason_category,
             },
+        )?;
+        require(
+            self.finding_id.is_none() || self.kind == AskKind::Blocked,
+            || DomainError::AskFindingNotBlocked { kind: self.kind },
         )?;
         require(
             self.task_id.is_some() || self.run_id.is_some() || self.kind == AskKind::Blocked,
@@ -1338,6 +1353,7 @@ mod attention_tests {
             created_at: 0,
             answered_at: None,
             closed_at: None,
+            finding_id: None,
         };
         assert!(ask.is_open());
         assert_eq!(ask.waits_for(), Some(SessionRole::Inbox));
@@ -1367,6 +1383,7 @@ mod attention_tests {
             options: vec!["a".into()],
             asked_by: "worker".into(),
             reason_category: crate::domain::AskReason::Scope,
+            finding_id: None,
         };
         assert!(valid.validate().is_ok());
         for broken in [

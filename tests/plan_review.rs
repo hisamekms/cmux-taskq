@@ -473,6 +473,7 @@ fn a_revise_goes_to_the_live_planner_with_the_precedents_and_times_out_to_the_in
             options: Vec::new(),
             asked_by: "observer".into(),
             reason_category: dagq::domain::AskReason::Scope,
+            finding_id: None,
         })
         .unwrap()
         .ask
@@ -1305,6 +1306,7 @@ fn a_planner_question_answer_is_typed_into_its_planner_or_carried_by_a_new_one()
             options: vec!["adopt".into(), "cancel".into(), "keep_draft".into()],
             asked_by: "planner".into(),
             reason_category: dagq::domain::AskReason::Scope,
+            finding_id: None,
         })
         .unwrap()
         .ask;
@@ -1345,6 +1347,7 @@ fn a_planner_question_answer_is_typed_into_its_planner_or_carried_by_a_new_one()
             options: vec!["adopt".into(), "cancel".into(), "keep_draft".into()],
             asked_by: "planner".into(),
             reason_category: dagq::domain::AskReason::Scope,
+            finding_id: None,
         })
         .unwrap()
         .ask;
@@ -1380,6 +1383,7 @@ fn a_planner_question_answer_is_typed_into_its_planner_or_carried_by_a_new_one()
             options: vec!["adopt".into(), "cancel".into(), "keep_draft".into()],
             asked_by: "planner".into(),
             reason_category: dagq::domain::AskReason::Scope,
+            finding_id: None,
         })
         .unwrap()
         .ask;

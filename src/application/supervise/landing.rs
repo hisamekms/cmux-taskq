@@ -511,6 +511,7 @@ impl Supervisor<'_> {
                 options: LANDING_OPTIONS.iter().map(|o| (*o).to_owned()).collect(),
                 asked_by: "supervisor".to_owned(),
                 reason_category: AskReason::Scope,
+                finding_id: None,
             },
             self.cmux,
         )?;

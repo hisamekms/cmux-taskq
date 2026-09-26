@@ -1408,7 +1408,7 @@ fn notes_are_observations_read_by_notes_show_and_goal_show() {
         serde_json::json!({"text": "goal is slow", "kind": "note", "by": "human"})
     );
     let on_task = ok_as(
-        "observer",
+        "planner",
         &db,
         &[
             "note",
@@ -1421,7 +1421,7 @@ fn notes_are_observations_read_by_notes_show_and_goal_show() {
         ],
     );
     assert_eq!(on_task["task_id"], 1);
-    assert_eq!(on_task["payload"]["by"], "observer");
+    assert_eq!(on_task["payload"]["by"], "planner");
     assert_eq!(on_task["payload"]["kind"], "retry");
     assert!(
         !invoke(&db, &["note", "--task", "1", "--goal", "1", "--text", "x"])
@@ -1464,7 +1464,7 @@ fn notes_are_observations_read_by_notes_show_and_goal_show() {
 
     let shown = ok(&db, &["show", "1"]);
     assert_eq!(shown["observations"][0]["text"], "failed twice");
-    assert_eq!(shown["observations"][0]["by"], "observer");
+    assert_eq!(shown["observations"][0]["by"], "planner");
     let goal = ok(&db, &["goal", "show", "1"]);
     assert_eq!(
         goal["observations"],
@@ -1474,7 +1474,7 @@ fn notes_are_observations_read_by_notes_show_and_goal_show() {
 }
 
 #[test]
-fn observer_may_note_and_propose_but_not_change_queue_state() {
+fn observer_may_record_findings_and_ask_but_not_change_queue_state() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("queue.db");
     ok(&db, &["init"]);
@@ -1502,6 +1502,11 @@ fn observer_may_note_and_propose_but_not_change_queue_state() {
         &["goal", "ready", "1"],
         &["goal", "edit", "1", "--title", "x"],
         &["goal", "add", "not a draft"],
+        // Notes, draft goals and their tasks are no longer the observer's
+        // (ADR-0044 decision 4); a finding carries what it sees.
+        &["goal", "add", "proposal", "--draft"],
+        &["note", "--goal", "1", "--text", "seen"],
+        &["finding", "dismiss", "1", "--reason", "x"],
         &["add", "loose"],
         &["add", "into open goal", "--goal", "1"],
         &["set-goal", "1", "--none"],
@@ -1531,7 +1536,7 @@ fn observer_may_note_and_propose_but_not_change_queue_state() {
         denied(args);
     }
 
-    // Reads, notes, a draft goal and draft tasks in it are allowed.
+    // Reads, findings and blocked asks are allowed.
     for args in [
         &["list"][..],
         &["show", "1"],
@@ -1547,12 +1552,36 @@ fn observer_may_note_and_propose_but_not_change_queue_state() {
         &["asks"],
         &["status", "--role", "inbox"],
         &["planners", "--all"],
+        &["findings", "--all", "--full"],
     ] {
         ok_as("observer", &db, args);
     }
-    ok_as("observer", &db, &["note", "--goal", "1", "--text", "seen"]);
-    // A threshold crossing goes to the inbox as a blocked ask, on a task or
-    // on nothing; registering the same one again returns the open ask.
+    let finding = ok_as(
+        "observer",
+        &db,
+        &[
+            "finding",
+            "record",
+            "--kind",
+            "stall",
+            "--queue",
+            "--summary",
+            "slots idle",
+        ],
+    );
+    assert_eq!(finding["recorded_by"], "observer");
+    // A threshold crossing goes to the inbox as a blocked ask on its
+    // finding, on a task or on nothing; registering the same one again
+    // returns the open ask. Without a finding it is refused.
+    denied(&[
+        "ask",
+        "--kind",
+        "blocked",
+        "--because",
+        "scope",
+        "--question",
+        "no finding",
+    ]);
     let on_task = ok_as(
         "observer",
         &db,
@@ -1565,6 +1594,8 @@ fn observer_may_note_and_propose_but_not_change_queue_state() {
             "--question",
             "stuck",
             "--task",
+            "1",
+            "--finding",
             "1",
         ],
     );
@@ -1583,6 +1614,8 @@ fn observer_may_note_and_propose_but_not_change_queue_state() {
             "slots idle",
             "--option",
             "leave it",
+            "--finding",
+            "1",
         ],
     );
     assert_eq!(idle["task_id"], Value::Null);
@@ -1613,6 +1646,8 @@ fn observer_may_note_and_propose_but_not_change_queue_state() {
             "scope",
             "--question",
             "slots idle again",
+            "--finding",
+            "1",
         ],
     );
     assert_eq!(
@@ -1629,20 +1664,356 @@ fn observer_may_note_and_propose_but_not_change_queue_state() {
             .any(|a| a["ask_id"] == idle["id"] && a["task_id"].is_null()),
         "{inbox}"
     );
-    let draft = ok_as("observer", &db, &["goal", "add", "proposal", "--draft"]);
-    assert_eq!(draft["status"], "draft");
+    ok_as(
+        "observer",
+        &db,
+        &[
+            "finding",
+            "resolve",
+            "1",
+            "--reason",
+            "slots are busy again",
+        ],
+    );
+    // Other roles are not restricted.
+    ok_as("planner", &db, &["add", "planned"]);
+}
+
+/// A finding is one row per problem (ADR-0044 decision 18): recording the
+/// same kind, target and subject again adds the new evidence as one more
+/// occurrence, and a blocked ask raises it with one open ask per finding
+/// (decision 23).
+#[test]
+fn findings_are_recorded_once_per_problem_and_listed_by_impact() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("queue.db");
+    ok(&db, &["init"]);
+    ok(&db, &["goal", "add", "g"]);
+    ok(&db, &["add", "t", "--goal", "1"]);
+    ok(&db, &["add", "u"]);
+    let events: Vec<String> = ok(&db, &["events", "--all"])["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["id"].to_string())
+        .collect();
+    assert!(events.len() >= 3, "{events:?}");
+    let record = |extra: &[&str]| {
+        let mut args = vec![
+            "finding",
+            "record",
+            "--kind",
+            "stall",
+            "--queue",
+            "--subject",
+            "idle_slots",
+            "--summary",
+            "slots idle",
+        ];
+        args.extend_from_slice(extra);
+        ok_as("observer", &db, &args)
+    };
+    let first = record(&["--evidence", &events[0]]);
+    assert_eq!(first["created"], true);
+    assert_eq!(
+        (
+            &first["target"],
+            &first["status"],
+            &first["impact"],
+            &first["occurrences"]
+        ),
+        (
+            &Value::from("queue"),
+            &Value::from("open"),
+            &Value::from("normal"),
+            &Value::from(1)
+        )
+    );
+    let id = first["id"].to_string();
+    // New evidence is one more occurrence of the same finding.
+    let second = record(&["--evidence", &events[0], "--evidence", &events[1]]);
+    assert_eq!(
+        (&second["id"], &second["created"]),
+        (&first["id"], &Value::Bool(false))
+    );
+    assert_eq!(second["occurrences"], 2);
+    assert_eq!(
+        second["evidence"],
+        serde_json::json!([first["evidence"][0], second["evidence"][1]])
+    );
+    assert_eq!(second["evidence"].as_array().unwrap().len(), 2);
+    // Nothing new: nothing written.
+    let same = record(&["--evidence", &events[1]]);
+    assert_eq!(same["changed"], serde_json::json!([]));
+    assert_eq!(same["occurrences"], 2);
+    // A different subject or target is another finding.
     let task = ok_as(
         "observer",
         &db,
-        &["add", "proposed", "--goal", "2", "--depends-on", "1"],
+        &[
+            "finding",
+            "record",
+            "--kind",
+            "failure",
+            "--task",
+            "1",
+            "--summary",
+            "fails twice",
+            "--impact",
+            "high",
+            "--propose",
+            "recurs",
+        ],
     );
-    assert_eq!(task["status"], "draft");
-    // The observer cannot adopt its own proposal; the planner does.
-    denied(&["goal", "ready", "2"]);
-    ok(&db, &["goal", "ready", "2"]);
-    denied(&["add", "after adoption", "--goal", "2"]);
-    // Other roles are not restricted.
-    ok_as("planner", &db, &["add", "planned"]);
+    assert_eq!(task["created"], true);
+    assert_eq!(task["task_id"], 1);
+    assert_eq!(task["propose_reason"], "recurs");
+    let task_id = task["id"].to_string();
+    let listed = ok(&db, &["findings"])["findings"].clone();
+    assert_eq!(
+        listed
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| f["id"].clone())
+            .collect::<Vec<_>>(),
+        vec![task["id"].clone(), first["id"].clone()],
+        "high impact first"
+    );
+    assert_eq!(listed[0]["proposal_status"], Value::Null);
+    assert!(listed[0].get("evidence_events").is_none());
+    assert_eq!(
+        ok(&db, &["findings", "--task", "1"])["findings"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        ok(&db, &["findings", "--queue"])["findings"][0]["id"],
+        first["id"]
+    );
+    assert_eq!(
+        ok(&db, &["findings", "--kind", "wait"])["findings"],
+        serde_json::json!([])
+    );
+    let full = ok(&db, &["findings", &id, "--full"])["findings"][0].clone();
+    assert_eq!(full["evidence_events"].as_array().unwrap().len(), 2);
+    assert_eq!(full["evidence_events"][0]["id"], first["evidence"][0]);
+    // Its own events ride on the queue (no task) or on its target.
+    let kinds: Vec<(Value, Value)> = ok(&db, &["events", "--all"])["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["kind"].as_str().unwrap().starts_with("finding_"))
+        .map(|e| (e["kind"].clone(), e["task_id"].clone()))
+        .collect();
+    assert_eq!(
+        kinds,
+        vec![
+            (Value::from("finding_recorded"), Value::Null),
+            (Value::from("finding_updated"), Value::Null),
+            (Value::from("finding_recorded"), Value::from(1)),
+        ]
+    );
+
+    // A task-less blocked ask per finding (ADR-0044 decision 23).
+    let ask = |finding: &str| {
+        ok_as(
+            "observer",
+            &db,
+            &[
+                "ask",
+                "--kind",
+                "blocked",
+                "--question",
+                "q",
+                "--because",
+                "scope",
+                "--finding",
+                finding,
+            ],
+        )
+    };
+    let on_first = ask(&id);
+    let on_task = ask(&task_id);
+    assert_eq!(
+        (&on_first["created"], &on_task["created"]),
+        (&Value::Bool(true), &Value::Bool(true))
+    );
+    assert_eq!(on_first["finding_id"], first["id"]);
+    assert_eq!(ask(&id)["id"], on_first["id"]);
+    assert_eq!(
+        ok(&db, &["findings", &id])["findings"][0]["open_asks"],
+        serde_json::json!([on_first["id"]])
+    );
+    let error = |role: &str, args: &[&str]| {
+        let output = invoke_as(Some(role), &db, args);
+        assert!(!output.status.success(), "{args:?}");
+        serde_json::from_slice::<Value>(&output.stderr).unwrap()["error"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+    assert_eq!(
+        error(
+            "planner",
+            &[
+                "ask",
+                "--kind",
+                "decide",
+                "--task",
+                "1",
+                "--question",
+                "q",
+                "--because",
+                "scope",
+                "--finding",
+                &id
+            ]
+        ),
+        "only a blocked ask may name a finding, not decide"
+    );
+    assert_eq!(
+        error(
+            "observer",
+            &[
+                "ask",
+                "--kind",
+                "blocked",
+                "--question",
+                "q",
+                "--because",
+                "scope",
+                "--finding",
+                "99"
+            ]
+        ),
+        "finding 99 does not exist"
+    );
+    assert_eq!(
+        error(
+            "observer",
+            &[
+                "finding",
+                "record",
+                "--kind",
+                "x",
+                "--queue",
+                "--summary",
+                "s",
+                "--evidence",
+                "9999"
+            ]
+        ),
+        "event 9999 does not exist"
+    );
+    assert_eq!(
+        error(
+            "observer",
+            &[
+                "finding",
+                "record",
+                "--kind",
+                "Bad",
+                "--queue",
+                "--summary",
+                "s"
+            ]
+        ),
+        "finding kind \"Bad\" must be a slug of lowercase letters, digits, '-' and '_'"
+    );
+
+    // Resolved, it leaves the default list; occurring again reopens it.
+    let resolved = ok_as(
+        "observer",
+        &db,
+        &["finding", "resolve", &id, "--reason", "busy again"],
+    );
+    assert_eq!(
+        (&resolved["status"], &resolved["status_reason"]),
+        (&Value::from("resolved"), &Value::from("busy again"))
+    );
+    assert_eq!(
+        ok(&db, &["findings"])["findings"].as_array().unwrap().len(),
+        1
+    );
+    assert_eq!(
+        ok(&db, &["findings", "--status", "resolved"])["findings"][0]["id"],
+        first["id"]
+    );
+    let again = record(&["--evidence", &events[2]]);
+    assert_eq!(
+        (&again["id"], &again["status"], &again["occurrences"]),
+        (&first["id"], &Value::from("open"), &Value::from(3))
+    );
+    // Dismissed by a person, it only counts what recurs.
+    let dismissed = ok(
+        &db,
+        &[
+            "finding",
+            "dismiss",
+            &task_id,
+            "--reason",
+            "task 2 covers it",
+        ],
+    );
+    assert_eq!(dismissed["status"], "dismissed");
+    assert_eq!(
+        error(
+            "planner",
+            &["finding", "dismiss", &task_id, "--reason", "again"]
+        ),
+        format!("finding {task_id} is dismissed; it cannot become dismissed")
+    );
+    assert_eq!(
+        error(
+            "planner",
+            &["finding", "resolve", &task_id, "--reason", "x"]
+        ),
+        format!("finding {task_id} is dismissed; it cannot become resolved")
+    );
+    assert_eq!(
+        ok(&db, &["findings", "--all"])["findings"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    let counted = ok_as(
+        "observer",
+        &db,
+        &[
+            "finding",
+            "record",
+            "--kind",
+            "failure",
+            "--task",
+            "1",
+            "--summary",
+            "fails",
+            "--evidence",
+            &events[0],
+        ],
+    );
+    assert_eq!(
+        (
+            &counted["status"],
+            &counted["occurrences"],
+            &counted["summary"]
+        ),
+        (
+            &Value::from("dismissed"),
+            &Value::from(2),
+            &Value::from("fails twice")
+        )
+    );
+    // The headless reviewer reads findings but writes none.
+    ok_as("reviewer", &db, &["findings"]);
+    assert_eq!(
+        error("reviewer", &["finding", "resolve", &id, "--reason", "x"]),
+        "reviewer may not change queue state"
+    );
 }
 
 mod stats {
@@ -2750,7 +3121,8 @@ fn migrate_is_explicit_and_older_binaries_keep_working_within_the_floor() {
             {"version": 26, "compatible": true},
             {"version": 27, "compatible": false},
             {"version": 28, "compatible": false},
-            {"version": 29, "compatible": false}
+            {"version": 29, "compatible": false},
+            {"version": 30, "compatible": false}
         ])
     );
     assert_eq!(version(), 23);

@@ -647,33 +647,30 @@ impl SqliteQueue {
         )?)
     }
 
-    /// The highest ask id and goal id now, 0 when none exists: where the
-    /// observer's own asks and goals start.
-    pub fn ask_and_goal_high_water(&self) -> Result<(AskId, GoalId)> {
-        Ok(self.conn.query_row(
-            "SELECT (SELECT ifnull(max(id),0) FROM asks), (SELECT ifnull(max(id),0) FROM goals)",
-            [],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )?)
+    /// The newest ask's ID: the mark [`Self::written_by`] counts past.
+    pub fn ask_high_water(&self) -> Result<AskId> {
+        Ok(self
+            .conn
+            .query_row("SELECT ifnull(max(id),0) FROM asks", [], |r| r.get(0))?)
     }
 
-    /// What `role` wrote after the marks: notes recorded after `event_id`,
-    /// asks after `ask_id`, and draft goals after `goal_id` (goals do not
-    /// record who added them; the observer is the one that adds drafts).
+    /// What `role` wrote after the marks: findings it recorded and updated
+    /// (`finding_recorded`, `finding_updated` after `event_id`) and asks
+    /// after `ask_id`.
     pub fn written_by(
         &self,
         role: &str,
         event_id: EventId,
         ask_id: AskId,
-        goal_id: GoalId,
     ) -> Result<(i64, i64, i64)> {
         Ok(self.conn.query_row(
             "SELECT
-               (SELECT count(*) FROM run_events WHERE id>?2 AND kind='observation'
+               (SELECT count(*) FROM run_events WHERE id>?2 AND kind='finding_recorded'
                   AND json_extract(payload,'$.by')=?1),
-               (SELECT count(*) FROM asks WHERE id>?3 AND asked_by=?1),
-               (SELECT count(*) FROM goals WHERE id>?4 AND status='draft')",
-            params![role, event_id, ask_id, goal_id],
+               (SELECT count(*) FROM run_events WHERE id>?2 AND kind='finding_updated'
+                  AND json_extract(payload,'$.by')=?1),
+               (SELECT count(*) FROM asks WHERE id>?3 AND asked_by=?1)",
+            params![role, event_id, ask_id],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )?)
     }

@@ -17,9 +17,10 @@ use serde_json::{Value, json};
 use dagq::{
     application::{StatusFilter, TaskQuery, TaskStore, claim_candidates, dependency_graph},
     domain::{
-        AskId, AskKind, AskReason, EventId, GoalEdit, GoalId, GoalVerdict, NewAsk, NewGoal,
-        NewNote, NewTask, NoteQuery, NoteTarget, PlannerOrigin, PlannerOwner, ProposalId, RunId,
-        SessionRole, Submission, TaskAction, TaskEdit, TaskId, TaskStatus,
+        AskId, AskKind, AskReason, EventId, FindingId, FindingQuery, FindingStatus, FindingTarget,
+        GoalEdit, GoalId, GoalVerdict, NewAsk, NewFinding, NewGoal, NewNote, NewTask, NoteQuery,
+        NoteTarget, PlannerOrigin, PlannerOwner, ProposalId, RunId, SessionRole, Submission,
+        TaskAction, TaskEdit, TaskId, TaskStatus,
         search::{self, SearchQuery},
     },
     infrastructure::{adapters::path_text, location::QueueLocation, sqlite::SqliteQueue},
@@ -295,6 +296,43 @@ enum Command {
         #[arg(long, default_value_t = 20, value_parser = clap::value_parser!(u32).range(1..))]
         limit: u32,
     },
+    /// Record a finding (ADR-0044 decision 18), or resolve or dismiss one.
+    Finding {
+        #[command(subcommand)]
+        command: FindingCommand,
+    },
+    /// List findings: the open and proposed ones unless --all or --status says otherwise, larger
+    /// impact first (then more occurrences, then the latest seen). Each has its proposal's status
+    /// and its open asks. Prints {"findings"}.
+    #[command(group = clap::ArgGroup::new("target"))]
+    Findings {
+        /// Only this finding, whatever its status.
+        id: Option<i64>,
+        /// Include resolved and dismissed findings.
+        #[arg(long, conflicts_with = "status")]
+        all: bool,
+        /// Only these statuses (comma-separated): open, proposed, resolved, dismissed.
+        #[arg(long, value_delimiter = ',', value_parser = FINDING_STATUSES)]
+        status: Vec<String>,
+        /// Only these kinds (comma-separated).
+        #[arg(long = "kind", value_delimiter = ',')]
+        kinds: Vec<String>,
+        /// Only findings on this task.
+        #[arg(long, group = "target")]
+        task: Option<i64>,
+        /// Only findings on this run.
+        #[arg(long, group = "target")]
+        run: Option<String>,
+        /// Only findings on this goal.
+        #[arg(long, group = "target")]
+        goal: Option<i64>,
+        /// Only findings on the queue as a whole.
+        #[arg(long, group = "target")]
+        queue: bool,
+        /// Include the evidence events in full.
+        #[arg(long)]
+        full: bool,
+    },
     /// Full-text search of tasks (title, description, acceptance, context), goals (title,
     /// description, acceptance, constraints), notes and the messages of landed commits, in every
     /// status (ADR-0046). QUERY is words (all must match; `"..."` for a phrase) with FTS5's AND,
@@ -398,8 +436,8 @@ enum Command {
         plugin_dir: Option<PathBuf>,
     },
     /// Run the observer job once: headless Claude under DAGQ_ROLE=observer reads stats past the
-    /// cursor, the latest notes, the open asks and the graph, and writes notes, blocked asks and
-    /// draft goals only. Records observe_started / observe_finished and saves the new cursor.
+    /// cursor, the open findings, the latest notes, the open asks and the graph, and writes
+    /// findings and blocked asks on them only (ADR-0044 decision 4). Records observe_started / observe_finished and saves the new cursor.
     Observe {
         /// Event id to read stats past; defaults to the cursor the last observe saved
         /// (<queue dir>/observer/cursor), or with --daily the last event 24 hours ago.
@@ -535,6 +573,9 @@ enum Command {
         /// Run the ask is about (its task is implied).
         #[arg(long)]
         run: Option<String>,
+        /// Finding a blocked ask raises; one ask per finding stays open (ADR-0044 decision 23).
+        #[arg(long)]
+        finding: Option<i64>,
         /// cmux executable, used to notify the inbox; a bare name is resolved on PATH.
         #[arg(long, default_value = "cmux")]
         cmux: PathBuf,
@@ -688,6 +729,62 @@ fn parse_role(value: Option<String>) -> Result<Option<SessionRole>> {
     Ok(value.map(|value| value.parse()).transpose()?)
 }
 
+/// The statuses of a finding.
+const FINDING_STATUSES: [&str; 4] = ["open", "proposed", "resolved", "dismissed"];
+
+#[derive(Subcommand)]
+enum FindingCommand {
+    /// Record a finding. The open or proposed finding of the same kind, target and subject takes
+    /// it instead: new evidence adds an occurrence (and reopens a resolved one), a new summary,
+    /// detail, impact or --propose is written, and a record with nothing new changes nothing
+    /// (`changed` is empty). Prints the finding with `created` and `changed`.
+    #[command(group = clap::ArgGroup::new("target").required(true))]
+    Record {
+        /// A lowercase slug: stall, failure, wait, capacity, threshold, conflict_hotspot, ...
+        #[arg(long)]
+        kind: String,
+        #[arg(long, group = "target")]
+        task: Option<i64>,
+        #[arg(long, group = "target")]
+        run: Option<String>,
+        #[arg(long, group = "target")]
+        goal: Option<i64>,
+        /// The queue as a whole.
+        #[arg(long, group = "target")]
+        queue: bool,
+        /// What tells the problem apart within its target: a path, an alert, a threshold.
+        #[arg(long, default_value = "")]
+        subject: String,
+        /// One line.
+        #[arg(long)]
+        summary: String,
+        /// The reading of it; omitted keeps the recorded one.
+        #[arg(long)]
+        detail: Option<String>,
+        /// high, normal or low; omitted keeps the recorded one (a new finding: normal).
+        #[arg(long, value_parser = ["high", "normal", "low"])]
+        impact: Option<String>,
+        /// Run event that shows it; repeatable.
+        #[arg(long = "evidence")]
+        evidence: Vec<i64>,
+        /// Ask for a proposal to remedy it, with the reason (ADR-0044 decision 19).
+        #[arg(long)]
+        propose: Option<String>,
+    },
+    /// Mark a finding resolved: the problem no longer occurs.
+    Resolve {
+        id: i64,
+        #[arg(long)]
+        reason: String,
+    },
+    /// Mark a finding dismissed: nobody will remedy it. It still counts occurrences.
+    Dismiss {
+        id: i64,
+        #[arg(long)]
+        reason: String,
+    },
+}
+
 #[derive(Subcommand)]
 enum AskCommand {
     /// Mark an answered ask read. An open ask is withdrawn by answering it first.
@@ -807,6 +904,7 @@ fn reads_only(command: &Command) -> bool {
             | Command::Stats { .. }
             | Command::Doctor { .. }
             | Command::Notes { .. }
+            | Command::Findings { .. }
             | Command::Search { .. }
             | Command::Related { .. }
             | Command::Proposal {
@@ -829,17 +927,17 @@ fn reviewer_access(command: &Command) -> ObserverAccess {
     }
 }
 
-/// What the observer's environment may run (ADR-0024 decision 4).
+/// What the observer's environment may run (ADR-0044 decision 4).
 #[derive(Debug, PartialEq, Eq)]
 enum ObserverAccess {
     Allowed,
     Denied,
-    /// `add` into this goal, allowed only while it is a draft.
-    DraftGoal(i64),
 }
 
-/// An allowlist: reads, notes, blocked asks, draft goals and tasks of a draft goal. Every
-/// other command, including ones added later, is refused until listed here.
+/// An allowlist: reads, findings (recording and resolving; dismissing is a
+/// person's or a planner's) and blocked asks. Notes, goals and tasks are
+/// not; every other command, including ones added later, is refused until
+/// listed here.
 fn observer_access(command: &Command) -> ObserverAccess {
     match command {
         Command::Locate
@@ -854,8 +952,11 @@ fn observer_access(command: &Command) -> ObserverAccess {
         | Command::Watch { .. }
         | Command::Stats { .. }
         | Command::Doctor { .. }
-        | Command::Note { .. }
         | Command::Notes { .. }
+        | Command::Findings { .. }
+        | Command::Finding {
+            command: FindingCommand::Record { .. } | FindingCommand::Resolve { .. },
+        }
         | Command::Search { .. }
         | Command::Related { .. }
         | Command::Proposal {
@@ -864,21 +965,32 @@ fn observer_access(command: &Command) -> ObserverAccess {
         | Command::Planners { .. }
         | Command::Lint { .. }
         | Command::Goal {
-            command:
-                GoalCommand::List | GoalCommand::Show { .. } | GoalCommand::Add { draft: true, .. },
+            command: GoalCommand::List | GoalCommand::Show { .. },
         } => ObserverAccess::Allowed,
-        Command::Add {
-            goal_id: Some(goal_id),
-            ..
-        } => ObserverAccess::DraftGoal(*goal_id),
-        // The threshold crossings it raises to the inbox, and nothing else.
+        // The threshold crossings it raises to the inbox, each on its
+        // finding (ADR-0044 decision 23), and nothing else.
         Command::Ask {
             command: None,
             kind: Some(kind),
+            finding: Some(_),
             ..
         } if kind == AskKind::Blocked.as_str() => ObserverAccess::Allowed,
         _ => ObserverAccess::Denied,
     }
+}
+
+/// The task, run or goal a finding command names, if any.
+fn finding_target(
+    task: Option<i64>,
+    run: Option<String>,
+    goal: Option<i64>,
+) -> Result<Option<FindingTarget>> {
+    Ok(match (task, run, goal) {
+        (Some(task), _, _) => Some(FindingTarget::Task(TaskId::new(task))),
+        (_, Some(run), _) => Some(FindingTarget::Run(RunId::new(run)?)),
+        (_, _, Some(goal)) => Some(FindingTarget::Goal(GoalId::new(goal))),
+        _ => None,
+    })
 }
 
 fn execute(cli: Cli) -> Result<Value> {
@@ -971,11 +1083,6 @@ fn execute(cli: Cli) -> Result<Value> {
     .with_generators(generators.clone());
     if let Some(common_dir) = &common_dir {
         queue.assert_repository(common_dir)?;
-    }
-    if let ObserverAccess::DraftGoal(goal_id) = access
-        && !queue.show_goal(GoalId::new(goal_id))?.goal.is_draft()
-    {
-        bail!(OBSERVER_DENIED);
     }
     Ok(match cli.command {
         Command::Init | Command::Locate | Command::Rebind { .. } | Command::Migrate { .. } => {
@@ -1263,6 +1370,70 @@ fn execute(cli: Cli) -> Result<Value> {
             since: since.map(EventId::new),
             limit: usize::try_from(limit)?,
         })?)?,
+        Command::Finding {
+            command:
+                FindingCommand::Record {
+                    kind,
+                    task,
+                    run,
+                    goal,
+                    queue: _,
+                    subject,
+                    summary,
+                    detail,
+                    impact,
+                    evidence,
+                    propose,
+                },
+        } => serde_json::to_value(queue.record_finding(NewFinding {
+            kind,
+            target: finding_target(task, run, goal)?.unwrap_or(FindingTarget::Queue),
+            subject,
+            summary,
+            detail,
+            impact: impact.map(|impact| impact.parse()).transpose()?,
+            evidence: evidence.into_iter().map(EventId::new).collect(),
+            propose,
+            by: role.unwrap_or_else(|| "human".into()),
+        })?)?,
+        Command::Finding {
+            command: FindingCommand::Resolve { id, reason },
+        } => serde_json::to_value(queue.set_finding_status(
+            FindingId::new(id),
+            FindingStatus::Resolved,
+            &reason,
+            role.as_deref().unwrap_or("human"),
+        )?)?,
+        Command::Finding {
+            command: FindingCommand::Dismiss { id, reason },
+        } => serde_json::to_value(queue.set_finding_status(
+            FindingId::new(id),
+            FindingStatus::Dismissed,
+            &reason,
+            role.as_deref().unwrap_or("human"),
+        )?)?,
+        Command::Findings {
+            id,
+            all,
+            status,
+            kinds,
+            task,
+            run,
+            goal,
+            queue: on_queue,
+            full,
+        } => json!({"findings": queue.findings(&FindingQuery {
+            id: id.map(FindingId::new),
+            all,
+            statuses: status
+                .iter()
+                .map(|value| value.parse())
+                .collect::<Result<_, _>>()?,
+            kinds,
+            target: finding_target(task, run, goal)?
+                .or(on_queue.then_some(FindingTarget::Queue)),
+            full,
+        })?}),
         Command::Search {
             query,
             status,
@@ -1321,6 +1492,7 @@ fn execute(cli: Cli) -> Result<Value> {
             because,
             task_id,
             run,
+            finding,
             cmux,
         } => {
             use dagq::infrastructure::adapters::{Cmux, executable};
@@ -1337,6 +1509,7 @@ fn execute(cli: Cli) -> Result<Value> {
                     // The session's role; a person at a plain terminal has none.
                     asked_by: role.unwrap_or_else(|| "human".into()),
                     reason_category: because.unwrap_or_default().parse::<AskReason>()?,
+                    finding_id: finding.map(FindingId::new),
                 },
                 &Cmux {
                     executable: executable(&cmux).unwrap_or(cmux),

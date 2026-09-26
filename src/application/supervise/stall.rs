@@ -498,6 +498,7 @@ impl StallWatch {
                 options: STALLED_OPTIONS.iter().map(|o| (*o).to_owned()).collect(),
                 asked_by: SessionRole::Supervisor.as_str().into(),
                 reason_category: AskReason::RecoveryFailed,
+                finding_id: None,
             },
             sv.cmux,
         )?;

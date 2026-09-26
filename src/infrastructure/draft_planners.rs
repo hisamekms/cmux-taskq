@@ -578,6 +578,7 @@ mod tests {
                 options: Vec::new(),
                 asked_by: "planner".into(),
                 reason_category: crate::domain::AskReason::Scope,
+                finding_id: None,
             })
             .unwrap()
             .ask

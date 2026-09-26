@@ -2341,6 +2341,7 @@ fn a_failed_answer_delivery_is_left_to_the_inbox() {
             options: vec![],
             asked_by: "worker".into(),
             reason_category: dagq::domain::AskReason::Scope,
+            finding_id: None,
         })
         .unwrap()
         .ask;
@@ -8401,6 +8402,7 @@ fn adopted_run_does_not_ask_about_its_exit_twice() {
             options: Vec::new(),
             asked_by: "supervisor".into(),
             reason_category: dagq::domain::AskReason::RecoveryFailed,
+            finding_id: None,
         })
         .unwrap()
         .ask;
@@ -8759,6 +8761,7 @@ fn only_a_new_ask_notifies_and_it_goes_to_the_inbox() {
         options: vec!["land".into()],
         asked_by: "worker".into(),
         reason_category: dagq::domain::AskReason::Scope,
+        finding_id: None,
     };
     // Without an inbox the notification names no workspace; the bound
     // repository's main checkout names the queue.
@@ -8797,6 +8800,7 @@ fn only_a_new_ask_notifies_and_it_goes_to_the_inbox() {
             options: Vec::new(),
             asked_by: "worker".into(),
             reason_category: dagq::domain::AskReason::RecoveryFailed,
+            finding_id: None,
         },
         &backend,
     )
@@ -8823,6 +8827,7 @@ fn only_a_new_ask_notifies_and_it_goes_to_the_inbox() {
             options: Vec::new(),
             asked_by: "observer".into(),
             reason_category: dagq::domain::AskReason::Scope,
+            finding_id: None,
         },
         &backend,
     )
@@ -8863,6 +8868,7 @@ fn asks_of_a_run_are_attention_for_the_inbox_until_closed() {
         options: vec!["land".into(), "send back".into()],
         asked_by: "worker".into(),
         reason_category: dagq::domain::AskReason::RecoveryFailed,
+        finding_id: None,
     };
 
     // An inbox watch started before the ask wakes on ask_opened alone.
@@ -9264,6 +9270,7 @@ fn status_reports_failed_runs_and_unanswered_exit_requests() {
             options: Vec::new(),
             asked_by: "supervisor".into(),
             reason_category: dagq::domain::AskReason::RecoveryFailed,
+            finding_id: None,
         })
         .unwrap();
     let woke = joined(watcher, "the watch thread to return");
@@ -10281,7 +10288,7 @@ fn queue_events(db: &Path, kind: &str) -> Vec<Value> {
 }
 
 #[test]
-fn observe_writes_a_note_a_blocked_ask_and_a_draft_goal_and_advances_the_cursor() {
+fn observe_records_findings_and_a_blocked_ask_and_advances_the_cursor() {
     use dagq::observer::{ObserveMode, observe, read_cursor};
     let (_dir, _repo, db) = fixture();
     // `dagq` is first on PATH and the queue is in DAGQ_QUEUE; the state
@@ -10291,14 +10298,17 @@ fn observe_writes_a_note_a_blocked_ask_and_a_draft_goal_and_advances_the_cursor(
 set -e
 printf '%s' "$DAGQ_ROLE" > role.txt
 q() { dagq --db "$DAGQ_QUEUE" "$@" > /dev/null; }
-q note --task 1 --kind stall --text 'task 1 waits for a slot'
-q ask --kind blocked --because recovery_failed --question 'slots idle while task 1 is ready' --option 'leave it' --cmux /usr/bin/true
-q ask --kind blocked --because recovery_failed --question 'the same alert again' --cmux /usr/bin/true
-q goal add --draft 'claim faster' --description 'evidence: the stall note'
+q finding record --kind stall --task 1 --summary 'task 1 waits for a slot' --evidence 1
+q finding record --kind stall --task 1 --summary 'task 1 waits for a slot' --evidence 1 --evidence 2
+q finding record --kind capacity --queue --subject idle_slots --summary 'slots idle'
+q ask --kind blocked --because recovery_failed --finding 2 --question 'slots idle while task 1 is ready' --option 'leave it' --cmux /usr/bin/true
+q ask --kind blocked --because recovery_failed --finding 2 --question 'the same alert again' --cmux /usr/bin/true
 if q ready 1 2> ready.err; then exit 3; fi
 if q ask --kind decide --because recovery_failed --task 1 --question 'decide?' 2> ask.err; then exit 4; fi
 if q goal ready 1 2> goal.err; then exit 5; fi
-echo 'wrote 1 note, 1 ask, 1 draft goal'
+if q note --task 1 --text 'seen' 2> note.err; then exit 6; fi
+if q goal add --draft 'claim faster' 2> draft.err; then exit 7; fi
+echo 'recorded 2 findings, updated 1, wrote 1 ask'
 "#
         .into(),
     };
@@ -10306,8 +10316,12 @@ echo 'wrote 1 note, 1 ask, 1 draft goal'
     let first = observe(&db, &provider, &observe_options(ObserveMode::Hourly)).unwrap();
     assert_eq!(first["outcome"], "succeeded", "{first}");
     assert_eq!(
-        (&first["notes"], &first["asks"], &first["goals"]),
-        (&json!(1), &json!(1), &json!(1))
+        (
+            &first["findings_recorded"],
+            &first["findings_updated"],
+            &first["asks"]
+        ),
+        (&json!(2), &json!(1), &json!(1))
     );
     assert_eq!(first["since"], Value::Null);
     let cursor = first["cursor"].as_i64().unwrap();
@@ -10326,7 +10340,7 @@ echo 'wrote 1 note, 1 ask, 1 draft goal'
         fs::read_to_string(dir.join("role.txt")).unwrap(),
         "observer"
     );
-    for denied in ["ready.err", "ask.err", "goal.err"] {
+    for denied in ["ready.err", "ask.err", "goal.err", "note.err", "draft.err"] {
         assert!(
             fs::read_to_string(dir.join(denied))
                 .unwrap()
@@ -10337,20 +10351,20 @@ echo 'wrote 1 note, 1 ask, 1 draft goal'
     assert!(
         fs::read_to_string(dir.join("output.log"))
             .unwrap()
-            .contains("wrote 1 note")
+            .contains("recorded 2 findings")
     );
     assert!(
         fs::read_to_string(dir.join("prompt.md"))
             .unwrap()
             .contains("\"stats\"")
     );
-    // Nothing changed state: the task is still ready and the goal a draft.
+    // Nothing changed state: the task is still ready and no goal was added.
     let mut queue = SqliteQueue::open(&db).unwrap();
     assert_eq!(
         queue.show(TaskId::new(1)).unwrap().task.status(),
         TaskStatus::Ready
     );
-    assert!(queue.show_goal(GoalId::new(1)).unwrap().goal.is_draft());
+    assert!(queue.show_goal(GoalId::new(1)).is_err());
     let asks = queue
         .asks(dagq::infrastructure::asks::AskQuery::default())
         .unwrap();
@@ -10358,6 +10372,14 @@ echo 'wrote 1 note, 1 ask, 1 draft goal'
     assert_eq!(asks[0].kind.as_str(), "blocked");
     assert_eq!(asks[0].task_id, None);
     assert_eq!(asks[0].asked_by, "observer");
+    assert_eq!(asks[0].finding_id, Some(dagq::domain::FindingId::new(2)));
+    let findings = queue
+        .findings(&dagq::domain::FindingQuery::default())
+        .unwrap();
+    assert_eq!(findings.len(), 2);
+    let stall = findings.iter().find(|f| f.finding.kind == "stall").unwrap();
+    assert_eq!(stall.finding.occurrences, 2);
+    assert_eq!(stall.finding.recorded_by, "observer");
     assert_eq!(queue_events(&db, "observe_started").len(), 1);
     assert_eq!(
         queue_events(&db, "observe_finished"),
@@ -10391,12 +10413,16 @@ echo 'wrote 1 note, 1 ask, 1 draft goal'
     let prompt = dry["prompt"].as_str().unwrap();
     assert!(prompt.contains("daily observation"), "{prompt}");
     assert!(prompt.contains("ask --kind blocked"), "{prompt}");
-    assert!(prompt.contains("goal add --draft"), "{prompt}");
+    assert!(prompt.contains("finding record --kind"), "{prompt}");
+    assert!(prompt.contains("--finding ID"), "{prompt}");
+    assert!(!prompt.contains("goal add --draft"), "{prompt}");
+    assert!(prompt.contains("\"findings\""), "{prompt}");
     assert!(
         prompt.contains("slots idle while task 1 is ready"),
         "{prompt}"
     );
     assert!(prompt.contains("task 1 waits for a slot"), "{prompt}");
+    assert!(prompt.contains("idle_slots"), "{prompt}");
     assert_eq!(queue_events(&db, "observe_started").len(), 2);
 
     // An agent that cannot start is an error outcome, not a failed observe.
@@ -10450,7 +10476,7 @@ fn observe_kills_an_agent_past_its_timeout() {
 }
 
 /// A Claude Code stand-in for the supervisor's observer: `--version` for
-/// the preflight, and in print mode (`-p`) a note through the queue CLI it
+/// the preflight, and in print mode (`-p`) a finding through the queue CLI it
 /// finds first on PATH.
 fn observer_claude_stub(db: &Path) -> PathBuf {
     let stub = db.parent().unwrap().join("claude-observer-stub");
@@ -10460,7 +10486,7 @@ fn observer_claude_stub(db: &Path) -> PathBuf {
 if [ "$1" = "-p" ]; then
   mode=hourly
   case "$*" in *"daily observation"*) mode=daily ;; esac
-  exec dagq --db "$DAGQ_QUEUE" note --goal 1 --kind "$mode" --text "observed by $DAGQ_ROLE"
+  exec dagq --db "$DAGQ_QUEUE" finding record --goal 1 --kind observed --subject "$mode" --summary "observed by $DAGQ_ROLE"
 fi
 printf 'test provider\n'
 "#,
@@ -10519,24 +10545,19 @@ fn supervisor_starts_the_observer_on_its_interval_without_a_run_slot() {
             .collect::<Vec<_>>(),
         [("daily", "succeeded"), ("hourly", "succeeded")]
     );
-    assert!(finished.iter().all(|f| f["notes"] == 1));
-    let notes = SqliteQueue::open(&db)
+    assert!(finished.iter().all(|f| f["findings_recorded"] == 1));
+    let mut findings = SqliteQueue::open(&db)
         .unwrap()
-        .notes(&dagq::domain::NoteQuery {
-            goal_id: Some(GoalId::new(1)),
-            task_id: None,
-            since: None,
-            limit: 10,
+        .findings(&dagq::domain::FindingQuery {
+            target: Some(dagq::domain::FindingTarget::Goal(GoalId::new(1))),
+            ..Default::default()
         })
-        .unwrap()
-        .notes;
+        .unwrap();
+    findings.sort_by_key(|f| f.finding.id);
     assert_eq!(
-        notes
+        findings
             .iter()
-            .map(|n| (
-                n.payload["kind"].as_str().unwrap(),
-                n.payload["text"].as_str().unwrap()
-            ))
+            .map(|f| (f.finding.subject.as_str(), f.finding.summary.as_str()))
             .collect::<Vec<_>>(),
         [
             ("daily", "observed by observer"),
@@ -12302,6 +12323,7 @@ fn triage_answers_resume_the_run_or_ready_the_task() {
                 options: vec!["retry".into(), "resume".into(), "cancel".into()],
                 asked_by: "supervisor".into(),
                 reason_category: dagq::domain::AskReason::RecoveryFailed,
+                finding_id: None,
             })
             .unwrap()
             .ask
@@ -13102,6 +13124,7 @@ fn status_and_doctor_measure_to_the_injected_clock() {
             options: vec![],
             asked_by: "planner".into(),
             reason_category: dagq::domain::AskReason::Scope,
+            finding_id: None,
         })
         .unwrap()
         .ask;
@@ -13216,6 +13239,7 @@ fn a_follow_up_draft_records_its_origin_and_its_planner_question_is_delivered_by
                 .collect(),
             asked_by: "planner".into(),
             reason_category: dagq::domain::AskReason::Scope,
+            finding_id: None,
         })
         .unwrap()
         .ask;
@@ -13602,6 +13626,7 @@ receipt "$(git rev-parse HEAD)"; idle; await_exit
             options: vec!["wait".into(), "intervene".into()],
             asked_by: "supervisor".into(),
             reason_category: dagq::domain::AskReason::RecoveryFailed,
+            finding_id: None,
         })
         .unwrap()
         .ask;

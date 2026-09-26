@@ -326,6 +326,7 @@ impl Supervisor<'_> {
                 options: TRIAGE_OPTIONS.iter().map(|o| (*o).to_owned()).collect(),
                 asked_by: TRIAGE_ASKER.to_owned(),
                 reason_category: AskReason::RecoveryFailed,
+                finding_id: None,
             },
             self.cmux,
         )?;

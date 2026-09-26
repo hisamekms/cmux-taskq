@@ -1,7 +1,8 @@
-//! The observer job (ADR-0024 decision 4): a headless agent run that reads
-//! `stats`, the latest notes, the open asks and the dependency graph, and
-//! may write only notes, `blocked` asks and draft goals. The CLI refuses
-//! everything else under `DAGQ_ROLE=observer`. The supervisor starts it on
+//! The observer job (ADR-0044 decision 4): a headless agent run that reads
+//! `stats`, the unsettled findings, the latest notes, the open asks and the
+//! dependency graph, and may write only findings (ADR-0044 decision 18) and
+//! `blocked` asks. The CLI refuses everything else under
+//! `DAGQ_ROLE=observer`, notes and goals included. The supervisor starts it on
 //! a timer (`--observe-interval`, `--observe-daily`); `observe` starts it
 //! by hand.
 use std::{
@@ -17,7 +18,7 @@ use serde_json::{Value, json};
 
 use crate::{
     application::{AgentProvider, TaskStore, dependency_graph},
-    domain::{EventId, NoteQuery, stats::StatsQuery},
+    domain::{EventId, FindingQuery, NoteQuery, stats::StatsQuery},
     infrastructure::{adapters::shell_join, asks::AskQuery, sqlite::SqliteQueue},
     lifecycle::{OBSERVER_ROLE, QUEUE_ENV, ROLE_ENV},
 };
@@ -111,9 +112,11 @@ pub fn observe(db: &Path, provider: &dyn AgentProvider, options: &ObserveOptions
         open: true,
         ..AskQuery::default()
     })?;
+    let findings = queue.findings(&FindingQuery::default())?;
     let graph = dependency_graph(queue.graph_input()?, None);
     let input = json!({
         "stats": stats,
+        "findings": findings,
         "notes": notes.notes,
         "open_asks": asks,
         "graph": {"candidates": graph.candidates, "critical": graph.critical},
@@ -139,7 +142,7 @@ pub fn observe(db: &Path, provider: &dyn AgentProvider, options: &ObserveOptions
         dir.join("input.json"),
         serde_json::to_string_pretty(&input)?,
     )?;
-    let (ask_mark, goal_mark) = queue.ask_and_goal_high_water()?;
+    let ask_mark = queue.ask_high_water()?;
     let event_mark = queue.record_queue_event(
         "observe_started",
         json!({"mode": options.mode.as_str(), "since": since, "dir": dir}),
@@ -158,7 +161,7 @@ pub fn observe(db: &Path, provider: &dyn AgentProvider, options: &ObserveOptions
         Ok(code) => ("failed", code, None),
         Err(error) => ("error", None, Some(format!("{error:#}"))),
     };
-    let (notes, asks, goals) = queue.written_by(OBSERVER_ROLE, event_mark, ask_mark, goal_mark)?;
+    let (recorded, updated, asks) = queue.written_by(OBSERVER_ROLE, event_mark, ask_mark)?;
     let saved = outcome == "succeeded" && options.mode == ObserveMode::Hourly;
     if saved {
         write_cursor(&db, cursor)?;
@@ -171,9 +174,9 @@ pub fn observe(db: &Path, provider: &dyn AgentProvider, options: &ObserveOptions
         "since": since,
         "cursor": cursor,
         "cursor_saved": saved,
-        "notes": notes,
+        "findings_recorded": recorded,
+        "findings_updated": updated,
         "asks": asks,
-        "goals": goals,
         "duration_secs": clock.elapsed().as_secs(),
         "dir": dir,
     });
@@ -183,9 +186,9 @@ pub fn observe(db: &Path, provider: &dyn AgentProvider, options: &ObserveOptions
         outcome,
         exit_code,
         error,
-        notes,
+        findings_recorded = recorded,
+        findings_updated = updated,
         asks,
-        goals,
         "observer ({}) finished: {outcome}",
         options.mode.as_str()
     );
@@ -271,7 +274,7 @@ pub fn observer_prompt(
         (ObserveMode::Daily, _) => {
             "This is the daily observation: the stats cover the runs that finished in the last 24 hours. \
              Look for trends rather than single incidents: failures, resumes or waits that recur across tasks and goals, \
-             alerts that keep coming back in the notes, and whether earlier notes' problems went away."
+             findings that keep coming back, and whether the problems of earlier findings went away."
                 .to_owned()
         }
         (ObserveMode::Hourly, Some(since)) => format!(
@@ -282,26 +285,28 @@ pub fn observer_prompt(
         }
     };
     Ok(format!(
-        "You are the observer of the dagq queue (ADR-0024 decision 4), started headless by the supervisor.\n\
+        "You are the observer of the dagq queue (ADR-0044 decision 4), started headless by the supervisor.\n\
          Your job is to observe whether dagq is running well, not to fix it.\n\
          {window}\n\
          \n\
          Do:\n\
-         - Record what is not going well as a note on the task, run or goal it concerns: `{dagq} note --task ID|--run ID|--goal ID --kind <slug> --text '...'` (a lowercase slug such as stall, failure, wait, capacity).\n\
-         - Raise each alert of the stats to the inbox as a blocked ask: `{dagq} ask --kind blocked --because <scope|discard|recovery_failed> --question '...' --option '...' [--task ID | --run ID]` (`--because` is why a person is needed: the scope or a decision changes, work may be thrown away, or what should have fixed it did not; an alert that needs none of them is a note, not an ask), with your reading of it and the next moves a person can choose as options (leave it, act from the inbox or planner, register a goal). \
-           An alert with no task (idle_slots, backend_failures) is an ask without --task and --run; put every such alert in its question. \
-           Raise the same alert only once: do not ask when an open ask below already covers it or a note shows you raised it before.\n\
-         - For a problem that recurs, register an improvement as a draft goal: `{dagq} goal add --draft 'title' --description '...' --acceptance '...'`, and cite the ids of the observations (note event ids) that are its evidence in the description. \
-           You may add draft tasks to that draft goal with `{dagq} add --goal ID ...`. A person adopts or rejects it in the planner.\n\
-         - Read more when needed: `{dagq} stats`, `{dagq} notes`, `{dagq} show ID`, `{dagq} events --all`, `{dagq} asks`, `{dagq} graph`, `{dagq} goal show ID`.\n\
+         - Record each problem you see as a finding: `{dagq} finding record --kind <slug> --task ID|--run ID|--goal ID|--queue [--subject '...'] --summary '...' [--detail '...'] [--impact high|normal|low] --evidence EVENT_ID ...` \
+           (a lowercase kind such as stall, failure, wait, capacity, threshold, conflict_hotspot; the subject tells problems of one target apart, such as an alert's name, a threshold's name or a file's path; \
+           the evidence is the ids of the run events that show it, never written into the text). \
+           Recording the same kind, target and subject again updates the existing finding: only new evidence adds an occurrence, so record a finding below again only when there are events it does not hold yet or your reading of it changed.\n\
+         - When a finding recurs or weighs enough that a planned change should remedy it (a refactoring of a file that keeps conflicting, a threshold to revisit), add `--propose '<why>'` to its record. A planner the runtime opens makes the proposal; you do not write goals or tasks.\n\
+         - When the problem no longer occurs, resolve its finding with the evidence in the reason: `{dagq} finding resolve ID --reason '...'`.\n\
+         - Raise what needs a person now (an alert past its threshold that waiting does not clear) to the inbox as a blocked ask on its finding: `{dagq} ask --kind blocked --because <scope|discard|recovery_failed> --finding ID --question '...' --option '...' [--task ID | --run ID]`, with your reading of it and the next moves a person can choose as options. \
+           One ask per finding stays open: do not ask again when an open ask below already covers it.\n\
+         - Read more when needed: `{dagq} findings [ID] [--full]`, `{dagq} stats`, `{dagq} notes`, `{dagq} show ID`, `{dagq} events --all`, `{dagq} asks`, `{dagq} graph`, `{dagq} goal show ID`.\n\
          \n\
          Do not:\n\
-         - Resolve individual stalls, answer asks, or change the state of runs, tasks or goals (ready, cancel, integrate, recover, goal ready/close); the queue refuses those from your environment.\n\
+         - Write notes, goals or tasks, resolve individual stalls, answer asks, dismiss findings, or change the state of runs, tasks or goals (ready, cancel, integrate, recover, goal ready/close); the queue refuses those from your environment.\n\
          - Edit files or run anything but the queue commands above.\n\
          \n\
-         When you are done, print one line saying how many notes, asks and draft goals you wrote.\n\
+         When you are done, print one line saying how many findings you recorded or updated and how many asks you wrote.\n\
          \n\
-         Inputs (JSON: stats, the latest {PROMPT_NOTES} notes, the open asks, and the graph's candidates and critical chain):\n\
+         Inputs (JSON: stats, the open and proposed findings, the latest {PROMPT_NOTES} notes, the open asks, and the graph's candidates and critical chain):\n\
          ```json\n{}\n```\n",
         serde_json::to_string_pretty(input)?
     ))

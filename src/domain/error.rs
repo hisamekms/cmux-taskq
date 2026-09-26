@@ -1,8 +1,8 @@
 use std::fmt;
 
 use super::{
-    AskKind, AskReason, CheckStatus, GoalId, GoalVerdict, ProposalId, ProposalStatus,
-    ReceiptResult, RunId, RunStatus, TaskAction, TaskId, TaskStatus,
+    AskKind, AskReason, CheckStatus, FindingId, FindingStatus, GoalId, GoalVerdict, ProposalId,
+    ProposalStatus, ReceiptResult, RunId, RunStatus, TaskAction, TaskId, TaskStatus,
 };
 
 /// A business rejection by the domain: an invalid value, a transition the
@@ -158,6 +158,20 @@ pub enum DomainError {
     /// A note kind that is not a lowercase slug.
     InvalidNoteKind {
         kind: String,
+    },
+    /// A finding's kind is not a lowercase slug.
+    InvalidFindingKind {
+        kind: String,
+    },
+    /// A finding status change its status does not allow.
+    FindingNotInStatus {
+        finding_id: FindingId,
+        status: FindingStatus,
+        to: FindingStatus,
+    },
+    /// Only a `blocked` ask may name a finding (ADR-0044 decision 23).
+    AskFindingNotBlocked {
+        kind: AskKind,
     },
     /// An ask of `kind` names neither a task nor a run; only `blocked` may.
     AskWithoutTarget {
@@ -376,6 +390,25 @@ impl fmt::Display for DomainError {
             Self::InvalidNoteKind { kind } => write!(
                 f,
                 "note kind {kind:?} must be a slug of lowercase letters, digits, '-' and '_'"
+            ),
+            Self::InvalidFindingKind { kind } => write!(
+                f,
+                "finding kind {kind:?} must be a slug of lowercase letters, digits, '-' and '_'"
+            ),
+            Self::FindingNotInStatus {
+                finding_id,
+                status,
+                to,
+            } => write!(
+                f,
+                "finding {finding_id} is {}; it cannot become {}",
+                status.as_str(),
+                to.as_str()
+            ),
+            Self::AskFindingNotBlocked { kind } => write!(
+                f,
+                "only a blocked ask may name a finding, not {}",
+                kind.as_str()
             ),
         }
     }

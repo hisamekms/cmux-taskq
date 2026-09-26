@@ -730,7 +730,8 @@ fn opening_or_initializing_an_older_queue_never_migrates_it() {
             (26, true),
             (27, false),
             (28, false),
-            (29, false)
+            (29, false),
+            (30, false)
         ]
     );
     let raw = Connection::open(&path).unwrap();
@@ -744,7 +745,7 @@ fn opening_or_initializing_an_older_queue_never_migrates_it() {
     std::fs::write(dir.path().join("backups/queue-23-5.sqlite3"), "earlier").unwrap();
     let report = SqliteQueue::migrate(&path, Some(&|_| false), 5).unwrap();
     assert_eq!(report.floor, floor_for(SqliteQueue::SCHEMA_VERSION));
-    assert_eq!(report.applied.len(), 6);
+    assert_eq!(report.applied.len(), 7);
     let backup = report.backup.unwrap();
     assert!(
         backup.ends_with("backups/queue-23-5-1.sqlite3"),
@@ -1348,9 +1349,10 @@ fn migration_from_v6_adds_goals_and_keeps_tasks_runs_and_events() {
     // 0023 (planner sessions), 0024 (the schema floor), 0025 (the stalled
     // ask), 0026 (the search index), 0027 (plan review) and 0028 (draft
     // planners: draft origins, the planner_question ask, no task leases)
-    // and 0029 (ask reasons, the queue_hold ask) are applied together.
-    assert_eq!(SqliteQueue::SCHEMA_VERSION, 29);
-    assert_eq!(queue.schema_version().unwrap(), 29);
+    // and 0029 (ask reasons, the queue_hold ask) and 0030 (findings) are
+    // applied together.
+    assert_eq!(SqliteQueue::SCHEMA_VERSION, 30);
+    assert_eq!(queue.schema_version().unwrap(), 30);
     assert_eq!(
         queue
             .session_workspace(dagq::domain::SessionRole::Inbox)
@@ -3201,13 +3203,19 @@ fn migration_indexes_the_existing_rows_and_landings_record_their_message() {
             .iter()
             .map(|m| (m.version, m.compatible))
             .collect::<Vec<_>>(),
-        [(26, true), (27, false), (28, false), (29, false)]
+        [
+            (26, true),
+            (27, false),
+            (28, false),
+            (29, false),
+            (30, false)
+        ]
     );
-    // 0027 (plan review), 0028 (draft planners) and 0029 (ask reasons) are
-    // applied with it and are breaking: a copy is taken and the floor rises
+    // 0027 (plan review), 0028 (draft planners), 0029 (ask reasons) and 0030
+    // (findings) are applied with it and are breaking: a copy is taken and the floor rises
     // to the last.
     assert!(report.backup.is_some());
-    assert_eq!(report.floor, 29);
+    assert_eq!(report.floor, 30);
     let mut queue = SqliteQueue::open(&path).unwrap();
     assert_eq!(
         search(&queue, "古い", |_| {}),
@@ -3432,6 +3440,7 @@ fn a_login_that_stops_several_runs_is_one_ask_that_lists_them() {
             options: Vec::new(),
             asked_by: "worker".into(),
             reason_category: AskReason::Authentication,
+            finding_id: None,
         })
         .unwrap_err();
     assert!(
@@ -3439,5 +3448,92 @@ fn a_login_that_stops_several_runs_is_one_ask_that_lists_them() {
             .to_string()
             .contains("queue_hold asks the runtime opens"),
         "{error}"
+    );
+}
+
+/// A finding on a run keeps the run's task and records its events there; a
+/// finding on a goal records them on the goal; a missing target is refused
+/// (ADR-0044 decision 18).
+#[test]
+fn findings_on_a_run_or_a_goal_ride_on_their_target() {
+    use dagq::domain::{FindingQuery, FindingStatus, FindingTarget, NewFinding};
+    let (_dir, mut queue) = fixture();
+    let goal = queue.add_goal(new_goal("observed")).unwrap();
+    let task = queue.add(new_task("slow")).unwrap();
+    queue
+        .transition(task.id(), TaskAction::BypassReview)
+        .unwrap();
+    let ClaimOutcome::Claimed { run } = queue.claim(&base()).unwrap() else {
+        panic!()
+    };
+    let finding = |target: FindingTarget| NewFinding {
+        kind: "wait".into(),
+        target,
+        subject: String::new(),
+        summary: "waits".into(),
+        detail: Some("long".into()),
+        impact: None,
+        evidence: Vec::new(),
+        propose: None,
+        by: "observer".into(),
+    };
+    let on_run = queue
+        .record_finding(finding(FindingTarget::Run(run.id().clone())))
+        .unwrap();
+    assert!(on_run.created);
+    assert_eq!(
+        (
+            on_run.finding.task_id,
+            on_run.finding.run_id.clone(),
+            on_run.finding.goal_id
+        ),
+        (Some(task.id()), Some(run.id().clone()), None)
+    );
+    assert_eq!(on_run.finding.detail, "long");
+    let on_goal = queue
+        .record_finding(finding(FindingTarget::Goal(goal.id())))
+        .unwrap();
+    assert_eq!(on_goal.finding.goal_id, Some(goal.id()));
+    let task_events = serde_json::to_value(queue.show(task.id()).unwrap()).unwrap();
+    assert!(
+        task_events.to_string().contains("finding_recorded"),
+        "{task_events}"
+    );
+    for missing in [
+        FindingTarget::Run(RunId::new("missing").unwrap()),
+        FindingTarget::Goal(GoalId::new(99)),
+        FindingTarget::Task(TaskId::new(99)),
+    ] {
+        assert!(queue.record_finding(finding(missing)).is_err());
+    }
+    let listed = queue
+        .findings(&FindingQuery {
+            target: Some(FindingTarget::Run(run.id().clone())),
+            ..FindingQuery::default()
+        })
+        .unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].finding.id, on_run.finding.id);
+    let dismissed = queue
+        .set_finding_status(
+            on_goal.finding.id,
+            FindingStatus::Dismissed,
+            "known",
+            "planner",
+        )
+        .unwrap();
+    assert_eq!(dismissed.status, FindingStatus::Dismissed);
+    assert!(
+        queue
+            .set_finding_status(on_goal.finding.id, FindingStatus::Resolved, " ", "planner")
+            .is_err()
+    );
+    assert!(
+        queue
+            .findings(&FindingQuery {
+                id: Some(dagq::domain::FindingId::new(99)),
+                ..FindingQuery::default()
+            })
+            .is_err()
     );
 }

@@ -477,11 +477,15 @@ pub(super) fn insert_ask(tx: &Connection, ask: &NewAsk) -> Result<AskOutcome> {
         // `validate` admits this for a blocked ask only.
         (None, None) => None,
     };
+    if let Some(finding_id) = ask.finding_id {
+        super::findings::read_finding(tx, finding_id)?;
+    }
     if let Some(existing) = tx
             .query_row(
                 "SELECT * FROM asks WHERE ifnull(task_id,0)=ifnull(?1,0) AND ifnull(run_id,'')=ifnull(?2,'')
-                 AND kind=?3 AND answered_at IS NULL AND closed_at IS NULL",
-                params![task_id, ask.run_id, ask.kind.as_str()],
+                 AND kind=?3 AND ifnull(finding_id,0)=ifnull(?4,0)
+                 AND answered_at IS NULL AND closed_at IS NULL",
+                params![task_id, ask.run_id, ask.kind.as_str(), ask.finding_id],
                 ask_row,
             )
             .optional()?
@@ -492,8 +496,8 @@ pub(super) fn insert_ask(tx: &Connection, ask: &NewAsk) -> Result<AskOutcome> {
             });
         }
     tx.execute(
-        "INSERT INTO asks(kind,task_id,run_id,question,options,asked_by,reason_category)
-             VALUES (?1,?2,?3,?4,?5,?6,?7)",
+        "INSERT INTO asks(kind,task_id,run_id,question,options,asked_by,reason_category,finding_id)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
         params![
             ask.kind.as_str(),
             task_id,
@@ -501,7 +505,8 @@ pub(super) fn insert_ask(tx: &Connection, ask: &NewAsk) -> Result<AskOutcome> {
             ask.question,
             serde_json::to_string(&ask.options)?,
             ask.asked_by,
-            ask.reason_category.as_str()
+            ask.reason_category.as_str(),
+            ask.finding_id
         ],
     )?;
     let id = AskId::new(tx.last_insert_rowid());
@@ -562,5 +567,6 @@ pub(super) fn ask_row(row: &Row<'_>) -> rusqlite::Result<Ask> {
         created_at: row.get("created_at")?,
         answered_at: row.get("answered_at")?,
         closed_at: row.get("closed_at")?,
+        finding_id: row.get("finding_id")?,
     })
 }

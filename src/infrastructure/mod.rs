@@ -3,6 +3,7 @@ pub mod asks;
 pub mod claude;
 pub mod clock;
 pub mod draft_planners;
+mod findings;
 pub mod launchd;
 pub mod location;
 mod plan_reviews;

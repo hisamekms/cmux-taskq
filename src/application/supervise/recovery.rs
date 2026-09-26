@@ -667,6 +667,7 @@ impl SessionWatch {
                 options,
                 asked_by: SessionRole::Supervisor.as_str().into(),
                 reason_category: category,
+                finding_id: None,
             },
             sv.cmux,
         )?;
