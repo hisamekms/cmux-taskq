@@ -71,6 +71,7 @@ ADRは、将来の実装や運用に大きな影響を与える決定の理由�
 | [ADR-0046](0046-full-text-search-related-and-duplicate-of.md) | taskの全文検索（search）と決まった規則の関連（related）と重複の記録（cancel --duplicate-of）を持ち、plannerとplan reviewはその候補だけをLLMで判断する | 2026-09-25 |
 | [ADR-0047](0047-irregularities-in-three-layers-recovery-job-ask-reasons-and-goal-review.md) | イレギュラーをruntimeの自動修正・復旧job・inboxの3層で扱い、askに人が要る理由の分類を必須にし、自動修正を数え、goalの達成をgoal review jobが判断する（ADR-0019・ADR-0043・ADR-0044を統合） | 2026-09-26 |
 | [ADR-0049](0049-share-compile-cache-across-runs-and-break-down-wait-to-land.md) | 検証をintegrateの1回にし、reviewをsupervisorの工程にし、dagq.tomlでrunのenvを渡してsccacheでcompileの結果をrun間で共有し、taskの5段階の優先度と解放数でclaim順を決め、statsで詰まりを数える（ADR-0040を統合） | 2026-09-26 |
+| [ADR-0062](0062-runs-waiting-for-a-person-leave-the-slot.md) | 人の答えを待つrunをslotから外し、leaseを持ったまま軽く見張り、待ちの数に上限を付け、待ちが終わったrunを新しいclaimより先にslotへ戻す | 2026-09-26 |
 
 ## 置き換え・廃止されたADR
 
