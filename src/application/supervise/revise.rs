@@ -83,7 +83,7 @@ impl ReviseWatch {
         sent_at: SystemTime,
         start: Option<StartCheck>,
     ) -> Result<Self> {
-        let live = Box::new(SessionWatch::revising(run, &session, sent_at)?);
+        let live = Box::new(SessionWatch::fixing(run, &session.workspace, sent_at)?);
         Ok(ReviseWatch {
             session,
             attempt,

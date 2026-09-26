@@ -1,4 +1,5 @@
-//! Runs that wait for a person outside the slots (ADR-0062): a run whose
+//! Runs that wait for a person outside the slots (ADR-0071, which took
+//! ADR-0062 over): a run whose
 //! live session waits only for the answer of one of its asks leaves its
 //! slot, keeps its lease and is watched without anything sent to its
 //! session, within `--max-waiting`; once the wait ends it goes back to a
@@ -52,8 +53,10 @@ impl Slot {
     }
 
     /// The phase a run may wait in (decision 1): the first session before
-    /// any `/exit`, with a heartbeating wrapper and no recovery job running,
-    /// or the `/exit` after a verdict, with a session.
+    /// any `/exit`, with a heartbeating wrapper and no recovery job running;
+    /// the `/exit` after a verdict, with a session; a revise with a
+    /// heartbeating wrapper and no recovery job running; or a resume
+    /// before its `/exit`, likewise.
     fn wait_phase(&self) -> Option<WaitPhase> {
         match &self.phase {
             Phase::Session(watch)
@@ -64,6 +67,17 @@ impl Slot {
             Phase::Exiting(watch) if watch.session.is_some() && !watch.recovery.running() => {
                 Some(WaitPhase::Exit)
             }
+            Phase::Revise(watch) if !watch.live.silent && !watch.live.recovery.running() => {
+                Some(WaitPhase::Revise)
+            }
+            Phase::Resume(watch)
+                if watch.exit_requested.is_none()
+                    && !watch.silent
+                    && !watch.recovery.running()
+                    && !watch.live.recovery.running() =>
+            {
+                Some(WaitPhase::Resume)
+            }
             _ => None,
         }
     }
@@ -73,7 +87,33 @@ impl Slot {
         match &self.phase {
             Phase::Session(watch) => Some(watch.workspace.clone()),
             Phase::Exiting(watch) => watch.session.as_ref().map(|s| s.workspace.clone()),
+            Phase::Revise(watch) => Some(watch.session.workspace.clone()),
+            Phase::Resume(watch) => Some(watch.workspace.clone()),
             _ => None,
+        }
+    }
+
+    /// The watch of the live session's answers and dialogs, in the phases
+    /// that have one.
+    fn live_mut(&mut self) -> Option<&mut SessionWatch> {
+        match &mut self.phase {
+            Phase::Session(watch) => Some(watch),
+            Phase::Revise(watch) => Some(&mut watch.live),
+            Phase::Resume(watch) => Some(&mut watch.live),
+            _ => None,
+        }
+    }
+}
+
+impl Phase {
+    /// Start the clocks of a revise or a resume again once its run is back
+    /// in a slot (ADR-0071 decision 15): the wait stopped them, and the
+    /// time left before it is not carried over.
+    fn restart_stage_clocks(&mut self, files: &dyn RunFiles) {
+        match self {
+            Phase::Revise(watch) => watch.sent = Instant::now(),
+            Phase::Resume(watch) => watch.restart_clocks(files),
+            _ => {}
         }
     }
 }
@@ -257,6 +297,8 @@ impl Supervisor<'_> {
         let silent = match &mut slot.phase {
             Phase::Session(watch) => &mut watch.silent,
             Phase::Exiting(watch) => &mut watch.silent,
+            Phase::Revise(watch) => &mut watch.live.silent,
+            Phase::Resume(watch) => &mut watch.silent,
             _ => return Ok(Step::Continue),
         };
         let pulse = wrapper_pulse(
@@ -270,8 +312,9 @@ impl Supervisor<'_> {
         match pulse {
             // The next look sees its exit.
             WrapperPulse::Exited => return Ok(Step::Continue),
-            // The session is sent /exit from its slot.
-            WrapperPulse::Silent if phase == WaitPhase::Session => {
+            // The session is sent /exit from its slot, or its revise ends
+            // there.
+            WrapperPulse::Silent if phase != WaitPhase::Exit => {
                 self.end_wait(slot, WaitCause::WrapperSilent, None)?;
                 return Ok(Step::Continue);
             }
@@ -321,7 +364,15 @@ impl Supervisor<'_> {
                 .stall
                 .poll_quiet(self, &run, &workspace, &idle_marker, dialog)?;
         }
-        // A person who answered the dialog or typed into the session.
+        // A revise or a resume that waits for the answer of its own question
+        // goes on only once it is answered: back in its slot without it, the
+        // run would hold the slot until then, its stage waiting for the
+        // answer (ADR-0071 decisions 2 and 16).
+        if phase.fixes() && held_kind(AskKind::WorkerQuestion).is_some() {
+            return Ok(Step::Continue);
+        }
+        // A person who answered the dialog or typed into the session (a
+        // receipt rewritten during the wait is one of its markers).
         let moves = held_kind(AskKind::AnswerPrompt).or(held_kind(AskKind::Stalled));
         let since = slot.waiting.as_ref().map_or(UNIX_EPOCH, |w| w.since);
         if let Some(ask) = moves
@@ -330,7 +381,7 @@ impl Supervisor<'_> {
             self.end_wait(slot, WaitCause::SessionMoved, Some(ask))?;
             return Ok(Step::Continue);
         }
-        if phase == WaitPhase::Session
+        if phase != WaitPhase::Exit
             && let Some(ask) = held_kind(AskKind::AnswerPrompt)
             && let Some(cause) = self.dialog_ended(slot, &run, &workspace)?
         {
@@ -382,7 +433,9 @@ impl Supervisor<'_> {
     /// Read the screen of a session that waits at a dialog, as often as
     /// [`SessionWatch::watch_prompt`] does: a login that ran out holds the
     /// queue (`queue_hold`), and a screen without the dialog clears it
-    /// (`dialog_cleared`). No key is sent.
+    /// (`dialog_cleared`). A resumed session whose input box was not ready
+    /// for its request waits until it is (its `ResumeWatch` closes the ask
+    /// before it sends the request). No key is sent.
     fn dialog_ended(
         &mut self,
         slot: &mut Slot,
@@ -404,18 +457,25 @@ impl Supervisor<'_> {
                 return Ok(None);
             }
         };
-        let Phase::Session(watch) = &mut slot.phase else {
+        let unsent = matches!(&slot.phase, Phase::Resume(watch) if watch.message_sent.is_none());
+        let Some(watch) = slot.live_mut() else {
             return Ok(None);
         };
         if self.signals.auth_required(&screen) && raise_auth(self, run, workspace, &screen)? {
             watch.clear_prompt(self, run)?;
             return Ok(Some(WaitCause::QueueHold));
         }
-        if self.signals.detect_prompt(&screen).is_none() {
-            watch.clear_prompt(self, run)?;
-            return Ok(Some(WaitCause::DialogCleared));
+        if self.signals.detect_prompt(&screen).is_some() {
+            return Ok(None);
         }
-        Ok(None)
+        if unsent {
+            return Ok(self
+                .signals
+                .input_ready(&screen)
+                .then_some(WaitCause::DialogCleared));
+        }
+        watch.clear_prompt(self, run)?;
+        Ok(Some(WaitCause::DialogCleared))
     }
 
     /// End the slot's wait: record `run_waiting_ended` and, when a person
@@ -456,7 +516,10 @@ impl Supervisor<'_> {
     /// `run_slot_regained`; `used` is the slots in use with it.
     fn regain_slot(&mut self, slot: &mut Slot, used: usize) -> Result<()> {
         match slot.waiting.take() {
-            Some(waiting) => self.record_regained(slot.run.id(), &waiting, used),
+            Some(waiting) => {
+                slot.phase.restart_stage_clocks(&*self.files);
+                self.record_regained(slot.run.id(), &waiting, used)
+            }
             None => Ok(()),
         }
     }
@@ -499,6 +562,7 @@ impl Supervisor<'_> {
             let Some(waiting) = self.slots[index].waiting.take() else {
                 continue;
             };
+            self.slots[index].phase.restart_stage_clocks(&*self.files);
             let run = self.slots[index].run.id().clone();
             let used = self.used_slots();
             if let Err(error) = self.record_regained(&run, &waiting, used) {

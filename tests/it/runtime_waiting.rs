@@ -552,15 +552,24 @@ fn an_adopted_run_keeps_waiting_outside_the_slot() {
 
 /// Point the run's wrapper row at `pid` with a heartbeat long expired, as
 /// if the wrapper stopped heartbeating: the real wrapper's heartbeats no
-/// longer match the row.
+/// longer match the row. A heartbeat already past its pid check still
+/// writes `heartbeat_at` (the check and the write are two statements), so
+/// the heartbeat is expired only once such a write has landed.
 fn stop_wrapper_heartbeat(db: &Path, run: &TaskRun, pid: u32) {
-    Connection::open(db)
-        .unwrap()
-        .execute(
-            "UPDATE run_processes SET pid=?2, heartbeat_at=0 WHERE run_id=?1 AND role='wrapper'",
-            rusqlite::params![run.id(), pid],
-        )
-        .unwrap();
+    let raw = Connection::open(db).unwrap();
+    raw.execute(
+        "UPDATE run_processes SET pid=?2 WHERE run_id=?1 AND role='wrapper'",
+        rusqlite::params![run.id(), pid],
+    )
+    .unwrap();
+    // How long a heartbeat in flight takes to write: fixed, whatever the
+    // test tick.
+    thread::sleep(Duration::from_millis(200));
+    raw.execute(
+        "UPDATE run_processes SET heartbeat_at=0 WHERE run_id=?1 AND role='wrapper'",
+        [run.id()],
+    )
+    .unwrap();
 }
 
 /// A wrapper that dies during a `stuck_exit` wait without recording its

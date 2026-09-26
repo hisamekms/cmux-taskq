@@ -291,7 +291,16 @@ impl Supervisor<'_> {
             } => {
                 let task = self.queue.show(run.task_id())?.task;
                 let now = Instant::now();
+                // Answers and dialogs are followed from the request on; an
+                // answer typed since closed its ask, which moves the last
+                // input on (ADR-0071 decision 17).
+                let live = Box::new(SessionWatch::fixing(
+                    run,
+                    &workspace,
+                    time(message_sent_at.unwrap_or(started_at)),
+                )?);
                 Phase::Resume(ResumeWatch {
+                    live,
                     workspace,
                     attempt,
                     run_dir: PathBuf::from(run.run_dir().context("missing run directory")?),

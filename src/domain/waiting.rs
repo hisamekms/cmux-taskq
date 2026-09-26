@@ -24,9 +24,10 @@ pub const RUN_WAITING_DEFERRED: &str = "run_waiting_deferred";
 /// The default of `--max-waiting` (decision 7).
 pub const DEFAULT_MAX_WAITING: usize = 4;
 
-/// The asks a run in `phase` waits for (decision 1's table): the first
-/// session's `worker_question`, `answer_prompt` and `stalled`, and the
-/// `stuck_exit` and `answer_prompt` of the `/exit` after a verdict.
+/// The asks a run in `phase` waits for (ADR-0071 decision 1's table): the
+/// first session's `worker_question`, `answer_prompt` and `stalled`, the
+/// `stuck_exit` and `answer_prompt` of the `/exit` after a verdict, and the
+/// `worker_question` and `answer_prompt` of a revise or a resume.
 pub fn waits_for(phase: WaitPhase, kind: &AskKind) -> bool {
     match phase {
         WaitPhase::Session => matches!(
@@ -34,16 +35,22 @@ pub fn waits_for(phase: WaitPhase, kind: &AskKind) -> bool {
             AskKind::WorkerQuestion | AskKind::AnswerPrompt | AskKind::Stalled
         ),
         WaitPhase::Exit => matches!(kind, AskKind::StuckExit | AskKind::AnswerPrompt),
+        WaitPhase::Revise | WaitPhase::Resume => {
+            matches!(kind, AskKind::WorkerQuestion | AskKind::AnswerPrompt)
+        }
     }
 }
 
-/// The phase a waiting run keeps: the worker's first session or the
-/// `/exit` after its verdict.
+/// The phase a waiting run keeps: the worker's first session, the `/exit`
+/// after its verdict, the live session fixing a `revise` verdict or a
+/// conflict, or the resumed session of a `needs_session` run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WaitPhase {
     Session,
     Exit,
+    Revise,
+    Resume,
 }
 
 impl WaitPhase {
@@ -51,7 +58,16 @@ impl WaitPhase {
         match self {
             Self::Session => "session",
             Self::Exit => "exit",
+            Self::Revise => "revise",
+            Self::Resume => "resume",
         }
+    }
+
+    /// Whether the phase keeps its stage going on its own after a
+    /// `worker_question` is answered: a revise or a resume, whose wait for
+    /// the answer no receipt or dialog ends (ADR-0071 decision 2).
+    pub const fn fixes(self) -> bool {
+        matches!(self, Self::Revise | Self::Resume)
     }
 }
 
@@ -459,6 +475,16 @@ mod tests {
         assert!(waits_for(WaitPhase::Exit, &AskKind::AnswerPrompt));
         assert!(!waits_for(WaitPhase::Exit, &AskKind::WorkerQuestion));
         assert_eq!(WaitPhase::Exit.as_str(), "exit");
+        for phase in [WaitPhase::Revise, WaitPhase::Resume] {
+            assert!(waits_for(phase, &AskKind::WorkerQuestion));
+            assert!(waits_for(phase, &AskKind::AnswerPrompt));
+            assert!(!waits_for(phase, &AskKind::Stalled));
+            assert!(!waits_for(phase, &AskKind::StuckExit));
+            assert!(phase.fixes());
+        }
+        assert!(!WaitPhase::Session.fixes() && !WaitPhase::Exit.fixes());
+        assert_eq!(WaitPhase::Revise.as_str(), "revise");
+        assert_eq!(WaitPhase::Resume.as_str(), "resume");
         for cause in [
             WaitCause::Answered,
             WaitCause::DialogCleared,

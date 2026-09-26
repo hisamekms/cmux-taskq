@@ -383,7 +383,7 @@ impl Supervisor<'_> {
             json!({"workspace_id": workspace, "resume_attempt": attempt}),
         )?;
         Ok(ResumeWatch {
-            workspace,
+            workspace: workspace.clone(),
             attempt,
             run_dir,
             receipt_path: PathBuf::from(run.receipt_path().context("missing receipt path")?),
@@ -404,6 +404,7 @@ impl Supervisor<'_> {
             exit_for_silence: false,
             stale: None,
             recovery: RecoveryWatch::default(),
+            live: Box::new(SessionWatch::fixing(run, &workspace, self.files.now())?),
         })
     }
     /// The resumed session ended, or resolved the run: record
@@ -654,6 +655,10 @@ pub(super) struct ResumeWatch {
     /// The recovery job of a session that holds the `/exit` back past the
     /// exit timeout (`stuck_exit`, ADR-0047 decision 39).
     pub(super) recovery: RecoveryWatch,
+    /// The answers of the session's `worker_question`s and the dialogs it
+    /// stops at once the request is sent, followed as a revise's are
+    /// (ADR-0071 decision 17); its `input_at` is the last input typed.
+    pub(super) live: Box<SessionWatch>,
 }
 
 /// What a resumed session left behind when it exited.
@@ -689,6 +694,60 @@ impl ResumeVerdict {
 }
 
 impl ResumeWatch {
+    /// Record `exit_requested` (before the `/exit` is typed: the session
+    /// may exit before the send returns) and type the `/exit` unless
+    /// `typed` is false (a dialog is up). The stage ends here: a dialog it
+    /// recorded is no attention any more, and its answers are no longer
+    /// typed (ADR-0071 decision 17).
+    fn request_exit(&mut self, sv: &mut Supervisor<'_>, run: &TaskRun, typed: bool) -> Result<()> {
+        sv.queue.record_runtime_event(
+            run.id(),
+            "exit_requested",
+            json!({
+                "workspace_id": self.workspace,
+                "timeout_secs": sv.cmux.exit_timeout().as_secs(),
+                "resume_attempt": self.attempt,
+            }),
+        )?;
+        self.end_live(sv, run)?;
+        if typed {
+            submit(sv, run, &self.workspace, Input::Exit, "/exit")?;
+            self.exit_typed = true;
+        }
+        self.exit_requested = Some(Instant::now());
+        Ok(())
+    }
+
+    /// The stage ends: the dialog recorded during it is cleared and its
+    /// recovery job stopped, as a revise's.
+    fn end_live(&mut self, sv: &mut Supervisor<'_>, run: &TaskRun) -> Result<()> {
+        self.live.clear_prompt(sv, run)?;
+        self.live.recovery.stop(sv, run);
+        Ok(())
+    }
+
+    /// Start the stage's clocks again (ADR-0071 decision 15): the resume
+    /// timeout of the request, or before it the wait for a ready input
+    /// box, and the timeout of a stale-receipt request not settled yet,
+    /// with the idle that answers it. Nothing is carried over.
+    pub(super) fn restart_clocks(&mut self, files: &dyn RunFiles) {
+        let now = Instant::now();
+        match &mut self.message_sent {
+            Some((sent, _)) => *sent = now,
+            None => {
+                if self.agent_seen.is_some() {
+                    self.agent_seen = Some(now);
+                }
+                self.ready_since = None;
+            }
+        }
+        if let Some(nudge) = &mut self.stale
+            && !nudge.settled
+        {
+            nudge.at = files.now();
+        }
+    }
+
     /// Record how the request to rewrite a stale receipt ended, once the
     /// attempt ends with the session alive: `rewritten` when the receipt
     /// changed after it.
@@ -760,12 +819,9 @@ impl ResumeWatch {
             // The Enter of a /exit typed over a dialog would pick its
             // option: then nothing is typed, and the exit timeout lets the
             // session go with a stuck_exit ask.
-            if sv.signals.detect_prompt(&screen).is_none() {
-                submit(sv, run, &self.workspace, Input::Exit, "/exit")?;
-                self.exit_typed = true;
-            }
+            let typed = sv.signals.detect_prompt(&screen).is_none();
+            self.request_exit(sv, run, typed)?;
             info!(run_id = %run.id(), "resumed session of {} did not get ready for the resolution request within the resume timeout; exit requested", run.id());
-            self.exit_requested = Some(Instant::now());
             return Ok(());
         }
         if !sv.signals.input_ready(&screen) {
@@ -818,6 +874,7 @@ impl ResumeWatch {
             "resolution request",
         )?;
         self.message_sent = Some((Instant::now(), sent_at));
+        self.live.input_at = Some(sent_at);
         self.start = Some(StartCheck::new(
             "resolution request",
             &message,
@@ -848,6 +905,8 @@ impl ResumeWatch {
         if wrapper.exited_at.is_some() {
             // Nobody needs to send anything to a session that exited.
             self.recovery.stop(sv, run);
+            self.live.recovery.stop(sv, run);
+            self.live.prompt_hash = None;
             close_answer_prompt_asks(sv, run, PROMPT_EXITED_CLOSED)?;
             if let Some(nudge) = &mut self.stale {
                 nudge.settle(sv, run, RESUME_PHASE, Some(self.attempt), "run_ended")?;
@@ -891,10 +950,8 @@ impl ResumeWatch {
         }
         if matches!(pulse, WrapperPulse::Silent) && self.exit_requested.is_none() {
             // Ask once, the way a person would; never kill the session.
-            submit(sv, run, &self.workspace, Input::Exit, "/exit")?;
-            self.exit_typed = true;
+            self.request_exit(sv, run, true)?;
             warn!(run_id = %run.id(), "resumed session of {} lost its wrapper heartbeat; exit requested", run.id());
-            self.exit_requested = Some(Instant::now());
             self.exit_for_silence = true;
         }
         if let Some(requested) = self.exit_requested {
@@ -976,15 +1033,50 @@ impl ResumeWatch {
             }
             return Ok(None);
         }
-        let Some((sent, sent_at)) = self.message_sent else {
+        let Some((_, sent_at)) = self.message_sent else {
             if processes.iter().any(|p| p.role == "agent") {
                 self.send_when_ready(sv, run)?;
             }
             return Ok(None);
         };
+        // An answer to a question the session asked during the resume is
+        // typed once it went idle at it: the session works again, and gets
+        // the resume timeout again (ADR-0071 decision 17, as a revise's).
+        if let Some(typed) = self.live.deliver_answers(sv, run)? {
+            self.live.input_at = Some(typed);
+            self.restart_clocks(&*sv.files);
+            self.start = self.live.answer_start.take();
+        }
+        if let Some(agent) = processes
+            .iter()
+            .find(|p| p.role == "agent" && p.exited_at.is_none())
+        {
+            self.live.watch_prompt(sv, run, agent)?;
+        }
         if let Some(start) = &mut self.start {
             start.poll(sv, run, &self.workspace, &self.idle_marker)?;
         }
+        // A session stopped at its own question waits for its answer,
+        // however long a person takes: it neither went idle without a
+        // resolving receipt nor ran out of time, and is not asked to
+        // rewrite a stale receipt (ADR-0071 decision 16).
+        if sv.queue.has_unclosed_worker_question(run.id())? {
+            return Ok(None);
+        }
+        // An answer delivered by hand (or by the supervisor this one took
+        // the run over from) is input too: its close, in a later second
+        // than the last input, moves the last input there.
+        let input_at = self.live.input_at.unwrap_or(sent_at);
+        if let Some(closed) = sv.queue.last_worker_question_closed(run.id())?
+            && closed > unix_seconds(input_at)
+        {
+            self.live.input_at = Some(UNIX_EPOCH + Duration::from_secs(closed.max(0) as u64));
+            self.restart_clocks(&*sv.files);
+        }
+        let input_at = self.live.input_at.unwrap_or(sent_at).max(sent_at);
+        let sent = self
+            .message_sent
+            .map_or_else(Instant::now, |(sent, _)| sent);
         // The idle marker is read before the receipt and the
         // worktree: a receipt rewritten after this read is judged
         // at the next poll, never as idle without it.
@@ -1008,6 +1100,7 @@ impl ResumeWatch {
         // validation and review (ADR-0027 decision 3).
         if matches!(verdict, ResumeOutcome::Resolved) && !self.approved && idle_after_receipt {
             self.settle_stale(sv, run)?;
+            self.end_live(sv, run)?;
             info!(run_id = %run.id(), "resumed session of {} rewrote its receipt and went idle (head {head}); validating with the session open", run.id());
             return Ok(Some(ResumeVerdict {
                 kind: ResumeOutcome::Resolved,
@@ -1017,8 +1110,9 @@ impl ResumeWatch {
             }));
         }
         // Once the session was asked to rewrite a stale receipt, only an
-        // idle after that request answers it.
-        let answered_from = self.stale.map_or(sent_at, |n| n.at.max(sent_at));
+        // idle after that request answers it; and only one after the last
+        // input typed (an answer) is this turn's.
+        let answered_from = self.stale.map_or(input_at, |n| n.at.max(input_at));
         let why = match verdict {
             ResumeOutcome::Unresolved
                 if idle
@@ -1058,10 +1152,8 @@ impl ResumeWatch {
         if let Some(why) = why {
             self.settle_stale(sv, run)?;
             // Ask once, the way a person would; never kill the session.
-            submit(sv, run, &self.workspace, Input::Exit, "/exit")?;
-            self.exit_typed = true;
+            self.request_exit(sv, run, true)?;
             info!(run_id = %run.id(), "resumed session of {} {why} (head {head}); exit requested", run.id());
-            self.exit_requested = Some(Instant::now());
         }
         Ok(None)
     }

@@ -338,6 +338,8 @@ impl AgentProvider for TestProvider {
             .env("IDLE", run.idle_marker_path().unwrap())
             .env("EXIT", exit_request_path(run_dir))
             .env("MESSAGE", resume_message_path(run_dir))
+            .env("DAGQ", env!("CARGO_BIN_EXE_dagq"))
+            .env("DB", &self.db)
             .arg("-c")
             .arg(format!("{RESUME_PRELUDE}\n{}", self.script));
         Ok(command)

@@ -238,15 +238,12 @@ pub(super) struct SessionWatch {
 
 impl SessionWatch {
     /// The watch of a live session asked at `input_at` to fix what its
-    /// review or a conflict named ([`ReviseWatch`]): only the answers of its
-    /// `worker_question`s and its dialogs are followed (task 238).
-    pub(super) fn revising(
-        run: &TaskRun,
-        session: &SessionRef,
-        input_at: SystemTime,
-    ) -> Result<Self> {
+    /// review or a conflict named ([`ReviseWatch`]), or what parked its run
+    /// ([`ResumeWatch`]): only the answers of its `worker_question`s and its
+    /// dialogs are followed (task 238, ADR-0071 decision 17).
+    pub(super) fn fixing(run: &TaskRun, workspace: &str, input_at: SystemTime) -> Result<Self> {
         Ok(SessionWatch {
-            workspace: session.workspace.clone(),
+            workspace: workspace.to_owned(),
             run_dir: PathBuf::from(run.run_dir().context("missing run directory")?),
             receipt_path: PathBuf::from(run.receipt_path().context("missing receipt path")?),
             idle_marker: run.idle_marker_path()?,

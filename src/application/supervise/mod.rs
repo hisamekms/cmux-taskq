@@ -1107,6 +1107,8 @@ impl Supervisor<'_> {
                     });
                 }
                 Err(error) if matches!(slot.phase, Phase::Resume(_)) => {
+                    // Nobody reads the verdict of its recovery jobs now.
+                    stop_recovery(&mut slot);
                     let message = format!("{error:#}");
                     warn!(run_id = %slot.run.id(), "run {} resume stopped: {message}; its workspace is kept for inspection", slot.run.id());
                     let (attempt, workspace) = match &slot.phase {
@@ -1636,7 +1638,11 @@ impl Supervisor<'_> {
                             format!("the session {why}"),
                             format!("the session {why} after {label}"),
                         );
-                        slot.phase = Phase::Exiting(ExitWatch::new(Some(session), then));
+                        let mut exit = ExitWatch::new(Some(session), then);
+                        // A silence the revise's wait recorded is not
+                        // recorded twice.
+                        exit.silent = watch.live.silent && why.starts_with("went silent");
+                        slot.phase = Phase::Exiting(exit);
                     }
                 }
                 Ok(Step::Continue)
@@ -1736,7 +1742,11 @@ fn stop_recovery(slot: &mut Slot) {
     match &mut slot.phase {
         Phase::Session(watch) => watch.recovery.stop_job(),
         Phase::Exiting(watch) => watch.recovery.stop_job(),
-        Phase::Resume(watch) => watch.recovery.stop_job(),
+        Phase::Resume(watch) => {
+            watch.recovery.stop_job();
+            watch.live.recovery.stop_job();
+        }
+        Phase::Revise(watch) => watch.live.recovery.stop_job(),
         _ => {}
     }
 }

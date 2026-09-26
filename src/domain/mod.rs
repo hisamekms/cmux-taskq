@@ -418,13 +418,29 @@ pub fn fix_requested(events: &[RunEvent]) -> bool {
     })
 }
 
+/// Whether a `needs_session` run's resumed session is on: its latest
+/// `resume_started` has neither a `resume_finished` nor an `exit_requested`
+/// after it (ADR-0071 decision 17).
+pub fn resume_in_progress(events: &[RunEvent]) -> bool {
+    events
+        .iter()
+        .rposition(|e| e.kind == "resume_started")
+        .is_some_and(|start| {
+            !events[start + 1..]
+                .iter()
+                .any(|e| matches!(e.kind.as_str(), "resume_finished" | "exit_requested"))
+        })
+}
+
 /// Whether the supervisor types the answer of a run's `worker_question`
-/// into its worker's terminal: the run is `running`, or awaiting
-/// integration while its live session fixes what it was asked to
-/// ([`fix_requested`]). The caller checks that a supervisor leases it.
+/// into its worker's terminal: the run is `running`, awaiting integration
+/// while its live session fixes what it was asked to ([`fix_requested`]),
+/// or `needs_session` while its resumed session is on
+/// ([`resume_in_progress`]). The caller checks that a supervisor leases it.
 pub fn session_takes_answers(status: RunStatus, events: &[RunEvent]) -> bool {
     status == RunStatus::Running
         || (status == RunStatus::AwaitingIntegration && fix_requested(events))
+        || (status == RunStatus::NeedsSession && resume_in_progress(events))
 }
 
 pub fn triage_state(events: &[RunEvent]) -> TriageState {
@@ -2488,6 +2504,17 @@ mod attention_tests {
         // A request the session did not fix ends in its `/exit`.
         events.push(event(7, "exit_requested", serde_json::json!({})));
         assert!(!session_takes_answers(waiting, &events));
+        // A resumed session takes them until its `/exit` or its end.
+        let parked = RunStatus::NeedsSession;
+        events.push(event(8, "resume_started", serde_json::json!({})));
+        assert!(session_takes_answers(parked, &events));
+        assert!(!session_takes_answers(waiting, &events));
+        events.push(event(9, "exit_requested", json!({"resume_attempt": 1})));
+        assert!(!session_takes_answers(parked, &events));
+        events.push(event(10, "resume_started", serde_json::json!({})));
+        assert!(session_takes_answers(parked, &events));
+        events.push(event(11, "resume_finished", serde_json::json!({})));
+        assert!(!session_takes_answers(parked, &events));
     }
 
     #[test]
