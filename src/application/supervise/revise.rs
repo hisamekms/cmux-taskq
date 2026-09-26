@@ -145,6 +145,10 @@ impl ReviseWatch {
                     .to_owned(),
             )));
         }
+        // A silence its wait recorded ended before the revise did: the
+        // session may wait again, and a later silence is recorded again
+        // (task 606).
+        self.live.silent = false;
         // An answer to a question the session asked during the revise is
         // typed once it went idle at it: the session works again, and gets
         // the resume timeout again (task 238).

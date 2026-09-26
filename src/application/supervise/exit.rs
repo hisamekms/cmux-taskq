@@ -456,13 +456,16 @@ pub(super) enum WrapperPulse {
     Exited,
 }
 
-/// `Silent` also records `wrapper_heartbeat_expired` once per watch (`noted`)
-/// and logs it. A wrapper whose heartbeat expired and whose process is gone
-/// is an error with `message`, as before: nothing is left to ask to exit,
-/// and the run is given up to `recover`; a `stuck_exit` ask the silence
-/// raised is closed then, since no session is left to exit. The row is read
-/// again first, so a wrapper that recorded its exit just before it died is
-/// `Exited`, not an error.
+/// `Silent` also records `wrapper_heartbeat_expired` once per silence
+/// (`noted`) and logs it. `Fresh` leaves `noted` as it is: a watch that has
+/// not sent its `/exit` clears it itself (task 606), so that its session
+/// may wait again and a later silence is recorded again, while one past its
+/// `/exit` keeps it for the `stuck_exit` ask closed below. A wrapper whose
+/// heartbeat expired and whose process is gone is an error with `message`,
+/// as before: nothing is left to ask to exit, and the run is given up to
+/// `recover`; a `stuck_exit` ask the silence raised is closed then, since
+/// no session is left to exit. The row is read again first, so a wrapper
+/// that recorded its exit just before it died is `Exited`, not an error.
 pub(super) fn wrapper_pulse(
     sv: &mut Supervisor<'_>,
     run: &TaskRun,

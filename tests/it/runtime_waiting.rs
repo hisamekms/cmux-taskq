@@ -665,3 +665,101 @@ await_exit
         "{outcome}"
     );
 }
+
+/// Make the run's wrapper heartbeat come back (far ahead, so it stays
+/// fresh) in the transaction that records the wait's end: back in its slot
+/// the run sees a fresh heartbeat on its first look, whatever the test's
+/// timing.
+fn restore_heartbeat_when_the_wait_ends(db: &Path, run: &TaskRun) {
+    Connection::open(db)
+        .unwrap()
+        .execute_batch(&format!(
+            "CREATE TRIGGER heartbeat_back AFTER INSERT ON run_events
+             WHEN NEW.run_id = '{run}' AND NEW.kind = 'run_waiting_ended'
+             BEGIN
+               UPDATE run_processes SET heartbeat_at = CAST(strftime('%s','now') AS INTEGER) + 3600
+               WHERE run_id = '{run}' AND role = 'wrapper';
+             END;",
+            run = run.id()
+        ))
+        .unwrap();
+}
+
+/// A wrapper whose heartbeat stops during a wait and comes back before the
+/// run's slot looks at it leaves no silence behind (task 606): the wait
+/// ends `wrapper_silent`, the session goes on without a `/exit`, its next
+/// `worker_question` waits outside the slot again, and a second silence is
+/// recorded as `wrapper_heartbeat_expired` again before the `/exit`.
+#[test]
+fn a_wrapper_heartbeat_that_comes_back_lets_the_run_wait_again() {
+    let (_dir, repo, db) = fixture();
+    let backend = Arc::new(TestWorkspace::new(
+        &db,
+        false,
+        r#"
+"$DAGQ" --db "$DB" ask --run "$RUN_ID" --kind worker_question --because scope --question 'Which word?' --cmux /usr/bin/true > /dev/null || exit 70
+idle
+while [ ! -f "$MESSAGE" ]; do sleep 0.05; done
+rm "$MESSAGE"
+"$DAGQ" --db "$DB" ask --run "$RUN_ID" --kind worker_question --because scope --question 'Which colour?' --cmux /usr/bin/true > /dev/null || exit 70
+idle
+await_exit
+"#,
+    ));
+    let supervisor = supervise_in_thread(&db, &repo, &backend, supervise_options(1, true));
+    wait_until(&db, Duration::from_secs(60), |queue| {
+        run_of(queue, 1)
+            .is_some_and(|run| !events_of(&db, run.id(), "run_waiting_started").is_empty())
+    });
+    let mut queue = SqliteQueue::open(&db).unwrap();
+    let run = run_of(&mut queue, 1).unwrap();
+    let first = open_ask_of(&mut queue, &run, AskKind::WorkerQuestion).unwrap();
+    let mut silent = sleeper();
+    restore_heartbeat_when_the_wait_ends(&db, &run);
+    stop_wrapper_heartbeat(&db, &run, silent.id());
+    wait_until(&db, Duration::from_secs(30), |_| {
+        !events_of(&db, run.id(), "run_slot_regained").is_empty()
+    });
+    let ended = events_of(&db, run.id(), "run_waiting_ended");
+    assert_eq!(ended[0]["cause"], "wrapper_silent");
+    assert_eq!(
+        events_of(&db, run.id(), "wrapper_heartbeat_expired").len(),
+        1
+    );
+
+    // The session goes on: its answer is delivered from the slot and its
+    // next question waits outside it again.
+    queue.answer(first, "blue").unwrap();
+    wait_until(&db, Duration::from_secs(60), |_| {
+        events_of(&db, run.id(), "run_waiting_started").len() == 2
+    });
+    let second = open_ask_of(&mut queue, &run, AskKind::WorkerQuestion).unwrap();
+    assert_ne!(second, first);
+    assert_eq!(
+        events_of(&db, run.id(), "run_waiting_started")[1]["ask_id"],
+        json!(second)
+    );
+    assert!(events_of(&db, run.id(), "exit_requested").is_empty());
+
+    // A second silence is recorded again, and this one gets the /exit.
+    let raw = Connection::open(&db).unwrap();
+    raw.execute_batch("DROP TRIGGER heartbeat_back").unwrap();
+    raw.execute(
+        "UPDATE run_processes SET heartbeat_at=0 WHERE run_id=?1 AND role='wrapper'",
+        [run.id()],
+    )
+    .unwrap();
+    wait_until(&db, Duration::from_secs(30), |_| {
+        !events_of(&db, run.id(), "exit_requested").is_empty()
+    });
+    let expired = events_of(&db, run.id(), "wrapper_heartbeat_expired");
+    assert_eq!(expired.len(), 2, "{expired:?}");
+    let ended = events_of(&db, run.id(), "run_waiting_ended");
+    assert_eq!(ended.len(), 2);
+    assert_eq!(ended[1]["cause"], "wrapper_silent");
+    // The wrapper dies without recording its exit: the run is given up.
+    silent.kill().unwrap();
+    silent.wait().unwrap();
+    let outcome = joined(supervisor, "the supervisor thread to return").unwrap();
+    assert_eq!(outcome["errors"][0]["run_id"], json!(run.id()), "{outcome}");
+}

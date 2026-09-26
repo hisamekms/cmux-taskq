@@ -213,7 +213,8 @@ pub(super) struct SessionWatch {
     /// previous supervisor).
     pub(super) exit_asked: bool,
     /// The wrapper went silent while its process lived on
-    /// (`wrapper_heartbeat_expired` is recorded).
+    /// (`wrapper_heartbeat_expired` is recorded); cleared when its
+    /// heartbeat comes back before any `/exit` (task 606).
     pub(super) silent: bool,
     /// The `/exit` was sent because of that silence.
     pub(super) exit_for_silence: bool,
@@ -418,6 +419,10 @@ impl SessionWatch {
                 WrapperPulse::Exited => return Ok(None),
                 WrapperPulse::Fresh => {
                     if self.exit_requested.is_none() {
+                        // A silence that ended before any /exit is over:
+                        // the session may wait again, and a later silence
+                        // is recorded again (task 606).
+                        self.silent = false;
                         self.deliver_answers(sv, run)?;
                         // A request to rewrite a stale receipt is typed
                         // after the receipt.

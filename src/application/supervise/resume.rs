@@ -645,7 +645,8 @@ pub(super) struct ResumeWatch {
     /// review; otherwise it stays open for validation and review.
     pub(super) approved: bool,
     /// The wrapper went silent while its process lived on
-    /// (`wrapper_heartbeat_expired` is recorded).
+    /// (`wrapper_heartbeat_expired` is recorded); cleared when its
+    /// heartbeat comes back before any `/exit` (task 606).
     pub(super) silent: bool,
     /// The `/exit` was sent because of that silence.
     pub(super) exit_for_silence: bool,
@@ -947,6 +948,12 @@ impl ResumeWatch {
         )?;
         if matches!(pulse, WrapperPulse::Exited) {
             return Ok(None);
+        }
+        if matches!(pulse, WrapperPulse::Fresh) && self.exit_requested.is_none() {
+            // A silence that ended before any /exit is over: the session
+            // may wait again, and a later silence is recorded again (task
+            // 606).
+            self.silent = false;
         }
         if matches!(pulse, WrapperPulse::Silent) && self.exit_requested.is_none() {
             // Ask once, the way a person would; never kill the session.
