@@ -18,7 +18,7 @@ use crate::domain::{
     UPDATE_FAILED_OPTIONS, event_attention, heartbeat_stale, reason, recheck, run_attention,
     run_env::{RUN_ENV_PROGRAM_KINDS, RUN_ENV_PROGRAM_MISSING, RunEnvCheck},
     session_takes_answers, supervisor_attention, triage_state,
-    waiting::WaitState,
+    waiting::{WaitCount, WaitState},
 };
 
 /// Health of one run's lease as `status` and `doctor` report it.
@@ -325,11 +325,12 @@ pub fn status(
 }
 
 /// Each registered supervisor's `slots` (`used` of `parallel`) and
-/// `waiting` (`count` of `limit`), and the runs that wait for a person or
-/// for a slot to go back to (ADR-0062 decision 12), from the leases and the
-/// run events. `used` counts the leased runs that are not integrating and
-/// do not wait; a run waiting to go back is in neither count, and shows in
-/// `waiting` as `state: returning`. A supervisor that holds its claims
+/// `waiting` (`count` of `limit`, with the `returning` among them), and the
+/// runs that wait for a person or for a slot to go back to (ADR-0071
+/// decision 12), from the leases and the run events. `used` counts the
+/// leased runs that are not integrating and do not wait; `count` is what
+/// `--max-waiting` bounds (ADR-0071 (f2)): the runs that wait and those
+/// that wait to go back (`state: returning` in `waiting`). A supervisor that holds its claims
 /// has `claim_hold`: its latest `claim_held` payload and `since` (task
 /// 327).
 fn slots_and_waits(
@@ -340,8 +341,9 @@ fn slots_and_waits(
     now: i64,
 ) -> Result<(Vec<Value>, Vec<Value>)> {
     let mut waiting = Vec::new();
-    // Per token: the slots in use and the runs that wait.
-    let mut counts: HashMap<&str, (i64, i64)> = HashMap::new();
+    // Per token: the slots in use and the runs out of them, counted as
+    // `--max-waiting` counts them.
+    let mut counts: HashMap<&str, (i64, WaitCount)> = HashMap::new();
     for lease in leases {
         let run = queue.run(&lease.run_id)?;
         let entry = counts.entry(lease.token.as_str()).or_default();
@@ -362,13 +364,11 @@ fn slots_and_waits(
             "since": since,
             "waited_secs": state.ended.map_or(now, |(ms, _)| ms.div_euclid(1000)) - since,
         });
-        match state.ended {
-            Some((ms, cause)) => {
-                wait["ended_at"] = json!(ms.div_euclid(1000));
-                wait["cause"] = json!(cause.as_str());
-            }
-            None => entry.1 += 1,
+        if let Some((ms, cause)) = state.ended {
+            wait["ended_at"] = json!(ms.div_euclid(1000));
+            wait["cause"] = json!(cause.as_str());
         }
+        entry.1.add(state.ended.is_some());
         waiting.push(wait);
     }
     // The hold on new claims in progress (task 327), on its supervisor.
@@ -386,7 +386,11 @@ fn slots_and_waits(
                     .copied()
                     .unwrap_or_default();
                 value["slots"] = json!({"used": used, "parallel": registration.parallel});
-                value["waiting"] = json!({"count": count, "limit": registration.max_waiting});
+                value["waiting"] = json!({
+                    "count": count.count(),
+                    "returning": count.returning,
+                    "limit": registration.max_waiting,
+                });
                 if let Some(event) = hold.as_ref().filter(|event| {
                     event.payload.get("supervisor").and_then(Value::as_str)
                         == Some(registration.token.as_str())

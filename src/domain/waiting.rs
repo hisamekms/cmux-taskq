@@ -186,6 +186,40 @@ impl WaitState {
     }
 }
 
+/// The runs out of a supervisor's slots, as `--max-waiting` counts them
+/// and `status` shows them (ADR-0071 (f2)): those that wait for a person,
+/// and those whose wait ended and that wait for a slot to go back to
+/// (returning). Both hold a live session, so both count toward the limit.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WaitCount {
+    pub waiting: usize,
+    pub returning: usize,
+}
+
+impl WaitCount {
+    /// The count of waits, each `true` when its wait ended (returning).
+    pub fn of(ended: impl IntoIterator<Item = bool>) -> Self {
+        let mut count = Self::default();
+        for ended in ended {
+            count.add(ended);
+        }
+        count
+    }
+
+    pub fn add(&mut self, ended: bool) {
+        if ended {
+            self.returning += 1;
+        } else {
+            self.waiting += 1;
+        }
+    }
+
+    /// What `--max-waiting` bounds: the waits and the returning runs.
+    pub fn count(&self) -> usize {
+        self.waiting + self.returning
+    }
+}
+
 /// The asks of every wait of the run that ended: none of them starts a
 /// wait again (decision 2).
 pub fn consumed_asks(events: &[RunEvent]) -> Vec<AskId> {
@@ -334,6 +368,20 @@ mod tests {
             json!({"ask_id": ask, "ask_kind": kind, "phase": "exit", "status": "awaiting_integration"}),
             "2026-09-26T04:10:00.000Z",
         )
+    }
+
+    #[test]
+    fn the_limit_counts_the_waits_and_the_returning_runs() {
+        let count = WaitCount::of([false, true, false]);
+        assert_eq!(
+            count,
+            WaitCount {
+                waiting: 2,
+                returning: 1
+            }
+        );
+        assert_eq!(count.count(), 3);
+        assert_eq!(WaitCount::default().count(), 0);
     }
 
     #[test]

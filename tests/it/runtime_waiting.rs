@@ -89,7 +89,7 @@ fn a_run_waiting_for_its_answer_leaves_the_slot_to_another_task() {
     );
     assert_eq!(
         status["supervisors"][0]["waiting"],
-        json!({"count": 1, "limit": 4})
+        json!({"count": 1, "returning": 0, "limit": 4})
     );
     let waiting = &status["waiting"][0];
     assert_eq!(waiting["run_id"], json!(first.id()));
@@ -189,7 +189,7 @@ fn the_waits_stay_within_their_limit() {
     let status = runtime::status(&db).unwrap();
     assert_eq!(
         status["supervisors"][0]["waiting"],
-        json!({"count": 1, "limit": 1}),
+        json!({"count": 1, "returning": 0, "limit": 1}),
         "{status}"
     );
     assert_eq!(
@@ -217,6 +217,80 @@ fn the_waits_stay_within_their_limit() {
     let stats = runtime::stats(&db, &Default::default()).unwrap();
     assert_eq!(stats["waiting"]["deferred"], 1, "{stats}");
     assert_eq!(stats["waiting"]["started"]["worker_question"], 2);
+}
+
+/// A run whose answer came while its one slot is taken waits to go back,
+/// and still counts toward `--max-waiting` (ADR-0071 (f2)): `status`
+/// shows it in `waiting.count` and in `returning`, and with the limit of
+/// one reached, the run in the slot that asks next is deferred.
+#[test]
+fn a_returning_run_counts_toward_the_limit() {
+    let (_dir, repo, db) = fixture();
+    add_ready_task(&mut SqliteQueue::open(&db).unwrap(), "second", &[]);
+    let backend = TestWorkspace::new(&db, false, ASKING_AGENT);
+    // The second worker asks only once the test lets it.
+    backend.script_for(
+        2,
+        &format!("while [ ! -f \"$EXIT.gate\" ]; do sleep 0.05; done\n{ASKING_AGENT}"),
+    );
+    let backend = Arc::new(backend);
+    let options = SuperviseOptions {
+        max_waiting: 1,
+        ..supervise_options(1, true)
+    };
+    let supervisor = supervise_in_thread(&db, &repo, &backend, options);
+    wait_until(&db, Duration::from_secs(60), |queue| {
+        run_of(queue, 2).is_some()
+    });
+    let mut queue = SqliteQueue::open(&db).unwrap();
+    let first = run_of(&mut queue, 1).unwrap();
+    let second = run_of(&mut queue, 2).unwrap();
+    let ask = open_ask_of(&mut queue, &first, AskKind::WorkerQuestion).unwrap();
+    queue.answer(ask, "blue").unwrap();
+    wait_until(&db, Duration::from_secs(30), |_| {
+        !events_of(&db, first.id(), "run_waiting_ended").is_empty()
+    });
+    let status = runtime::status(&db).unwrap();
+    assert_eq!(
+        status["supervisors"][0]["waiting"],
+        json!({"count": 1, "returning": 1, "limit": 1}),
+        "{status}"
+    );
+    assert_eq!(
+        status["supervisors"][0]["slots"],
+        json!({"used": 1, "parallel": 1})
+    );
+    assert_eq!(status["waiting"][0]["run_id"], json!(first.id()));
+    assert_eq!(status["waiting"][0]["state"], "returning");
+    assert_eq!(status["waiting"][0]["cause"], "answered");
+
+    // The second worker asks while the returning run fills the limit.
+    fs::write(
+        exit_request_path(second.run_dir().unwrap()).with_extension("gate"),
+        "",
+    )
+    .unwrap();
+    wait_until(&db, Duration::from_secs(30), |_| {
+        !events_of(&db, second.id(), "run_waiting_deferred").is_empty()
+    });
+    let deferrals = events_of(&db, second.id(), "run_waiting_deferred");
+    assert_eq!(deferrals.len(), 1);
+    assert_eq!(deferrals[0]["waiting"], 1);
+    assert_eq!(deferrals[0]["limit"], 1);
+    assert!(events_of(&db, second.id(), "run_waiting_started").is_empty());
+
+    let other = open_ask_of(&mut queue, &second, AskKind::WorkerQuestion).unwrap();
+    queue.answer(other, "green").unwrap();
+    let outcome = joined(supervisor, "the supervisor thread to return").unwrap();
+    backend.join();
+    assert_eq!(outcome["errors"], json!([]), "{outcome}");
+    for task in [1, 2] {
+        assert_eq!(
+            run_of(&mut queue, task).unwrap().status(),
+            RunStatus::AwaitingIntegration
+        );
+    }
+    assert_eq!(events_of(&db, first.id(), "run_slot_regained").len(), 1);
 }
 
 /// A session that holds the `/exit` after its verdict back waits for the
@@ -350,7 +424,7 @@ fn no_wait_without_a_limit() {
     let status = runtime::status(&db).unwrap();
     assert_eq!(
         status["supervisors"][0]["waiting"],
-        json!({"count": 0, "limit": 0}),
+        json!({"count": 0, "returning": 0, "limit": 0}),
         "{status}"
     );
     let ask = open_ask_of(&mut queue, &run, AskKind::WorkerQuestion).unwrap();

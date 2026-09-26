@@ -10,8 +10,8 @@ use crate::domain::{
     Ask,
     waiting::{
         RUN_SLOT_REGAINED, RUN_WAITING_ASK_ADDED, RUN_WAITING_DEFERRED, RUN_WAITING_ENDED,
-        RUN_WAITING_STARTED, WaitCause, WaitPhase, WaitState, consumed_asks, deferred_asks,
-        waits_for,
+        RUN_WAITING_STARTED, WaitCause, WaitCount, WaitPhase, WaitState, consumed_asks,
+        deferred_asks, waits_for,
     },
 };
 
@@ -98,7 +98,13 @@ impl Supervisor<'_> {
     /// The runs held against `--max-waiting`: the waiting ones and those
     /// waiting to go back, whose sessions are open all the same.
     fn waiting_runs(&self) -> usize {
-        self.slots.iter().filter(|slot| slot.out_of_slot()).count()
+        WaitCount::of(
+            self.slots
+                .iter()
+                .filter_map(|slot| slot.waiting.as_ref())
+                .map(|waiting| waiting.ended.is_some()),
+        )
+        .count()
     }
 
     /// Move the runs in the slots that wait for a person into waits, the
