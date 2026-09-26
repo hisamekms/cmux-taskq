@@ -1259,12 +1259,16 @@ impl WorkspaceBackend for Cmux {
     }
 
     fn send_enter(&self, workspace_id: &str) -> Result<()> {
+        self.send_key(workspace_id, "enter")
+    }
+
+    fn send_key(&self, workspace_id: &str, key: &str) -> Result<()> {
         output(Command::new(&self.executable).args([
             "send-key",
             "--workspace",
             workspace_id,
             "--",
-            "enter",
+            key,
         ]))?;
         Ok(())
     }

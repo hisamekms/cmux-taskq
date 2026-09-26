@@ -282,6 +282,10 @@ impl Supervisor<'_> {
                     start: None,
                     // Never a second /exit; its timeout restarts now.
                     exit_requested: exit_requested.then_some(now),
+                    // Whether that /exit was typed is not handed over: its
+                    // "Background work is running" dialog is left to the
+                    // stuck_exit ask (ADR-0047 decision 29).
+                    exit_typed: false,
                     required_evidence: task.required_evidence().to_vec(),
                     approved,
                     silent: false,

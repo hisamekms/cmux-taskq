@@ -75,6 +75,7 @@ use crate::domain::{
 
 mod adopt;
 mod deliver;
+mod dialog;
 mod draft_planner;
 mod exit;
 mod handoff;
@@ -92,8 +93,8 @@ mod triage;
 
 pub use self::handoff::SUPERVISOR_HANDED_OFF;
 use self::{
-    deliver::*, exit::*, idle::*, jobs::*, recovery::*, resume::*, revise::*, session::*, stall::*,
-    sweep::*,
+    deliver::*, dialog::*, exit::*, idle::*, jobs::*, recovery::*, resume::*, revise::*,
+    session::*, stall::*, sweep::*,
 };
 
 /// How far back the daily observation reads.

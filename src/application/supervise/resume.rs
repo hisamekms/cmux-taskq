@@ -379,6 +379,7 @@ impl Supervisor<'_> {
             message_sent: None,
             start: None,
             exit_requested: None,
+            exit_typed: false,
             required_evidence: task.required_evidence().to_vec(),
             approved: self.queue.has_run_event(run.id(), "integration_approved")?,
             silent: false,
@@ -591,6 +592,9 @@ pub(super) struct ResumeWatch {
     /// Whether the session took the request (task 285).
     pub(super) start: Option<StartCheck>,
     pub(super) exit_requested: Option<Instant>,
+    /// The `/exit` of `exit_requested` was typed: past the resume timeout
+    /// it is not typed over a dialog, which is then not answered either.
+    pub(super) exit_typed: bool,
     /// The task's required checks: a rewritten receipt still without them
     /// has not resolved the run.
     pub(super) required_evidence: Vec<EvidenceCheck>,
@@ -695,6 +699,7 @@ impl ResumeWatch {
             // session go with a stuck_exit ask.
             if sv.signals.detect_prompt(&screen).is_none() {
                 submit(sv, run, &self.workspace, Input::Exit, "/exit")?;
+                self.exit_typed = true;
             }
             info!(run_id = %run.id(), "resumed session of {} did not get ready for the resolution request within the resume timeout; exit requested", run.id());
             self.exit_requested = Some(Instant::now());
@@ -820,12 +825,20 @@ impl ResumeWatch {
         if matches!(pulse, WrapperPulse::Silent) && self.exit_requested.is_none() {
             // Ask once, the way a person would; never kill the session.
             submit(sv, run, &self.workspace, Input::Exit, "/exit")?;
+            self.exit_typed = true;
             warn!(run_id = %run.id(), "resumed session of {} lost its wrapper heartbeat; exit requested", run.id());
             self.exit_requested = Some(Instant::now());
             self.exit_for_silence = true;
         }
         if let Some(requested) = self.exit_requested {
-            if requested.elapsed() >= sv.cmux.exit_timeout() {
+            let workspace = self.workspace.clone();
+            if requested.elapsed() >= sv.cmux.exit_timeout()
+                && answer_exit_dialog(sv, run, &workspace, self.exit_typed)?
+            {
+                // A known dialog answered by rule gets the exit timeout
+                // again (ADR-0047 decision 29).
+                self.exit_requested = Some(Instant::now());
+            } else if requested.elapsed() >= sv.cmux.exit_timeout() {
                 // /exit is not resent (it could pick a dialog's option).
                 warn!(run_id = %run.id(), "resumed session of {} did not exit within {}s of the exit request; letting it go as unresolved (its workspace {} is kept)", run.id(), sv.cmux.exit_timeout().as_secs(), self.workspace);
                 // Its dialog stays until someone answers it: raise it to
@@ -905,6 +918,7 @@ impl ResumeWatch {
         if let Some(why) = why {
             // Ask once, the way a person would; never kill the session.
             submit(sv, run, &self.workspace, Input::Exit, "/exit")?;
+            self.exit_typed = true;
             info!(run_id = %run.id(), "resumed session of {} {why} (head {head}); exit requested", run.id());
             self.exit_requested = Some(Instant::now());
         }

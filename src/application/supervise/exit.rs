@@ -155,6 +155,13 @@ impl ExitWatch {
                 }
             }
             Some(requested) if !self.timed_out && requested.elapsed() >= sv.cmux.exit_timeout() => {
+                // A known dialog answered by rule gets the exit timeout
+                // again to let the session go (ADR-0047 decision 29).
+                let workspace = session.workspace.clone();
+                if answer_exit_dialog(sv, run, &workspace, true)? {
+                    self.requested = Some(Instant::now());
+                    return Ok(false);
+                }
                 let timeout = sv.cmux.exit_timeout();
                 sv.queue.record_runtime_event(
                     run.id(),

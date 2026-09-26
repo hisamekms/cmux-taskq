@@ -396,6 +396,44 @@ pub trait AgentSignals {
     fn input_pending(&self, screen: &str, text: &str) -> bool;
     /// Whether the screen shows the agent at work on a turn.
     fn working(&self, screen: &str) -> bool;
+    /// The dialog of the fixed list the supervisor answers by rule
+    /// (ADR-0047 decision 29) at the bottom of `screen`, with the keys that
+    /// answer it, or `None` for any other screen, however much a dialog.
+    fn known_dialog(&self, _screen: &str) -> Option<DialogAnswer> {
+        None
+    }
+}
+
+/// A dialog of the agent's TUI the supervisor answers by a fixed rule once
+/// its safety conditions hold (ADR-0047 decision 29). Any other dialog gets
+/// no key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KnownDialog {
+    /// The confirmation a `/exit` gets while background work runs
+    /// ("Background work is running"): answered with "Exit and stop tasks"
+    /// only after the supervisor's `/exit`, with the worktree clean and the
+    /// receipt's commit at HEAD.
+    BackgroundWork,
+    /// The Settings panel (`/status`, `/usage`, ...) left open over the
+    /// input box: closed with Esc at any stage.
+    SettingsPanel,
+}
+
+impl KnownDialog {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::BackgroundWork => "background_work",
+            Self::SettingsPanel => "settings_panel",
+        }
+    }
+}
+
+/// A known dialog found on a screen and the keys that answer it, in the
+/// backend's key names ([`WorkspaceBackend::send_key`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DialogAnswer {
+    pub dialog: KnownDialog,
+    pub keys: Vec<&'static str>,
 }
 
 /// The content of an idle marker, as [`AgentSignals::idle_hook`] read it.
@@ -503,6 +541,13 @@ pub trait WorkspaceBackend {
     /// Press Enter alone: a text or `/exit` left in the input box after its
     /// submit is submitted again without being typed twice (task 285).
     fn send_enter(&self, workspace_id: &str) -> Result<()>;
+    /// Press one key (`down`, `up`, `enter`, `escape`): the answer to a
+    /// known dialog (ADR-0047 decision 29), the only keys the supervisor
+    /// sends besides Enter. A backend without keys refuses.
+    fn send_key(&self, workspace_id: &str, key: &str) -> Result<()> {
+        let _ = (workspace_id, key);
+        anyhow::bail!("this workspace backend sends no keys")
+    }
     fn capture(&self, workspace_id: &str) -> Result<String>;
     /// Close the workspace; the worktree and branch are not touched. A
     /// pinned workspace is unpinned first, since cmux refuses to close one

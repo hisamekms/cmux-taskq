@@ -583,6 +583,10 @@ struct TestWorkspace {
     /// `close` times out and leaves the workspace and its session as they
     /// are, as cmux does under load.
     close_times_out: bool,
+    /// `send_key` calls: the keys a known dialog was answered with. Enter on
+    /// the "Background work is running" screen lets a held session exit,
+    /// and Escape closes the Settings panel.
+    keys: Mutex<Vec<String>>,
 }
 impl TestWorkspace {
     fn new(db: &Path, fail: bool, script: &str) -> Self {
@@ -623,6 +627,7 @@ impl TestWorkspace {
             exit_unsent: AtomicUsize::new(0),
             close_ends_session: false,
             close_times_out: false,
+            keys: Mutex::new(Vec::new()),
         }
     }
     /// Let cmux list `workspace` as if an earlier supervisor opened it.
@@ -848,6 +853,19 @@ impl WorkspaceBackend for TestWorkspace {
             == Ok(1)
         {
             *self.screen.lock().unwrap() = READY_SCREEN.into();
+        }
+        Ok(())
+    }
+    fn send_key(&self, workspace_id: &str, key: &str) -> Result<()> {
+        self.keys.lock().unwrap().push(key.into());
+        let mut screen = self.screen.lock().unwrap();
+        match key {
+            "enter" if screen.contains("Background work is running") => {
+                *screen = READY_SCREEN.into();
+                release_held_session(&self.session_run_dir(workspace_id));
+            }
+            "escape" if screen.contains("Settings:") => *screen = WORK_SCREEN.into(),
+            _ => (),
         }
         Ok(())
     }
@@ -1831,6 +1849,32 @@ const DIALOG_SCREEN: &str = "\
 ";
 const WORK_SCREEN: &str = "⏺ Bash(cargo test)\n  ⎿  test result: ok\n\n│ ❯ \n  ? for shortcuts\n";
 
+/// Claude Code's confirmation of a `/exit` while background work runs.
+const BACKGROUND_WORK_SCREEN: &str = "\
+╭──────────────────────────────────────────────────────────────╮
+│ Background work is running                                   │
+│                                                              │
+│ 1 background task is still running:                          │
+│   · sleep 600 (shell)                                        │
+│                                                              │
+│ ❯ 1. Exit and stop tasks                                     │
+│   2. Move to background and exit                             │
+│   3. Stay                                                    │
+╰──────────────────────────────────────────────────────────────╯
+   Enter to confirm · Esc to cancel
+";
+
+/// The Settings panel `/status` leaves open over the input box.
+const SETTINGS_SCREEN: &str = "\
+────────────────────────────────────────────────────────────────
+ Settings:  Status   Config   Usage   (←/→ or tab to cycle)
+
+ Current session
+ ███████████▌                               23% used
+
+ Esc to exit
+";
+
 /// Fake agent that works (no receipt, no idle marker) until the test writes
 /// `$EXIT.go`, then finishes like `VALID_AGENT` and waits for `/exit`.
 const PROMPTED_AGENT: &str = "while [ ! -f \"$EXIT.go\" ]; do sleep 0.05; done; commit work; receipt \"$(git rev-parse HEAD)\"; idle; await_exit";
@@ -2403,6 +2447,175 @@ fn a_failed_answer_delivery_is_left_to_the_inbox() {
             late.id
         )
     );
+}
+
+/// The "Background work is running" dialog that holds the supervisor's
+/// `/exit` back is answered by rule at the exit timeout (ADR-0047 decision
+/// 29): the worktree is clean and the receipt names its HEAD, so "Exit and
+/// stop tasks" is picked, recorded as `auto_repaired` with the conditions
+/// and the screen, and the session exits without a timeout or an ask.
+#[test]
+fn a_background_work_dialog_after_exit_is_answered_when_the_receipt_is_at_head() {
+    let (_dir, repo, db) = fixture();
+    let mut backend = TestWorkspace::new(&db, false, HELD_AGENT);
+    backend.exit_timeout = Duration::from_millis(500);
+    *backend.screen.lock().unwrap() = BACKGROUND_WORK_SCREEN.into();
+    let backend = Arc::new(backend);
+    let outcome = supervise(&db, &repo, &backend).unwrap();
+    backend.join();
+    assert_eq!(outcome["errors"], json!([]), "{outcome}");
+    assert_eq!(*backend.keys.lock().unwrap(), ["enter"]);
+    let mut queue = SqliteQueue::open(&db).unwrap();
+    let detail = queue.show(TaskId::new(1)).unwrap();
+    let kinds = event_kinds(&detail);
+    assert!(!kinds.contains(&"exit_request_timed_out"), "{kinds:?}");
+    assert!(!kinds.contains(&"known_dialog_unanswered"), "{kinds:?}");
+    let position = |kind: &str| kinds.iter().position(|k| *k == kind).unwrap();
+    assert!(position("exit_requested") < position("auto_repaired"));
+    assert!(position("auto_repaired") < position("session_exited"));
+    let repaired = detail
+        .events
+        .iter()
+        .find(|e| e.kind == "auto_repaired")
+        .unwrap();
+    let head = detail.runs[0].result_commit().unwrap().to_string();
+    assert_eq!(repaired.payload["layer"], "runtime");
+    assert_eq!(repaired.payload["repair"], "dialog_answered");
+    assert_eq!(repaired.payload["dialog"], "background_work");
+    assert_eq!(repaired.payload["keys"], json!(["enter"]));
+    assert_eq!(
+        repaired.payload["conditions"],
+        json!({"exit_requested": true, "clean": true, "head": head, "receipt_commit": head})
+    );
+    assert_eq!(repaired.payload["detail"]["workspace_id"], WORKSPACE_ID);
+    assert!(
+        repaired.payload["detail"]["excerpt"]
+            .as_str()
+            .unwrap()
+            .contains("❯ 1. Exit and stop tasks")
+    );
+    // No stuck_exit ask; the only one is the failed review's.
+    let asks = queue.asks(AskQuery::default()).unwrap();
+    assert!(
+        asks.iter().all(|a| a.kind != AskKind::StuckExit),
+        "{asks:?}"
+    );
+}
+
+/// The same dialog is not answered when the work it would stop can still
+/// change the result (here the worktree is dirty after the `/exit`): the
+/// conditions are recorded as `known_dialog_unanswered`, no key is sent,
+/// and the exit timeout raises the `stuck_exit` ask as before.
+#[test]
+fn a_background_work_dialog_over_a_dirty_worktree_is_left_to_the_ask() {
+    let (_dir, repo, db) = fixture();
+    let mut backend = TestWorkspace::new(
+        &db,
+        false,
+        "commit work; receipt \"$(git rev-parse HEAD)\"; idle; while [ ! -f \"$EXIT\" ]; do sleep 0.05; done; echo more > untracked.txt; while [ ! -f \"$EXIT.held\" ]; do sleep 0.05; done",
+    );
+    backend.exit_timeout = Duration::from_millis(500);
+    *backend.screen.lock().unwrap() = BACKGROUND_WORK_SCREEN.into();
+    let backend = Arc::new(backend);
+    let supervisor = {
+        let (db, repo, backend) = (db.clone(), repo.clone(), backend.clone());
+        thread::spawn(move || supervise(&db, &repo, &backend))
+    };
+    wait_until(&db, Duration::from_secs(30), |queue| {
+        queue
+            .asks(AskQuery::default())
+            .unwrap()
+            .iter()
+            .any(|a| a.kind == AskKind::StuckExit)
+    });
+    let mut queue = SqliteQueue::open(&db).unwrap();
+    let detail = queue.show(TaskId::new(1)).unwrap();
+    let run = detail.runs[0].clone();
+    assert!(backend.keys.lock().unwrap().is_empty());
+    let kinds = event_kinds(&detail);
+    assert!(!kinds.contains(&"auto_repaired"), "{kinds:?}");
+    let position = |kind: &str| kinds.iter().position(|k| *k == kind).unwrap();
+    assert!(position("known_dialog_unanswered") < position("exit_request_timed_out"));
+    let unanswered = detail
+        .events
+        .iter()
+        .find(|e| e.kind == "known_dialog_unanswered")
+        .unwrap();
+    assert_eq!(unanswered.payload["dialog"], "background_work");
+    assert_eq!(unanswered.payload["conditions"]["exit_requested"], true);
+    assert_eq!(unanswered.payload["conditions"]["clean"], false);
+    assert!(
+        unanswered.payload["excerpt"]
+            .as_str()
+            .unwrap()
+            .contains("Background work is running")
+    );
+    release_held_session(run.run_dir().unwrap());
+    let outcome = joined(supervisor, "the supervisor thread to return").unwrap();
+    backend.join();
+    assert_eq!(outcome["errors"], json!([]), "{outcome}");
+    assert!(backend.keys.lock().unwrap().is_empty());
+    let detail = queue.show(TaskId::new(1)).unwrap();
+    let kinds = event_kinds(&detail);
+    assert_eq!(
+        kinds
+            .iter()
+            .filter(|k| **k == "known_dialog_unanswered")
+            .count(),
+        1
+    );
+}
+
+/// A Settings panel left open over a working session's input box is closed
+/// with Escape once (ADR-0047 decision 29), recorded as `auto_repaired`,
+/// without a `prompt_waiting` or an `answer_prompt` ask.
+#[test]
+fn a_settings_panel_is_closed_with_escape() {
+    let (_dir, repo, db) = fixture();
+    let mut backend = TestWorkspace::new(&db, false, PROMPTED_AGENT);
+    backend.prompt_wait = Duration::from_millis(300);
+    *backend.screen.lock().unwrap() = SETTINGS_SCREEN.into();
+    let backend = Arc::new(backend);
+    let supervisor = {
+        let (db, repo, backend) = (db.clone(), repo.clone(), backend.clone());
+        thread::spawn(move || supervise(&db, &repo, &backend))
+    };
+    wait_until(&db, Duration::from_secs(30), |queue| {
+        event_kinds(&queue.show(TaskId::new(1)).unwrap()).contains(&"auto_repaired")
+    });
+    let mut queue = SqliteQueue::open(&db).unwrap();
+    let detail = queue.show(TaskId::new(1)).unwrap();
+    let run = detail.runs[0].clone();
+    assert_eq!(*backend.keys.lock().unwrap(), ["escape"]);
+    let repaired = detail
+        .events
+        .iter()
+        .find(|e| e.kind == "auto_repaired")
+        .unwrap();
+    assert_eq!(repaired.payload["repair"], "dialog_answered");
+    assert_eq!(repaired.payload["dialog"], "settings_panel");
+    assert_eq!(repaired.payload["keys"], json!(["escape"]));
+    assert_eq!(repaired.payload["conditions"], json!({}));
+    // The screen is back at work: more reads find nothing to answer or ask.
+    let captured = backend.captures.load(Ordering::SeqCst);
+    let started = Instant::now();
+    while backend.captures.load(Ordering::SeqCst) < captured + 2 {
+        assert!(started.elapsed() < Duration::from_secs(30));
+        thread::sleep(Duration::from_millis(20));
+    }
+    let detail = queue.show(TaskId::new(1)).unwrap();
+    let kinds = event_kinds(&detail);
+    assert!(!kinds.contains(&"prompt_waiting"), "{kinds:?}");
+    assert!(queue.asks(AskQuery::default()).unwrap().is_empty());
+    assert_eq!(backend.keys.lock().unwrap().len(), 1);
+    fs::write(
+        exit_request_path(run.run_dir().unwrap()).with_extension("go"),
+        "",
+    )
+    .unwrap();
+    let outcome = joined(supervisor, "the supervisor thread to return").unwrap();
+    backend.join();
+    assert_eq!(outcome["errors"], json!([]), "{outcome}");
 }
 
 /// An unanswered `/exit` is recorded once and raised as one `stuck_exit` ask

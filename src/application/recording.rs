@@ -355,6 +355,10 @@ impl WorkspaceBackend for RecordingBackend<'_> {
         let result = self.inner.send_enter(workspace_id);
         self.recorded("send_enter", Some(workspace_id), None, result)
     }
+    fn send_key(&self, workspace_id: &str, key: &str) -> Result<()> {
+        let result = self.inner.send_key(workspace_id, key);
+        self.recorded("send_key", Some(workspace_id), None, result)
+    }
     fn capture(&self, workspace_id: &str) -> Result<String> {
         self.retried(
             "capture",

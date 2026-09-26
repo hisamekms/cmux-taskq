@@ -339,7 +339,12 @@ impl SessionWatch {
             && !self.exit_timed_out
         {
             let timeout = sv.cmux.exit_timeout();
-            if requested.elapsed() >= timeout {
+            let workspace = self.workspace.clone();
+            if requested.elapsed() >= timeout && answer_exit_dialog(sv, run, &workspace, true)? {
+                // A known dialog answered by rule gets the exit timeout
+                // again (ADR-0047 decision 29).
+                self.exit_requested = Some(Instant::now());
+            } else if requested.elapsed() >= timeout {
                 // Something in the session (for example a dialog) held the
                 // /exit back. Keep the lease and keep watching: the run
                 // proceeds to validation once the session exits. /exit is not
@@ -405,8 +410,9 @@ impl SessionWatch {
     /// Read the screen of a session that has run for `prompt_wait` with
     /// neither a receipt nor an idle marker, its wrapper and agent alive, and
     /// record a dialog found there as `prompt_waiting` (once per screen) and
-    /// its disappearance as `prompt_cleared`. No key is sent (ADR-0019). A
-    /// dialog is raised to the inbox as an `answer_prompt` ask with the
+    /// its disappearance as `prompt_cleared`. A known dialog whose
+    /// conditions hold is answered by rule instead (ADR-0047 decision 29);
+    /// no other dialog gets a key. A dialog is raised to the inbox as an `answer_prompt` ask with the
     /// screen's excerpt (ADR-0024's Consequences), which the runtime closes
     /// once the dialog is gone, the receipt arrives or the session exits.
     pub(super) fn watch_prompt(
@@ -455,6 +461,12 @@ impl SessionWatch {
         let workspace = self.workspace.clone();
         if sv.signals.auth_required(&screen) && raise_auth(sv, run, &workspace, &screen)? {
             return self.clear_prompt(sv, run);
+        }
+        // A known dialog is answered by rule once its conditions hold
+        // (ADR-0047 decision 29); otherwise, or once answered in vain, it is
+        // raised like any other.
+        if answer_known_dialog(sv, run, &workspace, &screen, false)? {
+            return Ok(());
         }
         match sv.signals.detect_prompt(&screen) {
             Some(kind) => {

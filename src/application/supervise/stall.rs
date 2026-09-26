@@ -392,11 +392,16 @@ impl StallWatch {
         if sv.queue.hold_of(run.id())?.is_some() {
             return Ok(None);
         }
-        if let Ok(screen) = sv.cmux.capture(workspace)
-            && sv.signals.auth_required(&screen)
-            && raise_auth(sv, run, workspace, &screen)?
-        {
-            return Ok(None);
+        if let Ok(screen) = sv.cmux.capture(workspace) {
+            if sv.signals.auth_required(&screen) && raise_auth(sv, run, workspace, &screen)? {
+                return Ok(None);
+            }
+            // A Settings panel left open would take the nudge: it is closed
+            // first, and the nudge follows on a later tick (ADR-0047
+            // decision 29).
+            if answer_known_dialog(sv, run, workspace, &screen, false)? {
+                return Ok(None);
+            }
         }
         let idle_secs = secs_between(modified, now);
         match self.nudge {
