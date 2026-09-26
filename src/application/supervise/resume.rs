@@ -54,7 +54,7 @@ impl Supervisor<'_> {
                 }
                 continue;
             }
-            if self.slots.len() >= parallel {
+            if self.used_slots() >= parallel {
                 break;
             }
             self.close_left_resume_workspaces(&run)?;
@@ -78,10 +78,7 @@ impl Supervisor<'_> {
             match self.start_resume(&run, attempt, &request) {
                 Ok(watch) => {
                     info!(run_id = %run.id(), task_id = %run.task_id(), "run {} of task {} resumed (attempt {attempt}; {} of at most {MAX_RESUME_ATTEMPTS} counted before it) in workspace {}", run.id(), run.task_id(), resumes.counted, watch.workspace);
-                    self.slots.push(Slot {
-                        run,
-                        phase: Phase::Resume(watch),
-                    });
+                    self.slots.push(Slot::new(run, Phase::Resume(watch)));
                 }
                 Err(error) => {
                     let message = format!("run {} could not be resumed: {error:#}", run.id());
@@ -205,7 +202,7 @@ impl Supervisor<'_> {
         } else {
             Phase::Validating(Some(self.validate(run.clone())), None)
         };
-        self.slots.push(Slot { run, phase });
+        self.slots.push(Slot::new(run, phase));
         Ok(())
     }
     /// End a `needs_session` run whose resumes are used up (ADR-0047

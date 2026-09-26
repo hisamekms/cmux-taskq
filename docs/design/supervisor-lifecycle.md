@@ -129,6 +129,10 @@ failed / interrupted run (a dead run nobody leases is recovered to interrupted f
 
 - [Handoff](supervisor-lifecycle/handoff.md)
 
+### 人の答えを待つrun（slotの外の待ち）
+
+- [人の答えを待つrun（slotの外の待ち）](supervisor-lifecycle/waiting.md)
+
 ### `install`
 
 - [`install`](supervisor-lifecycle/install.md)

@@ -180,6 +180,8 @@ pub struct Ports<'a> {
 #[derive(Debug, Clone)]
 pub struct UpOptions {
     pub parallel: u16,
+    /// The supervisor's `--max-waiting` (ADR-0062 decision 7).
+    pub max_waiting: u16,
     /// Start the supervisor inside the cmux workspace `[<repo>]supervisor`
     /// instead of as a LaunchAgent: no launchd, no automatic restart, and no
     /// out-of-cmux preflight to pass.
@@ -1138,6 +1140,12 @@ fn supervise_arguments(
         arguments.push(path_text(
             &dir.canonicalize().unwrap_or_else(|_| dir.clone()),
         )?);
+    }
+    // The default is left out, so a supervisor started before the option
+    // existed is started with the same arguments.
+    if usize::from(options.max_waiting) != crate::domain::waiting::DEFAULT_MAX_WAITING {
+        arguments.push("--max-waiting".into());
+        arguments.push(options.max_waiting.to_string());
     }
     if options.auto_update {
         arguments.push("--auto-update".into());

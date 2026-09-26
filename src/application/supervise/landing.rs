@@ -579,7 +579,7 @@ impl Supervisor<'_> {
             // decision 9): the answer waits until it is found.
             if answer == "land"
                 && (self.run_env_missing
-                    || self.slots.len() >= parallel
+                    || self.used_slots() >= parallel
                     || !self
                         .queue
                         .runs_with_status(RunStatus::Integrating)?
@@ -615,10 +615,8 @@ impl Supervisor<'_> {
                 info!(run_id = %run.id(), "run {} lands onto main {main} as ask {ask_id} answered", run.id());
                 let handle =
                     self.spawn_landing(landing.clone(), RunStatus::AwaitingIntegration, main)?;
-                self.slots.push(Slot {
-                    run: landing,
-                    phase: Phase::Landing(Some(handle)),
-                });
+                self.slots
+                    .push(Slot::new(landing, Phase::Landing(Some(handle))));
             }
             "send_back" => {
                 let reasons = latest_review_reasons(&*self.queue, run.id())?;

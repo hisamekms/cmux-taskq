@@ -474,6 +474,10 @@ enum Command {
         /// Maximum number of runs executing at once.
         #[arg(long, default_value_t = 4, value_parser = clap::value_parser!(u16).range(1..))]
         parallel: u16,
+        /// Maximum number of runs waiting for a person's answer outside the
+        /// --parallel slots (ADR-0062); 0 keeps every run in its slot.
+        #[arg(long, default_value_t = 4)]
+        max_waiting: u16,
         /// Exit once no run is active and no task can be claimed, instead of
         /// waiting for new work.
         #[arg(long)]
@@ -589,6 +593,11 @@ enum Command {
         /// Maximum number of runs the supervisor executes at once.
         #[arg(long, default_value_t = 4, value_parser = clap::value_parser!(u16).range(1..))]
         parallel: u16,
+        /// Maximum number of runs the supervisor keeps waiting for a
+        /// person's answer outside the --parallel slots (ADR-0062); 0 keeps
+        /// every run in its slot.
+        #[arg(long, default_value_t = 4)]
+        max_waiting: u16,
         /// Run the supervisor in the cmux workspace `[<repo>]supervisor`
         /// instead of under launchd: no socket password needed, and nothing
         /// restarts it if it stops.
@@ -1810,6 +1819,7 @@ fn execute(cli: Cli) -> Result<Value> {
         Command::Supervise {
             repo,
             parallel,
+            max_waiting,
             once,
             cmux,
             claude,
@@ -1849,6 +1859,7 @@ fn execute(cli: Cli) -> Result<Value> {
                     build_command: update_build_command,
                     cmux: Some(cmux.clone()),
                 },
+                max_waiting: usize::from(max_waiting),
                 ..SuperviseOptions::new(usize::from(parallel), once)
             };
             dagq::compose::supervise(
@@ -1862,6 +1873,7 @@ fn execute(cli: Cli) -> Result<Value> {
         }
         Command::Up {
             parallel,
+            max_waiting,
             in_cmux,
             no_wait,
             handoff_timeout,
@@ -1892,6 +1904,7 @@ fn execute(cli: Cli) -> Result<Value> {
             };
             let options = UpOptions {
                 parallel,
+                max_waiting,
                 in_cmux,
                 no_wait,
                 plugin_dir,

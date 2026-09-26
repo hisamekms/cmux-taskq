@@ -101,11 +101,16 @@ pub fn stats(
         })
         .map(|registration| i64::from(registration.parallel))
         .sum();
-    let executing = queue
-        .active_runs()?
-        .iter()
-        .filter(|run| run.status() != RunStatus::Integrating)
-        .count();
+    // A run that waits for a person, or waits to go back to its slot,
+    // holds no slot (ADR-0062 decision 13).
+    let mut executing: i64 = 0;
+    for run in queue.active_runs()? {
+        if run.status() != RunStatus::Integrating
+            && crate::domain::waiting::WaitState::of(&queue.run_events(run.id())?).is_none()
+        {
+            executing += 1;
+        }
+    }
     let ready = queue
         .list(&TaskQuery {
             status: StatusFilter::Only(vec![TaskStatus::Ready]),
@@ -123,7 +128,7 @@ pub fn stats(
         .sum();
     let ready = ready.saturating_sub(ready_in_draft_goals);
     let snapshot = SlotSnapshot {
-        free_slots: slots - i64::try_from(executing)?,
+        free_slots: slots - executing,
         candidates: queue.candidates()?.len(),
         ready,
     };

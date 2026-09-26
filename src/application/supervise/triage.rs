@@ -119,7 +119,7 @@ impl Supervisor<'_> {
     pub(super) fn triage_runs(&mut self, parallel: usize) -> Result<()> {
         let now = self.generators.clock.now();
         for run in self.queue.runs_to_triage()? {
-            if self.slots.len() >= parallel {
+            if self.used_slots() >= parallel {
                 break;
             }
             if triage_state(&self.queue.run_events(run.id())?) != TriageState::Pending
@@ -136,10 +136,7 @@ impl Supervisor<'_> {
             match self.spawn_triage(&run, attempt) {
                 Ok(watch) => {
                     info!(run_id = %run.id(), task_id = %run.task_id(), "run {} of task {} ({}) triage {attempt} started", run.id(), run.task_id(), run.status().as_str());
-                    self.slots.push(Slot {
-                        run,
-                        phase: Phase::Triage(watch),
-                    });
+                    self.slots.push(Slot::new(run, Phase::Triage(watch)));
                 }
                 Err(error) => {
                     let error = format!("the headless triage could not start: {error:#}");

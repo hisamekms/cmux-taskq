@@ -98,6 +98,9 @@ pub struct AutoUpdateJob {
 pub struct SuperviseOptions {
     /// Upper bound on runs executing at once.
     pub parallel: usize,
+    /// Upper bound on the runs waiting for a person outside the slots
+    /// (ADR-0062 decision 7); zero keeps every run in its slot.
+    pub max_waiting: usize,
     /// Exit when no run is active and no task can be claimed, instead of
     /// polling for new work.
     pub once: bool,
@@ -145,6 +148,7 @@ impl SuperviseOptions {
     pub fn new(parallel: usize, once: bool) -> Self {
         Self {
             parallel,
+            max_waiting: crate::domain::waiting::DEFAULT_MAX_WAITING,
             once,
             stop: Arc::new(AtomicBool::new(false)),
             observe_interval: Duration::ZERO,
@@ -166,6 +170,7 @@ impl SuperviseOptions {
     fn settings(&self, stall: StallConfig, conflicts: ConflictConfigReport) -> LoopSettings {
         LoopSettings {
             parallel: self.parallel,
+            max_waiting: self.max_waiting,
             once: self.once,
             stop: self.stop.clone(),
             observe_interval: self.observe_interval,

@@ -8,7 +8,7 @@
 use anyhow::{Result, ensure};
 use serde::Serialize;
 use serde_json::{Value, json};
-use std::path::Path;
+use std::{collections::HashMap, path::Path};
 
 use super::{AskQuery, Clock, PlannerAnswerRoute, ProcessControl, Queue, RunFiles, TRIAGE_ASKER};
 use crate::domain::{
@@ -19,6 +19,7 @@ use crate::domain::{
     reason, recheck, run_attention,
     run_env::{RUN_ENV_PROGRAM_KINDS, RUN_ENV_PROGRAM_MISSING, RunEnvCheck},
     supervisor_attention, triage_state,
+    waiting::WaitState,
 };
 
 /// Health of one run's lease as `status` and `doctor` report it.
@@ -276,10 +277,18 @@ pub fn status(
             })
         })
         .collect::<Vec<_>>();
+    let (supervisors, waiting) = slots_and_waits(
+        queue,
+        supervisors(&registrations, &leases, now, control),
+        &registrations,
+        &leases,
+        now,
+    )?;
     Ok(json!({
         "checked_at": now,
-        "supervisors": supervisors(&registrations, &leases, now, control),
+        "supervisors": supervisors,
         "runs": runs,
+        "waiting": waiting,
         "attention": attention(queue, &registrations, now, control)?
             .into_iter()
             .filter(|_| for_role(role))
@@ -307,6 +316,70 @@ pub fn status(
         ),
         "cursor": cursor,
     }))
+}
+
+/// Each registered supervisor's `slots` (`used` of `parallel`) and
+/// `waiting` (`count` of `limit`), and the runs that wait for a person or
+/// for a slot to go back to (ADR-0062 decision 12), from the leases and the
+/// run events. `used` counts the leased runs that are not integrating and
+/// do not wait; a run waiting to go back is in neither count, and shows in
+/// `waiting` as `state: returning`.
+fn slots_and_waits(
+    queue: &dyn Queue,
+    health: Vec<SupervisorHealth>,
+    registrations: &[SupervisorRegistration],
+    leases: &[RunLease],
+    now: i64,
+) -> Result<(Vec<Value>, Vec<Value>)> {
+    let mut waiting = Vec::new();
+    // Per token: the slots in use and the runs that wait.
+    let mut counts: HashMap<&str, (i64, i64)> = HashMap::new();
+    for lease in leases {
+        let run = queue.run(&lease.run_id)?;
+        let entry = counts.entry(lease.token.as_str()).or_default();
+        let Some(state) = WaitState::of(&queue.run_events(run.id())?) else {
+            if run.status() != RunStatus::Integrating {
+                entry.0 += 1;
+            }
+            continue;
+        };
+        let since = state.since_ms.div_euclid(1000);
+        let mut wait = json!({
+            "run_id": run.id(),
+            "task_id": run.task_id(),
+            "asks": state.asks_json(),
+            "phase": state.phase,
+            "status": run.status(),
+            "state": if state.ended.is_some() { "returning" } else { "waiting" },
+            "since": since,
+            "waited_secs": state.ended.map_or(now, |(ms, _)| ms.div_euclid(1000)) - since,
+        });
+        match state.ended {
+            Some((ms, cause)) => {
+                wait["ended_at"] = json!(ms.div_euclid(1000));
+                wait["cause"] = json!(cause.as_str());
+            }
+            None => entry.1 += 1,
+        }
+        waiting.push(wait);
+    }
+    let supervisors = health
+        .into_iter()
+        .enumerate()
+        .map(|(index, health)| {
+            let mut value = serde_json::to_value(health)?;
+            if let Some(registration) = registrations.get(index) {
+                let (used, count) = counts
+                    .get(registration.token.as_str())
+                    .copied()
+                    .unwrap_or_default();
+                value["slots"] = json!({"used": used, "parallel": registration.parallel});
+                value["waiting"] = json!({"count": count, "limit": registration.max_waiting});
+            }
+            Ok(value)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok((supervisors, waiting))
 }
 
 /// `doctor`: with `full`, every registered supervisor and every unfinished
@@ -943,6 +1016,7 @@ mod tests {
             handoff_accepted: false,
             handoff_binary: None,
             auto_update: false,
+            max_waiting: None,
             binary_version: Some("1.0.0".into()),
         }
     }

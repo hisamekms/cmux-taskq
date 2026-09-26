@@ -447,6 +447,7 @@ pub mod task;
 pub mod timeline;
 pub mod transcript;
 mod views;
+pub mod waiting;
 pub mod worktime;
 
 pub use error::DomainError;
@@ -2057,6 +2058,7 @@ mod attention_tests {
             handoff_accepted: false,
             handoff_binary: None,
             auto_update: false,
+            max_waiting: None,
             binary_version: None,
         };
         let fresh =

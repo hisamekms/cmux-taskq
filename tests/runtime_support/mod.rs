@@ -864,12 +864,12 @@ impl WorkspaceBackend for TestWorkspace {
             }
         }
         if let Some(run_id) = &run_id {
-            let exited: bool = connection.query_row(
-                "SELECT EXISTS(SELECT 1 FROM run_processes WHERE run_id=?1 AND role='wrapper' AND exited_at IS NOT NULL)",
+            let (exited, pid): (bool, u32) = connection.query_row(
+                "SELECT exited_at IS NOT NULL, pid FROM run_processes WHERE run_id=?1 AND role='wrapper'",
                 [run_id],
-                |r| r.get(0),
+                |r| Ok((r.get(0)?, r.get(1)?)),
             )?;
-            assert!(exited);
+            assert!(exited || !pid_alive(pid));
         } else {
             let live: Vec<u32> = connection
                 .prepare(

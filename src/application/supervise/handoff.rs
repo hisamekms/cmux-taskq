@@ -213,7 +213,11 @@ impl Supervisor<'_> {
             match phase {
                 Ok(phase) => {
                     info!(run_id = %run.id(), task_id = %run.task_id(), "run {} of task {} taken over after the handoff ({})", run.id(), run.task_id(), run.status().as_str());
-                    self.slots.push(Slot { run, phase });
+                    let mut slot = Slot::new(run, phase);
+                    // Kept as it was, even past the limit (ADR-0062
+                    // decision 7).
+                    self.restore_waiting(&mut slot, true)?;
+                    self.slots.push(slot);
                 }
                 Err(error) => {
                     let message = format!(

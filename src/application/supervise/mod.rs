@@ -99,12 +99,13 @@ mod stall;
 mod sweep;
 mod triage;
 mod update;
+mod waiting;
 
 pub use self::handoff::SUPERVISOR_HANDED_OFF;
 pub use self::update::{UPDATE_INTERVAL, UpdateSettings};
 use self::{
     deliver::*, dialog::*, exit::*, idle::*, jobs::*, recovery::*, resume::*, revise::*,
-    session::*, stale::*, stall::*, sweep::*,
+    session::*, stale::*, stall::*, sweep::*, waiting::*,
 };
 
 /// How often the supervisor records the finished transcript turns of the
@@ -137,6 +138,9 @@ impl ObserveMode {
 pub struct LoopSettings {
     /// Upper bound on runs executing at once.
     pub parallel: usize,
+    /// Upper bound on the runs waiting for a person outside the slots
+    /// (ADR-0062 decision 7); zero keeps every run in its slot.
+    pub max_waiting: usize,
     /// Exit when no run is active and no task can be claimed, instead of
     /// polling for new work.
     pub once: bool,
@@ -379,6 +383,12 @@ pub fn supervise(ports: &Ports<'_>, settings: &LoopSettings) -> Result<Value> {
             token
         }
     };
+    // Next to `parallel` on the registration, for `status` (ADR-0062
+    // decision 7); written again by the process an exec continues.
+    queue.set_max_waiting(
+        &token,
+        u32::try_from(settings.max_waiting).context("max-waiting does not fit a registration")?,
+    )?;
     let mut config = serde_json::to_value(settings.stall)?;
     config["supervisor"] = json!(token);
     queue.record_queue_event(STALL_CONFIG_LOADED, config)?;
@@ -427,6 +437,8 @@ pub fn supervise(ports: &Ports<'_>, settings: &LoopSettings) -> Result<Value> {
         token,
         heartbeat,
         slots: Vec::new(),
+        parallel: settings.parallel,
+        max_waiting: settings.max_waiting,
         finished: Vec::new(),
         errors: Vec::new(),
         claiming: true,
@@ -485,6 +497,11 @@ struct Supervisor<'a> {
     token: String,
     heartbeat: Heartbeat,
     slots: Vec<Slot>,
+    /// `--parallel`: the slots in use (the runs not waiting) are held under
+    /// it, apart from a run a person moved (ADR-0062 decision 10).
+    parallel: usize,
+    /// `--max-waiting` (ADR-0062 decision 7).
+    max_waiting: usize,
     finished: Vec<TaskRun>,
     errors: Vec<RunError>,
     /// Cleared after a provisioning failure so an unavailable cmux or Git
@@ -546,6 +563,13 @@ struct Supervisor<'a> {
 struct Slot {
     run: TaskRun,
     phase: Phase,
+    /// The run waits for a person outside the slots, or waits to go back
+    /// to one (ADR-0062).
+    waiting: Option<Waiting>,
+    /// The asks of the run's waits that ended: none starts another.
+    consumed: Vec<AskId>,
+    /// The asks `run_waiting_deferred` was recorded for.
+    deferred: Vec<AskId>,
 }
 
 enum Phase {
@@ -669,6 +693,9 @@ impl Supervisor<'_> {
             self.check_run_env_programs()?;
             self.mark_run_env_change()?;
             self.draining = stopping || !self.claiming || self.handoff.is_some();
+            // Before any new work, draining or not: a drain waits for them
+            // (ADR-0062 decision 8).
+            self.return_waiting_runs();
             // A stop wins over a handoff: the drain goes on as before.
             if !stopping {
                 if self.handoff.is_none() {
@@ -768,19 +795,19 @@ impl Supervisor<'_> {
     /// claimable. `main` is reread per claim so a task released by
     /// `integrate` starts from the main that contains its predecessor.
     fn fill_slots(&mut self, parallel: usize, sweep_interval: Duration) -> Result<()> {
-        if self.slots.len() < parallel {
-            self.adopt_stale_runs(parallel)?;
-        }
+        // A run that waits for a person is adopted without a free slot
+        // (ADR-0062 decision 11): the check is per run.
+        self.adopt_stale_runs(parallel)?;
         // Takes no slot: a dead run goes to the triage below.
         self.recover_dead_runs()?;
-        if self.slots.len() < parallel {
+        if self.used_slots() < parallel {
             self.apply_landing_answers(parallel)?;
         }
         self.apply_triage_answers()?;
-        if self.slots.len() < parallel {
+        if self.used_slots() < parallel {
             self.resume_parked_runs(parallel)?;
         }
-        if self.slots.len() < parallel {
+        if self.used_slots() < parallel {
             self.triage_runs(parallel)?;
         }
         // Takes no slot: only closes and frees what ended runs left.
@@ -794,7 +821,7 @@ impl Supervisor<'_> {
             return Ok(());
         }
         let mut host: Option<HostVersions> = None;
-        while self.slots.len() < parallel {
+        while self.used_slots() < parallel {
             // Highest effective priority, then most-releasing, then lowest
             // ID (ADR-0040 decision 4); `candidates` and `graph` show the
             // same order, so it is not recorded.
@@ -824,10 +851,7 @@ impl Supervisor<'_> {
             match self.provision(&run) {
                 Ok(watch) => {
                     let run = self.queue.run(run.id())?;
-                    self.slots.push(Slot {
-                        run,
-                        phase: Phase::Session(watch),
-                    });
+                    self.slots.push(Slot::new(run, Phase::Session(watch)));
                 }
                 Err(error) => {
                     let message = format!("run {} provisioning failed: {error:#}", run.id());
@@ -914,13 +938,14 @@ impl Supervisor<'_> {
     }
     /// What `run_claimed` records of a claim made now (task 197): this
     /// binary's build identifier, the host's versions, `parallel`, the
-    /// slots held before the claim and the load average.
+    /// slots held before the claim (runs waiting for a person hold none,
+    /// ADR-0062) and the load average.
     fn claim_attributes(&self, parallel: usize, host: HostVersions) -> ClaimAttributes {
         ClaimAttributes {
             dagq_version: self.layout.version.clone(),
             host,
             parallel,
-            slots: self.slots.len(),
+            slots: self.used_slots(),
             load_avg: (self.load_average)(),
         }
     }
@@ -942,6 +967,9 @@ impl Supervisor<'_> {
     /// handoff waits for (their validation or landing in progress) only.
     fn tick(&mut self, unsettled_only: bool) {
         self.sample_load();
+        if !unsettled_only {
+            self.start_waits();
+        }
         let mut index = 0;
         while index < self.slots.len() {
             if unsettled_only && self.slots[index].phase.rebuildable() {
@@ -949,7 +977,12 @@ impl Supervisor<'_> {
                 continue;
             }
             let mut slot = self.slots.remove(index);
-            match self.step(&mut slot) {
+            let stepped = if slot.out_of_slot() {
+                self.watch_waiting(&mut slot)
+            } else {
+                self.step(&mut slot)
+            };
+            match stepped {
                 Ok(Step::Continue) => {
                     self.slots.insert(index, slot);
                     index += 1;

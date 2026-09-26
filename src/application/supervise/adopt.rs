@@ -17,9 +17,6 @@ impl Supervisor<'_> {
     /// exactly once.
     pub(super) fn adopt_stale_runs(&mut self, parallel: usize) -> Result<()> {
         for candidate in self.queue.runs_leased_by_others(&self.token)? {
-            if self.slots.len() >= parallel {
-                break;
-            }
             let now = self.generators.clock.now();
             let LeasedRun {
                 run,
@@ -30,6 +27,12 @@ impl Supervisor<'_> {
                 continue;
             }
             if !self.adoptable(&run, wrapper.as_ref(), now)? {
+                continue;
+            }
+            // A run that waits for a person needs no free slot while the
+            // waits are under their limit (ADR-0062 decision 11).
+            let as_waiting = self.adopts_as_waiting(run.id())?;
+            if !as_waiting && self.used_slots() >= parallel {
                 continue;
             }
             let alive = self.wrapper_alive(wrapper.as_ref(), now);
@@ -61,7 +64,11 @@ impl Supervisor<'_> {
                 self.resume(&run)
             };
             match phase {
-                Ok(phase) => self.slots.push(Slot { run, phase }),
+                Ok(phase) => {
+                    let mut slot = Slot::new(run, phase);
+                    self.restore_waiting(&mut slot, as_waiting)?;
+                    self.slots.push(slot);
+                }
                 Err(error) => {
                     // The lease is this process's now; give it up like any
                     // other runtime error so `recover` can judge the run.

@@ -403,6 +403,9 @@ pub struct Stats {
     /// `--goal`, only that goal's runs' sessions and its proposals' plan
     /// reviews.
     pub sessions: Sessions,
+    /// The runs that waited for a person outside the slots (ADR-0062
+    /// decision 13) in the same window as `backend_failures`.
+    pub waiting: super::waiting::WaitingStats,
     /// Pass it to `--since` to read only runs that finish later.
     pub next_cursor: EventId,
 }
@@ -761,6 +764,7 @@ pub fn stats(
     let landing_rechecks = landing_rechecks(events, window_start, next_cursor, counts);
     let verification_commands =
         measures::verification_commands(events, window_start, next_cursor, counts);
+    let waiting = super::waiting::waiting_stats(events, window_start, next_cursor, counts);
     let stall_thresholds = thresholds::thresholds(
         &thresholds::detections(events, now * 1000),
         &thresholds::preemptions(events),
@@ -850,6 +854,7 @@ pub fn stats(
         load_bands,
         verification_commands,
         sessions,
+        waiting,
         next_cursor,
     }
 }

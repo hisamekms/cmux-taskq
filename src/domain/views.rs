@@ -187,6 +187,11 @@ pub struct SupervisorRegistration {
     /// `supervise --auto-update` that registers, cleared by a plain `up`.
     #[serde(default)]
     pub auto_update: bool,
+    /// The limit on the runs it keeps waiting for a person outside its
+    /// slots (ADR-0062 decision 7); `None` for a supervisor of an older
+    /// binary, which waits in its slots.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_waiting: Option<u32>,
 }
 
 /// One step of the automatic update of the fixed binary (ADR-0045 decision

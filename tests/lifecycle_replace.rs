@@ -696,6 +696,7 @@ fn gone_registration() -> dagq::domain::SupervisorRegistration {
         handoff_accepted: true,
         handoff_binary: None,
         auto_update: false,
+        max_waiting: None,
     }
 }
 
@@ -749,6 +750,7 @@ fn up_applies_compatible_migrations_and_refuses_breaking_ones() {
              ALTER TABLE supervisors DROP COLUMN handoff_binary;
              ALTER TABLE supervisors DROP COLUMN handoff_requested_at;
              ALTER TABLE supervisors DROP COLUMN auto_update;
+             ALTER TABLE supervisors DROP COLUMN max_waiting;
              DROP TABLE binary_updates;
              ALTER TABLE tasks DROP COLUMN kind;
              PRAGMA user_version = 30;",
@@ -808,6 +810,7 @@ fn up_applies_compatible_migrations_and_refuses_breaking_ones() {
         .unwrap()
         .execute_batch(&format!(
             "ALTER TABLE supervisors DROP COLUMN auto_update;
+             ALTER TABLE supervisors DROP COLUMN max_waiting;
              DROP TABLE binary_updates;
              ALTER TABLE tasks DROP COLUMN kind;
              PRAGMA user_version = {};",

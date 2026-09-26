@@ -975,6 +975,10 @@ pub trait RunStore {
     /// Turn the automatic update of the supervisor `token` on or off
     /// (ADR-0045 decision 17).
     fn set_auto_update(&self, token: &str, enabled: bool) -> Result<()>;
+    /// Record the supervisor `token`'s `--max-waiting` (ADR-0062 decision 7).
+    fn set_max_waiting(&self, token: &str, max_waiting: u32) -> Result<()>;
+    /// The unclosed asks of the run, answered or not, oldest first.
+    fn unclosed_run_asks(&self, run_id: &RunId) -> Result<Vec<crate::domain::Ask>>;
     /// Append one step of the automatic update to its log.
     fn record_binary_update(
         &self,

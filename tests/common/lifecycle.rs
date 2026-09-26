@@ -98,6 +98,7 @@ pub fn fixture() -> Fixture {
         },
         options: UpOptions {
             parallel: 2,
+            max_waiting: 4,
             in_cmux: false,
             no_wait: false,
             plugin_dir: Some(dir.path().to_path_buf()),

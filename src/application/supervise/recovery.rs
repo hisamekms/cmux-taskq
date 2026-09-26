@@ -148,6 +148,12 @@ impl RecoveryWatch {
         }
     }
 
+    /// Whether a recovery job is running for the session: a run then waits
+    /// for the job, not for a person (ADR-0062 decision 6).
+    pub(super) fn running(&self) -> bool {
+        self.job.is_some()
+    }
+
     pub(super) fn stop_job(&mut self) {
         if let Some(job) = &mut self.job {
             job.job.stop();

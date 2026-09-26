@@ -292,6 +292,27 @@ impl SqliteQueue {
         Ok(())
     }
 
+    /// Record the supervisor `token`'s `--max-waiting` (ADR-0062 decision 7).
+    pub fn set_max_waiting(&self, token: &str, max_waiting: u32) -> Result<()> {
+        ensure!(
+            self.conn.execute(
+                "UPDATE supervisors SET max_waiting=?2 WHERE token=?1",
+                params![token, max_waiting],
+            )? == 1,
+            "supervisor {token} is no longer registered"
+        );
+        Ok(())
+    }
+
+    /// The unclosed asks of the run, answered or not, oldest first.
+    pub fn unclosed_run_asks(&self, run_id: &RunId) -> Result<Vec<crate::domain::Ask>> {
+        Ok(self
+            .conn
+            .prepare("SELECT * FROM asks WHERE run_id=?1 AND closed_at IS NULL ORDER BY id")?
+            .query_map([run_id], super::asks::ask_row)?
+            .collect::<rusqlite::Result<_>>()?)
+    }
+
     /// Append one step of the automatic update to `binary_updates`.
     pub fn record_binary_update(
         &self,
@@ -2681,6 +2702,7 @@ fn supervisor_row(r: &Row<'_>) -> rusqlite::Result<SupervisorRegistration> {
         handoff_accepted: r.get::<_, Option<i64>>("handoff_accepted")? == Some(1),
         handoff_binary: r.get("handoff_binary")?,
         auto_update: r.get::<_, Option<i64>>("auto_update")? == Some(1),
+        max_waiting: r.get("max_waiting")?,
     })
 }
 
@@ -2845,6 +2867,12 @@ impl RunStore for SqliteQueue {
     }
     fn set_auto_update(&self, token: &str, enabled: bool) -> Result<()> {
         SqliteQueue::set_auto_update(self, token, enabled)
+    }
+    fn set_max_waiting(&self, token: &str, max_waiting: u32) -> Result<()> {
+        SqliteQueue::set_max_waiting(self, token, max_waiting)
+    }
+    fn unclosed_run_asks(&self, run_id: &RunId) -> Result<Vec<crate::domain::Ask>> {
+        SqliteQueue::unclosed_run_asks(self, run_id)
     }
     fn record_binary_update(
         &self,

@@ -356,6 +356,34 @@ impl StallWatch {
         idle_marker: &Path,
         dialog: bool,
     ) -> Result<Option<StartCheck>> {
+        self.observe(sv, run, workspace, idle_marker, dialog, false)
+    }
+
+    /// The same observation for a run that waits for a person outside
+    /// its slot (ADR-0062 decision 6): the `stalled` ask is followed and
+    /// its answer applied, and one more ask opens after a `wait`, but
+    /// nothing is sent to the session (no nudge, no key to a dialog).
+    pub(super) fn poll_quiet(
+        &mut self,
+        sv: &mut Supervisor<'_>,
+        run: &TaskRun,
+        workspace: &str,
+        idle_marker: &Path,
+        dialog: bool,
+    ) -> Result<()> {
+        self.observe(sv, run, workspace, idle_marker, dialog, true)
+            .map(|_| ())
+    }
+
+    fn observe(
+        &mut self,
+        sv: &mut Supervisor<'_>,
+        run: &TaskRun,
+        workspace: &str,
+        idle_marker: &Path,
+        dialog: bool,
+        quiet: bool,
+    ) -> Result<Option<StartCheck>> {
         let now = sv.files.now();
         let idle = IdleMarker::read(&*sv.files, sv.signals, idle_marker)?;
         let marker = idle.as_ref().map(IdleMarker::modified);
@@ -390,6 +418,15 @@ impl StallWatch {
         // log in, in the queue's one authentication ask (ADR-0047 decision
         // 42), not for a nudge or a stalled ask of its own.
         if sv.queue.hold_of(run.id())?.is_some() {
+            return Ok(None);
+        }
+        if quiet {
+            // Nothing is typed: a stall before its nudge waits for the slot.
+            let Some(nudge) = self.nudge else {
+                return Ok(None);
+            };
+            let idle_secs = secs_between(modified, now);
+            self.open_ask(sv, run, workspace, &idle, idle_secs, nudge, now)?;
             return Ok(None);
         }
         if let Ok(screen) = sv.cmux.capture(workspace) {
