@@ -11,6 +11,7 @@
 #![allow(dead_code)]
 
 pub mod cli;
+pub mod queue;
 
 use std::{
     collections::HashMap,

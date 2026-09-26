@@ -2773,7 +2773,7 @@ fn up_drains_and_replaces_a_launchd_supervisor_of_another_version() {
         assert!(processes.killed.lock().unwrap().is_empty());
         // Only the started supervisor is registered, carrying the version
         // the fake `supervise` recorded for itself (the real write is
-        // covered by tests/queue.rs and the e2e).
+        // covered by tests/queue_migration.rs and the e2e).
         let registrations = queue.supervisors().unwrap();
         assert_eq!(registrations.len(), 1, "{registrations:?}");
         assert_eq!(registrations[0].binary_version.as_deref(), Some(VERSION));
