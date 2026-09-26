@@ -6,7 +6,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
-use serde_json::json;
+use serde_json::{Value, json};
 
 use super::{
     adapters::process_alive,
@@ -48,16 +48,18 @@ impl SqliteQueue {
         base_commit: &CommitSha,
         token: &str,
     ) -> Result<ClaimOutcome> {
-        self.claim_for_supervisor_in_order(base_commit, token, &[])
+        self.claim_for_supervisor_in_order(base_commit, token, &[], None)
     }
 
     /// [`Self::claim_for_supervisor`], taking the first task of `order` that
-    /// is still claimable (the lowest-ID candidate when none is).
+    /// is still claimable (the lowest-ID candidate when none is), with
+    /// `attributes` in its `run_claimed`.
     pub fn claim_for_supervisor_in_order(
         &mut self,
         base_commit: &CommitSha,
         token: &str,
         order: &[TaskId],
+        attributes: Option<&Value>,
     ) -> Result<ClaimOutcome> {
         let tx = self
             .conn
@@ -71,6 +73,7 @@ impl SqliteQueue {
             at,
             base_commit,
             order,
+            attributes,
         )?;
         if let ClaimOutcome::Claimed { run } = &outcome {
             tx.execute(
@@ -2962,8 +2965,9 @@ impl RunStore for SqliteQueue {
         base_commit: &CommitSha,
         token: &str,
         order: &[TaskId],
+        attributes: Option<&Value>,
     ) -> Result<ClaimOutcome> {
-        SqliteQueue::claim_for_supervisor_in_order(self, base_commit, token, order)
+        SqliteQueue::claim_for_supervisor_in_order(self, base_commit, token, order, attributes)
     }
     fn heartbeat(&mut self, token: &str) -> Result<usize> {
         SqliteQueue::heartbeat(self, token)

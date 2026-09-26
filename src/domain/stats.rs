@@ -16,11 +16,16 @@ use super::{
 
 pub mod conflicts;
 pub mod landing;
+pub mod measures;
 pub mod retries;
 pub mod thresholds;
 
 pub use conflicts::{ConflictConfig, ConflictConfigReport, ConflictHotspots, History};
 pub use landing::{LandBreakdown, LandClock, LandPhases, PhaseSummary};
+pub use measures::{
+    BandCount, CommandStats, IntervalLoad, LoadBandStats, RunLoad, RunMeasures, VersionStats,
+    Versions,
+};
 pub use retries::{BrokenBy, ResumeAttempt, ResumeBreakdown, Retries};
 pub use thresholds::ThresholdStats;
 
@@ -152,7 +157,7 @@ pub struct SlotSnapshot {
 
 /// One run's times in seconds (null when an end point was never recorded)
 /// and counts.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct RunStats {
     pub run_id: RunId,
     pub task_id: TaskId,
@@ -191,6 +196,10 @@ pub struct RunStats {
     /// broke them, and its resumes.
     #[serde(flatten)]
     pub retries: Retries,
+    /// The versions, parallel and load it was claimed with, and the load
+    /// over its intervals (task 197).
+    #[serde(flatten)]
+    pub measures: RunMeasures,
 }
 
 /// Count, sum and median of one interval over a set of runs; runs without
@@ -259,6 +268,9 @@ pub struct BackendFailures {
     pub max_load_avg: Option<f64>,
     /// The most slots held when one failed.
     pub max_slots: Option<i64>,
+    /// Failures per band of the load they were recorded under (task 197),
+    /// lightest first; failures without a load are not counted.
+    pub by_load_band: Vec<BandCount>,
 }
 
 /// The events in the window that carry a reason code (ADR-0034): how often
@@ -358,6 +370,14 @@ pub struct Stats {
     /// The landing rechecks of the waiting runs (ADR-0068 decision 6) in
     /// the same window as `backend_failures`.
     pub landing_rechecks: LandingRechecks,
+    /// Those runs per version of `dagq`, Claude Code and `rustc` they
+    /// were claimed with (task 197).
+    pub versions: Versions,
+    /// Those runs per `load_band` (task 197).
+    pub load_bands: Vec<LoadBandStats>,
+    /// The time each verification command of `integrate` took, in the same
+    /// window as `backend_failures` (task 197).
+    pub verification_commands: Vec<CommandStats>,
     /// Pass it to `--since` to read only runs that finish later.
     pub next_cursor: EventId,
 }
@@ -609,7 +629,10 @@ pub fn stats(
             intervals: intervals(runs),
         })
         .collect::<Vec<_>>();
-    let overall = intervals(&finished.iter().map(|t| &t.stats).collect::<Vec<_>>());
+    let page = finished.iter().map(|t| &t.stats).collect::<Vec<_>>();
+    let overall = intervals(&page);
+    let versions = measures::versions(&page);
+    let load_bands = measures::load_bands(&page);
 
     let mut alerts = Vec::new();
     let considered = finished.iter().chain(open.iter()).collect::<Vec<_>>();
@@ -701,6 +724,8 @@ pub fn stats(
     let reason_codes = reason_codes(events, window_start, next_cursor, counts);
     let duplicate_cancels = duplicate_cancels(events, window_start, next_cursor, counts);
     let landing_rechecks = landing_rechecks(events, window_start, next_cursor, counts);
+    let verification_commands =
+        measures::verification_commands(events, window_start, next_cursor, counts);
     let stall_thresholds = thresholds::thresholds(
         &thresholds::detections(events, now * 1000),
         &thresholds::preemptions(events),
@@ -765,6 +790,9 @@ pub fn stats(
         stall_thresholds,
         conflict_hotspots,
         landing_rechecks,
+        versions,
+        load_bands,
+        verification_commands,
         next_cursor,
     }
 }
@@ -1165,6 +1193,7 @@ fn backend_failures(
             .or_default() += 1;
         if let Some(load) = event.payload.get("load_avg").and_then(Value::as_f64) {
             failures.max_load_avg = Some(failures.max_load_avg.map_or(load, |max| max.max(load)));
+            measures::count_band(&mut failures.by_load_band, load);
         }
         if let Some(slots) = event.payload.get("slots").and_then(Value::as_i64) {
             failures.max_slots = Some(failures.max_slots.map_or(slots, |max| max.max(slots)));
@@ -1195,6 +1224,19 @@ pub fn median(values: &mut [i64]) -> Option<i64> {
         _ if n % 2 == 1 => Some(values[n / 2]),
         _ => Some((values[n / 2 - 1] + values[n / 2]).div_euclid(2)),
     }
+}
+
+/// [`median`] of seconds with fractions: the mean of the two middle values
+/// for an even count, to three decimals.
+pub fn median_f64(values: &mut [f64]) -> Option<f64> {
+    values.sort_unstable_by(f64::total_cmp);
+    let n = values.len();
+    let middle = match n {
+        0 => return None,
+        _ if n % 2 == 1 => values[n / 2],
+        _ => (values[n / 2 - 1] + values[n / 2]) / 2.0,
+    };
+    Some((middle * 1000.0).round() / 1000.0)
 }
 
 fn summary(values: impl Iterator<Item = Option<i64>>) -> Summary {
@@ -1255,6 +1297,7 @@ struct Track {
     awaiting_since: Option<i64>,
     /// The wait to land by phase, from the first `validation_finished`.
     land: Option<LandClock>,
+    measure: measures::MeasureTrack,
 }
 
 fn payload_status(payload: &Value) -> Option<&str> {
@@ -1298,6 +1341,7 @@ fn runs(events: &[RunEvent], goals: &HashMap<TaskId, Option<GoalId>>) -> Vec<Tra
                     validated_at: None,
                     landed_at: None,
                     retries: Retries::default(),
+                    measures: RunMeasures::default(),
                 },
                 claimed: None,
                 receipt: None,
@@ -1305,8 +1349,10 @@ fn runs(events: &[RunEvent], goals: &HashMap<TaskId, Option<GoalId>>) -> Vec<Tra
                 agent_started: None,
                 awaiting_since: None,
                 land: None,
+                measure: measures::MeasureTrack::default(),
             }
         });
+        track.measure.observe(event);
         if let (Some(clock), Some(at)) = (&mut track.land, at) {
             clock.observe(event, at);
         }
@@ -1378,6 +1424,7 @@ fn runs(events: &[RunEvent], goals: &HashMap<TaskId, Option<GoalId>>) -> Vec<Tra
         .filter_map(|id| tracks.remove(&id))
         .map(|mut track| {
             track.stats.retries = retries.remove(&track.stats.run_id).unwrap_or_default();
+            track.stats.measures = std::mem::take(&mut track.measure).finish();
             track.stats.land_phases = track
                 .land
                 .as_ref()

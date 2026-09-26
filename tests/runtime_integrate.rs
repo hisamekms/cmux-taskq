@@ -465,6 +465,42 @@ fn conflict_free_run_lands_as_one_squash_commit_and_releases_dependents() {
     assert_eq!(verifications.len(), 1, "{verifications:?}");
     assert_eq!(verifications[0]["command"], "test -f seed.txt");
     assert_eq!(verifications[0]["exit_code"], 0);
+    // Each command's time and the load it ran under (task 197).
+    let duration = verifications[0]["duration_secs"].as_f64().unwrap();
+    assert!((0.0..60.0).contains(&duration), "{}", verifications[0]);
+    assert_load(verifications[0]);
+    // The claim records the binary, the host and the load it was made
+    // under; each interval's end, its load.
+    let event = |kind: &str| {
+        &detail
+            .events
+            .iter()
+            .find(|e| e.kind == kind)
+            .unwrap_or_else(|| panic!("no {kind}"))
+            .payload
+    };
+    let claimed = event("run_claimed");
+    assert_eq!(claimed["dagq_version"], dagq::VERSION, "{claimed}");
+    assert_eq!(claimed["parallel"], 4, "{claimed}");
+    assert_eq!(claimed["slots"], 0, "{claimed}");
+    assert!(claimed["load_avg"].is_f64(), "{claimed}");
+    // The stub agent is no versioned install of Claude Code.
+    assert!(claimed["claude_version"].is_null(), "{claimed}");
+    assert!(
+        claimed["rustc_release"]
+            .as_str()
+            .is_some_and(|release| release.split('.').count() == 3),
+        "{claimed}"
+    );
+    assert!(
+        claimed["rustc_host"]
+            .as_str()
+            .is_some_and(|host| host.contains('-')),
+        "{claimed}"
+    );
+    assert!(claimed.get("path").is_none(), "{claimed}");
+    assert_load(event("receipt_observed"));
+    assert_load(event("validation_finished"));
     assert!(
         detail
             .events
@@ -2112,5 +2148,16 @@ fn a_renamed_migration_is_not_renumbered() {
     assert_eq!(
         migrations_on(&repo, "main"),
         ["migrations/0001_initial.sql", "migrations/0002_goals.sql"]
+    );
+}
+
+/// The load average an interval's end recorded: a mean no higher than
+/// the maximum.
+fn assert_load(payload: &Value) {
+    let mean = payload["load_avg_mean"].as_f64();
+    let max = payload["load_avg_max"].as_f64();
+    assert!(
+        mean.zip(max).is_some_and(|(mean, max)| mean <= max),
+        "{payload}"
     );
 }

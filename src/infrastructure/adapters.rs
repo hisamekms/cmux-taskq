@@ -6,6 +6,7 @@ use crate::{
     },
     domain::{
         CommitSha, Task, TaskId, TaskRun,
+        measure::HostVersions,
         recovery::ProcessInfo,
         stall::IDLE_LOG,
         stats::{
@@ -268,6 +269,38 @@ pub fn load_average() -> Option<f64> {
     // SAFETY: getloadavg writes at most `nelem` doubles into the buffer.
     let written = unsafe { libc::getloadavg(loads.as_mut_ptr(), 1) };
     (written >= 1 && loads[0].is_finite()).then_some(loads[0])
+}
+
+/// How long [`host_versions`] lets `rustc -vV` run.
+const RUSTC_VERSION_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The versions a claim records (task 197): Claude Code's from the file
+/// `claude` resolves to (`<...>/versions/<version>`, where its installer
+/// keeps each version; null for any other path), and `release` and `host`
+/// of `rustc -vV` run in `checkout`, so that its toolchain file applies
+/// (null when it cannot be run).
+pub fn host_versions(claude: &Path, checkout: &Path) -> HostVersions {
+    let versions = HostVersions {
+        claude_version: claude_version(claude),
+        ..HostVersions::default()
+    };
+    match capture(
+        Command::new("rustc").arg("-vV").current_dir(checkout),
+        RUSTC_VERSION_TIMEOUT,
+    ) {
+        Ok((status, stdout, _)) if status.success() => versions.with_rustc_verbose(&stdout),
+        _ => versions,
+    }
+}
+
+/// The version the path of Claude Code names: the file name of what
+/// `claude` resolves to when it sits in a `versions` directory.
+pub fn claude_version(claude: &Path) -> Option<String> {
+    let resolved = claude.canonicalize().ok()?;
+    let parent = resolved.parent()?.file_name()?;
+    (parent == "versions")
+        .then(|| resolved.file_name()?.to_str().map(str::to_owned))
+        .flatten()
 }
 
 pub fn output(command: &mut Command) -> Result<String> {
@@ -2742,5 +2775,29 @@ esac
         );
         assert_eq!(claude_global_config(None, Some("")), None);
         assert_eq!(claude_global_config(None, None), None);
+    }
+
+    /// Claude Code's version is the name of the versioned file `claude`
+    /// resolves to, through a link; any other path names none. `rustc -vV`
+    /// runs in the checkout, and a directory it cannot run in gives none.
+    #[test]
+    fn host_versions_come_from_the_claude_path_and_rustc() {
+        let dir = tempfile::tempdir().unwrap();
+        let versions = dir.path().join("versions");
+        fs::create_dir(&versions).unwrap();
+        let installed = versions.join("2.1.3");
+        fs::write(&installed, "").unwrap();
+        let link = dir.path().join("claude");
+        std::os::unix::fs::symlink(&installed, &link).unwrap();
+        assert_eq!(claude_version(&link).as_deref(), Some("2.1.3"));
+        assert_eq!(claude_version(&dir.path().join("elsewhere")), None);
+        let other = dir.path().join("claude-stub");
+        fs::write(&other, "").unwrap();
+        assert_eq!(claude_version(&other), None);
+        let host = host_versions(&link, dir.path());
+        assert_eq!(host.claude_version.as_deref(), Some("2.1.3"));
+        assert!(host.rustc_release.is_some(), "{host:?}");
+        let missing = host_versions(&other, &dir.path().join("missing"));
+        assert_eq!(missing, HostVersions::default());
     }
 }

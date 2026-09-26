@@ -246,11 +246,14 @@ impl SessionWatch {
         if !self.receipt_seen && sv.files.is_file(&self.receipt_path) {
             self.receipt_seen = true;
             self.receipt_seen_at = Some(Instant::now());
-            sv.queue.record_runtime_event(
-                run.id(),
-                "receipt_observed",
-                json!({"path": path_text(&self.receipt_path)?, "validated": false}),
-            )?;
+            // The work interval ends here (`stats`' `work`); its load goes
+            // with it (task 197).
+            let mut payload = json!({"path": path_text(&self.receipt_path)?, "validated": false});
+            if let Value::Object(load) = serde_json::to_value(sv.take_load(run.id()))? {
+                payload.as_object_mut().expect("an object").extend(load);
+            }
+            sv.queue
+                .record_runtime_event(run.id(), "receipt_observed", payload)?;
             info!(run_id = %run.id(), "receipt received for {}; waiting for the session to go idle (or a person's /exit)", run.id());
         }
         self.stall.settle(sv, run, self.receipt_seen)?;

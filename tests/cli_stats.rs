@@ -86,6 +86,197 @@ mod stats {
         }
     }
 
+    /// What each run was claimed with and the load over its intervals
+    /// (task 197): on the run, per version and load band, and per
+    /// verification command; the cmux failures per load band. Runs from
+    /// before any of it was recorded have nulls, and the older items stay.
+    #[test]
+    fn versions_loads_and_verification_times_come_from_the_events() {
+        let mut events = Events::default();
+        let claim = |dagq: &str, load: f64| {
+            json!({
+                "from": "ready", "to": "in_progress", "provider": "claude",
+                "dagq_version": dagq, "claude_version": "2.1.0",
+                "rustc_release": "1.93.0", "rustc_host": "aarch64-apple-darwin",
+                "parallel": 3, "slots": 1, "load_avg": load,
+            })
+        };
+        let load = |mean: f64, max: f64| json!({"load_avg_mean": mean, "load_avg_max": max});
+        let verify = |command: &str, secs: f64, exit_code: i64| {
+            json!({
+                "phase": "integration", "command": command, "exit_code": exit_code,
+                "duration_secs": secs, "load_avg_mean": 20.0, "load_avg_max": 30.0,
+            })
+        };
+        events.push(1, Some("a"), "run_claimed", 0, claim("0.4.0-dev+aaa", 2.5));
+        events.push(1, Some("a"), "receipt_observed", 10, load(5.0, 9.0));
+        events.push(
+            1,
+            Some("a"),
+            "validation_finished",
+            12,
+            json!({"status": "awaiting_integration", "load_avg_mean": 3.0, "load_avg_max": 4.0}),
+        );
+        events.push(
+            1,
+            Some("a"),
+            "verification_command",
+            20,
+            verify("cargo fmt --all --check", 2.0, 0),
+        );
+        events.push(
+            1,
+            Some("a"),
+            "verification_command",
+            22,
+            verify("cargo llvm-cov", 300.0, 0),
+        );
+        events.push(
+            1,
+            Some("a"),
+            "verification_command",
+            22,
+            json!({"phase": "recheck", "command": "cargo llvm-cov", "duration_secs": 1.0}),
+        );
+        events.run(1, "a", "run_integrated", 30);
+        events.push(
+            2,
+            Some("b"),
+            "run_claimed",
+            40,
+            claim("0.4.0-dev+bbb", 70.0),
+        );
+        events.push(
+            2,
+            Some("b"),
+            "backend_call_failed",
+            41,
+            json!({"op": "capture", "load_avg": 70.0}),
+        );
+        events.push(
+            2,
+            Some("b"),
+            "backend_call_failed",
+            42,
+            json!({"op": "capture", "load_avg": 5.0}),
+        );
+        events.push(
+            2,
+            Some("b"),
+            "backend_call_failed",
+            42,
+            json!({"op": "capture", "load_avg": null}),
+        );
+        events.push(
+            2,
+            Some("b"),
+            "verification_command",
+            50,
+            verify("cargo llvm-cov", 100.0, 101),
+        );
+        events.push(
+            2,
+            Some("b"),
+            "verification_command",
+            51,
+            verify("cargo llvm-cov", 200.0, 0),
+        );
+        events.run(2, "b", "run_integrated", 60);
+        events.run(3, "c", "run_claimed", 70);
+        events.status(3, "c", "validation_finished", 80, "failed");
+        let report = value(&stats(
+            &events.0,
+            &goals([(1, None), (2, None), (3, None)]),
+            at(120),
+            SlotSnapshot::default(),
+            &StatsQuery::default(),
+            &LiveSnapshot::default(),
+        ));
+        let runs = report["runs"].as_array().unwrap();
+        let a = &runs[0];
+        assert_eq!(a["dagq_version"], "0.4.0-dev+aaa");
+        assert_eq!(a["claude_version"], "2.1.0");
+        assert_eq!(a["rustc_release"], "1.93.0");
+        assert_eq!(a["rustc_host"], "aarch64-apple-darwin");
+        assert_eq!(a["claim_parallel"], 3);
+        assert_eq!(a["claim_slots"], 1);
+        assert_eq!(a["claim_load_avg"], 2.5);
+        assert_eq!(
+            a["load"]["work"],
+            json!({"mean": 5.0, "max": 9.0, "band": "4-8"})
+        );
+        assert_eq!(
+            a["load"]["validate"],
+            json!({"mean": 3.0, "max": 4.0, "band": "0-4"})
+        );
+        assert_eq!(
+            a["load"]["verify"],
+            json!({"mean": 20.0, "max": 30.0, "band": "16-32"})
+        );
+        assert_eq!(a["load_band"], "4-8");
+        // Only the claim's load: the band is its.
+        assert_eq!(runs[1]["load_band"], "64+");
+        assert_eq!(runs[1]["load"]["work"], Value::Null);
+        // A run claimed without any of it.
+        let c = &runs[2];
+        for key in [
+            "dagq_version",
+            "claude_version",
+            "rustc_release",
+            "claim_load_avg",
+            "load_band",
+        ] {
+            assert_eq!(c[key], Value::Null, "{key}");
+        }
+        assert_eq!(
+            c["load"],
+            json!({"work": null, "validate": null, "verify": null})
+        );
+        // The older items are all still there.
+        for key in [
+            "work",
+            "validate",
+            "wait_to_land",
+            "startup",
+            "status",
+            "kind",
+        ] {
+            assert!(c.get(key).is_some(), "{key}");
+        }
+
+        let versions = &report["versions"];
+        let dagq = versions["dagq"].as_array().unwrap();
+        assert_eq!(dagq.len(), 3);
+        assert_eq!(dagq[0]["version"], "0.4.0-dev+aaa");
+        assert_eq!(dagq[0]["runs"], 1);
+        assert_eq!(dagq[0]["work"]["median"], 600);
+        assert_eq!(dagq[1]["version"], "0.4.0-dev+bbb");
+        assert_eq!(dagq[2]["version"], Value::Null);
+        assert_eq!(versions["claude"][0]["version"], "2.1.0");
+        assert_eq!(versions["claude"][0]["runs"], 2);
+        assert_eq!(
+            versions["rustc"][0]["version"],
+            "1.93.0 aarch64-apple-darwin"
+        );
+        let bands = report["load_bands"].as_array().unwrap();
+        let names = bands.iter().map(|b| b["band"].clone()).collect::<Vec<_>>();
+        assert_eq!(names, [json!("4-8"), json!("64+"), Value::Null]);
+        assert_eq!(bands[0]["runs"], 1);
+
+        assert_eq!(
+            report["backend_failures"]["by_load_band"],
+            json!([{"band": "4-8", "count": 1}, {"band": "64+", "count": 1}])
+        );
+        assert_eq!(report["backend_failures"]["count"], 3);
+        assert_eq!(
+            report["verification_commands"],
+            json!([
+                {"command": "cargo fmt --all --check", "count": 1, "failed": 0, "total_secs": 2.0, "median_secs": 2.0},
+                {"command": "cargo llvm-cov", "count": 3, "failed": 1, "total_secs": 600.0, "median_secs": 200.0},
+            ])
+        );
+    }
+
     #[test]
     fn runs_goals_and_alerts_come_from_the_event_sequence() {
         let mut events = Events::default();
@@ -183,6 +374,13 @@ mod stats {
                     "started_at": "2026-09-23T12:13:00.000Z",
                     "secs": null, "resolved": null,
                 }],
+                // Task 197: nothing was recorded at the claim nor over
+                // the intervals.
+                "dagq_version": null, "claude_version": null,
+                "rustc_release": null, "rustc_host": null,
+                "claim_parallel": null, "claim_slots": null, "claim_load_avg": null,
+                "load": {"work": null, "validate": null, "verify": null},
+                "load_band": null,
             })
         );
         // Parked three times, then the landing: the wait is the resume's.
@@ -389,7 +587,9 @@ mod stats {
         assert_eq!(
             all["backend_failures"],
             json!({"count": 4, "by_op": {"close": 1, "ensure_group": 1, "send_exit": 2},
-                   "max_load_avg": 34.25, "max_slots": 4})
+                   "max_load_avg": 34.25, "max_slots": 4,
+                   "by_load_band": [{"band": "0-4", "count": 1}, {"band": "16-32", "count": 1},
+                                    {"band": "32-64", "count": 1}]})
         );
         assert!(all["alerts"].as_array().unwrap().contains(&alert));
 
@@ -422,7 +622,7 @@ mod stats {
         });
         assert_eq!(
             only_close["backend_failures"],
-            json!({"count": 0, "by_op": {}, "max_load_avg": null, "max_slots": null})
+            json!({"count": 0, "by_op": {}, "max_load_avg": null, "max_slots": null, "by_load_band": []})
         );
 
         // Nothing past the last event: an empty window.

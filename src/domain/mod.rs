@@ -426,6 +426,7 @@ pub mod goal;
 pub mod ids;
 mod input;
 pub mod lint;
+pub mod measure;
 pub mod plan_review;
 pub mod planner;
 pub mod proposal;

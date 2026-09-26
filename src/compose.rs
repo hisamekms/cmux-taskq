@@ -46,7 +46,7 @@ use crate::{
     infrastructure::{
         adapters::{
             ClaudeCode, Cmux, GitRepository, SystemProcesses, claude_trusts_repository,
-            load_average, path_text,
+            host_versions, load_average, path_text,
         },
         binaries::LocalBinaries,
         clock,
@@ -279,6 +279,7 @@ pub fn supervise_with_reviewer(
         generators,
         review_material: &review_material,
         load_average,
+        host_versions,
         layout,
     };
     supervisor::supervise(&ports, &options.settings(stall, conflicts))
@@ -379,6 +380,7 @@ impl OneShot {
             ids: &*self.generators.ids,
             processes: &SystemProcesses,
             pid: std::process::id(),
+            load_average,
         };
         let Some(begun) = integration::begin(&mut integration, target, repo)? else {
             return Ok(serde_json::to_value(IntegrationOutcome::NoRunAwaiting)?);

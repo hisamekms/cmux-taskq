@@ -51,6 +51,7 @@ impl Supervisor<'_> {
             .find(|e| e.kind == "integration_approved")
             .is_none_or(|e| e.payload.get("push") != Some(&json!(false)));
         let generators = self.generators.clone();
+        let load_average = self.load_average;
         Ok(spawn_traced(move || {
             let mut queue = queues.open()?;
             integration::land_integrating(
@@ -65,6 +66,7 @@ impl Supervisor<'_> {
                     ids: &*generators.ids,
                     processes: &*processes,
                     pid,
+                    load_average,
                 },
                 &run,
                 previous,

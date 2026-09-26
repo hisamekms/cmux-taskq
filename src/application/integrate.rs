@@ -7,7 +7,12 @@
 
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Value, json};
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    sync::mpsc,
+    thread,
+    time::{Duration, Instant},
+};
 use tracing::{info, warn};
 
 use super::{
@@ -19,6 +24,7 @@ use crate::domain::{
     PUSH_REMOTE, PushReport, PushResult, Reason, ReasonCode, Receipt, ReceiptResult,
     RegisteredFollowUp, RunId, RunStatus, Task, TaskId, TaskRun, evidence_missing_reason,
     heartbeat_stale,
+    measure::{LoadSummary, LoadWindow},
     scope::{out_of_scope, scope_violation_reason},
 };
 use crate::migration_numbers;
@@ -221,6 +227,9 @@ pub struct Integration<'a> {
     pub processes: &'a dyn ProcessControl,
     /// This process, recorded with the approval to land.
     pub pid: u32,
+    /// The 1-minute load average, sampled while each verification command
+    /// runs (task 197).
+    pub load_average: fn() -> Option<f64>,
 }
 
 /// A run that holds the integration slot under `token`: `previous` is the
@@ -348,7 +357,16 @@ pub fn land_integrating(
         run.id(),
         run.task_id()
     );
-    let verdict = match land(queue, repository, ctx.verifier, ctx.files, &task, run, main) {
+    let verdict = match land(
+        queue,
+        repository,
+        ctx.verifier,
+        ctx.load_average,
+        ctx.files,
+        &task,
+        run,
+        main,
+    ) {
         Ok(verdict) => verdict,
         Err(error) => {
             // Nothing reached main: give the slot back and keep the run where it was.
@@ -735,10 +753,12 @@ enum Verdict {
 /// Rebase, re-validate and land one run. `Ok(Deferred)` and
 /// `Ok(ReceiptFailed)` are verdicts on the run; `Err` is a failure of the
 /// landing itself (Git, files) before `main` moved.
+#[allow(clippy::too_many_arguments)]
 fn land(
     queue: &mut dyn Queue,
     repository: &dyn Repository,
     verifier: &dyn Verifier,
+    load_average: fn() -> Option<f64>,
     files: &dyn RunFiles,
     task: &Task,
     run: &TaskRun,
@@ -963,7 +983,12 @@ fn land(
     let attempt = next_integrate_attempt(files, run_dir);
     for (index, command) in commands.iter().enumerate() {
         let log = integrate_verify_log(run_dir, attempt, index + 1);
-        let status = verifier.run_to_log(command, worktree, &run_env, &log)?;
+        let started = Instant::now();
+        let (status, load) = sampled(load_average, LOAD_SAMPLE_INTERVAL, || {
+            verifier.run_to_log(command, worktree, &run_env, &log)
+        });
+        let duration_secs = (started.elapsed().as_secs_f64() * 1000.0).round() / 1000.0;
+        let status = status?;
         let exit_code = status.code.unwrap_or(128);
         let output = files.read_to_string(&log).unwrap_or_default();
         queue.record_runtime_event(
@@ -975,6 +1000,9 @@ fn land(
                 "index": index + 1,
                 "command": command,
                 "exit_code": exit_code,
+                "duration_secs": duration_secs,
+                "load_avg_mean": load.load_avg_mean,
+                "load_avg_max": load.load_avg_max,
                 "log_path": path_text(&log)?,
                 "output_tail": tail(&output, 2000),
             }),
@@ -1153,6 +1181,38 @@ fn renumber_migration(
         run.id()
     );
     Ok(Renumbering::Renumbered(head))
+}
+
+/// How often [`sampled`] reads the load average while a verification
+/// command runs.
+const LOAD_SAMPLE_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Run `work`, sampling `load_average` when it starts, every `every` while
+/// it runs, and when it ends: the load over one verification command.
+fn sampled<T>(
+    load_average: fn() -> Option<f64>,
+    every: Duration,
+    work: impl FnOnce() -> T,
+) -> (T, LoadSummary) {
+    let (stop, stopped) = mpsc::channel::<()>();
+    thread::scope(|scope| {
+        let sampler = scope.spawn(move || {
+            let mut window = LoadWindow::default();
+            loop {
+                window.add(load_average());
+                match stopped.recv_timeout(every) {
+                    Err(mpsc::RecvTimeoutError::Timeout) => (),
+                    _ => break,
+                }
+            }
+            window.add(load_average());
+            window.summary()
+        });
+        let value = work();
+        drop(stop);
+        let load = sampler.join().unwrap_or_default();
+        (value, load)
+    })
 }
 
 /// Where integrate's attempt `attempt` writes the log of its `index`th

@@ -834,6 +834,7 @@ impl TaskStore for SqliteQueue {
             self.generators.clock.system_time(),
             base_commit,
             &[],
+            None,
         )?;
         tx.commit()?;
         Ok(outcome)
@@ -1649,7 +1650,9 @@ fn claim_order(conn: &Connection) -> Result<Vec<TaskId>> {
 /// claim order). There
 /// is no queue-wide execution slot; `one_unfinished_run_per_task` is the
 /// only limit, so concurrent claims take different tasks. The run is
-/// created at `at` with an ID from `ids`.
+/// created at `at` with an ID from `ids`. `attributes` (an object: what a
+/// supervisor measured at the claim, task 197) go into `run_claimed`
+/// beside its transition.
 pub(super) fn claim_task(
     tx: &Connection,
     runs_dir: &Path,
@@ -1657,6 +1660,7 @@ pub(super) fn claim_task(
     at: SystemTime,
     base_commit: &CommitSha,
     order: &[TaskId],
+    attributes: Option<&serde_json::Value>,
 ) -> Result<ClaimOutcome> {
     let mut ready = ready_tasks(tx)?;
     if ready.is_empty() {
@@ -1696,13 +1700,16 @@ pub(super) fn claim_task(
             run.created_at()
         ],
     )?;
-    event(
-        tx,
-        task.id(),
-        Some(run.id()),
-        "run_claimed",
-        json!({"from": "ready", "to": task.status(), "provider": run.actual_provider()}),
-    )?;
+    event(tx, task.id(), Some(run.id()), "run_claimed", {
+        let mut payload =
+            json!({"from": "ready", "to": task.status(), "provider": run.actual_provider()});
+        if let (Some(payload), Some(serde_json::Value::Object(attributes))) =
+            (payload.as_object_mut(), attributes)
+        {
+            payload.extend(attributes.clone());
+        }
+        payload
+    })?;
     let run = run.relocated(runs_dir);
     Ok(ClaimOutcome::Claimed { run: Box::new(run) })
 }

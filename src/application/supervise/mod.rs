@@ -29,6 +29,7 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -69,6 +70,7 @@ use crate::domain::{
     ReviewDecision, ReviewVerdict, RunId, RunLease, RunPaths, RunPlan, RunProcess, RunStatus,
     SessionRole, TRIAGE_OPTIONS, TRIAGE_RETRY_FAILURES, TaskAction, TaskId, TaskRun, TaskStatus,
     TriageDecision, TriageState, TriageVerdict, heartbeat_stale,
+    measure::{ClaimAttributes, HostVersions, LoadSummary, LoadWindow},
     recovery::RecoveryDecision,
     resume::{ResumeCount, inherits_on_exhaustion},
     run_env::RUN_ENV_PROGRAM_KINDS,
@@ -227,8 +229,12 @@ pub struct Ports<'a> {
     /// Writes a task's review material (`review`) and reports its path.
     pub review_material: &'a dyn Fn(TaskId) -> Result<Value>,
     /// The log of this start, given the registration's `started_at`.
-    /// The 1-minute load average recorded with a failed cmux call.
+    /// The 1-minute load average recorded with a failed cmux call, at a
+    /// claim and over each interval of a run.
     pub load_average: fn() -> Option<f64>,
+    /// The versions of Claude Code (given `--claude`) and of the host's
+    /// `rustc` (run in the given checkout) a claim records (task 197).
+    pub host_versions: fn(&Path, &Path) -> HostVersions,
     pub layout: Layout,
 }
 
@@ -411,6 +417,9 @@ pub fn supervise(ports: &Ports<'_>, settings: &LoopSettings) -> Result<Value> {
         draining: false,
         update: update::UpdateWatch::default(),
         rechecks: recheck::Rechecks::default(),
+        load_average: ports.load_average,
+        host_versions: ports.host_versions,
+        loads: HashMap::new(),
     };
     if settings.handoff_token.is_some() {
         supervisor.rebuild_own_runs(previous_version.as_deref())?;
@@ -492,6 +501,11 @@ struct Supervisor<'a> {
     update: update::UpdateWatch,
     /// The landing recheck running and the one due (ADR-0068).
     rechecks: recheck::Rechecks,
+    /// The 1-minute load average, and the host's versions a claim records.
+    load_average: fn() -> Option<f64>,
+    host_versions: fn(&Path, &Path) -> HostVersions,
+    /// The load samples of each held run's current interval (task 197).
+    loads: HashMap<RunId, LoadWindow>,
 }
 
 /// One executing run between provisioning and rest.
@@ -734,6 +748,7 @@ impl Supervisor<'_> {
         if self.run_env_missing {
             return Ok(());
         }
+        let mut host: Option<HostVersions> = None;
         while self.slots.len() < parallel {
             // Highest effective priority, then most-releasing, then lowest
             // ID (ADR-0040 decision 4); `candidates` and `graph` show the
@@ -743,13 +758,24 @@ impl Supervisor<'_> {
                 break;
             }
             let base = self.repository.main_head()?;
-            let run = match self
-                .queue
-                .claim_for_supervisor_in_order(&base, &self.token, &order)?
-            {
+            // Read once per pass: `rustc -vV` takes a moment on a loaded host.
+            let host = host.get_or_insert_with(|| {
+                (self.host_versions)(&self.layout.claude, &self.layout.repo_root)
+            });
+            let attributes = self.claim_attributes(parallel, host.clone());
+            let run = match self.queue.claim_for_supervisor_in_order(
+                &base,
+                &self.token,
+                &order,
+                Some(&serde_json::to_value(&attributes)?),
+            )? {
                 ClaimOutcome::Claimed { run } => *run,
                 ClaimOutcome::NoReadyTask => break,
             };
+            // The work interval starts at the claim, with its sample.
+            let mut window = LoadWindow::default();
+            window.add(attributes.load_avg);
+            self.loads.insert(run.id().clone(), window);
             match self.provision(&run) {
                 Ok(watch) => {
                     let run = self.queue.run(run.id())?;
@@ -805,9 +831,36 @@ impl Supervisor<'_> {
         self.run_env_missing = !check.missing().is_empty();
         Ok(())
     }
+    /// What `run_claimed` records of a claim made now (task 197): this
+    /// binary's build identifier, the host's versions, `parallel`, the
+    /// slots held before the claim and the load average.
+    fn claim_attributes(&self, parallel: usize, host: HostVersions) -> ClaimAttributes {
+        ClaimAttributes {
+            dagq_version: self.layout.version.clone(),
+            host,
+            parallel,
+            slots: self.slots.len(),
+            load_avg: (self.load_average)(),
+        }
+    }
+    /// Sample the load average once for every slot's current interval
+    /// (task 197); the windows of runs no slot holds any more are dropped.
+    fn sample_load(&mut self) {
+        let load = (self.load_average)();
+        let held: HashSet<&RunId> = self.slots.iter().map(|slot| slot.run.id()).collect();
+        self.loads.retain(|id, _| held.contains(id));
+        for id in held {
+            self.loads.entry(id.clone()).or_default().add(load);
+        }
+    }
+    /// The load over the run's interval that ends now, and start the next.
+    pub(super) fn take_load(&mut self, id: &RunId) -> LoadSummary {
+        self.loads.entry(id.clone()).or_default().take()
+    }
     /// One pass over the slots; with `unsettled_only`, over the slots a
     /// handoff waits for (their validation or landing in progress) only.
     fn tick(&mut self, unsettled_only: bool) {
+        self.sample_load();
         let mut index = 0;
         while index < self.slots.len() {
             if unsettled_only && self.slots[index].phase.rebuildable() {
@@ -1217,11 +1270,12 @@ impl Supervisor<'_> {
                 if !handle.as_ref().is_some_and(|h| h.is_finished()) {
                     return Ok(Step::Continue);
                 }
-                let validation = handle
+                let mut validation = handle
                     .take()
                     .context("validation already joined")?
                     .join()
                     .map_err(|_| anyhow!("validation thread panicked"))??;
+                validation.load = self.take_load(slot.run.id());
                 let run = self
                     .queue
                     .finish_validation(slot.run.id(), &self.token, &validation)?;
@@ -1534,6 +1588,7 @@ fn spawn_validation(
                 evidence_missing: Vec::new(),
                 scope_violation: Vec::new(),
                 allowed_paths: Vec::new(),
+                load: LoadSummary::default(),
             },
             Err(rejection) => {
                 warn!(run_id = %run.id(), "run {} rejected: {}", run.id(), rejection.reason);
@@ -1554,6 +1609,7 @@ fn spawn_validation(
                         task.paths().to_vec()
                     },
                     scope_violation: rejection.scope_violation,
+                    load: LoadSummary::default(),
                 }
             }
         })

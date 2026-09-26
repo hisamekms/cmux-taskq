@@ -794,6 +794,10 @@ pub struct Validation {
     pub scope_violation: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub allowed_paths: Vec<String>,
+    /// The load average from `receipt_observed` to this validation (task
+    /// 197): the supervisor's samples, filled in when it records the result.
+    #[serde(flatten)]
+    pub load: crate::domain::measure::LoadSummary,
 }
 
 /// A workspace an ended run opened (the worker's or a resume's), which the
@@ -1034,12 +1038,14 @@ pub trait RunStore {
     fn bind_repository(&mut self, common_dir: &str) -> Result<()>;
     fn assert_repository(&self, common_dir: &str) -> Result<()>;
     /// [`RunStore::claim_for_supervisor`], taking the first task of `order`
-    /// that is still claimable.
+    /// that is still claimable, with `attributes` (an object) in its
+    /// `run_claimed`.
     fn claim_for_supervisor_in_order(
         &mut self,
         base_commit: &CommitSha,
         token: &str,
         order: &[TaskId],
+        attributes: Option<&serde_json::Value>,
     ) -> Result<ClaimOutcome>;
     /// One heartbeat of the process `token`: its registration and every
     /// lease it holds; how many leases there were.
