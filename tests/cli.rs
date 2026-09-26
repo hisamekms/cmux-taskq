@@ -3123,7 +3123,8 @@ fn migrate_is_explicit_and_older_binaries_keep_working_within_the_floor() {
             {"version": 28, "compatible": false},
             {"version": 29, "compatible": false},
             {"version": 30, "compatible": false},
-            {"version": 31, "compatible": true}
+            {"version": 31, "compatible": true},
+            {"version": 32, "compatible": false}
         ])
     );
     assert_eq!(version(), 23);

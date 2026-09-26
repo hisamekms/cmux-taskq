@@ -9,13 +9,19 @@
 //! TOML that needs no parser crate.
 use anyhow::{Context, Result, bail, ensure};
 use std::{
+    env,
+    ffi::OsStr,
     fs,
     path::{Path, PathBuf},
 };
 
 use crate::{
     application::{Exit, Verifier},
-    domain::{stall::StallConfig, stats::ConflictConfig},
+    domain::{
+        run_env::{RunEnvCheck, RunEnvProgram},
+        stall::StallConfig,
+        stats::ConflictConfig,
+    },
 };
 
 pub const CONFIG_FILE_NAME: &str = "dagq.toml";
@@ -28,6 +34,21 @@ const TABLES: [&str; 3] = [RUN_ENV_TABLE, STALL_TABLE, CONFLICTS_TABLE];
 /// Names the runtime itself sets on a workspace (`DAGQ_ROLE`, `DAGQ_QUEUE`)
 /// and may set later; `[run.env]` cannot override them.
 const RESERVED_PREFIX: &str = "DAGQ_";
+
+/// The variables of `[run.env]` cargo executes as a program (ADR-0049
+/// decision 9): `up`, the supervisor, `integrate` and `doctor` check that
+/// each one's value resolves. A tool other than cargo's is not inferred;
+/// naming one needs an ADR that adds a table declaring it.
+pub const PROGRAM_VARIABLES: [&str; 8] = [
+    "RUSTC_WRAPPER",
+    "RUSTC_WORKSPACE_WRAPPER",
+    "RUSTC",
+    "RUSTDOC",
+    "CARGO_BUILD_RUSTC_WRAPPER",
+    "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER",
+    "CARGO_BUILD_RUSTC",
+    "CARGO_BUILD_RUSTDOC",
+];
 
 /// `[run.env]` as written, in file order, values unexpanded.
 pub fn parse_run_env(text: &str) -> Result<Vec<(String, String)>> {
@@ -217,6 +238,77 @@ pub fn load_run_env(
         .collect())
 }
 
+/// Where `value` resolves as a program: a value with a `/` is that path, one
+/// without is looked up in each directory of `path` in order, like a shell
+/// does; either must be an executable file.
+pub fn resolve_program(value: &str, path: Option<&OsStr>) -> Option<PathBuf> {
+    if value.contains('/') {
+        let candidate = PathBuf::from(value);
+        return is_executable(&candidate).then_some(candidate);
+    }
+    env::split_paths(path?)
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .map(|dir| dir.join(value))
+        .find(|candidate| is_executable(candidate))
+}
+
+fn is_executable(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    fs::metadata(path).is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+}
+
+/// Resolve every variable of `env` (expanded) that names a program
+/// ([`PROGRAM_VARIABLES`]) in `path`. An empty value names none (cargo runs
+/// no wrapper for an empty `RUSTC_WRAPPER`).
+pub fn check_programs(env: &[(String, String)], path: Option<&OsStr>) -> RunEnvCheck {
+    RunEnvCheck {
+        config: true,
+        path: path
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+        programs: env
+            .iter()
+            .filter(|(key, value)| PROGRAM_VARIABLES.contains(&key.as_str()) && !value.is_empty())
+            .map(|(key, value)| RunEnvProgram {
+                variable: key.clone(),
+                value: value.clone(),
+                resolved: resolve_program(value, path)
+                    .map(|resolved| resolved.to_string_lossy().into_owned()),
+            })
+            .collect(),
+    }
+}
+
+/// Check the programs of the `[run.env]` in the `dagq.toml` of `root` in
+/// `path`, the values expanded for the run whose directory is `run_dir`.
+/// Without a run (`up`, a claim, `doctor`) a value that names
+/// `${DAGQ_RUN_DIR}` is not checked: nothing is in a run directory before
+/// the run exists. No file is nothing to check.
+pub fn check_run_env_programs(
+    root: &Path,
+    queue_dir: &Path,
+    run_dir: Option<&Path>,
+    path: Option<&OsStr>,
+) -> Result<RunEnvCheck> {
+    let file = root.join(CONFIG_FILE_NAME);
+    let Some(text) = read_config(&file)? else {
+        return Ok(RunEnvCheck::default());
+    };
+    let queue_dir = path_str(queue_dir)?;
+    let run_dir = run_dir.map(path_str).transpose()?;
+    let run_dir_var = format!("${{{RUN_DIR_VAR}}}");
+    let env: Vec<(String, String)> = parse_run_env(&text)
+        .with_context(|| format!("parse {}", file.display()))?
+        .into_iter()
+        .filter(|(_, value)| run_dir.is_some() || !value.contains(&run_dir_var))
+        .map(|(key, value)| {
+            let value = expand(&value, queue_dir, run_dir.unwrap_or_default());
+            (key, value)
+        })
+        .collect();
+    Ok(check_programs(&env, path))
+}
+
 fn path_str(path: &Path) -> Result<&str> {
     path.to_str()
         .with_context(|| format!("{} is not UTF-8", path.display()))
@@ -289,6 +381,19 @@ impl Verifier for ShellVerifier {
             .parent()
             .context("queue database has no directory")?;
         load_run_env(&self.checkout, queue_dir, run_dir)
+    }
+
+    fn run_env_programs(&self, run_dir: Option<&Path>) -> Result<RunEnvCheck> {
+        let queue_dir = self
+            .db
+            .parent()
+            .context("queue database has no directory")?;
+        check_run_env_programs(
+            &self.checkout,
+            queue_dir,
+            run_dir,
+            env::var_os("PATH").as_deref(),
+        )
     }
 
     fn run_to_log(
@@ -501,6 +606,143 @@ LITERAL = 'no \n escapes # here'
             error.contains("parse ") && error.contains("unknown table"),
             "{error}"
         );
+    }
+
+    fn executable(dir: &Path, name: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join(name);
+        fs::write(&path, "#!/bin/sh\n").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    #[test]
+    fn resolves_a_program_by_path_or_in_the_path_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("bin");
+        fs::create_dir(&bin).unwrap();
+        let tool = executable(&bin, "tool");
+        fs::write(bin.join("plain"), "not executable").unwrap();
+        fs::create_dir(bin.join("folder")).unwrap();
+        let path = env::join_paths(["", "/nonexistent", bin.to_str().unwrap()]).unwrap();
+        assert_eq!(resolve_program("tool", Some(&path)), Some(tool.clone()));
+        assert_eq!(resolve_program(tool.to_str().unwrap(), None), Some(tool));
+        for missing in ["plain", "folder", "absent"] {
+            assert_eq!(resolve_program(missing, Some(&path)), None, "{missing}");
+        }
+        assert_eq!(resolve_program("tool", None), None);
+        assert_eq!(
+            resolve_program(bin.join("plain").to_str().unwrap(), Some(&path)),
+            None
+        );
+    }
+
+    #[test]
+    fn checks_only_the_variables_cargo_executes_with_a_value() {
+        let dir = tempfile::tempdir().unwrap();
+        executable(dir.path(), "sccache");
+        let path = dir.path().as_os_str();
+        let check = check_programs(
+            &pairs(&[
+                ("RUSTC_WRAPPER", "sccache"),
+                ("SCCACHE_IGNORE_SERVER_IO_ERROR", "1"),
+                ("RUSTC_WORKSPACE_WRAPPER", ""),
+                ("CARGO_BUILD_RUSTDOC", "missing-rustdoc"),
+            ]),
+            Some(path),
+        );
+        assert!(check.config);
+        assert_eq!(check.path, dir.path().to_str().unwrap());
+        assert_eq!(
+            check.programs,
+            vec![
+                RunEnvProgram {
+                    variable: "RUSTC_WRAPPER".into(),
+                    value: "sccache".into(),
+                    resolved: Some(dir.path().join("sccache").to_str().unwrap().into()),
+                },
+                RunEnvProgram {
+                    variable: "CARGO_BUILD_RUSTDOC".into(),
+                    value: "missing-rustdoc".into(),
+                    resolved: None,
+                },
+            ]
+        );
+        assert_eq!(check.missing().len(), 1);
+    }
+
+    #[test]
+    fn checks_the_run_env_of_the_file_in_the_root() {
+        let root = tempfile::tempdir().unwrap();
+        let queue = tempfile::tempdir().unwrap();
+        let bin = queue.path().join("bin");
+        fs::create_dir(&bin).unwrap();
+        executable(&bin, "sccache");
+        let path = bin.as_os_str();
+        // No dagq.toml: nothing to check, whatever the PATH holds.
+        let none = check_run_env_programs(root.path(), queue.path(), None, None).unwrap();
+        assert_eq!(none, RunEnvCheck::default());
+        assert!(none.missing_message().is_none());
+        // A [run.env] without a program: nothing missing.
+        fs::write(root.path().join(CONFIG_FILE_NAME), "[run.env]\nA = 'x'\n").unwrap();
+        let plain = check_run_env_programs(root.path(), queue.path(), None, Some(path)).unwrap();
+        assert!(plain.config && plain.programs.is_empty());
+        // Found on the PATH, by name and by an expanded path.
+        fs::write(
+            root.path().join(CONFIG_FILE_NAME),
+            "[run.env]\nRUSTC_WRAPPER = 'sccache'\nRUSTC_WORKSPACE_WRAPPER = '${DAGQ_QUEUE_DIR}/bin/sccache'\nRUSTDOC = '${DAGQ_RUN_DIR}/rustdoc'\n",
+        )
+        .unwrap();
+        let found = check_run_env_programs(root.path(), queue.path(), None, Some(path)).unwrap();
+        assert_eq!(found.programs.len(), 2, "{found:?}");
+        assert!(found.missing().is_empty(), "{found:?}");
+        // With a run, the run directory is expanded and checked too.
+        let run = queue.path().join("runs/r1");
+        fs::create_dir_all(&run).unwrap();
+        let in_run =
+            check_run_env_programs(root.path(), queue.path(), Some(&run), Some(path)).unwrap();
+        assert_eq!(in_run.missing()[0].variable, "RUSTDOC");
+        assert_eq!(
+            in_run.missing()[0].value,
+            run.join("rustdoc").to_str().unwrap()
+        );
+        // Missing from the PATH.
+        let missing = check_run_env_programs(
+            root.path(),
+            queue.path(),
+            None,
+            Some(OsStr::new("/nonexistent")),
+        )
+        .unwrap();
+        assert_eq!(missing.missing()[0].variable, "RUSTC_WRAPPER");
+        assert!(
+            missing
+                .missing_message()
+                .unwrap()
+                .contains("RUSTC_WRAPPER = \"sccache\"")
+        );
+        fs::write(root.path().join(CONFIG_FILE_NAME), "[other]\n").unwrap();
+        assert!(check_run_env_programs(root.path(), queue.path(), None, Some(path)).is_err());
+    }
+
+    #[test]
+    fn the_shell_verifier_checks_on_the_process_path() {
+        let root = tempfile::tempdir().unwrap();
+        let queue = tempfile::tempdir().unwrap();
+        let verifier = ShellVerifier {
+            checkout: root.path().to_path_buf(),
+            db: queue.path().join("queue.sqlite3"),
+        };
+        assert!(!verifier.run_env_programs(None).unwrap().config);
+        fs::write(
+            root.path().join(CONFIG_FILE_NAME),
+            "[run.env]\nRUSTC_WRAPPER = '/nonexistent/sccache'\nRUSTC = 'sh'\n",
+        )
+        .unwrap();
+        let check = verifier.run_env_programs(Some(queue.path())).unwrap();
+        assert_eq!(check.programs.len(), 2);
+        assert_eq!(check.missing().len(), 1, "{check:?}");
+        assert_eq!(check.missing()[0].variable, "RUSTC_WRAPPER");
     }
 
     #[test]

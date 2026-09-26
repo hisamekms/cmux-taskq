@@ -69,6 +69,7 @@ use crate::domain::{
     SessionRole, TRIAGE_OPTIONS, TRIAGE_RETRY_FAILURES, TaskAction, TaskId, TaskRun, TaskStatus,
     TriageDecision, TriageState, TriageVerdict, heartbeat_stale,
     recovery::RecoveryDecision,
+    run_env::RUN_ENV_PROGRAM_KINDS,
     stall::{BackgroundTask, STALL_CONFIG_LOADED, StallConfig},
     triage_state,
 };
@@ -394,6 +395,8 @@ pub fn supervise(ports: &Ports<'_>, settings: &LoopSettings) -> Result<Value> {
         planner_exits: Vec::new(),
         handoff: None,
         exec: None,
+        run_env_missing: false,
+        draining: false,
     };
     if settings.handoff_token.is_some() {
         supervisor.rebuild_own_runs(previous_version.as_deref())?;
@@ -464,6 +467,13 @@ struct Supervisor<'a> {
     handoff: Option<String>,
     /// Set when the loop ended for that exec: the registration stays.
     exec: Option<String>,
+    /// A program `[run.env]` names did not resolve on this process's PATH
+    /// at the last claim pass (ADR-0049 decision 9): nothing is claimed and
+    /// no passed run lands until it does.
+    run_env_missing: bool,
+    /// This pass drains (a stop, a handoff, or claiming stopped after a
+    /// provisioning failure): nothing may wait for the program to appear.
+    draining: bool,
 }
 
 /// One executing run between provisioning and rest.
@@ -579,6 +589,10 @@ impl Supervisor<'_> {
                 return Err(error);
             }
             let stopping = options.stop.load(Ordering::SeqCst);
+            // Every pass, draining or not, so a hold on landings ends as soon
+            // as the program is found (ADR-0049 decision 9).
+            self.check_run_env_programs()?;
+            self.draining = stopping || !self.claiming || self.handoff.is_some();
             // A stop wins over a handoff: the drain goes on as before.
             if !stopping {
                 if self.handoff.is_none() {
@@ -608,6 +622,7 @@ impl Supervisor<'_> {
                             "triaged": self.triaged,
                         }));
                     }
+                    self.draining = true;
                     self.poll_observer();
                     self.tick(true);
                     thread::sleep(options.tick);
@@ -681,6 +696,12 @@ impl Supervisor<'_> {
         if let Err(error) = self.sweep_ended_runs(sweep_interval) {
             warn!(error = %format_args!("{error:#}"), "the workspaces and worktrees of ended runs could not all be swept: {error:#}");
         }
+        // A run claimed now would fail every cargo command (ADR-0049
+        // decision 9; checked at the top of the pass); the runs in flight,
+        // their reviews and resumes go on.
+        if self.run_env_missing {
+            return Ok(());
+        }
         while self.slots.len() < parallel {
             // Highest effective priority, then most-releasing, then lowest
             // ID (ADR-0040 decision 4); `candidates` and `graph` show the
@@ -719,6 +740,37 @@ impl Supervisor<'_> {
                 }
             }
         }
+        Ok(())
+    }
+    /// Check the programs `[run.env]` names on this process's PATH
+    /// (ADR-0049 decision 9) and record `run_env_program_missing` or
+    /// `run_env_program_found` when the answer differs from the latest one
+    /// on the queue, so a restarted supervisor does not repeat it. A
+    /// `dagq.toml` that cannot be read leaves the last answer: provisioning
+    /// and `integrate` report that file themselves.
+    fn check_run_env_programs(&mut self) -> Result<()> {
+        let check = match self.verifier.run_env_programs(None) {
+            Ok(check) => check,
+            Err(error) => {
+                warn!(error = %format_args!("{error:#}"), "the programs of [run.env] could not be checked: {error:#}");
+                return Ok(());
+            }
+        };
+        let last = self.queue.latest_queue_event(&RUN_ENV_PROGRAM_KINDS)?;
+        if let Some((kind, mut payload)) = check.transition(last.as_ref().map(|e| e.kind.as_str()))
+        {
+            payload["supervisor"] = json!(self.token);
+            self.queue.record_queue_event(kind, payload)?;
+            match check.missing_message() {
+                Some(message) => {
+                    warn!("{message}; no task is claimed and no run lands until it is found")
+                }
+                None => {
+                    info!("the programs of [run.env] are found again; claiming and landing resume")
+                }
+            }
+        }
+        self.run_env_missing = !check.missing().is_empty();
         Ok(())
     }
     /// One pass over the slots; with `unsettled_only`, over the slots a
@@ -1035,6 +1087,20 @@ impl Supervisor<'_> {
                 self.finish_resumed_session(slot, attempt, &workspace, verdict)
             }
             Phase::AwaitingSlot => {
+                // Its verification would fail on the missing program: the
+                // run stays awaiting integration, leased, and the
+                // integration slot stays free (ADR-0049 decision 9). A
+                // supervisor that drains or hands off cannot wait for it:
+                // it gives the lease back and leaves the run awaiting
+                // integration for a person (`review and integrate`).
+                if self.run_env_missing {
+                    if !self.draining {
+                        return Ok(Step::Continue);
+                    }
+                    warn!(run_id = %slot.run.id(), "run {} is left awaiting integration: a program [run.env] names is missing and this supervisor stops", slot.run.id());
+                    self.queue.release_lease(slot.run.id(), &self.token)?;
+                    return Ok(Step::Done(Box::new(self.queue.run(slot.run.id())?)));
+                }
                 if !self
                     .queue
                     .runs_with_status(RunStatus::Integrating)?

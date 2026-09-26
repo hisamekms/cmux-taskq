@@ -10,6 +10,7 @@ scope: runtime
 related:
   - design-supervisor-lifecycle
   - adr-0040
+  - adr-0049
 ---
 
 # Run environment
@@ -22,3 +23,19 @@ repository rootの`dagq.toml`の`[run.env]`（[ADR-0040](../../adr/0040-verify-o
 - 渡し先: (a) `provision`がworkerのworkspaceを作るとき、`DAGQ_ROLE` / `DAGQ_QUEUE`の後ろに`--env KEY=VALUE`で並べる（ADR-0026の仕組み）。worktreeを作る前に読むので、壊れた`dagq.toml`はprovisioningの失敗になり、workspaceは開かずsupervisorはclaimを止める。(b) `integrate`の`verification_commands`を`Command`のenvに足す（validatingは検証コマンドを実行しない）。読めないファイルは着地処理のエラーで、runは元の状態に戻る。(c) reviewのheadless実行（ADR-0040の決定2）のコマンドのenvに足す。needs_sessionのresumeが開くworkspaceには今は渡していない。
 - `dagq.toml`はrepositoryにcommitされ、値はworkspaceを開く`cmux`のargvに出るので、secretは入れない。
 - この repositoryではtargetを共有せず、`dagq.toml`も置かない（ADR-0040の決定3。ADR-0023の決定3は`CARGO_TARGET_DIR = "${DAGQ_QUEUE_DIR}/target"`を置くとしたが、task 91の着地前のreviewの指摘を受けて2026-09-23にユーザーが決めた）。理由: (a) cargoのlockはbuildだけを直列化し、その後のtest実行は分離されないので、`CARGO_BIN_EXE_dagq`をexecするtest（`tests/cli.rs`・`runtime.rs`・`location.rs`・`plugin.rs`・`e2e.rs`）が、並行する別のrunのbuildが上書きした`target/debug/dagq`を実行しうる。(b) 同時の`cargo llvm-cov`が共有の`llvm-cov-target`のprofrawを消し合い・混ぜ合い、coverageの関門が誤る。buildの共有はsccacheなど安全な方法を別途検討する。
+
+## `[run.env]`が名指すプログラムの検査
+
+[ADR-0049](../../adr/0049-share-compile-cache-across-runs-and-break-down-wait-to-land.md)の決定8・9（task 395）。`[run.env]`の`RUSTC_WRAPPER`などが実行できないと、runのcargoは`could not execute process`ですぐ失敗し、そのまま流すとworkerの検証も`integrate`の検証も全部落ちてresumeを使い切る。そこでruntimeが、cargoを走らせる前に解決できるかを見る。
+
+- **検査する変数**: cargoがプログラムとして実行する`RUSTC_WRAPPER`・`RUSTC_WORKSPACE_WRAPPER`・`RUSTC`・`RUSTDOC`と、その`CARGO_BUILD_`付きの形の8つ（`src/infrastructure/run_env.rs`の`PROGRAM_VARIABLES`）。それ以外の変数は見ない。
+- **解決の規則**（`resolve_program`・`check_programs`・`check_run_env_programs`）: 値が空なら検査しない。`/`を含む値はそのpathが実行可能なfile、含まない値は検査するプロセスのPATHの各directoryに実行可能なfileがあること。`${DAGQ_QUEUE_DIR}` / `${DAGQ_RUN_DIR}`は展開してから見る。runの無い検査（`up`・claim・`doctor`）では`${DAGQ_RUN_DIR}`を含む値は検査しない（runの前にはrun directoryに何も無いため）。`dagq.toml`が無ければ何も検査せず、今までどおりに動く。結果は`domain::run_env::RunEnvCheck`（`config`、`path`、`programs[]`の`variable` / `value` / `resolved`）。
+- **`up`のpreflight**: cmux・Claude・trustの後に、`up`のPATH（supervisorに渡す`UpEnvironment.path`）で検査する（`lifecycle::Ports::run_env_programs`）。見つからなければsupervisorを起動せず、変数名・値・PATHと対処（入れるか、`dagq.toml`から外すtaskを登録する）を挙げたerrorで止まる。`dagq.toml`があるrepositoryでは`up`の出力に`run_env`（検査の結果）が付く。
+- **supervisorのclaimの前**: 各fill passのclaimの前に自分のPATHで検査する（`Verifier::run_env_programs`）。見つからなければそのpassではclaimしない。走っているrun、review、resume、triageは止めない。queueの最新の`run_env_program_missing` / `run_env_program_found`と答えが変わったときだけ記録する（見つからなくなったら`run_env_program_missing`、payloadは最初に見つからなかった`variable` / `value`と`path`、全部の`programs`、`message`、`supervisor`。見つかるようになったら`run_env_program_found`）。queueの記録と比べるので、supervisorを起動し直しても繰り返さない。`dagq.toml`が読めないときは前の答えのまま（provisioningがそのfileのerrorを出す）。
+- **着地の保留**: 見つからない間、passしたrunは`awaiting_integration`のままleaseを持って着地slotを待ち（`Phase::AwaitingSlot`）、統合slotは取らない。見つかれば次のpassで着地に進む。検査はpassごとに（drain・handoff中も）行う。drain・handoff・claimの停止の最中に見つからなければ、supervisorは待たずにそのrunのleaseを返し、runは`awaiting_integration`のまま人の`review and integrate`になる。`approve_landing`の`land`の答えも、見つかるまで適用しない。
+- **`integrate`の検証の前**: 検証コマンドを実行する前に同じ検査をrunの`run_dir`で行い、見つからなければ検証コマンドを実行せず、`dagq.toml`が読めないときと同じく着地処理のエラーにする（runは元の状態に戻り、`needs_session`にしないのでresumeを使わない。`last_error`に変数名と値とPATHが入る）。検証コマンドが無いtaskは検査しない。
+- **attention**: `run_env_program_missing`はinbox宛てのattention（`next: install tool`）で、`watch`はこのeventで起き、`status`は最新がmissingの間`kind: run_env_program_missing`、`status: missing`、`last_error`にその`message`を出す（`run_id` / `task_id`はnull）。`run_env_program_found`で消える。
+- **`doctor`**: `run_env`の欄に`config`、`doctor`を打ったプロセスのPATH（`path`）、`programs`（`resolved`は見つからなければnull）、`missing`（件数）、supervisorが最後に記録した`run_env_program_missing` / `run_env_program_found`（`supervisor_last`）を出す。`dagq.toml`が無く記録も無ければ欄ごと出さない。
+- workerのworkspaceのPATHはsupervisorからは見えない。workerのPATHでだけ見つからない場合は、workerの検証が失敗してreceiptかtriageで分かる。
+- 2つのkindはtaskにもgoalにも紐づかない行なので、`0032_run_env_program_events.sql`が`run_events`を作り直してCHECKに足した（[persistence](../persistence.md)）。
+

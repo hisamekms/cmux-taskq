@@ -939,6 +939,12 @@ fn land(
     let run_env = if commands.is_empty() {
         Vec::new()
     } else {
+        // A program [run.env] names that cannot be executed would fail
+        // every command: stop before them, like an unreadable dagq.toml,
+        // so the run goes back without using a resume (ADR-0049 decision 9).
+        if let Some(message) = verifier.run_env_programs(Some(run_dir))?.missing_message() {
+            bail!("{message}");
+        }
         verifier.run_env(run_dir)?
     };
     // Each attempt keeps its own logs, so a second integrate of the run does

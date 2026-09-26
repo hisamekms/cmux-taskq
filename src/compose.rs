@@ -20,7 +20,7 @@ use std::{
 use crate::{
     application::{
         AgentProvider, Generators, LaunchAgent, MainRemote, ProcessControl, QueueOpener,
-        Repository, Spawner, WorkspaceBackend, health,
+        Repository, Spawner, Verifier, WorkspaceBackend, health,
         install::{self as installation, InstallOptions},
         integrate::{self as integration, IntegrateTarget, Integration},
         lifecycle::{
@@ -382,12 +382,14 @@ impl OneShot {
     /// `doctor`: see [`health::doctor`].
     pub fn doctor(&self, db: &Path, full: bool) -> Result<Value> {
         let queue = self.open_read_only(db)?;
+        let run_env = doctor_run_env(&queue, db).map_err(|error| format!("{error:#}"));
         health::doctor(
             &queue,
             &SystemProcesses,
             &LocalRunFiles,
             &*self.generators.clock,
             full,
+            run_env,
         )
     }
 
@@ -713,6 +715,7 @@ same in one step",
             queues,
             inspect_repository: &inspect_repository,
             trusts_repository: &claude_trusts_repository,
+            run_env_programs: &up_run_env_programs,
             load_average,
         }
     }
@@ -804,6 +807,41 @@ pub fn down(
     options: &DownOptions,
 ) -> Result<Value> {
     OneShot::system().down(location, cmux, launchd, processes, options)
+}
+
+/// The programs the `[run.env]` of the `dagq.toml` in `checkout` names,
+/// resolved on `path`, the PATH of `up` and of the supervisor it starts
+/// (ADR-0049 decision 9).
+fn up_run_env_programs(
+    checkout: &Path,
+    db: &Path,
+    path: &str,
+) -> Result<crate::domain::run_env::RunEnvCheck> {
+    crate::infrastructure::run_env::check_run_env_programs(
+        checkout,
+        db.parent().context("queue database has no directory")?,
+        None,
+        Some(std::ffi::OsStr::new(path)),
+    )
+}
+
+/// The programs the `[run.env]` of the main checkout of the repository the
+/// queue is bound to names, resolved on this process's PATH (ADR-0049
+/// decision 9).
+fn doctor_run_env(queue: &SqliteQueue, db: &Path) -> Result<crate::domain::run_env::RunEnvCheck> {
+    // A queue no supervisor or `up` bound has no repository to read.
+    let Some(common_dir) = queue.repository_binding()?.map(PathBuf::from) else {
+        return Ok(crate::domain::run_env::RunEnvCheck::default());
+    };
+    let checkout = match common_dir.parent() {
+        Some(parent) if common_dir.file_name() == Some(".git".as_ref()) => parent.to_path_buf(),
+        _ => common_dir.clone(),
+    };
+    ShellVerifier {
+        checkout,
+        db: db.to_path_buf(),
+    }
+    .run_env_programs(None)
 }
 
 /// The main worktree of the repository: the parent of a `.git` common

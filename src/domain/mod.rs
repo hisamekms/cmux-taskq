@@ -421,6 +421,7 @@ pub mod reason;
 pub mod recovery;
 pub mod related;
 pub mod run;
+pub mod run_env;
 pub mod scope;
 pub mod search;
 pub mod stall;
@@ -988,6 +989,11 @@ pub enum AttentionNext {
     /// registered, and none decided it (`draft_planner_exhausted`,
     /// ADR-0041 decision 16): a person decides it in a planner of theirs.
     DecideDraft,
+    /// A program `[run.env]` names is not found on the supervisor's PATH
+    /// (`run_env_program_missing`, ADR-0049 decision 9): a person installs
+    /// it or has a task take it out of `dagq.toml`; the supervisor claims
+    /// nothing and lands nothing until then.
+    InstallTool,
 }
 
 /// How many times the supervisor resumes one `needs_session` run (one
@@ -1025,6 +1031,7 @@ impl fmt::Display for AttentionNext {
             Self::PlanReviewByHand => f.write_str("plan review by hand"),
             Self::CheckPlanner => f.write_str("check the planner"),
             Self::DecideDraft => f.write_str("decide the draft in a planner"),
+            Self::InstallTool => f.write_str("install tool"),
         }
     }
 }
@@ -1052,6 +1059,7 @@ pub const ATTENTION_KINDS: &[&str] = &[
     "plan_review_failed",
     "planner_unresponsive",
     "draft_planner_exhausted",
+    run_env::RUN_ENV_PROGRAM_MISSING,
     "ask_opened",
     "ask_answered",
     "ask_delivery_failed",
@@ -1130,6 +1138,7 @@ pub fn event_attention(kind: &str, payload: &serde_json::Value) -> Option<Attent
         ("planner_unresponsive", _) => Some(AttentionNext::CheckPlanner),
         ("draft_planner_exhausted", _) => Some(AttentionNext::DecideDraft),
         ("push_failed", _) => Some(AttentionNext::PushMain),
+        (run_env::RUN_ENV_PROGRAM_MISSING, _) => Some(AttentionNext::InstallTool),
         ("runtime_error", _)
             if payload.get("lease_released") == Some(&serde_json::Value::Bool(true)) =>
         {
@@ -1643,6 +1652,16 @@ mod attention_tests {
                 Some(PushMain),
             ),
             (
+                "run_env_program_missing",
+                json!({"variable": "RUSTC_WRAPPER", "value": "sccache", "path": "/bin"}),
+                Some(InstallTool),
+            ),
+            (
+                "run_env_program_found",
+                json!({"variable": "RUSTC_WRAPPER", "value": "sccache", "path": "/bin"}),
+                None,
+            ),
+            (
                 "push_finished",
                 json!({"remote": "origin", "commit": "c"}),
                 None,
@@ -1784,6 +1803,7 @@ mod attention_tests {
         );
         assert_eq!(RecoverRun.to_string(), "recover run");
         assert_eq!(PushMain.to_string(), "push main");
+        assert_eq!(InstallTool.to_string(), "install tool");
         assert_eq!(
             DeliveringAnswer {
                 ask_id: AskId::new(2)

@@ -537,6 +537,53 @@ fn dead_pid() -> u32 {
     pid
 }
 
+/// A program the `[run.env]` of `dagq.toml` names that the PATH of `up`
+/// does not find stops `up` before it starts a supervisor (ADR-0049
+/// decision 9); found, `up` reports where.
+#[test]
+fn up_refuses_a_run_env_program_its_path_does_not_find() {
+    use std::os::unix::fs::PermissionsExt;
+    let mut fixture = fixture();
+    let bin = fixture.repo.parent().unwrap().join("tools");
+    fs::create_dir(&bin).unwrap();
+    fs::write(
+        fixture.repo.join("dagq.toml"),
+        "[run.env]\nRUSTC_WRAPPER = 'sccache'\n",
+    )
+    .unwrap();
+    let cmux = FakeCmux::default();
+    let launchd = FakeLaunchd::new(&fixture.location.db);
+    let processes = FakeProcesses::default();
+    let error = format!(
+        "{:#}",
+        try_up(&fixture, &cmux, &launchd, &processes).unwrap_err()
+    );
+    assert!(
+        error.contains("RUSTC_WRAPPER = \"sccache\"")
+            && error.contains("PATH: /usr/bin:/bin")
+            && error.contains("the supervisor was not started"),
+        "{error}"
+    );
+    assert!(
+        SqliteQueue::open(&fixture.location.db)
+            .unwrap()
+            .supervisors()
+            .unwrap()
+            .is_empty()
+    );
+    let tool = bin.join("sccache");
+    fs::write(&tool, "#!/bin/sh\n").unwrap();
+    fs::set_permissions(&tool, fs::Permissions::from_mode(0o755)).unwrap();
+    fixture.environment.path = format!("{}:/usr/bin:/bin", bin.display());
+    let report = up(&fixture, &cmux, &launchd, &processes);
+    assert_eq!(report["supervisor"]["outcome"], "started", "{report}");
+    assert_eq!(
+        report["run_env"]["programs"][0]["resolved"],
+        tool.to_str().unwrap(),
+        "{report}"
+    );
+}
+
 #[test]
 fn up_starts_the_agent_and_the_sessions_once_and_reuses_them_after() {
     let fixture = fixture();
@@ -3810,9 +3857,11 @@ fn up_drains_a_supervisor_whose_agent_starts_another_binary() {
     assert_eq!(queue.handoff_request("old").unwrap(), None);
 }
 
-/// `up` applies the queue's pending migrations first when every one of
-/// them is compatible (ADR-0045 decision 15), and refuses a breaking one
-/// with the way to it, before it starts or touches anything.
+/// `up` applies the queue's pending migrations first only when every one
+/// of them is compatible (ADR-0045 decision 15), and refuses a breaking one
+/// with the way to it, before it starts or touches anything. The last
+/// migration (0032) is breaking, so a queue before it is refused even when
+/// the migration it lacks first (0031) is compatible.
 #[test]
 fn up_applies_compatible_migrations_and_refuses_breaking_ones() {
     let fixture = fixture();
@@ -3830,14 +3879,21 @@ fn up_applies_compatible_migrations_and_refuses_breaking_ones() {
     let cmux = FakeCmux::default();
     let launchd = FakeLaunchd::new(db);
     let processes = FakeProcesses::default();
+    let error = format!(
+        "{:#}",
+        try_up(&fixture, &cmux, &launchd, &processes).unwrap_err()
+    );
+    assert!(error.contains("breaking migration(s) 32"), "{error}");
+    let version: i64 = Connection::open(db)
+        .unwrap()
+        .pragma_query_value(None, "user_version", |r| r.get(0))
+        .unwrap();
+    assert_eq!(version, 30);
+    // Migrated, it starts.
+    SqliteQueue::migrate(db, None, 0).unwrap();
     let report = up(&fixture, &cmux, &launchd, &processes);
     assert_eq!(report["supervisor"]["outcome"], "started", "{report}");
-    assert_eq!(report["migrated"]["previous_version"], 30, "{report}");
-    assert_eq!(
-        report["migrated"]["schema_version"],
-        SqliteQueue::SCHEMA_VERSION
-    );
-    assert_eq!(report["migrated"]["backup"], Value::Null);
+    assert_eq!(report["migrated"], Value::Null, "{report}");
 
     Connection::open(db)
         .unwrap()

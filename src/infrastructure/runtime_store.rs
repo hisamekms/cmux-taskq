@@ -716,6 +716,22 @@ impl SqliteQueue {
         Ok(EventId::new(self.conn.last_insert_rowid()))
     }
 
+    /// The newest event of the queue itself (on no task, goal or run) of one
+    /// of `kinds`.
+    pub fn latest_queue_event(&self, kinds: &[&str]) -> Result<Option<RunEvent>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT * FROM run_events
+                 WHERE run_id IS NULL AND task_id IS NULL AND goal_id IS NULL
+                   AND kind IN (SELECT value FROM json_each(?1))
+                 ORDER BY id DESC LIMIT 1",
+                [serde_json::to_string(kinds)?],
+                event_row,
+            )
+            .optional()?)
+    }
+
     /// The id of the last event recorded before `unix` (seconds), 0 when
     /// there is none: a cursor that reads everything from that time on.
     pub fn event_id_before(&self, unix: i64) -> Result<EventId> {
@@ -2951,6 +2967,9 @@ impl RunStore for SqliteQueue {
     }
     fn record_queue_event(&self, kind: &str, payload: serde_json::Value) -> Result<EventId> {
         SqliteQueue::record_queue_event(self, kind, payload)
+    }
+    fn latest_queue_event(&self, kinds: &[&str]) -> Result<Option<RunEvent>> {
+        SqliteQueue::latest_queue_event(self, kinds)
     }
 }
 

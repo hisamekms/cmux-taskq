@@ -9,6 +9,7 @@ last_verified: 2026-09-26
 scope: runtime
 related:
   - design-supervisor-lifecycle
+  - adr-0049
 ---
 
 # `doctor`
@@ -20,5 +21,6 @@ related:
 - `supervisors`: `status`と同じ。staleな登録は報告するだけで、`doctor`も`recover`も`integrate`も消さない。
 - `runs`: `claimed`/`starting`/`running`/`validating`/`integrating`のrunごとに、`workspace_id`、worktreeとrun directoryとreceiptの存在、`last_error`、そのrunの`lease`（PID、`kill -0`による生存、heartbeatの経過秒数、30秒を超えた`stale`。なければnull）、登録済みwrapper/agentプロセスのPID・生存・heartbeat経過秒数・終了コード。`exited_at`が記録済みのプロセスはPIDが再利用されうるため生存確認せず`alive: null`にする。
 - `blockers`: そのrunの`recover`を拒む理由の一覧。そのrunのprocessとleaseだけを見る。空なら`recoverable: true`。
+- `run_env`（既定の出力にも出す）: queueが束縛されたrepositoryのmain checkoutの`dagq.toml`の`[run.env]`が名指すプログラム（`RUSTC_WRAPPER`など）を、`doctor`を打ったプロセスのPATHで解決した結果（`config`、`path`、`programs[]`の`variable` / `value` / `resolved`（見つからなければnull）、`missing`）と、supervisorが最後に記録した`run_env_program_missing` / `run_env_program_found`（`supervisor_last`、無ければnull）。`dagq.toml`が読めなければ`error`。`dagq.toml`が無く記録も無いrepositoryでは欄ごと出さない。状態は変えない（[ADR-0049](../../adr/0049-share-compile-cache-across-runs-and-break-down-wait-to-land.md)の決定9、[Run environment](run-environment.md#runenvが名指すプログラムの検査)）。
 
 cmux workspaceの存在は確認しない（cmuxなしで動く）。IDを見てユーザーが`cmux workspace list`で確認する。

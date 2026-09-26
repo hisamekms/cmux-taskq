@@ -53,6 +53,7 @@ Report each to the person in one short list (task, status, `next`, gist of `last
 - `decide the draft in a planner` (`draft_planner_exhausted`): the runtime's planners left a draft undecided; tell the person, who decides it in a planner of theirs (`dagq plan`).
 - `plan review by hand` (`plan_review_failed`): the headless plan review of a proposal failed and it is held; it is not reviewed again by itself. Show the task and `last_error`; the person picks per `dagq-recover` section 8.
 - `check the planner` (`planner_unresponsive`): the planner a revise went to did not submit again in time, or no runtime planner took it. Tell the person which proposal; they look at that planner's workspace. Nothing closes it.
+- `install tool` (`run_env_program_missing`): a program `dagq.toml`'s `[run.env]` names (`RUSTC_WRAPPER` and the like) is not on the supervisor's PATH, so it claims and lands nothing. Show `last_error`; the person installs it or has a planner take it out of `dagq.toml`. It clears by itself.
 - `restart supervisor` (`supervisor_stopped`, `supervisor_stale`): tell the person; `up` once they say so (`dagq-recover`, section 5).
 - `review by hand`, `review and integrate`, `push main`: `${CLAUDE_PLUGIN_ROOT}/skills/dagq-recover/reference/review-by-hand.md`, with the person.
 - `recover run`, `triage by hand`: the `dagq-recover` skill.

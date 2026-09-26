@@ -1149,6 +1149,8 @@ pub trait RunStore {
     -> Result<()>;
     /// Record an event of the queue itself, on no task, goal or run.
     fn record_queue_event(&self, kind: &str, payload: serde_json::Value) -> Result<EventId>;
+    /// The newest event of the queue itself (on no run) of one of `kinds`.
+    fn latest_queue_event(&self, kinds: &[&str]) -> Result<Option<RunEvent>>;
 }
 
 /// The questions the runtime and its sessions put to a person (ADR-0022).
@@ -1535,6 +1537,12 @@ pub struct DiffNumbers {
 pub trait Verifier {
     /// The environment of the run whose directory is `run_dir`.
     fn run_env(&self, run_dir: &Path) -> Result<Vec<(String, String)>>;
+    /// Whether the programs that environment names resolve on this
+    /// process's `PATH` (ADR-0049 decision 9); `None` is before any run.
+    fn run_env_programs(
+        &self,
+        run_dir: Option<&Path>,
+    ) -> Result<crate::domain::run_env::RunEnvCheck>;
     /// Run `command` in a shell in `cwd` with `env`, its output in `log`.
     fn run_to_log(
         &self,

@@ -10046,6 +10046,136 @@ fn a_broken_dagq_toml_stops_provisioning_before_the_workspace() {
     assert!(backend.tags.lock().unwrap().is_empty());
 }
 
+#[test]
+fn a_missing_run_env_program_stops_claims_and_landings_until_it_is_found() {
+    use std::os::unix::fs::PermissionsExt;
+    let (fixture, repo, db) = fixture();
+    let tool = fixture.dir.path().join("bin").join("sccache");
+    fs::write(
+        repo.join("dagq.toml"),
+        format!(
+            "[run.env]\nRUSTC_WRAPPER = '{}'\nSCCACHE_IGNORE_SERVER_IO_ERROR = '1'\n",
+            tool.display()
+        ),
+    )
+    .unwrap();
+    git(&repo, &["add", "dagq.toml"]);
+    git(&repo, &["commit", "-m", "run env"]);
+    let kinds = |db: &Path| -> Vec<String> {
+        Connection::open(db)
+            .unwrap()
+            .prepare("SELECT kind FROM run_events WHERE kind LIKE 'run_env_program_%' ORDER BY id")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    };
+
+    // Missing: nothing is claimed, the change is recorded once, and the
+    // inbox is told to install the tool.
+    let backend = TestWorkspace::new(&db, false, VALID_AGENT);
+    for _ in 0..2 {
+        let outcome = supervise(&db, &repo, &backend).unwrap();
+        assert_eq!(outcome["runs"], json!([]), "{outcome}");
+    }
+    assert!(backend.tags.lock().unwrap().is_empty());
+    assert_eq!(kinds(&db), ["run_env_program_missing"]);
+    let status = runtime::status(&db).unwrap();
+    let install = status["attention"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["kind"] == "run_env_program_missing")
+        .unwrap_or_else(|| panic!("{status}"))
+        .clone();
+    assert_eq!(install["next"], "install tool");
+    assert!(
+        install["last_error"]
+            .as_str()
+            .unwrap()
+            .contains("RUSTC_WRAPPER"),
+        "{install}"
+    );
+    let doctor = runtime::doctor(&db, false).unwrap();
+    assert_eq!(doctor["run_env"]["missing"], 1, "{doctor}");
+    assert_eq!(
+        doctor["run_env"]["programs"][0]["variable"],
+        "RUSTC_WRAPPER"
+    );
+    assert_eq!(
+        doctor["run_env"]["supervisor_last"]["kind"],
+        "run_env_program_missing"
+    );
+    let full = runtime::doctor(&db, true).unwrap();
+    assert_eq!(full["run_env"]["programs"][0]["resolved"], Value::Null);
+
+    // Found: the change is recorded, the attention ends and the task runs.
+    fs::create_dir_all(tool.parent().unwrap()).unwrap();
+    fs::write(&tool, "#!/bin/sh\nexec \"$@\"\n").unwrap();
+    fs::set_permissions(&tool, fs::Permissions::from_mode(0o755)).unwrap();
+    let outcome = supervise(&db, &repo, &backend).unwrap();
+    backend.join();
+    assert_eq!(outcome["errors"], json!([]), "{outcome}");
+    assert_eq!(
+        kinds(&db),
+        ["run_env_program_missing", "run_env_program_found"]
+    );
+    let status = runtime::status(&db).unwrap();
+    assert!(
+        status["attention"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|entry| entry["kind"] != "run_env_program_missing"),
+        "{status}"
+    );
+    assert_eq!(
+        runtime::doctor(&db, false).unwrap()["run_env"]["programs"][0]["resolved"],
+        tool.to_str().unwrap()
+    );
+    let run = SqliteQueue::open(&db)
+        .unwrap()
+        .show(TaskId::new(1))
+        .unwrap()
+        .runs[0]
+        .clone();
+    assert_eq!(run.status(), RunStatus::AwaitingIntegration);
+
+    // `integrate` checks again before the verification commands: without
+    // the tool it runs none and the run goes back where it was.
+    fs::remove_file(&tool).unwrap();
+    let error = format!("{:#}", integrate(&db, 1, &repo).unwrap_err());
+    assert!(
+        error.contains("RUSTC_WRAPPER") && error.contains("returned to awaiting_integration"),
+        "{error}"
+    );
+    let run_dir = PathBuf::from(run.run_dir().unwrap());
+    assert!(!run_dir.join("integrate-1-verify-1.log").exists());
+    let queue = SqliteQueue::open(&db).unwrap();
+    assert_eq!(
+        queue.run(run.id()).unwrap().status(),
+        RunStatus::AwaitingIntegration
+    );
+}
+
+#[test]
+fn a_repository_without_dagq_toml_checks_no_program() {
+    // An unbound queue has no repository to read, and a bound one without
+    // dagq.toml has nothing to check: doctor adds nothing either way.
+    let (_fixture, repo, db) = fixture();
+    let doctor = runtime::doctor(&db, true).unwrap();
+    assert_eq!(doctor.get("run_env"), None, "{doctor}");
+    let backend = TestWorkspace::new(&db, false, VALID_AGENT);
+    let outcome = supervise(&db, &repo, &backend).unwrap();
+    backend.join();
+    assert_eq!(outcome["errors"], json!([]), "{outcome}");
+    for full in [false, true] {
+        let doctor = runtime::doctor(&db, full).unwrap();
+        assert_eq!(doctor.get("run_env"), None, "{doctor}");
+    }
+}
+
 /// A fixture whose only ready task requires `evidence` in the receipt.
 fn evidence_fixture(evidence: &[EvidenceCheck]) -> (Fixture, PathBuf, PathBuf) {
     let (dir, repo, db) = fixture();

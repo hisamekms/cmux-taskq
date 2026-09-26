@@ -15,8 +15,9 @@ use crate::domain::{
     ASK_EVENT_KINDS, AskId, AskKind, Attention, AttentionNext, HEARTBEAT_TIMEOUT_SECS,
     LANDING_OPTIONS, ReasonCode, RunEvent, RunId, RunLease, RunProcess, RunStatus, SessionRole,
     SupervisorMode, SupervisorPulse, SupervisorRegistration, TRIAGE_OPTIONS, TaskId, TaskRun,
-    TriageState, event_attention, heartbeat_stale, reason, run_attention, supervisor_attention,
-    triage_state,
+    TriageState, event_attention, heartbeat_stale, reason, run_attention,
+    run_env::{RUN_ENV_PROGRAM_KINDS, RUN_ENV_PROGRAM_MISSING, RunEnvCheck},
+    supervisor_attention, triage_state,
 };
 
 /// Health of one run's lease as `status` and `doctor` report it.
@@ -197,6 +198,8 @@ pub struct DoctorReport {
     pub checked_at: i64,
     pub supervisors: Vec<SupervisorHealth>,
     pub runs: Vec<RunHealth>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_env: Option<Value>,
 }
 
 /// Characters of an ask's question `status` keeps before `…`.
@@ -285,13 +288,19 @@ pub fn status(
 /// `doctor`: with `full`, every registered supervisor and every unfinished
 /// run with its lease, processes and paths; without it, one line's worth
 /// per run and per supervisor ([`RunHealth::summary`],
-/// [`SupervisorHealth::summary`]). Reads only.
+/// [`SupervisorHealth::summary`]). Both add `run_env` when the repository
+/// has a `dagq.toml` or the supervisor recorded a check: the programs its
+/// `[run.env]` names, where they resolved on the caller's PATH (`run_env`,
+/// or why they could not be checked), and the supervisor's latest
+/// `run_env_program_missing` / `run_env_program_found` (ADR-0049 decision
+/// 9). Reads only.
 pub fn doctor(
     queue: &dyn Queue,
     control: &dyn ProcessControl,
     files: &dyn RunFiles,
     clock: &dyn Clock,
     full: bool,
+    run_env: std::result::Result<RunEnvCheck, String>,
 ) -> Result<Value> {
     let now = clock.now();
     let registrations = queue.supervisors()?;
@@ -309,17 +318,38 @@ pub fn doctor(
         })
         .collect::<Result<Vec<_>>>()?;
     let supervisors = supervisors(&registrations, &leases, now, control);
+    let last = queue
+        .latest_queue_event(&RUN_ENV_PROGRAM_KINDS)?
+        .map(|event| json!({"kind": event.kind, "created_at": event.created_at, "payload": event.payload}));
+    // A repository without dagq.toml, whose supervisor never found a
+    // program missing, has nothing to report.
+    let run_env = match run_env {
+        Ok(check) if !check.config && last.is_none() => None,
+        Ok(check) => Some(json!({
+            "config": check.config,
+            "path": check.path,
+            "programs": check.programs,
+            "missing": check.missing().len(),
+            "supervisor_last": last,
+        })),
+        Err(error) => Some(json!({"error": error, "supervisor_last": last})),
+    };
     if !full {
-        return Ok(json!({
+        let mut summary = json!({
             "checked_at": now,
             "supervisors": supervisors.iter().map(SupervisorHealth::summary).collect::<Vec<_>>(),
             "runs": runs.iter().map(RunHealth::summary).collect::<Vec<_>>(),
-        }));
+        });
+        if let Some(run_env) = run_env {
+            summary["run_env"] = run_env;
+        }
+        return Ok(summary);
     }
     Ok(serde_json::to_value(DoctorReport {
         checked_at: now,
         supervisors,
         runs,
+        run_env,
     })?)
 }
 
@@ -633,6 +663,29 @@ pub fn attention(
             last_error_code: error.as_ref().map(|_| ReasonCode::PushFailed),
             last_error: error,
             next,
+        });
+    }
+    // A program [run.env] names that the supervisor did not find stops its
+    // claims and landings until a person installs it or takes it out of
+    // dagq.toml (ADR-0049 decision 9).
+    if let Some(event) = queue.latest_queue_event(&RUN_ENV_PROGRAM_KINDS)?
+        && event.kind == RUN_ENV_PROGRAM_MISSING
+    {
+        attention.push(Attention {
+            run_id: None,
+            task_id: None,
+            pid: None,
+            ask_id: None,
+            reason_category: None,
+            status: "missing".into(),
+            kind: RUN_ENV_PROGRAM_MISSING.into(),
+            last_error: event
+                .payload
+                .get("message")
+                .and_then(Value::as_str)
+                .map(truncate_reason),
+            last_error_code: None,
+            next: AttentionNext::InstallTool,
         });
     }
     // A proposal whose plan review failed, or whose planner did not answer

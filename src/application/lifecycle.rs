@@ -41,6 +41,7 @@ use crate::{
     VERSION,
     domain::{
         HEARTBEAT_TIMEOUT_SECS, RunStatus, SessionRole, SupervisorMode, SupervisorRegistration,
+        run_env::RunEnvCheck,
     },
 };
 use anyhow::{Context, Result, bail, ensure};
@@ -169,6 +170,10 @@ pub struct Ports<'a> {
     pub queues: &'a dyn Fn(&Path) -> Arc<dyn QueueOpener>,
     pub inspect_repository: &'a dyn Fn(&Path) -> Result<RepositoryPaths>,
     pub trusts_repository: &'a dyn Fn(&Path, &Path) -> Result<bool>,
+    /// `run_env_programs(checkout, db, path)` checks the programs the
+    /// `[run.env]` of the `dagq.toml` in `checkout` names on `path`
+    /// (ADR-0049 decision 9).
+    pub run_env_programs: &'a dyn Fn(&Path, &Path, &str) -> Result<RunEnvCheck>,
     pub load_average: fn() -> Option<f64>,
 }
 
@@ -244,6 +249,13 @@ pub fn up(
         trusted,
         untrusted_repository_hint(trust_root, environment.claude_config.as_deref())
     );
+    // The supervisor `up` starts gets this PATH, and a worker's workspace
+    // one from the same login shell: a program [run.env] names that is not
+    // on it would fail every run's cargo (ADR-0049 decision 9).
+    let run_env = (ports.run_env_programs)(trust_root, &db, &environment.path)?;
+    if let Some(message) = run_env.missing_message() {
+        bail!("{message}; the supervisor was not started");
+    }
     let plugin_dir = options
         .plugin_dir
         .as_deref()
@@ -332,14 +344,19 @@ pub fn up(
         || inbox_command(&db, &options.claude, plugin_dir.as_deref()),
     )?;
 
-    Ok(json!({
+    let mut report = json!({
         "supervisor": supervisor,
         "inbox": inbox,
         "retired_sessions": retired_sessions,
         "pruned_supervisors": pruned,
         "warnings": workspaces.take_warnings(),
         "doctor": open_work(queue, processes, ports.clock)?,
-    }))
+    });
+    // What the preflight found, only for a repository with a dagq.toml.
+    if run_env.config {
+        report["run_env"] = serde_json::to_value(&run_env)?;
+    }
+    Ok(report)
 }
 
 /// One `up`'s settled inputs, shared by the ways it starts a supervisor.

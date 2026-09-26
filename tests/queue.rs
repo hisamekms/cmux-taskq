@@ -732,7 +732,8 @@ fn opening_or_initializing_an_older_queue_never_migrates_it() {
             (28, false),
             (29, false),
             (30, false),
-            (31, true)
+            (31, true),
+            (32, false)
         ]
     );
     let raw = Connection::open(&path).unwrap();
@@ -746,7 +747,7 @@ fn opening_or_initializing_an_older_queue_never_migrates_it() {
     std::fs::write(dir.path().join("backups/queue-23-5.sqlite3"), "earlier").unwrap();
     let report = SqliteQueue::migrate(&path, Some(&|_| false), 5).unwrap();
     assert_eq!(report.floor, floor_for(SqliteQueue::SCHEMA_VERSION));
-    assert_eq!(report.applied.len(), 8);
+    assert_eq!(report.applied.len(), 9);
     let backup = report.backup.unwrap();
     assert!(
         backup.ends_with("backups/queue-23-5-1.sqlite3"),
@@ -1350,10 +1351,11 @@ fn migration_from_v6_adds_goals_and_keeps_tasks_runs_and_events() {
     // 0023 (planner sessions), 0024 (the schema floor), 0025 (the stalled
     // ask), 0026 (the search index), 0027 (plan review) and 0028 (draft
     // planners: draft origins, the planner_question ask, no task leases),
-    // 0029 (ask reasons, the queue_hold ask), 0030 (findings) and 0031 (the
-    // supervisor handoff) are applied together.
-    assert_eq!(SqliteQueue::SCHEMA_VERSION, 31);
-    assert_eq!(queue.schema_version().unwrap(), 31);
+    // 0029 (ask reasons, the queue_hold ask), 0030 (findings), 0031 (the
+    // supervisor handoff) and 0032 (the run env program events) are applied
+    // together.
+    assert_eq!(SqliteQueue::SCHEMA_VERSION, 32);
+    assert_eq!(queue.schema_version().unwrap(), 32);
     assert_eq!(
         queue
             .session_workspace(dagq::domain::SessionRole::Inbox)
@@ -3210,14 +3212,16 @@ fn migration_indexes_the_existing_rows_and_landings_record_their_message() {
             (28, false),
             (29, false),
             (30, false),
-            (31, true)
+            (31, true),
+            (32, false)
         ]
     );
     // 0027 (plan review), 0028 (draft planners), 0029 (ask reasons) and 0030
     // (findings) are applied with it and are breaking: a copy is taken and the floor rises
-    // to the last. 0031 (the supervisor handoff) is compatible and leaves it there.
+    // to the last. 0031 (the supervisor handoff) is compatible, and 0032 (the
+    // run env program events) is breaking again and raises it to itself.
     assert!(report.backup.is_some());
-    assert_eq!(report.floor, 30);
+    assert_eq!(report.floor, 32);
     let mut queue = SqliteQueue::open(&path).unwrap();
     assert_eq!(
         search(&queue, "古い", |_| {}),

@@ -540,8 +540,11 @@ impl Supervisor<'_> {
             {
                 continue;
             }
+            // A landing would fail on the missing program (ADR-0049
+            // decision 9): the answer waits until it is found.
             if answer == "land"
-                && (self.slots.len() >= parallel
+                && (self.run_env_missing
+                    || self.slots.len() >= parallel
                     || !self
                         .queue
                         .runs_with_status(RunStatus::Integrating)?
