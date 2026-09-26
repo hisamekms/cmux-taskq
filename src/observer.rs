@@ -92,7 +92,8 @@ pub fn observe(db: &Path, provider: &dyn AgentProvider, options: &ObserveOptions
     let cmux = crate::infrastructure::adapters::executable(Path::new("cmux"))
         .ok()
         .map(|executable| crate::infrastructure::adapters::Cmux { executable });
-    let stats = crate::compose::OneShot::new(queue.generators().clone()).stats(
+    let stats = crate::compose::OneShot::new(queue.generators().clone()).stats_of(
+        &queue,
         &db,
         &StatsQuery {
             since,

@@ -21,7 +21,7 @@ use dagq::{
     },
     infrastructure::{
         schema::{MIGRATIONS, floor_for},
-        sqlite::SqliteQueue,
+        sqlite::{ReadOnlyQueue, SqliteQueue},
     },
 };
 use rusqlite::Connection;
@@ -802,6 +802,18 @@ fn a_read_only_open_never_writes_and_reads_an_older_queue_in_memory() {
         1
     );
     assert!(!dir.path().join("backups").exists());
+    // `doctor`'s open reads the file's schema and the migrated copy on one
+    // connection.
+    let (schema, opened) = SqliteQueue::inspect_read_only(&path).unwrap();
+    assert_eq!(schema.schema_version, 23);
+    assert!(!schema.refuses_binary() && !schema.pending.is_empty());
+    let ReadOnlyQueue::Readable(queue) = opened else {
+        panic!("an older queue is readable")
+    };
+    assert_eq!(queue.schema_version().unwrap(), SqliteQueue::SCHEMA_VERSION);
+    assert_eq!(queue.list(&TaskQuery::default()).unwrap().total, 1);
+    drop(queue);
+    assert_eq!((version(), tables()), (23, before));
 
     // At this binary's schema the file itself is opened, and read-only.
     SqliteQueue::migrate(&path, None, 0).unwrap();
@@ -829,6 +841,18 @@ fn a_read_only_open_never_writes_and_reads_an_older_queue_in_memory() {
         .unwrap()
         .to_string();
     assert!(error.contains("install a newer dagq"), "{error}");
+    let (schema, opened) = SqliteQueue::inspect_read_only(&path).unwrap();
+    assert!(schema.refuses_binary());
+    let ReadOnlyQueue::Refused {
+        binding,
+        error: refused,
+    } = opened
+    else {
+        panic!("a queue above the floor is refused")
+    };
+    assert_eq!(refused.to_string(), error);
+    assert_eq!(binding.repository_binding().unwrap(), None);
+    binding.assert_repository("/elsewhere/.git").unwrap();
     let empty = dir.path().join("empty.db");
     drop(Connection::open(&empty).unwrap());
     let error = SqliteQueue::open_read_only(&empty)

@@ -56,7 +56,7 @@ use crate::{
         run_env::{ShellVerifier, load_conflict_config, load_stall_config},
         run_files::LocalRunFiles,
         runtime_store::SqliteOpener,
-        sqlite::SqliteQueue,
+        sqlite::{ReadOnlyQueue, SqliteQueue},
     },
 };
 
@@ -375,8 +375,13 @@ impl OneShot {
     /// `status --role`: see [`health::status`], measured to these
     /// generators' now.
     pub fn status_for(&self, db: &Path, role: Option<SessionRole>) -> Result<Value> {
-        let queue = self.open_read_only(db)?;
-        health::status(&queue, &SystemProcesses, &*self.generators.clock, role)
+        self.status_of(&self.open_read_only(db)?, role)
+    }
+
+    /// [`Self::status_for`] on a queue the caller already opened, so a
+    /// command opens it once.
+    pub fn status_of(&self, queue: &SqliteQueue, role: Option<SessionRole>) -> Result<Value> {
+        health::status(queue, &SystemProcesses, &*self.generators.clock, role)
     }
 
     /// `doctor`: see [`health::doctor`], with the queue's `schema` as
@@ -386,30 +391,32 @@ impl OneShot {
     /// `error` says why. `common_dir`, when given, is the repository the
     /// queue must be bound to, checked either way.
     pub fn doctor(&self, db: &Path, full: bool, common_dir: Option<&str>) -> Result<Value> {
-        let schema = SqliteQueue::schema(db)?;
-        let mut report = if schema.refuses_binary() {
-            if let Some(common_dir) = common_dir {
-                SqliteQueue::assert_repository_at(db, common_dir)?;
+        let (schema, queue) = SqliteQueue::inspect_read_only(db)?;
+        let mut report = match queue {
+            ReadOnlyQueue::Refused { binding, error } => {
+                if let Some(common_dir) = common_dir {
+                    binding.assert_repository(common_dir)?;
+                }
+                serde_json::json!({
+                    "checked_at": self.generators.clock.now(),
+                    "error": format!("{error:#}"),
+                })
             }
-            let error = self
-                .open_read_only(db)
-                .err()
-                .map(|error| format!("{error:#}"));
-            serde_json::json!({ "checked_at": self.generators.clock.now(), "error": error })
-        } else {
-            let queue = self.open_read_only(db)?;
-            if let Some(common_dir) = common_dir {
-                queue.assert_repository(common_dir)?;
+            ReadOnlyQueue::Readable(queue) => {
+                let queue = queue.with_generators(self.generators.clone());
+                if let Some(common_dir) = common_dir {
+                    queue.assert_repository(common_dir)?;
+                }
+                let run_env = doctor_run_env(&queue, db).map_err(|error| format!("{error:#}"));
+                health::doctor(
+                    &queue,
+                    &SystemProcesses,
+                    &LocalRunFiles,
+                    &*self.generators.clock,
+                    full,
+                    run_env,
+                )?
             }
-            let run_env = doctor_run_env(&queue, db).map_err(|error| format!("{error:#}"));
-            health::doctor(
-                &queue,
-                &SystemProcesses,
-                &LocalRunFiles,
-                &*self.generators.clock,
-                full,
-                run_env,
-            )?
         };
         report["schema"] = serde_json::to_value(schema)?;
         Ok(report)
@@ -439,7 +446,18 @@ impl OneShot {
         query: &StatsQuery,
         workspaces: Option<&dyn WorkspaceListing>,
     ) -> Result<Value> {
-        let queue = self.open_read_only(db)?;
+        self.stats_of(&self.open_read_only(db)?, db, query, workspaces)
+    }
+
+    /// [`Self::stats`] on `queue`, the queue at `db` the caller already
+    /// opened, so a command opens it once.
+    pub fn stats_of(
+        &self,
+        queue: &SqliteQueue,
+        db: &Path,
+        query: &StatsQuery,
+        workspaces: Option<&dyn WorkspaceListing>,
+    ) -> Result<Value> {
         let now = self.generators.clock.now();
         let checkout = queue
             .repository_binding()?
@@ -475,7 +493,7 @@ impl OneShot {
             history: &history,
         };
         Ok(serde_json::to_value(statistics::stats(
-            &queue,
+            queue,
             &SystemProcesses,
             now,
             query,
@@ -689,13 +707,24 @@ same in one step",
     /// `planners`: every planner not closed (with `all`, every one), with
     /// its state judged by [`planner::planner_views`].
     pub fn planners(&self, db: &Path, cmux: &dyn WorkspaceBackend, all: bool) -> Result<Value> {
-        let queue = self.open_read_only(db)?;
+        self.planners_of(&self.open_read_only(db)?, db, cmux, all)
+    }
+
+    /// [`Self::planners`] on `queue`, the queue at `db` the caller already
+    /// opened, so a command opens it once.
+    pub fn planners_of(
+        &self,
+        queue: &SqliteQueue,
+        db: &Path,
+        cmux: &dyn WorkspaceBackend,
+        all: bool,
+    ) -> Result<Value> {
         // Claude Code's signals only read what its hook and screen show.
         let signals = ClaudeCode {
             executable: PathBuf::from("claude"),
         };
         let views = planner::planner_views(
-            &queue,
+            queue,
             &PlannerProbes {
                 cmux,
                 processes: &SystemProcesses,

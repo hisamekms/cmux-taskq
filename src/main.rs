@@ -1589,7 +1589,7 @@ fn execute(cli: Cli) -> Result<Value> {
             queue.graph_input()?,
             goal_id.map(GoalId::new),
         ))?,
-        Command::Status { role: r } => one_shot.status_for(&db, parse_role(r)?)?,
+        Command::Status { role: r } => one_shot.status_of(&queue, parse_role(r)?)?,
         Command::Ask {
             command: Some(AskCommand::Close { id }),
             ..
@@ -1645,8 +1645,8 @@ fn execute(cli: Cli) -> Result<Value> {
             kind,
             since,
             until,
-        } => dagq::watch::events_matching(
-            &db,
+        } => dagq::watch::events_in(
+            &queue,
             &dagq::watch::EventsQuery {
                 after: EventId::new(after),
                 limit: limit as usize,
@@ -1663,7 +1663,7 @@ fn execute(cli: Cli) -> Result<Value> {
             },
         )?,
         Command::Timeline { run, gap, full } => {
-            dagq::watch::timeline(&db, &RunId::new(run)?, gap, full)?
+            dagq::watch::timeline_in(&queue, &RunId::new(run)?, gap, full)?
         }
         Command::Watch {
             after,
@@ -1796,7 +1796,8 @@ fn execute(cli: Cli) -> Result<Value> {
         }
         Command::Planners { all, cmux } => {
             use dagq::infrastructure::adapters::{Cmux, executable};
-            one_shot.planners(
+            one_shot.planners_of(
+                &queue,
                 &db,
                 &Cmux {
                     executable: executable(&cmux)?,
@@ -1865,7 +1866,8 @@ fn execute(cli: Cli) -> Result<Value> {
             use dagq::infrastructure::adapters::{Cmux, executable};
             // A missing cmux leaves only `workspace_mismatch` unjudged.
             let cmux = executable(&cmux).ok().map(|executable| Cmux { executable });
-            one_shot.stats(
+            one_shot.stats_of(
+                &queue,
                 &db,
                 &dagq::domain::stats::StatsQuery {
                     since: since.map(EventId::new),

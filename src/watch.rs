@@ -116,9 +116,14 @@ pub fn events(db: &Path, after: EventId, limit: usize, all: bool) -> Result<Valu
 /// `events` with its filters and `--full`: the events after `query.after`
 /// that the query keeps, oldest first.
 pub fn events_matching(db: &Path, query: &EventsQuery) -> Result<Value> {
-    let queue = SqliteQueue::open_read_only(db)?;
+    events_in(&SqliteQueue::open_read_only(db)?, query)
+}
+
+/// [`events_matching`] on a queue the caller already opened, so a command
+/// opens it once.
+pub fn events_in(queue: &SqliteQueue, query: &EventsQuery) -> Result<Value> {
     let upto = queue.latest_event_id()?;
-    let (events, cursor) = read_events(&queue, query, upto, None)?;
+    let (events, cursor) = read_events(queue, query, upto, None)?;
     Ok(json!({"events": events, "cursor": cursor}))
 }
 
@@ -172,7 +177,12 @@ fn well_formed(time: &str) -> bool {
 /// `timeline RUN`: the run's events oldest first and its gaps of at least
 /// `gap_secs` with their reasons (`domain::timeline`).
 pub fn timeline(db: &Path, run: &RunId, gap_secs: i64, full: bool) -> Result<Value> {
-    let queue = SqliteQueue::open_read_only(db)?;
+    timeline_in(&SqliteQueue::open_read_only(db)?, run, gap_secs, full)
+}
+
+/// [`timeline`] on a queue the caller already opened, so a command opens
+/// it once.
+pub fn timeline_in(queue: &SqliteQueue, run: &RunId, gap_secs: i64, full: bool) -> Result<Value> {
     let task_run = queue.run(run)?;
     let events = queue.run_events(run)?;
     // The latest run of an unfinished task still moves on, even `failed` or

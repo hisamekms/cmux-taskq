@@ -120,6 +120,19 @@ impl SqliteQueue {
     /// migration only rewrites the copy. The copy is a snapshot: a command
     /// that polls, like `watch`, opens the queue itself.
     pub fn open_read_only(path: impl AsRef<Path>) -> Result<Self> {
+        match Self::inspect_read_only(path)?.1 {
+            ReadOnlyQueue::Readable(queue) => Ok(queue),
+            ReadOnlyQueue::Refused { error, .. } => Err(error),
+        }
+    }
+
+    /// [`Self::open_read_only`] for `doctor`, which reports the schema even
+    /// of a queue that refuses this binary (ADR-0045 decision 5): the
+    /// queue's schema as [`Self::schema`] reports it, read on the same
+    /// connection before any in-memory migration, and the queue, or the
+    /// connection of one that refuses this binary with the reason. The
+    /// file is opened once either way.
+    pub fn inspect_read_only(path: impl AsRef<Path>) -> Result<(SchemaState, ReadOnlyQueue)> {
         let queue = Self::connect_with(
             path.as_ref(),
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -127,9 +140,18 @@ impl SqliteQueue {
         let state = queue
             .state()?
             .context("queue is not initialized; use init first")?;
-        state.check_floor()?;
+        let schema = state.report();
+        if let Err(error) = state.check_floor() {
+            return Ok((
+                schema,
+                ReadOnlyQueue::Refused {
+                    binding: queue,
+                    error,
+                },
+            ));
+        }
         if state.version >= BINARY_SCHEMA {
-            return Ok(queue);
+            return Ok((schema, ReadOnlyQueue::Readable(queue)));
         }
         let mut memory = Connection::open_in_memory()?;
         rusqlite::backup::Backup::new(&queue.conn, &mut memory)?
@@ -142,7 +164,7 @@ impl SqliteQueue {
             generators: queue.generators.clone(),
         };
         copy.apply(state.version, None)?;
-        Ok(copy)
+        Ok((schema, ReadOnlyQueue::Readable(copy)))
     }
 
     /// The schema of the queue at `path` as this binary sees it, without
@@ -156,17 +178,6 @@ impl SqliteQueue {
             .state()?
             .context("queue is not initialized; use init first")?;
         Ok(state.report())
-    }
-
-    /// Checks the repository binding of the queue at `path` (see
-    /// [`Self::assert_repository`]) without checking its schema, for
-    /// `doctor` on a queue that refuses this binary.
-    pub fn assert_repository_at(path: impl AsRef<Path>, common_dir: &str) -> Result<()> {
-        Self::connect_with(
-            path.as_ref(),
-            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        )?
-        .assert_repository(common_dir)
     }
 
     /// `dagq migrate`: applies the migrations this binary knows and the
@@ -402,6 +413,19 @@ impl QueueSchema {
             opens: self.check_opens().is_ok(),
         }
     }
+}
+
+/// A queue opened read-only by [`SqliteQueue::inspect_read_only`].
+pub enum ReadOnlyQueue {
+    /// A queue this binary reads (an older one from its in-memory copy).
+    Readable(SqliteQueue),
+    /// A queue whose floor refuses this binary: `binding` reads only its
+    /// repository binding ([`SqliteQueue::assert_repository`]), and `error`
+    /// is what [`SqliteQueue::open_read_only`] fails with.
+    Refused {
+        binding: SqliteQueue,
+        error: anyhow::Error,
+    },
 }
 
 /// A queue's schema as `migrate --check` and `doctor` report it.
