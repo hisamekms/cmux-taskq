@@ -28,6 +28,7 @@ related:
   - `validate`: 最初の`receipt_observed`→最初の`validation_finished`
   - `wait_to_land`: 最初の`validation_finished`→`run_integrated`
   - `startup`: `agent_started`→`first_commit_observed`（[最初のcommitの観測](first-commit.md#最初のcommitの観測)。記録の無いrunはnull）
+  - `work_breakdown`: runのsession（`worker` / `resume` / `revise`）が何に時間を使ったか（task 514。下の[作業の内訳](#作業の内訳)）。記録した区間が無ければnull
   - `resumes`: `resume_started`（ADR-0019の自動resume。記録されるまでは0）の数、`review_verdict`: 最後の`review_finished`の`verdict`（goal 11のreview工程が記録するまではnull）、`needs_session` / `failed`: payloadの`status`がその値のイベントの数。`integration_error`は試行前のstatusに戻すだけなので`needs_session`に数えない
   - `land_phases`: `wait_to_land`の工程別の内訳（下の[着地待ちの内訳](#着地待ちの内訳)）。`run_integrated`の無いrunはnull
   - `title`: taskのtitle。`kind`: taskの変更の種類（goal 21。無いtaskはnull）。`claimed_at` / `validated_at` / `landed_at`: 最初の`run_claimed`・最初の`validation_finished`・`run_integrated`の記録時刻（queueの`created_at`のまま。無ければnull）
@@ -126,3 +127,13 @@ runtimeが記録したClaude sessionの区間（`session_opened` / `session_clos
 - **`runs`の`sessions`**: `{<kind>: {count, open, active}}`で、`open` / `active`はそのrunの区間の秒の合計（`active`は記録が無ければnull）。windowで切らない。区間の無いkindは出さない（区間の無い過去のrunは`{}`）。
 - **`goals`と`overall`の`sessions`**: `{<kind>: {count, open, active, active_ratio}}`で、`open` / `active`は区間ごとの秒の`{count, total, median}`。対象のrunの区間を数え、区間の無いkindは出さない。
 - observerは`stats`を入力に読むので、そのまま載る。
+
+## 作業の内訳
+
+task 514で足した集計。runのsessionの区間（`worker` / `resume` / `revise`）が閉じるとき、runtimeがtranscriptから区間の時間を分類して`session_closed`の`work`に記録する（書き方は[provider-lifecycle](../provider-lifecycle.md#作業の内訳)）。集計は`domain::stats::work`がその`work`から再導出し、transcriptもrun directoryの`worktime.jsonl`も読まない。既存の項目は変えず、足すだけにする。
+
+- **分類**（`secs`のkey）: `model`（Claudeの思考・生成）、`chain`（重いコマンドを2種類以上つないだもの）、`e2e`、`llvm_cov`、`test`、`build`（build / clippy / check / run）、`fmt`、`wait`（sleepなどの待ちと、ScheduleWakeup / Monitor / TaskOutput / BashOutputのtool）、`dagq`、`git`、`other_command`、`tool`（ファイルを読む・書く・探すtool）、`subagent`、`idle`。秒の無い分類は出さない
+- **`runs`の`work_breakdown`**: `{sessions, total_secs, secs: {<分類>: 秒}, commands: {<分類>: {runs, failed}}, verification_repeats, test_with_llvm_cov}`。区間の`work`を足したもの。`commands`は重いコマンド（`chain` / `e2e` / `llvm_cov` / `test` / `build`）の起動回数と失敗回数（foregroundは`is_error`か`Exit code`が0でない、backgroundは通知の`status: failed`か`exit code`が0でない）
+- **検証の重複**: `verification_repeats`は、workerがtaskの`verification_commands`のうち`integrate`がもう一度流す検証（llvm-cov、全体の`cargo test`、e2e。fmt・clippyは数えない）と同じ種類のものを流したコマンドの数。一致はコマンドの文字列ではなく種類で見る（`cargo llvm-cov`を含むもの、targetを選ぶ・絞るflagや引数の無い`cargo test` / `cargo nextest run`、`--test e2e`）。`test_with_llvm_cov`は、llvm-covも流したrunでの全体の`cargo test`の回数（同じtestを2回流した回数。llvm-covを流していないrunは0）
+- **`goals`と`overall`の`work_breakdown`**（`kinds`・`versions`・`load_bands`も同じ形）: `{runs, total_secs, categories: {<分類>: {total, median, share}}, commands, verification_repeats, runs_with_repeats, test_with_llvm_cov}`。`runs`は内訳のあるrunの数で、内訳の無いrunは数えない。`median`はそれらのrunの秒の中央値（その分類の無いrunは0として数える）、`share`は`total`を`total_secs`で割った値（小数3桁）。`runs_with_repeats`は`verification_repeats`が1以上のrunの数
+

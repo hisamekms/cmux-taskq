@@ -38,6 +38,9 @@ pub struct Span {
     pub active_unavailable: bool,
     /// Its transcript turns recorded so far (unix milliseconds).
     pub turns: Vec<Turn>,
+    /// The work breakdown of a run's own session, recorded when it closed
+    /// (task 514).
+    pub work: Option<Value>,
 }
 
 impl Span {
@@ -93,6 +96,7 @@ pub fn spans(events: &[RunEvent]) -> Vec<Span> {
                     active: None,
                     active_unavailable: false,
                     turns: Vec::new(),
+                    work: None,
                 });
             }
             SESSION_TURNS => {
@@ -128,6 +132,7 @@ pub fn spans(events: &[RunEvent]) -> Vec<Span> {
                 span.inferred = event.payload["reason"] == INFERRED;
                 span.active = event.payload["active_secs"].as_i64();
                 span.active_unavailable = event.payload["active"] == "unavailable";
+                span.work = event.payload.get("work").filter(|w| w.is_object()).cloned();
             }
             _ => {}
         }
@@ -238,6 +243,8 @@ pub struct RunSpan {
     pub kind: String,
     pub open: i64,
     pub active: Option<i64>,
+    /// Its work breakdown (task 514).
+    pub work: Option<Value>,
 }
 
 /// The spans of `run`, whole (not cut to a window), an open one counted to
@@ -250,6 +257,7 @@ pub fn run_spans(spans: &[Span], run: &RunId, now: i64) -> Vec<RunSpan> {
             kind: span.kind.clone(),
             open: span.open_secs(None, now),
             active: span.active_secs(),
+            work: span.work.clone(),
         })
         .collect()
 }
@@ -555,6 +563,7 @@ mod tests {
             kind: "review".into(),
             open: 10,
             active: Some(4),
+            work: None,
         }];
         assert_eq!(per_run(&with_active)["review"].active, Some(4));
         assert_eq!(per_goal(with_active.iter())["review"].active.total, 4);

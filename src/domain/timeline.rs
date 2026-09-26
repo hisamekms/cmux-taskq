@@ -25,6 +25,10 @@
 //! - `after_receipt`: a receipt was observed, and the run waits for its
 //!   validation or review.
 //! - `unknown`.
+//!
+//! Next to the gaps, `commands` lists the heavy commands (e2e, llvm-cov,
+//! test, build/clippy, chains) the run's sessions ran, from the `work` their
+//! `session_closed` recorded (task 514).
 use std::collections::BTreeSet;
 
 use serde::Serialize;
@@ -233,6 +237,51 @@ pub fn gaps(events: &[RunEvent], min_secs: i64, now_ms: Option<i64>) -> Vec<Gap>
         found.push(gap);
     }
     found
+}
+
+/// A heavy command a run's session ran, as `timeline` lists it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct HeavyCommand {
+    /// The span's kind: `worker`, `resume` or `revise`.
+    pub session: String,
+    /// The `session_closed` that recorded it.
+    pub event: EventId,
+    pub category: String,
+    pub from: String,
+    pub until: String,
+    pub secs: i64,
+    pub background: bool,
+    /// Whether its end was seen; otherwise it is cut at the session's end.
+    pub finished: bool,
+    /// `None` when its outcome is unknown.
+    pub failed: Option<bool>,
+}
+
+/// The heavy commands the run's sessions ran, by start.
+pub fn heavy_commands(events: &[RunEvent]) -> Vec<HeavyCommand> {
+    let mut commands: Vec<HeavyCommand> = events
+        .iter()
+        .filter(|event| event.kind == super::sessions::SESSION_CLOSED)
+        .flat_map(|event| {
+            let heavy = event.payload["work"]["heavy"].as_array().cloned();
+            heavy.into_iter().flatten().filter_map(move |row| {
+                let text = |key: &str| row[key].as_str().map(str::to_owned);
+                Some(HeavyCommand {
+                    session: event.payload["kind"].as_str()?.to_owned(),
+                    event: event.id,
+                    category: text("category")?,
+                    from: text("start")?,
+                    until: text("end")?,
+                    secs: row["secs"].as_i64()?,
+                    background: row["background"].as_bool().unwrap_or(false),
+                    finished: row["finished"].as_bool().unwrap_or(true),
+                    failed: row["failed"].as_bool(),
+                })
+            })
+        })
+        .collect();
+    commands.sort_by(|a, b| a.from.cmp(&b.from));
+    commands
 }
 
 #[cfg(test)]
@@ -444,5 +493,37 @@ mod tests {
             ("receipt_observed", json!({}), "not a time"),
         ]);
         assert_eq!(reasons(&gaps(&run, 60, None)), [(1, "unknown")]);
+    }
+
+    #[test]
+    fn heavy_commands_come_from_the_closed_sessions_work() {
+        let heavy = |category: &str, start: &str| {
+            json!({"category": category, "start": start, "end": "2026-09-24T01:10:00.000Z",
+                   "secs": 60, "background": true, "finished": true, "failed": false})
+        };
+        let run = events(&[
+            ("session_opened", json!({"kind": "worker"}), "01:00:00"),
+            (
+                "session_closed",
+                json!({"kind": "worker", "work": {"heavy": [
+                    heavy("test", "2026-09-24T01:05:00.000Z"),
+                    {"category": "e2e"},
+                ]}}),
+                "01:20:00",
+            ),
+            (
+                "session_closed",
+                json!({"kind": "resume", "work": {"heavy": [heavy("llvm_cov", "2026-09-24T01:01:00.000Z")]}}),
+                "01:30:00",
+            ),
+            ("session_closed", json!({"kind": "review"}), "01:40:00"),
+        ]);
+        let commands = heavy_commands(&run);
+        assert_eq!(commands.len(), 2);
+        assert_eq!(commands[0].category, "llvm_cov");
+        assert_eq!(commands[0].session, "resume");
+        assert_eq!(commands[1].event, EventId::new(2));
+        assert_eq!(commands[1].failed, Some(false));
+        assert!(commands[1].background);
     }
 }

@@ -13,7 +13,7 @@ related:
 
 # `timeline`
 
-`dagq timeline RUN [--gap SECS（既定300）] [--full]`（task 293、ADR-0044の決定22）は、runのイベントを古い順に並べ、隣り合うイベントの間が`--gap`秒以上の区間（空白）ごとに理由を付けて返す読むだけのコマンド。返り値は`{run_id, task_id, status, gap_secs, events, gaps, gap_total_secs}`で、`events`は`events`と同じ圧縮形（`--full`で全フィールド）。runがin_progressのtaskの最新のrun（triageを待つ`failed` / `interrupted`も含む）なら、最後のイベントから今までも空白にする（`before_event`と`until`がnull）。各空白は`after_event`、`before_event`、`from`、`until`、`secs`、`reason`と、あれば`phase`（supervisorが見ていたsession: `session` / `resume` / `revise` / `conflict`）、`confirmed`（`idle`のとき）、`ask_ids`（`waiting_ask`のとき）。
+`dagq timeline RUN [--gap SECS（既定300）] [--full]`（task 293、ADR-0044の決定22）は、runのイベントを古い順に並べ、隣り合うイベントの間が`--gap`秒以上の区間（空白）ごとに理由を付けて返す読むだけのコマンド。返り値は`{run_id, task_id, status, gap_secs, events, gaps, gap_total_secs, commands}`で、`events`は`events`と同じ圧縮形（`--full`で全フィールド）。runがin_progressのtaskの最新のrun（triageを待つ`failed` / `interrupted`も含む）なら、最後のイベントから今までも空白にする（`before_event`と`until`がnull）。各空白は`after_event`、`before_event`、`from`、`until`、`secs`、`reason`と、あれば`phase`（supervisorが見ていたsession: `session` / `resume` / `revise` / `conflict`）、`confirmed`（`idle`のとき）、`ask_ids`（`waiting_ask`のとき）。
 
 理由はrunのイベントだけから決まった規則で導く（`domain::timeline::gaps`。LLMもrunのディレクトリも読まない）。空白の始まりのイベントまでの状態で、上から最初に当たるもの:
 
@@ -24,3 +24,8 @@ related:
 - `waiting_integration`: sessionが終わっていて、受理された`validation_finished`がある（着地の順番待ち）
 - `after_receipt`: sessionが終わっていて、receiptは観測済み（validationやreviewの待ち）
 - どれにも当たらなければ`unknown`
+
+## 重いコマンドの行
+
+`commands`は、runのsession（`worker` / `resume` / `revise`）が流した重いコマンド（`chain` / `e2e` / `llvm_cov` / `test` / `build`。分類は[stats の作業の内訳](stats.md#作業の内訳)）を始まった順に並べたもの（task 514）。各行は`{session, event, category, from, until, secs, background, finished, failed}`で、`session`は区間のkind、`event`はそれを記録した`session_closed`のid、`finished: false`は終わりが見えず区間の終わりで切ったもの、`failed`は結果が分からなければnull。`session_closed`の`work.heavy`から導き、コマンドの全文は持たない（全文はrun directoryの`worktime.jsonl`にある）。内訳を記録していない区間（transcriptが読めなかった、task 514より前）は行を出さない。
+

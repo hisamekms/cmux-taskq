@@ -20,6 +20,7 @@ pub mod measures;
 pub mod retries;
 pub mod sessions;
 pub mod thresholds;
+pub mod work;
 
 pub use conflicts::{ConflictConfig, ConflictConfigReport, ConflictHotspots, History};
 pub use landing::{LandBreakdown, LandClock, LandPhases, PhaseSummary};
@@ -30,6 +31,7 @@ pub use measures::{
 pub use retries::{BrokenBy, ResumeAttempt, ResumeBreakdown, Retries};
 pub use sessions::{GoalKindSessions, KindSessions, RunKindSessions, SessionWindow, Sessions};
 pub use thresholds::ThresholdStats;
+pub use work::{CategoryShare, CommandCount, RunWork, WorkShares};
 
 /// Runs returned without `--full`.
 pub const DEFAULT_RUNS: usize = 50;
@@ -206,6 +208,9 @@ pub struct RunStats {
     /// many, and their seconds open and active in total. Kinds without one
     /// are not listed.
     pub sessions: BTreeMap<String, RunKindSessions>,
+    /// What its own sessions (worker, resume, revise) spent their time on
+    /// (task 514); null when none recorded it.
+    pub work_breakdown: Option<RunWork>,
     /// Each of its spans, for the per-goal summaries.
     #[serde(skip)]
     pub session_spans: Vec<sessions::RunSpan>,
@@ -234,6 +239,9 @@ pub struct Intervals {
     /// The runs' Claude sessions per kind (ADR-0048 decision 12): how many,
     /// and their seconds open and active. Kinds without one are not listed.
     pub sessions: BTreeMap<String, GoalKindSessions>,
+    /// The runs' work breakdown (task 514): per category its total, median
+    /// and share, the heavy commands, and the verification repeated.
+    pub work_breakdown: WorkShares,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -636,6 +644,8 @@ pub fn stats(
     for track in &mut finished {
         let run_spans = sessions::run_spans(&spans, &track.stats.run_id, now * 1000);
         track.stats.sessions = sessions::per_run(&run_spans);
+        track.stats.work_breakdown =
+            work::per_run(run_spans.iter().filter_map(|s| s.work.as_ref()));
         track.stats.session_spans = run_spans;
     }
 
@@ -1332,6 +1342,7 @@ fn intervals(runs: &[&RunStats]) -> Intervals {
             runs.iter().flat_map(|r| &r.retries.resume_attempts),
         ),
         sessions: sessions::per_goal(runs.iter().flat_map(|r| &r.session_spans)),
+        work_breakdown: work::shares(runs.iter().filter_map(|r| r.work_breakdown.as_ref())),
     }
 }
 
@@ -1392,6 +1403,7 @@ fn runs(events: &[RunEvent], goals: &HashMap<TaskId, Option<GoalId>>) -> Vec<Tra
                     retries: Retries::default(),
                     measures: RunMeasures::default(),
                     sessions: BTreeMap::new(),
+                    work_breakdown: None,
                     session_spans: Vec::new(),
                 },
                 claimed: None,
@@ -2359,6 +2371,99 @@ mod tests {
             Cursor::Time(T * 1000 + 99_999).event_id(&events),
             EventId::new(1)
         );
+    }
+
+    /// The work breakdown (task 514): a run sums the `work` of its own
+    /// sessions; goals and overall total it with medians and shares.
+    #[test]
+    fn work_breakdowns_are_summed_per_run_and_shared_per_goal() {
+        let span = |id: i64, run: &str, kind: &str, work: Value, secs: i64| {
+            [
+                run_event(id, run, "session_opened", json!({"kind": kind}), secs),
+                run_event(
+                    id + 1,
+                    run,
+                    "session_closed",
+                    json!({"opened_event_id": id, "kind": kind, "reason": "exited", "work": work}),
+                    secs + 100,
+                ),
+            ]
+        };
+        let r2 = |event: RunEvent| RunEvent {
+            task_id: Some(TaskId::new(2)),
+            ..event
+        };
+        let mut events = vec![run_event(1, R1, "run_claimed", json!({}), T)];
+        events.extend(span(
+            2,
+            R1,
+            "worker",
+            json!({"total_secs": 100, "secs": {"model": 30, "test": 70},
+                   "commands": {"test": {"runs": 1, "failed": 0}},
+                   "verification_repeats": 0, "full_tests": 1, "llvm_cov_runs": 0}),
+            T,
+        ));
+        events.extend(span(
+            4,
+            R1,
+            "resume",
+            json!({"total_secs": 100, "secs": {"llvm_cov": 100},
+                   "commands": {"llvm_cov": {"runs": 1, "failed": 1}},
+                   "verification_repeats": 1, "full_tests": 0, "llvm_cov_runs": 1}),
+            T + 200,
+        ));
+        events.push(run_event(6, R1, "run_integrated", json!({}), T + 400));
+        events.push(r2(run_event(7, R2, "run_claimed", json!({}), T + 500)));
+        events.extend(
+            span(
+                8,
+                R2,
+                "worker",
+                json!({"total_secs": 200, "secs": {"model": 200}}),
+                T + 500,
+            )
+            .map(r2),
+        );
+        // A review has no work breakdown.
+        events.extend(span(10, R2, "review", Value::Null, T + 600).map(r2));
+        events.push(r2(run_event(12, R2, "run_integrated", json!({}), T + 800)));
+        let goals = HashMap::from([
+            (TaskId::new(1), Some(GoalId::new(5))),
+            (TaskId::new(2), Some(GoalId::new(5))),
+        ]);
+        let all = stats(
+            &events,
+            &goals,
+            T + 1000,
+            SlotSnapshot::default(),
+            &StatsQuery {
+                full: true,
+                ..StatsQuery::default()
+            },
+            &LiveSnapshot::default(),
+        );
+        let json = serde_json::to_value(&all).unwrap();
+        let r1 = &json["runs"][0]["work_breakdown"];
+        assert_eq!(r1["sessions"], 2);
+        assert_eq!(r1["total_secs"], 200);
+        assert_eq!(
+            r1["secs"],
+            json!({"model": 30, "test": 70, "llvm_cov": 100})
+        );
+        assert_eq!(r1["commands"]["llvm_cov"], json!({"runs": 1, "failed": 1}));
+        assert_eq!(r1["verification_repeats"], 1);
+        assert_eq!(r1["test_with_llvm_cov"], 1);
+        assert_eq!(json["runs"][1]["work_breakdown"]["sessions"], 1);
+        let overall = &json["overall"]["work_breakdown"];
+        assert_eq!(overall["runs"], 2);
+        assert_eq!(overall["total_secs"], 400);
+        assert_eq!(overall["categories"]["model"]["total"], 230);
+        assert_eq!(overall["categories"]["model"]["median"], 115);
+        assert_eq!(overall["categories"]["model"]["share"], json!(0.575));
+        assert_eq!(overall["categories"]["test"]["median"], 35);
+        assert_eq!(overall["verification_repeats"], 1);
+        assert_eq!(overall["runs_with_repeats"], 1);
+        assert_eq!(json["goals"][0]["work_breakdown"], *overall);
     }
 
     /// The Claude sessions (ADR-0048): per run whole, per goal and overall

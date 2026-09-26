@@ -42,7 +42,7 @@ pub const KINDS: [&str; 10] = [
 
 /// The kinds of a run's own session: the worker's, a resume's, and the
 /// revise it is sent back to.
-const RUN_SESSION: [&str; 3] = [WORKER, RESUME, REVISE];
+pub const RUN_SESSION: [&str; 3] = [WORKER, RESUME, REVISE];
 
 /// Why a span was closed.
 pub const EXITED: &str = "exited";

@@ -35,6 +35,46 @@ pub struct TranscriptRecord {
     pub version: Option<String>,
     /// `message.usage` of an `assistant` record, for task 199.
     pub usage: Option<Value>,
+    /// An `assistant` record (the model wrote it), for the work breakdown.
+    pub assistant: bool,
+    /// The tools an `assistant` record called (task 514).
+    pub tool_uses: Vec<ToolUse>,
+    /// The tool results a `user` record returned.
+    pub tool_results: Vec<ToolResult>,
+    /// The completion of a background command or an async subagent this
+    /// record announces (`<task-notification>`).
+    pub notification: Option<Notification>,
+}
+
+/// A `tool_use` of an `assistant` record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolUse {
+    pub id: String,
+    pub name: String,
+    /// `input.command` of a shell tool.
+    pub command: Option<String>,
+    /// `input.run_in_background` is true.
+    pub background: bool,
+}
+
+/// A `tool_result` of a `user` record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolResult {
+    pub tool_use_id: String,
+    pub is_error: bool,
+    /// The `Exit code N` a failed shell command's result starts with.
+    pub exit_code: Option<i64>,
+}
+
+/// A `<task-notification>`: the background command or subagent started by
+/// the tool use `tool_use_id` ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Notification {
+    pub tool_use_id: String,
+    /// `completed`, `failed`, `killed`, `stopped`.
+    pub status: Option<String>,
+    /// The `exit code N` its summary names.
+    pub exit_code: Option<i64>,
 }
 
 impl TranscriptRecord {
@@ -61,6 +101,26 @@ impl TranscriptRecord {
         let usage = (kind == "assistant")
             .then(|| line["message"].get("usage").cloned())
             .flatten();
+        let content = &line["message"]["content"];
+        let parts = content.as_array().map(Vec::as_slice).unwrap_or_default();
+        let tool_uses = if kind == "assistant" {
+            parts.iter().filter_map(tool_use).collect()
+        } else {
+            Vec::new()
+        };
+        let tool_results = if kind == "user" {
+            parts.iter().filter_map(tool_result).collect()
+        } else {
+            Vec::new()
+        };
+        // Claude Code queues the notification (`queue-operation`) and then
+        // gives it to the model as a `user` input.
+        let notification = match kind {
+            "queue-operation" => line["content"].as_str(),
+            "user" => content.as_str(),
+            _ => None,
+        }
+        .and_then(notification);
         Some((
             Self {
                 at,
@@ -68,10 +128,70 @@ impl TranscriptRecord {
                 sidechain,
                 version: line["version"].as_str().map(str::to_owned),
                 usage,
+                assistant: kind == "assistant",
+                tool_uses,
+                tool_results,
+                notification,
             },
             session_id,
         ))
     }
+}
+
+fn tool_use(part: &Value) -> Option<ToolUse> {
+    (part["type"] == "tool_use").then_some(())?;
+    Some(ToolUse {
+        id: part["id"].as_str()?.to_owned(),
+        name: part["name"].as_str().unwrap_or_default().to_owned(),
+        command: part["input"]["command"].as_str().map(str::to_owned),
+        background: part["input"]["run_in_background"].as_bool() == Some(true),
+    })
+}
+
+fn tool_result(part: &Value) -> Option<ToolResult> {
+    (part["type"] == "tool_result").then_some(())?;
+    let text = match &part["content"] {
+        Value::String(text) => Some(text.as_str()),
+        Value::Array(parts) => parts.iter().find_map(|part| part["text"].as_str()),
+        _ => None,
+    };
+    let exit_code = text
+        .and_then(|text| text.strip_prefix("Exit code "))
+        .and_then(leading_number);
+    Some(ToolResult {
+        tool_use_id: part["tool_use_id"].as_str()?.to_owned(),
+        is_error: part["is_error"].as_bool() == Some(true),
+        exit_code,
+    })
+}
+
+/// The `<task-notification>` in `text`.
+fn notification(text: &str) -> Option<Notification> {
+    let tag = |name: &str| {
+        let open = format!("<{name}>");
+        let start = text.find(&open)? + open.len();
+        let end = start + text[start..].find(&format!("</{name}>"))?;
+        Some(text[start..end].trim())
+    };
+    tag("task-notification")?;
+    let summary = tag("summary").unwrap_or_default();
+    let exit_code = summary
+        .rfind("exit code ")
+        .and_then(|at| leading_number(&summary[at + "exit code ".len()..]));
+    Some(Notification {
+        tool_use_id: tag("tool-use-id")?.to_owned(),
+        status: tag("status").map(str::to_owned),
+        exit_code,
+    })
+}
+
+/// The integer `text` starts with.
+fn leading_number(text: &str) -> Option<i64> {
+    let end = text
+        .char_indices()
+        .find(|&(at, c)| !(c.is_ascii_digit() || (at == 0 && c == '-')))
+        .map_or(text.len(), |(at, _)| at);
+    text[..end].parse().ok()
 }
 
 /// Whether a `user` message's content is `tool_result`s only.
@@ -479,6 +599,66 @@ mod tests {
             .overlap(400, 1000),
             0
         );
+    }
+
+    /// Tool calls, their results and the notices of background work are
+    /// kept for the work breakdown (task 514).
+    #[test]
+    fn records_keep_their_tool_calls_results_and_notices() {
+        let lines = [
+            line(
+                "assistant",
+                0,
+                json!({"message": {"content": [
+                    {"type": "tool_use", "id": "a", "name": "Bash",
+                     "input": {"command": "sleep 1", "run_in_background": true}},
+                    {"type": "tool_use", "name": "Read"},
+                ]}}),
+            ),
+            line(
+                "user",
+                1,
+                json!({"message": {"content": [
+                    {"type": "tool_result", "tool_use_id": "a", "is_error": true,
+                     "content": [{"type": "text", "text": "Exit code 2\nboom"}]},
+                    {"type": "tool_result", "tool_use_id": "b", "content": {"odd": true}},
+                ]}}),
+            ),
+            input(
+                2,
+                "<task-notification>\n<tool-use-id>a</tool-use-id>\n<status>completed</status>\n<summary>Background command \"x\" completed (exit code 0)</summary>\n</task-notification>",
+            ),
+            input(
+                3,
+                "<task-notification><status>failed</status></task-notification>",
+            ),
+        ];
+        let records = parse(&lines).unwrap().records;
+        assert_eq!(
+            records[0].tool_uses,
+            vec![ToolUse {
+                id: "a".into(),
+                name: "Bash".into(),
+                command: Some("sleep 1".into()),
+                background: true,
+            }]
+        );
+        assert!(records[0].assistant);
+        assert_eq!(records[1].tool_results[0].exit_code, Some(2));
+        assert!(records[1].tool_results[0].is_error);
+        assert_eq!(records[1].tool_results[1].exit_code, None);
+        assert_eq!(
+            records[2].notification,
+            Some(Notification {
+                tool_use_id: "a".into(),
+                status: Some("completed".into()),
+                exit_code: Some(0),
+            })
+        );
+        // A notice without its tool use's id names nothing.
+        assert_eq!(records[3].notification, None);
+        assert_eq!(leading_number("-3 left"), Some(-3));
+        assert_eq!(leading_number("x"), None);
     }
 
     #[test]

@@ -203,6 +203,7 @@ pub fn timeline_in(queue: &SqliteQueue, run: &RunId, gap_secs: i64, full: bool) 
         "events": events.iter().map(|event| shown(event, full)).collect::<Vec<_>>(),
         "gaps": gaps,
         "gap_total_secs": waited,
+        "commands": timeline::heavy_commands(&events),
     }))
 }
 

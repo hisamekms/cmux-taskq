@@ -1749,6 +1749,20 @@ impl SqliteQueue {
         }
         let status = status.unwrap_or(RunStatus::NeedsSession);
         payload["status"] = json!(status.as_str());
+        // The work of the resumed session, closed when it exited (task 514).
+        let resumed: i64 = tx.query_row(
+            "SELECT coalesce(max(id),0) FROM run_events WHERE run_id=?1 AND kind='resume_started'",
+            [id],
+            |r| r.get(0),
+        )?;
+        if let Some(work) = super::sessions::closed_work(
+            &tx,
+            id,
+            crate::domain::sessions::RESUME,
+            crate::domain::EventId::new(resumed),
+        )? {
+            payload["work_breakdown"] = work;
+        }
         run_event(&tx, id, "resume_finished", payload)?;
         if !keep_lease {
             tx.execute(

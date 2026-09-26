@@ -200,6 +200,54 @@ fn events_full_and_filters_narrow_what_they_read() {
     }
 }
 
+/// Task 514: the work breakdown a run's session closed with is in
+/// `timeline`'s heavy commands and in `stats --full`.
+#[test]
+fn timeline_and_stats_show_the_work_breakdown() {
+    use serde_json::json;
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("queue.db");
+    let run = run_with_events(
+        &db,
+        &[
+            ("agent_started", json!({"session_id": "s"}), "00:00:05"),
+            ("session_exited", json!({"exit_code": 0}), "00:30:00"),
+            ("run_integrated", json!({}), "00:40:00"),
+        ],
+    );
+    // The breakdown the span would have recorded from its transcript.
+    let work = json!({
+        "total_secs": 1795, "secs": {"model": 600, "llvm_cov": 900, "idle": 295},
+        "commands": {"llvm_cov": {"runs": 1, "failed": 0}},
+        "verification_repeats": 1, "full_tests": 0, "llvm_cov_runs": 1,
+        "heavy": [{"category": "llvm_cov", "start": "2026-09-24T00:10:00.000Z",
+                   "end": "2026-09-24T00:25:00.000Z", "secs": 900,
+                   "background": true, "finished": true, "failed": false}],
+    });
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    conn.execute(
+        "UPDATE run_events SET payload=json_set(payload,'$.work',json(?1)) WHERE kind='session_closed'",
+        [work.to_string()],
+    )
+    .unwrap();
+    let timeline = ok(&db, &["timeline", &run]);
+    let commands = timeline["commands"].as_array().unwrap();
+    assert_eq!(commands.len(), 1);
+    assert_eq!(commands[0]["session"], "worker");
+    assert_eq!(commands[0]["category"], "llvm_cov");
+    assert_eq!(commands[0]["secs"], 900);
+    assert_eq!(commands[0]["background"], true);
+    let stats = ok(&db, &["stats", "--full"]);
+    let breakdown = &stats["runs"][0]["work_breakdown"];
+    assert_eq!(breakdown["secs"]["llvm_cov"], 900);
+    assert_eq!(breakdown["verification_repeats"], 1);
+    let overall = &stats["overall"]["work_breakdown"];
+    assert_eq!(overall["runs"], 1);
+    assert_eq!(overall["categories"]["llvm_cov"]["share"], json!(0.501));
+    assert_eq!(overall["verification_repeats"], 1);
+    assert_eq!(stats["goals"][0]["work_breakdown"]["runs"], 1);
+}
+
 #[test]
 fn timeline_names_the_long_gap_before_the_receipt() {
     use serde_json::json;

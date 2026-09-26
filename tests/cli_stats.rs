@@ -384,6 +384,8 @@ mod stats {
                 // ADR-0048: the run's Claude sessions per kind; these
                 // events recorded none.
                 "sessions": {},
+                // Task 514: no session recorded its work breakdown.
+                "work_breakdown": null,
             })
         );
         // Parked three times, then the landing: the wait is the resume's.
@@ -424,13 +426,19 @@ mod stats {
                  "validate": {"count": 2, "total": 180, "median": 90},
                  "wait_to_land": {"count": 2, "total": 1440, "median": 720},
                  "startup": {"count": 1, "total": 180, "median": 180},
-                 "sessions": {}},
+                 "sessions": {},
+                 "work_breakdown": {"runs": 0, "total_secs": 0, "categories": {}, "commands": {},
+                                    "verification_repeats": 0, "runs_with_repeats": 0,
+                                    "test_with_llvm_cov": 0}},
                 {"goal_id": null, "runs": 2,
                  "work": {"count": 1, "total": 300, "median": 300},
                  "validate": {"count": 1, "total": 60, "median": 60},
                  "wait_to_land": {"count": 0, "total": 0, "median": null},
                  "startup": {"count": 0, "total": 0, "median": null},
-                 "sessions": {}},
+                 "sessions": {},
+                 "work_breakdown": {"runs": 0, "total_secs": 0, "categories": {}, "commands": {},
+                                    "verification_repeats": 0, "runs_with_repeats": 0,
+                                    "test_with_llvm_cov": 0}},
             ])
         );
         assert_eq!(report["overall"]["runs"], 4);

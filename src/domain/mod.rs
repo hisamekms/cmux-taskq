@@ -447,6 +447,7 @@ pub mod task;
 pub mod timeline;
 pub mod transcript;
 mod views;
+pub mod worktime;
 
 pub use error::DomainError;
 use error::require;
