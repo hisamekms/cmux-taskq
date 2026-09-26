@@ -3,9 +3,16 @@
 //! the first reason that holds; the supervisor records `claim_held` when
 //! the hold starts (or its reason changes) and `claim_resumed` when it
 //! ends, as queue events, so `status` shows a hold in progress and `stats`
-//! the time spent held apart from the `idle_slots` alert. The only reason
-//! so far is the 1-minute load average above `supervise --max-load`; the
-//! later reasons join [`HoldReason`] and [`ClaimHold::judge`].
+//! the time spent held apart from the `idle_slots` alert. The reasons are
+//! the free disk space below what a run needs (task 377) and the 1-minute
+//! load average above `supervise --max-load`; later reasons join
+//! [`HoldReason`] and [`ClaimHold::judge`].
+//!
+//! Landings are held the same way (task 377): the supervisor starts no
+//! landing's verification while the free disk space is below what it
+//! needs, and records `landing_held` / `landing_resumed` with the same
+//! payloads, so `status` and `stats` show them in the same shape
+//! ([`LANDINGS`]).
 
 use std::collections::BTreeMap;
 
@@ -23,6 +30,45 @@ pub const CLAIM_HELD: &str = "claim_held";
 pub const CLAIM_RESUMED: &str = "claim_resumed";
 /// The two kinds, for reading the latest of them.
 pub const CLAIM_HOLD_KINDS: [&str; 2] = [CLAIM_HELD, CLAIM_RESUMED];
+/// Recorded when the supervisor starts holding the landings' verification
+/// (task 377), with the payload of `claim_held`.
+pub const LANDING_HELD: &str = "landing_held";
+/// Recorded when landings resume, with the payload of `claim_resumed`.
+pub const LANDING_RESUMED: &str = "landing_resumed";
+/// The two kinds, for reading the latest of them.
+pub const LANDING_HOLD_KINDS: [&str; 2] = [LANDING_HELD, LANDING_RESUMED];
+
+/// What a hold holds: new claims or the landings' verification, each
+/// recorded by its pair of queue events.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HoldKinds {
+    pub held: &'static str,
+    pub resumed: &'static str,
+    /// The hold is of the supervisor that recorded it, not of the host:
+    /// another live supervisor does not end it (a landing waits in one
+    /// supervisor's slot).
+    pub own: bool,
+}
+
+impl HoldKinds {
+    /// Both kinds, for reading the latest of them.
+    pub const fn kinds(self) -> [&'static str; 2] {
+        [self.held, self.resumed]
+    }
+}
+
+/// The holds on new claims.
+pub const CLAIMS: HoldKinds = HoldKinds {
+    held: CLAIM_HELD,
+    resumed: CLAIM_RESUMED,
+    own: false,
+};
+/// The holds on the landings' verification.
+pub const LANDINGS: HoldKinds = HoldKinds {
+    held: LANDING_HELD,
+    resumed: LANDING_RESUMED,
+    own: true,
+};
 
 /// The default of `supervise --max-load`: the 1-minute load average above
 /// which no new run is claimed. On the 8-core host this queue runs on,
@@ -35,6 +81,9 @@ pub const DEFAULT_MAX_LOAD: f64 = 16.0;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HoldReason {
+    /// The free disk space of the queue's directory is below what a run
+    /// needs (task 377, [`super::disk`]).
+    DiskSpace,
     /// The 1-minute load average is above `--max-load`.
     LoadAverage,
 }
@@ -42,6 +91,7 @@ pub enum HoldReason {
 impl HoldReason {
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::DiskSpace => "disk_space",
             Self::LoadAverage => "load_average",
         }
     }
@@ -54,6 +104,12 @@ pub struct HoldInputs {
     pub load_average: Option<f64>,
     /// `--max-load`; `None` holds for no load.
     pub max_load: Option<f64>,
+    /// The free bytes of the queue's directory; `None` when they could not
+    /// be read.
+    pub free_bytes: Option<u64>,
+    /// The free bytes a new run (or a landing) needs; `None` holds for no
+    /// disk space.
+    pub needed_bytes: Option<u64>,
 }
 
 /// A hold on new claims: its reason, and the value that crossed the
@@ -66,9 +122,20 @@ pub struct ClaimHold {
 }
 
 impl ClaimHold {
-    /// The first reason that holds, or `None` when claims may go on. A load
-    /// that could not be read holds nothing.
+    /// The first reason that holds, or `None` when claims may go on: the
+    /// free disk space below the bytes needed (the disk fills whatever the
+    /// load), then the load above `--max-load`. A value that could not be
+    /// read holds nothing.
     pub fn judge(inputs: &HoldInputs) -> Option<Self> {
+        if let (Some(free), Some(needed)) = (inputs.free_bytes, inputs.needed_bytes)
+            && free < needed
+        {
+            return Some(Self {
+                reason: HoldReason::DiskSpace,
+                value: free as f64,
+                threshold: needed as f64,
+            });
+        }
         match (inputs.load_average, inputs.max_load) {
             (Some(value), Some(threshold)) if value > threshold => Some(Self {
                 reason: HoldReason::LoadAverage,
@@ -82,10 +149,33 @@ impl ClaimHold {
     /// Why nothing is claimed, for the log and the event.
     pub fn message(&self) -> String {
         match self.reason {
+            HoldReason::DiskSpace => format!(
+                "the free disk space {} of the queue's directory is below the {} a new run needs: no new run is claimed until the ended runs' worktrees are cleaned or a person frees the disk; the runs in flight go on",
+                super::disk::gib(self.value),
+                super::disk::gib(self.threshold)
+            ),
             HoldReason::LoadAverage => format!(
                 "the 1-minute load average {:.2} is above --max-load {:.2}: no new run is claimed until it falls back; the runs in flight go on",
                 self.value, self.threshold
             ),
+        }
+    }
+
+    /// Why no landing starts its verification, for the log and the event.
+    pub fn landing_message(&self) -> String {
+        format!(
+            "the free disk space {} of the queue's directory is below the {} a landing's verification needs: no run lands until the ended runs' worktrees are cleaned or a person frees the disk; the runs stay awaiting integration",
+            super::disk::gib(self.value),
+            super::disk::gib(self.threshold)
+        )
+    }
+
+    /// The message of a hold of `kinds`.
+    pub fn message_for(&self, kinds: HoldKinds) -> String {
+        if kinds == LANDINGS {
+            self.landing_message()
+        } else {
+            self.message()
         }
     }
 }
@@ -106,7 +196,19 @@ pub fn transition(
     token: &str,
     live: impl Fn(&str) -> bool,
 ) -> Option<(&'static str, Value)> {
-    let held = last.filter(|event| event.kind == CLAIM_HELD);
+    transition_of(CLAIMS, hold, last, token, live)
+}
+
+/// [`transition`] for the holds of `kinds`: `last` is the latest of its
+/// two events.
+pub fn transition_of(
+    kinds: HoldKinds,
+    hold: Option<&ClaimHold>,
+    last: Option<&RunEvent>,
+    token: &str,
+    live: impl Fn(&str) -> bool,
+) -> Option<(&'static str, Value)> {
+    let held = last.filter(|event| event.kind == kinds.held);
     let held_reason = held
         .filter(|event| {
             text(event, "supervisor").is_some_and(|holder| holder == token || live(holder))
@@ -114,17 +216,25 @@ pub fn transition(
         .and_then(|event| text(event, "reason"));
     match hold {
         Some(hold) if held_reason != Some(hold.reason.as_str()) => Some((
-            CLAIM_HELD,
+            kinds.held,
             json!({
                 "reason": hold.reason,
                 "value": hold.value,
                 "threshold": hold.threshold,
-                "message": hold.message(),
+                "message": hold.message_for(kinds),
                 "supervisor": token,
             }),
         )),
+        // Another live supervisor's own hold is its to end.
+        None if kinds.own
+            && held
+                .and_then(|event| text(event, "supervisor"))
+                .is_some_and(|holder| holder != token && live(holder)) =>
+        {
+            None
+        }
         None if held.is_some() => Some((
-            CLAIM_RESUMED,
+            kinds.resumed,
             json!({"reason": held.and_then(|event| text(event, "reason")), "supervisor": token}),
         )),
         _ => None,
@@ -173,6 +283,19 @@ pub fn claim_holds(
     end_ms: i64,
     counts: impl Fn(Option<TaskId>) -> bool,
 ) -> ClaimHolds {
+    holds_of(CLAIMS, events, after, upto, end_ms, counts)
+}
+
+/// [`claim_holds`] for the holds of `kinds` (`stats`' `landing_holds` for
+/// [`LANDINGS`]).
+pub fn holds_of(
+    kinds: HoldKinds,
+    events: &[RunEvent],
+    after: EventId,
+    upto: EventId,
+    end_ms: i64,
+    counts: impl Fn(Option<TaskId>) -> bool,
+) -> ClaimHolds {
     let mut stats = ClaimHolds::default();
     let mut open: Option<(&RunEvent, i64)> = None;
     let close = |stats: &mut ClaimHolds, (event, start): (&RunEvent, i64), end: i64| {
@@ -191,13 +314,13 @@ pub fn claim_holds(
     for event in events {
         let at = || timestamp_millis(&event.created_at).unwrap_or(end_ms);
         match event.kind.as_str() {
-            CLAIM_HELD => {
+            kind if kind == kinds.held => {
                 if let Some(held) = open.take() {
                     close(&mut stats, held, at());
                 }
                 open = Some((event, at()));
             }
-            CLAIM_RESUMED => {
+            kind if kind == kinds.resumed => {
                 if let Some(held) = open.take() {
                     close(&mut stats, held, at());
                 }
@@ -252,7 +375,90 @@ mod tests {
         ClaimHold::judge(&HoldInputs {
             load_average: value,
             max_load: max,
+            ..HoldInputs::default()
         })
+    }
+
+    fn disk(free: Option<u64>, needed: Option<u64>, load: Option<f64>) -> Option<ClaimHold> {
+        ClaimHold::judge(&HoldInputs {
+            load_average: load,
+            max_load: Some(16.0),
+            free_bytes: free,
+            needed_bytes: needed,
+        })
+    }
+
+    #[test]
+    fn the_disk_holds_below_the_bytes_needed_before_the_load() {
+        const GIB: u64 = 1 << 30;
+        let hold = disk(Some(GIB), Some(4 * GIB), Some(40.0)).unwrap();
+        assert_eq!(hold.reason, HoldReason::DiskSpace);
+        assert_eq!((hold.value, hold.threshold), (GIB as f64, 4.0 * GIB as f64));
+        assert!(hold.message().contains("1.0 GiB"), "{}", hold.message());
+        assert!(hold.message().contains("4.0 GiB a new run needs"));
+        assert!(hold.landing_message().contains("no run lands"));
+        assert_eq!(hold.message_for(LANDINGS), hold.landing_message());
+        assert_eq!(hold.message_for(CLAIMS), hold.message());
+        assert_eq!(HoldReason::DiskSpace.as_str(), "disk_space");
+        // Enough space, or nothing to judge by: the load decides.
+        assert_eq!(
+            disk(Some(4 * GIB), Some(4 * GIB), Some(40.0))
+                .unwrap()
+                .reason,
+            HoldReason::LoadAverage
+        );
+        assert_eq!(disk(None, Some(4 * GIB), Some(1.0)), None);
+        assert_eq!(disk(Some(GIB), None, Some(1.0)), None);
+    }
+
+    #[test]
+    fn landings_are_held_and_summed_by_their_own_kinds() {
+        let hold = disk(Some(1), Some(2), None).unwrap();
+        let (kind, payload) = transition_of(LANDINGS, Some(&hold), None, "s", |_| true).unwrap();
+        assert_eq!(kind, LANDING_HELD);
+        assert_eq!(payload["reason"], json!("disk_space"));
+        assert!(
+            payload["message"]
+                .as_str()
+                .unwrap()
+                .contains("no run lands")
+        );
+        // A claim hold is no landing hold.
+        let claim = event(1, CLAIM_HELD, payload.clone(), "00:00");
+        assert_eq!(
+            transition_of(LANDINGS, None, Some(&claim), "s", |_| true),
+            None
+        );
+        let held = event(2, LANDING_HELD, payload, "00:00");
+        assert_eq!(
+            transition_of(LANDINGS, Some(&hold), Some(&held), "s", |_| true),
+            None
+        );
+        let (kind, _) = transition_of(LANDINGS, None, Some(&held), "s", |_| true).unwrap();
+        assert_eq!(kind, LANDING_RESUMED);
+        // Another live supervisor with no landing waiting leaves it; one
+        // that stopped does not hold it any more.
+        assert_eq!(
+            transition_of(LANDINGS, None, Some(&held), "t", |_| true),
+            None
+        );
+        let (kind, _) = transition_of(LANDINGS, None, Some(&held), "t", |_| false).unwrap();
+        assert_eq!(kind, LANDING_RESUMED);
+        let events = [claim, held, event(3, LANDING_RESUMED, json!({}), "00:30")];
+        let end = timestamp_millis("2026-09-26T01:03:00.000Z").unwrap();
+        let landings = holds_of(
+            LANDINGS,
+            &events,
+            EventId::new(0),
+            EventId::new(3),
+            end,
+            |_| true,
+        );
+        assert_eq!((landings.count, landings.secs), (1, 30));
+        assert_eq!(landings.by_reason["disk_space"].count, 1);
+        assert_eq!(landings.held, None);
+        assert_eq!(LANDINGS.kinds(), LANDING_HOLD_KINDS);
+        assert_eq!(CLAIMS.kinds(), CLAIM_HOLD_KINDS);
     }
 
     #[test]

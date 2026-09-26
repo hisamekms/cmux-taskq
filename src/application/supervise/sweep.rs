@@ -134,7 +134,7 @@ impl Supervisor<'_> {
         self.last_sweep = Some(Instant::now());
         let closed = self.sweep_ended_workspaces();
         let cleaned = self.clean_ended_worktrees(None);
-        closed.and(cleaned)
+        closed.and(cleaned.map(|_| ()))
     }
     fn sweep_ended_workspaces(&mut self) -> Result<()> {
         let candidates: Vec<EndedRunWorkspace> = self
@@ -215,8 +215,12 @@ impl Supervisor<'_> {
     /// supervisor was given; one already gone is left at that, so every
     /// pass can look again. A failure records `cleanup_failed` (`path`,
     /// `message`, `by: supervisor`) once per worktree and process, is
-    /// retried on the next sweep, and the others go on.
-    pub(super) fn clean_ended_worktrees(&mut self, task: Option<TaskId>) -> Result<()> {
+    /// retried on the next sweep, and the others go on. Returns what was
+    /// removed (for the cleanup for disk space, task 377).
+    pub(super) fn clean_ended_worktrees(
+        &mut self,
+        task: Option<TaskId>,
+    ) -> Result<super::disk::Cleaned> {
         let candidates: Vec<EndedRunWorktree> = self
             .queue
             .ended_run_worktrees()?
@@ -224,35 +228,40 @@ impl Supervisor<'_> {
             .filter(|w| task.is_none_or(|task| w.task_id == task))
             .filter(|w| !self.slots.iter().any(|slot| *slot.run.id() == w.run_id))
             .collect();
+        let mut cleaned = super::disk::Cleaned::default();
         for candidate in candidates {
-            if let Err(error) = self.clean_worktree(&candidate) {
-                let path = &candidate.worktree;
-                if self.sweep_failures.contains(path) {
-                    warn!(run_id = %candidate.run_id, "run {}: worktree {path} still could not be cleaned: {error:#}", candidate.run_id);
-                    continue;
+            match self.clean_worktree(&candidate) {
+                Ok(bytes) => cleaned.add(&candidate.run_id, bytes),
+                Err(error) => {
+                    let path = &candidate.worktree;
+                    if self.sweep_failures.contains(path) {
+                        warn!(run_id = %candidate.run_id, "run {}: worktree {path} still could not be cleaned: {error:#}", candidate.run_id);
+                        continue;
+                    }
+                    self.sweep_failures.push(path.clone());
+                    let message = format!("worktree {path} could not be cleaned: {error:#}");
+                    warn!(run_id = %candidate.run_id, "run {}: {message}", candidate.run_id);
+                    self.queue.record_runtime_event(
+                        &candidate.run_id,
+                        "cleanup_failed",
+                        reason_of_error(&error, ReasonCode::Other)
+                            .on(json!({"path": path, "message": message, "by": "supervisor"})),
+                    )?;
                 }
-                self.sweep_failures.push(path.clone());
-                let message = format!("worktree {path} could not be cleaned: {error:#}");
-                warn!(run_id = %candidate.run_id, "run {}: {message}", candidate.run_id);
-                self.queue.record_runtime_event(
-                    &candidate.run_id,
-                    "cleanup_failed",
-                    reason_of_error(&error, ReasonCode::Other)
-                        .on(json!({"path": path, "message": message, "by": "supervisor"})),
-                )?;
             }
         }
-        Ok(())
+        Ok(cleaned)
     }
-    /// Clean one ended run's worktree ([`Self::clean_ended_worktrees`]).
-    fn clean_worktree(&mut self, candidate: &EndedRunWorktree) -> Result<()> {
+    /// Clean one ended run's worktree ([`Self::clean_ended_worktrees`]);
+    /// the bytes removed.
+    fn clean_worktree(&mut self, candidate: &EndedRunWorktree) -> Result<u64> {
         let worktree = Path::new(&candidate.worktree);
         let repo_root = &self.layout.repo_root;
         if !worktree.starts_with(&self.layout.runs_dir)
             || repo_root.starts_with(worktree)
             || !self.files.is_dir(worktree)
         {
-            return Ok(());
+            return Ok(0);
         }
         let run_id = &candidate.run_id;
         if matches!(
@@ -260,7 +269,7 @@ impl Supervisor<'_> {
             TaskStatus::Completed | TaskStatus::Canceled
         ) {
             let Some(branch) = candidate.branch.as_deref() else {
-                return Ok(());
+                return Ok(0);
             };
             let bytes = self
                 .files
@@ -271,11 +280,12 @@ impl Supervisor<'_> {
                 .remove_worktree_and_branch(worktree, branch)?;
             let reason = format!("task_{}", candidate.task_status.as_str());
             info!(run_id = %run_id, task_id = %candidate.task_id, "task {} is {}; removed worktree {} and branch {branch} of run {run_id} ({bytes} bytes)", candidate.task_id, candidate.task_status.as_str(), candidate.worktree);
-            return self.queue.record_runtime_event(
+            self.queue.record_runtime_event(
                 run_id,
                 "worktree_removed",
                 json!({"path": candidate.worktree, "branch": branch, "bytes": bytes, "by": "supervisor", "reason": reason}),
-            );
+            )?;
+            return Ok(bytes);
         }
         if !matches!(
             candidate.status,
@@ -284,7 +294,7 @@ impl Supervisor<'_> {
                 | RunStatus::Failed
                 | RunStatus::Interrupted
         ) {
-            return Ok(());
+            return Ok(0);
         }
         let mut paths = Vec::new();
         let mut bytes = 0;
@@ -307,14 +317,15 @@ impl Supervisor<'_> {
             bytes += size;
         }
         if paths.is_empty() {
-            return Ok(());
+            return Ok(0);
         }
         info!(run_id = %run_id, "run {run_id} is {}; removed the build outputs of its worktree ({bytes} bytes)", candidate.status.as_str());
         self.queue.record_runtime_event(
             run_id,
             "build_outputs_removed",
             json!({"paths": paths, "bytes": bytes, "by": "supervisor"}),
-        )
+        )?;
+        Ok(bytes)
     }
     /// [`Self::clean_ended_worktrees`] for `task` as one of its runs ends,
     /// where a failure is only logged.

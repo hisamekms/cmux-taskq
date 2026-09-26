@@ -241,7 +241,7 @@ fn a_login_that_stops_several_runs_is_one_ask_that_lists_them() {
     let hold = |run: &RunId| NewHold {
         reason_category: AskReason::Authentication,
         subject: None,
-        run_id: run.clone(),
+        run_id: Some(run.clone()),
         question: "Log in again.".into(),
         options: HOLD_OPTIONS.iter().map(|o| (*o).to_owned()).collect(),
         asked_by: "supervisor".into(),

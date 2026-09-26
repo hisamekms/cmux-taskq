@@ -4,12 +4,13 @@ type: design
 title: Supervisor and workspace lifecycle
 status: current
 created: 2026-09-21
-updated: 2026-09-26
-last_verified: 2026-09-26
+updated: 2026-09-27
+last_verified: 2026-09-27
 scope: runtime
 related:
   - design-supervisor-lifecycle-claim-hold
   - design-supervisor-lifecycle-claim-defer
+  - design-supervisor-lifecycle-disk-space
   - adr-0044
   - adr-0047
   - adr-0038
@@ -147,6 +148,10 @@ live session alert (long_background, stuck_exit, prompt_waiting)
 ### claimを控える（衝突の多いファイル）
 
 - [claimを控える（衝突の多いファイル）](supervisor-lifecycle/claim-defer.md)（[ADR-0069](../adr/0069-do-not-claim-tasks-overlapping-hot-files.md)）
+
+### 空き容量を確かめる（claimと着地の検証の前）
+
+- [空き容量を確かめる](supervisor-lifecycle/disk-space.md)（[ADR-0047](../adr/0047-irregularities-in-three-layers-recovery-job-ask-reasons-and-goal-review.md)の決定44、task 377）
 
 ### 人の答えを待つrun（slotの外の待ち）
 

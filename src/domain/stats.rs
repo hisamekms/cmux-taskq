@@ -439,6 +439,9 @@ pub struct Stats {
     /// The holds on new claims (task 327): those that started in the
     /// window by reason with how long they lasted, and the hold now.
     pub claim_holds: super::claim_hold::ClaimHolds,
+    /// The holds on the landings' verification for the disk (task 377), in
+    /// the shape of `claim_holds`.
+    pub landing_holds: super::claim_hold::ClaimHolds,
     /// The claims deferred on a conflict hotspot (ADR-0069): those that
     /// started in the window with how long they lasted and how they
     /// ended, and the deferrals now.
@@ -848,6 +851,14 @@ pub fn stats(
     );
     let claim_holds =
         super::claim_hold::claim_holds(events, window_start, next_cursor, window_end, counts);
+    let landing_holds = super::claim_hold::holds_of(
+        super::claim_hold::LANDINGS,
+        events,
+        window_start,
+        next_cursor,
+        window_end,
+        counts,
+    );
     let claim_deferrals =
         super::claim_defer::claim_deferrals(events, window_start, next_cursor, window_end, counts);
     let verification_commands =
@@ -961,6 +972,7 @@ pub fn stats(
         waiting,
         asks: ask_stats,
         claim_holds,
+        landing_holds,
         claim_deferrals,
         auto_repairs,
         updates,

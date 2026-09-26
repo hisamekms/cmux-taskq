@@ -46,7 +46,7 @@ use crate::{
     infrastructure::{
         adapters::{
             ClaudeCode, Cmux, GitRepository, SystemProcesses, claude_trusts_repository,
-            host_versions, load_average, path_text,
+            free_disk_bytes, host_versions, load_average, path_text,
         },
         binaries::LocalBinaries,
         clock,
@@ -55,7 +55,10 @@ use crate::{
             runs_dir,
         },
         process::LocalSpawner,
-        run_env::{ShellVerifier, load_conflict_config, load_kpi_settings, load_stall_config},
+        run_env::{
+            ShellVerifier, load_conflict_config, load_disk_config, load_kpi_settings,
+            load_stall_config,
+        },
         run_files::LocalRunFiles,
         runtime_store::SqliteOpener,
         sqlite::{ReadOnlyQueue, SqliteQueue},
@@ -152,6 +155,11 @@ pub struct SuperviseOptions {
     pub max_load: Option<f64>,
     /// Reads the 1-minute load average; tests set it.
     pub load_average: fn() -> Option<f64>,
+    /// How much free disk space a claim and a landing need (task 377);
+    /// `None` reads `[disk]` of the main checkout's `dagq.toml`.
+    pub disk: Option<crate::domain::disk::DiskConfig>,
+    /// Reads the free bytes of the file system of a path; tests set it.
+    pub free_space: fn(&Path) -> Option<u64>,
 }
 
 impl SuperviseOptions {
@@ -179,10 +187,17 @@ impl SuperviseOptions {
             // (the tests) holds for no load unless it asks to.
             max_load: None,
             load_average,
+            disk: None,
+            free_space: free_disk_bytes,
         }
     }
 
-    fn settings(&self, stall: StallConfig, conflicts: ConflictConfigReport) -> LoopSettings {
+    fn settings(
+        &self,
+        stall: StallConfig,
+        conflicts: ConflictConfigReport,
+        disk: crate::domain::disk::DiskConfig,
+    ) -> LoopSettings {
         LoopSettings {
             parallel: self.parallel,
             max_waiting: self.max_waiting,
@@ -201,6 +216,7 @@ impl SuperviseOptions {
             mode: self.mode,
             update: self.update.clone(),
             max_load: self.max_load,
+            disk,
         }
     }
 }
@@ -251,6 +267,17 @@ pub fn supervise_with_reviewer(
             None
         })
     }));
+    // The free disk space a claim and a landing need (ADR-0047 decision
+    // 44): a `[disk]` that cannot be read leaves the defaults, as
+    // `[conflicts]` does.
+    let disk = options.disk.unwrap_or_else(|| {
+        load_disk_config(&main_checkout(&repository))
+            .unwrap_or_else(|error| {
+                tracing::warn!(error = %format_args!("{error:#}"), "[disk] of dagq.toml not read: {error:#}; using the defaults");
+                None
+            })
+            .unwrap_or_default()
+    });
     let pid = std::process::id();
     let generators = options.generators.clone();
     let layout = Layout {
@@ -306,10 +333,11 @@ pub fn supervise_with_reviewer(
         generators,
         review_material: &review_material,
         load_average: options.load_average,
+        free_space: options.free_space,
         host_versions,
         layout,
     };
-    supervisor::supervise(&ports, &options.settings(stall, conflicts))
+    supervisor::supervise(&ports, &options.settings(stall, conflicts, disk))
 }
 
 /// The runtime's own constructor of the cmux wrapper `up`, `down` and the

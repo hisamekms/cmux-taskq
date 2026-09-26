@@ -42,10 +42,10 @@ use std::{
 use tracing::{error, info, warn};
 
 use super::{
-    AgentProvider, AgentSignals, CommandSpec, Exhaustion, Generators, IdleHook, LeasedRun,
-    MainRemote, ProcessControl, Queue, QueueOpener, Repository, ResumeCandidate, RunFiles, Spawned,
-    Spawner, Streams, TRIAGE_ASKER, TriageAction, Validation, Verifier, WorkspaceBackend,
-    WorkspaceTags, ask, dependency_graph,
+    AgentProvider, AgentSignals, AskQuery, CommandSpec, Exhaustion, Generators, IdleHook,
+    LeasedRun, MainRemote, ProcessControl, Queue, QueueOpener, Repository, ResumeCandidate,
+    RunFiles, Spawned, Spawner, Streams, TRIAGE_ASKER, TriageAction, Validation, Verifier,
+    WorkspaceBackend, WorkspaceTags, ask, dependency_graph,
     health::{lease_health, run_health},
     integrate::{self as integration, Integration, check_receipt},
     naming::{
@@ -70,7 +70,7 @@ use crate::domain::{
     ReviewDecision, ReviewVerdict, RunId, RunLease, RunPaths, RunPlan, RunProcess, RunStatus,
     SessionRole, TRIAGE_OPTIONS, TRIAGE_RETRY_FAILURES, TaskAction, TaskId, TaskRun, TaskStatus,
     TriageState,
-    claim_hold::{self, CLAIM_HOLD_KINDS, ClaimHold, HoldInputs},
+    claim_hold::{self, ClaimHold, HoldInputs},
     heartbeat_stale,
     marks::{RUN_ENV_CHANGED, SUPERVISOR_STARTED, SUPERVISOR_STOPPED, run_env_digest},
     measure::{ClaimAttributes, HostVersions, LoadSummary, LoadWindow},
@@ -85,6 +85,7 @@ mod adopt;
 mod claim_defer;
 mod deliver;
 mod dialog;
+mod disk;
 mod draft_planner;
 mod exit;
 mod handoff;
@@ -187,6 +188,8 @@ pub struct LoopSettings {
     /// `--max-load`: no new run is claimed while the 1-minute load average
     /// is above it (task 327); `None` holds for no load.
     pub max_load: Option<f64>,
+    /// How much free disk space a claim and a landing need (task 377).
+    pub disk: crate::domain::disk::DiskConfig,
 }
 
 /// Where the supervisor works and what it starts: the queue database and
@@ -251,6 +254,8 @@ pub struct Ports<'a> {
     /// The 1-minute load average recorded with a failed cmux call, at a
     /// claim and over each interval of a run.
     pub load_average: fn() -> Option<f64>,
+    /// The free bytes of the file system of a path (task 377).
+    pub free_space: fn(&Path) -> Option<u64>,
     /// The versions of Claude Code (given `--claude`) and of the host's
     /// `rustc` (run in the given checkout) a claim records (task 197).
     pub host_versions: fn(&Path, &Path) -> HostVersions,
@@ -471,6 +476,10 @@ pub fn supervise(ports: &Ports<'_>, settings: &LoopSettings) -> Result<Value> {
         host_versions: ports.host_versions,
         loads: HashMap::new(),
         defer: claim_defer::DeferWatch::default(),
+        disk_config: settings.disk,
+        free_space: ports.free_space,
+        disk: disk::DiskWatch::default(),
+        free: None,
     };
     if settings.handoff_token.is_some() {
         supervisor.rebuild_own_runs(previous_version.as_deref())?;
@@ -569,6 +578,15 @@ struct Supervisor<'a> {
     loads: HashMap<RunId, LoadWindow>,
     /// The claims deferred on conflict hotspots (ADR-0069).
     defer: claim_defer::DeferWatch,
+    /// `[disk]`: how much free disk space a claim and a landing need
+    /// (task 377).
+    disk_config: crate::domain::disk::DiskConfig,
+    /// Reads the free bytes of the file system of a path.
+    free_space: fn(&Path) -> Option<u64>,
+    /// The disk between passes (task 377).
+    disk: disk::DiskWatch,
+    /// The free bytes of the queue's directory read this pass.
+    free: Option<u64>,
 }
 
 /// One executing run between provisioning and rest.
@@ -708,6 +726,9 @@ impl Supervisor<'_> {
             // as the program is found (ADR-0049 decision 9).
             self.check_run_env_programs()?;
             self.mark_run_env_change()?;
+            // Every pass too, so a hold on landings ends as soon as there
+            // is room (task 377).
+            self.check_disk()?;
             self.draining = stopping || !self.claiming || self.handoff.is_some();
             // Before any new work, draining or not: a drain waits for them
             // (ADR-0062 decision 8).
@@ -892,43 +913,19 @@ impl Supervisor<'_> {
         }
         Ok(())
     }
-    /// Judge whether new claims are held now ([`ClaimHold::judge`]) and
-    /// record `claim_held` or `claim_resumed` when the answer differs from
-    /// the hold in place on the queue (task 327). Returns
-    /// whether they are held.
+    /// Judge whether new claims are held now ([`ClaimHold::judge`]: the
+    /// free disk space this pass read against what a claim needs (task
+    /// 377), and the load) and record `claim_held` or `claim_resumed` when
+    /// the answer differs from the hold in place on the queue (task 327).
+    /// Returns whether they are held.
     fn hold_claims(&mut self) -> Result<bool> {
         let hold = ClaimHold::judge(&HoldInputs {
             load_average: (self.load_average)(),
             max_load: self.max_load,
+            free_bytes: self.free,
+            needed_bytes: self.disk_needs()?.claim,
         });
-        let last = self.queue.latest_queue_event(&CLAIM_HOLD_KINDS)?;
-        // The supervisors running now: a hold another one recorded is in
-        // place only while it runs (its registration's heartbeat is fresh).
-        let now = self.generators.clock.now();
-        let live: Vec<String> = self
-            .queue
-            .supervisors()?
-            .into_iter()
-            .filter(|registration| {
-                !heartbeat_stale(
-                    self.processes.alive(registration.pid),
-                    now - registration.heartbeat_at,
-                )
-            })
-            .map(|registration| registration.token)
-            .collect();
-        if let Some((kind, payload)) =
-            claim_hold::transition(hold.as_ref(), last.as_ref(), &self.token, |holder| {
-                live.iter().any(|token| token == holder)
-            })
-        {
-            self.queue.record_queue_event(kind, payload)?;
-            match &hold {
-                Some(hold) => warn!("{}", hold.message()),
-                None => info!("claims resume: nothing holds them any more"),
-            }
-        }
-        Ok(hold.is_some())
+        self.record_hold(claim_hold::CLAIMS, hold.as_ref())
     }
     /// Check the programs `[run.env]` names on this process's PATH
     /// (ADR-0049 decision 9) and record `run_env_program_missing` or
@@ -1392,11 +1389,18 @@ impl Supervisor<'_> {
                 // supervisor that drains or hands off cannot wait for it:
                 // it gives the lease back and leaves the run awaiting
                 // integration for a person (`review and integrate`).
-                if self.run_env_missing {
+                // So would it, short of free disk space (task 377): it
+                // starts no verification until there is room.
+                if self.run_env_missing || self.disk.landing_short {
                     if !self.draining {
                         return Ok(Step::Continue);
                     }
-                    warn!(run_id = %slot.run.id(), "run {} is left awaiting integration: a program [run.env] names is missing and this supervisor stops", slot.run.id());
+                    let why = if self.run_env_missing {
+                        "a program [run.env] names is missing"
+                    } else {
+                        "the free disk space is short of what its verification needs"
+                    };
+                    warn!(run_id = %slot.run.id(), "run {} is left awaiting integration: {why} and this supervisor stops", slot.run.id());
                     self.queue.release_lease(slot.run.id(), &self.token)?;
                     return Ok(Step::Done(Box::new(self.queue.run(slot.run.id())?)));
                 }

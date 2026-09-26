@@ -1312,6 +1312,9 @@ pub trait RunStore {
     fn close_review_session(&self, id: &RunId) -> Result<usize>;
     /// The newest event of `kind`, on whatever task, goal or run.
     fn latest_event_of(&self, kind: &str) -> Result<Option<RunEvent>>;
+    /// The newest `limit` events of `kind`, on whatever task, goal or run,
+    /// newest first.
+    fn latest_events_of(&self, kind: &str, limit: usize) -> Result<Vec<RunEvent>>;
     /// The newest event of the queue itself (on no run) of one of `kinds`.
     fn latest_queue_event(&self, kinds: &[&str]) -> Result<Option<RunEvent>>;
 }
@@ -1342,6 +1345,14 @@ pub trait AskStore {
     fn hold(&mut self, hold: crate::domain::NewHold) -> Result<crate::domain::HoldOutcome>;
     /// The open `queue_hold` ask that holds the run, if any.
     fn hold_of(&self, run_id: &RunId) -> Result<Option<Ask>>;
+    /// Close the `queue_hold` asks of `reason` and `subject` nobody
+    /// closed, answering the open ones `answer` (task 377).
+    fn close_hold_asks(
+        &mut self,
+        reason: crate::domain::AskReason,
+        subject: Option<&str>,
+        answer: &str,
+    ) -> Result<Vec<Ask>>;
     fn read_ask(&self, id: AskId) -> Result<Ask>;
     /// Write the answer of an open ask, given by `answered_by` (a role,
     /// `person` or `runtime`).
@@ -1700,6 +1711,11 @@ pub trait Repository {
     fn advance_main(&self, from: &str, to: &str) -> Result<()>;
     /// Point the repository's record of a moved worktree at it again.
     fn repair_worktree(&self, worktree: &Path) -> Result<()>;
+    /// Forget the worktrees whose directory is gone (`git worktree
+    /// prune`); a repository without worktrees has none to forget.
+    fn prune_worktrees(&self) -> Result<()> {
+        Ok(())
+    }
     /// Remove the worktree and its branch; a branch already gone is not
     /// an error.
     fn remove_worktree_and_branch(&self, worktree: &Path, branch: &str) -> Result<()>;

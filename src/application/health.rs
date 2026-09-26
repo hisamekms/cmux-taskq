@@ -333,7 +333,8 @@ pub fn status(
 /// `--max-waiting` bounds (ADR-0071 (f2)): the runs that wait and those
 /// that wait to go back (`state: returning` in `waiting`). A supervisor that holds its claims
 /// has `claim_hold`: its latest `claim_held` payload and `since` (task
-/// 327).
+/// 327); one that holds the landings' verification for the disk has
+/// `landing_hold` in the same shape (task 377).
 fn slots_and_waits(
     queue: &dyn Queue,
     health: Vec<SupervisorHealth>,
@@ -371,9 +372,15 @@ fn slots_and_waits(
         waiting.push(wait);
     }
     // The hold on new claims in progress (task 327), on its supervisor.
-    let hold = queue
-        .latest_queue_event(&crate::domain::claim_hold::CLAIM_HOLD_KINDS)?
-        .filter(|event| event.kind == crate::domain::claim_hold::CLAIM_HELD);
+    let held = |kinds: crate::domain::claim_hold::HoldKinds| -> Result<Option<RunEvent>> {
+        Ok(queue
+            .latest_queue_event(&kinds.kinds())?
+            .filter(|event| event.kind == kinds.held))
+    };
+    let holds = [
+        ("claim_hold", held(crate::domain::claim_hold::CLAIMS)?),
+        ("landing_hold", held(crate::domain::claim_hold::LANDINGS)?),
+    ];
     let supervisors = health
         .into_iter()
         .enumerate()
@@ -390,13 +397,15 @@ fn slots_and_waits(
                     "returning": count.returning,
                     "limit": registration.max_waiting,
                 });
-                if let Some(event) = hold.as_ref().filter(|event| {
-                    event.payload.get("supervisor").and_then(Value::as_str)
-                        == Some(registration.token.as_str())
-                }) {
-                    let mut held = event.payload.clone();
-                    held["since"] = json!(event.created_at);
-                    value["claim_hold"] = held;
+                for (key, hold) in &holds {
+                    if let Some(event) = hold.as_ref().filter(|event| {
+                        event.payload.get("supervisor").and_then(Value::as_str)
+                            == Some(registration.token.as_str())
+                    }) {
+                        let mut held = event.payload.clone();
+                        held["since"] = json!(event.created_at);
+                        value[*key] = held;
+                    }
                 }
             }
             Ok(value)

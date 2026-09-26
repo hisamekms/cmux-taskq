@@ -817,7 +817,7 @@ pub(super) fn raise_auth(
         NewHold {
             reason_category: AskReason::Authentication,
             subject: None,
-            run_id: run.id().clone(),
+            run_id: Some(run.id().clone()),
             question: AUTH_QUESTION.into(),
             options: HOLD_OPTIONS.iter().map(|o| (*o).to_owned()).collect(),
             asked_by: SessionRole::Supervisor.as_str().into(),

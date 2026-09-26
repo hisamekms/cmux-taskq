@@ -592,9 +592,11 @@ impl Supervisor<'_> {
                 continue;
             }
             // A landing would fail on the missing program (ADR-0049
-            // decision 9): the answer waits until it is found.
+            // decision 9), or short of free disk space (task 377): the
+            // answer waits until it is found, or there is room.
             if answer == "land"
                 && (self.run_env_missing
+                    || self.disk.landing_short
                     || self.used_slots() >= parallel
                     || !self
                         .queue

@@ -271,6 +271,25 @@ pub fn load_average() -> Option<f64> {
     (written >= 1 && loads[0].is_finite()).then_some(loads[0])
 }
 
+/// The bytes free for an unprivileged process on the file system of `path`
+/// (statvfs(3): available blocks times the fragment size); `None` when it
+/// cannot be read.
+pub fn free_disk_bytes(path: &Path) -> Option<u64> {
+    use std::os::unix::ffi::OsStrExt;
+    let path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    let mut stat = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+    // SAFETY: `path` is a NUL-terminated string and statvfs fills `stat`
+    // when it returns 0.
+    if unsafe { libc::statvfs(path.as_ptr(), stat.as_mut_ptr()) } != 0 {
+        return None;
+    }
+    // SAFETY: statvfs returned 0, so it initialized `stat`.
+    let stat = unsafe { stat.assume_init() };
+    #[allow(clippy::useless_conversion)]
+    let (available, fragment) = (u64::from(stat.f_bavail), u64::from(stat.f_frsize));
+    available.checked_mul(fragment)
+}
+
 /// How long [`host_versions`] lets `rustc -vV` run.
 const RUSTC_VERSION_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -1171,6 +1190,20 @@ impl GitRepository {
         Ok(())
     }
 
+    /// Forget the worktrees whose directory is gone (`git worktree
+    /// prune`), administered from the main working tree.
+    pub fn prune_worktrees(&self) -> Result<()> {
+        let primary = self.primary_worktree()?;
+        output(
+            Command::new(&self.git)
+                .arg("-C")
+                .arg(&primary)
+                .args(["worktree", "prune"]),
+        )
+        .context("prune the worktrees whose directory is gone")?;
+        Ok(())
+    }
+
     /// Remove a run's worktree and branch. Administered from the main
     /// working tree, since `root` may be the worktree being removed. A
     /// branch already gone is left at that.
@@ -1348,6 +1381,9 @@ impl Repository for GitRepository {
     }
     fn advance_main(&self, from: &str, to: &str) -> Result<()> {
         GitRepository::advance_main(self, from, to)
+    }
+    fn prune_worktrees(&self) -> Result<()> {
+        GitRepository::prune_worktrees(self)
     }
     fn repair_worktree(&self, worktree: &Path) -> Result<()> {
         GitRepository::repair_worktree(self, worktree)

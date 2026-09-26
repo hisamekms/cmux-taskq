@@ -553,6 +553,7 @@ impl std::str::FromStr for Priority {
 
 pub mod claim_defer;
 pub mod claim_hold;
+pub mod disk;
 mod error;
 pub mod finding;
 pub mod follow_up;
@@ -787,8 +788,9 @@ pub struct NewHold {
     /// `authentication` or `cost`.
     pub reason_category: AskReason,
     pub subject: Option<String>,
-    /// The run that hit it.
-    pub run_id: RunId,
+    /// The run that hit it; `None` for a hold no run hit yet (the disk a
+    /// claim needs, task 377), which opens the ask or leaves the open one.
+    pub run_id: Option<RunId>,
     /// What the person is asked, without the list of runs: the ask's
     /// question ends with the runs it holds, rewritten as runs join.
     pub question: String,
@@ -814,8 +816,12 @@ impl NewHold {
         })
     }
 
-    /// The question of the ask holding `affected`.
+    /// The question of the ask holding `affected`; without runs, the
+    /// question alone.
     pub fn question_for(question: &str, affected: &[String]) -> String {
+        if affected.is_empty() {
+            return question.to_owned();
+        }
         format!(
             "{question}\n\n{HOLD_AFFECTED_HEADING}{}",
             affected.join(", ")
@@ -1379,6 +1385,10 @@ pub const QUEUE_EVENT_KINDS: &[&str] = &[
     "mark_retracted",
     claim_hold::CLAIM_HELD,
     claim_hold::CLAIM_RESUMED,
+    claim_hold::LANDING_HELD,
+    claim_hold::LANDING_RESUMED,
+    // The cleanup for the disk (task 377) is about no run.
+    "auto_repaired",
     UPDATE_STARTED,
     UPDATE_BUILT,
     UPDATE_INSTALLED,
@@ -1922,7 +1932,7 @@ mod attention_tests {
         let hold = NewHold {
             reason_category: AskReason::Authentication,
             subject: None,
-            run_id: RunId::new("run-1").unwrap(),
+            run_id: Some(RunId::new("run-1").unwrap()),
             question: "Log in.".into(),
             options: HOLD_OPTIONS.iter().map(|o| (*o).to_owned()).collect(),
             asked_by: "supervisor".into(),
@@ -1961,6 +1971,10 @@ mod attention_tests {
         assert_eq!(
             NewHold::question_for("Log in.", &["a".into(), "b".into()]),
             "Log in.\n\nAffected runs: a, b"
+        );
+        assert_eq!(
+            NewHold::question_for("Free the disk.", &[]),
+            "Free the disk."
         );
     }
 

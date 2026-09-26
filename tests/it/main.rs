@@ -40,6 +40,7 @@ mod runtime_ask;
 mod runtime_claim;
 mod runtime_claim_defer;
 mod runtime_claim_hold;
+mod runtime_disk;
 mod runtime_evidence;
 mod runtime_handoff;
 mod runtime_integrate;

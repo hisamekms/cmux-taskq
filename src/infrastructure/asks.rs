@@ -35,20 +35,23 @@ impl SqliteQueue {
     /// run, or add the run to the open one (ADR-0047 decision 42). A new
     /// ask writes `ask_opened` on the queue; a run that joins an open one
     /// rewrites its question's list of runs and writes `ask_updated` on
-    /// that run. A run already in it changes nothing.
+    /// that run. A run already in it changes nothing, nor does a hold
+    /// without a run while the ask is open (task 377).
     pub fn hold(&mut self, hold: NewHold) -> Result<HoldOutcome> {
         hold.validate()?;
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let task_id: TaskId = tx
-            .query_row(
-                "SELECT task_id FROM task_runs WHERE id=?1",
-                [&hold.run_id],
-                |r| r.get(0),
-            )
-            .optional()?
-            .with_context(|| format!("run {} does not exist", hold.run_id))?;
+        let task_id: Option<TaskId> = match &hold.run_id {
+            Some(run_id) => Some(
+                tx.query_row("SELECT task_id FROM task_runs WHERE id=?1", [run_id], |r| {
+                    r.get(0)
+                })
+                .optional()?
+                .with_context(|| format!("run {run_id} does not exist"))?,
+            ),
+            None => None,
+        };
         let open = tx
             .query_row(
                 "SELECT * FROM asks WHERE kind='queue_hold' AND reason_category=?1
@@ -58,14 +61,19 @@ impl SqliteQueue {
                 ask_row,
             )
             .optional()?;
-        let run = hold.run_id.as_str().to_owned();
-        let outcome = match open {
-            Some(ask) if ask.affected.contains(&run) => HoldOutcome {
+        let run = hold.run_id.as_ref().map(|run| run.as_str().to_owned());
+        let outcome = match (open, run) {
+            (Some(ask), None) => HoldOutcome {
                 ask,
                 created: false,
                 joined: false,
             },
-            Some(ask) => {
+            (Some(ask), Some(run)) if ask.affected.contains(&run) => HoldOutcome {
+                ask,
+                created: false,
+                joined: false,
+            },
+            (Some(ask), Some(run)) => {
                 let mut affected = ask.affected.clone();
                 affected.push(run);
                 let base = ask
@@ -82,8 +90,8 @@ impl SqliteQueue {
                 )?;
                 ask_event(
                     &tx,
-                    Some(task_id),
-                    Some(&hold.run_id),
+                    task_id,
+                    hold.run_id.as_ref(),
                     "ask_updated",
                     json!({
                         "ask_id": ask.id,
@@ -98,8 +106,8 @@ impl SqliteQueue {
                     joined: true,
                 }
             }
-            None => {
-                let affected = vec![run];
+            (None, run) => {
+                let affected: Vec<String> = run.into_iter().collect();
                 let kind = AskKind::QueueHold;
                 check_ask_kind(&kind, None, None, hold.reason_category)?;
                 tx.execute(
@@ -132,7 +140,7 @@ impl SqliteQueue {
                 HoldOutcome {
                     ask: read_ask(&tx, id)?,
                     created: true,
-                    joined: true,
+                    joined: hold.run_id.is_some(),
                 }
             }
         };
@@ -140,12 +148,15 @@ impl SqliteQueue {
         Ok(outcome)
     }
 
-    /// The open `queue_hold` ask that holds the run, if any.
+    /// The open `queue_hold` ask that holds the run's session, if any. The
+    /// disk's `cost` ask (task 377) lists the runs whose landing waited,
+    /// and holds no session: it is not one.
     pub fn hold_of(&self, run_id: &RunId) -> Result<Option<Ask>> {
         Ok(self
             .conn
             .query_row(
                 "SELECT * FROM asks WHERE kind='queue_hold'
+                 AND ifnull(subject,'') <> 'disk'
                  AND answered_at IS NULL AND closed_at IS NULL
                  AND EXISTS (SELECT 1 FROM json_each(asks.affected) WHERE value=?1)
                  ORDER BY id LIMIT 1",
@@ -590,6 +601,53 @@ impl SqliteQueue {
         }
         tx.commit()?;
         Ok(noted)
+    }
+
+    /// Close the `queue_hold` asks of `reason` and `subject` nobody closed
+    /// (task 377): an open one is answered `answer` by the runtime
+    /// (`ask_answered` with `runtime_closed`), an answered one's answer is
+    /// applied by this close (`ask_closed`). The asks closed.
+    pub fn close_hold_asks(
+        &mut self,
+        reason: AskReason,
+        subject: Option<&str>,
+        answer: &str,
+    ) -> Result<Vec<Ask>> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let unclosed: Vec<Ask> = tx
+            .prepare(
+                "SELECT * FROM asks WHERE kind='queue_hold' AND reason_category=?1
+                 AND ifnull(subject,'')=ifnull(?2,'') AND closed_at IS NULL ORDER BY id",
+            )?
+            .query_map(params![reason.as_str(), subject], ask_row)?
+            .collect::<rusqlite::Result<_>>()?;
+        let now = self.generators.clock.now();
+        let mut closed = Vec::with_capacity(unclosed.len());
+        for ask in unclosed {
+            if ask.is_open() {
+                let mut payload =
+                    json!({"ask_id": ask.id, "kind": ask.kind, "runtime_closed": true});
+                write_answer(&tx, &ask, answer, ANSWERED_BY_RUNTIME, now, &mut payload)?;
+                ask_event(&tx, None, None, "ask_answered", payload)?;
+            } else {
+                ask_event(
+                    &tx,
+                    None,
+                    None,
+                    "ask_closed",
+                    json!({"ask_id": ask.id, "kind": ask.kind}),
+                )?;
+            }
+            tx.execute(
+                "UPDATE asks SET closed_at=?2 WHERE id=?1",
+                params![ask.id, now],
+            )?;
+            closed.push(read_ask(&tx, ask.id)?);
+        }
+        tx.commit()?;
+        Ok(closed)
     }
 
     fn close_runtime_asks(

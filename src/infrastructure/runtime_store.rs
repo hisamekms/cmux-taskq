@@ -805,6 +805,19 @@ impl SqliteQueue {
             .optional()?)
     }
 
+    /// The newest `limit` events of `kind`, on whatever task, goal or run,
+    /// newest first.
+    pub fn latest_events_of(&self, kind: &str, limit: usize) -> Result<Vec<RunEvent>> {
+        Ok(self
+            .conn
+            .prepare("SELECT * FROM run_events WHERE kind=?1 ORDER BY id DESC LIMIT ?2")?
+            .query_map(
+                params![kind, i64::try_from(limit).unwrap_or(i64::MAX)],
+                event_row,
+            )?
+            .collect::<rusqlite::Result<_>>()?)
+    }
+
     /// The newest event of the queue itself (on no task, goal or run) of one
     /// of `kinds`.
     /// One lookup per kind, so each walks `events_by_kind` from its newest
@@ -3426,6 +3439,9 @@ impl RunStore for SqliteQueue {
     fn latest_event_of(&self, kind: &str) -> Result<Option<RunEvent>> {
         SqliteQueue::latest_event_of(self, kind)
     }
+    fn latest_events_of(&self, kind: &str, limit: usize) -> Result<Vec<RunEvent>> {
+        SqliteQueue::latest_events_of(self, kind, limit)
+    }
     fn latest_queue_event(&self, kinds: &[&str]) -> Result<Option<RunEvent>> {
         SqliteQueue::latest_queue_event(self, kinds)
     }
@@ -3458,6 +3474,14 @@ impl AskStore for SqliteQueue {
     }
     fn hold_of(&self, run_id: &RunId) -> Result<Option<crate::domain::Ask>> {
         SqliteQueue::hold_of(self, run_id)
+    }
+    fn close_hold_asks(
+        &mut self,
+        reason: crate::domain::AskReason,
+        subject: Option<&str>,
+        answer: &str,
+    ) -> Result<Vec<crate::domain::Ask>> {
+        SqliteQueue::close_hold_asks(self, reason, subject, answer)
     }
     fn read_ask(&self, id: AskId) -> Result<crate::domain::Ask> {
         SqliteQueue::read_ask(self, id)

@@ -6,7 +6,9 @@
 //! decision 4). `[conflicts]` holds the thresholds of the
 //! `conflict_hotspot` alert of `stats` (goal 31). `[recheck]` holds the
 //! `command` the landing recheck runs on main's tree with a waiting run
-//! merged in (ADR-0068 decision 2). The file is parsed by
+//! merged in (ADR-0068 decision 2). `[disk]` holds how much free disk
+//! space a claim and a landing need (ADR-0047 decision 44, task 377). The
+//! file is parsed by
 //! hand: the format is these tables of `KEY = value` lines, a subset of
 //! TOML that needs no parser crate.
 use anyhow::{Context, Result, bail, ensure};
@@ -20,6 +22,7 @@ use std::{
 use crate::{
     application::{Exit, Verifier},
     domain::{
+        disk::DiskConfig,
         kpi::KpiSettings,
         run_env::{RunEnvCheck, RunEnvProgram},
         stall::StallConfig,
@@ -35,9 +38,16 @@ const RUN_ENV_TABLE: &str = "run.env";
 const STALL_TABLE: &str = "stall";
 const CONFLICTS_TABLE: &str = "conflicts";
 const RECHECK_TABLE: &str = "recheck";
+const DISK_TABLE: &str = "disk";
 /// `[kpi]` and its targets (ADR-0051), read by [`KpiTables`].
 const KPI_TABLE: &str = "kpi";
-const TABLES: [&str; 4] = [RUN_ENV_TABLE, STALL_TABLE, CONFLICTS_TABLE, RECHECK_TABLE];
+const TABLES: [&str; 5] = [
+    RUN_ENV_TABLE,
+    STALL_TABLE,
+    CONFLICTS_TABLE,
+    RECHECK_TABLE,
+    DISK_TABLE,
+];
 /// The one key of `[recheck]`.
 const RECHECK_COMMAND: &str = "command";
 /// Names the runtime itself sets on a workspace (`DAGQ_ROLE`, `DAGQ_QUEUE`)
@@ -65,8 +75,8 @@ pub fn parse_run_env(text: &str) -> Result<Vec<(String, String)>> {
 }
 
 /// What the file holds: `[run.env]`, `[stall]` (ADR-0043 decision 4),
-/// `[conflicts]`, `[recheck]` (ADR-0068 decision 2) and `[kpi]` (ADR-0051
-/// decisions 17 and 19).
+/// `[conflicts]`, `[recheck]` (ADR-0068 decision 2), `[disk]` (ADR-0047
+/// decision 44) and `[kpi]` (ADR-0051 decisions 17 and 19).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Config {
     /// `[run.env]` as written, in file order, values unexpanded.
@@ -77,6 +87,8 @@ pub struct Config {
     pub conflicts: ConflictConfig,
     /// `[recheck] command`; none checks the merge only.
     pub recheck_command: Option<String>,
+    /// `[disk]`, the defaults for the keys it does not set.
+    pub disk: DiskConfig,
     /// `[kpi]` and its `[kpi.targets."<kpi>"]`; `None` without any.
     pub kpi: Option<KpiSettings>,
 }
@@ -88,6 +100,7 @@ pub fn parse_config(text: &str) -> Result<Config> {
     let mut config = Config::default();
     let mut stall_keys: Vec<String> = Vec::new();
     let mut conflict_keys: Vec<String> = Vec::new();
+    let mut disk_keys: Vec<String> = Vec::new();
     let mut kpi = KpiTables::default();
     let text = text.strip_prefix('\u{feff}').unwrap_or(text);
     for (index, raw) in text.lines().enumerate() {
@@ -110,7 +123,7 @@ pub fn parse_config(text: &str) -> Result<Config> {
             }
             let known = TABLES.iter().find(|table| **table == name).with_context(|| {
                 format!(
-                    "{CONFIG_FILE_NAME}:{number}: unknown table [{name}]; only [{RUN_ENV_TABLE}], [{STALL_TABLE}], [{CONFLICTS_TABLE}], [{RECHECK_TABLE}] and [{KPI_TABLE}] are supported"
+                    "{CONFIG_FILE_NAME}:{number}: unknown table [{name}]; only [{RUN_ENV_TABLE}], [{STALL_TABLE}], [{CONFLICTS_TABLE}], [{RECHECK_TABLE}], [{DISK_TABLE}] and [{KPI_TABLE}] are supported"
                 )
             })?;
             ensure!(
@@ -163,6 +176,27 @@ pub fn parse_config(text: &str) -> Result<Config> {
                 );
                 config.recheck_command = Some(command);
             }
+            Some(DISK_TABLE) => {
+                ensure!(
+                    DiskConfig::KEYS.contains(&key),
+                    "{CONFIG_FILE_NAME}:{number}: unknown key {key} in [{DISK_TABLE}]; the keys are {}",
+                    DiskConfig::KEYS.join(", ")
+                );
+                ensure!(
+                    !disk_keys.iter().any(|existing| existing == key),
+                    "{CONFIG_FILE_NAME}:{number}: {key} is defined twice"
+                );
+                if DiskConfig::FACTORS.contains(&key) {
+                    let value = parse_positive_number(rest.trim())
+                        .with_context(|| format!("{CONFIG_FILE_NAME}:{number}: value of {key}"))?;
+                    config.disk.set_factor(key, value);
+                } else {
+                    let value = parse_positive(rest.trim(), "number")
+                        .with_context(|| format!("{CONFIG_FILE_NAME}:{number}: value of {key}"))?;
+                    config.disk.set_whole(key, value);
+                }
+                disk_keys.push(key.to_owned());
+            }
             Some(CONFLICTS_TABLE) => {
                 ensure!(
                     ConflictConfig::KEYS.contains(&key),
@@ -194,7 +228,7 @@ pub fn parse_config(text: &str) -> Result<Config> {
                 stall_keys.push(key.to_owned());
             }
             None => bail!(
-                "{CONFIG_FILE_NAME}:{number}: a key outside [{RUN_ENV_TABLE}], [{STALL_TABLE}], [{CONFLICTS_TABLE}], [{RECHECK_TABLE}] or [{KPI_TABLE}]"
+                "{CONFIG_FILE_NAME}:{number}: a key outside [{RUN_ENV_TABLE}], [{STALL_TABLE}], [{CONFLICTS_TABLE}], [{RECHECK_TABLE}], [{DISK_TABLE}] or [{KPI_TABLE}]"
             ),
         }
     }
@@ -212,6 +246,36 @@ pub(super) fn parse_positive(text: &str, what: &str) -> Result<i64> {
         .with_context(|| format!("expected a whole {what}, not {digits}"))?;
     ensure!(value > 0, "must be a positive {what}, not {value}");
     Ok(value)
+}
+
+/// A positive number, whole or not (`1.5`), followed by nothing but an
+/// optional comment.
+fn parse_positive_number(text: &str) -> Result<f64> {
+    let digits = strip_comment(text);
+    ensure!(!digits.is_empty(), "missing value");
+    let value: f64 = digits
+        .replace('_', "")
+        .parse()
+        .with_context(|| format!("expected a number, not {digits}"))?;
+    ensure!(
+        value.is_finite() && value > 0.0,
+        "must be a positive number, not {digits}"
+    );
+    Ok(value)
+}
+
+/// `[disk]` of the `dagq.toml` in `root` (ADR-0047 decision 44), `None`
+/// when there is no file; no table or no key is the default.
+pub fn load_disk_config(root: &Path) -> Result<Option<DiskConfig>> {
+    let path = root.join(CONFIG_FILE_NAME);
+    let Some(text) = read_config(&path)? else {
+        return Ok(None);
+    };
+    Ok(Some(
+        parse_config(&text)
+            .with_context(|| format!("parse {}", path.display()))?
+            .disk,
+    ))
 }
 
 /// `[stall]` of the `dagq.toml` in `root` (ADR-0043 decision 4), `None`
@@ -597,6 +661,37 @@ LITERAL = 'no \n escapes # here'
     }
 
     #[test]
+    fn parses_the_disk_table() {
+        let config = parse_config(
+            "[disk]\nsample_runs = 5\nclaim_factor = 2.5 # more\nintegrate_factor = 1\nmin_free_bytes = 1_000\n",
+        )
+        .unwrap();
+        assert_eq!(
+            config.disk,
+            DiskConfig {
+                sample_runs: 5,
+                claim_factor: 2.5,
+                integrate_factor: 1.0,
+                min_free_bytes: Some(1000),
+            }
+        );
+        assert_eq!(parse_config("").unwrap().disk, DiskConfig::default());
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(load_disk_config(dir.path()).unwrap(), None);
+        fs::write(
+            dir.path().join(CONFIG_FILE_NAME),
+            "[disk]\nclaim_factor = 3\n",
+        )
+        .unwrap();
+        assert_eq!(
+            load_disk_config(dir.path()).unwrap().unwrap().claim_factor,
+            3.0
+        );
+        fs::write(dir.path().join(CONFIG_FILE_NAME), "[disk]\nx = 3\n").unwrap();
+        assert!(load_disk_config(dir.path()).is_err());
+    }
+
+    #[test]
     fn empty_text_and_empty_table_are_no_env() {
         assert!(parse_run_env("").unwrap().is_empty());
         assert!(parse_run_env("# nothing\n[run.env]\n").unwrap().is_empty());
@@ -643,6 +738,15 @@ LITERAL = 'no \n escapes # here'
                 "hotspot_conflicts is defined twice",
             ),
             ("A = 'x'", "a key outside [run.env]"),
+            ("[disk]\nother = 1", "unknown key other in [disk]"),
+            ("[disk]\nclaim_factor = 0", "positive number, not 0"),
+            ("[disk]\nclaim_factor = x", "expected a number, not x"),
+            ("[disk]\nclaim_factor = ", "missing value"),
+            ("[disk]\nsample_runs = 1.5", "whole number"),
+            (
+                "[disk]\nsample_runs = 1\nsample_runs = 2",
+                "sample_runs is defined twice",
+            ),
             ("[recheck]\nargs = 'x'", "unknown key args in [recheck]"),
             (
                 "[recheck]\ncommand = 'x'\ncommand = 'y'",
