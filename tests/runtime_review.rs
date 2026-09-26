@@ -96,6 +96,23 @@ fn an_exit_that_never_got_there_closes_a_sound_passed_run_and_lands_it() {
             &json!({"code": "backend_timeout", "workspace_id": WORKSPACE_ID, "attempts": 3, "action": "close_and_land"})
         ]
     );
+    // Closing the workspace to land is recorded as a repair.
+    assert_eq!(
+        payloads(&detail, "auto_repaired"),
+        [&json!({
+            "layer": "runtime",
+            "repair": "exit_forced_close",
+            "conditions": {
+                "cause": "backend_timeout",
+                "attempts": 3,
+                "exit_reached": false,
+                "then": "land",
+                "review": "pass",
+                "receipt_holds": true,
+            },
+            "detail": {"workspace_id": WORKSPACE_ID},
+        })]
+    );
     let kinds = event_kinds(&detail);
     for (earlier, later) in [
         ("review_finished", "exit_requested"),
@@ -137,6 +154,8 @@ fn an_exit_that_never_got_there_asks_for_a_run_that_cannot_land() {
     let run = detail.runs[0].clone();
     assert_eq!(run.status(), RunStatus::AwaitingIntegration);
     assert!(queue.run_lease(run.id()).unwrap().is_some());
+    // A run held back is not repaired: it goes to the ask.
+    assert!(payloads(&detail, "auto_repaired").is_empty());
     assert_eq!(
         payloads(&detail, "exit_unsent"),
         [&json!({

@@ -277,6 +277,15 @@ fn approved_needs_session_run_is_resumed_until_the_runtime_lands_it() {
         started[0],
         &json!({"attempt": 1, "counted": false, "reason": reason, "main": first_landed})
     );
+    // Each conflict-only resume left out of the count is a repair.
+    let uncounted: Vec<&Value> = payloads(&detail, "auto_repaired")
+        .into_iter()
+        .filter(|p| p["repair"] == "conflict_resume_uncounted")
+        .collect();
+    assert_eq!(uncounted.len(), 2, "{:?}", event_kinds(&detail));
+    assert_eq!(uncounted[0]["conditions"]["conflict_only_resumes"], 1);
+    assert_eq!(uncounted[1]["conditions"]["conflict_only_resumes"], 2);
+    assert_eq!(uncounted[0]["detail"]["attempt"], 1);
     assert_eq!(started[1]["attempt"], 2);
     assert!(
         started[1]["reason"]
@@ -1061,10 +1070,18 @@ fn conflict_only_resumes_are_not_counted_and_a_used_up_run_is_retried_with_its_b
         json!(format!("dagq/{}", run.id()))
     );
     assert!(finished[0].get("ask_id").is_none());
+    // Each conflict-only resume was left out of the count, then the
+    // retry carried the branch over: all repairs (ADR-0047 decision 38).
     let repaired = payloads(&detail, "auto_repaired");
-    assert_eq!(repaired.len(), 1, "{repaired:?}");
+    let repairs: Vec<&str> = repaired
+        .iter()
+        .map(|p| p["repair"].as_str().unwrap())
+        .collect();
+    let mut expected = vec!["conflict_resume_uncounted"; CONFLICT_ONLY_RESUME_LIMIT];
+    expected.push("inherit_retry");
+    assert_eq!(repairs, expected, "{repaired:?}");
+    let repaired = &repaired[CONFLICT_ONLY_RESUME_LIMIT..];
     assert_eq!(repaired[0]["layer"], "runtime");
-    assert_eq!(repaired[0]["repair"], "inherit_retry");
     assert_eq!(repaired[0]["conditions"]["review"], "pass");
     assert_eq!(repaired[0]["conditions"]["parked"], "rebase_conflict");
     assert!(
@@ -1350,6 +1367,18 @@ fn a_request_left_in_the_input_box_gets_enter_again_not_the_text() {
     assert_eq!(retried[0]["retries"], 2);
     assert_eq!(retried[0]["submitted"], true);
     assert!(payloads(&detail, "submit_unconfirmed").is_empty());
+    // The Enters that got it through are one repair (ADR-0047 decision 38).
+    let repaired: Vec<&Value> = payloads(&detail, "auto_repaired")
+        .into_iter()
+        .filter(|p| p["repair"] == "submit_enter_retry")
+        .collect();
+    assert_eq!(repaired.len(), 1, "{:?}", event_kinds(&detail));
+    assert_eq!(repaired[0]["layer"], "runtime");
+    assert_eq!(
+        repaired[0]["conditions"],
+        json!({"input": "text", "retries": 2, "submitted": true})
+    );
+    assert_eq!(repaired[0]["detail"]["what"], "resolution request");
     assert!(other_asks(&mut queue, true).is_empty());
 }
 

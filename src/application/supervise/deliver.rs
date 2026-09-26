@@ -175,6 +175,21 @@ pub(super) fn submit(
             }),
         );
         info!(run_id = %run.id(), "{what} stayed in the input box of workspace {workspace}; Enter sent again {retries} times");
+        // Enters that got the input through, as the screen shows, are a
+        // repair (ADR-0047 decision 38); ones that did not go on to the ask
+        // below, and a dialog or an unread screen confirms nothing.
+        if matches!(submission, Submission::Submitted(Some(_))) {
+            note(
+                sv,
+                "auto_repaired",
+                json!({
+                    "layer": "runtime",
+                    "repair": "submit_enter_retry",
+                    "conditions": {"input": input.name(), "retries": retries, "submitted": true},
+                    "detail": {"workspace_id": workspace, "what": what},
+                }),
+            );
+        }
     }
     if let Submission::Stuck(screen) = &submission {
         let excerpt = sv.signals.screen_excerpt(screen);

@@ -1664,7 +1664,8 @@ impl SqliteQueue {
         }
         // A resume of a run parked only by a conflict after its review
         // passed is not one of the counted attempts.
-        let counted = !resume::parked_for_conflict_only(&events);
+        let basis = resume::conflict_only_basis(&events);
+        let counted = basis.is_none();
         let Some(previous) = lease_parked_run(&tx, id, token, now, true)? else {
             return Ok(None);
         };
@@ -1681,6 +1682,26 @@ impl SqliteQueue {
             "resume_started",
             json!({"attempt": attempt, "counted": counted, "reason": reason.or(run.last_error()), "main": main}),
         )?;
+        if let Some(basis) = basis {
+            run_event(
+                &tx,
+                id,
+                "auto_repaired",
+                json!({
+                    "layer": "runtime",
+                    "repair": "conflict_resume_uncounted",
+                    "conditions": {
+                        "review_passed": basis.passed,
+                        "landing_approved": basis.approved,
+                        "rechecked": basis.rechecked,
+                        "parked": ReasonCode::RebaseConflict,
+                        "counted_resumes": resumes.counted,
+                        "conflict_only_resumes": resumes.conflict_only + 1,
+                    },
+                    "detail": {"attempt": attempt, "main": main},
+                }),
+            )?;
+        }
         tx.commit()?;
         Ok(Some((run.relocated(&self.runs_dir), attempt)))
     }

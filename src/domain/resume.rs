@@ -90,6 +90,27 @@ pub fn parked_for_conflict_only(events: &[RunEvent]) -> bool {
     history(events).conflict_only()
 }
 
+/// Why a run parked only by a conflict counts as such
+/// ([`parked_for_conflict_only`]): its latest review passed, its landing was
+/// approved, or the landing recheck found the conflict. `None` when it is
+/// not parked only by a conflict.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConflictOnly {
+    pub passed: bool,
+    pub approved: bool,
+    pub rechecked: bool,
+}
+
+/// [`parked_for_conflict_only`] with what made it so.
+pub fn conflict_only_basis(events: &[RunEvent]) -> Option<ConflictOnly> {
+    let history = history(events);
+    history.conflict_only().then_some(ConflictOnly {
+        passed: history.passed,
+        approved: history.approved,
+        rechecked: history.rechecked,
+    })
+}
+
 /// Whether the latest event that parked the run for a session is the
 /// landing recheck's (ADR-0068 decision 3).
 pub fn parked_by_recheck(events: &[RunEvent]) -> bool {
@@ -217,6 +238,14 @@ mod tests {
         assert_eq!(count.left(), MAX_RESUME_ATTEMPTS);
         assert!(!count.exhausted());
         assert!(parked_for_conflict_only(&events));
+        assert_eq!(
+            conflict_only_basis(&events),
+            Some(ConflictOnly {
+                passed: true,
+                approved: false,
+                rechecked: false,
+            })
+        );
     }
 
     #[test]
@@ -242,6 +271,7 @@ mod tests {
         ];
         assert_eq!(ResumeCount::of(&events).counted, 1);
         assert!(!parked_for_conflict_only(&events));
+        assert_eq!(conflict_only_basis(&events), None);
     }
 
     #[test]

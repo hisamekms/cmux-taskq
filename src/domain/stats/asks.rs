@@ -27,6 +27,9 @@ pub struct OpenedAsks {
     pub by_kind: BTreeMap<String, i64>,
     /// By the role that registered the ask (`asked_by`).
     pub by_asked_by: BTreeMap<String, i64>,
+    /// By why a person was needed (`reason_category`, ADR-0047 decision
+    /// 41), `unknown` for an ask opened before the reason was kept.
+    pub by_reason_category: BTreeMap<String, i64>,
 }
 
 /// The `ask_answered` events of the window.
@@ -82,6 +85,10 @@ pub fn asks(
                     .by_asked_by
                     .entry(text(payload, "asked_by"))
                     .or_default() += 1;
+                *opened
+                    .by_reason_category
+                    .entry(text(payload, "reason_category"))
+                    .or_default() += 1;
             }
             "ask_answered" => {
                 let answered = &mut stats.answered;
@@ -132,7 +139,7 @@ mod tests {
                 1,
                 Some(1),
                 "ask_opened",
-                json!({"ask_id": 1, "kind": "decide", "asked_by": "triage"}),
+                json!({"ask_id": 1, "kind": "decide", "asked_by": "triage", "reason_category": "recovery_failed"}),
             ),
             event(
                 2,
@@ -183,6 +190,8 @@ mod tests {
         assert_eq!(all.opened.by_kind["decide"], 1);
         assert_eq!(all.opened.by_asked_by[UNKNOWN], 1);
         assert_eq!(all.opened.by_asked_by["supervisor"], 1);
+        assert_eq!(all.opened.by_reason_category["recovery_failed"], 1);
+        assert_eq!(all.opened.by_reason_category[UNKNOWN], 2);
         assert_eq!(all.answered.count, 4);
         assert_eq!(all.answered.by_kind["approve_landing"], 2);
         assert_eq!(

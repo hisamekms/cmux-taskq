@@ -129,6 +129,32 @@ pub(super) fn nudge_stale_receipt(
         "stale receipt nudge",
     ) {
         Ok(submission) => {
+            let mut detail = json!({"phase": phase, "workspace_id": workspace});
+            if let Some(attempt) = attempt {
+                detail["attempt"] = json!(attempt);
+            }
+            // Only a request that left the input box is a repair; one stuck
+            // there or under a dialog went on to the ask. The text is typed,
+            // so a record that fails is only noted.
+            if matches!(submission, Submission::Submitted(_))
+                && let Err(error) = sv.queue.record_runtime_event(
+                    run.id(),
+                    "auto_repaired",
+                    json!({
+                        "layer": "runtime",
+                        "repair": "receipt_rewrite_requested",
+                        "conditions": {
+                            "clean": true,
+                            "on_base": true,
+                            "receipt_commit": stale.receipt_commit,
+                            "head": stale.head,
+                        },
+                        "detail": detail,
+                    }),
+                )
+            {
+                warn!(run_id = %run.id(), error = %format_args!("{error:#}"), "auto_repaired of {} could not be recorded: {error:#}", run.id());
+            }
             info!(run_id = %run.id(), "run {} went idle with a receipt for {} while its clean HEAD is {}; asked it to rewrite the receipt in workspace {workspace}", run.id(), stale.receipt_commit, stale.head);
             Ok(Some((
                 StaleNudge {

@@ -212,6 +212,65 @@ fn a_handoff_while_a_rejected_run_waits_for_its_exit_sends_no_second_exit() {
     assert!(!kinds.contains(&"run_adopted"), "{kinds:?}");
 }
 
+/// A handoff while a resumed session resolves a conflict carries the
+/// resume over in `handoff.json`: the next process goes on watching that
+/// session instead of resuming the run again, and records it as
+/// `auto_repaired` (`repair: resume_adopted`, ADR-0047 decision 24).
+#[test]
+fn a_handoff_during_a_resume_goes_on_watching_the_resumed_session() {
+    let (_dir, repo, db) = fixture();
+    let backend = Arc::new(TestWorkspace::new(&db, false, VALID_AGENT));
+    let (run, _) = parked_conflict(&repo, &db, &backend);
+    backend.resume_script_for(
+        2,
+        "await_message; while [ ! -f \"$EXIT.go\" ]; do sleep 0.05; done; resolve; receipt \"$(git rev-parse HEAD)\"; idle; await_exit",
+    );
+    let (outcome, token) = hand_off_when(&db, &repo, &backend, |queue| {
+        event_kinds(&queue.show(TaskId::new(2)).unwrap()).contains(&"resume_started")
+    });
+    assert_eq!(outcome["handed_over"], 1, "{outcome}");
+    let snapshot = Path::new(run.run_dir().unwrap()).join("handoff.json");
+    let written: Value = serde_json::from_slice(&fs::read(&snapshot).unwrap()).unwrap();
+    assert_eq!(written["phase"], "resume");
+
+    let next = {
+        let (db, repo, backend, token) = (db.clone(), repo.clone(), backend.clone(), token.clone());
+        thread::spawn(move || supervise_after_handoff(&db, &repo, &backend, &token))
+    };
+    wait_until(&db, Duration::from_secs(30), |_| !snapshot.exists());
+    fs::write(
+        exit_request_path(run.run_dir().unwrap()).with_extension("go"),
+        "",
+    )
+    .unwrap();
+    let outcome = joined(next, "the supervisor after the handoff").unwrap();
+    backend.join();
+    assert_eq!(outcome["errors"], json!([]), "{outcome}");
+    let detail = SqliteQueue::open(&db)
+        .unwrap()
+        .show(TaskId::new(2))
+        .unwrap();
+    assert_eq!(detail.task.status(), TaskStatus::Completed);
+    let kinds = event_kinds(&detail);
+    assert_eq!(kinds.iter().filter(|k| **k == "resume_started").count(), 1);
+    let adopted: Vec<&Value> = payloads(&detail, "auto_repaired")
+        .into_iter()
+        .filter(|p| p["repair"] == "resume_adopted")
+        .collect();
+    assert_eq!(adopted.len(), 1, "{kinds:?}");
+    assert_eq!(adopted[0]["layer"], "runtime");
+    assert_eq!(adopted[0]["conditions"]["handoff"], true);
+    assert_eq!(adopted[0]["conditions"]["attempt"], 1);
+    assert_eq!(adopted[0]["detail"]["version"], VERSION);
+    // The conflict-only resume was not counted, and that too is a repair.
+    assert!(
+        payloads(&detail, "auto_repaired")
+            .iter()
+            .any(|p| p["repair"] == "conflict_resume_uncounted"),
+        "{kinds:?}"
+    );
+}
+
 /// A handoff that finds a leased run it has nothing to rebuild from (a
 /// resting run without a `handoff.json`) gives the lease back, and a
 /// registration that is gone refuses the continuation.

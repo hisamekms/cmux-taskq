@@ -194,6 +194,7 @@ impl Supervisor<'_> {
                     }),
                 }),
             )?;
+            let resumed = matches!(snapshot, Some(Snapshot::Resume { .. }));
             let phase = match (run.status(), snapshot) {
                 (_, Some(snapshot)) => self.rebuild_from(&run, snapshot),
                 (
@@ -213,6 +214,32 @@ impl Supervisor<'_> {
             match phase {
                 Ok(phase) => {
                     info!(run_id = %run.id(), task_id = %run.task_id(), "run {} of task {} taken over after the handoff ({})", run.id(), run.task_id(), run.status().as_str());
+                    // A resumed session goes on watched instead of being
+                    // resumed again (ADR-0047 decision 24).
+                    // A record that fails is only noted: the run is taken
+                    // over either way.
+                    if let (true, Phase::Resume(watch)) = (resumed, &phase)
+                        && let Err(error) = self.queue.record_runtime_event(
+                            run.id(),
+                            "auto_repaired",
+                            json!({
+                                "layer": "runtime",
+                                "repair": "resume_adopted",
+                                "conditions": {
+                                    "handoff": true,
+                                    "attempt": watch.attempt,
+                                    "request_sent": watch.message_sent.is_some(),
+                                },
+                                "detail": {
+                                    "workspace_id": watch.workspace,
+                                    "previous_version": previous_version,
+                                    "version": self.layout.version,
+                                },
+                            }),
+                        )
+                    {
+                        warn!(run_id = %run.id(), error = %format_args!("{error:#}"), "auto_repaired of {} could not be recorded: {error:#}", run.id());
+                    }
                     let mut slot = Slot::new(run, phase);
                     // Kept as it was, even past the limit (ADR-0062
                     // decision 7).

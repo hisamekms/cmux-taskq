@@ -229,6 +229,28 @@ impl ExitWatch {
                 )?,
             }
             close_answer_prompt_asks(sv, run, PROMPT_EXITED_CLOSED)?;
+            // Closing the workspace to land is a repair (ADR-0047 decisions
+            // 25 and 38); the workspace is closed, so a record that fails is
+            // only noted.
+            if let Err(error) = sv.queue.record_runtime_event(
+                run.id(),
+                "auto_repaired",
+                json!({
+                    "layer": "runtime",
+                    "repair": "exit_forced_close",
+                    "conditions": {
+                        "cause": ReasonCode::BackendTimeout,
+                        "attempts": sv.cmux.call_attempts().max(1),
+                        "exit_reached": false,
+                        "then": "land",
+                        "review": "pass",
+                        "receipt_holds": true,
+                    },
+                    "detail": {"workspace_id": workspace},
+                }),
+            ) {
+                warn!(run_id = %run.id(), error = %format_args!("{error:#}"), "auto_repaired of {} could not be recorded: {error:#}", run.id());
+            }
             info!(run_id = %run.id(), "/exit could not be sent to {} in workspace {workspace}; it lands and its receipt still holds against its clean worktree, so its workspace was closed and it goes on to land", run.id());
             return Ok(true);
         };

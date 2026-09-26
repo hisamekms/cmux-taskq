@@ -277,6 +277,21 @@ fn ask_answer_asks_and_close_through_the_cli() {
     assert_eq!(asks["opened"]["by_kind"]["decide"], 2, "{asks}");
     assert_eq!(asks["opened"]["by_asked_by"]["human"], 2, "{asks}");
     assert_eq!(
+        asks["opened"]["by_reason_category"]["recovery_failed"], 2,
+        "{asks}"
+    );
+    // `auto_repairs` puts the asks opened each day next to the repairs:
+    // none here.
+    let repairs = &ok(&db, &["stats", "--full"])["auto_repairs"];
+    assert_eq!(repairs["count"], 0, "{repairs}");
+    assert_eq!(repairs["by_layer"], serde_json::json!({}));
+    let days = repairs["by_day"].as_object().unwrap();
+    assert_eq!(days.len(), 1, "{repairs}");
+    let day = days.values().next().unwrap();
+    assert_eq!(day["asks_opened"], 2, "{repairs}");
+    assert_eq!(day["auto_repaired"], 0, "{repairs}");
+    assert_eq!(day["asks_by_reason"]["recovery_failed"], 2, "{repairs}");
+    assert_eq!(
         asks["answered"]["by_answered_by"],
         serde_json::json!({"inbox": 1, "person": 1})
     );

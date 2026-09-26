@@ -15,6 +15,7 @@ use super::{
 };
 
 pub mod asks;
+pub mod auto_repairs;
 pub mod conflicts;
 pub mod landing;
 pub mod measures;
@@ -24,6 +25,7 @@ pub mod thresholds;
 pub mod work;
 
 pub use asks::{AnsweredAsks, AskStats, Choices, OpenedAsks};
+pub use auto_repairs::{AutoRepairStats, DayCounts, LayerRepairs};
 pub use conflicts::{ConflictConfig, ConflictConfigReport, ConflictHotspots, History};
 pub use landing::{LandBreakdown, LandClock, LandPhases, PhaseSummary};
 pub use measures::{
@@ -412,6 +414,10 @@ pub struct Stats {
     /// `backend_failures` (task 325): by kind, by asker, by answerer and
     /// the option each answer chose.
     pub asks: AskStats,
+    /// The irregularities repaired without a person (`auto_repaired`,
+    /// ADR-0047 decision 45) in the same window as `asks`: by layer and
+    /// repair, and per day next to the asks opened that day.
+    pub auto_repairs: AutoRepairStats,
     /// Pass it to `--since` to read only runs that finish later.
     pub next_cursor: EventId,
 }
@@ -769,6 +775,7 @@ pub fn stats(
     let duplicate_cancels = duplicate_cancels(events, window_start, next_cursor, counts);
     let landing_rechecks = landing_rechecks(events, window_start, next_cursor, counts);
     let ask_stats = asks::asks(events, window_start, next_cursor, counts);
+    let auto_repairs = auto_repairs::auto_repairs(events, window_start, next_cursor, counts);
     let verification_commands =
         measures::verification_commands(events, window_start, next_cursor, counts);
     let waiting = super::waiting::waiting_stats(events, window_start, next_cursor, counts);
@@ -863,6 +870,7 @@ pub fn stats(
         sessions,
         waiting,
         asks: ask_stats,
+        auto_repairs,
         next_cursor,
     }
 }

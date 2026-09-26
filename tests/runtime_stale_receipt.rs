@@ -67,6 +67,12 @@ fn a_session_idle_with_a_stale_receipt_is_asked_once_and_the_rewrite_goes_on() {
         payloads(&detail, "stale_receipt_resolved"),
         [&json!({"phase": "session", "outcome": "rewritten"})]
     );
+    let repaired = payloads(&detail, "auto_repaired");
+    assert_eq!(repaired.len(), 1, "{repaired:?}");
+    assert_eq!(repaired[0]["repair"], "receipt_rewrite_requested");
+    assert_eq!(repaired[0]["conditions"]["receipt_commit"], old);
+    assert_eq!(repaired[0]["conditions"]["head"], head);
+    assert_eq!(repaired[0]["detail"]["phase"], "session");
     // The stall watch took no part in it.
     assert!(payloads(&detail, "stall_nudged").is_empty());
 }
