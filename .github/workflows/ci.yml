@@ -44,6 +44,9 @@ jobs:
       - name: Migration numbers
         run: sh scripts/check-migration-numbers.sh
 
+      - name: Test file lines
+        run: sh scripts/check-test-file-lines.sh
+
       - name: cargo clippy
         run: cargo clippy --locked --all-targets -- -D warnings
 
