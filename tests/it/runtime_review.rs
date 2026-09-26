@@ -1496,8 +1496,11 @@ fn a_stuck_exit_repair_that_does_not_hold_becomes_the_stuck_exit_ask() {
             "reason_category": "scope",
         })),
     );
+    // The ask opens before the job's `recovery_finished` is recorded: both
+    // are waited for.
     wait_until(&db, Duration::from_secs(30), |queue| {
         !queue.asks(AskQuery::default()).unwrap().is_empty()
+            && !payloads(&queue.show(TaskId::new(1)).unwrap(), "recovery_finished").is_empty()
     });
     let mut queue = SqliteQueue::open(&db).unwrap();
     let ask = queue.asks(AskQuery::default()).unwrap().remove(0);
