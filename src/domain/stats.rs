@@ -271,6 +271,35 @@ pub struct DuplicateCancels {
     pub tasks: Vec<DuplicateCancel>,
 }
 
+/// What the landing rechecks found (ADR-0068 decision 6).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct LandingRechecks {
+    /// Rechecks that ended (`landing_recheck_finished`).
+    pub rechecks: i64,
+    /// The waiting runs they checked, a run once per recheck.
+    pub runs_checked: i64,
+    /// Runs found conflicting with main (`rebase_conflict`).
+    pub conflicts: i64,
+    /// Runs that merged cleanly but failed the recheck's command
+    /// (`verification_failed`): the conflicts Git does not see.
+    pub check_failures: i64,
+    /// Findings that parked their run for a resume, at once or, for a run
+    /// held in a slot, when it would have landed.
+    pub resumed: i64,
+    /// Each finding, oldest first (a held run's parking is not repeated).
+    pub runs: Vec<RecheckedRun>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RecheckedRun {
+    pub task_id: Option<TaskId>,
+    pub run_id: Option<RunId>,
+    pub code: String,
+    /// `resumed` or `held`.
+    pub action: String,
+    pub landed_task_id: Option<i64>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct DuplicateCancel {
     pub task_id: TaskId,
@@ -312,6 +341,9 @@ pub struct Stats {
     /// how many landings on main that changed them, and whether main still
     /// has them.
     pub conflict_hotspots: ConflictHotspots,
+    /// The landing rechecks of the waiting runs (ADR-0068 decision 6) in
+    /// the same window as `backend_failures`.
+    pub landing_rechecks: LandingRechecks,
     /// Pass it to `--since` to read only runs that finish later.
     pub next_cursor: EventId,
 }
@@ -654,6 +686,7 @@ pub fn stats(
     let backend_failures = backend_failures(events, window_start, next_cursor, counts);
     let reason_codes = reason_codes(events, window_start, next_cursor, counts);
     let duplicate_cancels = duplicate_cancels(events, window_start, next_cursor, counts);
+    let landing_rechecks = landing_rechecks(events, window_start, next_cursor, counts);
     let stall_thresholds = thresholds::thresholds(
         &thresholds::detections(events, now * 1000),
         &thresholds::preemptions(events),
@@ -716,6 +749,7 @@ pub fn stats(
         stall_config: live.config.clone(),
         stall_thresholds,
         conflict_hotspots,
+        landing_rechecks,
         next_cursor,
     }
 }
@@ -1042,6 +1076,55 @@ fn duplicate_cancels(
         }
     }
     cancels
+}
+
+/// Aggregate the landing rechecks with `after < id <= upto` whose task
+/// `counts` accepts (a recheck is on the task whose landing it followed).
+fn landing_rechecks(
+    events: &[RunEvent],
+    after: EventId,
+    upto: EventId,
+    counts: impl Fn(Option<TaskId>) -> bool,
+) -> LandingRechecks {
+    use super::recheck::{LANDING_RECHECK_FAILED, LANDING_RECHECK_FINISHED, RESUMED};
+    let mut rechecks = LandingRechecks::default();
+    for event in events
+        .iter()
+        .filter(|event| event.id > after && event.id <= upto && counts(event.task_id))
+    {
+        match event.kind.as_str() {
+            LANDING_RECHECK_FINISHED => {
+                rechecks.rechecks += 1;
+                rechecks.runs_checked += event.payload["checked"].as_i64().unwrap_or(0);
+            }
+            LANDING_RECHECK_FAILED => {
+                if event.payload["action"] == RESUMED {
+                    rechecks.resumed += 1;
+                }
+                if event.payload["repeat"] == true {
+                    continue;
+                }
+                let code = event.payload["code"].as_str().unwrap_or_default();
+                if code == "rebase_conflict" {
+                    rechecks.conflicts += 1;
+                } else {
+                    rechecks.check_failures += 1;
+                }
+                rechecks.runs.push(RecheckedRun {
+                    task_id: event.task_id,
+                    run_id: event.run_id.clone(),
+                    code: code.to_owned(),
+                    action: event.payload["action"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_owned(),
+                    landed_task_id: event.payload["landed_task_id"].as_i64(),
+                });
+            }
+            _ => {}
+        }
+    }
+    rechecks
 }
 
 /// Aggregate the `backend_call_failed` events with `after < id <= upto`
@@ -1380,6 +1463,51 @@ mod tests {
             created_at: at(secs),
             ..event(id, 1, kind, payload)
         }
+    }
+
+    #[test]
+    fn landing_rechecks_count_each_finding_once_and_every_parking() {
+        let queue_event =
+            |id: i64, payload: Value| event(id, 2, "landing_recheck_finished", payload);
+        let events = [
+            queue_event(1, json!({"checked": 3})),
+            run_event(
+                2,
+                R1,
+                "landing_recheck_failed",
+                json!({"code": "rebase_conflict", "action": "resumed", "landed_task_id": 9}),
+                T,
+            ),
+            run_event(
+                3,
+                R2,
+                "landing_recheck_failed",
+                json!({"code": "verification_failed", "action": "held"}),
+                T,
+            ),
+            // The held run parked when it would have landed: not a new
+            // finding, but a resume.
+            run_event(
+                4,
+                R2,
+                "landing_recheck_failed",
+                json!({"code": "verification_failed", "action": "resumed", "repeat": true}),
+                T,
+            ),
+            queue_event(5, json!({"checked": 1})),
+        ];
+        let all = landing_rechecks(&events, EventId::new(0), EventId::new(5), |_| true);
+        assert_eq!(all.rechecks, 2);
+        assert_eq!(all.runs_checked, 4);
+        assert_eq!(all.conflicts, 1);
+        assert_eq!(all.check_failures, 1);
+        assert_eq!(all.resumed, 2);
+        assert_eq!(all.runs.len(), 2);
+        assert_eq!(all.runs[0].landed_task_id, Some(9));
+        assert_eq!(all.runs[1].action, "held");
+        let window = landing_rechecks(&events, EventId::new(1), EventId::new(3), |_| true);
+        assert_eq!(window.rechecks, 0);
+        assert_eq!(window.runs.len(), 2);
     }
 
     fn live_run(run: &str, status: RunStatus) -> LiveRun {

@@ -16,7 +16,7 @@ use crate::domain::{
     LANDING_OPTIONS, ReasonCode, RunEvent, RunId, RunLease, RunProcess, RunStatus, SessionRole,
     SupervisorMode, SupervisorPulse, SupervisorRegistration, TRIAGE_OPTIONS, TaskId, TaskRun,
     TriageState, UPDATE_FAILED_OPTIONS, UPDATE_FAILED_SUBJECT, event_attention, heartbeat_stale,
-    reason, run_attention,
+    reason, recheck, run_attention,
     run_env::{RUN_ENV_PROGRAM_KINDS, RUN_ENV_PROGRAM_MISSING, RunEnvCheck},
     supervisor_attention, triage_state,
 };
@@ -286,6 +286,15 @@ pub fn status(
             .collect::<Vec<_>>(),
         "asks": asks,
         "proposals": queue.proposals(false)?,
+        // The latest landing recheck of the waiting runs (ADR-0068
+        // decision 6), with when it finished.
+        "landing_recheck": queue
+            .latest_event_of(recheck::LANDING_RECHECK_FINISHED)?
+            .map(|event| {
+                let mut payload = event.payload;
+                payload["at"] = json!(event.created_at);
+                payload
+            }),
         // The build identifier this `status` runs, and the automatic update
         // of the supervisors' binary (ADR-0045 decision 17); each
         // supervisor's own build is its `binary_version`.

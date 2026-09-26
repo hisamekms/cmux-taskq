@@ -361,6 +361,16 @@ impl Supervisor<'_> {
             "validation_finished" if events.iter().any(|e| e.kind == "integration_approved") => {
                 Some(AfterExit::Land)
             }
+            // A rebased run a landing recheck resumed waits for the answer
+            // to its approve_landing ask, not a review (ADR-0068 decision 4).
+            "validation_finished"
+                if crate::domain::resume::parked_by_recheck(&events)
+                    && self
+                        .queue
+                        .has_unclosed_ask(run.id(), AskKind::ApproveLanding)? =>
+            {
+                Some(AfterExit::Rest { close: true })
+            }
             _ => None,
         };
         let Some(then) = then else {

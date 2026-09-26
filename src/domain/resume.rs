@@ -2,7 +2,7 @@
 //! whose resumes are used up is retried with its branch carried over
 //! (ADR-0047 decision 24). Both are read from the run's events alone.
 
-use super::{MAX_RESUME_ATTEMPTS, ReasonCode, ReviewDecision, RunEvent};
+use super::{MAX_RESUME_ATTEMPTS, ReasonCode, ReviewDecision, RunEvent, recheck};
 
 /// How many resumes of one run the supervisor starts while the run was
 /// parked only by a rebase conflict after its review passed: such a resume
@@ -28,13 +28,15 @@ const PARKING: [&str; 7] = [
 
 /// What the events so far say about the run: whether its landing was
 /// approved (`integration_approved`, an `integrate` call or a person's
-/// `land`), whether its latest review passed, and whether the latest
-/// parking event is a landing deferred for a rebase conflict.
+/// `land`), whether its latest review passed, whether the latest parking
+/// event is a landing deferred for a rebase conflict or a landing recheck
+/// that found one, and whether it is that recheck (ADR-0068 decision 5).
 #[derive(Debug, Clone, Copy, Default)]
 struct History {
     approved: bool,
     passed: bool,
     conflict: bool,
+    rechecked: bool,
 }
 
 impl History {
@@ -44,20 +46,32 @@ impl History {
             "review_finished" => {
                 self.passed = event.payload["verdict"] == ReviewDecision::Pass.as_str();
             }
-            kind if PARKING.contains(&kind) => {
-                self.conflict = kind == "integration_deferred"
-                    && event.payload["code"] == ReasonCode::RebaseConflict.as_str();
+            kind if PARKING.contains(&kind) || recheck::parks(event) => {
+                self.conflict = matches!(
+                    kind,
+                    "integration_deferred" | recheck::LANDING_RECHECK_FAILED
+                ) && event.payload["code"] == ReasonCode::RebaseConflict.as_str();
+                self.rechecked = kind == recheck::LANDING_RECHECK_FAILED;
             }
             _ => {}
         }
     }
 
-    /// The run's review passed (or its landing was approved) and it waits
-    /// for a session only because the landing's rebase conflicted with
-    /// main: not a failed verification, `evidence_missing`,
-    /// `scope_violation`, a person's `send_back` or a triage.
+    /// The run waits for a session only because it conflicts with main,
+    /// found by the landing's rebase after its review passed (or its
+    /// landing was approved), or by the landing recheck while it waited
+    /// (ADR-0068 decision 5: the wait, not the run, made the conflict,
+    /// whatever its review said): not a failed verification or recheck
+    /// command, `evidence_missing`, `scope_violation`, a person's
+    /// `send_back` or a triage.
     fn conflict_only(self) -> bool {
-        (self.approved || self.passed) && self.conflict
+        self.conflict && (self.approved || self.passed || self.rechecked)
+    }
+
+    /// [`Self::conflict_only`] with a review that passed or an approved
+    /// landing: what the automatic retry with the branch carried over asks.
+    fn reviewed_conflict(self) -> bool {
+        self.conflict && (self.approved || self.passed)
     }
 }
 
@@ -74,6 +88,12 @@ fn history(events: &[RunEvent]) -> History {
 /// counted toward [`MAX_RESUME_ATTEMPTS`].
 pub fn parked_for_conflict_only(events: &[RunEvent]) -> bool {
     history(events).conflict_only()
+}
+
+/// Whether the latest event that parked the run for a session is the
+/// landing recheck's (ADR-0068 decision 3).
+pub fn parked_by_recheck(events: &[RunEvent]) -> bool {
+    history(events).rechecked
 }
 
 /// The resumes of one run (`resume_started` events), split by whether
@@ -134,7 +154,7 @@ pub fn is_inherit_retry(event: &RunEvent) -> bool {
 /// only, and no run of its task (`task_events`) was retried that way
 /// before. Otherwise a person decides.
 pub fn inherits_on_exhaustion(run_events: &[RunEvent], task_events: &[RunEvent]) -> bool {
-    parked_for_conflict_only(run_events) && !task_events.iter().any(is_inherit_retry)
+    history(run_events).reviewed_conflict() && !task_events.iter().any(is_inherit_retry)
 }
 
 /// Whether the run was ended by the automatic retry that carries its
@@ -300,5 +320,46 @@ mod tests {
             event("triage_decided", json!({"answer": "retry"}))
         ]));
         assert!(!retried_with_inheritance(&run));
+    }
+
+    fn recheck(code: &str, action: &str) -> RunEvent {
+        event(
+            recheck::LANDING_RECHECK_FAILED,
+            json!({"code": code, "action": action}),
+        )
+    }
+
+    #[test]
+    fn a_conflict_the_landing_recheck_found_is_not_counted_whatever_the_review() {
+        let concern = event("review_finished", json!({"verdict": "concern"}));
+        let events = [
+            concern.clone(),
+            recheck("rebase_conflict", recheck::RESUMED),
+            resume(),
+        ];
+        assert_eq!(
+            ResumeCount::of(&events),
+            ResumeCount {
+                counted: 0,
+                conflict_only: 1
+            }
+        );
+        // The retry that carries the branch over still needs a review that
+        // passed.
+        assert!(!inherits_on_exhaustion(&events, &events));
+        let passed = [pass(), recheck("rebase_conflict", recheck::RESUMED)];
+        assert!(inherits_on_exhaustion(&passed, &passed));
+        assert!(parked_by_recheck(&passed));
+        assert!(!parked_by_recheck(&[pass(), conflict()]));
+        // A failed recheck command is counted, and a held failure parks
+        // nothing.
+        let failed = [
+            pass(),
+            recheck("verification_failed", recheck::RESUMED),
+            resume(),
+        ];
+        assert_eq!(ResumeCount::of(&failed).counted, 1);
+        let held = [concern, recheck("rebase_conflict", recheck::HELD), resume()];
+        assert_eq!(ResumeCount::of(&held).counted, 1);
     }
 }

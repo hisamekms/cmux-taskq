@@ -4,7 +4,9 @@
 //! `${DAGQ_QUEUE_DIR}` and `${DAGQ_RUN_DIR}` are expanded. `[stall]` holds
 //! the thresholds of the stalled-session checks in seconds (ADR-0043
 //! decision 4). `[conflicts]` holds the thresholds of the
-//! `conflict_hotspot` alert of `stats` (goal 31). The file is parsed by
+//! `conflict_hotspot` alert of `stats` (goal 31). `[recheck]` holds the
+//! `command` the landing recheck runs on main's tree with a waiting run
+//! merged in (ADR-0068 decision 2). The file is parsed by
 //! hand: the format is these tables of `KEY = value` lines, a subset of
 //! TOML that needs no parser crate.
 use anyhow::{Context, Result, bail, ensure};
@@ -30,7 +32,10 @@ pub const RUN_DIR_VAR: &str = "DAGQ_RUN_DIR";
 const RUN_ENV_TABLE: &str = "run.env";
 const STALL_TABLE: &str = "stall";
 const CONFLICTS_TABLE: &str = "conflicts";
-const TABLES: [&str; 3] = [RUN_ENV_TABLE, STALL_TABLE, CONFLICTS_TABLE];
+const RECHECK_TABLE: &str = "recheck";
+const TABLES: [&str; 4] = [RUN_ENV_TABLE, STALL_TABLE, CONFLICTS_TABLE, RECHECK_TABLE];
+/// The one key of `[recheck]`.
+const RECHECK_COMMAND: &str = "command";
 /// Names the runtime itself sets on a workspace (`DAGQ_ROLE`, `DAGQ_QUEUE`)
 /// and may set later; `[run.env]` cannot override them.
 const RESERVED_PREFIX: &str = "DAGQ_";
@@ -55,8 +60,8 @@ pub fn parse_run_env(text: &str) -> Result<Vec<(String, String)>> {
     Ok(parse_config(text)?.run_env)
 }
 
-/// What the file holds: `[run.env]`, `[stall]` (ADR-0043 decision 4) and
-/// `[conflicts]`.
+/// What the file holds: `[run.env]`, `[stall]` (ADR-0043 decision 4),
+/// `[conflicts]` and `[recheck]` (ADR-0068 decision 2).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Config {
     /// `[run.env]` as written, in file order, values unexpanded.
@@ -65,6 +70,8 @@ pub struct Config {
     pub stall: StallConfig,
     /// `[conflicts]`, the defaults for the keys it does not set.
     pub conflicts: ConflictConfig,
+    /// `[recheck] command`; none checks the merge only.
+    pub recheck_command: Option<String>,
 }
 
 /// Parse the whole file.
@@ -88,7 +95,7 @@ pub fn parse_config(text: &str) -> Result<Config> {
                 .trim();
             let known = TABLES.iter().find(|table| **table == name).with_context(|| {
                 format!(
-                    "{CONFIG_FILE_NAME}:{number}: unknown table [{name}]; only [{RUN_ENV_TABLE}], [{STALL_TABLE}] and [{CONFLICTS_TABLE}] are supported"
+                    "{CONFIG_FILE_NAME}:{number}: unknown table [{name}]; only [{RUN_ENV_TABLE}], [{STALL_TABLE}], [{CONFLICTS_TABLE}] and [{RECHECK_TABLE}] are supported"
                 )
             })?;
             ensure!(
@@ -121,6 +128,23 @@ pub fn parse_config(text: &str) -> Result<Config> {
                     .with_context(|| format!("{CONFIG_FILE_NAME}:{number}: value of {key}"))?;
                 config.run_env.push((key.to_owned(), value));
             }
+            Some(RECHECK_TABLE) => {
+                ensure!(
+                    key == RECHECK_COMMAND,
+                    "{CONFIG_FILE_NAME}:{number}: unknown key {key} in [{RECHECK_TABLE}]; the key is {RECHECK_COMMAND}"
+                );
+                ensure!(
+                    config.recheck_command.is_none(),
+                    "{CONFIG_FILE_NAME}:{number}: {key} is defined twice"
+                );
+                let command = parse_string(rest.trim())
+                    .with_context(|| format!("{CONFIG_FILE_NAME}:{number}: value of {key}"))?;
+                ensure!(
+                    !command.trim().is_empty(),
+                    "{CONFIG_FILE_NAME}:{number}: {key} is blank"
+                );
+                config.recheck_command = Some(command);
+            }
             Some(CONFLICTS_TABLE) => {
                 ensure!(
                     ConflictConfig::KEYS.contains(&key),
@@ -152,7 +176,7 @@ pub fn parse_config(text: &str) -> Result<Config> {
                 stall_keys.push(key.to_owned());
             }
             None => bail!(
-                "{CONFIG_FILE_NAME}:{number}: a key outside [{RUN_ENV_TABLE}], [{STALL_TABLE}] or [{CONFLICTS_TABLE}]"
+                "{CONFIG_FILE_NAME}:{number}: a key outside [{RUN_ENV_TABLE}], [{STALL_TABLE}], [{CONFLICTS_TABLE}] or [{RECHECK_TABLE}]"
             ),
         }
     }
@@ -197,6 +221,18 @@ pub fn load_conflict_config(root: &Path) -> Result<Option<ConflictConfig>> {
             .with_context(|| format!("parse {}", path.display()))?
             .conflicts,
     ))
+}
+
+/// `[recheck] command` of the `dagq.toml` in `root`; no file, no table or
+/// no key is none.
+pub fn load_recheck_command(root: &Path) -> Result<Option<String>> {
+    let path = root.join(CONFIG_FILE_NAME);
+    let Some(text) = read_config(&path)? else {
+        return Ok(None);
+    };
+    Ok(parse_config(&text)
+        .with_context(|| format!("parse {}", path.display()))?
+        .recheck_command)
 }
 
 fn read_config(path: &Path) -> Result<Option<String>> {
@@ -396,6 +432,10 @@ impl Verifier for ShellVerifier {
         )
     }
 
+    fn recheck_command(&self) -> Result<Option<String>> {
+        load_recheck_command(&self.checkout)
+    }
+
     fn run_to_log(
         &self,
         command: &str,
@@ -486,6 +526,13 @@ LITERAL = 'no \n escapes # here'
                 "hotspot_conflicts is defined twice",
             ),
             ("A = 'x'", "a key outside [run.env]"),
+            ("[recheck]\nargs = 'x'", "unknown key args in [recheck]"),
+            (
+                "[recheck]\ncommand = 'x'\ncommand = 'y'",
+                "command is defined twice",
+            ),
+            ("[recheck]\ncommand = ' '", "command is blank"),
+            ("[recheck]\ncommand = x", "expected a quoted string"),
             ("[run.env]\nA 'x'", "expected KEY"),
             ("[run.env]\n1A = 'x'", "not an environment variable name"),
             ("[run.env]\nA-B = 'x'", "not an environment variable name"),
@@ -502,6 +549,38 @@ LITERAL = 'no \n escapes # here'
             let error = format!("{:#}", parse_run_env(text).unwrap_err());
             assert!(error.contains(message), "{text:?}: {error}");
         }
+    }
+
+    #[test]
+    fn reads_the_recheck_command() {
+        let config =
+            parse_config("[recheck]\ncommand = \"cargo check --locked\" # fast\n").unwrap();
+        assert_eq!(
+            config.recheck_command.as_deref(),
+            Some("cargo check --locked")
+        );
+        assert_eq!(parse_config("").unwrap().recheck_command, None);
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(load_recheck_command(dir.path()).unwrap(), None);
+        fs::write(
+            dir.path().join(CONFIG_FILE_NAME),
+            "[run.env]\nA = 'x'\n[recheck]\ncommand = 'make check'\n",
+        )
+        .unwrap();
+        assert_eq!(
+            load_recheck_command(dir.path()).unwrap().as_deref(),
+            Some("make check")
+        );
+        let verifier = ShellVerifier {
+            checkout: dir.path().to_owned(),
+            db: dir.path().join("queue.db"),
+        };
+        assert_eq!(
+            verifier.recheck_command().unwrap().as_deref(),
+            Some("make check")
+        );
+        fs::write(dir.path().join(CONFIG_FILE_NAME), "[recheck]\nnope = 1\n").unwrap();
+        assert!(load_recheck_command(dir.path()).is_err());
     }
 
     #[test]

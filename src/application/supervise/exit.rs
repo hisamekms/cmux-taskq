@@ -53,6 +53,9 @@ impl ExitWatch {
             AfterExit::ReviewFailed { .. } => {
                 "opens an approve_landing ask for the person about its failed review"
             }
+            AfterExit::Rest { close: true } if run.status() == RunStatus::AwaitingIntegration => {
+                "waits for the answer to its approve_landing ask"
+            }
             AfterExit::Rest { close: true } => "is resumed in a session of its own",
             AfterExit::Rest { close: false } => "is left to the person",
         };

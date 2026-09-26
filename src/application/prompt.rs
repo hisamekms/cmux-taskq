@@ -643,6 +643,10 @@ pub(crate) enum ResumeKind {
     /// session (`triage_finished` with action `resume`, or a person's
     /// `resume` answer, `triage_decided`): do what the reason asks.
     Triage,
+    /// A run that waited to land, parked by the landing recheck after
+    /// another landing moved main (ADR-0068 decision 3): rebase, like
+    /// `Landing`, and run the failed recheck command again.
+    Recheck,
 }
 
 /// The fixed resolution request the supervisor types into a resumed
@@ -685,6 +689,11 @@ pub(crate) fn resume_request(
         ),
         ResumeKind::Triage => format!(
             "dagq: run {} (task {}) failed or was interrupted, and the supervisor's triage sent it back to this session to finish, so the run is needs_session.",
+            run.id(),
+            task.id()
+        ),
+        ResumeKind::Recheck => format!(
+            "dagq: run {} (task {}) was waiting to land, and after another landing moved main the supervisor's landing recheck found that it no longer lands, so the run is needs_session before anyone answers for it.",
             run.id(),
             task.id()
         ),
@@ -739,10 +748,14 @@ pub(crate) fn resume_request(
         ));
         // Only integrate's deferral can name a failed verification command;
         // the precheck's reason is always a conflict.
-        let reproduce = if request.kind == ResumeKind::Landing {
-            " If the reason is a verification command that failed after integrate's rebase, you may also run that command in the worktree to reproduce and fix the failure."
-        } else {
-            ""
+        let reproduce = match request.kind {
+            ResumeKind::Landing => {
+                " If the reason is a verification command that failed after integrate's rebase, you may also run that command in the worktree to reproduce and fix the failure."
+            }
+            ResumeKind::Recheck => {
+                " If the reason is a command that failed on main with the run merged in (git found no conflict), run that command in the worktree after the rebase to reproduce and fix the failure."
+            }
+            _ => "",
         };
         lines.push(format!("2. {checks}{reproduce} Commit the result."));
     }

@@ -15,6 +15,7 @@ related:
   - adr-0017
   - adr-0029
   - adr-0040
+  - adr-0068
 ---
 
 # `integrate`
@@ -35,3 +36,5 @@ related:
 10. **follow_upsの登録**（ADR-0019の決定4）: 着地したreceipt（ステップ3で読んだもの）の`follow_ups`を1件ずつdraft taskとして登録する（`application::integrate::register_follow_ups`。`runtime::register_follow_ups`として再公開）。titleとdescriptionはfollow_upのもの、acceptance・`verification_commands`・dependenciesは空、goalは元のtaskと同じ（無ければgoalなし）、`context`は「task <id>（<title>）の run <run-id> の receipt が提案した follow_up」。登録ごとに着地したrunへ`follow_up_registered`（`task_id`、`title`、配列内の位置`index`）を記録する。goalが閉じていればgoalなしで登録し、payloadに`goal_closed: true`を書く。同じrunの`follow_up_registered`が既に持つ`index`は登録しないので、同じrunについて2回呼んでも二重に登録しない（`needs_session`で着地しなかった`integrate`は登録しないので、再着地で登録されるのは1回だけ）。`title`が空でない文字列でないか`description`が文字列でない項目は登録せず、`follow_up_registered`に`task_id: null`、`skipped`（理由）、`follow_up`（項目そのもの）を書く。taskの登録とイベントの記録は別のトランザクションなので、その間で記録に失敗した項目だけは次の呼び出しが再び登録しうる。登録の失敗はstderrに出すだけで、着地とexit codeは変えない。draftの`follow_up_depth`は元のtaskの値+1にし、出どころ（`draft_origins`の`follow_up`、元のtaskとrun）を記録する。draftなのでsupervisorのclaimは拾わず、補ってsubmitするか、cancelするか、人に聞くかは、supervisorがdraftごとに立てるplannerが決める（[Draft planners (supervisor)](draft-planners.md#draft-planners-supervisor)）。`follow_up_registered`はattentionにしない。
 
 結果は`IntegrationOutcome`: `{"outcome":"integrated","task":…,"run":…,"verification_skipped":…,"push":{"outcome":"pushed"|"skipped"|"failed","remote":"origin","error":…,"reason":…},"follow_ups":[{"task_id":…,"title":…}]}`（`verification_skipped`はステップ5が検証コマンドを常に実行するので常に`false`で、出力の形を保つために残す。`run_integrated`イベントのpayloadにも同じ項目が入る。`push`はステップ9の結果で、`error`は`failed`のときだけ文字列（ほかは`null`）、`reason`は`skipped`のときだけ入る。`follow_ups`はステップ10でこの呼び出しが登録したtaskの`[{"task_id","title"}]`で、無ければ空配列）、`{"outcome":"needs_session","run":…,"main":…,"reason":…}`、`{"outcome":"failed","run":…,"reason":…}`、`--next`で対象がなければ`{"outcome":"no_run_awaiting"}`。
+
+supervisorが着地させたrunが`integrated`で終わるたびに、着地待ちのrunをその後のmainに対して`git merge-tree`と`[recheck] command`で確かめ、着地しなくなったrunは次の`integrate`を待たずに`needs_session`にする（[Landing recheck](landing-recheck.md)、[ADR-0068](../../adr/0068-recheck-waiting-runs-after-each-landing.md)）。人が打った`integrate`の着地の後には走らない。

@@ -768,6 +768,18 @@ impl SqliteQueue {
         Ok(EventId::new(self.conn.last_insert_rowid()))
     }
 
+    /// The newest event of `kind`, on whatever task, goal or run.
+    pub fn latest_event_of(&self, kind: &str) -> Result<Option<RunEvent>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT * FROM run_events WHERE kind=?1 ORDER BY id DESC LIMIT 1",
+                [kind],
+                event_row,
+            )
+            .optional()?)
+    }
+
     /// The newest event of the queue itself (on no task, goal or run) of one
     /// of `kinds`.
     pub fn latest_queue_event(&self, kinds: &[&str]) -> Result<Option<RunEvent>> {
@@ -1192,6 +1204,67 @@ impl SqliteQueue {
         run_event(&tx, id, "landing_decided", payload)?;
         tx.commit()?;
         Ok(run.relocated(&self.runs_dir))
+    }
+
+    /// Park a run awaiting integration that the landing recheck found no
+    /// longer landing on main (ADR-0068 decision 3): it becomes
+    /// `needs_session` with `reason` as `last_error`, recorded as
+    /// `landing_recheck_failed` with `payload`, `action: resumed`, the
+    /// status and the reason. With `token` the run must be leased to it,
+    /// and the lease goes; without one it must be leased to nobody.
+    /// `None`, and nothing written, when the run is not so (it moved on, or
+    /// someone took it meanwhile).
+    pub fn park_rechecked(
+        &mut self,
+        id: &RunId,
+        token: Option<&str>,
+        reason: &str,
+        mut payload: serde_json::Value,
+    ) -> Result<Option<TaskRun>> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let lease: Option<String> = tx
+            .query_row("SELECT token FROM run_leases WHERE run_id=?1", [id], |r| {
+                r.get(0)
+            })
+            .optional()?;
+        let waiting = stored_run(&tx, id)?
+            .is_some_and(|run| run.status() == crate::domain::RunStatus::AwaitingIntegration);
+        if lease.as_deref() != token || !waiting {
+            return Ok(None);
+        }
+        let run = apply(
+            &tx,
+            refusals(&self.runs_dir, &self.generators),
+            id,
+            None,
+            || format!("run {id} is not awaiting integration"),
+            |run| run::park_after_recheck(run, reason.to_owned()),
+        )?;
+        if let Some(token) = token {
+            tx.execute(
+                "DELETE FROM run_leases WHERE run_id=?1 AND token=?2",
+                params![id, token],
+            )?;
+            run_event(
+                &tx,
+                id,
+                "lease_released",
+                json!({"reason": crate::domain::recheck::LANDING_RECHECK_FAILED}),
+            )?;
+        }
+        payload["action"] = json!(crate::domain::recheck::RESUMED);
+        payload["status"] = json!(run.status());
+        payload["reason"] = json!(reason);
+        run_event(
+            &tx,
+            id,
+            crate::domain::recheck::LANDING_RECHECK_FAILED,
+            payload,
+        )?;
+        tx.commit()?;
+        Ok(Some(run.relocated(&self.runs_dir)))
     }
 
     pub fn finish_validation(
@@ -2917,6 +2990,15 @@ impl RunStore for SqliteQueue {
     ) -> Result<TaskRun> {
         SqliteQueue::decide_landing(self, id, status, reason, payload)
     }
+    fn park_rechecked(
+        &mut self,
+        id: &RunId,
+        token: Option<&str>,
+        reason: &str,
+        payload: serde_json::Value,
+    ) -> Result<Option<TaskRun>> {
+        SqliteQueue::park_rechecked(self, id, token, reason, payload)
+    }
     fn runs_to_triage(&self) -> Result<Vec<TaskRun>> {
         SqliteQueue::runs_to_triage(self)
     }
@@ -3098,6 +3180,9 @@ impl RunStore for SqliteQueue {
     fn record_queue_event(&self, kind: &str, payload: serde_json::Value) -> Result<EventId> {
         SqliteQueue::record_queue_event(self, kind, payload)
     }
+    fn latest_event_of(&self, kind: &str) -> Result<Option<RunEvent>> {
+        SqliteQueue::latest_event_of(self, kind)
+    }
     fn latest_queue_event(&self, kinds: &[&str]) -> Result<Option<RunEvent>> {
         SqliteQueue::latest_queue_event(self, kinds)
     }
@@ -3181,6 +3266,14 @@ impl AskStore for SqliteQueue {
         answer: &str,
     ) -> Result<Vec<crate::domain::Ask>> {
         SqliteQueue::close_stalled_asks(self, run_id, answer)
+    }
+    fn note_on_asks(
+        &mut self,
+        run_id: &RunId,
+        note: &str,
+        why: &str,
+    ) -> Result<Vec<crate::domain::Ask>> {
+        SqliteQueue::note_on_asks(self, run_id, note, why)
     }
     fn close_approve_landing_asks(
         &mut self,

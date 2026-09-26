@@ -579,6 +579,17 @@ impl GitRepository {
     /// object store alone: no worktree, index or ref moves (ADR-0027
     /// decision 4). Empty when they merge cleanly.
     pub fn merge_conflicts(&self, main: &str, head: &str) -> Result<Vec<String>> {
+        Ok(self.merged_tree(main, head)?.err().unwrap_or_default())
+    }
+
+    /// The tree `git merge-tree --write-tree` makes of `head` merged with
+    /// `main`, in the object store alone: `Ok(tree)` when they merge
+    /// cleanly, `Err(paths)` with each conflicted path once otherwise.
+    pub fn merged_tree(
+        &self,
+        main: &str,
+        head: &str,
+    ) -> Result<std::result::Result<String, Vec<String>>> {
         let (status, stdout, stderr) = capture(
             Command::new(&self.git).arg("-C").arg(&self.root).args([
                 "merge-tree",
@@ -592,7 +603,13 @@ impl GitRepository {
             Duration::from_secs(5 * 60),
         )?;
         match status.code() {
-            Some(0) => Ok(Vec::new()),
+            // The tree's OID, NUL-terminated.
+            Some(0) => Ok(Ok(stdout
+                .split('\0')
+                .next()
+                .unwrap_or_default()
+                .trim()
+                .to_owned())),
             // The tree's OID, then each conflicted path, NUL-terminated and
             // never quoted.
             Some(1) => {
@@ -602,10 +619,51 @@ impl GitRepository {
                         paths.push(path.to_owned());
                     }
                 }
-                Ok(paths)
+                Ok(Err(paths))
             }
             _ => bail!("git merge-tree failed ({status}): {stderr}"),
         }
+    }
+
+    /// Check `commit` out detached in the scratch worktree at `path` (the
+    /// landing recheck's, ADR-0068 decision 2), adding it when it is not a
+    /// worktree yet and dropping whatever its last use left in it.
+    pub fn checkout_scratch(&self, path: &Path, commit: &str) -> Result<()> {
+        if !path.join(".git").exists() {
+            // A directory left without its worktree, or a record left
+            // without its directory, is cleared first.
+            if path.exists() {
+                fs::remove_dir_all(path).with_context(|| format!("remove {}", path.display()))?;
+            }
+            output(
+                Command::new(&self.git)
+                    .arg("-C")
+                    .arg(&self.root)
+                    .args(["worktree", "prune"]),
+            )?;
+            output(
+                Command::new(&self.git)
+                    .arg("-C")
+                    .arg(&self.root)
+                    .args(["worktree", "add", "--detach", "--force"])
+                    .arg(path)
+                    .arg(commit),
+            )?;
+            return Ok(());
+        }
+        output(
+            Command::new(&self.git)
+                .arg("-C")
+                .arg(path)
+                .args(["checkout", "--detach", "--force", "--quiet", commit]),
+        )?;
+        output(
+            Command::new(&self.git)
+                .arg("-C")
+                .arg(path)
+                .args(["clean", "-ffdxq"]),
+        )?;
+        Ok(())
     }
 
     /// The commits of main's first-parent line since `since` (unix
@@ -1221,6 +1279,16 @@ impl Repository for GitRepository {
         paragraphs: &[String],
     ) -> Result<CommitSha> {
         GitRepository::rename_and_commit(self, worktree, from, to, paragraphs)
+    }
+    fn merged_tree(
+        &self,
+        main: &str,
+        head: &str,
+    ) -> Result<std::result::Result<String, Vec<String>>> {
+        GitRepository::merged_tree(self, main, head)
+    }
+    fn checkout_scratch(&self, path: &Path, commit: &str) -> Result<()> {
+        GitRepository::checkout_scratch(self, path, commit)
     }
     fn tree_of(&self, commit: &str) -> Result<String> {
         GitRepository::tree_of(self, commit)

@@ -86,6 +86,7 @@ mod idle;
 mod jobs;
 mod landing;
 mod plan_review;
+mod recheck;
 mod recovery;
 mod resume;
 mod revise;
@@ -409,6 +410,7 @@ pub fn supervise(ports: &Ports<'_>, settings: &LoopSettings) -> Result<Value> {
         run_env_missing: false,
         draining: false,
         update: update::UpdateWatch::default(),
+        rechecks: recheck::Rechecks::default(),
     };
     if settings.handoff_token.is_some() {
         supervisor.rebuild_own_runs(previous_version.as_deref())?;
@@ -488,6 +490,8 @@ struct Supervisor<'a> {
     draining: bool,
     /// The automatic update's look at main (ADR-0045 decision 17).
     update: update::UpdateWatch,
+    /// The landing recheck running and the one due (ADR-0068).
+    rechecks: recheck::Rechecks,
 }
 
 /// One executing run between provisioning and rest.
@@ -619,7 +623,14 @@ impl Supervisor<'_> {
                     }
                 }
                 if let Some(binary) = self.handoff.clone() {
-                    if self.slots.iter().all(|slot| slot.phase.rebuildable()) {
+                    // A landing recheck in progress is waited for: its
+                    // command would go on in the scratch worktree the next
+                    // process uses (ADR-0068). None starts meanwhile (this
+                    // pass drains).
+                    self.recheck_pass();
+                    if !self.rechecks.running()
+                        && self.slots.iter().all(|slot| slot.phase.rebuildable())
+                    {
                         let runs = self.prepare_handoff();
                         info!(
                             "supervisor {} execs {binary}, handing over {runs} run(s)",
@@ -647,6 +658,7 @@ impl Supervisor<'_> {
                 self.fill_slots(options.parallel, options.sweep_interval)?;
             }
             self.poll_observer();
+            let rechecked = self.recheck_pass();
             // A supervisor that stopped claiming is draining, not observing
             // nor starting plan reviews, nor updating itself.
             if !stopping && self.claiming {
@@ -657,9 +669,14 @@ impl Supervisor<'_> {
             // pass, which claims them.
             let progressed = self.plan_review_pass(options, !stopping && self.claiming);
             if self.slots.is_empty() {
-                // A running observer or plan review is waited for like a
-                // run: it is short and bounded by its own timeout.
-                let job = self.observer.is_some() || self.plan_review.is_some();
+                // A running observer, plan review or landing recheck is
+                // waited for like a run: it is bounded by its own timeout
+                // or its command. A recheck just applied is followed by one
+                // more pass, which resumes the runs it parked.
+                let job = self.observer.is_some()
+                    || self.plan_review.is_some()
+                    || self.rechecks.running()
+                    || rechecked;
                 if !job && !progressed && (options.once || stopping || !self.claiming) {
                     break;
                 }
@@ -805,6 +822,11 @@ impl Supervisor<'_> {
                 }
                 Ok(Step::Done(run)) => {
                     info!(run_id = %run.id(), "run {} is {}", run.id(), run.status().as_str());
+                    // Main moved: the runs that wait to land are checked
+                    // against it (ADR-0068 decision 1).
+                    if run.status() == RunStatus::Integrated {
+                        self.note_landed(&run);
+                    }
                     // A landed run needs none of its workspaces; a failed
                     // one keeps them for its triage.
                     if matches!(run.status(), RunStatus::Integrated | RunStatus::Succeeded)
@@ -1123,8 +1145,14 @@ impl Supervisor<'_> {
                 {
                     return Ok(Step::Continue);
                 }
-                let previous = self.queue.run(slot.run.id())?.status();
+                let current = self.queue.run(slot.run.id())?;
+                let previous = current.status();
                 let main = self.repository.main_head()?;
+                // A head the landing recheck found not landing on this main
+                // is parked for a resume instead (ADR-0068 decision 3).
+                if let Some(parked) = self.park_held_by_recheck(&current, &main)? {
+                    return Ok(Step::Done(Box::new(parked)));
+                }
                 let run = match self
                     .queue
                     .begin_integration(slot.run.id(), &self.token, &main)
@@ -1205,6 +1233,19 @@ impl Supervisor<'_> {
                         if self.queue.has_run_event(run.id(), "integration_approved")? =>
                     {
                         Phase::Exiting(ExitWatch::new(session, AfterExit::Land))
+                    }
+                    // A landing recheck resumed the run without waiting for
+                    // the answer to its approve_landing ask (ADR-0068
+                    // decision 4): the rebased run waits for it instead of
+                    // a new review.
+                    RunStatus::AwaitingIntegration
+                        if crate::domain::resume::parked_by_recheck(
+                            &self.queue.run_events(run.id())?,
+                        ) && self
+                            .queue
+                            .has_unclosed_ask(run.id(), AskKind::ApproveLanding)? =>
+                    {
+                        Phase::Exiting(ExitWatch::new(session, AfterExit::Rest { close: true }))
                     }
                     RunStatus::AwaitingIntegration => self.start_review(&run, session)?,
                     // A run parked for evidence gives up its workspace, since a

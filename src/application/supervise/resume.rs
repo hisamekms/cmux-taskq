@@ -117,12 +117,13 @@ impl Supervisor<'_> {
         run: &TaskRun,
         main: &CommitSha,
     ) -> Result<Option<CommitSha>> {
-        const PARKING: [&str; 5] = [
+        const PARKING: [&str; 6] = [
             "integration_deferred",
             "integration_error",
             "evidence_missing",
             "scope_violation",
             "landing_decided",
+            crate::domain::recheck::LANDING_RECHECK_FAILED,
         ];
         let events = self.queue.run_events(run.id())?;
         let parked = events
@@ -587,7 +588,7 @@ pub(super) fn resume_reason(
                 | "landing_decided"
                 | "triage_finished"
                 | "triage_decided"
-        )
+        ) || crate::domain::recheck::parks(e)
     });
     // The triage's resume asks for its `instruction`, not its reason.
     let key = match parked {
@@ -607,6 +608,7 @@ pub(super) fn resume_reason(
         }
         Some(e) if e.kind == "landing_decided" => ResumeKind::SentBack,
         Some(e) if e.kind.starts_with("triage_") => ResumeKind::Triage,
+        Some(e) if e.kind == crate::domain::recheck::LANDING_RECHECK_FAILED => ResumeKind::Recheck,
         _ => ResumeKind::Landing,
     };
     Ok((reason, kind))

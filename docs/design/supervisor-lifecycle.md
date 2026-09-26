@@ -153,6 +153,10 @@ failed / interrupted run (a dead run nobody leases is recovered to interrupted f
 
 - [Conflict thresholds](supervisor-lifecycle/conflict-thresholds.md)
 
+### Landing recheck
+
+- [Landing recheck](supervisor-lifecycle/landing-recheck.md)
+
 ### Prompt
 
 - [Prompt](supervisor-lifecycle/prompt.md)

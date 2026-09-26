@@ -359,6 +359,20 @@ pub fn decide_landing(
     Ok(run)
 }
 
+/// `awaiting_integration` → `needs_session`: the landing recheck found
+/// that the waiting run no longer lands on main (ADR-0068 decision 3),
+/// with `reason` as `last_error`.
+pub fn park_after_recheck(mut run: TaskRun, reason: String) -> Result<TaskRun, DomainError> {
+    require_status(
+        &run,
+        &[RunStatus::AwaitingIntegration],
+        "park after a landing recheck",
+    )?;
+    run.status = RunStatus::NeedsSession;
+    run.last_error = Some(reason);
+    Ok(run)
+}
+
 /// A runtime error on the run: `message` becomes `last_error` and the
 /// status stays, whether or not its supervisor lets it go.
 pub fn abandon(mut run: TaskRun, message: String) -> Result<TaskRun, DomainError> {
@@ -850,6 +864,13 @@ mod tests {
             decide_landing(run(RunStatus::Failed), RunStatus::Failed, "r".into()),
             RunStatus::Failed,
         );
+        refused(
+            park_after_recheck(run(RunStatus::NeedsSession), "r".into()),
+            RunStatus::NeedsSession,
+        );
+        let parked = park_after_recheck(run(RunStatus::AwaitingIntegration), "r".into()).unwrap();
+        assert_eq!(parked.status(), RunStatus::NeedsSession);
+        assert_eq!(parked.last_error(), Some("r"));
         refused(
             decide_landing(
                 run(RunStatus::AwaitingIntegration),

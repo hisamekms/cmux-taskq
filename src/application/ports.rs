@@ -1069,6 +1069,16 @@ pub trait RunStore {
         reason: &str,
         payload: serde_json::Value,
     ) -> Result<TaskRun>;
+    /// Park a run awaiting integration that the landing recheck found no
+    /// longer landing on main (ADR-0068 decision 3), leased to `token` or
+    /// to nobody; `None` when it is not so any more.
+    fn park_rechecked(
+        &mut self,
+        id: &RunId,
+        token: Option<&str>,
+        reason: &str,
+        payload: serde_json::Value,
+    ) -> Result<Option<TaskRun>>;
     /// The latest `failed` / `interrupted` run of every task in progress.
     fn runs_to_triage(&self) -> Result<Vec<TaskRun>>;
     /// Take the run's lease for its triage; the attempt, or `None` when
@@ -1199,6 +1209,8 @@ pub trait RunStore {
     -> Result<()>;
     /// Record an event of the queue itself, on no task, goal or run.
     fn record_queue_event(&self, kind: &str, payload: serde_json::Value) -> Result<EventId>;
+    /// The newest event of `kind`, on whatever task, goal or run.
+    fn latest_event_of(&self, kind: &str) -> Result<Option<RunEvent>>;
     /// The newest event of the queue itself (on no run) of one of `kinds`.
     fn latest_queue_event(&self, kinds: &[&str]) -> Result<Option<RunEvent>>;
 }
@@ -1248,6 +1260,9 @@ pub trait AskStore {
     fn unclosed_stalled_ask(&self, run_id: &RunId) -> Result<Option<Ask>>;
     /// Close the run's `stalled` asks nobody closed, with `answer`.
     fn close_stalled_asks(&mut self, run_id: &RunId, answer: &str) -> Result<Vec<Ask>>;
+    /// Add `note` as a paragraph to the question of every ask of the run
+    /// nobody closed, recording `ask_updated` with `why`; the asks noted.
+    fn note_on_asks(&mut self, run_id: &RunId, note: &str, why: &str) -> Result<Vec<Ask>>;
     /// Close the run's `approve_landing` asks nobody closed, with `answer`.
     fn close_approve_landing_asks(&mut self, run_id: &RunId, answer: &str) -> Result<Vec<Ask>>;
 }
@@ -1589,6 +1604,22 @@ pub trait Repository {
     /// The paths `git merge-tree` finds conflicting between two commits,
     /// without touching a worktree; empty when they merge cleanly.
     fn merge_conflicts(&self, main: &str, head: &str) -> Result<Vec<String>>;
+    /// The tree of `head` merged with `main` without touching a worktree:
+    /// `Ok(tree)` when they merge cleanly, `Err(paths)` when they conflict.
+    fn merged_tree(
+        &self,
+        main: &str,
+        head: &str,
+    ) -> Result<std::result::Result<String, Vec<String>>> {
+        let _ = (main, head);
+        anyhow::bail!("this repository cannot merge trees")
+    }
+    /// Check `commit` out detached in the scratch worktree at `path`,
+    /// adding it when missing and clearing what its last use left.
+    fn checkout_scratch(&self, path: &Path, commit: &str) -> Result<()> {
+        let _ = (path, commit);
+        anyhow::bail!("this repository keeps no scratch worktree")
+    }
     /// The tasks landed between two commits, oldest first, from their
     /// `Dagq-Task` trailers.
     fn landed_task_ids(&self, base: &str, head: &str) -> Result<Vec<TaskId>>;
@@ -1622,6 +1653,12 @@ pub trait Verifier {
         &self,
         run_dir: Option<&Path>,
     ) -> Result<crate::domain::run_env::RunEnvCheck>;
+    /// The command the landing recheck runs on main's tree with a waiting
+    /// run merged in (`[recheck] command` of `dagq.toml`, ADR-0068 decision
+    /// 2); `None` checks the merge only.
+    fn recheck_command(&self) -> Result<Option<String>> {
+        Ok(None)
+    }
     /// Run `command` in a shell in `cwd` with `env`, its output in `log`.
     fn run_to_log(
         &self,

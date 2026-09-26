@@ -310,11 +310,11 @@ domainの関数は業務上の拒否を`DomainError`（`src/domain/error.rs`）�
 | `commit_mismatch` | receiptのcommitがrun branchのbaseの上の新しいheadでない（別のbranch、headでない、commitが無い、baseから辿れない） | |
 | `worktree_dirty` | worktreeにcommitされていない変更がある | |
 | `scope_violation` | 差分がtaskの`--paths`の外を変えた | （`paths` / `scope_violation`は既存） |
-| `rebase_conflict` | runがmainと衝突した（着地のrebase、passの後の`git merge-tree`の事前判定） | （`conflicts`は既存） |
+| `rebase_conflict` | runがmainと衝突した（着地のrebase、passの後の`git merge-tree`の事前判定、着地の後のlanding recheck） | （`conflicts`は既存） |
 | `rebase_empty` | rebaseの後にmainの上にcommitが残らない | |
 | `rebase_in_progress` | worktreeに途中のrebaseが残っていたので中止した | |
 | `migration_number_taken` | runが足したmigrationの番号がmainで埋まっていて、機械的に振り直せない（runが足したmigrationが2つ以上か、番号をrunの他の変更が含む。[ADR-0067](../adr/0067-migrations-are-listed-by-build-and-renumbered-on-landing.md)の決定3） | `migrations`、`taken`、`next_number`、（番号を含むファイルがあれば）`referring` |
-| `verification_failed` | rebaseの後の検証コマンドが非0で終わった | `index`（1始まり）、（`command` / `exit_code`は既存） |
+| `verification_failed` | rebaseの後の検証コマンドが非0で終わった（landing recheckの`[recheck] command`がmainに載せた木で非0で終わったときも） | `index`（1始まり）、（`command` / `exit_code`は既存） |
 | `backend_timeout` | cmuxの呼び出しがtimeoutした（adapterの`did not finish within`、cmuxの`Command timed out`） | `op`（`backend_call_failed`は既存の`op`） |
 | `backend_failed` | cmuxの呼び出しが失敗した | `op` |
 | `job_failed` | headlessのreviewかtriageのjobが失敗した | |
@@ -357,6 +357,7 @@ domainの関数は業務上の拒否を`DomainError`（`src/domain/error.rs`）�
 | `backend_call_failed` | cmuxの呼び出しの失敗 | `backend_timeout` / `backend_failed` |
 | `review_failed` / `triage_failed` | headlessのjobの失敗 | `job_failed` |
 | `conflict_precheck` | passの後の事前判定がmainとの衝突を見つけた | `rebase_conflict` |
+| `landing_recheck_failed` | 着地の後のlanding recheckが、着地待ちのrunがもう着地しないことを見つけた（ADR-0068） | `rebase_conflict` / `verification_failed` |
 | `revise_receipt_rejected` / `conflict_receipt_rejected` | 生きているsessionが書き直したreceiptが合わない | `commit_mismatch` / `worktree_dirty` / `receipt_invalid` |
 | `push_failed` | pushの失敗 | `push_failed` |
 
