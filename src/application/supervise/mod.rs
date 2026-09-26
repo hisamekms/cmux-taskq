@@ -69,7 +69,9 @@ use crate::domain::{
     MAX_REVISE_ATTEMPTS, NewAsk, NewHold, Predecessor, Reason, ReasonCode, Receipt, ReceiptResult,
     ReviewDecision, ReviewVerdict, RunId, RunLease, RunPaths, RunPlan, RunProcess, RunStatus,
     SessionRole, TRIAGE_OPTIONS, TRIAGE_RETRY_FAILURES, TaskAction, TaskId, TaskRun, TaskStatus,
-    TriageState, heartbeat_stale,
+    TriageState,
+    claim_hold::{self, CLAIM_HOLD_KINDS, ClaimHold, HoldInputs},
+    heartbeat_stale,
     marks::{RUN_ENV_CHANGED, SUPERVISOR_STARTED, SUPERVISOR_STOPPED, run_env_digest},
     measure::{ClaimAttributes, HostVersions, LoadSummary, LoadWindow},
     recovery::{RecoveryAlert, RecoveryDecision, RecoveryVerdict, STUCK_EXIT_ACTIONS},
@@ -181,6 +183,9 @@ pub struct LoopSettings {
     /// The automatic update of this supervisor's binary (ADR-0045
     /// decision 17).
     pub update: UpdateSettings,
+    /// `--max-load`: no new run is claimed while the 1-minute load average
+    /// is above it (task 327); `None` holds for no load.
+    pub max_load: Option<f64>,
 }
 
 /// Where the supervisor works and what it starts: the queue database and
@@ -460,6 +465,7 @@ pub fn supervise(ports: &Ports<'_>, settings: &LoopSettings) -> Result<Value> {
         draining: false,
         update: update::UpdateWatch::default(),
         rechecks: recheck::Rechecks::default(),
+        max_load: settings.max_load,
         load_average: ports.load_average,
         host_versions: ports.host_versions,
         loads: HashMap::new(),
@@ -552,6 +558,8 @@ struct Supervisor<'a> {
     update: update::UpdateWatch,
     /// The landing recheck running and the one due (ADR-0068).
     rechecks: recheck::Rechecks,
+    /// `--max-load` (task 327).
+    max_load: Option<f64>,
     /// The 1-minute load average, and the host's versions a claim records.
     load_average: fn() -> Option<f64>,
     host_versions: fn(&Path, &Path) -> HostVersions,
@@ -820,6 +828,10 @@ impl Supervisor<'_> {
         if self.run_env_missing {
             return Ok(());
         }
+        // The runs in flight go on; only new claims wait (task 327).
+        if self.hold_claims()? {
+            return Ok(());
+        }
         let mut host: Option<HostVersions> = None;
         while self.used_slots() < parallel {
             // Highest effective priority, then most-releasing, then lowest
@@ -868,6 +880,44 @@ impl Supervisor<'_> {
             }
         }
         Ok(())
+    }
+    /// Judge whether new claims are held now ([`ClaimHold::judge`]) and
+    /// record `claim_held` or `claim_resumed` when the answer differs from
+    /// the hold in place on the queue (task 327). Returns
+    /// whether they are held.
+    fn hold_claims(&mut self) -> Result<bool> {
+        let hold = ClaimHold::judge(&HoldInputs {
+            load_average: (self.load_average)(),
+            max_load: self.max_load,
+        });
+        let last = self.queue.latest_queue_event(&CLAIM_HOLD_KINDS)?;
+        // The supervisors running now: a hold another one recorded is in
+        // place only while it runs (its registration's heartbeat is fresh).
+        let now = self.generators.clock.now();
+        let live: Vec<String> = self
+            .queue
+            .supervisors()?
+            .into_iter()
+            .filter(|registration| {
+                !heartbeat_stale(
+                    self.processes.alive(registration.pid),
+                    now - registration.heartbeat_at,
+                )
+            })
+            .map(|registration| registration.token)
+            .collect();
+        if let Some((kind, payload)) =
+            claim_hold::transition(hold.as_ref(), last.as_ref(), &self.token, |holder| {
+                live.iter().any(|token| token == holder)
+            })
+        {
+            self.queue.record_queue_event(kind, payload)?;
+            match &hold {
+                Some(hold) => warn!("{}", hold.message()),
+                None => info!("claims resume: nothing holds them any more"),
+            }
+        }
+        Ok(hold.is_some())
     }
     /// Check the programs `[run.env]` names on this process's PATH
     /// (ADR-0049 decision 9) and record `run_env_program_missing` or

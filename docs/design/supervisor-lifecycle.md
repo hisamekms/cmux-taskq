@@ -8,6 +8,7 @@ updated: 2026-09-26
 last_verified: 2026-09-26
 scope: runtime
 related:
+  - design-supervisor-lifecycle-claim-hold
   - adr-0044
   - adr-0047
   - adr-0038
@@ -137,6 +138,10 @@ live session alert (long_background, stuck_exit, prompt_waiting)
 ### Handoff
 
 - [Handoff](supervisor-lifecycle/handoff.md)
+
+### claimを控える（load average）
+
+- [claimを控える（load average）](supervisor-lifecycle/claim-hold.md)
 
 ### 人の答えを待つrun（slotの外の待ち）
 

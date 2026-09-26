@@ -478,6 +478,10 @@ enum Command {
         /// --parallel slots (ADR-0062); 0 keeps every run in its slot.
         #[arg(long, default_value_t = 4)]
         max_waiting: u16,
+        /// Claim no new run while the host's 1-minute load average is above
+        /// this; the runs in flight go on. 0 disables the hold.
+        #[arg(long, default_value_t = dagq::domain::claim_hold::DEFAULT_MAX_LOAD)]
+        max_load: f64,
         /// Exit once no run is active and no task can be claimed, instead of
         /// waiting for new work.
         #[arg(long)]
@@ -1866,6 +1870,7 @@ fn execute(cli: Cli) -> Result<Value> {
             repo,
             parallel,
             max_waiting,
+            max_load,
             once,
             cmux,
             claude,
@@ -1906,6 +1911,7 @@ fn execute(cli: Cli) -> Result<Value> {
                     cmux: Some(cmux.clone()),
                 },
                 max_waiting: usize::from(max_waiting),
+                max_load: (max_load > 0.0).then_some(max_load),
                 ..SuperviseOptions::new(usize::from(parallel), once)
             };
             dagq::compose::supervise(

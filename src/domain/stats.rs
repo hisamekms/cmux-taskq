@@ -418,6 +418,9 @@ pub struct Stats {
     /// `backend_failures` (task 325): by kind, by asker, by answerer and
     /// the option each answer chose.
     pub asks: AskStats,
+    /// The holds on new claims (task 327): those that started in the
+    /// window by reason with how long they lasted, and the hold now.
+    pub claim_holds: super::claim_hold::ClaimHolds,
     /// The irregularities repaired without a person (`auto_repaired`,
     /// ADR-0047 decision 45) in the same window as `asks`: by layer and
     /// repair, and per day next to the asks opened that day.
@@ -792,6 +795,8 @@ pub fn stats(
     let ask_stats = asks::asks(events, window_start, next_cursor, window_end, counts);
     let auto_repairs = auto_repairs::auto_repairs(events, window_start, next_cursor, counts);
     let updates = updates::updates(events, window_start, next_cursor, counts);
+    let claim_holds =
+        super::claim_hold::claim_holds(events, window_start, next_cursor, window_end, counts);
     let verification_commands =
         measures::verification_commands(events, window_start, next_cursor, counts);
     let waiting = super::waiting::waiting_stats(events, window_start, next_cursor, counts);
@@ -846,7 +851,18 @@ pub fn stats(
             phase: None,
         });
     }
-    if slots.free_slots > 0 && slots.candidates == 0 && slots.ready > 0 {
+    // Slots left free while claims are held are that hold's, not idle ones.
+    if slots.free_slots > 0 && claim_holds.held.is_some() {
+        alerts.push(Alert {
+            kind: "claim_held",
+            task_id: None,
+            run_id: None,
+            value: slots.free_slots,
+            threshold: 0,
+            path: None,
+            phase: None,
+        });
+    } else if slots.free_slots > 0 && slots.candidates == 0 && slots.ready > 0 {
         alerts.push(Alert {
             kind: "idle_slots",
             task_id: None,
@@ -879,6 +895,7 @@ pub fn stats(
         sessions,
         waiting,
         asks: ask_stats,
+        claim_holds,
         auto_repairs,
         updates,
         next_cursor,

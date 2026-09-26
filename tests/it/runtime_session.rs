@@ -1361,8 +1361,11 @@ fn unanswered_exit_request_times_out_and_keeps_the_run() {
         let (db, repo, backend) = (db.clone(), repo.clone(), backend.clone());
         thread::spawn(move || supervise(&db, &repo, &backend))
     };
+    // The stuck_exit ask follows the timeout on a later pass; a loaded host
+    // can take longer than the pause below between the two.
     wait_until(&db, Duration::from_secs(30), |queue| {
         event_kinds(&queue.show(TaskId::new(1)).unwrap()).contains(&"exit_request_timed_out")
+            && !queue.asks(AskQuery::default()).unwrap().is_empty()
     });
     // Let a few more polls pass: the timeout is not recorded again and the
     // run is not given up.

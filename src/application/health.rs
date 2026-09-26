@@ -322,7 +322,9 @@ pub fn status(
 /// for a slot to go back to (ADR-0062 decision 12), from the leases and the
 /// run events. `used` counts the leased runs that are not integrating and
 /// do not wait; a run waiting to go back is in neither count, and shows in
-/// `waiting` as `state: returning`.
+/// `waiting` as `state: returning`. A supervisor that holds its claims
+/// has `claim_hold`: its latest `claim_held` payload and `since` (task
+/// 327).
 fn slots_and_waits(
     queue: &dyn Queue,
     health: Vec<SupervisorHealth>,
@@ -362,6 +364,10 @@ fn slots_and_waits(
         }
         waiting.push(wait);
     }
+    // The hold on new claims in progress (task 327), on its supervisor.
+    let hold = queue
+        .latest_queue_event(&crate::domain::claim_hold::CLAIM_HOLD_KINDS)?
+        .filter(|event| event.kind == crate::domain::claim_hold::CLAIM_HELD);
     let supervisors = health
         .into_iter()
         .enumerate()
@@ -374,6 +380,14 @@ fn slots_and_waits(
                     .unwrap_or_default();
                 value["slots"] = json!({"used": used, "parallel": registration.parallel});
                 value["waiting"] = json!({"count": count, "limit": registration.max_waiting});
+                if let Some(event) = hold.as_ref().filter(|event| {
+                    event.payload.get("supervisor").and_then(Value::as_str)
+                        == Some(registration.token.as_str())
+                }) {
+                    let mut held = event.payload.clone();
+                    held["since"] = json!(event.created_at);
+                    value["claim_hold"] = held;
+                }
             }
             Ok(value)
         })

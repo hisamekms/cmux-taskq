@@ -9,6 +9,7 @@ last_verified: 2026-09-26
 scope: runtime
 related:
   - design-supervisor-lifecycle
+  - design-supervisor-lifecycle-claim-hold
   - design-supervisor-lifecycle-kpi
   - adr-0062
   - design-supervisor-lifecycle-waiting
@@ -52,8 +53,10 @@ related:
   - `task_failed`: 同じtaskのrunの`failed`が合わせて2回。回数はpageに関係なく全runで数え、`run_id`はその最後に失敗したrunで、そのrunが対象に入るときに出す（`--since`で2回目だけが新しくても出る）
   - `work_over_median`: `work`がそのgoal（goalの無いrunはgoalの無いrun同士）の中央値の2倍を超えたrun
   - `idle_slots`: staleでないsupervisorの`parallel`の合計から実行中（`integrating`以外の未完了で、人の答えを待つ・slotへ戻るのを待つrunを除く。[ADR-0062](../../adr/0062-runs-waiting-for-a-person-leave-the-slot.md)の決定13）runを引いた空きslotがあるのに、candidatesがゼロで`ready`のtaskが残っている（依存で詰まっている）。`value`は空きslot数で、`task_id` / `run_id`はnull。readyのtaskが無い空のqueueは詰まりではないので出さない。draftのgoalに属するreadyのtaskは`goal ready`を待っているだけなので数えない。`stats`を読んだ時点のsnapshotで判定し、時間帯の履歴は持たない
+  - `claim_held`: supervisorがclaimを控えている（`claim_holds.held`がある）間に空きslotがある。`value`は空きslot数（`idle_slots`と同じ数え方）で、`task_id` / `run_id`はnull。これが出るときは`idle_slots`を出さない（[claimを控える](claim-hold.md)。task 327）
   - `backend_failures`: 同じwindowの`backend_call_failed`が2件以上。`value`は件数、`task_id` / `run_id`はnull
   - `conflict_hotspot`: `conflict_hotspots`の`alert`が立ったファイルごとに1件。`value`はそのファイルの衝突の回数、`threshold`は`[conflicts].hotspot_conflicts`、`path`にファイル（このalertだけが持つ）、`task_id` / `run_id`はnull
+- **`claim_holds`**: `{count, secs, by_reason, held}`。windowの中で始まったclaimの控え（`claim_held`）の件数と合計秒、理由ごとの`{count, secs}`、今の控え`held`（無ければnull）。集計は`domain::claim_hold::claim_holds`（[claimを控える](claim-hold.md)）
 - **`backend_failures`**: `{count, by_op, max_load_avg, max_slots, by_load_band}`。`backend_call_failed`の件数、`op`ごとの件数、記録された`load_avg`の最大（無ければnull）、`slots`の最大（無ければnull）、`load_avg`の帯ごとの件数`[{band, count}]`（軽い帯から。`load_avg`の無い失敗は数えない。task 197）。windowは`--since`があればcursorより後から`next_cursor`まで、無ければ対象のrunの最初のイベントのうち最も古いもの以降（`--full`か対象のrunが無ければ全件）。`--goal`はそのgoalのrunの失敗だけを数える（runの無い失敗は数えない）
 - **`running_alerts`**: まだ終わっていない（`integrated` / `succeeded` / `failed` / `interrupted`以外の）runの、今の状態から導くalert（ADR-0043の決定5、task 290）。`--since`に関係なく毎回出し、`--goal`はそのgoalのtaskのものだけにする。run_events・askに加えて、run directoryの`idle.json`（idle marker。`background_tasks`の`running`の処理）、`prompt-submit.json`（sessionが入力を受けた印。書くhookはgoal 30の後続taskで入り、無ければ見ない）、`receipt_path`のmtimeと、全windowの`workspace list`（[Naming](naming.md#naming)）を読む。新しい表は持たない。各要素は`{kind, task_id, run_id, …}`で、`value`と`threshold`は秒。
   - 見ているsession（`phase`）: `running`のrunは`session`（最新の`agent_started`から。無ければ`run_claimed`）、`needs_session`で最後のresumeのeventが`resume_started`なら`resume`（その時刻から）、`validating` / `awaiting_integration`でreviewの流れの最後のeventが`revise_requested`なら`revise`（その時刻から。送れずに`revise_unsent`で取り消したものは除く）。それ以外は見ているsessionが無い。

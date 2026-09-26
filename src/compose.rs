@@ -142,6 +142,12 @@ pub struct SuperviseOptions {
     /// The automatic update of the supervisor's binary (ADR-0045 decision
     /// 17): off unless `supervise --auto-update`.
     pub update: UpdateSettings,
+    /// `supervise --max-load` (task 327): no new run is claimed while the
+    /// 1-minute load average is above it; `None` (the default here) holds
+    /// for no load.
+    pub max_load: Option<f64>,
+    /// Reads the 1-minute load average; tests set it.
+    pub load_average: fn() -> Option<f64>,
 }
 
 impl SuperviseOptions {
@@ -164,6 +170,10 @@ impl SuperviseOptions {
             handoff_token: None,
             mode: None,
             update: UpdateSettings::default(),
+            // The CLI's `--max-load` has a default; a caller of the library
+            // (the tests) holds for no load unless it asks to.
+            max_load: None,
+            load_average,
         }
     }
 
@@ -185,6 +195,7 @@ impl SuperviseOptions {
             handoff_token: self.handoff_token.clone(),
             mode: self.mode,
             update: self.update.clone(),
+            max_load: self.max_load,
         }
     }
 }
@@ -288,7 +299,7 @@ pub fn supervise_with_reviewer(
         processes: Arc::new(SystemProcesses),
         generators,
         review_material: &review_material,
-        load_average,
+        load_average: options.load_average,
         host_versions,
         layout,
     };

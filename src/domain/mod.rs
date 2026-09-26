@@ -490,6 +490,7 @@ impl std::str::FromStr for Priority {
     }
 }
 
+pub mod claim_hold;
 mod error;
 pub mod finding;
 pub mod follow_up;
@@ -1311,6 +1312,8 @@ pub const QUEUE_EVENT_KINDS: &[&str] = &[
     "run_env_changed",
     "mark_recorded",
     "mark_retracted",
+    claim_hold::CLAIM_HELD,
+    claim_hold::CLAIM_RESUMED,
     UPDATE_STARTED,
     UPDATE_BUILT,
     UPDATE_INSTALLED,
