@@ -27,12 +27,16 @@ fn run_with_events(db: &Path, events: &[(&str, serde_json::Value, &str)]) -> Str
     )
     .unwrap();
     for (kind, payload, at) in events {
+        let before: i64 = conn
+            .query_row("SELECT MAX(id) FROM run_events", [], |r| r.get(0))
+            .unwrap();
         queue
             .record_runtime_event(run.id(), kind, payload.clone())
             .unwrap();
+        // The event and the session spans written with it (ADR-0048).
         conn.execute(
-            "UPDATE run_events SET created_at=?1 WHERE id=(SELECT MAX(id) FROM run_events)",
-            [format!("2026-09-24T{at}.000Z")],
+            "UPDATE run_events SET created_at=?1 WHERE id>?2",
+            rusqlite::params![format!("2026-09-24T{at}.000Z"), before],
         )
         .unwrap();
     }
@@ -173,7 +177,8 @@ fn events_full_and_filters_narrow_what_they_read() {
                 "2026-09-24T10:00:01",
             ]
         )),
-        ["agent_started", "receipt_observed"]
+        // The worker's span opens with its session (ADR-0048).
+        ["agent_started", "session_opened", "receipt_observed"]
     );
     assert_eq!(
         kinds(&ok(

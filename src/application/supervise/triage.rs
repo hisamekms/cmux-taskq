@@ -173,6 +173,17 @@ impl Supervisor<'_> {
         let mut command = self
             .reviewer
             .headless_command(&dir, &prompt, TRIAGE_TOOLS)?;
+        // The session id `triage_started` recorded (ADR-0048 decision 4).
+        if let Some(session_id) = self
+            .queue
+            .run_events(run.id())?
+            .iter()
+            .rev()
+            .find(|e| e.kind == "triage_started")
+            .and_then(|e| e.payload["session_id"].as_str())
+        {
+            self.reviewer.assign_session_id(&mut command, session_id);
+        }
         // Like the review: the CLI knows the job by its role and allows it
         // only reads of this queue.
         command.envs(self.layout.job_env.iter().cloned());

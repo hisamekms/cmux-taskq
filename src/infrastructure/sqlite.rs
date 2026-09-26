@@ -1940,7 +1940,15 @@ pub(super) fn event(
         "INSERT INTO run_events(task_id,run_id,kind,payload) VALUES (?1,?2,?3,?4)",
         params![task_id, run_id, kind, serde_json::to_string(&payload)?],
     )?;
-    Ok(())
+    // The Claude session spans this event starts or ends (ADR-0048).
+    super::sessions::follow(
+        conn,
+        EventId::new(conn.last_insert_rowid()),
+        Some(task_id),
+        run_id,
+        kind,
+        &payload,
+    )
 }
 
 pub(super) fn enum_col<T: FromStr<Err = DomainError>>(

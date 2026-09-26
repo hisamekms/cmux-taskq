@@ -11,7 +11,7 @@ use std::path::Path;
 
 use super::{
     asks::{insert_ask, read_ask},
-    proposals,
+    proposals, sessions,
     sqlite::{SqliteQueue, enum_col, event, insert_dependency, read_task, transition_task},
 };
 use crate::{
@@ -335,6 +335,7 @@ impl PlanReviewStore for SqliteQueue {
                 None,
                 Some("its supervisor is gone"),
             )?;
+            sessions::close_plan_review(&tx, id, true)?;
         }
         let candidate = candidates(&tx)?;
         if !candidate.iter().any(|c| c.proposal_id == proposal_id) {
@@ -360,12 +361,15 @@ impl PlanReviewStore for SqliteQueue {
             params![id, dir_text],
         )?;
         let anchor = anchor(&tx, proposal_id)?;
+        // The job's Claude session id, given to it by the runtime (ADR-0048
+        // decision 4).
+        let session_id = self.generators.ids.uuid();
         event(
             &tx,
             anchor,
             None,
             "plan_review_started",
-            json!({"proposal_id": proposal_id, "plan_review_id": id, "attempt": attempt, "dir": dir_text}),
+            json!({"proposal_id": proposal_id, "plan_review_id": id, "attempt": attempt, "dir": dir_text, "session_id": session_id}),
         )?;
         tx.commit()?;
         Ok(Some(PlanReviewJob {
@@ -374,6 +378,7 @@ impl PlanReviewStore for SqliteQueue {
             attempt,
             anchor,
             dir,
+            session_id,
         }))
     }
 
@@ -404,6 +409,7 @@ impl PlanReviewStore for SqliteQueue {
                 Some(&verdict_json),
                 Some("the proposal moved on during its review"),
             )?;
+            sessions::close_plan_review(&tx, job.id, false)?;
             tx.commit()?;
             return Ok(PlanReviewApplied {
                 stale: true,
@@ -525,6 +531,7 @@ impl PlanReviewStore for SqliteQueue {
         }
         if !reviewable(&tx, job.proposal_id)? {
             finish_row(&tx, job.id, now, "interrupted", None, Some(error))?;
+            sessions::close_plan_review(&tx, job.id, false)?;
             tx.commit()?;
             return Ok(());
         }

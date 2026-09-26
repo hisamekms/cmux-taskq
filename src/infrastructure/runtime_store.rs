@@ -739,7 +739,17 @@ impl SqliteQueue {
         kind: &str,
         payload: serde_json::Value,
     ) -> Result<()> {
-        run_event(&self.conn, id, kind, payload)
+        // The event and the session spans it opens or closes (ADR-0048),
+        // in one write transaction taken up front so it waits for other
+        // writers rather than failing to upgrade a read.
+        self.conn.execute_batch("BEGIN IMMEDIATE")?;
+        match run_event(&self.conn, id, kind, payload) {
+            Ok(()) => Ok(self.conn.execute_batch("COMMIT")?),
+            Err(error) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(error)
+            }
+        }
     }
 
     /// Record `backend_call_failed`: on `run` (its id) when the call was for
@@ -764,11 +774,16 @@ impl SqliteQueue {
     /// Record an event of the queue itself, on no task, goal or run (the
     /// observer's `observe_started` / `observe_finished`); returns its id.
     pub fn record_queue_event(&self, kind: &str, payload: serde_json::Value) -> Result<EventId> {
-        self.conn.execute(
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
             "INSERT INTO run_events(kind,payload) VALUES (?1,?2)",
             params![kind, serde_json::to_string(&payload)?],
         )?;
-        Ok(EventId::new(self.conn.last_insert_rowid()))
+        let id = EventId::new(tx.last_insert_rowid());
+        // The observer's session span (ADR-0048).
+        super::sessions::follow(&tx, id, None, None, kind, &payload)?;
+        tx.commit()?;
+        Ok(id)
     }
 
     /// The newest event of `kind`, on whatever task, goal or run.
@@ -2056,7 +2071,8 @@ impl SqliteQueue {
             &tx,
             id,
             "triage_started",
-            json!({"attempt": attempt, "status": run.status().as_str()}),
+            // The job's Claude session id (ADR-0048 decision 4).
+            json!({"attempt": attempt, "status": run.status().as_str(), "session_id": self.generators.ids.uuid()}),
         )?;
         tx.commit()?;
         Ok(Some((run, attempt)))

@@ -18,6 +18,7 @@ pub mod conflicts;
 pub mod landing;
 pub mod measures;
 pub mod retries;
+pub mod sessions;
 pub mod thresholds;
 
 pub use conflicts::{ConflictConfig, ConflictConfigReport, ConflictHotspots, History};
@@ -27,6 +28,7 @@ pub use measures::{
     Versions,
 };
 pub use retries::{BrokenBy, ResumeAttempt, ResumeBreakdown, Retries};
+pub use sessions::{GoalKindSessions, KindSessions, RunKindSessions, SessionWindow, Sessions};
 pub use thresholds::ThresholdStats;
 
 /// Runs returned without `--full`.
@@ -200,6 +202,13 @@ pub struct RunStats {
     /// over its intervals (task 197).
     #[serde(flatten)]
     pub measures: RunMeasures,
+    /// Its Claude sessions per kind (ADR-0048 decision 12), whole: how
+    /// many, and their seconds open and active in total. Kinds without one
+    /// are not listed.
+    pub sessions: BTreeMap<String, RunKindSessions>,
+    /// Each of its spans, for the per-goal summaries.
+    #[serde(skip)]
+    pub session_spans: Vec<sessions::RunSpan>,
 }
 
 /// Count, sum and median of one interval over a set of runs; runs without
@@ -222,6 +231,9 @@ pub struct Intervals {
     pub land_phases: LandBreakdown,
     /// The runs' resumes, together and per reason.
     pub resume_outcomes: ResumeBreakdown,
+    /// The runs' Claude sessions per kind (ADR-0048 decision 12): how many,
+    /// and their seconds open and active. Kinds without one are not listed.
+    pub sessions: BTreeMap<String, GoalKindSessions>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -378,6 +390,11 @@ pub struct Stats {
     /// The time each verification command of `integrate` took, in the same
     /// window as `backend_failures` (task 197).
     pub verification_commands: Vec<CommandStats>,
+    /// The Claude sessions per kind (ADR-0048 decision 12) that overlap the
+    /// same window as `backend_failures`, their time cut to it. With
+    /// `--goal`, only that goal's runs' sessions and its proposals' plan
+    /// reviews.
+    pub sessions: Sessions,
     /// Pass it to `--since` to read only runs that finish later.
     pub next_cursor: EventId,
 }
@@ -544,6 +561,7 @@ pub fn stats(
     let since = query.since.map(|cursor| cursor.event_id(events));
     let until = query.until.map(|cursor| cursor.event_id(events));
     let latest = events.iter().map(|e| e.id).max().unwrap_or(EventId::new(0));
+    let latest_event = latest;
     // A `--since` past `--until` leaves nothing, and the cursor does not go back.
     let latest = until.map_or(latest, |until| {
         let capped = until.min(latest);
@@ -612,6 +630,13 @@ pub fn stats(
         } else {
             finished.drain(..finished.len() - limit);
         }
+    }
+
+    let spans = sessions::spans(events);
+    for track in &mut finished {
+        let run_spans = sessions::run_spans(&spans, &track.stats.run_id, now * 1000);
+        track.stats.sessions = sessions::per_run(&run_spans);
+        track.stats.session_spans = run_spans;
     }
 
     let mut by_goal: BTreeMap<(bool, Option<GoalId>), Vec<&RunStats>> = BTreeMap::new();
@@ -741,6 +766,27 @@ pub fn stats(
         &live.history,
         live.conflicts,
     );
+    // The window ends now unless it stops at an earlier event.
+    let window_end = match events.iter().find(|event| event.id == next_cursor) {
+        Some(event) if until.is_some() || next_cursor < latest_event => {
+            timestamp_millis(&event.created_at).unwrap_or(now * 1000)
+        }
+        _ => now * 1000,
+    };
+    let sessions = sessions::by_kind(
+        &spans,
+        events,
+        SessionWindow {
+            after: window_start,
+            upto: next_cursor,
+        },
+        window_end,
+        |span| match query.goal_id {
+            None => true,
+            Some(_) if span.run_id.is_some() => span.task_id.is_some_and(in_goal),
+            Some(goal) => span.goal_ids.contains(&goal),
+        },
+    );
     for file in conflict_hotspots.files.iter().filter(|file| file.alert) {
         alerts.push(Alert {
             kind: "conflict_hotspot",
@@ -793,6 +839,7 @@ pub fn stats(
         versions,
         load_bands,
         verification_commands,
+        sessions,
         next_cursor,
     }
 }
@@ -1283,6 +1330,7 @@ fn intervals(runs: &[&RunStats]) -> Intervals {
         resume_outcomes: retries::resume_breakdown(
             runs.iter().flat_map(|r| &r.retries.resume_attempts),
         ),
+        sessions: sessions::per_goal(runs.iter().flat_map(|r| &r.session_spans)),
     }
 }
 
@@ -1342,6 +1390,8 @@ fn runs(events: &[RunEvent], goals: &HashMap<TaskId, Option<GoalId>>) -> Vec<Tra
                     landed_at: None,
                     retries: Retries::default(),
                     measures: RunMeasures::default(),
+                    sessions: BTreeMap::new(),
+                    session_spans: Vec::new(),
                 },
                 claimed: None,
                 receipt: None,
@@ -2308,5 +2358,132 @@ mod tests {
             Cursor::Time(T * 1000 + 99_999).event_id(&events),
             EventId::new(1)
         );
+    }
+
+    /// The Claude sessions (ADR-0048): per run whole, per goal and overall
+    /// over the runs returned, and per kind over the window, a span never
+    /// closed counted open to now; `--goal` keeps its runs' and its plan
+    /// reviews' spans.
+    #[test]
+    fn sessions_are_counted_per_run_goal_and_kind() {
+        let opened = |id: i64, run: &str, kind: &str, secs: i64| {
+            run_event(id, run, "session_opened", json!({"kind": kind}), secs)
+        };
+        let closed = |id: i64, run: &str, span: i64, reason: &str, secs: i64| {
+            run_event(
+                id,
+                run,
+                "session_closed",
+                json!({"opened_event_id": span, "reason": reason}),
+                secs,
+            )
+        };
+        let queue_event = |id: i64, kind: &str, payload: Value, secs: i64| RunEvent {
+            task_id: None,
+            created_at: at(secs),
+            ..event(id, 1, kind, payload)
+        };
+        let events = [
+            run_event(1, R1, "run_claimed", json!({}), T),
+            opened(2, R1, "worker", T),
+            closed(3, R1, 2, "next_span", T + 100),
+            opened(4, R1, "revise", T + 100),
+            closed(5, R1, 4, "exited", T + 160),
+            run_event(6, R1, "run_integrated", json!({}), T + 200),
+            RunEvent {
+                task_id: Some(TaskId::new(2)),
+                ..run_event(7, R2, "run_claimed", json!({}), T + 300)
+            },
+            // The session of a run still in flight that never recorded its end.
+            RunEvent {
+                task_id: Some(TaskId::new(2)),
+                ..opened(8, R2, "worker", T + 300)
+            },
+            queue_event(9, "session_opened", json!({"kind": "observer"}), T + 400),
+            queue_event(
+                10,
+                "session_closed",
+                json!({"opened_event_id": 9, "reason": "job_finished"}),
+                T + 460,
+            ),
+            RunEvent {
+                run_id: None,
+                created_at: at(T + 500),
+                ..event(
+                    11,
+                    1,
+                    "session_opened",
+                    json!({"kind": "plan_review", "goal_ids": [5]}),
+                )
+            },
+            RunEvent {
+                run_id: None,
+                created_at: at(T + 530),
+                ..event(
+                    12,
+                    1,
+                    "session_closed",
+                    json!({"opened_event_id": 11, "reason": "inferred"}),
+                )
+            },
+        ];
+        let goals = HashMap::from([
+            (TaskId::new(1), Some(GoalId::new(5))),
+            (TaskId::new(2), None),
+        ]);
+        let query = |since: Option<EventId>, goal_id: Option<GoalId>| {
+            stats(
+                &events,
+                &goals,
+                T + 1000,
+                SlotSnapshot::default(),
+                &StatsQuery {
+                    since: since.map(Cursor::from),
+                    goal_id,
+                    ..StatsQuery::default()
+                },
+                &LiveSnapshot::default(),
+            )
+        };
+        let all = query(None, None);
+        let json = serde_json::to_value(&all).unwrap();
+        assert_eq!(
+            json["runs"][0]["sessions"],
+            json!({
+                "worker": {"count": 1, "open": 100, "active": null},
+                "revise": {"count": 1, "open": 60, "active": null},
+            })
+        );
+        assert_eq!(
+            json["overall"]["sessions"]["revise"],
+            json!({
+                "count": 1,
+                "open": {"count": 1, "total": 60, "median": 60},
+                "active": {"count": 0, "total": 0, "median": null},
+            })
+        );
+        assert_eq!(all.goals[0].intervals.sessions["worker"].open.total, 100);
+        assert_eq!(json["sessions"]["window"], json!({"after": 0, "upto": 12}));
+        assert_eq!(json["sessions"]["by_kind"].as_object().unwrap().len(), 10);
+        let worker = &all.sessions.by_kind["worker"];
+        assert_eq!((worker.count, worker.open_now), (2, 1));
+        assert_eq!(worker.open.summary.total, 100 + 700);
+        assert_eq!(all.sessions.by_kind["observer"].open.summary.total, 60);
+        let plan = &all.sessions.by_kind["plan_review"];
+        assert_eq!((plan.count, plan.inferred), (1, 1));
+        assert_eq!(all.sessions.by_kind["inbox"].count, 0);
+
+        let goal = query(None, Some(GoalId::new(5)));
+        assert_eq!(goal.sessions.by_kind["worker"].count, 1);
+        assert_eq!(goal.sessions.by_kind["plan_review"].count, 1);
+        assert_eq!(goal.sessions.by_kind["observer"].count, 0);
+        let other = query(None, Some(GoalId::new(6)));
+        assert_eq!(other.sessions.by_kind["plan_review"].count, 0);
+
+        // After event 6 the first run's spans are over.
+        let since = query(Some(EventId::new(6)), None);
+        assert_eq!(since.sessions.by_kind["worker"].count, 1);
+        assert_eq!(since.sessions.by_kind["revise"].count, 0);
+        assert_eq!(since.sessions.by_kind["observer"].count, 1);
     }
 }

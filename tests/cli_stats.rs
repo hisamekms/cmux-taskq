@@ -381,6 +381,9 @@ mod stats {
                 "claim_parallel": null, "claim_slots": null, "claim_load_avg": null,
                 "load": {"work": null, "validate": null, "verify": null},
                 "load_band": null,
+                // ADR-0048: the run's Claude sessions per kind; these
+                // events recorded none.
+                "sessions": {},
             })
         );
         // Parked three times, then the landing: the wait is the resume's.
@@ -420,12 +423,14 @@ mod stats {
                  "work": {"count": 2, "total": 3000, "median": 1500},
                  "validate": {"count": 2, "total": 180, "median": 90},
                  "wait_to_land": {"count": 2, "total": 1440, "median": 720},
-                 "startup": {"count": 1, "total": 180, "median": 180}},
+                 "startup": {"count": 1, "total": 180, "median": 180},
+                 "sessions": {}},
                 {"goal_id": null, "runs": 2,
                  "work": {"count": 1, "total": 300, "median": 300},
                  "validate": {"count": 1, "total": 60, "median": 60},
                  "wait_to_land": {"count": 0, "total": 0, "median": null},
-                 "startup": {"count": 0, "total": 0, "median": null}},
+                 "startup": {"count": 0, "total": 0, "median": null},
+                 "sessions": {}},
             ])
         );
         assert_eq!(report["overall"]["runs"], 4);

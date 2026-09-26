@@ -2043,6 +2043,10 @@ impl AgentProvider for ClaudeCode {
             .arg(prompt);
         Ok(command)
     }
+    /// `--session-id <id>` among the options, before the prompt.
+    fn assign_session_id(&self, command: &mut CommandSpec, session_id: &str) {
+        command.option_args(["--session-id", session_id]);
+    }
 }
 
 /// Settings of the headless review: no hooks, and the same `autoMode`
@@ -2381,6 +2385,18 @@ mod tests {
             .headless_command(Path::new("/tmp"), "p", &[])
             .unwrap();
         assert_eq!(bare.get_args().collect::<Vec<_>>(), ["-p", "--", "p"]);
+        // A job's session id goes among the options (ADR-0048 decision 4).
+        let mut named = claude
+            .headless_command(Path::new("/tmp"), "p", &[])
+            .unwrap();
+        claude.assign_session_id(&mut named, "s-1");
+        assert_eq!(
+            named.get_args().collect::<Vec<_>>(),
+            ["-p", "--session-id", "s-1", "--", "p"]
+        );
+        let mut plain = CommandSpec::new("x");
+        plain.arg("a").option_args(["b"]);
+        assert_eq!(plain.get_args().collect::<Vec<_>>(), ["a", "b"]);
     }
 
     fn run(repo_path: Option<&str>) -> TaskRun {

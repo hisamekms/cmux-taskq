@@ -150,6 +150,24 @@ impl CommandSpec {
         self
     }
 
+    /// Add options `args` before the `--` that ends the options given so
+    /// far, or after them all when there is none.
+    pub fn option_args<I, S>(&mut self, args: I) -> &mut Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        let at = self
+            .args
+            .iter()
+            .position(|arg| arg == "--")
+            .unwrap_or(self.args.len());
+        let rest = self.args.split_off(at);
+        self.args(args);
+        self.args.extend(rest);
+        self
+    }
+
     pub fn env(&mut self, key: impl AsRef<OsStr>, value: impl AsRef<OsStr>) -> &mut Self {
         self.envs
             .push((key.as_ref().to_owned(), Some(value.as_ref().to_owned())));
@@ -353,6 +371,14 @@ pub trait AgentProvider {
     /// idle marker. The runtime wires stdin, stdout and stderr, waits at
     /// most [`AgentProvider::review_timeout`] and reads stdout.
     fn review_command(&self, run: &crate::domain::TaskRun, prompt: &str) -> Result<CommandSpec>;
+    /// Start the session of a headless job (`command`, from
+    /// [`AgentProvider::review_command`] or
+    /// [`AgentProvider::headless_command`]) with `session_id`, so that its
+    /// span and transcript are known before it ends (ADR-0048 decision 4).
+    /// A provider that cannot name its session leaves it as it is.
+    fn assign_session_id(&self, command: &mut CommandSpec, session_id: &str) {
+        let _ = (command, session_id);
+    }
     /// How long the headless review may take before it counts as failed.
     fn review_timeout(&self) -> std::time::Duration {
         std::time::Duration::from_secs(600)
@@ -1379,6 +1405,8 @@ pub struct PlanReviewJob {
     pub attempt: usize,
     pub anchor: TaskId,
     pub dir: PathBuf,
+    /// The Claude session id the job is started with (ADR-0048 decision 4).
+    pub session_id: String,
 }
 
 /// What the runtime makes of a plan review's verdict before it is applied:

@@ -88,12 +88,13 @@ if [ -n "$headless" ]; then
   # The supervisor's headless review (ADR-0027): read review.md, print the
   # verdict JSON on stdout. Only a task that says E2E-REVIEW-PASS passes;
   # any other review fails, and its run waits in an approve_landing ask.
-  [ -z "$session_id" ] && [ -n "$debug_file" ] && [ -n "$add_dir" ] && [ -n "$settings" ] && [ -n "$prompt" ] \
+  # The runtime names the review's own session (ADR-0048 decision 4).
+  [ -n "$session_id" ] && [ -n "$debug_file" ] && [ -n "$add_dir" ] && [ -n "$settings" ] && [ -n "$prompt" ] \
     && [ "$tools" = "Read,Grep,Glob" ] && [ "$denied" = "Bash,Edit,Write,NotebookEdit" ] || { printf 'stub: bad review arguments\n' >&2; exit 64; }
   ! grep -q '"Stop"' "$settings" || { printf 'stub: review settings would write the idle marker\n' >&2; exit 64; }
   review=$(printf '%s\n' "$prompt" | sed -n 's/^Read the review material at \(.*\): the task.*/\1/p')
   [ -f "$review" ] || { printf 'stub: no review material at %s\n' "$review" >&2; exit 65; }
-  printf 'argv: -p --debug-file %s --add-dir %s --settings %s\nreview: %s\n' "$debug_file" "$add_dir" "$settings" "$review" > "$debug_file"
+  printf 'argv: -p --debug-file %s --add-dir %s --settings %s\nreview: %s\nsession: %s\n' "$debug_file" "$add_dir" "$settings" "$review" "$session_id" > "$debug_file"
   if grep -q 'E2E-REVIEW-PASS' "$review"; then
     printf '{"verdict":"pass","reasons":[],"summary":"the stub reviewer found e2e.txt committed"}\n'
     exit 0
@@ -1151,6 +1152,17 @@ fn happy_path_runs_a_stub_agent_through_cmux_and_lands_on_main() {
     );
     assert!(
         review_log.contains(&format!("review: {}/review.md", run_dir.display())),
+        "{review_log}"
+    );
+    // With a session id of its own, recorded in `review_started` and in the
+    // review's span (ADR-0048).
+    let review_session = review_log
+        .lines()
+        .find_map(|line| line.strip_prefix("session: "))
+        .unwrap_or_default()
+        .to_owned();
+    assert!(
+        !review_session.is_empty() && review_session != run_id,
         "{review_log}"
     );
     // The run workspace joined the queue's group, made by its external ID.

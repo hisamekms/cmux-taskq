@@ -439,6 +439,7 @@ pub mod run;
 pub mod run_env;
 pub mod scope;
 pub mod search;
+pub mod sessions;
 pub mod stall;
 pub mod stats;
 pub mod task;

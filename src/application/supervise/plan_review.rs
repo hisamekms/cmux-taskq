@@ -140,6 +140,8 @@ impl Supervisor<'_> {
         let mut command =
             self.reviewer
                 .headless_command(&self.layout.repo_root, &prompt, PLAN_REVIEW_TOOLS)?;
+        self.reviewer
+            .assign_session_id(&mut command, &job.session_id);
         command.envs(self.layout.job_env.iter().cloned());
         let child = self
             .spawner

@@ -123,6 +123,8 @@ impl Supervisor<'_> {
             Some(_) => session_alive(self, run.id())?,
             None => false,
         };
+        // The job's Claude session id (ADR-0048 decision 4).
+        let session_id = self.generators.ids.uuid();
         self.queue.record_runtime_event(
             run.id(),
             "review_started",
@@ -130,9 +132,10 @@ impl Supervisor<'_> {
                 "attempt": attempt,
                 "workspace_id": session.as_ref().map(|s| s.workspace.clone()),
                 "session_live": live,
+                "session_id": session_id,
             }),
         )?;
-        Ok(match self.spawn_review(run, attempt) {
+        Ok(match self.spawn_review(run, attempt, &session_id) {
             Ok((child, stdout, stderr)) => {
                 info!(run_id = %run.id(), "run {} review {attempt} started (session {})", run.id(), if live { "kept open" } else { "ended" });
                 Phase::Review(ReviewWatch {
@@ -167,6 +170,7 @@ impl Supervisor<'_> {
         &mut self,
         run: &TaskRun,
         attempt: usize,
+        session_id: &str,
     ) -> Result<(Box<dyn Spawned>, PathBuf, PathBuf)> {
         let run_dir = PathBuf::from(run.run_dir().context("missing run directory")?);
         let material = (self.review_material)(run.task_id())?;
@@ -183,6 +187,7 @@ impl Supervisor<'_> {
         let stdout = run_dir.join(format!("review-{attempt}.out"));
         let stderr = run_dir.join(format!("review-{attempt}.err"));
         let mut command = self.reviewer.review_command(run, &prompt)?;
+        self.reviewer.assign_session_id(&mut command, session_id);
         // The repository's [run.env] reaches the review too (ADR-0023
         // decision 3).
         command

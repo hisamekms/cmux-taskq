@@ -144,9 +144,11 @@ pub fn observe(db: &Path, provider: &dyn AgentProvider, options: &ObserveOptions
         serde_json::to_string_pretty(&input)?,
     )?;
     let ask_mark = queue.ask_high_water()?;
+    // The job's Claude session id (ADR-0048 decision 4).
+    let session_id = uuid::Uuid::new_v4().to_string();
     let event_mark = queue.record_queue_event(
         "observe_started",
-        json!({"mode": options.mode.as_str(), "since": since, "dir": dir}),
+        json!({"mode": options.mode.as_str(), "since": since, "dir": dir, "session_id": session_id}),
     )?;
     tracing::info!(
         mode = options.mode.as_str(),
@@ -157,11 +159,12 @@ pub fn observe(db: &Path, provider: &dyn AgentProvider, options: &ObserveOptions
     let clock = Instant::now();
     // `failed`: the agent exited non-zero or by a signal; `error`: it could
     // not start or ran past the timeout.
-    let (outcome, exit_code, error) = match run_agent(provider, &db, &dir, &prompt, options) {
-        Ok(Some(0)) => ("succeeded", Some(0), None),
-        Ok(code) => ("failed", code, None),
-        Err(error) => ("error", None, Some(format!("{error:#}"))),
-    };
+    let (outcome, exit_code, error) =
+        match run_agent(provider, &db, &dir, &prompt, &session_id, options) {
+            Ok(Some(0)) => ("succeeded", Some(0), None),
+            Ok(code) => ("failed", code, None),
+            Err(error) => ("error", None, Some(format!("{error:#}"))),
+        };
     let (recorded, updated, asks) = queue.written_by(OBSERVER_ROLE, event_mark, ask_mark)?;
     let saved = outcome == "succeeded" && options.mode == ObserveMode::Hourly;
     if saved {
@@ -225,14 +228,13 @@ fn run_agent(
     db: &Path,
     dir: &Path,
     prompt: &str,
+    session_id: &str,
     options: &ObserveOptions,
 ) -> Result<Option<i32>> {
     let log = fs::File::create(dir.join("output.log"))?;
-    let mut command = crate::infrastructure::process::command(&provider.headless_command(
-        dir,
-        prompt,
-        ALLOWED_TOOLS,
-    )?);
+    let mut spec = provider.headless_command(dir, prompt, ALLOWED_TOOLS)?;
+    provider.assign_session_id(&mut spec, session_id);
+    let mut command = crate::infrastructure::process::command(&spec);
     let mut path = std::env::var_os("PATH").unwrap_or_default();
     if let Some(bin) = options.dagq.parent() {
         let mut paths = vec![bin.to_path_buf()];

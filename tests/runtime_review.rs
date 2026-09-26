@@ -317,10 +317,33 @@ fn a_passing_review_exits_the_live_session_and_lands_it() {
         &json!({"status": "validating", "exit_code": null, "session_live": true})
     );
     let started = payloads(&detail, "review_started");
+    assert_eq!(started.len(), 1);
+    // The job's own session id (ADR-0048 decision 4).
+    let session_id = started[0]["session_id"].as_str().unwrap();
     assert_eq!(
         started,
-        [&json!({"attempt": 1, "workspace_id": WORKSPACE_ID, "session_live": true})]
+        [
+            &json!({"attempt": 1, "workspace_id": WORKSPACE_ID, "session_live": true, "session_id": session_id})
+        ]
     );
+    // The worker's session and the review's are spans, each closed once
+    // (ADR-0048 decision 2).
+    let opened: Vec<(&str, &str)> = payloads(&detail, "session_opened")
+        .iter()
+        .map(|p| {
+            (
+                p["kind"].as_str().unwrap(),
+                p["session_id"].as_str().unwrap(),
+            )
+        })
+        .collect();
+    let run_id = detail.runs[0].id().as_str();
+    assert_eq!(opened, [("worker", run_id), ("review", session_id)]);
+    let closed: Vec<(&str, &str)> = payloads(&detail, "session_closed")
+        .iter()
+        .map(|p| (p["kind"].as_str().unwrap(), p["reason"].as_str().unwrap()))
+        .collect();
+    assert_eq!(closed, [("review", "job_finished"), ("worker", "exited")]);
     let finished = payloads(&detail, "review_finished");
     assert_eq!(finished.len(), 1);
     assert_eq!(finished[0]["verdict"], "pass");

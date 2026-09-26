@@ -786,14 +786,24 @@ fn up_applies_compatible_migrations_and_refuses_breaking_ones() {
     assert_eq!(report["supervisor"]["outcome"], "started", "{report}");
     assert_eq!(report["migrated"], Value::Null, "{report}");
 
-    // Only compatible migrations are pending, the automatic update's (0033)
-    // first, then the task kind's: `up` applies them and goes on. Its version is looked up rather than written,
-    // so a later migration does not rewrite this test (ADR-0067 decision 4).
+    // The compatible automatic-update migration (0033) pending, with the
+    // task kind's (0034): `up` applies them and goes on when no breaking one
+    // follows; otherwise it names only the breaking ones (ADR-0048 added
+    // 0035). Versions are
+    // looked up rather than written, so a later migration does not rewrite
+    // this test (ADR-0067 decision 4).
     let auto_update = dagq::infrastructure::schema::MIGRATIONS
         .iter()
         .position(|migration| migration.contains("CREATE TABLE binary_updates"))
         .unwrap() as i64
         + 1;
+    let breaking_after: Vec<String> = dagq::infrastructure::schema::MIGRATIONS
+        .iter()
+        .enumerate()
+        .skip(auto_update as usize)
+        .filter(|(_, migration)| !dagq::infrastructure::schema::is_compatible(migration))
+        .map(|(index, _)| (index + 1).to_string())
+        .collect();
     Connection::open(db)
         .unwrap()
         .execute_batch(&format!(
@@ -804,12 +814,30 @@ fn up_applies_compatible_migrations_and_refuses_breaking_ones() {
             auto_update - 1
         ))
         .unwrap();
-    let report = up(&fixture, &cmux, &launchd, &processes);
-    assert_eq!(
-        report["migrated"]["applied"][0]["version"], auto_update,
-        "{report}"
-    );
-    assert_eq!(report["supervisor"]["auto_update"], false, "{report}");
+    if breaking_after.is_empty() {
+        let report = up(&fixture, &cmux, &launchd, &processes);
+        assert_eq!(
+            report["migrated"]["applied"][0]["version"], auto_update,
+            "{report}"
+        );
+        assert_eq!(report["supervisor"]["auto_update"], false, "{report}");
+    } else {
+        let error = format!(
+            "{:#}",
+            try_up(&fixture, &cmux, &launchd, &processes).unwrap_err()
+        );
+        assert!(
+            error.contains(&format!(
+                "breaking migration(s) {} ",
+                breaking_after.join(", ")
+            )),
+            "{error}"
+        );
+        SqliteQueue::migrate(db, None, 0).unwrap();
+        let report = up(&fixture, &cmux, &launchd, &processes);
+        assert_eq!(report["migrated"], Value::Null, "{report}");
+        assert_eq!(report["supervisor"]["auto_update"], false, "{report}");
+    }
 
     Connection::open(db)
         .unwrap()

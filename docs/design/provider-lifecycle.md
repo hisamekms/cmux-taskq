@@ -4,12 +4,13 @@ type: design
 title: Agent provider lifecycle
 status: current
 created: 2026-09-21
-updated: 2026-09-25
-last_verified: 2026-09-25
+updated: 2026-09-26
+last_verified: 2026-09-26
 scope: provider
 related:
   - adr-0004
   - adr-0040
+  - adr-0048
   - adr-0027
   - design-supervisor-lifecycle
 ---
@@ -26,6 +27,7 @@ AgentProvider
   headless_command(cwd, prompt, allowed_tools) -- 実装済み: observerのheadless job（runを持たない）
   review_command(run, prompt) -- 実装済み: supervisorのheadless review（stdoutがverdict JSON）
   review_timeout()         -- 実装済み: headless reviewの上限（既定600秒）
+  assign_session_id(command, session_id) -- 実装済み: headless jobのsessionにruntimeが決めたsession_idを付ける（既定は何もしない）
   inspect / interrupt / collect_result  -- 後続
 
 AgentSignals
@@ -43,6 +45,26 @@ Claude Code adapter（`src/infrastructure/adapters.rs`）はworktreeをcwdにし
 加えて`command()`は`<run-dir>/claude-settings.json`を書いて`--settings`で渡す。内容は`Stop` hook 1件で、hookのstdin（イベントJSON）を`<run-dir>/idle.json`（`TaskRun::idle_marker_path`）へ一時ファイル + renameで書く。supervisorはこのmarkerをidle判定に使う（[supervisor-lifecycle](supervisor-lifecycle.md)）。`SessionEnd` hookは使わず、セッション終了はwrapperの終了コードで確認する。他のproviderは同じmarkerを自分の仕組みで書けばよく、書かなければ手動終了待ちになる。同じ設定に`autoMode.environment: ["$defaults"]`も入れ、auto modeの初回案内（Teach auto mode）を抑止する（[起動時のダイアログ](#起動時のダイアログ)）。
 
 `review_command()`（[ADR-0040](../adr/0040-verify-once-review-run-env-graph-stats-and-task-priority-in-claim-order.md)の決定2、[ADR-0027](../adr/0027-keep-worker-session-through-review-revise-verdict-and-merge-tree-precheck.md)）はsupervisorが受理したrunをreviewさせる非対話のコマンドを返す。Claude Code adapterは`claude -p --debug-file <run-dir>/claude-review.log --add-dir <run-dir> --settings <run-dir>/claude-review-settings.json --allowedTools Read,Grep,Glob --disallowedTools Bash,Edit,Write,NotebookEdit -- <prompt>`をworktreeで起動する（worktreeは生きているworkerのsessionのものなので、reviewは読むだけ）。`claude-review-settings.json`は`autoMode.environment`だけで`Stop` hookを持たない: reviewの間もworkerのsessionは開いたままなので、reviewがidle markerを書くとsupervisorのidle判定（reviseの往復）を誤らせる。cmux workspaceは作らず、stdin / stdout / stderrはruntimeが繋ぐ（stdinはnull、stdoutとstderrは`<run-dir>/review-<attempt>.out` / `.err`）。runtimeは`review_timeout()`を過ぎたらkillし、stdoutの`{"verdict": "pass" | "revise" | "concern", "reasons": [..], "summary": ".."}`を読む（[supervisor-lifecycle](supervisor-lifecycle/review.md#review-supervisor)）。`headless_command()`と1つのportにしないのは、reviewがrunに属し、そのrun directoryの設定・debug file・`--add-dir`と禁止するtoolを要るのに対し、observerのjobにはrunが無いため。reviewの子プロセスにはruntimeが`DAGQ_ROLE=reviewer`と`DAGQ_QUEUE`を渡し、CLIはreviewerに読むコマンドだけを許す。print mode（`-p`）はfolder trustの判定を飛ばす（[binary から読める判定](#binary-から読める判定)の1）ので、reviewはtrust dialogで止まらない。
+
+headlessのjob（review・triage・plan review・observer）のsessionには、runtimeが起動前にUUIDを作って`assign_session_id()`で付ける（[ADR-0048](../adr/0048-record-claude-sessions-by-kind-with-open-and-active-time.md)の決定4）。Claude Code adapterは`--session-id <uuid>`をoptionの最後（promptの前の`--`の前）に足す。jobのtranscriptはjobが終わる前から`<session_id>.jsonl`として特定でき、`-p`のstdout（verdictのJSON）の形は変わらない。session_idはjobを始めるevent（`review_started`・`triage_started`・`plan_review_started`・`observe_started`）のpayloadの`session_id`に記録し、同じ値がjobのsessionの区間（`session_opened`）に載る。reviewとobserverはsupervisorとobserverが、triageとplan reviewはその開始を記録するqueueが作る。jobのsettingsにhookは足さない。session_idを付けられないproviderは既定の実装（何もしない）のままでよく、区間は`session_id`を持つが、transcriptと突き合わせられない。
+
+## Claude sessionの区間
+
+runtimeが起動するClaude sessionは、kindごとの区間（`session_opened` / `session_closed`のrun_events）として記録する（[ADR-0048](../adr/0048-record-claude-sessions-by-kind-with-open-and-active-time.md)の決定1・2・7）。区間は、それを開始・終了するeventを書く同じトランザクションで、同じ時刻に書く。書くのは`infrastructure::sqlite::event`（taskとrunのevent）と`record_queue_event`（queueのevent）の後に呼ぶ`infrastructure::sessions::follow`だけで、どの区間を開き閉じるかは`domain::sessions::changes`（純粋関数）が、eventのkindとpayload、同じ範囲の開いている区間、runの文脈（worktree、run directory、workspace、`resume_started` / `revise_requested`の数）から決める。
+
+| kind | 開く | 閉じる（`reason`） | session_id |
+| --- | --- | --- | --- |
+| `worker` | `resume_started`の無いrunの`agent_started` | `revise_requested`（`next_span`）、`session_exited`（`exited`） | `agent_started`の`session_id`（run ID） |
+| `resume` | `resume_started`の後の`agent_started` | 同上 | 同上 |
+| `revise` | `revise_requested` | 次の`revise_requested`（`next_span`）、`session_exited`（`exited`） | 閉じた`worker` / `resume` / `revise`の区間のもの |
+| `review` | `review_started` | `review_finished` / `review_failed` / `review_retried`（`job_finished`） | `review_started`の`session_id` |
+| `triage` | `triage_started` | `triage_finished` / `triage_failed`（`job_finished`） | `triage_started`の`session_id` |
+| `plan_review` | `plan_review_started`（proposalの最初のtaskのevent） | 同じ`plan_review_id`の`plan_review_finished` / `plan_review_failed`（`job_finished`） | `plan_review_started`の`session_id` |
+| `observer` | `observe_started`（taskの無いevent） | 同じ`dir`の`observe_finished`（`job_finished`） | `observe_started`の`session_id` |
+
+- **推定で閉じる（`inferred`）**: runのsessionの区間（`worker` / `resume` / `revise`）は、`session_exited`の無いまま次の`agent_started`が来たとき、`workspace_closed`・`run_recovered`・`triage_started`で閉じる（`run_recovered`と`triage_started`は開いている`review`も閉じる）。`record_runtime_event`はeventと区間を1つの書き込みトランザクション（`BEGIN IMMEDIATE`）で書く。jobの区間は、終わりのeventの無いまま同じkindの次の開始（別のsupervisorが引き継いだreviewの`review_started`、triageの`triage_started`、次の`observe_started`）で閉じ、plan reviewは行を`interrupted`で閉じたとき（supervisorが居ない行は`inferred`、proposalが動いたときは`job_finished`）に閉じる。時刻は閉じたeventの時刻（transcriptの最後のレコードの時刻は、transcriptを読む後続taskで使う）。
+- `session_opened`のpayloadは`kind`、`session_id`、`cwd`（runのsessionとreviewはworktree、triageはrun directory、observerは観測のdirectory、plan reviewは記録しない）、`transcript_path`（null）、`attempt`、`workspace_id`（`worker`はrunのworkspace、`revise`は`revise_requested`のもの）、plan reviewは`proposal_id`・`plan_review_id`・`goal_ids`（その時のproposalのtaskのgoal）。`session_closed`は`opened_event_id`・`kind`・`session_id`・`reason`。1つの区間は1回だけ閉じる（閉じた区間への2回目の終了は何も書かない）。
+- 稼働時間（transcriptのturn）、`session_turns`、inbox・planner・runtimeが立てるplannerの区間（hook）は後続taskが足す。queueのeventとして`session_opened` / `session_closed` / `session_turns`を書けるよう、migration 0035がrun_eventsのCHECKにこの3つを足した（breaking）。このADRが入る前のrunには区間が無く、埋め直さない。
 
 Claude providerはcmux内の通常セッションを起動し、実装、unit test、E2E、subagent review、完了レポートを実行させる。Codex providerはCodexの対応するセッション方式を使う。provider capabilityとしてinteractive、subagents、stream events、structured resultを表現する。
 

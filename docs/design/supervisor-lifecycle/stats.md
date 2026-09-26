@@ -11,6 +11,8 @@ related:
   - design-supervisor-lifecycle
   - adr-0040
   - adr-0049
+  - adr-0048
+  - design-provider-lifecycle
   - adr-0046
   - adr-0044
   - design-domain-model
@@ -33,10 +35,12 @@ related:
   - `dagq_version` / `claude_version` / `rustc_release` / `rustc_host` / `claim_parallel` / `claim_slots` / `claim_load_avg`: 最初の`run_claimed`が記録したclaimの属性（goal 21、task 197。[`supervise`](supervise.md)の5）の`dagq_version` / `claude_version` / `rustc_release` / `rustc_host` / `parallel` / `slots` / `load_avg`。記録の無いrun（手の`claim`、task 197より前）はnull
   - `load`: 区間ごとの`{mean, max, band}`（`band`は`mean`の帯）。`work`は最初の`receipt_observed`、`validate`は最初の`validation_finished`の`load_avg_mean` / `load_avg_max`、`verify`は`integrate`の`verification_command`（`phase: integration`、全試行）の`load_avg_mean`を`duration_secs`で重み付けした平均（`duration_secs`の無いものは1秒）と`load_avg_max`の最大。記録の無い区間はnull
   - `load_band`: `load.work.band`、無ければ`claim_load_avg`の帯（どちらも無ければnull）。帯は`0-4` / `4-8` / `8-16` / `16-32` / `32-64` / `64+`（下限を含む。`domain::measure::load_band`）。集計は`domain::stats::measures`
+  - `sessions`: そのrunのClaude sessionの区間のkindごとの`{count, open, active}`（下の[Claude session](#claude-session)）
 - **`goals`と`overall`**の`land_phases`: 着地したrun（`land_phases`と`wait_to_land`のあるrun）についての`{runs, tail_threshold, tail_runs, <工程>..., push}`。`tail_threshold`はそれらのrunの`wait_to_land`の90パーセンタイル（nearest-rank: 昇順でceil(0.9×n)番目。runが無ければnull）、`tail_runs`は`wait_to_land`がそれ以上のrun（長い裾）の数。工程ごとと`push`は`{count, total, median, p90, max, tail_total}`で、`count` / `total` / `median`は他の区間と同じ規則（工程は着地したrun全部を0も含めて数え、`push`は記録のあるrunだけ）、`p90`は上と同じ規則、`tail_total`は長い裾のrunだけの合計。どの工程が裾を作ったかは工程ごとの`tail_total`を比べて読む
 - **`goals`と`overall`**の`resume_outcomes`: それらのrunの`resume_attempts`全部の`{attempts, resolved, unresolved, resolved_percent, secs}`と、理由ごとの同じ形の`by_reason`（下の[着地の延期とresume](#着地の延期とresume)）
 - **`kinds`**: taskの`kind`ごと（名前の昇順、kindの無いtaskのrunは`kind: null`で最後）に、`goals`と同じ形（`runs`と区間ごとの`{count, total, median}`、`land_phases`、`resume_outcomes`）。`runs`のkindで`domain::stats::with_kinds`が組み、observerの入力の`stats`にも出る
 - **`goals`と`overall`**: goalごと（goal昇順、goalの無いrunは`goal_id: null`で最後）と全体で、`runs`（件数）と区間ごとの`{count, total, median}`。区間の無いrunは数えない。中央値は偶数個なら中央2つの平均の切り捨て。
+- **`goals`と`overall`**の`sessions`: それらのrunのClaude sessionの区間のkindごとの`{count, open, active}`で、`open`と`active`は区間ごとの秒の`{count, total, median}`（下の[Claude session](#claude-session)）
 - **`alerts`**: `[{kind, task_id, run_id, value, threshold, path?}]`（`value`と`threshold`は秒か回数）。対象のrunに加えて、まだ終わっていないrunも見る。
   - `awaiting_integration`: `wait_to_land`が15分（900秒）を超えたrun。まだ`awaiting_integration`にいるrunは最初に`awaiting_integration`になってからの経過で判定する（着地の失敗で戻っても起点は変えない）。着地待ちの内訳で最も長い工程を`phase`に添える（まだ待っているrunは今の時刻までの内訳。どの工程も0秒なら付けない）。他のalertは`phase`を持たない
   - `needs_session`: `needs_session`が3回目に達したrun
@@ -69,6 +73,7 @@ related:
   - `history`: mainの履歴を読めたら`{status: "checked", landings}`（windowの間のmainのcommit数）、読めなければ`{status: "unavailable", reason}`で、各ファイルの`landings` / `ratio`はnull、`state`は`unknown`。履歴は`StatsSources.history`（`Repository::main_history`＝`GitRepository::main_history`: `git log -z --first-parent --reverse --diff-merges=first-parent -M --name-status --max-age=<最も古いイベントの1秒前のUNIX秒> refs/heads/main`（windowの最初の衝突より前の着地も数えるため、windowに関わらずqueueの最も古いイベントから読む）と`git ls-tree -r --name-only refs/heads/main`）越しに、衝突のイベントがあるときだけ読む。main checkoutはqueueが束縛されたcommon directoryから`[stall]`と同じく決める。
   - `alert`: `state`が`deleted`でなく、`conflicts`が`[conflicts].hotspot_conflicts`（既定3）以上で、`ratio`が`[conflicts].hotspot_ratio_percent`（既定20）% 以上（`ratio`がnullなら回数だけで判定）。`config`は判定に使った2つの値と`source`（main checkoutの`dagq.toml`の`[conflicts]`なら`file`、無ければ`default`）。
   - observerは`stats`を入力に読むのでそのまま載り、plan reviewのpromptにも載る（[Plan review](plan-review.md#plan-review-supervisor)の4）。
+- **`sessions`**: `{window: {after, upto}, by_kind: {<kind>: {count, open, active, open_now, inferred, active_unavailable}}}`。`backend_failures`と同じwindowと重なるClaude sessionの区間をkindごとに数える（下の[Claude session](#claude-session)）
 
 ## 着地待ちの内訳
 
@@ -111,3 +116,13 @@ goal 21（task 197）で足した集計。runごとの値は上の`runs`の`dagq
 - **`verification_commands`**: `backend_failures`と同じwindowと`--goal`の絞り込みで、`integrate`の`verification_command`（`phase: integration`）のうち`duration_secs`を持つものをコマンドごと（コマンド文字列の昇順）に`{command, count, failed, total_secs, median_secs}`。`failed`は`exit_code`が0でないものの数、`median_secs`は偶数個なら中央2つの平均（小数3桁）
 - job（review・triage・observer・plan review）の所要時間はここでは数えない（ADR-0048のsessionの記録が持つ）
 
+## Claude session
+
+runtimeが記録したClaude sessionの区間（`session_opened` / `session_closed`。書き方は[provider-lifecycle](../provider-lifecycle.md#claude-sessionの区間)）を、kindごとに数える（[ADR-0048](../../adr/0048-record-claude-sessions-by-kind-with-open-and-active-time.md)の決定3・11・12）。集計は`domain::stats::sessions`がrun_eventsから再導出し、transcriptは読まない。既存の項目は変えず、足すだけにする。
+
+- **区間**: `session_opened`と、その`opened_event_id`を持つ最初の`session_closed`の対。開いている時間はその`created_at`の差（ミリ秒を秒に切り捨て）。閉じていない区間は、runの行では`stats`を読んだ時刻まで、`sessions`ではwindowの終わりまでの長さにする。どの`session_opened`も指さない`session_closed`と、2回目の`session_closed`は数えない。
+- **稼働時間**（`active`）: 区間の`session_closed`が`active_secs`を持つもの（transcriptのturnを取り込む後続taskが記録する）だけを数える。それまでは`active`の件数は0、runの行はnull。`active: "unavailable"`で閉じた区間は`active_unavailable`に数える。
+- **`sessions`**: kindは`worker` / `resume` / `revise` / `review` / `triage` / `observer` / `plan_review` / `runtime_planner` / `inbox` / `planner`の10個で、記録が0でも必ず出す。`window`の`after` / `upto`は`backend_failures`と同じwindowのevent id。`upto`以前に開き、`after`より後に閉じたか閉じていない区間を数え、長さはwindowで切る: 始まりは`after`のeventの時刻（0なら切らない）、終わりは`--until`かpageの続きがあれば`upto`のeventの時刻、無ければ今の時刻。`open`と`active`は`{count, total, median, p90, max}`（`median`と`p90`は他と同じ規則）。`open_now`はwindowの終わりまでに閉じていない区間、`inferred`はwindowの中で`reason: inferred`で閉じた区間の数。`--goal`があれば、runの区間はそのgoalのtaskのものだけ、`plan_review`は`goal_ids`にそのgoalを含むものだけにし、`observer`などrunもproposalも持たない区間は0にする。
+- **`runs`の`sessions`**: `{<kind>: {count, open, active}}`で、`open` / `active`はそのrunの区間の秒の合計（`active`は記録が無ければnull）。windowで切らない。区間の無いkindは出さない（区間の無い過去のrunは`{}`）。
+- **`goals`と`overall`の`sessions`**: `{<kind>: {count, open, active}}`で、`open` / `active`は区間ごとの秒の`{count, total, median}`。対象のrunの区間を数え、区間の無いkindは出さない。
+- observerは`stats`を入力に読むので、そのまま載る。
