@@ -156,30 +156,7 @@ impl Supervisor<'_> {
             .as_ref()
             .is_none_or(|(at, _)| now - at >= IN_FLIGHT_REFRESH_SECS)
         {
-            let mut in_flight = Vec::new();
-            for run in self.queue.latest_runs_in_progress()? {
-                let mut files = self.expected(run.task_id())?;
-                let head = run
-                    .result_commit()
-                    .map(|commit| commit.as_str().to_owned())
-                    .or_else(|| run.branch().map(str::to_owned));
-                if let Some(head) = head {
-                    match self
-                        .repository
-                        .changed_paths(run.base_commit().as_str(), &head)
-                    {
-                        Ok(changed) => files.extend(changed),
-                        Err(error) => {
-                            warn!(run_id = %run.id(), error = %format_args!("{error:#}"), "the files run {} changed could not be read: {error:#}", run.id())
-                        }
-                    }
-                }
-                in_flight.push(InFlight {
-                    run_id: run.id().as_str().to_owned(),
-                    task_id: run.task_id(),
-                    files,
-                });
-            }
+            let in_flight = self.runs_in_flight()?;
             self.defer.in_flight = Some((now, in_flight));
         }
         let in_flight = self
@@ -199,9 +176,48 @@ impl Supervisor<'_> {
         Ok((touched, in_flight))
     }
 
+    /// The runs in flight (the latest run of each in-progress task) and
+    /// the files each is expected to touch: its diff from its base to its
+    /// head and the expected files of its task (ADR-0069 decision 2).
+    pub(super) fn runs_in_flight(&mut self) -> Result<Vec<InFlight>> {
+        let mut in_flight = Vec::new();
+        for run in self.queue.latest_runs_in_progress()? {
+            let mut files = self.expected(run.task_id())?;
+            let head = run
+                .result_commit()
+                .map(|commit| commit.as_str().to_owned())
+                .or_else(|| run.branch().map(str::to_owned));
+            if let Some(head) = head {
+                match self
+                    .repository
+                    .changed_paths(run.base_commit().as_str(), &head)
+                {
+                    Ok(changed) => files.extend(changed),
+                    Err(error) => {
+                        warn!(run_id = %run.id(), error = %format_args!("{error:#}"), "the files run {} changed could not be read: {error:#}", run.id())
+                    }
+                }
+            }
+            in_flight.push(InFlight {
+                run_id: run.id().as_str().to_owned(),
+                task_id: run.task_id(),
+                files,
+            });
+        }
+        Ok(in_flight)
+    }
+
+    /// The files `task` is expected to touch as it is now, not as cached:
+    /// for a task whose paths may have changed since (one under plan
+    /// review).
+    pub(super) fn expected_now(&mut self, task: TaskId) -> Result<Vec<String>> {
+        self.defer.expected.remove(&task);
+        self.expected(task)
+    }
+
     /// The files `task` is expected to touch: its declared paths, or the
     /// files its most related landed tasks changed.
-    fn expected(&mut self, task: TaskId) -> Result<Vec<String>> {
+    pub(super) fn expected(&mut self, task: TaskId) -> Result<Vec<String>> {
         if let Some(files) = self.defer.expected.get(&task) {
             return Ok(files.clone());
         }

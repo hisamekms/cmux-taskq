@@ -9,6 +9,7 @@
 use anyhow::{Context, Result};
 use serde::Serialize;
 use serde_json::Value;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use super::{
@@ -1274,6 +1275,10 @@ pub struct DuplicateCandidates {
     pub search: Vec<SearchHit>,
 }
 
+/// Expected files the summary of a ready or in-progress task lists at
+/// most; the hotspot table reads them all.
+pub const SUMMARY_EXPECTED_FILES: usize = 10;
+
 /// What the headless plan review reads (ADR-0041 decision 10): the
 /// proposal and its tasks, the goals they belong to, what `dagq lint`
 /// found, the other proposals not yet ready (oldest submission first), the
@@ -1286,8 +1291,15 @@ pub struct PlanReviewMaterial<'a> {
     pub lint: &'a [LintViolation],
     /// Other submitted or revising proposals with their tasks.
     pub others: &'a [(Proposal, Vec<Task>)],
-    /// Ready and in-progress tasks, with their long fields.
+    /// Ready and in-progress tasks, with their long fields; the prompt
+    /// lists each in summary and gives the long fields only of those it
+    /// has a reason to (task 591).
     pub queued: &'a [TaskListItem],
+    /// Ready and in-progress tasks past the limit of `queued`.
+    pub queued_left_out: usize,
+    /// The files each task of the proposal and of `queued` is expected to
+    /// touch (ADR-0069 decisions 1, 2).
+    pub expected: &'a BTreeMap<TaskId, Vec<String>>,
     /// Asks a person answered, newest first.
     pub precedents: &'a [Ask],
     /// The files the landings conflicted in most (`stats`
@@ -1395,12 +1407,94 @@ pub fn plan_review_prompt(material: &PlanReviewMaterial<'_>) -> Result<String> {
             .collect::<Vec<_>>()
             .join("\n")
     };
-    let queued = json_lines(
+    let no_files = Vec::new();
+    let expected = |id: TaskId| material.expected.get(&id).unwrap_or(&no_files);
+    let touching = |path: &str, ids: &mut dyn Iterator<Item = TaskId>| {
+        ids.filter(|&id| crate::domain::claim_defer::touches(expected(id), path))
+            .collect::<Vec<_>>()
+    };
+    // Each hotspot with the tasks expected to touch it; a queued task on
+    // the same hotspot as a task of the proposal is given in full.
+    let mut full = BTreeSet::new();
+    let mut hotspots = Vec::new();
+    for file in material.hotspots {
+        let path = file.renamed_to.as_deref().unwrap_or(&file.path);
+        let own = touching(path, &mut material.tasks.iter().map(|d| d.task.id()));
+        let queued = touching(path, &mut material.queued.iter().map(|item| item.id));
+        if !own.is_empty() {
+            full.extend(queued.iter().copied());
+        }
+        hotspots.push(serde_json::json!({
+            "path": path,
+            "conflicts": file.conflicts, "tasks": file.tasks,
+            "landings": file.landings, "ratio": file.ratio,
+            "last_conflict_at": file.last_conflict_at, "alert": file.alert,
+            "proposal_tasks": own, "queued_tasks": queued,
+        }));
+    }
+    let hotspots = json_lines(hotspots);
+    for candidates in material.candidates {
+        full.extend(candidates.related.iter().map(|task| TaskId::new(task.id)));
+        full.extend(
+            candidates
+                .search
+                .iter()
+                .filter_map(|hit| match (hit.kind, &hit.id) {
+                    (
+                        crate::domain::search::SearchKind::Task,
+                        crate::domain::search::SearchRef::Id(id),
+                    ) => Some(TaskId::new(*id)),
+                    _ => hit.task_id.map(TaskId::new),
+                }),
+        );
+    }
+    let summaries = material
+        .queued
+        .iter()
+        .map(|item| {
+            let files = expected(item.id);
+            let mut summary = serde_json::json!({
+                "id": item.id, "status": item.status, "priority": item.priority,
+                "goal_id": item.goal_id, "title": item.title,
+                "paths": item.details.as_ref().map(|details| &details.paths).unwrap_or(&no_files),
+                "dependencies": item.dependencies, "goal_dependencies": item.goal_dependencies,
+                "expected_files": files.iter().take(SUMMARY_EXPECTED_FILES).collect::<Vec<_>>(),
+            });
+            if files.len() > SUMMARY_EXPECTED_FILES {
+                summary["more_expected_files"] = (files.len() - SUMMARY_EXPECTED_FILES).into();
+            }
+            if full.contains(&item.id) {
+                summary["full_text_below"] = true.into();
+            }
+            summary
+        })
+        .collect();
+    let mut queued = json_lines(summaries);
+    if material.queued_left_out > 0 {
+        queued.push_str(&format!(
+            "\n({} more ready or in-progress tasks, those of the lowest IDs, are left out of this list)",
+            material.queued_left_out
+        ));
+    }
+    let queued_full = json_lines(
         material
             .queued
             .iter()
+            .filter(|item| full.contains(&item.id))
             .map(serde_json::to_value)
             .collect::<serde_json::Result<_>>()?,
+    );
+    let own_expected = json_lines(
+        material
+            .tasks
+            .iter()
+            .map(|detail| {
+                serde_json::json!({
+                    "task_id": detail.task.id(),
+                    "expected_files": expected(detail.task.id()),
+                })
+            })
+            .collect(),
     );
     let precedents = if material.precedents.is_empty() {
         "(none)".to_owned()
@@ -1412,20 +1506,6 @@ pub fn plan_review_prompt(material: &PlanReviewMaterial<'_>) -> Result<String> {
             .collect::<Vec<_>>()
             .join("\n")
     };
-    let hotspots = json_lines(
-        material
-            .hotspots
-            .iter()
-            .map(|file| {
-                serde_json::json!({
-                    "path": file.renamed_to.as_deref().unwrap_or(&file.path),
-                    "conflicts": file.conflicts, "tasks": file.tasks,
-                    "landings": file.landings, "ratio": file.ratio,
-                    "last_conflict_at": file.last_conflict_at, "alert": file.alert,
-                })
-            })
-            .collect(),
-    );
     let candidates = json_lines(
         material
             .candidates
@@ -1451,25 +1531,28 @@ pub fn plan_review_prompt(material: &PlanReviewMaterial<'_>) -> Result<String> {
          Apply what they say (the verification each kind of change needs, the declared paths, how ADR numbers are assigned, ...); the runtime has no such rules of its own.\n\n\
          The proposal was submitted {submitted} and was sent back {revises} time(s) before (at most {max}; a revise past that goes to a person as a concern).\n\n\
          Tasks of the proposal:\n{tasks}\n\n\
+         Files each task of the proposal is expected to touch (its declared paths; without them, the files the landings of its 3 most related completed tasks changed; a guess, so check it against the source):\n{own_expected}\n\n\
          Goals they belong to (description, acceptance, constraints; constraints win over a task's description):\n{goals}\n\n\
          The mechanical checks (`dagq lint`) found:\n{lint}\n\n\
          Other proposals not ready yet:\n{others}\n\n\
-         Ready and in-progress tasks:\n{queued}\n\n\
+         Ready and in-progress tasks, in summary, newest first (expected_files as for the proposal's tasks, and for an in-progress task also what its run changed so far; full_text_below marks a task given in full below):\n{queued}\n\n\
+         In full, the ready and in-progress tasks among the candidates below or expected to touch a hotspot a task of the proposal is expected to touch:\n{queued_full}\n\n\
          Asks a person answered before (newest first):\n{precedents}\n\n\
-         Files the landings conflicted in most lately (`dagq stats` conflict_hotspots: conflicts, tasks, landings on main that changed the file, their ratio; alert when over the thresholds):\n{hotspots}\n\n\
+         Files the landings conflicted in most lately (`dagq stats` conflict_hotspots: conflicts, tasks, landings on main that changed the file, their ratio; alert when over the thresholds), each with the tasks of the proposal (proposal_tasks) and the ready and in-progress tasks (queued_tasks) expected to touch it:\n{hotspots}\n\n\
          Candidates of duplicates and of changes already made, one line per task of the proposal (related: the tasks `dagq related` ranks highest, in any status, with the clues that relate them; search: the tasks and landed commits `dagq search` finds for the words of the task's title, with their status; at most {most} of each, none of the proposal's own tasks; an empty list means none was found):\n{candidates}\n\n\
          Check the meaning of the plan:\n\
          - a task that repeats another task (ready, in progress, in another proposal, or already landed on main); start from its candidates above, a completed or canceled one included, and judge from their titles, clues and the source whether the task really repeats one;\n\
          - a task whose change is already on main (read the source; a completed candidate or a landed commit is where to look);\n\
          - a contradiction with an ADR or with the goal's constraints;\n\
          - an acceptance criterion that contradicts the task's own description or a sibling task's acceptance (for example a change of a type whose acceptance says a test file that uses the type is not changed);\n\
-         - tasks that change the same files without a dependency between them, above all a file listed as conflicting often;\n\
+         - tasks that change the same files without a dependency between them, above all a file listed as conflicting often: for each hotspot whose proposal_tasks and queued_tasks are both non-empty, add a dependency (add_dependency, the task of the proposal waiting for the queued one) or say in summary why none is needed; you may read the source to see which files a task of the proposal really touches;\n\
+         - a task that partly repeats a ready or in-progress task (the overlap goes once the scope of one is cut): not pass but revise, saying in the reason which part to cut and which of the two keeps it;\n\
          - a contradiction with another proposal: with one submitted before this one, send this one back; with one submitted after, pass this one (the later one is checked against it);\n\
          - a ready task that has to change for this proposal to hold: name it in reopen, and the runtime takes it out of the claim for a planner to fix; an in-progress task is never changed: send this proposal back asking for a task that fixes it after it lands and depends on it;\n\
          - every finding of `dagq lint` is one to fix.\n\n\
          Decide one verdict:\n\
          - pass: the tasks may run as written, after the actions below.\n\
-         - revise: findings the planner can fix without a person's judgment (wording, acceptance, verification, paths, a split, a missing task or dependency). Each reason says what to change.\n\
+         - revise: findings the planner can fix without a person's judgment (wording, acceptance, verification, paths, a split, a scope that partly overlaps another task, a missing task or dependency). Each reason says what to change.\n\
          - concern: findings that need a person's judgment: a doubtful duplicate, a change that looks already done, a contradiction with an ADR or the goal's constraints, a change of the plan's intent.\n\
          When a finding is of the same kind as an answered ask above, put that ask's id in precedents and say in the reason how the person answered then.\n\n\
          actions are the only changes you make yourself, and only with pass: add_dependency (a task of the proposal waits for another task), lower_priority (never raise one), cancel_duplicate (only an obvious duplicate; a doubtful one, or a change that looks already made, is a concern). Everything else is the planner's.\n\n\
@@ -1707,5 +1790,201 @@ mod tests {
         let revise = revise_request(&verified, &own_run, 1, &["fix it".into()]).unwrap();
         assert!(revise.contains(&format!("2. {}", local_checks(r#"["make gate"]"#))));
         assert!(revise.contains(default), "{revise}");
+    }
+
+    /// A task as plan review reads it, with long fields of the size of this
+    /// queue's (about 3 KB, task 591's measure of prompt 157).
+    fn long_task(id: i64, status: TaskStatus, paths: &[&str]) -> Task {
+        Task::restore(TaskRecord {
+            id: TaskId::new(id),
+            title: format!("task {id}"),
+            description: format!("description of {id} ").repeat(100),
+            acceptance: "acceptance ".repeat(60),
+            verification_commands: vec!["cargo test".into()],
+            required_evidence: Vec::new(),
+            paths: paths.iter().map(|path| (*path).to_owned()).collect(),
+            priority: Default::default(),
+            kind: None,
+            status,
+            goal_id: None,
+            context: "context ".repeat(80),
+            created_at: String::new(),
+            updated_at: String::new(),
+        })
+        .unwrap()
+    }
+
+    /// The plan review prompt with `queued` ready tasks: the proposal's
+    /// task 1000 touches `src/hot.rs`, and so does the ready task 5.
+    fn plan_prompt(queued: i64, left_out: usize) -> (String, usize) {
+        use crate::domain::{
+            PlannerOrigin, PlannerOwner, ProposalRecord, ProposalStatus, related::RelatedTask,
+        };
+        let proposal = Proposal::restore(ProposalRecord {
+            id: ProposalId::new(1),
+            status: ProposalStatus::Submitted,
+            owner: PlannerOwner {
+                origin: PlannerOrigin::Person,
+                workspace_id: None,
+            },
+            submitted_at: "now".into(),
+            revise_count: 0,
+            task_ids: vec![TaskId::new(1000)],
+            goal_ids: Vec::new(),
+            created_at: String::new(),
+            updated_at: String::new(),
+        })
+        .unwrap();
+        let tasks = [TaskDetail {
+            task: long_task(1000, TaskStatus::Submitted, &["src/hot.rs"]),
+            dependencies: Vec::new(),
+            goal_dependencies: Vec::new(),
+            duplicate_of: None,
+            duplicates: Vec::new(),
+            runs: Vec::new(),
+            events: Vec::new(),
+            processes: Vec::new(),
+        }];
+        let items: Vec<TaskListItem> = (1..=queued)
+            .map(|id| {
+                let paths: &[&str] = if id == 5 { &["src/*.rs"] } else { &[] };
+                TaskListItem::new(
+                    long_task(id, TaskStatus::Ready, paths),
+                    vec![TaskId::new(1)],
+                    Vec::new(),
+                    None,
+                    None,
+                    true,
+                )
+            })
+            .collect();
+        let mut expected = BTreeMap::new();
+        expected.insert(TaskId::new(1000), vec!["src/hot.rs".to_owned()]);
+        for item in &items {
+            let files = match item.id.as_i64() {
+                5 => vec!["src/*.rs".to_owned()],
+                6 => (0..30).map(|n| format!("src/other{n}.rs")).collect(),
+                _ => vec!["src/cold.rs".to_owned()],
+            };
+            expected.insert(item.id, files);
+        }
+        let hotspot = |path: &str| ConflictHotspot {
+            path: path.into(),
+            conflicts: 3,
+            tasks: 2,
+            task_ids: Vec::new(),
+            landings: Some(4),
+            ratio: Some(0.75),
+            last_conflict_at: "then".into(),
+            state: "present",
+            renamed_to: None,
+            alert: true,
+        };
+        let candidates = [DuplicateCandidates {
+            task_id: TaskId::new(1000),
+            related: vec![RelatedTask {
+                id: 7,
+                status: "ready".into(),
+                title: "task 7".into(),
+                score: 1.0,
+                clues: Vec::new(),
+                duplicate_of: None,
+            }],
+            search: Vec::new(),
+        }];
+        let old_size = items
+            .iter()
+            .map(|item| serde_json::to_string(item).unwrap().len())
+            .sum();
+        let prompt = plan_review_prompt(&PlanReviewMaterial {
+            proposal: &proposal,
+            tasks: &tasks,
+            goals: &[],
+            lint: &[],
+            others: &[],
+            queued: &items,
+            queued_left_out: left_out,
+            expected: &expected,
+            precedents: &[],
+            hotspots: &[hotspot("src/hot.rs"), hotspot("src/cold.rs")],
+            candidates: &candidates,
+            repo_root: Path::new("/repo"),
+        })
+        .unwrap();
+        (prompt, old_size)
+    }
+
+    #[test]
+    fn plan_review_lists_the_queue_in_summary_and_in_full_only_what_it_meets() {
+        let (prompt, _) = plan_prompt(10, 3);
+        let lines: Vec<Value> = prompt
+            .lines()
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect();
+        let summary = |id: i64| {
+            lines
+                .iter()
+                .find(|line| line["id"] == id && line.get("expected_files").is_some())
+                .unwrap_or_else(|| panic!("no summary of {id} in {prompt}"))
+        };
+        let full: Vec<i64> = lines
+            .iter()
+            .filter(|line| line.get("description").is_some() && line["id"] != 1000)
+            .map(|line| line["id"].as_i64().unwrap())
+            .collect();
+        // In full: the related candidate (7) and the task on the proposal's
+        // hotspot (5); not the ones on the hotspot nobody of the proposal
+        // touches.
+        assert_eq!(full, [5, 7]);
+        assert_eq!(summary(5)["full_text_below"], true);
+        assert_eq!(summary(5)["paths"], json!(["src/*.rs"]));
+        assert_eq!(summary(2).get("full_text_below"), None);
+        assert_eq!(summary(2).get("description"), None);
+        assert_eq!(summary(2)["expected_files"], json!(["src/cold.rs"]));
+        assert_eq!(summary(2)["dependencies"], json!([1]));
+        // A long list of expected files is cut, with the count left out.
+        assert_eq!(
+            summary(6)["expected_files"].as_array().unwrap().len(),
+            SUMMARY_EXPECTED_FILES
+        );
+        assert_eq!(summary(6)["more_expected_files"], 20);
+        // Each hotspot with the tasks expected to touch it.
+        let hot = |path: &str| {
+            lines
+                .iter()
+                .find(|line| line["path"] == path)
+                .unwrap_or_else(|| panic!("no {path} in {prompt}"))
+        };
+        assert_eq!(hot("src/hot.rs")["proposal_tasks"], json!([1000]));
+        assert_eq!(hot("src/hot.rs")["queued_tasks"], json!([5]));
+        assert_eq!(hot("src/cold.rs")["proposal_tasks"], json!([]));
+        assert_eq!(
+            hot("src/cold.rs")["queued_tasks"].as_array().unwrap().len(),
+            9
+        );
+        assert!(
+            prompt.contains("(3 more ready or in-progress tasks, those of the lowest IDs, are left out of this list)"),
+            "{prompt}"
+        );
+        assert!(prompt.contains("not pass but revise, saying in the reason which part to cut"));
+        assert!(prompt.contains("for each hotspot whose proposal_tasks and queued_tasks are both non-empty, add a dependency"));
+        let (prompt, _) = plan_prompt(4, 0);
+        assert!(!prompt.contains("are left out of this list"), "{prompt}");
+    }
+
+    #[test]
+    fn plan_review_prompt_of_a_queue_of_170_ready_tasks_is_a_fraction_of_their_full_text() {
+        let (prompt, full_text) = plan_prompt(170, 0);
+        println!(
+            "prompt {} bytes, full text of the queue {full_text} bytes",
+            prompt.len()
+        );
+        // Before task 591 the list alone was the full text of every task.
+        assert!(full_text > 500_000, "{full_text}");
+        assert!(
+            prompt.len() * 8 < full_text,
+            "{} bytes against {full_text}",
+            prompt.len()
+        );
     }
 }

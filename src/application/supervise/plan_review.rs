@@ -11,7 +11,7 @@
 use super::*;
 use crate::{
     application::{
-        PlanReviewApply, PlanReviewJob, StatusFilter, TaskQuery,
+        PlanReviewApply, PlanReviewJob, StatusFilter, TaskListItem, TaskQuery,
         planner::{PlannerLaunch, PlannerProbes, PlannerView, open_runtime_planner, planner_view},
         prompt::{
             DUPLICATE_CANDIDATES, DuplicateCandidates, PLAN_REVIEW_TOOLS, PlanReviewMaterial,
@@ -20,11 +20,14 @@ use crate::{
     },
     domain::{
         MAX_PLAN_REVISES, PLAN_OPTIONS, PLAN_REVIEW_ASKER, PlanReviewDecision, PlanReviewVerdict,
-        PlannerOrigin, PlannerState, Proposal, Task, next_to_review,
+        PlannerOrigin, PlannerState, Proposal, Task, TaskDetail,
+        claim_defer::expected_files,
+        next_to_review,
         search::{SearchKind, SearchQuery, SearchRef, any_word_query},
         stats::{LiveSnapshot, SlotSnapshot, StatsQuery, conflicts::ConflictHotspot},
     },
 };
+use std::collections::BTreeMap;
 
 /// Asks a person answered that the plan review prompt offers as
 /// precedents, newest first.
@@ -33,7 +36,8 @@ const PRECEDENT_ASKS: usize = 30;
 /// Files that conflict often the plan review prompt lists at most.
 const HOTSPOT_FILES: usize = 15;
 
-/// Ready and in-progress tasks the plan review prompt lists at most.
+/// Ready and in-progress tasks the plan review prompt lists at most, in
+/// summary (task 591); the prompt says how many it left out.
 const QUEUED_TASKS: usize = 200;
 
 /// The plan review job running now: one at a time, queue-wide.
@@ -196,15 +200,15 @@ impl Supervisor<'_> {
                 .collect::<Result<Vec<_>>>()?;
             others.push((other, tasks));
         }
-        let queued = self
-            .queue
-            .list(&TaskQuery {
-                status: StatusFilter::Only(vec![TaskStatus::Ready, TaskStatus::InProgress]),
-                limit: QUEUED_TASKS,
-                full: true,
-                ..TaskQuery::default()
-            })?
-            .tasks;
+        let page = self.queue.list(&TaskQuery {
+            status: StatusFilter::Only(vec![TaskStatus::Ready, TaskStatus::InProgress]),
+            limit: QUEUED_TASKS,
+            full: true,
+            ..TaskQuery::default()
+        })?;
+        let queued_left_out = page.total.saturating_sub(page.tasks.len());
+        let queued = page.tasks;
+        let expected = self.plan_expected_files(&tasks, &queued)?;
         let precedents = self.queue.answered_asks(PRECEDENT_ASKS)?;
         let hotspots = self.conflict_hotspots()?;
         let candidates = tasks
@@ -218,11 +222,45 @@ impl Supervisor<'_> {
             lint: &lint,
             others: &others,
             queued: &queued,
+            queued_left_out,
+            expected: &expected,
             precedents: &precedents,
             hotspots: &hotspots,
             candidates: &candidates,
             repo_root: &self.layout.repo_root,
         })
+    }
+
+    /// The files each task of the proposal and each ready or in-progress
+    /// task is expected to touch, by the rule of the claim's deferral
+    /// (ADR-0069 decisions 1, 2): its declared paths or the files its most
+    /// related landed tasks changed, and for an in-progress task also what
+    /// its run changed. The proposal's tasks are read afresh, as the
+    /// planner may have changed their paths.
+    fn plan_expected_files(
+        &mut self,
+        tasks: &[TaskDetail],
+        queued: &[TaskListItem],
+    ) -> Result<BTreeMap<TaskId, Vec<String>>> {
+        let mut expected = BTreeMap::new();
+        for detail in tasks {
+            let id = detail.task.id();
+            expected.insert(id, self.expected_now(id)?);
+        }
+        for item in queued {
+            expected.insert(item.id, self.expected(item.id)?);
+        }
+        if queued
+            .iter()
+            .any(|item| item.status == TaskStatus::InProgress)
+        {
+            for run in self.runs_in_flight()? {
+                if let Some(files) = expected.get_mut(&run.task_id) {
+                    *files = expected_files(&run.files, &[]);
+                }
+            }
+        }
+        Ok(expected)
     }
 
     /// Where the plan review starts looking for what `task` duplicates or

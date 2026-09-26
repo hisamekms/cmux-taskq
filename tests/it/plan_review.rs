@@ -1682,6 +1682,107 @@ fn the_prompt_lists_each_tasks_duplicate_candidates_but_not_the_proposals_own() 
     assert_eq!(candidates[2]["search"], json!([]), "{}", candidates[2]);
 }
 
+/// A task that declares `paths`, waiting for the draft blocker.
+fn add_paths(queue: &mut SqliteQueue, title: &str, paths: &[&str]) -> TaskId {
+    queue
+        .add(NewTask {
+            kind: None,
+            title: title.into(),
+            description: format!("{title}: the long description"),
+            acceptance: format!("{title} works"),
+            verification_commands: vec!["true".into()],
+            required_evidence: Vec::new(),
+            paths: paths.iter().map(|path| (*path).to_owned()).collect(),
+            priority: Priority::Normal,
+            dependencies: vec![TaskId::new(1)],
+            goal_dependencies: Vec::new(),
+            goal_id: None,
+            context: String::new(),
+        })
+        .unwrap()
+        .id()
+}
+
+/// The plan review prompt of a proposal whose task touches the hotspot
+/// `seed.txt`, with a ready task on another file and, with `meet`, one on
+/// the hotspot too: the one ready task, the one on the hotspot and the
+/// JSON lines of the prompt.
+fn hotspot_prompt(meet: bool) -> (TaskId, Option<TaskId>, TaskId, Vec<Value>) {
+    let fx = fixture();
+    let mut queue = SqliteQueue::open(&fx.db).unwrap();
+    let apart = add_paths(&mut queue, "qwertyuiop apart", &["other.txt"]);
+    let on_hot = meet.then(|| add_paths(&mut queue, "asdfghjkl hot", &["seed.txt"]));
+    for id in std::iter::once(apart).chain(on_hot) {
+        queue.transition(id, TaskAction::BypassReview).unwrap();
+    }
+    let own = add_paths(&mut queue, "zxcvbnm own", &["seed.txt"]);
+    submit(&mut queue, &[own], None);
+    Connection::open(&fx.db)
+        .unwrap()
+        .execute(
+            "INSERT INTO run_events(task_id, kind, payload) VALUES (1, 'conflict_precheck', ?1)",
+            [json!({"main": "m", "conflicts": ["seed.txt"]}).to_string()],
+        )
+        .unwrap();
+    let reviewer = StubReviewer::new(&[
+        json!({"verdict": "pass", "reasons": [], "summary": "sound", "actions": []}),
+    ]);
+    let outcome = supervise(&fx, &PlanWorkspace::default(), &reviewer);
+    assert_eq!(outcome["errors"], json!([]), "{outcome}");
+    let prompt = reviewer.prompts().remove(0);
+    for expected in [
+        "Ready and in-progress tasks, in summary",
+        "Files each task of the proposal is expected to touch",
+        "not pass but revise, saying in the reason which part to cut",
+    ] {
+        assert!(prompt.contains(expected), "{expected:?} not in {prompt}");
+    }
+    assert!(!prompt.contains("are left out of this list"), "{prompt}");
+    let lines = prompt
+        .lines()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect();
+    (apart, on_hot, own, lines)
+}
+
+/// Task 591: the ready tasks are listed in summary with their expected
+/// files, each hotspot names the tasks expected to touch it, and only a
+/// ready task on the same hotspot as the proposal's is given in full.
+#[test]
+fn the_prompt_lists_ready_tasks_in_summary_and_in_full_those_on_the_proposals_hotspot() {
+    for meet in [true, false] {
+        let (apart, on_hot, own, lines) = hotspot_prompt(meet);
+        let find = |what: &dyn Fn(&Value) -> bool| lines.iter().find(|line| what(line)).cloned();
+        let summary = |id: TaskId| {
+            find(&|line| line["id"] == json!(id) && line.get("expected_files").is_some())
+        };
+        let full =
+            |id: TaskId| find(&|line| line["id"] == json!(id) && line.get("description").is_some());
+        let hot = find(&|line| line["path"] == "seed.txt" && line.get("conflicts").is_some())
+            .unwrap_or_else(|| panic!("no hotspot in {lines:?}"));
+        assert_eq!(hot["proposal_tasks"], json!([own]), "{hot}");
+        let apart_summary = summary(apart).unwrap_or_else(|| panic!("{lines:?}"));
+        assert_eq!(apart_summary["expected_files"], json!(["other.txt"]));
+        assert_eq!(apart_summary["status"], "ready");
+        assert_eq!(apart_summary["dependencies"], json!([1]));
+        assert_eq!(apart_summary.get("description"), None);
+        assert!(full(apart).is_none(), "{lines:?}");
+        let own_files =
+            find(&|line| line["task_id"] == json!(own) && line.get("expected_files").is_some())
+                .unwrap_or_else(|| panic!("{lines:?}"));
+        assert_eq!(own_files["expected_files"], json!(["seed.txt"]));
+        match on_hot {
+            Some(on_hot) => {
+                assert_eq!(hot["queued_tasks"], json!([on_hot]), "{hot}");
+                assert_eq!(summary(on_hot).unwrap()["full_text_below"], true);
+                let full = full(on_hot).unwrap_or_else(|| panic!("{lines:?}"));
+                assert_eq!(full["description"], "asdfghjkl hot: the long description");
+            }
+            None => assert_eq!(hot["queued_tasks"], json!([]), "{hot}"),
+        }
+    }
+}
+
 /// Plan review predicts the weight of each submitted task (ADR-0079
 /// decision 2): recorded per task, again on a later review; predictions
 /// missing, malformed or not covering the tasks are not recorded, and the
