@@ -17,7 +17,13 @@ fn independent_tasks_run_concurrently_and_a_dependent_starts_after_integration()
     // session that finished at once let its run reach validation before the
     // other one started under a loaded host, and the two were never seen
     // running together.
-    let backend = Arc::new(TestWorkspace::new(&db, false, PROMPTED_AGENT));
+    // Starting a session is bounded by the same limit as the test's waits:
+    // under a loaded host a run's wrapper took longer than the backend's
+    // default windows to register.
+    let mut backend = TestWorkspace::new(&db, false, PROMPTED_AGENT);
+    backend.registration_timeout = common::STEP_LIMIT;
+    backend.start_wait = common::STEP_LIMIT;
+    let backend = Arc::new(backend);
     let options = supervise_options(4, false);
     let finish = |run: &TaskRun| {
         fs::write(
@@ -32,20 +38,15 @@ fn independent_tasks_run_concurrently_and_a_dependent_starts_after_integration()
         thread::spawn(move || supervise_with(&db, &repo, &backend, &options))
     };
 
-    // Both independent runs are alive at once; the dependent has none. The
-    // waits are long: under a loaded host (parallel `cargo llvm-cov` runs
-    // and integrates) starting two runs took longer than 20 seconds.
-    wait_until(&db, Duration::from_secs(60), |queue| {
-        let running: Vec<TaskRun> = queue
-            .active_runs()
-            .unwrap()
-            .into_iter()
-            .filter(|r| r.status() == RunStatus::Running)
-            .collect();
-        running.len() == 2
-            && running
-                .iter()
-                .all(|r| queue.run_lease(r.id()).unwrap().is_some())
+    // Both independent sessions start; the dependent has no run. Each
+    // session is held until the test finishes it, so this state, once
+    // reached, stays: the limit bounds reaching it (starting two runs under
+    // a loaded host took longer than 60 seconds), not a window to catch it.
+    wait_until(&db, common::STEP_LIMIT, |queue| {
+        let events = queue.all_events().unwrap();
+        [1, 2]
+            .iter()
+            .all(|task| first_event(&events, *task, &["agent_started"]).is_some())
     });
     assert!(queue.show(TaskId::new(3)).unwrap().runs.is_empty());
     let status = runtime::status(&db).unwrap();
@@ -74,7 +75,7 @@ fn independent_tasks_run_concurrently_and_a_dependent_starts_after_integration()
 
     // Accepted and past the supervisor's review (the stand-in `claude`
     // prints no verdict, so each waits for a review by hand).
-    wait_until(&db, Duration::from_secs(60), |queue| {
+    wait_until(&db, common::STEP_LIMIT, |queue| {
         [1, 2].iter().all(|task| {
             queue.show(TaskId::new(*task)).unwrap().runs[0].status()
                 == RunStatus::AwaitingIntegration
@@ -89,6 +90,35 @@ fn independent_tasks_run_concurrently_and_a_dependent_starts_after_integration()
     assert_ne!(first.workspace_id(), second.workspace_id());
     assert_eq!(first.base_commit(), second.base_commit());
     assert!(queue.run_leases().unwrap().is_empty());
+    // The two ran together, as the record shows: one supervisor took both
+    // leases and started both sessions before either session's supervision
+    // finished or either lease was released.
+    let events = queue.all_events().unwrap();
+    let ended = [1, 2]
+        .iter()
+        .map(|task| {
+            first_event(
+                &events,
+                *task,
+                &["supervision_finished", "session_exited", "lease_released"],
+            )
+            .unwrap()
+        })
+        .min()
+        .unwrap();
+    let mut holders = Vec::new();
+    for task in [1, 2] {
+        let acquired = events
+            .iter()
+            .find(|e| e.task_id == Some(TaskId::new(task)) && e.kind == "lease_acquired")
+            .unwrap();
+        assert!(acquired.id.as_i64() < ended);
+        holders.push(acquired.payload["pid"].clone());
+        assert!(first_event(&events, task, &["agent_started"]).unwrap() < ended);
+    }
+    assert!(holders[0].is_number());
+    assert_eq!(holders[0], holders[1]);
+    assert!(first_event(&events, 3, &["run_claimed"]).is_none());
 
     // Landing unblocks the dependent; the resident loop claims it from the landed main.
     assert_eq!(integrate(&db, 1, &repo).unwrap()["outcome"], "integrated");
@@ -100,7 +130,7 @@ fn independent_tasks_run_concurrently_and_a_dependent_starts_after_integration()
             .map(CommitSha::as_str),
         Some(landed.as_str())
     );
-    wait_until(&db, Duration::from_secs(60), |queue| {
+    wait_until(&db, common::STEP_LIMIT, |queue| {
         let runs = queue.show(TaskId::new(3)).unwrap().runs;
         if let Some(run) = runs.first().filter(|r| r.run_dir().is_some()) {
             finish(run);
@@ -111,6 +141,12 @@ fn independent_tasks_run_concurrently_and_a_dependent_starts_after_integration()
     let third = queue.show(TaskId::new(3)).unwrap().runs[0].clone();
     assert_eq!(*third.base_commit(), landed);
     assert_ne!(third.base_commit(), second.base_commit());
+    // The dependent was claimed only after its predecessor landed.
+    let events = queue.all_events().unwrap();
+    assert!(
+        first_event(&events, 3, &["run_claimed"]).unwrap()
+            > first_event(&events, 1, &["run_integrated"]).unwrap()
+    );
 
     // A graceful stop ends the loop once nothing is active.
     options.stop.store(true, Ordering::SeqCst);
@@ -136,6 +172,14 @@ fn independent_tasks_run_concurrently_and_a_dependent_starts_after_integration()
         "1"
     );
     drop(dir);
+}
+
+/// The id of `task`'s first event of one of `kinds`, in the queue's order.
+fn first_event(events: &[dagq::domain::RunEvent], task: i64, kinds: &[&str]) -> Option<i64> {
+    events
+        .iter()
+        .find(|e| e.task_id == Some(TaskId::new(task)) && kinds.contains(&e.kind.as_str()))
+        .map(|e| e.id.as_i64())
 }
 
 /// A run that does not answer the exit request keeps its lease without
