@@ -22,6 +22,8 @@ use crate::domain::{
     Priority, Proposal, ProposalId, Reason, ReasonCode, RunEvent, RunId, RunLease, RunPlan,
     RunProcess, RunStatus, SessionRole, Submission, SupervisorMode, SupervisorRegistration, Task,
     TaskAction, TaskDetail, TaskEdit, TaskId, TaskKind, TaskRun, TaskStatus,
+    related::RelatedPage,
+    search::{SearchPage, SearchQuery},
 };
 
 pub trait TaskStore {
@@ -1026,6 +1028,11 @@ pub trait RunStore {
     /// `task` (`dagq related`, ADR-0046), for the files it is expected to
     /// touch when it declares no paths (ADR-0069).
     fn related_landed_commits(&self, task: TaskId, limit: usize) -> Result<Vec<String>>;
+    /// The `limit` tasks most related to `task` in any status, best first,
+    /// with their clues (`dagq related`, ADR-0046 decision 4).
+    fn related_tasks(&self, task: TaskId, limit: usize) -> Result<RelatedPage>;
+    /// The documents matching `query`, best first (`dagq search`, ADR-0046).
+    fn search_documents(&self, query: &SearchQuery) -> Result<SearchPage>;
     /// The goal of every task, for `stats`.
     fn task_goals(&self) -> Result<HashMap<TaskId, Option<GoalId>>>;
     /// The title of every task, for `stats`.

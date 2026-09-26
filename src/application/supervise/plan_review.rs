@@ -14,13 +14,14 @@ use crate::{
         PlanReviewApply, PlanReviewJob, StatusFilter, TaskQuery,
         planner::{PlannerLaunch, PlannerProbes, PlannerView, open_runtime_planner, planner_view},
         prompt::{
-            PLAN_REVIEW_TOOLS, PlanReviewMaterial, plan_review_prompt, plan_revise_request,
-            precedent_line,
+            DUPLICATE_CANDIDATES, DuplicateCandidates, PLAN_REVIEW_TOOLS, PlanReviewMaterial,
+            plan_review_prompt, plan_revise_request, precedent_line,
         },
     },
     domain::{
         MAX_PLAN_REVISES, PLAN_OPTIONS, PLAN_REVIEW_ASKER, PlanReviewDecision, PlanReviewVerdict,
-        PlannerOrigin, PlannerState, Proposal, next_to_review,
+        PlannerOrigin, PlannerState, Proposal, Task, next_to_review,
+        search::{SearchKind, SearchQuery, SearchRef, any_word_query},
         stats::{LiveSnapshot, SlotSnapshot, StatsQuery, conflicts::ConflictHotspot},
     },
 };
@@ -206,6 +207,10 @@ impl Supervisor<'_> {
             .tasks;
         let precedents = self.queue.answered_asks(PRECEDENT_ASKS)?;
         let hotspots = self.conflict_hotspots()?;
+        let candidates = tasks
+            .iter()
+            .map(|detail| self.duplicate_candidates(proposal, &detail.task))
+            .collect::<Result<Vec<_>>>()?;
         plan_review_prompt(&PlanReviewMaterial {
             proposal,
             tasks: &tasks,
@@ -215,7 +220,58 @@ impl Supervisor<'_> {
             queued: &queued,
             precedents: &precedents,
             hotspots: &hotspots,
+            candidates: &candidates,
             repo_root: &self.layout.repo_root,
+        })
+    }
+
+    /// Where the plan review starts looking for what `task` duplicates or
+    /// what already made its change (goal 29): the tasks `related` ranks
+    /// highest, and the tasks and landed commits `search` finds for the
+    /// words of its title, at most [`DUPLICATE_CANDIDATES`] of each, none of
+    /// them the proposal's own.
+    fn duplicate_candidates(
+        &self,
+        proposal: &Proposal,
+        task: &Task,
+    ) -> Result<DuplicateCandidates> {
+        let own = proposal.task_ids();
+        let wanted = DUPLICATE_CANDIDATES + own.len();
+        let related = self
+            .queue
+            .related_tasks(task.id(), wanted)?
+            .related
+            .into_iter()
+            .filter(|candidate| !own.contains(&TaskId::new(candidate.id)))
+            .take(DUPLICATE_CANDIDATES)
+            .collect();
+        let search = match any_word_query(task.title()) {
+            Some(terms) => self
+                .queue
+                .search_documents(&SearchQuery {
+                    terms,
+                    kinds: vec![SearchKind::Task, SearchKind::Commit],
+                    limit: wanted,
+                    ..SearchQuery::default()
+                })?
+                .hits
+                .into_iter()
+                .filter(|hit| {
+                    // A task's hit is its ID; a commit's names its task.
+                    let task = match (hit.kind, &hit.id) {
+                        (SearchKind::Task, SearchRef::Id(id)) => Some(*id),
+                        _ => hit.task_id,
+                    };
+                    !task.is_some_and(|id| own.contains(&TaskId::new(id)))
+                })
+                .take(DUPLICATE_CANDIDATES)
+                .collect(),
+            None => Vec::new(),
+        };
+        Ok(DuplicateCandidates {
+            task_id: task.id(),
+            related,
+            search,
         })
     }
 

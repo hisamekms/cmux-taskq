@@ -473,7 +473,7 @@ fn a_passing_plan_review_readies_the_proposal_with_its_actions() {
         "\"title\":\"two\"",
         "depends_on_draft",
         "an acceptance criterion that contradicts the task's own description or a sibling task's acceptance",
-        "cancel_duplicate (only an obvious duplicate; a doubtful one is a concern)",
+        "cancel_duplicate (only an obvious duplicate; a doubtful one, or a change that looks already made, is a concern)",
         "Files the landings conflicted in most lately",
         "\"path\":\"seed.txt\"",
     ] {
@@ -1545,4 +1545,139 @@ fn edits_before_a_review_or_to_another_proposal_leave_its_verdict_applied() {
         );
         assert!(events(&mut queue, task, "plan_review_discarded").is_empty());
     }
+}
+
+/// A task of `title`, `description` and `acceptance`, waiting for the
+/// blocker.
+fn add_text(queue: &mut SqliteQueue, title: &str, description: &str, acceptance: &str) -> TaskId {
+    queue
+        .add(NewTask {
+            kind: None,
+            title: title.into(),
+            description: description.into(),
+            acceptance: acceptance.into(),
+            verification_commands: vec!["true".into()],
+            required_evidence: Vec::new(),
+            paths: Vec::new(),
+            priority: Priority::Normal,
+            dependencies: vec![TaskId::new(1)],
+            goal_dependencies: Vec::new(),
+            goal_id: None,
+            context: String::new(),
+        })
+        .unwrap()
+        .id()
+}
+
+#[test]
+fn the_prompt_lists_each_tasks_duplicate_candidates_but_not_the_proposals_own() {
+    let fx = fixture();
+    let mut queue = SqliteQueue::open(&fx.db).unwrap();
+    // Landed: completed with a commit on main; and one canceled.
+    let done = add_text(
+        &mut queue,
+        "runtime: search index for the plan review",
+        "adds src/infrastructure/search_index.rs",
+        "it finds tasks",
+    );
+    let dropped = add_text(
+        &mut queue,
+        "plan review candidates, first try",
+        "abandoned",
+        "none",
+    );
+    queue.transition(dropped, TaskAction::Cancel).unwrap();
+    let raw = Connection::open(&fx.db).unwrap();
+    raw.execute_batch("PRAGMA foreign_keys = OFF").unwrap();
+    raw.execute(
+        "UPDATE tasks SET status = 'completed' WHERE id = ?1",
+        [done.as_i64()],
+    )
+    .unwrap();
+    raw.execute(
+        "INSERT INTO landed_commits (run_id, task_id, commit_sha, message, landed_at)
+         VALUES ('run-landed', ?1, 'abc123', 'runtime: search index in src/infrastructure/search_index.rs', 'now')",
+        [done.as_i64()],
+    )
+    .unwrap();
+    let asked = add_text(
+        &mut queue,
+        "runtime: search index candidates in the plan review",
+        "change src/infrastructure/search_index.rs",
+        "the candidates are listed",
+    );
+    let twin = add_text(
+        &mut queue,
+        "runtime: search index candidates twin",
+        "also src/infrastructure/search_index.rs",
+        "twin",
+    );
+    let lone = add_text(&mut queue, "qwertyuiop", "zxcvbnm", "asdfghjkl");
+    submit(&mut queue, &[asked, twin, lone], None);
+    let reviewer = StubReviewer::new(&[
+        json!({"verdict": "pass", "reasons": [], "summary": "sound", "actions": []}),
+    ]);
+    let outcome = supervise(&fx, &PlanWorkspace::default(), &reviewer);
+    assert_eq!(outcome["errors"], json!([]), "{outcome}");
+    let prompt = reviewer.prompts().remove(0);
+    assert!(
+        prompt.contains("Candidates of duplicates and of changes already made"),
+        "{prompt}"
+    );
+    let candidates: Vec<Value> = prompt
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|line| line.get("related").is_some())
+        .collect();
+    assert_eq!(
+        candidates
+            .iter()
+            .map(|c| c["task_id"].as_i64().unwrap())
+            .collect::<Vec<_>>(),
+        [asked.as_i64(), twin.as_i64(), lone.as_i64()]
+    );
+    let own = [asked.as_i64(), twin.as_i64(), lone.as_i64()];
+    for entry in &candidates {
+        for related in entry["related"].as_array().unwrap() {
+            assert!(!own.contains(&related["id"].as_i64().unwrap()), "{entry}");
+        }
+        for hit in entry["search"].as_array().unwrap() {
+            let task = hit["task_id"].as_i64().or(hit["id"].as_i64()).unwrap();
+            assert!(!own.contains(&task), "{entry}");
+        }
+    }
+    // The related task that landed, with its clues and status.
+    let first = &candidates[0];
+    let related = first["related"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["id"] == json!(done))
+        .unwrap_or_else(|| panic!("{first}"));
+    assert_eq!(related["status"], "completed");
+    assert!(
+        related["clues"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["value"] == "src/infrastructure/search_index.rs"),
+        "{related}"
+    );
+    // Search finds the landed task, its commit and the canceled task.
+    let search = first["search"].as_array().unwrap();
+    let find = |kind: &str, id: Value| {
+        search
+            .iter()
+            .find(|hit| hit["kind"] == kind && hit["id"] == id)
+            .unwrap_or_else(|| panic!("{kind} {id} not in {first}"))
+    };
+    assert_eq!(find("task", json!(done))["status"], "completed");
+    assert_eq!(find("task", json!(dropped))["status"], "canceled");
+    let commit = find("commit", json!("abc123"));
+    assert_eq!(commit["task_id"], json!(done));
+    assert_eq!(commit["status"], "completed");
+    assert!(search.len() <= 5 && first["related"].as_array().unwrap().len() <= 5);
+    // A task nothing resembles has empty lists.
+    assert_eq!(candidates[2]["related"], json!([]), "{}", candidates[2]);
+    assert_eq!(candidates[2]["search"], json!([]), "{}", candidates[2]);
 }

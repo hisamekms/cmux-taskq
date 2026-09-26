@@ -159,6 +159,36 @@ fn tokens(query: &str) -> Vec<Token> {
     tokens
 }
 
+/// The most words of a text [`any_word_query`] asks the index for.
+const MAX_QUERY_WORDS: usize = 20;
+
+/// A query for documents holding any word of `text` (a task's title, for
+/// the plan review's candidates): its runs of letters, digits and `_ - . /`
+/// of at least [`TRIGRAM`] characters, each once (ASCII case ignored), each
+/// quoted and joined with `OR`; `None` when it has none.
+pub fn any_word_query(text: &str) -> Option<String> {
+    let mut words: Vec<String> = Vec::new();
+    for word in text.split(|c: char| !(c.is_alphanumeric() || "_-./".contains(c))) {
+        let word = word.trim_matches(|c: char| ".-/".contains(c));
+        if word.chars().count() < TRIGRAM
+            || words.iter().any(|seen| seen.eq_ignore_ascii_case(word))
+        {
+            continue;
+        }
+        words.push(word.to_owned());
+        if words.len() == MAX_QUERY_WORDS {
+            break;
+        }
+    }
+    (!words.is_empty()).then(|| {
+        words
+            .iter()
+            .map(|word| format!("\"{word}\""))
+            .collect::<Vec<_>>()
+            .join(" OR ")
+    })
+}
+
 /// What a hit is: a task or goal ID, a note's event ID or a commit's SHA.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
@@ -293,6 +323,27 @@ mod tests {
             parse_terms("  AND \"\" "),
             Err(DomainError::SearchQuery { .. })
         ));
+    }
+
+    #[test]
+    fn any_word_query_takes_each_long_word_once() {
+        let query =
+            any_word_query("runtime: plan review の prompt に、Plan AND (src/domain/task.rs).")
+                .unwrap();
+        assert_eq!(
+            query,
+            "\"runtime\" OR \"plan\" OR \"review\" OR \"prompt\" OR \"AND\" OR \"src/domain/task.rs\""
+        );
+        assert_eq!(
+            parse_terms(&query).unwrap().fts.as_deref(),
+            Some(query.as_str())
+        );
+        assert_eq!(any_word_query("の に 、 ab"), None);
+        let many: String = (100..200).map(|n| format!("w{n} ")).collect();
+        assert_eq!(
+            any_word_query(&many).unwrap().matches(" OR ").count(),
+            MAX_QUERY_WORDS - 1
+        );
     }
 
     #[test]

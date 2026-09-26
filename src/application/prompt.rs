@@ -22,7 +22,9 @@ use crate::domain::{
     Predecessor, Proposal, ProposalId, Receipt, RunEvent, RunId, RunStatus, TRIAGE_RETRY_FAILURES,
     Task, TaskDetail, TaskId, TaskRun,
     recovery::{ProcessInfo, RecoveryAlert},
+    related::RelatedTask,
     resume,
+    search::SearchHit,
     stats::conflicts::ConflictHotspot,
 };
 
@@ -1256,10 +1258,27 @@ pub const PLAN_REVIEW_TOOLS: &[&str] = &["Read", "Grep", "Glob"];
 /// and the revise request quote.
 const PRECEDENT_CHARS: usize = 400;
 
+/// Candidates of each kind (related tasks, search hits) the plan review
+/// prompt lists at most for one task of the proposal.
+pub const DUPLICATE_CANDIDATES: usize = 5;
+
+/// Where the plan review starts looking for duplicates and changes already
+/// made for one task of the proposal (goal 29): the tasks `dagq related`
+/// ranks highest with the clues that relate them, and the tasks and landed
+/// commits `dagq search` finds for the words of its title, in any status,
+/// none of them the proposal's own.
+#[derive(Debug, Clone, Serialize)]
+pub struct DuplicateCandidates {
+    pub task_id: TaskId,
+    pub related: Vec<RelatedTask>,
+    pub search: Vec<SearchHit>,
+}
+
 /// What the headless plan review reads (ADR-0041 decision 10): the
 /// proposal and its tasks, the goals they belong to, what `dagq lint`
 /// found, the other proposals not yet ready (oldest submission first), the
-/// ready and in-progress tasks, and the asks a person answered before.
+/// ready and in-progress tasks, the asks a person answered before, the
+/// files that conflict often and each task's duplicate candidates.
 pub struct PlanReviewMaterial<'a> {
     pub proposal: &'a Proposal,
     pub tasks: &'a [TaskDetail],
@@ -1274,6 +1293,8 @@ pub struct PlanReviewMaterial<'a> {
     /// The files the landings conflicted in most (`stats`
     /// `conflict_hotspots`), that main still has.
     pub hotspots: &'a [ConflictHotspot],
+    /// One entry per task of the proposal, in the order of `tasks`.
+    pub candidates: &'a [DuplicateCandidates],
     pub repo_root: &'a Path,
 }
 
@@ -1405,6 +1426,13 @@ pub fn plan_review_prompt(material: &PlanReviewMaterial<'_>) -> Result<String> {
             })
             .collect(),
     );
+    let candidates = json_lines(
+        material
+            .candidates
+            .iter()
+            .map(serde_json::to_value)
+            .collect::<serde_json::Result<_>>()?,
+    );
     Ok(format!(
         "You are the plan review of dagq proposal {id}: decide whether the queue may run its tasks as written, before they become ready.\n\
          Read only. Do not change any file and do not run dagq commands that write.\n\n\
@@ -1418,9 +1446,10 @@ pub fn plan_review_prompt(material: &PlanReviewMaterial<'_>) -> Result<String> {
          Ready and in-progress tasks:\n{queued}\n\n\
          Asks a person answered before (newest first):\n{precedents}\n\n\
          Files the landings conflicted in most lately (`dagq stats` conflict_hotspots: conflicts, tasks, landings on main that changed the file, their ratio; alert when over the thresholds):\n{hotspots}\n\n\
+         Candidates of duplicates and of changes already made, one line per task of the proposal (related: the tasks `dagq related` ranks highest, in any status, with the clues that relate them; search: the tasks and landed commits `dagq search` finds for the words of the task's title, with their status; at most {most} of each, none of the proposal's own tasks; an empty list means none was found):\n{candidates}\n\n\
          Check the meaning of the plan:\n\
-         - a task that repeats another task (ready, in progress, in another proposal, or already landed on main);\n\
-         - a task whose change is already on main (read the source);\n\
+         - a task that repeats another task (ready, in progress, in another proposal, or already landed on main); start from its candidates above, a completed or canceled one included, and judge from their titles, clues and the source whether the task really repeats one;\n\
+         - a task whose change is already on main (read the source; a completed candidate or a landed commit is where to look);\n\
          - a contradiction with an ADR or with the goal's constraints;\n\
          - an acceptance criterion that contradicts the task's own description or a sibling task's acceptance (for example a change of a type whose acceptance says a test file that uses the type is not changed);\n\
          - tasks that change the same files without a dependency between them, above all a file listed as conflicting often;\n\
@@ -1432,7 +1461,7 @@ pub fn plan_review_prompt(material: &PlanReviewMaterial<'_>) -> Result<String> {
          - revise: findings the planner can fix without a person's judgment (wording, acceptance, verification, paths, a split, a missing task or dependency). Each reason says what to change.\n\
          - concern: findings that need a person's judgment: a doubtful duplicate, a change that looks already done, a contradiction with an ADR or the goal's constraints, a change of the plan's intent.\n\
          When a finding is of the same kind as an answered ask above, put that ask's id in precedents and say in the reason how the person answered then.\n\n\
-         actions are the only changes you make yourself, and only with pass: add_dependency (a task of the proposal waits for another task), lower_priority (never raise one), cancel_duplicate (only an obvious duplicate; a doubtful one is a concern). Everything else is the planner's.\n\n\
+         actions are the only changes you make yourself, and only with pass: add_dependency (a task of the proposal waits for another task), lower_priority (never raise one), cancel_duplicate (only an obvious duplicate; a doubtful one, or a change that looks already made, is a concern). Everything else is the planner's.\n\n\
          Answer with one JSON object and nothing else, matching this schema:\n\
          {{\"verdict\": \"pass\" | \"revise\" | \"concern\", \"reasons\": [string], \"summary\": string, \
          \"actions\": [{{\"action\": \"add_dependency\", \"task_id\": int, \"depends_on\": int}} | {{\"action\": \"lower_priority\", \"task_id\": int, \"priority\": \"low\" | \"normal\" | \"high\" | \"urgent\"}} | {{\"action\": \"cancel_duplicate\", \"task_id\": int, \"duplicate_of\": int}}], \
@@ -1443,6 +1472,7 @@ pub fn plan_review_prompt(material: &PlanReviewMaterial<'_>) -> Result<String> {
         submitted = proposal.submitted_at(),
         revises = proposal.revise_count(),
         max = MAX_PLAN_REVISES,
+        most = DUPLICATE_CANDIDATES,
     ))
 }
 
