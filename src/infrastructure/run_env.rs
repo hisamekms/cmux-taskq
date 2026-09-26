@@ -20,10 +20,12 @@ use std::{
 use crate::{
     application::{Exit, Verifier},
     domain::{
+        kpi::KpiSettings,
         run_env::{RunEnvCheck, RunEnvProgram},
         stall::StallConfig,
         stats::ConflictConfig,
     },
+    infrastructure::kpi_config::KpiTables,
 };
 
 pub const CONFIG_FILE_NAME: &str = "dagq.toml";
@@ -33,6 +35,8 @@ const RUN_ENV_TABLE: &str = "run.env";
 const STALL_TABLE: &str = "stall";
 const CONFLICTS_TABLE: &str = "conflicts";
 const RECHECK_TABLE: &str = "recheck";
+/// `[kpi]` and its targets (ADR-0051), read by [`KpiTables`].
+const KPI_TABLE: &str = "kpi";
 const TABLES: [&str; 4] = [RUN_ENV_TABLE, STALL_TABLE, CONFLICTS_TABLE, RECHECK_TABLE];
 /// The one key of `[recheck]`.
 const RECHECK_COMMAND: &str = "command";
@@ -61,8 +65,9 @@ pub fn parse_run_env(text: &str) -> Result<Vec<(String, String)>> {
 }
 
 /// What the file holds: `[run.env]`, `[stall]` (ADR-0043 decision 4),
-/// `[conflicts]` and `[recheck]` (ADR-0068 decision 2).
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// `[conflicts]`, `[recheck]` (ADR-0068 decision 2) and `[kpi]` (ADR-0051
+/// decisions 17 and 19).
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct Config {
     /// `[run.env]` as written, in file order, values unexpanded.
     pub run_env: Vec<(String, String)>,
@@ -72,6 +77,8 @@ pub struct Config {
     pub conflicts: ConflictConfig,
     /// `[recheck] command`; none checks the merge only.
     pub recheck_command: Option<String>,
+    /// `[kpi]` and its `[kpi.targets."<kpi>"]`; `None` without any.
+    pub kpi: Option<KpiSettings>,
 }
 
 /// Parse the whole file.
@@ -81,6 +88,7 @@ pub fn parse_config(text: &str) -> Result<Config> {
     let mut config = Config::default();
     let mut stall_keys: Vec<String> = Vec::new();
     let mut conflict_keys: Vec<String> = Vec::new();
+    let mut kpi = KpiTables::default();
     let text = text.strip_prefix('\u{feff}').unwrap_or(text);
     for (index, raw) in text.lines().enumerate() {
         let number = index + 1;
@@ -93,9 +101,16 @@ pub fn parse_config(text: &str) -> Result<Config> {
                 .strip_suffix(']')
                 .with_context(|| format!("{CONFIG_FILE_NAME}:{number}: unclosed table header"))?
                 .trim();
+            if kpi
+                .header(name)
+                .with_context(|| format!("{CONFIG_FILE_NAME}:{number}"))?
+            {
+                table = Some(KPI_TABLE);
+                continue;
+            }
             let known = TABLES.iter().find(|table| **table == name).with_context(|| {
                 format!(
-                    "{CONFIG_FILE_NAME}:{number}: unknown table [{name}]; only [{RUN_ENV_TABLE}], [{STALL_TABLE}], [{CONFLICTS_TABLE}] and [{RECHECK_TABLE}] are supported"
+                    "{CONFIG_FILE_NAME}:{number}: unknown table [{name}]; only [{RUN_ENV_TABLE}], [{STALL_TABLE}], [{CONFLICTS_TABLE}], [{RECHECK_TABLE}] and [{KPI_TABLE}] are supported"
                 )
             })?;
             ensure!(
@@ -111,6 +126,9 @@ pub fn parse_config(text: &str) -> Result<Config> {
             .with_context(|| format!("{CONFIG_FILE_NAME}:{number}: expected KEY = value"))?;
         let key = key.trim();
         match table {
+            Some(KPI_TABLE) => kpi
+                .entry(key, rest.trim())
+                .with_context(|| format!("{CONFIG_FILE_NAME}:{number}"))?,
             Some(RUN_ENV_TABLE) => {
                 ensure!(
                     is_env_name(key),
@@ -176,15 +194,16 @@ pub fn parse_config(text: &str) -> Result<Config> {
                 stall_keys.push(key.to_owned());
             }
             None => bail!(
-                "{CONFIG_FILE_NAME}:{number}: a key outside [{RUN_ENV_TABLE}], [{STALL_TABLE}], [{CONFLICTS_TABLE}] or [{RECHECK_TABLE}]"
+                "{CONFIG_FILE_NAME}:{number}: a key outside [{RUN_ENV_TABLE}], [{STALL_TABLE}], [{CONFLICTS_TABLE}], [{RECHECK_TABLE}] or [{KPI_TABLE}]"
             ),
         }
     }
+    config.kpi = kpi.finish().with_context(|| CONFIG_FILE_NAME.to_owned())?;
     Ok(config)
 }
 
 /// A positive integer (a `what`), followed by nothing but an optional comment.
-fn parse_positive(text: &str, what: &str) -> Result<i64> {
+pub(super) fn parse_positive(text: &str, what: &str) -> Result<i64> {
     let digits = strip_comment(text);
     ensure!(!digits.is_empty(), "missing value");
     let value: i64 = digits
@@ -221,6 +240,20 @@ pub fn load_conflict_config(root: &Path) -> Result<Option<ConflictConfig>> {
             .with_context(|| format!("parse {}", path.display()))?
             .conflicts,
     ))
+}
+
+/// `[kpi]` of the `dagq.toml` in `root` (ADR-0051 decision 17), `None`
+/// when there is no file or no `[kpi]` table.
+pub fn load_kpi_settings(root: &Path) -> Result<Option<KpiSettings>> {
+    let path = root.join(CONFIG_FILE_NAME);
+    Ok(match read_config(&path)? {
+        Some(text) => {
+            parse_config(&text)
+                .with_context(|| format!("parse {}", path.display()))?
+                .kpi
+        }
+        None => None,
+    })
 }
 
 /// `[recheck] command` of the `dagq.toml` in `root`; no file, no table or
@@ -413,7 +446,7 @@ fn is_env_name(key: &str) -> bool {
 }
 
 /// The text before a `#` comment, for lines that hold no string.
-fn strip_comment(text: &str) -> &str {
+pub(super) fn strip_comment(text: &str) -> &str {
     text.split_once('#')
         .map_or(text, |(before, _)| before)
         .trim()
@@ -421,7 +454,7 @@ fn strip_comment(text: &str) -> &str {
 
 /// A TOML literal (`'...'`) or basic (`"..."`) string, followed by nothing
 /// but an optional comment.
-fn parse_string(text: &str) -> Result<String> {
+pub(super) fn parse_string(text: &str) -> Result<String> {
     let mut chars = text.chars();
     let quote = chars.next().context("missing value")?;
     let mut value = String::new();
@@ -681,6 +714,35 @@ LITERAL = 'no \n escapes # here'
             }
         );
         assert_eq!(parse_config("").unwrap().stall, StallConfig::default());
+    }
+
+    /// `[kpi]` and its targets sit among the other tables; a table after
+    /// them is its own again.
+    #[test]
+    fn parses_and_loads_the_kpi_tables() {
+        let text = "[run.env]\nA = 'x'\n[kpi]\nmin_samples = 4\nmax_improvement_proposals = 1\n[kpi.targets.\"phase.work\"]\nkind = \"runtime\"\nmax = 3600\n[stall]\nsend_confirm_secs = 30\n";
+        let config = parse_config(text).unwrap();
+        assert_eq!(config.run_env, pairs(&[("A", "x")]));
+        assert_eq!(config.stall.send_confirm_secs, 30);
+        let kpi = config.kpi.unwrap();
+        assert_eq!(kpi.min_samples, Some(4));
+        assert_eq!(kpi.max_improvement_proposals, Some(1));
+        assert_eq!(kpi.targets[0].stratum(), "kind=runtime");
+        assert_eq!(parse_config("[stall]\n").unwrap().kpi, None);
+        let error = format!("{:#}", parse_config("[kpi]\nx = 1\n").unwrap_err());
+        assert!(error.starts_with("dagq.toml:2: unknown key x"), "{error}");
+        let error = format!(
+            "{:#}",
+            parse_config("[kpi.targets.a]\nkind = \"docs\"\n").unwrap_err()
+        );
+        assert!(error.contains("neither min nor max"), "{error}");
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(load_kpi_settings(dir.path()).unwrap(), None);
+        fs::write(dir.path().join(CONFIG_FILE_NAME), text).unwrap();
+        assert_eq!(
+            load_kpi_settings(dir.path()).unwrap().unwrap().min_samples,
+            Some(4)
+        );
     }
 
     #[test]

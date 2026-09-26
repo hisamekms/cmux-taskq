@@ -55,7 +55,7 @@ use crate::{
             runs_dir,
         },
         process::LocalSpawner,
-        run_env::{ShellVerifier, load_conflict_config, load_stall_config},
+        run_env::{ShellVerifier, load_conflict_config, load_kpi_settings, load_stall_config},
         run_files::LocalRunFiles,
         runtime_store::SqliteOpener,
         sqlite::{ReadOnlyQueue, SqliteQueue},
@@ -500,14 +500,7 @@ impl OneShot {
         workspaces: Option<&dyn WorkspaceListing>,
     ) -> Result<Value> {
         let now = self.generators.clock.now();
-        let checkout = queue
-            .repository_binding()?
-            .map(PathBuf::from)
-            .and_then(|common_dir| {
-                (common_dir.file_name() == Some(".git".as_ref()))
-                    .then(|| common_dir.parent().map(Path::to_path_buf))
-                    .flatten()
-            });
+        let checkout = bound_checkout(queue)?;
         let config_file = || match &checkout {
             Some(checkout) => load_stall_config(checkout),
             None => Ok(None),
@@ -539,6 +532,37 @@ impl OneShot {
             now,
             query,
             &sources,
+        )?)?)
+    }
+
+    /// `kpi` (ADR-0051 decision 9): see [`crate::domain::kpi::kpi`],
+    /// measured to these generators' now in the host's time zone, judged by
+    /// the `[kpi]` of the main checkout's `dagq.toml` with the host's
+    /// `host.toml` (the queue's, over the host-wide one) over it.
+    pub fn kpi_of(
+        &self,
+        queue: &SqliteQueue,
+        db: &Path,
+        query: &crate::domain::kpi::KpiQuery,
+    ) -> Result<Value> {
+        use crate::infrastructure::kpi_config::{host_wide_file, load_host_kpi};
+        let now = self.generators.clock.now();
+        let repository = match bound_checkout(queue)? {
+            Some(checkout) => load_kpi_settings(&checkout)?,
+            None => None,
+        };
+        let queue_dir = db.parent().unwrap_or(Path::new("."));
+        let host = load_host_kpi(queue_dir, host_wide_file().as_deref())?;
+        let config = crate::domain::kpi::KpiConfig::merge(repository.as_ref(), host.as_ref());
+        Ok(serde_json::to_value(crate::application::kpi::kpi(
+            queue,
+            now,
+            crate::application::kpi::Host {
+                utc_offset_secs: clock::local_utc_offset(now),
+                cores: clock::logical_cores(),
+            },
+            &config,
+            query,
         )?)?)
     }
 
@@ -1017,6 +1041,19 @@ fn doctor_run_env(queue: &SqliteQueue, db: &Path) -> Result<crate::domain::run_e
 
 /// The main worktree of the repository: the parent of a `.git` common
 /// directory, or the inspected root for a bare common directory.
+/// The main checkout of the repository the queue is bound to: the parent
+/// of its `.git`; `None` for a queue bound to none, or to a bare one.
+fn bound_checkout(queue: &SqliteQueue) -> Result<Option<PathBuf>> {
+    Ok(queue
+        .repository_binding()?
+        .map(PathBuf::from)
+        .and_then(|common_dir| {
+            (common_dir.file_name() == Some(".git".as_ref()))
+                .then(|| common_dir.parent().map(Path::to_path_buf))
+                .flatten()
+        }))
+}
+
 fn main_checkout(repository: &GitRepository) -> PathBuf {
     match repository.common_dir.parent() {
         Some(parent) if repository.common_dir.file_name() == Some(".git".as_ref()) => {

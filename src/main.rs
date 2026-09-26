@@ -831,6 +831,45 @@ enum Command {
         #[arg(long, default_value = "cmux")]
         cmux: PathBuf,
     },
+    /// KPIs of the flow, rework, people's load, infrastructure, improvements and sessions per day
+    /// or ISO week (ADR-0051), split by the task's kind (`unknown` without one) and --by the
+    /// claim's attributes, each next to the previous period (and a day's 7-day median), judged
+    /// against the `[kpi.targets]` of dagq.toml and host.toml. --compare splits at a mark (its
+    /// event id) or a time, or compares two windows A..B,C..D, and lists every other mark in and
+    /// between them. Reads only; JSON.
+    Kpi {
+        #[arg(long, default_value = "day", value_parser = ["day", "week"])]
+        period: String,
+        /// How many periods to list, the latest last.
+        #[arg(long, default_value_t = 7, value_parser = clap::value_parser!(u16).range(1..=400))]
+        last: u16,
+        /// Event id, `@<unix seconds>` or an RFC 3339 time: the latest period is the one that
+        /// holds it (now without).
+        #[arg(long, conflicts_with_all = ["since", "until"])]
+        at: Option<dagq::domain::stats::Cursor>,
+        /// One window from this cursor instead of the periods.
+        #[arg(long)]
+        since: Option<dagq::domain::stats::Cursor>,
+        /// One window up to this cursor instead of the periods.
+        #[arg(long)]
+        until: Option<dagq::domain::stats::Cursor>,
+        /// List only these kinds' strata; a comparison's summary is made for them (runtime
+        /// without).
+        #[arg(long = "kind", value_parser = ["docs", "plugin", "runtime", "ci", "unknown"])]
+        kinds: Vec<String>,
+        /// Also split the runs by these attributes of the claim.
+        #[arg(long, value_parser = ["kind", "build", "parallel", "slot", "load", "toolchain", "claude"])]
+        by: Vec<String>,
+        /// A mark's event id or a time to compare before and after, or two windows A..B,C..D.
+        #[arg(long)]
+        compare: Option<dagq::domain::kpi::CompareSpec>,
+        /// Days on each side of a --compare at a mark or a time.
+        #[arg(long, default_value_t = dagq::domain::kpi::DEFAULT_WINDOW_DAYS, value_parser = clap::value_parser!(i64).range(1..=365))]
+        window: i64,
+        /// Only the runs, asks and findings of tasks in this goal.
+        #[arg(long = "goal")]
+        goal_id: Option<i64>,
+    },
     /// Report every unfinished run and supervisor, one line's worth each, without changing state.
     Doctor {
         /// Include each run's lease, processes, heartbeats and paths, and every supervisor field.
@@ -1057,6 +1096,7 @@ fn reads_only(command: &Command) -> bool {
             | Command::Events { .. }
             | Command::Timeline { .. }
             | Command::Stats { .. }
+            | Command::Kpi { .. }
             | Command::Doctor { .. }
             | Command::Notes { .. }
             | Command::Marks { .. }
@@ -1107,6 +1147,7 @@ fn observer_access(command: &Command) -> ObserverAccess {
         | Command::Timeline { .. }
         | Command::Watch { .. }
         | Command::Stats { .. }
+        | Command::Kpi { .. }
         | Command::Doctor { .. }
         | Command::Notes { .. }
         | Command::Marks { .. }
@@ -2047,6 +2088,37 @@ fn execute(cli: Cli) -> Result<Value> {
             )?
         }
         Command::Review { id } => dagq::compose::review(&db, TaskId::new(id))?,
+        Command::Kpi {
+            period,
+            last,
+            at,
+            since,
+            until,
+            kinds,
+            by,
+            compare,
+            window,
+            goal_id,
+        } => one_shot.kpi_of(
+            &queue,
+            &db,
+            &dagq::domain::kpi::KpiQuery {
+                period: period.parse().map_err(anyhow::Error::msg)?,
+                last: usize::from(last),
+                at,
+                since,
+                until,
+                kinds,
+                by: by
+                    .iter()
+                    .map(|axis| axis.parse())
+                    .collect::<Result<_, String>>()
+                    .map_err(anyhow::Error::msg)?,
+                compare,
+                window_days: window,
+                goal_id: goal_id.map(GoalId::new),
+            },
+        )?,
         Command::Stats {
             since,
             until,

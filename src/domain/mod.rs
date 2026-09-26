@@ -496,6 +496,7 @@ pub mod follow_up;
 pub mod goal;
 pub mod ids;
 mod input;
+pub mod kpi;
 pub mod lint;
 pub mod marks;
 pub mod measure;

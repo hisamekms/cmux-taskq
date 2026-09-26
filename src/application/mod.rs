@@ -10,6 +10,7 @@ pub mod ask;
 pub mod health;
 pub mod install;
 pub mod integrate;
+pub mod kpi;
 pub mod lifecycle;
 #[cfg(test)]
 mod memory_files;

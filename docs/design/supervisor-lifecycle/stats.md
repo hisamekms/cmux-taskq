@@ -9,6 +9,7 @@ last_verified: 2026-09-26
 scope: runtime
 related:
   - design-supervisor-lifecycle
+  - design-supervisor-lifecycle-kpi
   - adr-0062
   - design-supervisor-lifecycle-waiting
   - adr-0040
@@ -145,3 +146,6 @@ task 514で足した集計。runのsessionの区間（`worker` / `resume` / `rev
 - **検証の重複**: `verification_repeats`は、workerがtaskの`verification_commands`のうち`integrate`がもう一度流す検証（llvm-cov、全体の`cargo test`、e2e。fmt・clippyは数えない）と同じ種類のものを流したコマンドの数。一致はコマンドの文字列ではなく種類で見る（`cargo llvm-cov`を含むもの、targetを選ぶ・絞るflagや引数の無い`cargo test` / `cargo nextest run`、`--test e2e`）。`test_with_llvm_cov`は、llvm-covも流したrunでの全体の`cargo test`の回数（同じtestを2回流した回数。llvm-covを流していないrunは0）
 - **`goals`と`overall`の`work_breakdown`**（`kinds`・`versions`・`load_bands`も同じ形）: `{runs, total_secs, categories: {<分類>: {total, median, share}}, commands, verification_repeats, runs_with_repeats, test_with_llvm_cov}`。`runs`は内訳のあるrunの数で、内訳の無いrunは数えない。`median`はそれらのrunの秒の中央値（その分類の無いrunは0として数える）、`share`は`total`を`total_secs`で割った値（小数3桁）。`runs_with_repeats`は`verification_repeats`が1以上のrunの数
 
+## KPIからの読み口
+
+[`kpi`](kpi.md)（ADR-0051）は期間ごとの窓でこの`stats`を`full`に呼び、同じ区間・`land_phases`・`retries`・sessionを使う。KPIのために、同じ走査を共有する読み口を2つ足した: `stats::asks::human_waits`（`asks`と同じ`ask_opened` / `ask_answered` / 適用のeventの対応から、人が答えたaskの答えまでと適用までの秒を並べる。`runtime_closed`で閉じたaskは除く）と`stats::measures::verification_durations`（`verification_commands`と同じeventの選び方で、`integrate`の検証コマンドごとの秒を並べる）。`stats`の出力は変わらない。

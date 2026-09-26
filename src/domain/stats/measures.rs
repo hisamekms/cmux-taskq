@@ -256,6 +256,49 @@ pub struct CommandStats {
 }
 
 /// The `verification_command` events of `integrate` with `after < id <=
+/// upto` whose task `counts` accepts and that recorded their duration:
+/// the command, its seconds and whether it exited non-zero, in event order.
+fn integration_commands(
+    events: &[RunEvent],
+    after: EventId,
+    upto: EventId,
+    counts: impl Fn(Option<TaskId>) -> bool,
+) -> impl Iterator<Item = (&str, f64, bool)> {
+    events
+        .iter()
+        .filter(move |event| {
+            event.kind == "verification_command"
+                && event.id > after
+                && event.id <= upto
+                && counts(event.task_id)
+                && event.payload["phase"] == "integration"
+        })
+        .filter_map(|event| {
+            Some((
+                event.payload["command"].as_str()?,
+                event.payload["duration_secs"].as_f64()?,
+                event.payload["exit_code"].as_i64() != Some(0),
+            ))
+        })
+}
+
+/// The seconds each verification command of `integrate` took in the same
+/// window as [`verification_commands`], per command: what the KPIs'
+/// `verify_command.<command>` summarize (ADR-0051 decision 1).
+pub fn verification_durations(
+    events: &[RunEvent],
+    after: EventId,
+    upto: EventId,
+    counts: impl Fn(Option<TaskId>) -> bool,
+) -> BTreeMap<String, Vec<f64>> {
+    let mut by_command: BTreeMap<String, Vec<f64>> = BTreeMap::new();
+    for (command, secs, _) in integration_commands(events, after, upto, counts) {
+        by_command.entry(command.to_owned()).or_default().push(secs);
+    }
+    by_command
+}
+
+/// The `verification_command` events of `integrate` with `after < id <=
 /// upto` whose task `counts` accepts, per command, by command.
 pub(super) fn verification_commands(
     events: &[RunEvent],
@@ -264,22 +307,10 @@ pub(super) fn verification_commands(
     counts: impl Fn(Option<TaskId>) -> bool,
 ) -> Vec<CommandStats> {
     let mut by_command: BTreeMap<&str, (Vec<f64>, usize)> = BTreeMap::new();
-    for event in events.iter().filter(|event| {
-        event.kind == "verification_command"
-            && event.id > after
-            && event.id <= upto
-            && counts(event.task_id)
-            && event.payload["phase"] == "integration"
-    }) {
-        let (Some(command), Some(secs)) = (
-            event.payload["command"].as_str(),
-            event.payload["duration_secs"].as_f64(),
-        ) else {
-            continue;
-        };
+    for (command, secs, failed) in integration_commands(events, after, upto, counts) {
         let entry = by_command.entry(command).or_default();
         entry.0.push(secs);
-        if event.payload["exit_code"].as_i64() != Some(0) {
+        if failed {
             entry.1 += 1;
         }
     }
@@ -310,6 +341,35 @@ mod tests {
             payload,
             created_at: "1970-01-01T00:00:00.000Z".to_owned(),
         }
+    }
+
+    /// The durations per command are those of `integrate`'s commands in
+    /// the window that recorded one, the failed ones too; the summary
+    /// counts the same events.
+    #[test]
+    fn verification_durations_are_the_commands_of_the_window() {
+        let command = |id: i64, command: &str, phase: &str, secs: Value, exit: i64| {
+            event(
+                id,
+                "verification_command",
+                json!({"command": command, "phase": phase, "duration_secs": secs, "exit_code": exit}),
+            )
+        };
+        let events = [
+            command(1, "a", "integration", json!(5.0), 0),
+            command(2, "a", "integration", json!(7.5), 1),
+            command(3, "a", "validation", json!(9.0), 0),
+            command(4, "b", "integration", Value::Null, 0),
+            command(5, "b", "integration", json!(1.0), 0),
+        ];
+        let durations = verification_durations(&events, EventId::new(0), EventId::new(4), |_| true);
+        assert_eq!(durations.len(), 1);
+        assert_eq!(durations["a"], vec![5.0, 7.5]);
+        let summary = verification_commands(&events, EventId::new(0), EventId::new(5), |_| true);
+        assert_eq!(
+            (summary[0].count, summary[0].failed, summary[1].count),
+            (2, 1, 1)
+        );
     }
 
     #[test]

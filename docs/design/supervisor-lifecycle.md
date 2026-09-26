@@ -298,6 +298,10 @@ live session alert (long_background, stuck_exit, prompt_waiting)
 
 - [変更の印（`mark` / `marks`）](supervisor-lifecycle/marks.md)
 
+### `kpi`
+
+- [`kpi`](supervisor-lifecycle/kpi.md)（KPIを日・ISO週・taskの種類・claimの属性で集計し、前の期間と目標と比べ、変更の印の前後を比べる。[ADR-0051](../adr/0051-kpi-time-series-report-and-push.md)の決定1〜9・14〜19）
+
 ### `doctor`
 
 - [`doctor`](supervisor-lifecycle/doctor.md)

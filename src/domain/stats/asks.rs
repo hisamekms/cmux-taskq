@@ -123,6 +123,8 @@ struct AskTrack {
     answered: Option<(EventId, Option<i64>)>,
     /// The first event that applied the answer: its id and time.
     applied: Option<(EventId, Option<i64>)>,
+    /// The first answer was the runtime's own (`runtime_closed`).
+    runtime_closed: bool,
 }
 
 /// The events that do not apply an answer, though they name the ask: the
@@ -205,64 +207,7 @@ pub fn asks(
             .unwrap_or(UNKNOWN)
             .to_owned()
     };
-    // Up to the window's end, each ask as `ask_opened` recorded it (its
-    // reason, kind and asker), and when it was answered and applied: an
-    // answer the runtime wrote itself does not carry the reason, and an ask
-    // opened in the window may be answered after it.
-    let mut tracks: HashMap<AskKey, AskTrack> = HashMap::new();
-    // By the ask's id alone: the events that apply an answer name the ask
-    // but may sit on another run or none.
-    let mut by_id: HashMap<String, AskKey> = HashMap::new();
-    for event in events.iter().filter(|event| event.id <= upto) {
-        let at = || (event.id, timestamp_millis(&event.created_at));
-        match event.kind.as_str() {
-            "ask_opened" => {
-                let key = ask_key(event);
-                if let Some(id) = &key.0 {
-                    by_id.insert(id.clone(), key.clone());
-                }
-                tracks.insert(
-                    key,
-                    AskTrack {
-                        reason: text(&event.payload, "reason_category"),
-                        kind: text(&event.payload, "kind"),
-                        asked_by: text(&event.payload, "asked_by"),
-                        task_id: event.task_id,
-                        opened_ms: timestamp_millis(&event.created_at),
-                        answered: None,
-                        applied: None,
-                    },
-                );
-            }
-            "ask_answered" => {
-                if let Some(track) = tracks.get_mut(&ask_key(event))
-                    && track.answered.is_none()
-                {
-                    track.answered = Some(at());
-                    if event.payload.get("runtime_closed") == Some(&Value::Bool(true)) {
-                        track.applied = Some(at());
-                    }
-                }
-            }
-            kind if !NOT_APPLYING.contains(&kind) => {
-                // Only `ask_id` names the ask here: another event's `id`
-                // may be something else.
-                if let Some(track) = event
-                    .payload
-                    .get("ask_id")
-                    .and_then(|id| {
-                        by_id.get(&id.as_str().map_or_else(|| id.to_string(), str::to_owned))
-                    })
-                    .and_then(|key| tracks.get_mut(key))
-                    && track.answered.is_some()
-                    && track.applied.is_none()
-                {
-                    track.applied = Some(at());
-                }
-            }
-            _ => {}
-        }
-    }
+    let tracks = tracks(events, upto);
     for event in events
         .iter()
         .filter(|event| event.id > after && event.id <= upto && counts(event.task_id))
@@ -316,6 +261,111 @@ pub fn asks(
     }
     stats.times = times(&tracks, after, end_ms, counts);
     stats
+}
+
+/// Each ask opened up to `upto`, as `ask_opened` recorded it (its reason,
+/// kind and asker), and when it was answered and applied: an answer the
+/// runtime wrote itself does not carry the reason, and an ask opened in a
+/// window may be answered after it.
+fn tracks(events: &[RunEvent], upto: EventId) -> HashMap<AskKey, AskTrack> {
+    let text = |payload: &Value, key: &str| {
+        payload
+            .get(key)
+            .and_then(Value::as_str)
+            .unwrap_or(UNKNOWN)
+            .to_owned()
+    };
+    let mut tracks: HashMap<AskKey, AskTrack> = HashMap::new();
+    // By the ask's id alone: the events that apply an answer name the ask
+    // but may sit on another run or none.
+    let mut by_id: HashMap<String, AskKey> = HashMap::new();
+    for event in events.iter().filter(|event| event.id <= upto) {
+        let at = || (event.id, timestamp_millis(&event.created_at));
+        match event.kind.as_str() {
+            "ask_opened" => {
+                let key = ask_key(event);
+                if let Some(id) = &key.0 {
+                    by_id.insert(id.clone(), key.clone());
+                }
+                tracks.insert(
+                    key,
+                    AskTrack {
+                        reason: text(&event.payload, "reason_category"),
+                        kind: text(&event.payload, "kind"),
+                        asked_by: text(&event.payload, "asked_by"),
+                        task_id: event.task_id,
+                        opened_ms: timestamp_millis(&event.created_at),
+                        answered: None,
+                        applied: None,
+                        runtime_closed: false,
+                    },
+                );
+            }
+            "ask_answered" => {
+                if let Some(track) = tracks.get_mut(&ask_key(event))
+                    && track.answered.is_none()
+                {
+                    track.answered = Some(at());
+                    if event.payload.get("runtime_closed") == Some(&Value::Bool(true)) {
+                        track.runtime_closed = true;
+                        track.applied = Some(at());
+                    }
+                }
+            }
+            kind if !NOT_APPLYING.contains(&kind) => {
+                // Only `ask_id` names the ask here: another event's `id`
+                // may be something else.
+                if let Some(track) = event
+                    .payload
+                    .get("ask_id")
+                    .and_then(|id| {
+                        by_id.get(&id.as_str().map_or_else(|| id.to_string(), str::to_owned))
+                    })
+                    .and_then(|key| tracks.get_mut(key))
+                    && track.answered.is_some()
+                    && track.applied.is_none()
+                {
+                    track.applied = Some(at());
+                }
+            }
+            _ => {}
+        }
+    }
+    tracks
+}
+
+/// The seconds a person took over the asks whose task `counts` accepts
+/// (ADR-0051 decision 1's `ask_wait`): `ask_opened` → first `ask_answered`
+/// of the asks answered after `after` up to `upto`, and `ask_opened` → the
+/// event that applied the answer of those applied in the same window. An
+/// ask the runtime closed itself (`runtime_closed`) is no person's wait
+/// and is left out of both.
+pub fn human_waits(
+    events: &[RunEvent],
+    after: EventId,
+    upto: EventId,
+    counts: impl Fn(Option<TaskId>) -> bool,
+) -> (Vec<i64>, Vec<i64>) {
+    let secs = |from: Option<i64>, to: Option<i64>| Some((to? - from?) / 1000);
+    let (mut to_answer, mut to_apply) = (Vec::new(), Vec::new());
+    for track in tracks(events, upto)
+        .values()
+        .filter(|track| !track.runtime_closed && counts(track.task_id))
+    {
+        if let Some((id, at)) = track.answered
+            && id > after
+        {
+            to_answer.extend(secs(track.opened_ms, at));
+        }
+        if let Some((id, at)) = track.applied
+            && id > after
+        {
+            to_apply.extend(secs(track.opened_ms, at));
+        }
+    }
+    to_answer.sort_unstable();
+    to_apply.sort_unstable();
+    (to_answer, to_apply)
 }
 
 /// The waits of the `tracks` whose task `counts` accepts: answered or
@@ -396,6 +446,41 @@ mod tests {
             payload,
             created_at: String::new(),
         }
+    }
+
+    /// A person's waits: to the answer of the asks answered in the window,
+    /// and to the application of those applied in it; an ask the runtime
+    /// closed itself is left out of both.
+    #[test]
+    fn human_waits_leave_out_the_runtimes_own_closes() {
+        let at = |id: i64, task: Option<i64>, kind: &str, payload: Value, secs: i64| RunEvent {
+            created_at: crate::domain::marks::utc_text(secs * 1000),
+            ..event(id, task, kind, payload)
+        };
+        let events = [
+            at(1, Some(1), "ask_opened", json!({"ask_id": 1}), 0),
+            at(2, Some(1), "ask_opened", json!({"ask_id": 2}), 0),
+            at(3, Some(1), "ask_answered", json!({"ask_id": 1}), 30),
+            at(
+                4,
+                Some(1),
+                "ask_answered",
+                json!({"ask_id": 2, "runtime_closed": true}),
+                40,
+            ),
+            at(5, Some(1), "ask_closed", json!({"ask_id": 1}), 90),
+            at(6, Some(2), "ask_opened", json!({"ask_id": 3}), 0),
+            at(7, Some(2), "ask_answered", json!({"ask_id": 3}), 500),
+        ];
+        let everyone = human_waits(&events, EventId::new(0), EventId::new(7), |_| true);
+        assert_eq!(everyone, (vec![30, 500], vec![90]));
+        let first = human_waits(&events, EventId::new(0), EventId::new(7), |task| {
+            task == Some(TaskId::new(1))
+        });
+        assert_eq!(first, (vec![30], vec![90]));
+        // Answered before the window: only its later application counts.
+        let late = human_waits(&events, EventId::new(4), EventId::new(7), |_| true);
+        assert_eq!(late, (vec![500], vec![90]));
     }
 
     /// Opened asks count by kind and asker, answered ones by answerer and
