@@ -2,10 +2,12 @@
 id: adr-0045
 type: adr
 title: 固定バイナリをbuild識別子で見分け、queueを開いただけではmigrateせず、互換の範囲のschemaを受け入れ、supervisorを待たずに引き継ぎで入れ替え、up --auto-updateで着地のたびに自動で更新する
-status: accepted
+status: superseded
 created: 2026-09-25
 updated: 2026-09-25
 accepted_on: 2026-09-25
+superseded_by: adr-0073
+superseded_on: 2026-09-26
 supersedes:
   - adr-0014
 owners:
@@ -33,6 +35,8 @@ related:
 ---
 
 # ADR-0045: 固定バイナリをbuild識別子で見分け、queueを開いただけではmigrateせず、互換の範囲のschemaを受け入れ、supervisorを待たずに引き継ぎで入れ替え、`up --auto-update`で着地のたびに自動で更新する
+
+> **置き換え済み（2026-09-26）**: このADRの決定は現在有効ではない。現行の決定は[ADR-0073](0073-kind-additions-are-compatible.md)を読む。
 
 ## Context
 

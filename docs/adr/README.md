@@ -57,7 +57,6 @@ ADRは、将来の実装や運用に大きな影響を与える決定の理由�
 | [ADR-0038](0038-task-depends-on-a-goal-until-it-is-achieved.md) | taskがgoalに依存でき、依存先のgoalがachievedで閉じるまでclaimされない | 2026-09-25 |
 | [ADR-0039](0039-adopt-stale-lease-of-live-wrapper-and-renew-own-stale-lease.md) | supervisorが死んだrunは、wrapperが生きていれば次のsupervisorが引き継ぎ、自分のtokenのままstaleになったleaseは更新して続ける | 2026-09-25 |
 | [ADR-0042](0042-adr-is-superseded-whole-and-deprecation-date-is-deprecated-on.md) | ADRは丸ごと置き換え、置き換えの日付はsuperseded_on、廃止の日付はdeprecated_onに分けてfrontmatterと本文冒頭の注記に残す | 2026-09-25 |
-| [ADR-0045](0045-build-identifier-explicit-migrate-schema-compat-handoff-and-auto-update.md) | 固定バイナリをbuild識別子で見分け、queueを開いただけではmigrateせず、互換の範囲のschemaを受け入れ、supervisorを待たずに引き継ぎで入れ替え、up --auto-updateで着地のたびに自動で更新する | 2026-09-25 |
 | [ADR-0046](0046-full-text-search-related-and-duplicate-of.md) | taskの全文検索（search）と決まった規則の関連（related）と重複の記録（cancel --duplicate-of）を持ち、plannerとplan reviewはその候補だけをLLMで判断する | 2026-09-25 |
 | [ADR-0047](0047-irregularities-in-three-layers-recovery-job-ask-reasons-and-goal-review.md) | イレギュラーをruntimeの自動修正・復旧job・inboxの3層で扱い、askに人が要る理由の分類を必須にし、自動修正を数え、goalの達成をgoal review jobが判断する（ADR-0019・ADR-0043・ADR-0044を統合） | 2026-09-26 |
 | [ADR-0048](0048-record-claude-sessions-by-kind-with-open-and-active-time.md) | dagqが使うClaude sessionをkindごとの区間としてrun_eventsに記録し、開いている時間と、transcriptのturnから導く稼働時間をstatsで集計する | 2026-09-26 |
@@ -68,6 +67,7 @@ ADRは、将来の実装や運用に大きな影響を与える決定の理由�
 | [ADR-0054](0054-run-lease-ownership-parallel-supervisors-and-recover.md) | supervisorがrun単位のleaseでrunのlifecycleを所有して並列に実行し、死んだsupervisorのrunを引き継ぎ、手放したrunをrecoverに回す（ADR-0003・ADR-0007・ADR-0025を統合） | 2026-09-26 |
 | [ADR-0062](0062-runs-waiting-for-a-person-leave-the-slot.md) | 人の答えを待つrunをslotから外し、leaseを持ったまま軽く見張り、待ちの数に上限を付け、待ちが終わったrunを新しいclaimより先にslotへ戻す | 2026-09-26 |
 | [ADR-0068](0068-recheck-waiting-runs-after-each-landing.md) | 着地のたびに着地待ちのrunをmerge-treeと軽い検査で先回りして確かめ、着地しなくなったrunは人の回答や着地の順番を待たずにresumeする | 2026-09-26 |
+| [ADR-0073](0073-kind-additions-are-compatible.md) | 固定バイナリをbuild識別子で見分け、queueを開いただけではmigrateせず、互換の範囲のschemaを受け入れ、askとeventのkindの追加を互換として扱い、supervisorを待たずに引き継ぎで入れ替え、up --auto-updateで着地のたびに自動で更新する（ADR-0045を統合） | 2026-09-26 |
 | [ADR-0076](0076-run-the-coverage-gate-tests-with-nextest.md) | integrateのcoverageの関門のtestをcargo-nextestでbinaryをまたいで並列に流し（cargo llvm-cov nextest）、cargo-nextestは人がhostに入れる | 2026-09-26 |
 
 ## 置き換え・廃止されたADR
@@ -97,3 +97,4 @@ ADRは、将来の実装や運用に大きな影響を与える決定の理由�
 | [ADR-0041](0041-on-demand-planners-proposals-submitted-and-plan-review-job.md) | superseded | [ADR-0044](0044-findings-proposals-from-findings-and-quiet-observer.md) | 2026-09-26 |
 | [ADR-0043](0043-detect-stalled-worker-sessions-nudge-once-then-ask.md) | superseded | [ADR-0047](0047-irregularities-in-three-layers-recovery-job-ask-reasons-and-goal-review.md) | 2026-09-26 |
 | [ADR-0044](0044-findings-proposals-from-findings-and-quiet-observer.md) | superseded | [ADR-0047](0047-irregularities-in-three-layers-recovery-job-ask-reasons-and-goal-review.md) | 2026-09-26 |
+| [ADR-0045](0045-build-identifier-explicit-migrate-schema-compat-handoff-and-auto-update.md) | superseded | [ADR-0073](0073-kind-additions-are-compatible.md) | 2026-09-26 |
