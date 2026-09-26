@@ -26,6 +26,8 @@ Do only what the answer says, on the person's word. `wait` means: leave the sess
 
 ## What follows the exit
 
+While the ask waits, a run whose `/exit` followed its verdict (`awaiting_integration`, `needs_session` or `failed` below; not `running`, and not a resumed session's) holds no `--parallel` slot: it is listed in `status`'s `waiting` with `phase: exit` (ADR-0071), unless `--max-waiting` was reached (`run_waiting_deferred`), in which case it stays in its slot. When its session exits the wait ends (`session_exited`), the run shows `state: returning` until a slot is free, and only then does the supervisor go on as below; the ask itself is closed at the exit.
+
 Once the session exits, the supervisor moves the run on by its status (the question says which):
 
 - `running` (the older path): `validating`, then the supervisor's review.

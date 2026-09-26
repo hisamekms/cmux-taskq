@@ -38,13 +38,13 @@ Attention `triage by hand` (`kind` `triage_failed`): the supervisor's headless t
 ## 5. Start, stop and update the runtime
 
 ```sh
-"$DAGQ" up --plugin-dir "$CLAUDE_PLUGIN_ROOT"            # add --parallel N (default 4)
+"$DAGQ" up --plugin-dir "$CLAUDE_PLUGIN_ROOT"            # add --parallel N, --max-waiting N (both default 4)
 "$DAGQ" up --in-cmux --plugin-dir "$CLAUDE_PLUGIN_ROOT"  # only when the preflight sends you there
 "$DAGQ" down            # stop claiming; the supervisor drains its runs and exits
 "$DAGQ" down --wait     # the same, and block until it is gone
 ```
 
-`up` is idempotent: it keeps one supervisor resident and opens the inbox workspace (`skipped` when you run it from there). It opens no planner: a person opens each with `dagq plan --plugin-dir "$CLAUDE_PLUGIN_ROOT"` (a new one per call), and `dagq planners` lists them. `restart supervisor` (`supervisor_stopped`, `supervisor_stale`) is answered with `up`; an in-cmux supervisor is never restarted by anything else. Updating the fixed binary is: replace it, then `up`, which drains a supervisor of another version first. `down --force` kills the supervisor and loses its active runs: only on the person's explicit word. `${CLAUDE_PLUGIN_ROOT}/skills/dagq-recover/reference/up-down.md` has the outcomes, the in-cmux case, the binary update and the logs.
+`up` is idempotent: it keeps one supervisor resident and opens the inbox workspace (`skipped` when you run it from there). It opens no planner: a person opens each with `dagq plan --plugin-dir "$CLAUDE_PLUGIN_ROOT"` (a new one per call), and `dagq planners` lists them. `restart supervisor` (`supervisor_stopped`, `supervisor_stale`) is answered with `up`; an in-cmux supervisor is never restarted by anything else. Updating the fixed binary is: replace it, then `up`, which drains a supervisor of another version first. Runs waiting for a person hold no slot, and a drain waits for them until their asks are answered or their sessions exit. `down --force` kills the supervisor and loses its active runs: only on the person's explicit word. `${CLAUDE_PLUGIN_ROOT}/skills/dagq-recover/reference/up-down.md` has the outcomes, the in-cmux case, the binary update and the logs.
 
 ## 6. Review by hand, and a failed push
 
