@@ -146,6 +146,14 @@ fn reads_do_not_create_a_queue_and_unknown_tasks_fail() {
             expected["asks"] = serde_json::json!([]);
             expected["proposals"] = serde_json::json!([]);
             expected["cursor"] = serde_json::json!(0);
+        } else {
+            expected["schema"] = serde_json::json!({
+                "schema_version": SqliteQueue::SCHEMA_VERSION,
+                "binary_schema_version": SqliteQueue::SCHEMA_VERSION,
+                "floor": dagq::infrastructure::schema::floor_for(SqliteQueue::SCHEMA_VERSION),
+                "pending": [],
+                "opens": true,
+            });
         }
         assert_eq!(report, expected, "{command}");
     }
@@ -3100,18 +3108,18 @@ fn migrate_is_explicit_and_older_binaries_keep_working_within_the_floor() {
     // memory; the file stays at schema 23 (ADR-0045 decision 18).
     assert_eq!(ok(&db, &["list"])["total"], 1);
     assert_eq!(ok(&db, &["show", "1"])["task"]["title"], "old task");
-    for args in [
-        &["status"][..],
-        &["graph"],
-        &["stats"],
-        &["doctor"],
-        &["goal", "list"],
-    ] {
+    for args in [&["status"][..], &["graph"], &["stats"], &["goal", "list"]] {
         ok(&db, args);
     }
     assert_eq!(version(), 23);
     let check = ok(&db, &["migrate", "--check"]);
+    // `doctor` reports the schema as `migrate --check` does next to its
+    // runs and supervisors (ADR-0045 decision 5).
+    let doctor = ok(&db, &["doctor"]);
+    assert_eq!(doctor["schema"], check);
+    assert_eq!(doctor["runs"], serde_json::json!([]));
     assert_eq!(check["schema_version"], 23);
+    assert_eq!(check["binary_schema_version"], SqliteQueue::SCHEMA_VERSION);
     assert_eq!(check["opens"], false);
     assert_eq!(
         check["pending"],
@@ -3139,6 +3147,9 @@ fn migrate_is_explicit_and_older_binaries_keep_working_within_the_floor() {
     let backup = migrated["backup"].as_str().unwrap();
     assert!(Path::new(backup).starts_with(dir.path().canonicalize().unwrap().join("backups")));
     assert_eq!(version(), SqliteQueue::SCHEMA_VERSION);
+    let doctor = ok(&db, &["doctor"]);
+    assert_eq!(doctor["schema"]["opens"], true);
+    assert_eq!(doctor["schema"]["pending"], serde_json::json!([]));
     ok(&db, &["add", "task one"]);
 
     // A later binary's compatible migration: this binary, and the wrapper
@@ -3203,6 +3214,28 @@ fn migrate_is_explicit_and_older_binaries_keep_working_within_the_floor() {
             "{args:?}: {error}"
         );
     }
+    // `doctor` still reports the schema that refuses the binary, and why.
+    let output = run_copy(&runner, &db, &["doctor"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let doctor: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        doctor["schema"]["schema_version"],
+        SqliteQueue::SCHEMA_VERSION + 2
+    );
+    assert_eq!(doctor["schema"]["floor"], SqliteQueue::SCHEMA_VERSION + 2);
+    assert_eq!(doctor["schema"]["opens"], false);
+    assert!(doctor.get("runs").is_none());
+    assert!(
+        doctor["error"]
+            .as_str()
+            .unwrap()
+            .contains("unsupported queue schema version"),
+        "{doctor}"
+    );
     assert_eq!(version(), SqliteQueue::SCHEMA_VERSION + 2);
 }
 

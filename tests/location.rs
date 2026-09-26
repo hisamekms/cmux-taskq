@@ -355,6 +355,30 @@ fn a_repository_queue_bound_elsewhere_is_refused_by_every_command() {
     assert!(queue.bind_repository("/third/.git").is_err());
     assert!(queue.assert_repository("/somewhere/else/.git").is_ok());
     assert!(queue.assert_repository("/third/.git").is_err());
+    drop(queue);
+
+    // `doctor` reports the schema of a queue whose floor refuses this binary
+    // (ADR-0045 decision 5), and still checks the binding first.
+    let raw = rusqlite::Connection::open(&db).unwrap();
+    raw.execute_batch(&format!(
+        "UPDATE schema_floor SET floor = {0}; PRAGMA user_version = {0};",
+        SqliteQueue::SCHEMA_VERSION + 1
+    ))
+    .unwrap();
+    let message = error(&repo, &env, &["doctor"]);
+    assert!(
+        message.contains("bound to another Git repository: /somewhere/else/.git"),
+        "{message}"
+    );
+    raw.execute("DELETE FROM queue_repository", []).unwrap();
+    let doctor = ok(&repo, &env, &["doctor"]);
+    assert_eq!(doctor["schema"]["floor"], SqliteQueue::SCHEMA_VERSION + 1);
+    assert!(
+        doctor["error"]
+            .as_str()
+            .unwrap()
+            .contains("install a newer dagq")
+    );
 }
 
 /// A moved repository resolves to a new queue directory. `rebind --db` on

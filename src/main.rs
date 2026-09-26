@@ -1175,6 +1175,11 @@ fn execute(cli: Cli) -> Result<Value> {
     if let Command::Rebind { repo } = cli.command {
         return one_shot.rebind(&db, &checkout(repo));
     }
+    // `doctor` reports the schema even of a queue this binary cannot open
+    // (ADR-0045 decision 5), so it opens the queue itself.
+    if let Command::Doctor { full } = cli.command {
+        return one_shot.doctor(&db, full, common_dir.as_deref());
+    }
     let mut queue = if reads_only(&cli.command) {
         SqliteQueue::open_read_only(&db)?
     } else {
@@ -1189,7 +1194,8 @@ fn execute(cli: Cli) -> Result<Value> {
         | Command::Locate
         | Command::Rebind { .. }
         | Command::Migrate { .. }
-        | Command::Install { .. } => {
+        | Command::Install { .. }
+        | Command::Doctor { .. } => {
             unreachable!()
         }
         Command::Add {
@@ -1901,7 +1907,6 @@ fn execute(cli: Cli) -> Result<Value> {
                 },
             )?
         }
-        Command::Doctor { full } => one_shot.doctor(&db, full)?,
         Command::Recover { run } => one_shot.recover(&db, &RunId::new(run)?)?,
         Command::Session {
             run,

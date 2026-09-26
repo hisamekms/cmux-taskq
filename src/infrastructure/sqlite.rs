@@ -148,11 +148,25 @@ impl SqliteQueue {
     /// The schema of the queue at `path` as this binary sees it, without
     /// changing it.
     pub fn schema(path: impl AsRef<Path>) -> Result<SchemaState> {
-        let queue = Self::connect(path.as_ref(), false)?;
+        let queue = Self::connect_with(
+            path.as_ref(),
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
         let state = queue
             .state()?
             .context("queue is not initialized; use init first")?;
         Ok(state.report())
+    }
+
+    /// Checks the repository binding of the queue at `path` (see
+    /// [`Self::assert_repository`]) without checking its schema, for
+    /// `doctor` on a queue that refuses this binary.
+    pub fn assert_repository_at(path: impl AsRef<Path>, common_dir: &str) -> Result<()> {
+        Self::connect_with(
+            path.as_ref(),
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?
+        .assert_repository(common_dir)
     }
 
     /// `dagq migrate`: applies the migrations this binary knows and the
@@ -390,7 +404,7 @@ impl QueueSchema {
     }
 }
 
-/// A queue's schema as `migrate --check` reports it.
+/// A queue's schema as `migrate --check` and `doctor` report it.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct SchemaState {
     pub schema_version: i64,
@@ -402,6 +416,14 @@ pub struct SchemaState {
     pub pending: Vec<SchemaMigration>,
     /// Whether this binary's other commands open the queue as it is.
     pub opens: bool,
+}
+
+impl SchemaState {
+    /// Whether the queue's floor refuses this binary, so that not even the
+    /// commands that only read open it.
+    pub fn refuses_binary(&self) -> bool {
+        self.floor > self.binary_schema_version
+    }
 }
 
 /// One migration of this binary and its declaration.

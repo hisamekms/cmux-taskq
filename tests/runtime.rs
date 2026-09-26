@@ -13779,7 +13779,7 @@ fn status_and_doctor_measure_to_the_injected_clock() {
     assert_eq!(status["checked_at"], 1_042, "{status}");
     assert_eq!(status["asks"][0]["id"], ask.id.as_i64(), "{status}");
     assert_eq!(status["asks"][0]["age_secs"], 42, "{status}");
-    let doctor = one_shot.doctor(&db, false).unwrap();
+    let doctor = one_shot.doctor(&db, false, None).unwrap();
     assert_eq!(doctor["checked_at"], 1_042, "{doctor}");
 }
 

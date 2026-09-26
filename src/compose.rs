@@ -379,18 +379,40 @@ impl OneShot {
         health::status(&queue, &SystemProcesses, &*self.generators.clock, role)
     }
 
-    /// `doctor`: see [`health::doctor`].
-    pub fn doctor(&self, db: &Path, full: bool) -> Result<Value> {
-        let queue = self.open_read_only(db)?;
-        let run_env = doctor_run_env(&queue, db).map_err(|error| format!("{error:#}"));
-        health::doctor(
-            &queue,
-            &SystemProcesses,
-            &LocalRunFiles,
-            &*self.generators.clock,
-            full,
-            run_env,
-        )
+    /// `doctor`: see [`health::doctor`], with the queue's `schema` as
+    /// `migrate --check` reports it. The schema is reported even for a
+    /// queue that needs `migrate` or refuses this binary (ADR-0045 decision
+    /// 5); a queue that refuses it has no `supervisors` or `runs`, and
+    /// `error` says why. `common_dir`, when given, is the repository the
+    /// queue must be bound to, checked either way.
+    pub fn doctor(&self, db: &Path, full: bool, common_dir: Option<&str>) -> Result<Value> {
+        let schema = SqliteQueue::schema(db)?;
+        let mut report = if schema.refuses_binary() {
+            if let Some(common_dir) = common_dir {
+                SqliteQueue::assert_repository_at(db, common_dir)?;
+            }
+            let error = self
+                .open_read_only(db)
+                .err()
+                .map(|error| format!("{error:#}"));
+            serde_json::json!({ "checked_at": self.generators.clock.now(), "error": error })
+        } else {
+            let queue = self.open_read_only(db)?;
+            if let Some(common_dir) = common_dir {
+                queue.assert_repository(common_dir)?;
+            }
+            let run_env = doctor_run_env(&queue, db).map_err(|error| format!("{error:#}"));
+            health::doctor(
+                &queue,
+                &SystemProcesses,
+                &LocalRunFiles,
+                &*self.generators.clock,
+                full,
+                run_env,
+            )?
+        };
+        report["schema"] = serde_json::to_value(schema)?;
+        Ok(report)
     }
 
     /// `recover`: see [`health::recover`].
@@ -743,7 +765,7 @@ pub fn status_for(db: &Path, role: Option<SessionRole>) -> Result<Value> {
 
 /// `doctor` on the system clock: see [`OneShot::doctor`].
 pub fn doctor(db: &Path, full: bool) -> Result<Value> {
-    OneShot::system().doctor(db, full)
+    OneShot::system().doctor(db, full, None)
 }
 
 /// `recover` on the system clock: see [`OneShot::recover`].
