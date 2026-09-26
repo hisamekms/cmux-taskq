@@ -847,7 +847,7 @@ fn land(
         return defer(
             ReasonCode::CommitMismatch.into(),
             format!(
-                "receipt commit {} is not the head of {branch} ({head}); rerun the verification commands and rewrite the receipt for the current head",
+                "receipt commit {} is not the head of {branch} ({head}); rerun your checks and rewrite the receipt for the current head",
                 receipt.commit
             ),
             json!({"head": head}),
@@ -870,7 +870,7 @@ fn land(
         return defer(
             ReasonCode::RebaseConflict.into(),
             format!(
-                "rebase onto main {main} conflicted in {}; resolve it in the worktree (git rebase {main}), rerun the verification commands, and rewrite the receipt with the new head",
+                "rebase onto main {main} conflicted in {}; resolve it in the worktree (git rebase {main}), rerun your checks, and rewrite the receipt with the new head",
                 if conflicts.is_empty() {
                     "the run branch".to_owned()
                 } else {

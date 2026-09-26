@@ -354,7 +354,11 @@ impl AgentProvider for TestProvider {
     // headless job, which the observer test relies on.
     fn command(&self, run: &TaskRun, prompt: &str) -> Result<CommandSpec> {
         assert!(prompt.contains("Acceptance criteria:"));
-        assert!(prompt.contains("Verification commands (run in the worktree):"));
+        assert!(
+            prompt.contains(
+                "Verification commands (integrate runs them once after rebasing onto main;"
+            )
+        );
         // Every context section is present whether or not it has entries.
         assert!(prompt.contains("Goal"));
         assert!(prompt.contains("Context"));

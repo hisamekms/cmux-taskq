@@ -18,6 +18,8 @@ Follow the repository instructions first; for this repository:
 
 A task that mixes kinds takes the verification of the heaviest kind.
 
+The `--verify` commands are integrate's gate, not the worker's checklist: the worker prompt shows them as what integrate runs once after its rebase and tells the session to run the checks the repository's instructions ask of a worker (the `--verify` commands only when the instructions name none). In this repository a worker runs fmt, `cargo test --locked`, clippy and the task's `--verify` commands other than `cargo llvm-cov`; the coverage gate runs only in integrate (a run resumed because integrate's verification failed may rerun the failing command to reproduce it). A runtime run still runs e2e itself and writes it into the receipt's `e2e`.
+
 ## What happens outside the paths
 
 - Validation compares the receipt's commit with where the branch forked from the current `main` (`git merge-base`; the base commit unless a resumed session rebased), so paths other tasks landed are never counted. A changed path no glob matches parks the run as `needs_session` with a `scope_violation` event (`paths`, `allowed`, `reason`); the supervisor resumes the session to restore those paths to their state at `git merge-base HEAD <main>`.

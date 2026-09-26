@@ -180,7 +180,7 @@ impl Inheritance {
         format!(
             "Carried over from run {run}: its review passed, but its landing kept conflicting with main until its resumes were used up, so this run starts from its work instead of from scratch. \
              Its work is commit {head} (kept as refs/dagq/runs/{run}{branch}); its own commits are {base}..{head}. \
-             Bring them onto your base, the current main (for example `git cherry-pick {base}..{head}` in your worktree), resolve the conflicts keeping what both sides meant, rerun the verification commands, and write the receipt for your own head. \
+             Bring them onto your base, the current main (for example `git cherry-pick {base}..{head}` in your worktree), resolve the conflicts keeping what both sides meant, rerun your checks in the worktree as above, and write the receipt for your own head. \
              Its receipt ({receipt}) summary: {summary}\n",
             run = self.run_id,
             head = self.head,
@@ -218,6 +218,21 @@ pub const STOP_BACKGROUND: &str = "Before writing the receipt, stop every backgr
 /// tree only delays the first commit (goal 11, decision 4).
 pub const WORKER_READING: &str = "Read first, and only: the worker section of the repository instructions (AGENTS.md), the task context below and the documents it names, the goal doc if there is one, and the predecessor summaries below. \
 Do not run `dagq list` or `dagq show`, and skip the rest of the docs tree; open other files only when the task needs them.\n";
+
+/// Which checks a session runs in its worktree before the receipt, given
+/// how it names the task's verification commands (`above`, or the JSON
+/// list in a one-line request). The verification of record for a commit is
+/// integrate's single run of the verification commands after its rebase
+/// (ADR-0049 decision 1), so the worker runs what the repository's own
+/// instructions ask of it (they may leave a slow gate such as a coverage
+/// run to integrate), and the verification commands only when the
+/// repository says nothing. The runtime names no tool here: dagq runs in
+/// any repository.
+pub(crate) fn local_checks(verify: &str) -> String {
+    format!(
+        "Run in the worktree the checks the repository's instructions (AGENTS.md or CLAUDE.md) ask a worker to run, which may leave some of the verification commands to integrate; when the instructions name no such checks, run the verification commands {verify}."
+    )
+}
 
 /// Text of `prompt.txt`. `goal` is the task's goal as it reads at claim
 /// time, `predecessors` the task's direct dependencies, `goal_predecessors`
@@ -335,11 +350,12 @@ pub fn prompt(
         "You are executing dagq task {task_id}, run {run_id}.\n\
          Work only in the assigned Git worktree.\n\
          {reading}\
-         Implement the task, run the required verification commands, and commit the result.\n\
+         Implement the task, run the checks described below, and commit the result.\n\
          Do not merge, push, close the workspace, or modify the queue/runtime files.\n\
          Perform applicable unit tests, E2E, and subagent review. Record evidence or an explicit reason when not applicable.\n\
          Task title: {title}\nDescription:\n{description}\nAcceptance criteria:\n{acceptance}\n\
-         Verification commands (run in the worktree):\n{verification}\n\
+         Verification commands (integrate runs them once after rebasing onto main; that run is the verification of record for the commit):\n{verification}\n\
+         {local_checks}\n\
          {evidence}{paths}{goal}{context}{predecessors}{siblings}{inherited}\
          Your assignment is this task only. Do not change what a sibling task owns; if you find work outside this task, record it in the receipt as follow_ups instead of doing it.\n\
          Write a completion receipt to {receipt} using a temporary file in the same directory and atomic rename.\n\
@@ -347,7 +363,7 @@ pub fn prompt(
          Each of tests, e2e and subagent_review needs evidence when passed and a reason when not_applicable.\n\
          follow_ups is optional: an array of work you found outside this task, each with a title and a description, for the planner to decide on; omit it when there is none.\n\
          You may write this receipt outside the worktree. Keep the worktree clean after committing.\n\
-         The supervisor rejects the run unless the commit is the clean head of your branch on top of the base commit, and integrate reruns the verification commands itself after rebasing onto main.\n\
+         The supervisor rejects the run unless the commit is the clean head of your branch on top of the base commit, and integrate runs the verification commands itself after rebasing onto main.\n\
          When you need a decision you cannot make from the task and the repository, do not write the question to the terminal and wait: run `dagq ask --run {run_id} --kind worker_question --because scope --question '...'` in the worktree (one ask at a time, with everything you need decided in its question), report briefly that you asked, and stop. `--because` says why a person is needed: `scope` (the acceptance or the scope changes) or `discard` (whether to throw work away); a question that fits neither is yours to decide and record in the receipt's summary, or, when it leads outside the task, a failed receipt saying why. The answer arrives in this terminal as `answer to ask <id>: ...`; continue from it.\n\
          {stop_background}\n\
          After submitting, report the outcome briefly and stop; do not run /exit yourself. Once you are idle the supervisor ends the session, and a person can still send /exit. A receipt does not itself end the session.\n",
@@ -359,6 +375,7 @@ pub fn prompt(
         description = task.description(),
         acceptance = task.acceptance(),
         verification = serde_json::to_string_pretty(&task.verification_commands())?,
+        local_checks = local_checks("above"),
     ))
 }
 
@@ -690,41 +707,44 @@ pub(crate) fn resume_request(
         }
     }
     lines.push("Steps:".to_owned());
-    let verify = serde_json::to_string(task.verification_commands())?;
+    let checks = local_checks(&serde_json::to_string(task.verification_commands())?);
     if request.kind == ResumeKind::EvidenceMissing {
         lines.push(
             "1. Run the checks the reason names as missing and write their evidence into the receipt."
                 .to_owned(),
         );
-        lines.push(format!(
-            "2. If that changes files, commit them and rerun the verification commands {verify}."
-        ));
+        lines.push(format!("2. If that changes files, commit them. {checks}"));
     } else if request.kind == ResumeKind::ScopeViolation {
         lines.push(format!(
             "1. Take the changes to the paths the reason names out of the run branch: restore each to its state at git merge-base HEAD {} (delete the ones that did not exist there) and commit; if the task cannot be done without them, write the receipt with result failed and say which paths it needs.",
             request.main
         ));
-        lines.push(format!("2. Rerun the verification commands {verify}."));
+        lines.push(format!("2. {checks}"));
     } else if request.kind == ResumeKind::SentBack {
         lines.push(format!(
             "1. Fix the findings in the reason and commit; if main moved, git rebase {} first.",
             request.main
         ));
-        lines.push(format!("2. Rerun the verification commands {verify}."));
+        lines.push(format!("2. {checks}"));
     } else if request.kind == ResumeKind::Triage {
         lines.push(format!(
             "1. Do what the reason asks in this worktree and commit; if main moved, git rebase {} first.",
             request.main
         ));
-        lines.push(format!("2. Rerun the verification commands {verify}."));
+        lines.push(format!("2. {checks}"));
     } else {
         lines.push(format!(
             "1. In this worktree run git rebase {} and resolve the conflicts.",
             request.main
         ));
-        lines.push(format!(
-            "2. Rerun the verification commands {verify} and commit the result."
-        ));
+        // Only integrate's deferral can name a failed verification command;
+        // the precheck's reason is always a conflict.
+        let reproduce = if request.kind == ResumeKind::Landing {
+            " If the reason is a verification command that failed after integrate's rebase, you may also run that command in the worktree to reproduce and fix the failure."
+        } else {
+            ""
+        };
+        lines.push(format!("2. {checks}{reproduce} Commit the result."));
     }
     lines.push("3. Keep the worktree clean.".to_owned());
     lines.push(format!("4. {STOP_BACKGROUND}"));
@@ -1140,7 +1160,7 @@ pub(crate) fn revise_request(
     reasons: &[String],
 ) -> Result<String> {
     let receipt = run.receipt_path().context("missing receipt path")?;
-    let verify = serde_json::to_string(task.verification_commands())?;
+    let checks = local_checks(&serde_json::to_string(task.verification_commands())?);
     let mut lines = vec![format!(
         "dagq: the supervisor's review of run {} (task {}) asks for changes (revise {attempt} of {MAX_REVISE_ATTEMPTS}).",
         run.id(),
@@ -1152,7 +1172,7 @@ pub(crate) fn revise_request(
     }
     lines.push("Steps:".to_owned());
     lines.push("1. Fix the findings in this worktree and commit.".to_owned());
-    lines.push(format!("2. Run the verification commands {verify}."));
+    lines.push(format!("2. {checks}"));
     lines.push("3. Keep the worktree clean.".to_owned());
     lines.push(format!("4. {STOP_BACKGROUND}"));
     lines.push(format!(
@@ -1394,12 +1414,21 @@ mod tests {
     const RUN: &str = "00000000-0000-4000-8000-000000000001";
 
     fn task(id: i64, title: &str, status: TaskStatus) -> Task {
+        verified_task(id, title, status, Vec::new())
+    }
+
+    fn verified_task(
+        id: i64,
+        title: &str,
+        status: TaskStatus,
+        verification_commands: Vec<String>,
+    ) -> Task {
         Task::restore(TaskRecord {
             id: TaskId::new(id),
             title: title.into(),
             description: String::new(),
             acceptance: String::new(),
-            verification_commands: Vec::new(),
+            verification_commands,
             required_evidence: Vec::new(),
             paths: Vec::new(),
             priority: Default::default(),
@@ -1502,5 +1531,68 @@ mod tests {
         let alone = prompt(&waiting, &own_run, None, &[], &[], &[], None).unwrap();
         assert!(alone.contains("Predecessor tasks: none\n"));
         assert!(!alone.contains("Carried over from run"));
+    }
+
+    /// The worker, resume and revise prompts show the verification commands
+    /// as integrate's to run and send the session to the repository's own
+    /// instructions for its checks, with the verification commands as the
+    /// default (task 510).
+    #[test]
+    fn sessions_run_the_repository_checks_and_leave_the_verification_to_integrate() {
+        let verified = verified_task(7, "work", TaskStatus::InProgress, vec!["make gate".into()]);
+        let own_run = run(7, RunStatus::Claimed, None);
+        let checks = "the repository's instructions (AGENTS.md or CLAUDE.md) ask a worker to run";
+
+        let worker = prompt(&verified, &own_run, None, &[], &[], &[], None).unwrap();
+        assert!(worker.contains(
+            "Verification commands (integrate runs them once after rebasing onto main; that run is the verification of record for the commit):\n[\n  \"make gate\"\n]\n"
+        ));
+        assert!(worker.contains(checks), "{worker}");
+        assert!(worker.contains(
+            "when the instructions name no such checks, run the verification commands above."
+        ));
+        assert!(!worker.contains("run in the worktree):"));
+        let inheritance = Inheritance {
+            run_id: RunId::new(RUN).unwrap(),
+            base: CommitSha::try_from(SHA).unwrap(),
+            head: SHA.into(),
+            branch: None,
+            receipt_path: None,
+            summary: "earlier".into(),
+        };
+        let retried = prompt(&verified, &own_run, None, &[], &[], &[], Some(&inheritance)).unwrap();
+        let (before, carried) = retried.split_once("Carried over from run").unwrap();
+        assert!(before.contains(checks));
+        assert!(carried.contains("rerun your checks in the worktree as above"));
+
+        let default = r#"when the instructions name no such checks, run the verification commands ["make gate"]."#;
+        let reproduce = "If the reason is a verification command that failed after integrate's rebase, you may also run that command in the worktree";
+        for kind in [
+            ResumeKind::Landing,
+            ResumeKind::EvidenceMissing,
+            ResumeKind::SentBack,
+            ResumeKind::ScopeViolation,
+            ResumeKind::Precheck,
+            ResumeKind::Triage,
+        ] {
+            let request = ResumeRequest {
+                main: CommitSha::try_from(SHA).unwrap(),
+                reason: "why".into(),
+                kind,
+            };
+            let text = resume_request(&verified, &own_run, &request, &[]).unwrap();
+            assert!(text.contains(checks), "{kind:?}: {text}");
+            assert!(text.contains(default), "{kind:?}: {text}");
+            assert!(!text.contains("Rerun the verification commands"), "{text}");
+            assert_eq!(
+                text.contains(reproduce),
+                kind == ResumeKind::Landing,
+                "{kind:?}: {text}"
+            );
+        }
+
+        let revise = revise_request(&verified, &own_run, 1, &["fix it".into()]).unwrap();
+        assert!(revise.contains(&format!("2. {}", local_checks(r#"["make gate"]"#))));
+        assert!(revise.contains(default), "{revise}");
     }
 }
