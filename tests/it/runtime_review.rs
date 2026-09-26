@@ -706,6 +706,195 @@ fn a_concern_canceled_fails_the_run_and_cancels_the_task() {
     assert_eq!(reviewer.prompts().len(), 1);
 }
 
+/// A run whose review returned `concern` and opened ask A, then sent back
+/// without the ask (as by hand) so that A stays open; with `answered`, A is
+/// answered `land` but not applied (the run no longer awaits integration).
+/// Its resume commits `narrowed` and goes idle. Returns the run and A.
+fn sent_back_past_its_ask(
+    db: &Path,
+    repo: &Path,
+    backend: &TestWorkspace,
+    reviewer: &TestReviewer,
+    answered: bool,
+) -> (TaskRun, dagq::domain::Ask) {
+    let outcome = supervise_reviewed(db, repo, backend, reviewer);
+    assert_eq!(outcome["errors"], json!([]), "{outcome}");
+    let mut queue = SqliteQueue::open(db).unwrap();
+    let run = queue.show(TaskId::new(1)).unwrap().runs[0].clone();
+    assert_eq!(run.status(), RunStatus::AwaitingIntegration);
+    let asks = queue.asks(Default::default()).unwrap();
+    assert_eq!(asks.len(), 1, "{asks:?}");
+    let stale = asks[0].clone();
+    assert!(
+        stale.question.contains("returned concern: first"),
+        "{}",
+        stale.question
+    );
+    queue
+        .decide_landing(
+            run.id(),
+            RunStatus::NeedsSession,
+            "sent back by hand",
+            dagq::domain::Reason::new(ReasonCode::SentBack).on(json!({})),
+        )
+        .unwrap();
+    if answered {
+        queue.answer(stale.id, "land").unwrap();
+    }
+    backend.resume_script_for(
+        1,
+        "await_message; printf 'narrowed\\n' > change.txt; unlocked git commit -q -am narrowed; receipt \"$(git rev-parse HEAD)\"; idle; await_exit",
+    );
+    (run, queue.read_ask(stale.id).unwrap())
+}
+
+/// Assert that `stale` was closed by the runtime with `answer`: an open one
+/// as `ask_answered` with `runtime_closed`, an answered one as `ask_closed`.
+fn assert_closed_by_runtime(
+    queue: &mut SqliteQueue,
+    run: &TaskRun,
+    stale: &dagq::domain::Ask,
+    answer: &str,
+) {
+    let closed = queue.read_ask(stale.id).unwrap();
+    assert!(closed.closed_at.is_some(), "{closed:?}");
+    let detail = queue.show(run.task_id()).unwrap();
+    if stale.answer.is_none() {
+        assert_eq!(closed.answer.as_deref(), Some(answer));
+        let answered: Vec<_> = payloads(&detail, "ask_answered")
+            .into_iter()
+            .filter(|p| p["ask_id"] == stale.id.as_i64())
+            .collect();
+        assert_eq!(answered.len(), 1, "{answered:?}");
+        assert_eq!(answered[0]["runtime_closed"], true);
+    } else {
+        assert_eq!(closed.answer, stale.answer);
+        assert!(
+            payloads(&detail, "ask_closed")
+                .iter()
+                .any(|p| p["ask_id"] == stale.id.as_i64()),
+            "{:?}",
+            event_kinds(&detail)
+        );
+    }
+}
+
+/// A later review of a run that does not pass closes the run's earlier
+/// `approve_landing` ask, open or answered but not applied, as the
+/// runtime, and opens a new one with the new review's reasons, rather
+/// than being folded into the earlier one (task 425).
+#[test]
+fn a_later_concern_closes_the_earlier_landing_ask_and_asks_again() {
+    for answered in [false, true] {
+        let (_dir, repo, db) = fixture();
+        let backend = TestWorkspace::new(&db, false, IDLE_AGENT);
+        let reviewer = TestReviewer::new(&[
+            verdict("concern", &["the first finding"], "first"),
+            verdict("concern", &["the second finding"], "second"),
+        ]);
+        let (run, stale) = sent_back_past_its_ask(&db, &repo, &backend, &reviewer, answered);
+        let outcome = supervise_reviewed(&db, &repo, &backend, &reviewer);
+        assert_eq!(outcome["errors"], json!([]), "{outcome}");
+        let mut queue = SqliteQueue::open(&db).unwrap();
+        let detail = queue.show(TaskId::new(1)).unwrap();
+        assert_eq!(detail.runs[0].status(), RunStatus::AwaitingIntegration);
+        assert_eq!(reviewer.prompts().len(), 2);
+        assert_closed_by_runtime(
+            &mut queue,
+            &run,
+            &stale,
+            "a later review of the run asks again; closed by the runtime",
+        );
+        let asks = queue.asks(Default::default()).unwrap();
+        assert_eq!(asks.len(), 1, "{asks:?}");
+        let fresh = &asks[0];
+        assert_ne!(fresh.id, stale.id);
+        assert_eq!(fresh.kind, dagq::domain::AskKind::ApproveLanding);
+        assert_eq!(fresh.run_id.as_ref(), Some(run.id()));
+        assert!(fresh.answer.is_none());
+        assert!(
+            fresh.question.contains("returned concern: second"),
+            "{}",
+            fresh.question
+        );
+        assert!(
+            fresh.question.contains("\n- the second finding"),
+            "{}",
+            fresh.question
+        );
+        // The earlier answer was not applied to the later review.
+        assert!(payloads(&detail, "integration_approved").is_empty());
+    }
+}
+
+/// A run the supervisor lands closes its `approve_landing` ask nobody
+/// closed, open or answered but not applied (task 425).
+#[test]
+fn a_run_the_supervisor_lands_closes_its_landing_ask() {
+    for answered in [false, true] {
+        let (_dir, repo, db) = fixture();
+        let base = git_out(&repo, &["rev-parse", "main"]);
+        let backend = TestWorkspace::new(&db, false, IDLE_AGENT);
+        let reviewer = TestReviewer::new(&[
+            verdict("concern", &["the first finding"], "first"),
+            verdict("pass", &[], "fixed"),
+        ]);
+        let (run, stale) = sent_back_past_its_ask(&db, &repo, &backend, &reviewer, answered);
+        let outcome = supervise_reviewed(&db, &repo, &backend, &reviewer);
+        assert_eq!(outcome["errors"], json!([]), "{outcome}");
+        let mut queue = SqliteQueue::open(&db).unwrap();
+        let detail = queue.show(TaskId::new(1)).unwrap();
+        assert_landed_run(&detail.runs[0], &repo, &base);
+        assert_closed_by_runtime(
+            &mut queue,
+            &run,
+            &stale,
+            "the run was integrated; closed by the runtime",
+        );
+        assert!(queue.asks(Default::default()).unwrap().is_empty());
+        // Closed by the landing, after the run was integrated.
+        let kinds = event_kinds(&detail);
+        let closing = if answered {
+            "ask_closed"
+        } else {
+            "ask_answered"
+        };
+        let closed_at = kinds
+            .iter()
+            .rposition(|k| *k == closing)
+            .expect("the ask was closed");
+        assert!(position(&kinds, "run_integrated") < closed_at, "{kinds:?}");
+    }
+}
+
+/// `integrate` by hand of a run whose review asked a person closes the
+/// run's `approve_landing` ask: nobody needs to answer it any more
+/// (task 425).
+#[test]
+fn integrate_by_hand_closes_the_landing_ask_of_the_run() {
+    let (_dir, repo, db) = fixture();
+    let base = git_out(&repo, &["rev-parse", "main"]);
+    let backend = TestWorkspace::new(&db, false, IDLE_AGENT);
+    let reviewer = TestReviewer::new(&[verdict("concern", &["a finding"], "first")]);
+    let outcome = supervise_reviewed(&db, &repo, &backend, &reviewer);
+    assert_eq!(outcome["errors"], json!([]), "{outcome}");
+    let mut queue = SqliteQueue::open(&db).unwrap();
+    let run = queue.show(TaskId::new(1)).unwrap().runs[0].clone();
+    let stale = queue.asks(Default::default()).unwrap()[0].clone();
+    assert!(stale.closed_at.is_none());
+    let outcome = integrate(&db, 1, &repo).unwrap();
+    assert_eq!(outcome["outcome"], "integrated", "{outcome}");
+    let detail = queue.show(TaskId::new(1)).unwrap();
+    assert_landed_run(&detail.runs[0], &repo, &base);
+    assert_closed_by_runtime(
+        &mut queue,
+        &run,
+        &stale,
+        "the run was integrated; closed by the runtime",
+    );
+    assert!(queue.asks(Default::default()).unwrap().is_empty());
+}
+
 /// A headless review that fails (a non-zero exit, stdout without a verdict,
 /// or the timeout) exits and closes the session, and in the step that
 /// records `review_failed` opens an `approve_landing` ask with the failure

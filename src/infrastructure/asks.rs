@@ -546,8 +546,9 @@ impl SqliteQueue {
 
     /// Close every `approve_landing` ask of the run nobody closed, the way
     /// [`Self::close_stuck_exit_asks`] does: a later review of the run
-    /// failed and asks afresh (task 328), so an earlier question, or an
-    /// answer to it not applied yet, no longer fits the run.
+    /// asks afresh (task 328, task 425) or the run was integrated
+    /// (task 425), so an earlier question, or an answer to it not applied
+    /// yet, no longer fits the run.
     pub fn close_approve_landing_asks(&mut self, run_id: &RunId, answer: &str) -> Result<Vec<Ask>> {
         self.close_runtime_asks(run_id, AskKind::ApproveLanding, answer)
     }

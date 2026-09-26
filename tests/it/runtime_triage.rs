@@ -937,6 +937,85 @@ fn an_adopted_run_whose_failed_review_ask_was_answered_has_the_answer_applied() 
     assert!(queue.run_leases().unwrap().is_empty());
 }
 
+/// A supervisor that died after opening the `approve_landing` ask of a
+/// `concern` and before giving the lease back (task 425): the next one
+/// adopts the run and waits for that ask, open or answered, rather than
+/// closing it as stale and asking again.
+#[test]
+fn an_adopted_run_whose_concern_was_asked_waits_for_the_ask() {
+    for answer in [None, Some("cancel")] {
+        let (_dir, repo, db) = fixture();
+        let run = orphan_run(&repo, &db, "dead-supervisor", dead_pid(), dead_pid());
+        validated_orphan(&db, &run);
+        let mut queue = SqliteQueue::open(&db).unwrap();
+        queue
+            .record_runtime_event(
+                run.id(),
+                "review_started",
+                json!({"attempt": 1, "workspace_id": null, "session_live": false, "session_id": "s"}),
+            )
+            .unwrap();
+        queue
+            .record_runtime_event(
+                run.id(),
+                "review_finished",
+                json!({"attempt": 1, "verdict": "concern", "reasons": ["out of scope"], "summary": "scope"}),
+            )
+            .unwrap();
+        let ask = queue
+            .ask(NewAsk {
+                kind: AskKind::ApproveLanding,
+                task_id: None,
+                run_id: Some(run.id().clone()),
+                question: "The supervisor's review of run r (task 1) returned concern: scope"
+                    .into(),
+                options: vec!["land".into(), "send_back".into(), "cancel".into()],
+                asked_by: "supervisor".into(),
+                reason_category: dagq::domain::AskReason::Scope,
+                finding_id: None,
+            })
+            .unwrap()
+            .ask
+            .id;
+        if let Some(answer) = answer {
+            queue.answer(ask, answer).unwrap();
+        }
+        kill_supervisor_and_wrapper(&db, &run);
+        let backend = TestWorkspace::new(&db, false, VALID_AGENT);
+        let reviewer = TestReviewer::new(&[verdict("pass", &[], "meets the acceptance")]);
+        let outcome = supervise_reviewed(&db, &repo, &backend, &reviewer);
+        assert_eq!(outcome["errors"], json!([]), "{outcome}");
+        assert!(reviewer.prompts().is_empty());
+        assert!(backend.notifications.lock().unwrap().is_empty());
+        let detail = queue.show(TaskId::new(1)).unwrap();
+        assert_eq!(adoption_events(&detail).len(), 1);
+        assert_eq!(payloads(&detail, "ask_opened").len(), 1);
+        assert!(
+            payloads(&detail, "ask_answered")
+                .iter()
+                .all(|p| p["runtime_closed"] != true)
+        );
+        assert!(queue.run_leases().unwrap().is_empty());
+        if answer.is_none() {
+            assert_eq!(
+                queue.run(run.id()).unwrap().status(),
+                RunStatus::AwaitingIntegration
+            );
+            let asks = queue.asks(AskQuery::default()).unwrap();
+            assert_eq!(asks.len(), 1, "{asks:?}");
+            assert_eq!(asks[0].id, ask);
+            assert!(asks[0].answer.is_none());
+        } else {
+            // The answer given while no supervisor ran is applied.
+            assert_eq!(queue.run(run.id()).unwrap().status(), RunStatus::Failed);
+            assert_eq!(detail.task.status(), TaskStatus::Canceled);
+            let closed = queue.read_ask(ask).unwrap();
+            assert!(closed.closed_at.is_some());
+            assert_eq!(closed.answer.as_deref(), Some("cancel"));
+        }
+    }
+}
+
 /// Make the live wrapper of `run_id` go silent the way a wrapper whose
 /// heartbeat stopped does while its process lives on: its row names another
 /// live process (`stand_in`, so the in-test wrapper's heartbeats no longer

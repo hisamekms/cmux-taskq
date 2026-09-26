@@ -5,9 +5,10 @@
 use super::*;
 
 /// The answer the supervisor closes an earlier, unclosed `approve_landing`
-/// ask of a run with when a later review of the run fails (task 328).
+/// ask of a run with when a later review of the run asks again: it failed
+/// (task 328) or did not pass (task 425).
 const STALE_LANDING_ASK_CLOSED: &str =
-    "a later review of the run failed and asks again; closed by the runtime";
+    "a later review of the run asks again; closed by the runtime";
 
 impl Supervisor<'_> {
     /// Record `landing_queued` as `run` starts to wait for the integration
@@ -509,15 +510,6 @@ impl Supervisor<'_> {
         attempt: usize,
         error: &str,
     ) -> Result<AskId> {
-        // An earlier ask of the run is about an earlier review (the run was
-        // sent back or landed by hand since): it would hold the new one back
-        // as a repeat, and its answer no longer fits.
-        for stale in self
-            .queue
-            .close_approve_landing_asks(run.id(), STALE_LANDING_ASK_CLOSED)?
-        {
-            info!(run_id = %run.id(), ask_id = %stale.id, "run {}: closed its earlier approve_landing ask {}", run.id(), stale.id);
-        }
         let mut question = format!(
             "The supervisor's headless review of run {} (task {}) failed and gave no verdict (review {attempt}): {error}",
             run.id(),
@@ -534,6 +526,15 @@ impl Supervisor<'_> {
         self.ask_approve_landing(run, question)
     }
     fn ask_approve_landing(&mut self, run: &TaskRun, question: String) -> Result<AskId> {
+        // An earlier ask of the run is about an earlier review (the run was
+        // sent back since): it would hold the new one back as a repeat, and
+        // its answer no longer fits (task 328, task 425).
+        for stale in self
+            .queue
+            .close_approve_landing_asks(run.id(), STALE_LANDING_ASK_CLOSED)?
+        {
+            info!(run_id = %run.id(), ask_id = %stale.id, "run {}: closed its earlier approve_landing ask {}", run.id(), stale.id);
+        }
         // Through `ask`, like the CLI: a new ask notifies the inbox.
         let outcome = ask::ask(
             &mut *self.queue,

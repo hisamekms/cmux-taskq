@@ -411,6 +411,7 @@ pub fn land_integrating(
                 landing.commit,
                 run.id()
             );
+            close_landing_asks(queue, &run);
             remove_landed_worktree(queue, repository, &run);
             let push = push_main(queue, ctx.remote, run.id(), &landing.commit);
             let follow_ups = register_follow_ups(queue, &task, run.id(), proposed.as_ref());
@@ -1291,6 +1292,30 @@ fn commit_message(task: &Task, run: &TaskRun, receipt: &Receipt) -> Vec<String> 
     }
     paragraphs.push(format!("Dagq-Task: {}\nDagq-Run: {}", task.id(), run.id()));
     paragraphs
+}
+
+/// The answer an `approve_landing` ask of a run nobody closed is closed
+/// with once the run is integrated (task 425).
+const LANDED_LANDING_ASK_CLOSED: &str = "the run was integrated; closed by the runtime";
+
+/// Close the `approve_landing` asks of the landed `run` nobody closed
+/// (task 425): whether it was landed by hand or by the supervisor, nobody
+/// needs to answer them any more. `main` already moved, so a failure is
+/// only reported.
+fn close_landing_asks(queue: &mut dyn Queue, run: &TaskRun) {
+    match queue.close_approve_landing_asks(run.id(), LANDED_LANDING_ASK_CLOSED) {
+        Ok(closed) => {
+            for ask in closed {
+                info!(op = "integrate", ask_id = %ask.id, "run {}: closed its approve_landing ask {} as it was integrated", run.id(), ask.id);
+            }
+        }
+        Err(error) => warn!(
+            op = "integrate",
+            error = %format_args!("{error:#}"),
+            "run {}: could not close its approve_landing asks: {error:#}",
+            run.id()
+        ),
+    }
 }
 
 /// Drop the landed run's worktree and branch. The result is already on

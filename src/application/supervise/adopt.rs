@@ -384,9 +384,18 @@ impl Supervisor<'_> {
             }
             _ => None,
         };
-        let Some(then) = then else {
+        let Some(mut then) = then else {
             return self.start_review(run, session);
         };
+        // The ask was opened before the supervisor died, after this anchor:
+        // the run waits for it (open or answered) rather than asking again,
+        // which would close it as stale and notify the inbox twice (task 425).
+        if matches!(then, AfterExit::Ask { .. })
+            && let Some(ask) = self.unclosed_landing_ask_after(&events, anchor)?
+        {
+            info!(run_id = %run.id(), ask_id = %ask.id, "run {} waits for a person in ask {}, opened before the supervisor stopped; it is not asked again", run.id(), ask.id);
+            then = AfterExit::Rest { close: true };
+        }
         let after = |kind: &str| events.iter().any(|e| e.id > anchor.id && e.kind == kind);
         let mut watch = ExitWatch::new(session, then);
         // Never a second /exit; its timeout restarts now.
@@ -415,19 +424,9 @@ impl Supervisor<'_> {
         events: &[crate::domain::RunEvent],
         started: &crate::domain::RunEvent,
     ) -> Result<Option<Phase>> {
-        let opened = events.iter().rev().find(|e| {
-            e.id > started.id
-                && e.kind == "ask_opened"
-                && e.payload["kind"] == AskKind::ApproveLanding.as_str()
-                && e.payload["asked_by"] == "supervisor"
-        });
-        let Some(ask_id) = opened.and_then(|e| e.payload["ask_id"].as_i64()) else {
+        let Some(ask) = self.unclosed_landing_ask_after(events, started)? else {
             return Ok(None);
         };
-        let ask = self.queue.read_ask(AskId::new(ask_id))?;
-        if ask.closed_at.is_some() {
-            return Ok(None);
-        }
         let after = |kind: &str| events.iter().any(|e| e.id > started.id && e.kind == kind);
         if !after("review_failed") {
             let attempt = started.payload["attempt"].as_u64().unwrap_or(1);
@@ -465,6 +464,26 @@ impl Supervisor<'_> {
         watch.timed_out = after("exit_request_timed_out");
         watch.exit_asked = !watch.timed_out || self.queue.has_stuck_exit_ask(run.id())?;
         Ok(Some(Phase::Exiting(watch)))
+    }
+    /// The last `approve_landing` ask the supervisor opened after event
+    /// `anchor`, if nobody closed it since: the ask of the step the anchor
+    /// led to, opened before the supervisor died.
+    fn unclosed_landing_ask_after(
+        &self,
+        events: &[crate::domain::RunEvent],
+        anchor: &crate::domain::RunEvent,
+    ) -> Result<Option<crate::domain::Ask>> {
+        let opened = events.iter().rev().find(|e| {
+            e.id > anchor.id
+                && e.kind == "ask_opened"
+                && e.payload["kind"] == AskKind::ApproveLanding.as_str()
+                && e.payload["asked_by"] == "supervisor"
+        });
+        let Some(ask_id) = opened.and_then(|e| e.payload["ask_id"].as_i64()) else {
+            return Ok(None);
+        };
+        let ask = self.queue.read_ask(AskId::new(ask_id))?;
+        Ok(ask.closed_at.is_none().then_some(ask))
     }
     /// Whether a lease no longer has a working process behind it: its pid
     /// is dead or its heartbeat is older than `HEARTBEAT_TIMEOUT_SECS`.
