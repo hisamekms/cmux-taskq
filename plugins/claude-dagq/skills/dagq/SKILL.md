@@ -43,13 +43,13 @@ A goal has no verification commands; a goal-level check is a final task dependin
 
 ### Register the tasks
 
-Split the goal into tasks one session finishes in one worktree. Collect per task: title (one line), description (what to change and where), acceptance (how a reviewer decides it is done), verification commands (run by `integrate` after its rebase; repeat `--verify`), dependencies (tasks that must be `completed` first; repeat `--depends-on`, may cross goals), `--context` (why it exists and what to read first, when the goal does not say it), and `--evidence` (receipt checks the run must report as `passed` with evidence: `tests`, `e2e` or `subagent_review`; repeatable). A missing check parks the run (`needs_session`, `evidence_missing`) for a resume. `--paths GLOB` (repeatable) limits what the task may change: a run changing more parks (`scope_violation`) and never lands. Pick `--verify`, `--paths` and `--evidence` by kind of change (docs, plugin, runtime) per `reference/scope.md`.
+Split the goal into tasks one session finishes in one worktree. Collect per task: title (one line), description (what to change and where), acceptance (how a reviewer decides it is done), verification commands (run by `integrate` after its rebase; repeat `--verify`), dependencies (tasks that must be `completed` first; repeat `--depends-on`, may cross goals), `--context` (why it exists and what to read first, when the goal does not say it), and `--evidence` (receipt checks the run must report as `passed` with evidence: `tests`, `e2e` or `subagent_review`; repeatable). A missing check parks the run (`needs_session`, `evidence_missing`) for a resume. `--paths GLOB` (repeatable) limits what the task may change: a run changing more parks (`scope_violation`) and never lands. Pick `--verify`, `--paths`, `--evidence` and `--kind` (docs, plugin, runtime, ci) by kind of change per `reference/scope.md`.
 
 ```sh
 "$DAGQ" add "TITLE" --goal 1 \
   --description "..." --acceptance "..." --context "..." \
   --verify "cargo fmt --all --check" --verify "cargo test --locked" \
-  --evidence e2e --depends-on 3
+  --evidence e2e --kind runtime --depends-on 3
 "$DAGQ" lint ID...               # the fixed rules; each violation {code, task_id, reason}
 "$DAGQ" submit ID...             # or --goal GOAL; prints the proposal
 "$DAGQ" candidates

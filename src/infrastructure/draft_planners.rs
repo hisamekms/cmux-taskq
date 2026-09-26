@@ -561,6 +561,7 @@ mod tests {
                 dependencies: Vec::new(),
                 goal_dependencies: Vec::new(),
                 priority: Default::default(),
+                kind: None,
                 goal_id: None,
                 context: String::new(),
             })

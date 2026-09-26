@@ -196,7 +196,10 @@ fn opening_or_initializing_an_older_queue_never_migrates_it() {
     std::fs::write(dir.path().join("backups/queue-23-5.sqlite3"), "earlier").unwrap();
     let report = SqliteQueue::migrate(&path, Some(&|_| false), 5).unwrap();
     assert_eq!(report.floor, floor_for(SqliteQueue::SCHEMA_VERSION));
-    assert_eq!(report.applied.len(), 10);
+    assert_eq!(
+        report.applied.len(),
+        usize::try_from(SqliteQueue::SCHEMA_VERSION - 23).unwrap()
+    );
     let backup = report.backup.unwrap();
     assert!(
         backup.ends_with("backups/queue-23-5-1.sqlite3"),

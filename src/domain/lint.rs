@@ -282,6 +282,7 @@ mod tests {
                 required_evidence: vec![EvidenceCheck::E2e],
                 paths: vec![],
                 priority: Default::default(),
+                kind: None,
             },
             "t".into(),
         )
@@ -463,6 +464,7 @@ mod tests {
             required_evidence: task.required_evidence().to_vec(),
             paths: task.paths().to_vec(),
             priority: task.priority(),
+            kind: task.kind(),
             status: task.status(),
             goal_id: task.goal_id(),
             context: task.context().into(),

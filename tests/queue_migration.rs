@@ -9,7 +9,7 @@ use dagq::{
     domain::search::{SearchKind, SearchQuery},
     domain::{
         EventId, EvidenceCheck, GoalId, GoalStatus, Priority, RunId, RunStatus, SupervisorMode,
-        TaskAction, TaskId, TaskStatus,
+        TaskAction, TaskId, TaskKind, TaskStatus,
     },
     infrastructure::{
         schema::{MIGRATIONS, floor_for},
@@ -906,4 +906,57 @@ fn migration_to_v29_gives_every_ask_the_reason_of_its_kind() {
             ("blocked", "scope"),
         ]
     );
+}
+
+/// Goal 21: the task kind is an addition. The tasks of an older queue have
+/// none after the migration, which raises no floor, and an older binary's
+/// insert that does not name the column leaves it null too.
+#[test]
+fn migration_adding_the_task_kind_keeps_older_tasks_without_one() {
+    // Found by its statement, not its number, which a landing may change.
+    let at = MIGRATIONS
+        .iter()
+        .position(|migration| migration.contains("ALTER TABLE tasks ADD COLUMN kind"))
+        .unwrap();
+    let before = i64::try_from(at).unwrap();
+    assert_eq!(floor_for(before + 1), floor_for(before));
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("queue.db");
+    let raw = Connection::open(&path).unwrap();
+    for migration in &MIGRATIONS[..at] {
+        raw.execute_batch(migration).unwrap();
+    }
+    raw.execute_batch(&format!(
+        "PRAGMA application_id = 1129599281; PRAGMA user_version = {before};
+         INSERT INTO schema_floor(singleton, floor) VALUES (1, {floor});
+         INSERT INTO tasks(title,description,acceptance,verification_commands,status)
+         VALUES ('runtime: older','','','[]','draft');",
+        floor = floor_for(before),
+    ))
+    .unwrap();
+    drop(raw);
+    // A compatible step: `migrated` expects the backup of a breaking one.
+    SqliteQueue::migrate(&path, None, 0).unwrap();
+    let mut queue = SqliteQueue::open(&path).unwrap();
+    assert_eq!(queue.show(TaskId::new(1)).unwrap().task.kind(), None);
+    let mut kinded = new_task("docs");
+    kinded.kind = Some(TaskKind::Docs);
+    let added = queue.add(kinded).unwrap();
+    assert_eq!(added.kind(), Some(TaskKind::Docs));
+    Connection::open(&path)
+        .unwrap()
+        .execute(
+            "INSERT INTO tasks(title,description,acceptance,verification_commands,status)
+             VALUES ('older binary','','','[]','draft')",
+            [],
+        )
+        .unwrap();
+    assert_eq!(queue.show(TaskId::new(3)).unwrap().task.kind(), None);
+    // A kind a newer binary added reads as none; the task still restores.
+    Connection::open(&path)
+        .unwrap()
+        .execute("UPDATE tasks SET kind='later' WHERE id=3", [])
+        .unwrap();
+    assert_eq!(queue.show(TaskId::new(3)).unwrap().task.kind(), None);
+    assert_eq!(queue.list(&Default::default()).unwrap().total, 3);
 }

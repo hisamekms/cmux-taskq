@@ -206,6 +206,7 @@ mod tests {
             required_evidence: Vec::new(),
             paths: Vec::new(),
             priority: Default::default(),
+            kind: None,
             status: TaskStatus::InProgress,
             goal_id: None,
             context: String::new(),

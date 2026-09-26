@@ -92,6 +92,7 @@ fn fixture() -> Fixture {
 fn add(queue: &mut SqliteQueue, title: &str, deps: &[TaskId], priority: Priority) -> TaskId {
     queue
         .add(NewTask {
+            kind: None,
             title: title.into(),
             description: format!("{title}: change the type of Foo"),
             acceptance: format!("{title} works; tests/cli.rs is not changed"),
@@ -1096,6 +1097,7 @@ fn runtime_draft(
             required_evidence: Vec::new(),
             paths: Vec::new(),
             priority: Priority::Normal,
+            kind: None,
             dependencies: Vec::new(),
             goal_dependencies: Vec::new(),
             goal_id: goal,

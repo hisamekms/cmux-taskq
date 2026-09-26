@@ -355,10 +355,11 @@ fn list_defaults_to_unfinished_tasks_newest_first_with_compact_items() {
         serde_json::to_value(&page).unwrap(),
         serde_json::json!({
             "tasks": [
-                {"id": d, "status": "ready", "priority": "normal", "title": "waiting",
+                {"id": d, "status": "ready", "priority": "normal", "kind": null, "title": "waiting",
                  "goal_id": null,
                  "dependencies": [], "goal_dependencies": [], "latest_run": null},
-                {"id": c, "status": "in_progress", "priority": "normal", "title": "claimed",
+                {"id": c, "status": "in_progress", "priority": "normal", "kind": null,
+                 "title": "claimed",
                  "goal_id": goal,
                  "dependencies": [a], "goal_dependencies": [],
                  "latest_run": {"id": run.id(), "status": "claimed"}},

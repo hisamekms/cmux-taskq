@@ -28,10 +28,11 @@ related:
   - `startup`: `agent_started`→`first_commit_observed`（[最初のcommitの観測](first-commit.md#最初のcommitの観測)。記録の無いrunはnull）
   - `resumes`: `resume_started`（ADR-0019の自動resume。記録されるまでは0）の数、`review_verdict`: 最後の`review_finished`の`verdict`（goal 11のreview工程が記録するまではnull）、`needs_session` / `failed`: payloadの`status`がその値のイベントの数。`integration_error`は試行前のstatusに戻すだけなので`needs_session`に数えない
   - `land_phases`: `wait_to_land`の工程別の内訳（下の[着地待ちの内訳](#着地待ちの内訳)）。`run_integrated`の無いrunはnull
-  - `title`: taskのtitle。`claimed_at` / `validated_at` / `landed_at`: 最初の`run_claimed`・最初の`validation_finished`・`run_integrated`の記録時刻（queueの`created_at`のまま。無ければnull）
+  - `title`: taskのtitle。`kind`: taskの変更の種類（goal 21。無いtaskはnull）。`claimed_at` / `validated_at` / `landed_at`: 最初の`run_claimed`・最初の`validation_finished`・`run_integrated`の記録時刻（queueの`created_at`のまま。無ければnull）
   - `integrate_attempts` / `deferrals` / `conflict_files` / `broken_by` / `broke_runs` / `resume_attempts`: 着地の延期の中身と、崩した着地、resumeの効き目（下の[着地の延期とresume](#着地の延期とresume)）
 - **`goals`と`overall`**の`land_phases`: 着地したrun（`land_phases`と`wait_to_land`のあるrun）についての`{runs, tail_threshold, tail_runs, <工程>..., push}`。`tail_threshold`はそれらのrunの`wait_to_land`の90パーセンタイル（nearest-rank: 昇順でceil(0.9×n)番目。runが無ければnull）、`tail_runs`は`wait_to_land`がそれ以上のrun（長い裾）の数。工程ごとと`push`は`{count, total, median, p90, max, tail_total}`で、`count` / `total` / `median`は他の区間と同じ規則（工程は着地したrun全部を0も含めて数え、`push`は記録のあるrunだけ）、`p90`は上と同じ規則、`tail_total`は長い裾のrunだけの合計。どの工程が裾を作ったかは工程ごとの`tail_total`を比べて読む
 - **`goals`と`overall`**の`resume_outcomes`: それらのrunの`resume_attempts`全部の`{attempts, resolved, unresolved, resolved_percent, secs}`と、理由ごとの同じ形の`by_reason`（下の[着地の延期とresume](#着地の延期とresume)）
+- **`kinds`**: taskの`kind`ごと（名前の昇順、kindの無いtaskのrunは`kind: null`で最後）に、`goals`と同じ形（`runs`と区間ごとの`{count, total, median}`、`land_phases`、`resume_outcomes`）。`runs`のkindで`domain::stats::with_kinds`が組み、observerの入力の`stats`にも出る
 - **`goals`と`overall`**: goalごと（goal昇順、goalの無いrunは`goal_id: null`で最後）と全体で、`runs`（件数）と区間ごとの`{count, total, median}`。区間の無いrunは数えない。中央値は偶数個なら中央2つの平均の切り捨て。
 - **`alerts`**: `[{kind, task_id, run_id, value, threshold, path?}]`（`value`と`threshold`は秒か回数）。対象のrunに加えて、まだ終わっていないrunも見る。
   - `awaiting_integration`: `wait_to_land`が15分（900秒）を超えたrun。まだ`awaiting_integration`にいるrunは最初に`awaiting_integration`になってからの経過で判定する（着地の失敗で戻っても起点は変えない）。着地待ちの内訳で最も長い工程を`phase`に添える（まだ待っているrunは今の時刻までの内訳。どの工程も0秒なら付けない）。他のalertは`phase`を持たない

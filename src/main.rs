@@ -124,6 +124,11 @@ enum Command {
         /// soon), normal, or low (later). A ready task it waits for inherits it.
         #[arg(long, default_value = "normal", value_parser = PRIORITIES)]
         priority: String,
+        /// What the task changes: docs (documents, ADRs included), plugin (the plugin's
+        /// skills and documents), runtime (src/, tests/, migrations/) or ci (scripts and
+        /// CI). Omitted: none.
+        #[arg(long, value_parser = KINDS)]
+        kind: Option<String>,
     },
     /// List one page of tasks, newest first: unfinished ones unless --status or --all says otherwise.
     /// Prints {"tasks", "next", "total"}; pass `next` to --before for the following page (null: none).
@@ -290,6 +295,9 @@ enum Command {
         /// Declare no paths: runs may change anything.
         #[arg(long, group = "field")]
         no_paths: bool,
+        /// What the task changes (`add --kind`): docs, plugin, runtime or ci.
+        #[arg(long, group = "field", value_parser = KINDS)]
+        kind: Option<String>,
     },
     /// Give a draft or ready task another priority (`add --priority`); it takes effect at the
     /// next claim and never stops a running run.
@@ -825,6 +833,7 @@ enum Command {
 const ROLES: [&str; 2] = ["inbox", "planner"];
 /// The names of the task priorities (ADR-0040 decision 4), highest first.
 const PRIORITIES: [&str; 5] = ["interrupt", "urgent", "high", "normal", "low"];
+const KINDS: [&str; 4] = ["docs", "plugin", "runtime", "ci"];
 
 fn parse_role(value: Option<String>) -> Result<Option<SessionRole>> {
     Ok(value.map(|value| value.parse()).transpose()?)
@@ -1268,6 +1277,7 @@ fn execute(cli: Cli) -> Result<Value> {
             required_evidence,
             paths,
             priority,
+            kind,
         } => serde_json::to_value(
             queue.add(NewTask {
                 title,
@@ -1284,6 +1294,7 @@ fn execute(cli: Cli) -> Result<Value> {
                     .collect::<Result<_, _>>()?,
                 paths,
                 priority: priority.parse()?,
+                kind: kind.map(|kind| kind.parse()).transpose()?,
             })?,
         )?,
         Command::List {
@@ -1485,6 +1496,7 @@ fn execute(cli: Cli) -> Result<Value> {
             no_evidence,
             paths,
             no_paths,
+            kind,
         } => {
             // A list flag replaces the list; its --no- flag empties it.
             let replaced =
@@ -1502,6 +1514,7 @@ fn execute(cli: Cli) -> Result<Value> {
                     required_evidence,
                     paths: replaced(paths, no_paths),
                     context,
+                    kind: kind.map(|kind| kind.parse()).transpose()?,
                 },
             )?)?
         }

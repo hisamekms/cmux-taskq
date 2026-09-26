@@ -42,6 +42,18 @@ string_enum!(TaskStatus {
     Canceled => "canceled",
 });
 
+// What a task changes (goal 21, ADR-0029 decision 6): the kinds of change
+// AGENTS.md pairs `--paths` and `--verify` for. `docs` is documents (an ADR
+// included), `plugin` the plugin's skills and documents, `runtime` the
+// crate (`src/`, `tests/`, `migrations/`), `ci` the scripts and CI
+// configuration. A task registered before the kind existed has none.
+string_enum!(TaskKind {
+    Docs => "docs",
+    Plugin => "plugin",
+    Runtime => "runtime",
+    Ci => "ci",
+});
+
 string_enum!(RunStatus {
     Claimed => "claimed",
     Starting => "starting",
@@ -842,6 +854,7 @@ mod tests {
             required_evidence: Vec::new(),
             paths: Vec::new(),
             priority: Default::default(),
+            kind: None,
             dependencies: vec![TaskId::new(0)],
             goal_dependencies: Vec::new(),
             goal_id: None,
@@ -929,6 +942,7 @@ mod tests {
             required_evidence: vec![EvidenceCheck::E2e, EvidenceCheck::Tests, EvidenceCheck::E2e],
             paths: Vec::new(),
             priority: Default::default(),
+            kind: None,
             dependencies: Vec::new(),
             goal_dependencies: Vec::new(),
             goal_id: None,

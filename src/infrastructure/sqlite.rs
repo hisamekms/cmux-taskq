@@ -23,7 +23,7 @@ use crate::{
         GoalPredecessor, GoalRecord, GoalSummary, GoalTask, GoalVerdict, LintInput, LintNode,
         NewGoal, NewNote, NewTask, NotePage, NoteQuery, NoteTarget, OBSERVATION_KIND, Predecessor,
         Priority, Proposal, ProposalId, Provider, RunEvent, RunId, RunRecord, Submission, Task,
-        TaskAction, TaskDetail, TaskEdit, TaskId, TaskRecord, TaskRun, TaskStatus,
+        TaskAction, TaskDetail, TaskEdit, TaskId, TaskKind, TaskRecord, TaskRun, TaskStatus,
         TaskStatusCounts, goal, scope::validate_path_globs, task,
     },
     infrastructure::{
@@ -1279,7 +1279,7 @@ impl TaskStore for SqliteQueue {
             tx.execute(
                 "UPDATE tasks SET title=?1, description=?2, acceptance=?3,
                  verification_commands=?4, required_evidence=?5, paths=?6, context=?7,
-                 updated_at=?8 WHERE id=?9",
+                 kind=?8, updated_at=?9 WHERE id=?10",
                 params![
                     new.title(),
                     new.description(),
@@ -1288,6 +1288,7 @@ impl TaskStore for SqliteQueue {
                     serde_json::to_string(new.required_evidence())?,
                     serde_json::to_string(new.paths())?,
                     new.context(),
+                    new.kind().map(TaskKind::as_str),
                     self.generators.clock.timestamp(),
                     task_id
                 ],
@@ -1337,7 +1338,7 @@ impl TaskStore for SqliteQueue {
 
 /// The fields `dagq edit` replaces, as the task JSON names them; `task_edited`
 /// records the ones that changed.
-const EDITABLE_TASK_FIELDS: [&str; 7] = [
+const EDITABLE_TASK_FIELDS: [&str; 8] = [
     "title",
     "description",
     "acceptance",
@@ -1345,6 +1346,7 @@ const EDITABLE_TASK_FIELDS: [&str; 7] = [
     "required_evidence",
     "paths",
     "context",
+    "kind",
 ];
 
 /// Register `new` inside the caller's write transaction with
@@ -1360,13 +1362,14 @@ pub(super) fn insert_task(tx: &Connection, new: NewTask, now: &str) -> Result<Ta
     let id = task.id();
     tx.execute(
             "INSERT INTO tasks(id, title, description, acceptance, verification_commands, status, goal_id,
-                               context, required_evidence, paths, priority, created_at, updated_at)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+                               context, required_evidence, paths, priority, kind, created_at,
+                               updated_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
             params![id, task.title(), task.description(), task.acceptance(),
                 serde_json::to_string(task.verification_commands())?, task.status().as_str(),
                 task.goal_id(), task.context(), serde_json::to_string(task.required_evidence())?,
-                serde_json::to_string(task.paths())?, task.priority().as_i64(), task.created_at(),
-                task.updated_at()],
+                serde_json::to_string(task.paths())?, task.priority().as_i64(),
+                task.kind().map(TaskKind::as_str), task.created_at(), task.updated_at()],
         )?;
     event(
         tx,
@@ -1968,6 +1971,11 @@ fn task_row(row: &Row<'_>) -> rusqlite::Result<Task> {
         required_evidence: json_col(row, "required_evidence")?,
         paths: json_col(row, "paths")?,
         priority: Priority::from_i64(row.get("priority")?).map_err(restore_error)?,
+        // A kind a newer binary added reads as none, so the task still
+        // restores and the queue keeps claiming (the column is compatible).
+        kind: row
+            .get::<_, Option<String>>("kind")?
+            .and_then(|kind| kind.parse().ok()),
         status: enum_col(row, "status")?,
         goal_id: row.get("goal_id")?,
         context: row.get("context")?,

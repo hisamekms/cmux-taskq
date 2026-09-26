@@ -10,13 +10,14 @@
 
 Follow the repository instructions first; for this repository:
 
-| Change | `--paths` | `--verify` | `--evidence` |
-| --- | --- | --- | --- |
-| Docs only | `'docs/**'`, `'*.md'` | `'cargo fmt --all --check'` (or none) | none |
-| Plugin docs and skills | `'plugins/**'`, `'docs/**'`, `'*.md'` | `'cargo test --locked --test plugin'` (`tests/plugin.rs` checks the skills) | none |
-| Runtime (`src/`, `tests/`, `migrations/`) | none | fmt, clippy, `cargo llvm-cov nextest --locked --fail-under-lines 80` (it runs every test, so no separate `cargo test`) | `e2e` |
+| Change | `--kind` | `--paths` | `--verify` | `--evidence` |
+| --- | --- | --- | --- | --- |
+| Docs only (ADRs included) | `docs` | `'docs/**'`, `'*.md'` | `'cargo fmt --all --check'` (or none) | none |
+| Plugin docs and skills | `plugin` | `'plugins/**'`, `'docs/**'`, `'*.md'` | `'cargo test --locked --test plugin'` (`tests/plugin.rs` checks the skills) | none |
+| Runtime (`src/`, `tests/`, `migrations/`) | `runtime` | none | fmt, clippy, `cargo llvm-cov nextest --locked --fail-under-lines 80` (it runs every test, so no separate `cargo test`) | `e2e` |
+| Scripts and CI | `ci` | as the repository says | as the repository says | none |
 
-A task that mixes kinds takes the verification of the heaviest kind.
+A task that mixes kinds takes the verification and the `--kind` of the heaviest kind. `--kind` decides no check; it records what the task changes so `show`, `list` and `stats` (`kinds`: runs and median times per kind) need not guess from the title. Change it with `edit TASK --kind KIND` while the task is `draft` or `submitted`. A task without one (every task registered before the kind existed) shows `kind: null`.
 
 The `--verify` commands are integrate's gate, not the worker's checklist: the worker prompt shows them as what integrate runs once after its rebase and tells the session to run the checks the repository's instructions ask of a worker (the `--verify` commands only when the instructions name none). In this repository a worker runs fmt, clippy, `cargo test` for only the tests related to its change (`cargo test --locked --test <file>`, `cargo test --locked --lib <module>`: the unit tests of the changed module, the feature's `tests/*.rs`, and the test files that use a changed `tests/common` helper) and the task's `--verify` commands other than the coverage gate (`cargo llvm-cov nextest`, or `cargo llvm-cov` in tasks registered before ADR-0076, which stay valid) and a whole `cargo test --locked`, and writes the range it ran into the receipt's `tests` evidence. It never runs the whole `cargo test --locked`: integrate's verification runs every test once after its rebase (`cargo llvm-cov nextest` for a runtime task) (a run resumed because integrate's verification failed may rerun the failing command to reproduce it). A runtime run still runs e2e itself and writes it into the receipt's `e2e`. Decided by a person with the planner on 2026-09-26 (task 528): the worker's whole `cargo test` repeated the tests llvm-cov runs, and the extra test binaries made build and link heavy, raising host load and the worker's work time (median 1439 s).
 

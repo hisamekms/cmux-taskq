@@ -20,7 +20,7 @@ use crate::domain::{
     AskId, ClaimOutcome, CommitSha, DomainError, EventFilter, EventId, GoalId, PlannerId,
     PlannerOrigin, PlannerSession, ProposalId, Reason, ReasonCode, RunEvent, RunId, RunLease,
     RunPaths, RunProcess, RunStatus, SessionRole, SupervisorMode, SupervisorRegistration, Task,
-    TaskAction, TaskId, TaskRun,
+    TaskAction, TaskId, TaskKind, TaskRun,
     resume::{self, ResumeCount},
     run,
 };
@@ -1367,6 +1367,19 @@ impl SqliteQueue {
             .conn
             .prepare("SELECT id, title FROM tasks")?
             .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// The kind of every task, for `stats`; a kind this binary does not
+    /// know is read as none, as `task_row` reads it.
+    pub fn task_kinds(&self) -> Result<HashMap<TaskId, Option<TaskKind>>> {
+        Ok(self
+            .conn
+            .prepare("SELECT id, kind FROM tasks")?
+            .query_map([], |row| {
+                let kind: Option<String> = row.get(1)?;
+                Ok((row.get(0)?, kind.and_then(|kind| kind.parse().ok())))
+            })?
             .collect::<rusqlite::Result<_>>()?)
     }
 
@@ -2839,6 +2852,9 @@ impl RunStore for SqliteQueue {
     }
     fn task_goals(&self) -> Result<HashMap<TaskId, Option<GoalId>>> {
         SqliteQueue::task_goals(self)
+    }
+    fn task_kinds(&self) -> Result<HashMap<TaskId, Option<TaskKind>>> {
+        SqliteQueue::task_kinds(self)
     }
     fn task_titles(&self) -> Result<HashMap<TaskId, String>> {
         SqliteQueue::task_titles(self)

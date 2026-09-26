@@ -21,7 +21,7 @@ use crate::domain::{
     PlanReviewDecision, PlanReviewVerdict, PlannerId, PlannerOrigin, PlannerSession, Predecessor,
     Priority, Proposal, ProposalId, Reason, ReasonCode, RunEvent, RunId, RunLease, RunPlan,
     RunProcess, RunStatus, SessionRole, Submission, SupervisorMode, SupervisorRegistration, Task,
-    TaskAction, TaskDetail, TaskEdit, TaskId, TaskRun, TaskStatus,
+    TaskAction, TaskDetail, TaskEdit, TaskId, TaskKind, TaskRun, TaskStatus,
 };
 
 pub trait TaskStore {
@@ -960,6 +960,8 @@ pub trait RunStore {
     fn task_goals(&self) -> Result<HashMap<TaskId, Option<GoalId>>>;
     /// The title of every task, for `stats`.
     fn task_titles(&self) -> Result<HashMap<TaskId, String>>;
+    /// The kind of every task (none for a task without one), for `stats`.
+    fn task_kinds(&self) -> Result<HashMap<TaskId, Option<TaskKind>>>;
     /// Point the queue at `common_dir` whatever it was bound to, and return
     /// the previous binding (`rebind`, ADR-0020).
     fn rebind_repository(&mut self, common_dir: &str) -> Result<Option<String>>;

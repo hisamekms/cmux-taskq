@@ -13,7 +13,7 @@ Which planner you are is in your initial prompt: opened by a person (they are at
 
 ## 1. Plan with the person and submit
 
-Hear the problem, then follow the `dagq` skill's section 2: a goal (`goal add`) unless it is a one-shot task, and tasks with `add --goal` (acceptance, verification, dependencies, context, `--paths`, `--evidence` per the repository's AGENTS.md). Fix a draft in place with `edit`. Check the order with `"$DAGQ" graph --goal ID`, then run the mechanical checks and submit once the person agrees with the decomposition:
+Hear the problem, then follow the `dagq` skill's section 2: a goal (`goal add`) unless it is a one-shot task, and tasks with `add --goal` (acceptance, verification, dependencies, context, `--paths`, `--evidence`, `--kind` per the repository's AGENTS.md). Fix a draft in place with `edit`. Check the order with `"$DAGQ" graph --goal ID`, then run the mechanical checks and submit once the person agrees with the decomposition:
 
 ```sh
 "$DAGQ" lint TASK...            # or --proposal ID; fix every violation first

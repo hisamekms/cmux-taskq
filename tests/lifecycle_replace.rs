@@ -42,6 +42,7 @@ fn claim_a_run(fixture: &Fixture, queue: &mut SqliteQueue, token: &str) -> Strin
             required_evidence: Vec::new(),
             paths: Vec::new(),
             priority: Default::default(),
+            kind: None,
             dependencies: vec![],
             goal_dependencies: Vec::new(),
             goal_id: None,
@@ -749,6 +750,7 @@ fn up_applies_compatible_migrations_and_refuses_breaking_ones() {
              ALTER TABLE supervisors DROP COLUMN handoff_requested_at;
              ALTER TABLE supervisors DROP COLUMN auto_update;
              DROP TABLE binary_updates;
+             ALTER TABLE tasks DROP COLUMN kind;
              PRAGMA user_version = 30;",
         )
         .unwrap();
@@ -784,8 +786,8 @@ fn up_applies_compatible_migrations_and_refuses_breaking_ones() {
     assert_eq!(report["supervisor"]["outcome"], "started", "{report}");
     assert_eq!(report["migrated"], Value::Null, "{report}");
 
-    // Only the compatible automatic-update migration (0033) is pending: `up`
-    // applies it and goes on. Its version is looked up rather than written,
+    // Only compatible migrations are pending, the automatic update's (0033)
+    // first, then the task kind's: `up` applies them and goes on. Its version is looked up rather than written,
     // so a later migration does not rewrite this test (ADR-0067 decision 4).
     let auto_update = dagq::infrastructure::schema::MIGRATIONS
         .iter()
@@ -797,6 +799,7 @@ fn up_applies_compatible_migrations_and_refuses_breaking_ones() {
         .execute_batch(&format!(
             "ALTER TABLE supervisors DROP COLUMN auto_update;
              DROP TABLE binary_updates;
+             ALTER TABLE tasks DROP COLUMN kind;
              PRAGMA user_version = {};",
             auto_update - 1
         ))

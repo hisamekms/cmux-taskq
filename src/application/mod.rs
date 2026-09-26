@@ -32,7 +32,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::domain::{
     EvidenceCheck, GoalId, GoalStatus, GoalVerdict, Priority, RunId, RunStatus, Task, TaskId,
-    TaskStatus,
+    TaskKind, TaskStatus,
 };
 
 /// Which task statuses `list` returns.
@@ -95,6 +95,8 @@ pub struct TaskListItem {
     pub id: TaskId,
     pub status: TaskStatus,
     pub priority: Priority,
+    /// What the task changes; null when it was registered without a kind.
+    pub kind: Option<TaskKind>,
     pub title: String,
     pub goal_id: Option<GoalId>,
     /// IDs of the direct predecessors, ascending.
@@ -151,6 +153,7 @@ impl TaskListItem {
             id: task.id(),
             status: task.status(),
             priority: task.priority(),
+            kind: task.kind(),
             title: task.title().to_owned(),
             goal_id: task.goal_id(),
             dependencies,
@@ -705,6 +708,7 @@ mod tests {
                 required_evidence: Vec::new(),
                 paths: Vec::new(),
                 priority: Priority::Low,
+                kind: None,
                 status: TaskStatus::Ready,
                 goal_id: None,
                 context: String::new(),

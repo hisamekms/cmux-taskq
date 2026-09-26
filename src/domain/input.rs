@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use super::{
     CommitSha, DomainError, EvidenceCheck, GoalId, GoalStatus, GoalVerdict, Priority, Provider,
-    RunId, RunStatus, TaskId, TaskStatus, require, scope,
+    RunId, RunStatus, TaskId, TaskKind, TaskStatus, require, scope,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -34,6 +34,9 @@ pub struct NewTask {
     /// How urgently the task should be claimed (ADR-0040 decision 4).
     #[serde(default)]
     pub priority: Priority,
+    /// What the task changes (goal 21); none when the registrant did not say.
+    #[serde(default)]
+    pub kind: Option<TaskKind>,
 }
 
 impl NewTask {
@@ -137,6 +140,8 @@ pub struct TaskEdit {
     pub required_evidence: Option<Vec<EvidenceCheck>>,
     pub paths: Option<Vec<String>>,
     pub context: Option<String>,
+    #[serde(default)]
+    pub kind: Option<TaskKind>,
 }
 
 impl TaskEdit {
@@ -148,6 +153,7 @@ impl TaskEdit {
             && self.required_evidence.is_none()
             && self.paths.is_none()
             && self.context.is_none()
+            && self.kind.is_none()
     }
 
     /// The rules of [`NewTask::validate`] for the fields it replaces.
@@ -182,6 +188,7 @@ pub struct TaskRecord {
     pub required_evidence: Vec<EvidenceCheck>,
     pub paths: Vec<String>,
     pub priority: Priority,
+    pub kind: Option<TaskKind>,
     pub status: TaskStatus,
     pub goal_id: Option<GoalId>,
     pub context: String,

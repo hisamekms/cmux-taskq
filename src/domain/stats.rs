@@ -9,7 +9,7 @@ use serde::Serialize;
 use serde_json::Value;
 
 use super::{
-    EventId, GoalId, RunEvent, RunId, RunStatus, TaskId,
+    EventId, GoalId, RunEvent, RunId, RunStatus, TaskId, TaskKind,
     reason::{REPEATED_CODE_KINDS, event_code},
     stall::{BackgroundTask, StallConfig},
 };
@@ -180,6 +180,8 @@ pub struct RunStats {
     pub land_phases: Option<LandPhases>,
     /// The task's title (task 466).
     pub title: Option<String>,
+    /// The task's kind (goal 21); null for a task without one.
+    pub kind: Option<TaskKind>,
     /// When the run was claimed (`run_claimed`), first validated
     /// (`validation_finished`) and landed (`run_integrated`).
     pub claimed_at: Option<String>,
@@ -216,6 +218,15 @@ pub struct Intervals {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct GoalStats {
     pub goal_id: Option<GoalId>,
+    #[serde(flatten)]
+    pub intervals: Intervals,
+}
+
+/// The runs of one kind of task (goal 21), as [`GoalStats`] groups them by
+/// goal: `kind` is null for the runs of tasks registered without one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct KindStats {
+    pub kind: Option<TaskKind>,
     #[serde(flatten)]
     pub intervals: Intervals,
 }
@@ -312,6 +323,9 @@ pub struct Stats {
     pub runs: Vec<RunStats>,
     /// One entry per goal of those runs, ascending; runs of no goal last.
     pub goals: Vec<GoalStats>,
+    /// One entry per kind of those runs' tasks, by name; runs of tasks
+    /// without a kind last ([`with_kinds`]).
+    pub kinds: Vec<KindStats>,
     pub overall: Intervals,
     pub alerts: Vec<Alert>,
     /// Failed backend calls after `--since` (up to `next_cursor`); without
@@ -739,6 +753,7 @@ pub fn stats(
     Stats {
         runs: finished.into_iter().map(|track| track.stats).collect(),
         goals: goal_stats,
+        kinds: Vec::new(),
         overall,
         alerts,
         backend_failures,
@@ -1191,6 +1206,27 @@ fn summary(values: impl Iterator<Item = Option<i64>>) -> Summary {
     }
 }
 
+/// Give each run of `stats` the kind of its task from `kinds`, and group
+/// the runs by it into `stats.kinds` (goal 21): which kind of change takes
+/// how long, and where the landings wait.
+pub fn with_kinds(stats: &mut Stats, kinds: &HashMap<TaskId, Option<TaskKind>>) {
+    for run in &mut stats.runs {
+        run.kind = kinds.get(&run.task_id).copied().flatten();
+    }
+    let mut by_kind: BTreeMap<(bool, Option<&str>), Vec<&RunStats>> = BTreeMap::new();
+    for run in &stats.runs {
+        let kind = run.kind.map(TaskKind::as_str);
+        by_kind.entry((kind.is_none(), kind)).or_default().push(run);
+    }
+    stats.kinds = by_kind
+        .values()
+        .map(|runs| KindStats {
+            kind: runs[0].kind,
+            intervals: intervals(runs),
+        })
+        .collect();
+}
+
 fn intervals(runs: &[&RunStats]) -> Intervals {
     Intervals {
         runs: runs.len(),
@@ -1257,6 +1293,7 @@ fn runs(events: &[RunEvent], goals: &HashMap<TaskId, Option<GoalId>>) -> Vec<Tra
                     failed: 0,
                     land_phases: None,
                     title: None,
+                    kind: None,
                     claimed_at: None,
                     validated_at: None,
                     landed_at: None,

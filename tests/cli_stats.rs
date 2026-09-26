@@ -171,6 +171,8 @@ mod stats {
                 // Task 466: the times, the landings and the resumes. The
                 // title comes from the queue, not the events.
                 "title": null,
+                // Goal 21: the kind comes from the queue too.
+                "kind": null,
                 "claimed_at": "2026-09-23T12:00:00.000Z",
                 "validated_at": "2026-09-23T12:12:00.000Z",
                 "landed_at": "2026-09-23T12:32:00.000Z",
@@ -540,7 +542,7 @@ mod stats {
         assert_eq!(empty["alerts"], json!([]));
         assert_eq!(empty["overall"]["work"]["median"], Value::Null);
         ok(&db, &["goal", "add", "measured"]);
-        ok(&db, &["add", "first", "--goal", "1"]);
+        ok(&db, &["add", "first", "--goal", "1", "--kind", "runtime"]);
         ok(&db, &["add", "second"]);
         ok(&db, &["ready", "1", "--bypass-review"]);
         ok(&db, &["ready", "2", "--bypass-review"]);
@@ -567,6 +569,9 @@ mod stats {
         assert_eq!(report["runs"][0]["goal_id"], 1);
         assert_eq!(report["runs"][0]["failed"], 1);
         assert!(report["runs"][0]["work"].is_i64());
+        assert_eq!(report["runs"][0]["kind"], "runtime");
+        assert_eq!(report["kinds"][0]["kind"], "runtime");
+        assert_eq!(report["kinds"][0]["runs"], 1);
         let cursor = report["next_cursor"].as_i64().unwrap();
         assert_eq!(cursor, ok(&db, &["status"])["cursor"].as_i64().unwrap());
 
@@ -582,6 +587,13 @@ mod stats {
                 .len(),
             2
         );
+        // Per kind, by name, then the runs of tasks without a kind.
+        let kinds = ok(&db, &["stats", "--full"])["kinds"].clone();
+        assert_eq!(kinds.as_array().unwrap().len(), 2);
+        assert_eq!(kinds[0]["kind"], "runtime");
+        assert_eq!(kinds[1]["kind"], Value::Null);
+        assert_eq!(kinds[1]["runs"], 1);
+        assert!(kinds[1]["work"]["median"].is_i64());
         let goal = ok(&db, &["stats", "--goal", "1"]);
         assert_eq!(goal["runs"].as_array().unwrap().len(), 1);
         assert_eq!(goal["goals"][0]["goal_id"], 1);
