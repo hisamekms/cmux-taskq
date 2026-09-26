@@ -2,10 +2,12 @@
 id: adr-0040
 type: adr
 title: 検証をintegrateの1回にし、reviewをsupervisorの工程にし、dagq.tomlでrunのenvを渡し、taskの5段階の優先度と解放数でclaim順を決め、statsで詰まりを数える
-status: accepted
+status: superseded
 created: 2026-09-25
 updated: 2026-09-25
 accepted_on: 2026-09-25
+superseded_by: adr-0049
+superseded_on: 2026-09-26
 supersedes:
   - adr-0023
 owners:
@@ -32,6 +34,8 @@ related:
 ---
 
 # ADR-0040: 検証をintegrateの1回にし、reviewをsupervisorの工程にし、dagq.tomlでrunのenvを渡し、taskの5段階の優先度と解放数でclaim順を決め、statsで詰まりを数える
+
+> **置き換え済み（2026-09-26）**: このADRの決定は現在有効ではない。現行の決定は[ADR-0049](0049-share-compile-cache-across-runs-and-break-down-wait-to-land.md)を読む。
 
 ## Context
 
