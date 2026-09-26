@@ -308,6 +308,7 @@ impl PlanReviewStore for SqliteQueue {
         proposal_id: ProposalId,
         token: &str,
         plan_reviews_dir: &Path,
+        cwd: &Path,
     ) -> Result<Option<PlanReviewJob>> {
         let now = self.generators.clock.now();
         let tx = self
@@ -364,12 +365,13 @@ impl PlanReviewStore for SqliteQueue {
         // The job's Claude session id, given to it by the runtime (ADR-0048
         // decision 4).
         let session_id = self.generators.ids.uuid();
+        let cwd = cwd.to_str().context("repository checkout is not UTF-8")?;
         event(
             &tx,
             anchor,
             None,
             "plan_review_started",
-            json!({"proposal_id": proposal_id, "plan_review_id": id, "attempt": attempt, "dir": dir_text, "session_id": session_id}),
+            json!({"proposal_id": proposal_id, "plan_review_id": id, "attempt": attempt, "dir": dir_text, "session_id": session_id, "cwd": cwd}),
         )?;
         tx.commit()?;
         Ok(Some(PlanReviewJob {
@@ -928,5 +930,78 @@ fn latest_reasons(conn: &Connection, proposal_id: ProposalId) -> Result<Vec<Stri
             .collect()),
         Some(_) => bail!("plan review verdict of proposal {proposal_id} has malformed reasons"),
         None => Ok(Vec::new()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        application::TaskStore,
+        domain::{NewTask, PlannerOrigin, PlannerOwner, Submission},
+    };
+
+    /// The job's checkout is on its start event, and so on the span of its
+    /// Claude session (ADR-0048).
+    #[test]
+    fn a_plan_review_records_the_checkout_it_runs_in() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut queue = SqliteQueue::init(dir.path().join("q.db")).unwrap();
+        let task_id = queue
+            .add(NewTask {
+                title: "t".into(),
+                description: String::new(),
+                acceptance: String::new(),
+                verification_commands: Vec::new(),
+                required_evidence: Vec::new(),
+                paths: Vec::new(),
+                dependencies: Vec::new(),
+                goal_dependencies: Vec::new(),
+                priority: Default::default(),
+                goal_id: None,
+                context: String::new(),
+                kind: None,
+            })
+            .unwrap()
+            .id();
+        let proposal_id = queue
+            .submit(Submission {
+                tasks: vec![task_id],
+                goals: Vec::new(),
+                proposal: None,
+                owner: PlannerOwner {
+                    origin: PlannerOrigin::Person,
+                    workspace_id: None,
+                },
+            })
+            .unwrap()
+            .id();
+        let job = queue
+            .begin_plan_review(
+                proposal_id,
+                "token",
+                &dir.path().join("plan-reviews"),
+                Path::new("/repo"),
+            )
+            .unwrap()
+            .unwrap();
+        let payload = |kind: &str| -> Value {
+            let text: String = queue
+                .conn
+                .query_row(
+                    "SELECT payload FROM run_events WHERE kind=?1",
+                    [kind],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            serde_json::from_str(&text).unwrap()
+        };
+        let started = payload("plan_review_started");
+        assert_eq!(started["cwd"], "/repo");
+        assert_eq!(started["session_id"], job.session_id.as_str());
+        assert_eq!(started["plan_review_id"], job.id);
+        let opened = payload("session_opened");
+        assert_eq!(opened["kind"], "plan_review");
+        assert_eq!(opened["cwd"], "/repo");
     }
 }

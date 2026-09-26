@@ -423,6 +423,16 @@ fn a_passing_plan_review_readies_the_proposal_with_its_actions() {
     let started = events(&mut queue, two, "plan_review_started");
     assert_eq!(started.len(), 1);
     assert_eq!(started[0]["proposal_id"], json!(proposal));
+    // The job runs in the repository's checkout, and its Claude session's
+    // span has that cwd (ADR-0048).
+    assert_eq!(
+        started[0]["cwd"],
+        fx.repo.canonicalize().unwrap().to_str().unwrap()
+    );
+    let opened = events(&mut queue, two, "session_opened");
+    assert_eq!(opened.len(), 1);
+    assert_eq!(opened[0]["kind"], "plan_review");
+    assert_eq!(opened[0]["cwd"], started[0]["cwd"]);
     let finished = events(&mut queue, two, "plan_review_finished");
     assert_eq!(finished[0]["decision"], "pass");
     assert_eq!(finished[0]["summary"], "sound");

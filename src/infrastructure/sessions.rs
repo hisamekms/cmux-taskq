@@ -688,6 +688,8 @@ mod tests {
         assert_eq!(events[0].payload["workspace_id"], "W");
         assert_eq!(events[6].payload["attempt"], 1);
         assert_eq!(events[8].payload["cwd"], "/run");
+        // A plan review started without a cwd has a span without one.
+        assert_eq!(events[10].payload["cwd"], Value::Null);
         assert_eq!(events[1].payload["opened_event_id"], json!(events[0].id));
         assert!(events[12].id > observed);
         // Each span event has the time of the event that wrote it.

@@ -1542,14 +1542,16 @@ pub trait PlanReviewStore {
     fn plan_review_candidates(&self) -> Result<Vec<PlanReviewCandidate>>;
     /// Record the start of a plan review of `proposal` by `token`, in the
     /// directory named by its row's ID under `plan_reviews_dir`
-    /// (`plan_review_started`). Rows of gone supervisors are finished as
-    /// `interrupted` first. `None`: another supervisor's job runs, or the
+    /// (`plan_review_started`, with `cwd`, the checkout the job runs in, for
+    /// its Claude session: ADR-0048). Rows of gone supervisors are finished
+    /// as `interrupted` first. `None`: another supervisor's job runs, or the
     /// proposal is no longer a candidate.
     fn begin_plan_review(
         &mut self,
         proposal: ProposalId,
         token: &str,
         plan_reviews_dir: &Path,
+        cwd: &Path,
     ) -> Result<Option<PlanReviewJob>>;
     /// Apply what the runtime made of the verdict and finish the job
     /// (`plan_review_finished`); an action the job may not take is an

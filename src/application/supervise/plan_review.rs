@@ -100,6 +100,7 @@ impl Supervisor<'_> {
             proposal_id,
             &self.token,
             &self.layout.plan_reviews_dir,
+            &self.layout.repo_root,
         )?
         else {
             return Ok(());
