@@ -10,6 +10,7 @@ use serde_json::{Value, json};
 
 use super::{
     adapters::process_alive,
+    sessions::{Closing, read_before},
     sqlite::{
         SqliteQueue, claim_task, enum_col, event, event_row, read_task, run_row, stored_run_row,
     },
@@ -748,7 +749,9 @@ impl SqliteQueue {
     ) -> Result<()> {
         // The event and the session spans it opens or closes (ADR-0048),
         // in one write transaction taken up front so it waits for other
-        // writers rather than failing to upgrade a read.
+        // writers rather than failing to upgrade a read. The transcripts of
+        // the spans it closes are read before (task 543).
+        let _read = read_before(&self.conn, Closing::Run(id, &[kind]))?;
         self.conn.execute_batch("BEGIN IMMEDIATE")?;
         match run_event(&self.conn, id, kind, payload) {
             Ok(()) => Ok(self.conn.execute_batch("COMMIT")?),
@@ -781,6 +784,7 @@ impl SqliteQueue {
         // Immediate like every other write: a deferred one that read first
         // (the schema, to prepare the insert) got SQLITE_BUSY at once, past
         // the busy timeout, when another supervisor wrote at the same time.
+        let _read = read_before(&self.conn, Closing::Queue(kind, &payload))?;
         let tx = rusqlite::Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         tx.execute(
             "INSERT INTO run_events(kind,payload) VALUES (?1,?2)",
@@ -987,6 +991,8 @@ impl SqliteQueue {
         wrapper_pid: u32,
         agent_pid: u32,
     ) -> Result<()> {
+        // The spans it closes read their transcripts first (task 543).
+        let _read = read_before(&self.conn, Closing::Run(id, &["agent_started"]))?;
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -1024,6 +1030,8 @@ impl SqliteQueue {
     }
 
     pub fn register_agent(&mut self, id: &RunId, wrapper_pid: u32, agent_pid: u32) -> Result<()> {
+        // The spans it closes read their transcripts first (task 543).
+        let _read = read_before(&self.conn, Closing::Run(id, &["agent_started"]))?;
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -1061,6 +1069,8 @@ impl SqliteQueue {
     }
 
     pub fn wrapper_exited(&mut self, id: &RunId, pid: u32, exit_code: i32) -> Result<()> {
+        // The spans it closes read their transcripts first (task 543).
+        let _read = read_before(&self.conn, Closing::Run(id, &["session_exited"]))?;
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -1098,6 +1108,8 @@ impl SqliteQueue {
         checked_processes: usize,
         mut report: serde_json::Value,
     ) -> Result<TaskRun> {
+        // The spans it closes read their transcripts first (task 543).
+        let _read = read_before(&self.conn, Closing::Run(id, &["run_recovered"]))?;
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -2024,6 +2036,8 @@ impl SqliteQueue {
     /// Record a confirmed cmux close. Only an accepted run whose workspace is
     /// still recorded as open qualifies; the worktree and branch stay for integration.
     pub fn workspace_closed(&mut self, id: &RunId, token: &str) -> Result<TaskRun> {
+        // The spans it closes read their transcripts first (task 543).
+        let _read = read_before(&self.conn, Closing::Run(id, &["workspace_closed"]))?;
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -2108,6 +2122,8 @@ impl SqliteQueue {
         token: &str,
         request: Option<serde_json::Value>,
     ) -> Result<Option<(TaskRun, usize)>> {
+        // The spans it closes read their transcripts first (task 543).
+        let _read = read_before(&self.conn, Closing::Run(id, &["triage_started"]))?;
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -2185,6 +2201,11 @@ impl SqliteQueue {
         mut payload: serde_json::Value,
         also: Vec<(&'static str, serde_json::Value)>,
     ) -> Result<TaskRun> {
+        // The spans it closes read their transcripts first (task 543).
+        let kinds: Vec<&str> = std::iter::once("triage_finished")
+            .chain(also.iter().map(|(kind, _)| *kind))
+            .collect();
+        let _read = read_before(&self.conn, Closing::Run(id, &kinds))?;
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -2276,6 +2297,8 @@ impl SqliteQueue {
         exhaustion: &Exhaustion,
         reason: &str,
     ) -> Result<Option<TaskRun>> {
+        // The spans it closes read their transcripts first (task 543).
+        let _read = read_before(&self.conn, Closing::Run(id, &["triage_finished"]))?;
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -2399,6 +2422,8 @@ impl SqliteQueue {
         workspace_id: &str,
         mut payload: serde_json::Value,
     ) -> Result<()> {
+        // The spans it closes read their transcripts first (task 543).
+        let _read = read_before(&self.conn, Closing::Run(id, &["workspace_closed"]))?;
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -3388,6 +3413,7 @@ impl RunStore for SqliteQueue {
         super::sessions::record_open_turns(&self.conn)
     }
     fn close_review_session(&self, id: &RunId) -> Result<usize> {
+        let _read = read_before(&self.conn, Closing::Run(id, &["review_failed"]))?;
         let tx = rusqlite::Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         let closed = super::sessions::close_review(&tx, id)?;
         tx.commit()?;

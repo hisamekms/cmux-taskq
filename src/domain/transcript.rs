@@ -229,6 +229,9 @@ pub const TRANSCRIPT_UNSUPPORTED: &str = "transcript_unsupported";
 pub const SESSION_MISMATCH: &str = "session_mismatch";
 /// The span has no session id to find its transcript by.
 pub const SESSION_UNKNOWN: &str = "session_unknown";
+/// The span closed in a write transaction whose transcript was not read
+/// before it began: it is not read under the write lock (task 543).
+pub const TRANSCRIPT_NOT_READ_BEFORE: &str = "transcript_not_read_before";
 
 /// The records of a readable transcript, in file order, and the lines
 /// skipped because they were not JSON.

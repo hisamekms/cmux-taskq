@@ -4,7 +4,11 @@
 //! written in the same transaction, at the same time as that event. A span
 //! that closes takes its transcript's turns with it (its active time,
 //! decision 8), and the supervisor records the finished turns of the spans
-//! still open ([`record_open_turns`]).
+//! still open ([`record_open_turns`]). No transcript is read under a write
+//! lock (task 543): a write that may close spans reads theirs first
+//! ([`read_before`]), and the close takes what was read.
+
+use std::cell::RefCell;
 
 use anyhow::Result;
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
@@ -22,13 +26,133 @@ use crate::{
         },
         stats::rfc3339_millis,
         tokens,
-        transcript::{Transcript, Turn, Unreadable, millis_text, span_turns, turns},
+        transcript::{
+            TRANSCRIPT_NOT_READ_BEFORE, Transcript, Turn, Unreadable, millis_text, span_turns,
+            turns,
+        },
         worktime,
     },
 };
 
 /// The run directory's file of the commands of its sessions (task 514).
 pub const WORKTIME_FILE: &str = "worktime.jsonl";
+
+thread_local! {
+    /// The transcripts of the spans a write transaction about to begin on
+    /// this thread may close, read before it began ([`read_before`]).
+    static READ_BEFORE: RefCell<Vec<(OpenSpan, Result<Transcript, Unreadable>)>> =
+        const { RefCell::new(Vec::new()) };
+}
+
+/// The spans a write about to begin may close.
+#[derive(Debug, Clone, Copy)]
+pub(super) enum Closing<'a> {
+    /// The run's, by events of these kinds on it.
+    Run(&'a RunId, &'a [&'a str]),
+    /// The observer's, by an event of the queue of this kind and payload.
+    Queue(&'a str, &'a Value),
+    /// The plan review's of this id, or of every plan review when `None`.
+    PlanReviews(Option<i64>),
+}
+
+/// The transcripts [`read_before`] read, for the closes of the write that
+/// follows it on this thread; dropped with it.
+#[must_use = "the transcripts are there only while this lives"]
+pub(super) struct ReadBefore {
+    spans: Vec<EventId>,
+}
+
+impl Drop for ReadBefore {
+    fn drop(&mut self) {
+        READ_BEFORE.with_borrow_mut(|read| {
+            read.retain(|(span, _)| !self.spans.contains(&span.opened_event_id));
+        });
+    }
+}
+
+/// Read, before a write transaction begins, the transcripts of the open
+/// spans `closing` may close, for their closes in it (ADR-0048 decision
+/// 10): a worker's transcript can be megabytes, and reading it under the
+/// write lock kept other processes' writes waiting past the busy timeout.
+/// A span that opens between this and the transaction closes without its
+/// active time ([`TRANSCRIPT_NOT_READ_BEFORE`]). Called inside a
+/// transaction it reads nothing.
+pub(super) fn read_before(conn: &Connection, closing: Closing<'_>) -> Result<ReadBefore> {
+    if !conn.is_autocommit() {
+        debug!("session transcripts not read: a write transaction is open");
+        return Ok(ReadBefore { spans: Vec::new() });
+    }
+    let spans = match closing {
+        Closing::Run(run_id, kinds) => {
+            let kinds: Vec<&str> = kinds
+                .iter()
+                .copied()
+                .filter(|kind| scope(kind) == Some(Scope::Run))
+                .collect();
+            if kinds.is_empty() {
+                Vec::new()
+            } else {
+                let open = open_spans(conn, "o.run_id=?1", "c.run_id=?1", params![run_id])?;
+                let context = SpanContext::default();
+                kinds
+                    .iter()
+                    .flat_map(|kind| changes(kind, &Value::Null, &open, &context))
+                    .filter_map(|change| match change {
+                        SpanChange::Close { span, .. } => Some(span),
+                        SpanChange::Open(_) => None,
+                    })
+                    .collect()
+            }
+        }
+        Closing::Queue(kind, payload) => {
+            if scope(kind) == Some(Scope::Queue) {
+                let open = open_spans(
+                    conn,
+                    "o.task_id IS NULL AND o.goal_id IS NULL AND json_extract(o.payload,'$.kind')='observer'",
+                    "c.task_id IS NULL AND c.goal_id IS NULL",
+                    params![],
+                )?;
+                changes(kind, payload, &open, &SpanContext::default())
+                    .into_iter()
+                    .filter_map(|change| match change {
+                        SpanChange::Close { span, .. } => Some(span),
+                        SpanChange::Open(_) => None,
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            }
+        }
+        Closing::PlanReviews(plan_review_id) => open_spans(
+            conn,
+            "o.run_id IS NULL AND json_extract(o.payload,'$.kind')=?1
+             AND (?2 IS NULL OR json_extract(o.payload,'$.plan_review_id')=?2)",
+            "c.run_id IS NULL",
+            params![PLAN_REVIEW, plan_review_id],
+        )?,
+    };
+    let mut read_spans = Vec::new();
+    for span in spans {
+        if read_spans.contains(&span.opened_event_id) {
+            continue;
+        }
+        read_spans.push(span.opened_event_id);
+        let transcript = read(conn, &span);
+        READ_BEFORE.with_borrow_mut(|read| read.push((span, transcript)));
+    }
+    Ok(ReadBefore { spans: read_spans })
+}
+
+/// The transcript of `span` for its close: the one [`read_before`] read,
+/// else, outside a write transaction, read now; else unreadable.
+fn transcript_for_close(conn: &Connection, span: &OpenSpan) -> Result<Transcript, Unreadable> {
+    let taken = READ_BEFORE.with_borrow_mut(|read| {
+        read.iter()
+            .position(|(read, _)| read == span)
+            .map(|at| read.swap_remove(at).1)
+    });
+    taken.unwrap_or_else(|| read(conn, span))
+}
 
 /// Write the spans the event `event_id` (of `kind`, with `payload`, just
 /// inserted on `task_id` and `run_id`) opens and closes.
@@ -227,7 +351,7 @@ fn close(
     let mut payload = SpanChange::closed_payload(span, reason);
     let mut closed_at = now.to_owned();
     let mut closed = RunSessionClosed::default();
-    match (read(span), times(conn, span, now)?) {
+    match (transcript_for_close(conn, span), times(conn, span, now)?) {
         (Ok(transcript), Some((start, now_ms))) => {
             let mut end = now_ms;
             if reason == INFERRED
@@ -343,8 +467,18 @@ fn work_breakdown(
     Ok(breakdown.payload())
 }
 
-/// The transcript of `span`.
-fn read(span: &OpenSpan) -> Result<Transcript, Unreadable> {
+/// The transcript of `span`, never read while `conn` holds a write
+/// transaction (task 543).
+fn read(conn: &Connection, span: &OpenSpan) -> Result<Transcript, Unreadable> {
+    if !conn.is_autocommit() {
+        return Err(Unreadable {
+            code: TRANSCRIPT_NOT_READ_BEFORE,
+            version: None,
+            detail: "the transcript was not read before the write transaction began".into(),
+        });
+    }
+    #[cfg(test)]
+    tests::READS.with(|reads| reads.set(reads.get() + 1));
     let text = |key: &str| span.payload[key].as_str().map(str::to_owned);
     ClaudeTranscripts::from_env().read(&TranscriptSource {
         session_id: text("session_id"),
@@ -431,7 +565,7 @@ pub(super) fn record_open_turns(conn: &Connection) -> Result<usize> {
     let open = open_spans(conn, "1=1", "1=1", params![])?;
     let mut recorded = 0;
     for span in open {
-        let transcript = match read(&span) {
+        let transcript = match read(conn, &span) {
             Ok(transcript) => transcript,
             Err(unreadable) => {
                 debug!(
@@ -629,6 +763,11 @@ fn insert_at(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    thread_local! {
+        /// The transcripts read on this thread.
+        pub(super) static READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
     use crate::{
         application::TaskStore,
         domain::{NewTask, RunEvent},
@@ -1461,5 +1600,164 @@ mod tests {
         assert_eq!(closed.payload["reason"], "inferred");
         assert_eq!(closed.created_at, millis_text(start + 20_000));
         assert_eq!(closed.payload["tokens"]["output"], 6);
+    }
+
+    /// Write the transcript of `session` of a span in `cwd`: two turns,
+    /// 5–25 s and 40–50 s after `base`.
+    fn transcript_in(dir: &std::path::Path, cwd: &str, session: &str, base: i64) {
+        let project = dir.join("config/projects").join(cwd.replace('/', "-"));
+        std::fs::create_dir_all(&project).unwrap();
+        let line = |kind: &str, secs: i64, content: Value| {
+            json!({"type": kind, "timestamp": millis_text(base + secs * 1000),
+                   "sessionId": session, "version": "2.1.283", "message": {"content": content}})
+            .to_string()
+        };
+        let lines = [
+            line("user", 5, json!("go")),
+            line("assistant", 25, json!([{"type": "text"}])),
+            line("user", 40, json!("go")),
+            line("assistant", 50, json!([{"type": "text"}])),
+        ];
+        std::fs::write(project.join(format!("{session}.jsonl")), lines.join("\n")).unwrap();
+    }
+
+    /// The writes that close spans in a write transaction — a run's event,
+    /// a failed review's close, an event of the queue and a plan review's
+    /// close — read the transcripts before it begins and none under its
+    /// lock (task 543), and the spans close with the same turns and active
+    /// time as before. A span whose transcript was not read before closes
+    /// without its active time, and its event is written all the same.
+    #[test]
+    fn spans_closed_in_a_write_transaction_take_the_transcripts_read_before_it() {
+        use crate::application::RunStore;
+        let dir = tempfile::tempdir().unwrap();
+        let (queue, task_id, run) = run_queue(dir.path());
+        let conn = &queue.conn;
+        event(
+            conn,
+            task_id,
+            Some(&run),
+            "agent_started",
+            json!({"session_id": RUN}),
+        )
+        .unwrap();
+        SqliteQueue::record_runtime_event(
+            &queue,
+            &run,
+            "review_started",
+            json!({"attempt": 1, "session_id": "s-review"}),
+        )
+        .unwrap();
+        queue
+            .record_queue_event(
+                "observe_started",
+                json!({"mode": "hourly", "dir": "/obs", "session_id": "s-obs"}),
+            )
+            .unwrap();
+        event(
+            conn,
+            task_id,
+            None,
+            "plan_review_started",
+            json!({"proposal_id": 1, "plan_review_id": 7, "attempt": 1,
+                   "session_id": "s-plan", "cwd": "/plan"}),
+        )
+        .unwrap();
+        let start = retime(conn, 0, 100);
+        transcript_in(dir.path(), "/wt", RUN, start);
+        transcript_in(dir.path(), "/wt", "s-review", start);
+        transcript_in(dir.path(), "/obs", "s-obs", start);
+        transcript_in(dir.path(), "/plan", "s-plan", start);
+        READS.set(0);
+
+        SqliteQueue::record_runtime_event(&queue, &run, "session_exited", json!({"exit_code": 0}))
+            .unwrap();
+        assert_eq!(RunStore::close_review_session(&queue, &run).unwrap(), 1);
+        queue
+            .record_queue_event("observe_finished", json!({"dir": "/obs"}))
+            .unwrap();
+        {
+            let _read = read_before(conn, Closing::PlanReviews(Some(7))).unwrap();
+            let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate).unwrap();
+            close_plan_review(&tx, 7, false).unwrap();
+            tx.commit().unwrap();
+        }
+        // Each transcript was read once, before its transaction: `read`
+        // reads nothing inside one.
+        assert_eq!(READS.get(), 4);
+        let closed = of_kind(&queue, SESSION_CLOSED);
+        let described: Vec<(&str, &str, &Value, &Value)> = closed
+            .iter()
+            .map(|e| {
+                (
+                    e.payload["kind"].as_str().unwrap(),
+                    e.payload["reason"].as_str().unwrap(),
+                    &e.payload["active"],
+                    &e.payload["active_secs"],
+                )
+            })
+            .collect();
+        let recorded = json!("recorded");
+        let secs = json!(30);
+        assert_eq!(
+            described,
+            vec![
+                ("worker", "exited", &recorded, &secs),
+                ("review", "job_finished", &recorded, &secs),
+                ("observer", "job_finished", &recorded, &secs),
+                ("plan_review", "job_finished", &recorded, &secs),
+            ]
+        );
+        assert_eq!(of_kind(&queue, SESSION_TURNS).len(), 4);
+        // Nothing is left for a later write to take.
+        assert!(READ_BEFORE.with_borrow(Vec::is_empty));
+
+        // A span closed in a transaction nothing read before: its
+        // transcript is not read, and the event is written.
+        event(conn, task_id, Some(&run), "resume_started", json!({})).unwrap();
+        event(
+            conn,
+            task_id,
+            Some(&run),
+            "agent_started",
+            json!({"session_id": RUN}),
+        )
+        .unwrap();
+        let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate).unwrap();
+        event(
+            &tx,
+            task_id,
+            Some(&run),
+            "session_exited",
+            json!({"exit_code": 0}),
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        assert_eq!(READS.get(), 4);
+        let closed = of_kind(&queue, SESSION_CLOSED);
+        let last = closed.last().unwrap();
+        assert_eq!(last.payload["kind"], "resume");
+        assert_eq!(last.payload["active"], "unavailable");
+        assert_eq!(
+            last.payload["active_unavailable"],
+            TRANSCRIPT_NOT_READ_BEFORE
+        );
+        assert_eq!(of_kind(&queue, "session_exited").len(), 2);
+        // Called inside a transaction, `read_before` reads nothing, not
+        // even the transcript of a span open.
+        event(
+            conn,
+            task_id,
+            Some(&run),
+            "agent_started",
+            json!({"session_id": RUN}),
+        )
+        .unwrap();
+        let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate).unwrap();
+        let read = read_before(&tx, Closing::Run(&run, &["run_recovered"])).unwrap();
+        assert!(read.spans.is_empty());
+        drop(read);
+        tx.rollback().unwrap();
+        assert_eq!(READS.get(), 4);
     }
 }

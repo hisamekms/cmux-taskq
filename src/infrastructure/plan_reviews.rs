@@ -327,6 +327,8 @@ impl PlanReviewStore for SqliteQueue {
         cwd: &Path,
     ) -> Result<Option<PlanReviewJob>> {
         let now = self.generators.clock.now();
+        // The spans it closes read their transcripts first (task 543).
+        let _read = sessions::read_before(&self.conn, sessions::Closing::PlanReviews(None))?;
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -408,6 +410,9 @@ impl PlanReviewStore for SqliteQueue {
     ) -> Result<PlanReviewApplied> {
         let now = self.generators.clock.now();
         let stamp = self.generators.clock.timestamp();
+        // The spans it closes read their transcripts first (task 543).
+        let _read =
+            sessions::read_before(&self.conn, sessions::Closing::PlanReviews(Some(job.id)))?;
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -582,6 +587,9 @@ impl PlanReviewStore for SqliteQueue {
         duration_secs: u64,
     ) -> Result<()> {
         let now = self.generators.clock.now();
+        // The spans it closes read their transcripts first (task 543).
+        let _read =
+            sessions::read_before(&self.conn, sessions::Closing::PlanReviews(Some(job.id)))?;
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
