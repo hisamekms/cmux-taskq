@@ -7,7 +7,7 @@ description: dagq 自身のリリース手順。version を上げる、tag v* �
 
 根拠は [README の Release 節](../../../README.md#release) と [ADR-0030](../../../docs/adr/0030-publish-to-crates-io-on-tag-push-with-trusted-publishing.md)。tag `vX.Y.Z` の push で `.github/workflows/release.yml` が、tag と `Cargo.toml` の version の一致を検査し、`aarch64-apple-darwin` のバイナリを build して GitHub Release に添付し、同じ version を crates.io に publish する（crates.io に既にあれば skip）。
 
-main の version はリリースの直後に次の開発版 `X.Y.Z-dev` へ上げてあり（今は `0.4.0-dev`）、main のビルドは `dagq --version` で build 識別子 `X.Y.Z-dev+<commit>`（worktree が dirty なら `.dirty` が付く）を名乗る。リリースは `-dev` を外した `X.Y.Z` で、build 識別子も `X.Y.Z` だけになる（[ADR-0045](../../../docs/adr/0045-build-identifier-explicit-migrate-schema-compat-handoff-and-auto-update.md) 決定 1・2。`build.rs` が埋め込む）。
+main の version はリリースの直後に次の開発版 `X.Y.Z-dev` へ上げてあり（今は `0.4.0-dev`）、main のビルドは `dagq --version` で build 識別子 `X.Y.Z-dev+<commit>`（worktree が dirty なら `.dirty` が付く）を名乗る。リリースは `-dev` を外した `X.Y.Z` で、build 識別子も `X.Y.Z` だけになる（[ADR-0073](../../../docs/adr/0073-kind-additions-are-compatible.md) 決定 1・2。ADR-0045 を置き換えた。`build.rs` が埋め込む）。
 
 以下 `X.Y.Z` は新しい version。1・3・4・5 のコマンドは repository の main checkout で打つ（読むだけで、main の作業ファイルは変えない）。2 と 6 の変更は task の worker が worktree で行う。tag の作成と push はユーザーの確認を取ってから行う。
 
@@ -124,8 +124,12 @@ dagq add 'release: version を次の開発版 X.Y.Z-dev に上げる' \
   --verify 'cargo publish --dry-run --locked' --verify 'cargo test --locked --test plugin'
 ```
 
-これを忘れると、main のビルドがリリースと同じ `X.Y.Z` を名乗り、build 識別子に commit が入らないので、`up` がリリースのバイナリと開発中のビルドを見分けられない。
+これを忘れると、main のビルドがリリースと同じ `X.Y.Z` を名乗り、build 識別子に commit が入らないので、`up`・`dagq install`・自動更新がリリースのバイナリと開発中のビルドを見分けられない。
 
 ## 7. 固定バイナリの更新
 
-`~/.local/bin/dagq` の入れ替えはこの skill では行わない。AGENTS.md の「作業中」と「起動と停止」の手順（入替はユーザーに報告してから、build 識別子が変われば `up` が supervisor を入れ替える）に従う。
+この skill の中では `~/.local/bin/dagq` を `cp` で置き換えない（macOS では走行中のプロセスが kill されうるうえ、前のバイナリが残らない）。更新は [ADR-0073](../../../docs/adr/0073-kind-additions-are-compatible.md) の `dagq install` と自動更新で行い、手順は AGENTS.md の「作業中」と「起動と停止」と、plugin の `dagq-recover` skill の `reference/update.md` に従う。
+
+- 本番の supervisor が `up --auto-update` で動いていれば、2 の `-dev` を外す commit と 6 の次の開発版へ上げる commit はどちらも `Cargo.toml` と `Cargo.lock` を変えるので、それぞれの着地で supervisor が main をビルドし、固定バイナリと自分を引き継ぎで入れ替える（走っている run は止まらない）。着地の後に inbox の `report the update` か `dagq status` の `auto_update` と `supervisors[].binary_version` で、6 の着地の後に `X.Y.Z-dev+<commit>` になったことを確かめる
+- 自動更新が無効なら、6 の着地の後に inbox か planner の session から、ユーザーに報告してから `dagq install` を打つ（main checkout を build し、確認・差し替え・supervisor の引き継ぎまで行う）。リリースの間に非互換（`-- dagq-schema: breaking`）の migration が入っていて `install` が止まったら、開いた ask を人に見せ、ユーザーの了承を得てから `dagq install --allow-breaking`（drain して DB を退避し、migrate して起動し直す）を打つ
+- 自動更新が有効でも、非互換の migration を含むビルドは入れ替えられず、inbox に `approve_update` の ask が出る。人が `install` と答えたら、問いに書かれた `install --allow-breaking` のコマンドを打ち、それが起動し直した supervisor には `--auto-update` が付かないので、続けて AGENTS.md の cold start の `up`（`--auto-update` 付き）を打ち直す

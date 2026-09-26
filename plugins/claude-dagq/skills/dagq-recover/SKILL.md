@@ -1,6 +1,6 @@
 ---
 name: dagq-recover
-description: What a person does by hand in a dagq queue, from the inbox or a planner session and only on the person's word. Recover a run when no supervisor serves the queue (or a dead supervisor's lease holds it); decide on a failed or interrupted run whose headless triage failed; review and integrate a run whose headless review failed, or push main after a failed push; carry out the answer of a stuck_exit or answer_prompt ask in a run's cmux workspace; bypass plan review (ready --bypass-review) or resubmit a proposal whose plan review failed; and start, stop or update the runtime with up / down. Use when status or watch shows "recover run", "triage by hand", "review by hand", "plan review by hand", "review and integrate", "push main", "restart supervisor", "send the answer of ask <id> to the worker", an answered stuck_exit or answer_prompt ask, or when the person asks to start, stop, update or recover. Entries ending in "(runtime)" need nothing.
+description: What a person does by hand in a dagq queue, from the inbox or a planner session and only on the person's word. Recover a run when no supervisor serves the queue (or a dead supervisor's lease holds it); decide on a failed or interrupted run whose headless triage failed; review and integrate a run whose headless review failed, or push main after a failed push; carry out the answer of a stuck_exit or answer_prompt ask in a run's cmux workspace; bypass plan review (ready --bypass-review) or resubmit a proposal whose plan review failed; and start, stop or update the runtime with up / down / install. Use when status or watch shows "recover run", "triage by hand", "review by hand", "plan review by hand", "review and integrate", "push main", "restart supervisor", "send the answer of ask <id> to the worker", an answered stuck_exit or answer_prompt ask, or when the person asks to start, stop, update or recover. Entries ending in "(runtime)" need nothing.
 ---
 
 # dagq: what a person does by hand
@@ -38,13 +38,14 @@ Attention `triage by hand` (`kind` `triage_failed`): the supervisor's headless t
 ## 5. Start, stop and update the runtime
 
 ```sh
-"$DAGQ" up --plugin-dir "$CLAUDE_PLUGIN_ROOT"            # add --parallel N, --max-waiting N (both default 4)
+"$DAGQ" up --plugin-dir "$CLAUDE_PLUGIN_ROOT"            # add --parallel N, --max-waiting N, --auto-update
 "$DAGQ" up --in-cmux --plugin-dir "$CLAUDE_PLUGIN_ROOT"  # only when the preflight sends you there
 "$DAGQ" down            # stop claiming; the supervisor drains its runs and exits
 "$DAGQ" down --wait     # the same, and block until it is gone
+"$DAGQ" install         # build main, swap the binary, hand over
 ```
 
-`up` is idempotent: it keeps one supervisor resident and opens the inbox workspace (`skipped` when you run it from there). It opens no planner: a person opens each with `dagq plan --plugin-dir "$CLAUDE_PLUGIN_ROOT"` (a new one per call), and `dagq planners` lists them. `restart supervisor` (`supervisor_stopped`, `supervisor_stale`) is answered with `up`; an in-cmux supervisor is never restarted by anything else. Updating the fixed binary is: replace it, then `up`, which drains a supervisor of another version first. Runs waiting for a person hold no slot, and a drain waits for them until their asks are answered or their sessions exit. `down --force` kills the supervisor and loses its active runs: only on the person's explicit word. `${CLAUDE_PLUGIN_ROOT}/skills/dagq-recover/reference/up-down.md` has the outcomes, the in-cmux case, the binary update and the logs.
+`up` is idempotent: it keeps one supervisor resident and opens the inbox workspace. It opens no planner: a person opens each with `dagq plan --plugin-dir "$CLAUDE_PLUGIN_ROOT"` (a new one per call), and `dagq planners` lists them. `restart supervisor` (`supervisor_stopped`, `supervisor_stale`) is answered with `up`; an in-cmux supervisor is never restarted by anything else. Update the binary with `install` (or `--rollback`), never `cp`: supervisors take it over without waiting; only a breaking migration drains (`--allow-breaking`). `up --auto-update` does it per runtime landing; it and the `update_failed` / `approve_update` asks: `${CLAUDE_PLUGIN_ROOT}/skills/dagq-recover/reference/update.md`. A drain also waits for runs waiting on an ask. `down --force` kills the supervisor and loses its active runs: only on the person's explicit word. `${CLAUDE_PLUGIN_ROOT}/skills/dagq-recover/reference/up-down.md` has the outcomes, the in-cmux case and the logs.
 
 ## 6. Review by hand, and a failed push
 
