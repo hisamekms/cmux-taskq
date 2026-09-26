@@ -12,3 +12,11 @@
 RUSTC_WRAPPER = "sccache"
 # server と話せないときは rustc を直接実行し、cache が効かないだけで build を失敗させない。
 SCCACHE_IGNORE_SERVER_IO_ERROR = "1"
+# run ごとの cargo の並列度を絞る（2026-09-26 に人が planner と決めた。task 427）。
+# host は 8 コア / 16GB で、並列 4 の運用で load average が最大 151〜204 に達し、cmux の capture の
+# timeout が 400 件を超え、run の startup の中央値が約 1100 秒になった（goal 36 の note 8718）。
+# 値の決め方: supervisor の --parallel を 3 に下げ、worker 3 本と integrate 1 本が同時に cargo を回しても
+# 合計 16 並列（コア数 8 の 2 倍）程度に収まるようにする。--parallel や host を変えたら合わせて見直す。
+# CARGO_BUILD_JOBS は build の job 数、RUST_TEST_THREADS は 1 つの test binary の中の並列 thread 数。
+CARGO_BUILD_JOBS = "4"
+RUST_TEST_THREADS = "4"
