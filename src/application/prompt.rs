@@ -782,6 +782,33 @@ pub(crate) fn revise_mismatch_request(run: &TaskRun, label: &str, why: &str) -> 
     .join("\n"))
 }
 
+/// The one fixed request the supervisor types into a session that went idle
+/// with a receipt naming `receipt_commit` while its clean worktree HEAD is
+/// `head`, a new commit on top of its base (task 357): rewrite the receipt
+/// for the head, or fix the worktree first.
+pub(crate) fn stale_receipt_nudge(
+    run: &TaskRun,
+    receipt_commit: &str,
+    head: &CommitSha,
+) -> Result<String> {
+    let receipt = run.receipt_path().context("missing receipt path")?;
+    Ok([
+        format!(
+            "dagq: run {} went idle, but its receipt names commit {receipt_commit} while the clean worktree HEAD is {head} (for example after a rebase or a new commit). The supervisor cannot accept a receipt for another commit.",
+            run.id()
+        ),
+        "Steps:".to_owned(),
+        format!(
+            "1. If HEAD is the work you mean to submit, rewrite the receipt at {receipt} with commit {head} (git rev-parse HEAD), writing a temporary file in the same directory and renaming it. Otherwise fix the worktree, commit, and rewrite the receipt with the new HEAD."
+        ),
+        format!("2. {STOP_BACKGROUND}"),
+        "3. Do not merge or push. When done, report briefly and stop; do not run /exit.".to_owned(),
+        "If the receipt stays as it is, the run goes on as before and validation judges it."
+            .to_owned(),
+    ]
+    .join("\n"))
+}
+
 /// The one nudge the supervisor types into a worker's session that stayed
 /// idle without a receipt for `idle_secs` (ADR-0043 decision 1): commit and
 /// write the receipt, ask with `dagq ask`, or say what background work it

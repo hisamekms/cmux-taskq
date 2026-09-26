@@ -54,7 +54,8 @@ use super::{
     prompt::{
         GoalPredecessorSummary, Inheritance, PredecessorSummary, RecoveryMaterial, ResumeKind,
         ResumeRequest, TRIAGE_TOOLS, prompt, recovery_prompt, resume_request, review_prompt,
-        revise_mismatch_request, revise_request, siblings_in_progress, stall_nudge, triage_prompt,
+        revise_mismatch_request, revise_request, siblings_in_progress, stale_receipt_nudge,
+        stall_nudge, triage_prompt,
     },
     recording::{
         RecordingBackend, exit_unsent, reason_of_error, text_on_screen, timed_out_maybe_sent,
@@ -89,6 +90,7 @@ mod recovery;
 mod resume;
 mod revise;
 mod session;
+mod stale;
 mod stall;
 mod sweep;
 mod triage;
@@ -98,7 +100,7 @@ pub use self::handoff::SUPERVISOR_HANDED_OFF;
 pub use self::update::{UPDATE_INTERVAL, UpdateSettings};
 use self::{
     deliver::*, dialog::*, exit::*, idle::*, jobs::*, recovery::*, resume::*, revise::*,
-    session::*, stall::*, sweep::*,
+    session::*, stale::*, stall::*, sweep::*,
 };
 
 /// How far back the daily observation reads.

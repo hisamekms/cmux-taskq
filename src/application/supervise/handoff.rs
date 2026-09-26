@@ -290,6 +290,7 @@ impl Supervisor<'_> {
                     approved,
                     silent: false,
                     exit_for_silence,
+                    stale: adopted_stale_nudge(&*self.queue, run, RESUME_PHASE, Some(attempt))?,
                 })
             }
             Snapshot::Exit {

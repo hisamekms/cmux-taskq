@@ -446,6 +446,7 @@ impl Supervisor<'_> {
             approved: self.queue.has_run_event(run.id(), "integration_approved")?,
             silent: false,
             exit_for_silence: false,
+            stale: None,
         })
     }
     /// The resumed session ended, or resolved the run: record
@@ -688,6 +689,9 @@ pub(super) struct ResumeWatch {
     pub(super) silent: bool,
     /// The `/exit` was sent because of that silence.
     pub(super) exit_for_silence: bool,
+    /// Idle with a receipt for an older commit: the one request of this
+    /// attempt to rewrite it (task 357).
+    pub(super) stale: Option<StaleNudge>,
 }
 
 /// What a resumed session left behind when it exited.
@@ -723,6 +727,21 @@ impl ResumeVerdict {
 }
 
 impl ResumeWatch {
+    /// Record how the request to rewrite a stale receipt ended, once the
+    /// attempt ends with the session alive: `rewritten` when the receipt
+    /// changed after it.
+    fn settle_stale(&mut self, sv: &mut Supervisor<'_>, run: &TaskRun) -> Result<()> {
+        let Some(nudge) = &mut self.stale else {
+            return Ok(());
+        };
+        let rewritten = sv
+            .files
+            .modified(&self.receipt_path)
+            .is_ok_and(|modified| modified > nudge.at);
+        let outcome = if rewritten { "rewritten" } else { "unchanged" };
+        nudge.settle(sv, run, RESUME_PHASE, Some(self.attempt), outcome)
+    }
+
     /// The receipt the session rewrote during this resume, if any.
     pub(super) fn rewritten_receipt(&self, files: &dyn RunFiles) -> Option<Receipt> {
         let modified = files.modified(&self.receipt_path).ok()?;
@@ -867,6 +886,9 @@ impl ResumeWatch {
         if wrapper.exited_at.is_some() {
             // Nobody needs to send anything to a session that exited.
             close_answer_prompt_asks(sv, run, PROMPT_EXITED_CLOSED)?;
+            if let Some(nudge) = &mut self.stale {
+                nudge.settle(sv, run, RESUME_PHASE, Some(self.attempt), "run_ended")?;
+            }
             match sv.cmux.capture(&self.workspace) {
                 Ok(screen) => sv.files.write(
                     &self
@@ -978,6 +1000,7 @@ impl ResumeWatch {
         // An unapproved resolved run keeps its session for
         // validation and review (ADR-0027 decision 3).
         if matches!(verdict, ResumeOutcome::Resolved) && !self.approved && idle_after_receipt {
+            self.settle_stale(sv, run)?;
             info!(run_id = %run.id(), "resumed session of {} rewrote its receipt and went idle (head {head}); validating with the session open", run.id());
             return Ok(Some(ResumeVerdict {
                 kind: ResumeOutcome::Resolved,
@@ -986,18 +1009,47 @@ impl ResumeWatch {
                 live: true,
             }));
         }
+        // Once the session was asked to rewrite a stale receipt, only an
+        // idle after that request answers it.
+        let answered_from = self.stale.map_or(sent_at, |n| n.at.max(sent_at));
         let why = match verdict {
-            ResumeOutcome::Unresolved if idle.is_some_and(|idle| idle.idle_since(sent_at)) => {
+            ResumeOutcome::Unresolved
+                if idle
+                    .as_ref()
+                    .is_some_and(|idle| idle.idle_since(answered_from)) =>
+            {
+                if self.stale.is_none()
+                    && let Some(stale) = stale_receipt(sv, run)
+                {
+                    let workspace = self.workspace.clone();
+                    if let Some((nudge, start)) = nudge_stale_receipt(
+                        sv,
+                        run,
+                        &workspace,
+                        RESUME_PHASE,
+                        Some(self.attempt),
+                        &stale,
+                    )? {
+                        self.stale = Some(nudge);
+                        self.start = Some(start);
+                        return Ok(None);
+                    }
+                }
                 Some("went idle without a resolving receipt")
             }
             ResumeOutcome::Unresolved => None,
             _ => idle_after_receipt.then_some("rewrote its receipt and went idle"),
         }
         .or_else(|| {
-            (sent.elapsed() >= sv.cmux.resume_timeout())
-                .then_some("did not finish within the resume timeout")
+            // A request to rewrite a stale receipt gets its own timeout.
+            (sent.elapsed() >= sv.cmux.resume_timeout()
+                && self
+                    .stale
+                    .is_none_or(|n| n.settled || n.waited_out(&*sv.files, sv.cmux)))
+            .then_some("did not finish within the resume timeout")
         });
         if let Some(why) = why {
+            self.settle_stale(sv, run)?;
             // Ask once, the way a person would; never kill the session.
             submit(sv, run, &self.workspace, Input::Exit, "/exit")?;
             self.exit_typed = true;

@@ -178,6 +178,7 @@ so the run workspace opens outside it: {error:#}", self.layout.queue_hash);
             exit_for_silence: false,
             answer_start: None,
             stall: StallWatch::default(),
+            stale: None,
             recovery: RecoveryWatch::default(),
         })
     }
@@ -221,6 +222,9 @@ pub(super) struct SessionWatch {
     /// Idle without a receipt: the nudge and the `stalled` ask (ADR-0043
     /// decision 1).
     pub(super) stall: StallWatch,
+    /// Idle with a receipt for an older commit: the one request to rewrite
+    /// it (task 357).
+    pub(super) stale: Option<StaleNudge>,
     /// Background work past its threshold: the recovery job (ADR-0047
     /// decision 39).
     pub(super) recovery: RecoveryWatch,
@@ -267,6 +271,16 @@ impl SessionWatch {
             && !session_ended
             && let Some(evidence) =
                 match IdleMarker::read(&*sv.files, sv.signals, &self.idle_marker)? {
+                    // The session has not answered the request to rewrite
+                    // its receipt yet: waited for up to the resume timeout,
+                    // like background work after the receipt.
+                    Some(idle)
+                        if self.stale.is_some_and(|n| {
+                            idle.modified() <= n.at && !n.waited_out(&*sv.files, sv.cmux)
+                        }) =>
+                    {
+                        None
+                    }
                     Some(idle) if waited_out => {
                         idle.stopped_after_receipt(&*sv.files, &self.receipt_path)?
                     }
@@ -274,6 +288,9 @@ impl SessionWatch {
                     None => None,
                 }
         {
+            if self.stale_receipt(sv, run)? {
+                return Ok(None);
+            }
             sv.queue
                 .record_runtime_event(run.id(), "session_idle_observed", evidence)?;
             // The session stays open through validation and review, and
@@ -309,6 +326,9 @@ impl SessionWatch {
                 }
                 close_answer_prompt_asks(sv, run, PROMPT_EXITED_CLOSED)?;
                 self.stall.ended(sv, run)?;
+                if let Some(nudge) = &mut self.stale {
+                    nudge.settle(sv, run, SESSION_PHASE, None, "run_ended")?;
+                }
                 self.recovery.stop(sv, run);
                 return sv.queue.finish_supervision(run.id(), &sv.token).map(Some);
             }
@@ -341,7 +361,10 @@ impl SessionWatch {
                 WrapperPulse::Fresh => {
                     if self.exit_requested.is_none() {
                         self.deliver_answers(sv, run)?;
-                        if !self.receipt_seen
+                        // A request to rewrite a stale receipt is typed
+                        // after the receipt.
+                        let rewrite_asked = self.stale.is_some_and(|n| !n.settled);
+                        if (!self.receipt_seen || rewrite_asked)
                             && let Some(start) = &mut self.answer_start
                         {
                             start.poll(sv, run, &self.workspace, &self.idle_marker)?;
@@ -408,6 +431,34 @@ impl SessionWatch {
             self.exit_asked = true;
         }
         Ok(None)
+    }
+
+    /// The session went idle after its receipt: ask it once to rewrite a
+    /// receipt that names an older commit than its clean HEAD (task 357),
+    /// and `true` while that request waits for its answer. Once answered,
+    /// how it ended is recorded and the run goes on either way.
+    fn stale_receipt(&mut self, sv: &mut Supervisor<'_>, run: &TaskRun) -> Result<bool> {
+        if let Some(nudge) = &mut self.stale {
+            let rewritten = sv
+                .files
+                .modified(&self.receipt_path)
+                .is_ok_and(|modified| modified > nudge.at);
+            let outcome = if rewritten { "rewritten" } else { "unchanged" };
+            nudge.settle(sv, run, SESSION_PHASE, None, outcome)?;
+            return Ok(false);
+        }
+        let Some(stale) = stale_receipt(sv, run) else {
+            return Ok(false);
+        };
+        let workspace = self.workspace.clone();
+        let Some((nudge, start)) =
+            nudge_stale_receipt(sv, run, &workspace, SESSION_PHASE, None, &stale)?
+        else {
+            return Ok(false);
+        };
+        self.stale = Some(nudge);
+        self.answer_start = Some(start);
+        Ok(true)
     }
 
     /// Record `first_commit_observed` once, the first time the worktree's
