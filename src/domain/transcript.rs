@@ -35,6 +35,12 @@ pub struct TranscriptRecord {
     pub version: Option<String>,
     /// `message.usage` of an `assistant` record, for task 199.
     pub usage: Option<Value>,
+    /// `message.id` of an `assistant` record: Claude Code writes one record
+    /// per content block of a message, each with the message's usage.
+    pub message_id: Option<String>,
+    /// `costUSD` of an `assistant` record, which some versions of Claude
+    /// Code wrote.
+    pub cost_usd: Option<f64>,
     /// An `assistant` record (the model wrote it), for the work breakdown.
     pub assistant: bool,
     /// The tools an `assistant` record called (task 514).
@@ -128,6 +134,12 @@ impl TranscriptRecord {
                 sidechain,
                 version: line["version"].as_str().map(str::to_owned),
                 usage,
+                message_id: (kind == "assistant")
+                    .then(|| line["message"]["id"].as_str().map(str::to_owned))
+                    .flatten(),
+                cost_usd: (kind == "assistant")
+                    .then(|| line["costUSD"].as_f64())
+                    .flatten(),
                 assistant: kind == "assistant",
                 tool_uses,
                 tool_results,

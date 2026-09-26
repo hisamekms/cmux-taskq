@@ -386,6 +386,8 @@ mod stats {
                 "sessions": {},
                 // Task 514: no session recorded its work breakdown.
                 "work_breakdown": null,
+                // Task 199: nor its tokens.
+                "tokens": null,
             })
         );
         // Parked three times, then the landing: the wait is the resume's.
@@ -429,7 +431,10 @@ mod stats {
                  "sessions": {},
                  "work_breakdown": {"runs": 0, "total_secs": 0, "categories": {}, "commands": {},
                                     "verification_repeats": 0, "runs_with_repeats": 0,
-                                    "test_with_llvm_cov": 0}},
+                                    "test_with_llvm_cov": 0},
+                 "tokens": {"runs": 0, "input": {"count": 0, "total": 0, "median": null}, "output": {"count": 0, "total": 0, "median": null}, "cache_read": {"count": 0, "total": 0, "median": null},
+                            "cache_creation": {"count": 0, "total": 0, "median": null}, "total": {"count": 0, "total": 0, "median": null},
+                            "cost_usd": {"count": 0, "total": null, "median": null}}},
                 {"goal_id": null, "runs": 2,
                  "work": {"count": 1, "total": 300, "median": 300},
                  "validate": {"count": 1, "total": 60, "median": 60},
@@ -438,7 +443,10 @@ mod stats {
                  "sessions": {},
                  "work_breakdown": {"runs": 0, "total_secs": 0, "categories": {}, "commands": {},
                                     "verification_repeats": 0, "runs_with_repeats": 0,
-                                    "test_with_llvm_cov": 0}},
+                                    "test_with_llvm_cov": 0},
+                 "tokens": {"runs": 0, "input": {"count": 0, "total": 0, "median": null}, "output": {"count": 0, "total": 0, "median": null}, "cache_read": {"count": 0, "total": 0, "median": null},
+                            "cache_creation": {"count": 0, "total": 0, "median": null}, "total": {"count": 0, "total": 0, "median": null},
+                            "cost_usd": {"count": 0, "total": null, "median": null}}},
             ])
         );
         assert_eq!(report["overall"]["runs"], 4);

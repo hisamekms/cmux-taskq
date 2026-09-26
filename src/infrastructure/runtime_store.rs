@@ -1810,6 +1810,15 @@ impl SqliteQueue {
         )? {
             payload["work_breakdown"] = work;
         }
+        // Its tokens (task 199).
+        if let Some(tokens) = super::sessions::closed_tokens(
+            &tx,
+            id,
+            crate::domain::sessions::RESUME,
+            crate::domain::EventId::new(resumed),
+        )? {
+            payload["tokens"] = tokens;
+        }
         run_event(&tx, id, "resume_finished", payload)?;
         if !keep_lease {
             tx.execute(

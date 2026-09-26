@@ -11,7 +11,7 @@ use std::collections::{BTreeMap, HashMap};
 use serde::{Serialize, Serializer};
 use serde_json::Value;
 
-use super::{Summary, landing::p90, median, rfc3339_millis, timestamp_millis};
+use super::{Summary, landing::p90, median, rfc3339_millis, timestamp_millis, tokens::TokenTotals};
 use crate::domain::{
     EventId, GoalId, RunEvent, RunId, TaskId,
     sessions::{INFERRED, KINDS, SESSION_CLOSED, SESSION_OPENED, SESSION_TURNS},
@@ -41,6 +41,8 @@ pub struct Span {
     /// The work breakdown of a run's own session, recorded when it closed
     /// (task 514).
     pub work: Option<Value>,
+    /// The tokens it used, recorded when it closed (task 199).
+    pub tokens: Option<Value>,
 }
 
 impl Span {
@@ -97,6 +99,7 @@ pub fn spans(events: &[RunEvent]) -> Vec<Span> {
                     active_unavailable: false,
                     turns: Vec::new(),
                     work: None,
+                    tokens: None,
                 });
             }
             SESSION_TURNS => {
@@ -133,6 +136,11 @@ pub fn spans(events: &[RunEvent]) -> Vec<Span> {
                 span.active = event.payload["active_secs"].as_i64();
                 span.active_unavailable = event.payload["active"] == "unavailable";
                 span.work = event.payload.get("work").filter(|w| w.is_object()).cloned();
+                span.tokens = event
+                    .payload
+                    .get("tokens")
+                    .filter(|t| t.is_object())
+                    .cloned();
             }
             _ => {}
         }
@@ -200,6 +208,9 @@ pub struct KindSessions {
     pub inferred: usize,
     /// Spans closed without their active time.
     pub active_unavailable: usize,
+    /// The tokens of its spans closed in the window that recorded them
+    /// (task 199).
+    pub tokens: TokenTotals,
 }
 
 /// The window the sessions were counted in: the events after `after` up to
@@ -245,6 +256,8 @@ pub struct RunSpan {
     pub active: Option<i64>,
     /// Its work breakdown (task 514).
     pub work: Option<Value>,
+    /// Its tokens (task 199).
+    pub tokens: Option<Value>,
 }
 
 /// The spans of `run`, whole (not cut to a window), an open one counted to
@@ -258,6 +271,7 @@ pub fn run_spans(spans: &[Span], run: &RunId, now: i64) -> Vec<RunSpan> {
             open: span.open_secs(None, now),
             active: span.active_secs(),
             work: span.work.clone(),
+            tokens: span.tokens.clone(),
         })
         .collect()
 }
@@ -366,6 +380,9 @@ pub fn by_kind(
         }
         if unavailable {
             sessions.active_unavailable += 1;
+        }
+        if closed_in_window && let Some(tokens) = &span.tokens {
+            sessions.tokens.add(tokens);
         }
         // Its turns that overlap the window: all of them when it closed
         // with its active time recorded, those recorded so far while open.
@@ -564,6 +581,7 @@ mod tests {
             open: 10,
             active: Some(4),
             work: None,
+            tokens: None,
         }];
         assert_eq!(per_run(&with_active)["review"].active, Some(4));
         assert_eq!(per_goal(with_active.iter())["review"].active.total, 4);

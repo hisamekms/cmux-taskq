@@ -302,7 +302,7 @@ live session alert (long_background, stuck_exit, prompt_waiting)
 
 ### `stats`
 
-- [`stats`](supervisor-lifecycle/stats.md)（Claude sessionの区間のkindごとの開いている時間とtranscriptのturnから導く稼働時間の集計`sessions`を含む。[ADR-0048](../adr/0048-record-claude-sessions-by-kind-with-open-and-active-time.md)。runのsessionの作業の内訳`work_breakdown`（task 514）も）
+- [`stats`](supervisor-lifecycle/stats.md)（Claude sessionの区間のkindごとの開いている時間とtranscriptのturnから導く稼働時間の集計`sessions`を含む。[ADR-0048](../adr/0048-record-claude-sessions-by-kind-with-open-and-active-time.md)。runのsessionの作業の内訳`work_breakdown`（task 514）と、sessionのトークン数`tokens`（task 199）も）
 
 ### `mark` / `marks`
 

@@ -22,6 +22,7 @@ pub mod measures;
 pub mod retries;
 pub mod sessions;
 pub mod thresholds;
+pub mod tokens;
 pub mod updates;
 pub mod work;
 
@@ -38,6 +39,7 @@ pub use measures::{
 pub use retries::{BrokenBy, ResumeAttempt, ResumeBreakdown, Retries};
 pub use sessions::{GoalKindSessions, KindSessions, RunKindSessions, SessionWindow, Sessions};
 pub use thresholds::ThresholdStats;
+pub use tokens::{RunTokens, TokenSummary, TokenTotals};
 pub use updates::UpdateStats;
 pub use work::{CategoryShare, CommandCount, RunWork, WorkShares};
 
@@ -219,6 +221,9 @@ pub struct RunStats {
     /// What its own sessions (worker, resume, revise) spent their time on
     /// (task 514); null when none recorded it.
     pub work_breakdown: Option<RunWork>,
+    /// The tokens its sessions used (task 199), all of them and per kind of
+    /// session; null when none recorded them.
+    pub tokens: Option<RunTokens>,
     /// Each of its spans, for the per-goal summaries.
     #[serde(skip)]
     pub session_spans: Vec<sessions::RunSpan>,
@@ -250,6 +255,10 @@ pub struct Intervals {
     /// The runs' work breakdown (task 514): per category its total, median
     /// and share, the heavy commands, and the verification repeated.
     pub work_breakdown: WorkShares,
+    /// The runs' tokens (task 199): per kind of token the total and median
+    /// of the runs that recorded them, and the cost when Claude Code gave
+    /// one.
+    pub tokens: TokenSummary,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -676,6 +685,11 @@ pub fn stats(
         track.stats.sessions = sessions::per_run(&run_spans);
         track.stats.work_breakdown =
             work::per_run(run_spans.iter().filter_map(|s| s.work.as_ref()));
+        track.stats.tokens = tokens::per_run(
+            run_spans
+                .iter()
+                .filter_map(|s| Some((s.kind.as_str(), s.tokens.as_ref()?))),
+        );
         track.stats.session_spans = run_spans;
     }
 
@@ -1410,6 +1424,7 @@ fn intervals(runs: &[&RunStats]) -> Intervals {
         ),
         sessions: sessions::per_goal(runs.iter().flat_map(|r| &r.session_spans)),
         work_breakdown: work::shares(runs.iter().filter_map(|r| r.work_breakdown.as_ref())),
+        tokens: tokens::summary(runs.iter().filter_map(|r| r.tokens.as_ref())),
     }
 }
 
@@ -1471,6 +1486,7 @@ fn runs(events: &[RunEvent], goals: &HashMap<TaskId, Option<GoalId>>) -> Vec<Tra
                     measures: RunMeasures::default(),
                     sessions: BTreeMap::new(),
                     work_breakdown: None,
+                    tokens: None,
                     session_spans: Vec::new(),
                 },
                 claimed: None,
@@ -2531,6 +2547,98 @@ mod tests {
         assert_eq!(overall["verification_repeats"], 1);
         assert_eq!(overall["runs_with_repeats"], 1);
         assert_eq!(json["goals"][0]["work_breakdown"], *overall);
+    }
+
+    /// The tokens (task 199): a run sums its sessions', per kind too; goals,
+    /// kinds and overall total them with medians; the window's sessions
+    /// per kind have theirs, the observer's included.
+    #[test]
+    fn tokens_are_summed_per_run_and_per_kind_of_session() {
+        let span = |id: i64, run: Option<&str>, kind: &str, tokens: Value, secs: i64| {
+            let at = |event: RunEvent| RunEvent {
+                task_id: run.map(|_| event.task_id.unwrap()),
+                run_id: run.and(event.run_id),
+                ..event
+            };
+            [
+                at(run_event(
+                    id,
+                    run.unwrap_or(R1),
+                    "session_opened",
+                    json!({"kind": kind}),
+                    secs,
+                )),
+                at(run_event(
+                    id + 1,
+                    run.unwrap_or(R1),
+                    "session_closed",
+                    json!({"opened_event_id": id, "kind": kind, "reason": "exited", "tokens": tokens}),
+                    secs + 100,
+                )),
+            ]
+        };
+        let tokens = |input: i64, output: i64| {
+            json!({"input": input, "output": output, "cache_read": 1000, "cache_creation": 100,
+                   "messages": 2})
+        };
+        let r2 = |event: RunEvent| RunEvent {
+            task_id: Some(TaskId::new(2)),
+            ..event
+        };
+        let mut events = vec![run_event(1, R1, "run_claimed", json!({}), T)];
+        events.extend(span(2, Some(R1), "worker", tokens(10, 20), T));
+        events.extend(span(4, Some(R1), "review", tokens(1, 2), T + 200));
+        events.push(run_event(6, R1, "run_integrated", json!({}), T + 400));
+        events.push(r2(run_event(7, R2, "run_claimed", json!({}), T + 500)));
+        let mut costed = tokens(30, 40);
+        costed["cost_usd"] = json!(1.5);
+        events.extend(span(8, Some(R2), "worker", costed, T + 500).map(r2));
+        // A span without tokens counts in neither.
+        events.extend(span(10, Some(R2), "review", Value::Null, T + 600).map(r2));
+        events.push(r2(run_event(12, R2, "run_integrated", json!({}), T + 800)));
+        events.extend(span(13, None, "observer", tokens(5, 5), T + 900));
+        let goals = HashMap::from([
+            (TaskId::new(1), Some(GoalId::new(5))),
+            (TaskId::new(2), Some(GoalId::new(5))),
+        ]);
+        let all = stats(
+            &events,
+            &goals,
+            T + 1100,
+            SlotSnapshot::default(),
+            &StatsQuery {
+                full: true,
+                ..StatsQuery::default()
+            },
+            &LiveSnapshot::default(),
+        );
+        let json = serde_json::to_value(&all).unwrap();
+        let r1 = &json["runs"][0]["tokens"];
+        assert_eq!(r1["sessions"], 2);
+        assert_eq!(r1["input"], 11);
+        assert_eq!(r1["total"], 11 + 22 + 2200);
+        assert_eq!(r1["cost_usd"], Value::Null);
+        assert_eq!(r1["by_kind"]["review"]["output"], 2);
+        let r2 = &json["runs"][1]["tokens"];
+        assert_eq!(r2["sessions"], 1);
+        assert_eq!(r2["cost_usd"], json!(1.5));
+        let overall = &json["overall"]["tokens"];
+        assert_eq!(overall["runs"], 2);
+        assert_eq!(
+            overall["input"],
+            json!({"count": 2, "total": 41, "median": 20})
+        );
+        assert_eq!(
+            overall["cost_usd"],
+            json!({"count": 1, "total": 1.5, "median": 1.5})
+        );
+        assert_eq!(json["goals"][0]["tokens"], *overall);
+        let by_kind = &json["sessions"]["by_kind"];
+        assert_eq!(by_kind["worker"]["tokens"]["input"], 40);
+        assert_eq!(by_kind["worker"]["tokens"]["cost_sessions"], 1);
+        assert_eq!(by_kind["review"]["tokens"]["sessions"], 1);
+        assert_eq!(by_kind["observer"]["tokens"]["output"], 5);
+        assert_eq!(by_kind["triage"]["tokens"]["sessions"], 0);
     }
 
     /// The Claude sessions (ADR-0048): per run whole, per goal and overall

@@ -580,6 +580,7 @@ pub mod stall;
 pub mod stats;
 pub mod task;
 pub mod timeline;
+pub mod tokens;
 pub mod transcript;
 mod views;
 pub mod waiting;

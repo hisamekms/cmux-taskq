@@ -21,6 +21,7 @@ use crate::{
             SESSION_OPENED, SESSION_TURNS, Scope, SpanChange, SpanContext, changes, scope,
         },
         stats::rfc3339_millis,
+        tokens,
         transcript::{Transcript, Turn, Unreadable, millis_text, span_turns, turns},
         worktime,
     },
@@ -96,12 +97,12 @@ pub(super) fn follow(
         .map(|secs| millis_text(secs * 1000))
         .filter(|sent| rfc3339_millis(sent) < rfc3339_millis(&at))
         .unwrap_or(at);
-    let mut work = None;
+    let mut exited = RunSessionClosed::default();
     for change in changes {
         match change {
             SpanChange::Close { span, reason } => {
                 if let Some(closed) = close(conn, &at, task_id, run_id, &span, reason)? {
-                    work = Some(closed);
+                    exited = closed;
                 }
             }
             SpanChange::Open(payload) => {
@@ -109,16 +110,27 @@ pub(super) fn follow(
             }
         }
     }
-    // The session's exit carries the work of the span it ended (task 514).
-    if kind == "session_exited"
-        && let Some(work) = work
-    {
-        conn.execute(
-            "UPDATE run_events SET payload=json_set(payload,'$.work_breakdown',json(?2)) WHERE id=?1",
-            params![event_id, serde_json::to_string(&work)?],
-        )?;
+    // The session's exit carries the work (task 514) and the tokens (task
+    // 199) of the span it ended.
+    if kind == "session_exited" {
+        for (key, value) in [("work_breakdown", exited.work), ("tokens", exited.tokens)] {
+            if let Some(value) = value {
+                conn.execute(
+                    "UPDATE run_events SET payload=json_set(payload,?3,json(?2)) WHERE id=?1",
+                    params![event_id, serde_json::to_string(&value)?, format!("$.{key}")],
+                )?;
+            }
+        }
     }
     Ok(())
+}
+
+/// What the close of a run's own session (worker, resume, revise) hands its
+/// exit: its work breakdown with its kind and attempt, and its tokens.
+#[derive(Debug, Default)]
+struct RunSessionClosed {
+    work: Option<Value>,
+    tokens: Option<Value>,
 }
 
 /// The `work` of the latest closed span of `kind` of `run` opened after
@@ -130,6 +142,32 @@ pub(super) fn closed_work(
     kind: &str,
     after: EventId,
 ) -> Result<Option<Value>> {
+    Ok(closed_value(conn, run_id, kind, after, "work")?
+        .map(|(work, opened)| exited_work(&work, kind, &opened["attempt"])))
+}
+
+/// The `tokens` of the latest closed span of `kind` of `run` opened after
+/// the event `after`: what `resume_finished` carries of the resumed session
+/// (task 199).
+pub(super) fn closed_tokens(
+    conn: &Connection,
+    run_id: &RunId,
+    kind: &str,
+    after: EventId,
+) -> Result<Option<Value>> {
+    Ok(closed_value(conn, run_id, kind, after, "tokens")?.map(|(tokens, _)| tokens))
+}
+
+/// `key` of the latest `session_closed` of `kind` of `run` that has it,
+/// whose span opened after the event `after`, and the span's
+/// `session_opened` payload.
+fn closed_value(
+    conn: &Connection,
+    run_id: &RunId,
+    kind: &str,
+    after: EventId,
+    key: &str,
+) -> Result<Option<(Value, Value)>> {
     let found: Option<(Value, Value)> = conn
         .query_row(
             &format!(
@@ -137,10 +175,10 @@ pub(super) fn closed_work(
                    JOIN run_events o ON o.id=json_extract(c.payload,'$.opened_event_id')
                  WHERE c.run_id=?1 AND c.kind='{SESSION_CLOSED}' AND o.id>?3
                    AND json_extract(c.payload,'$.kind')=?2
-                   AND json_extract(c.payload,'$.work') IS NOT NULL
+                   AND json_extract(c.payload,?4) IS NOT NULL
                  ORDER BY c.id DESC LIMIT 1"
             ),
-            params![run_id, kind, after],
+            params![run_id, kind, after, format!("$.{key}")],
             |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
         )
         .optional()?
@@ -150,7 +188,7 @@ pub(super) fn closed_work(
                 serde_json::from_str(&opened).unwrap_or_default(),
             )
         });
-    Ok(found.map(|(closed, opened)| exited_work(&closed["work"], kind, &opened["attempt"])))
+    Ok(found.map(|(closed, opened)| (closed[key].clone(), opened)))
 }
 
 /// `work` with the kind and attempt of its span, as the session's exit and
@@ -176,7 +214,8 @@ fn now(conn: &Connection) -> Result<String> {
 /// record when that is earlier (ADR-0048 decision 7). A transcript that
 /// cannot be read leaves the active time unrecorded, and says why. A run's
 /// own session also gets its work breakdown (task 514), returned with the
-/// span's kind and attempt.
+/// span's kind and attempt, and every span its tokens (task 199), which a
+/// run's own session also returns.
 fn close(
     conn: &Connection,
     now: &str,
@@ -184,10 +223,10 @@ fn close(
     run_id: Option<&RunId>,
     span: &OpenSpan,
     reason: &str,
-) -> Result<Option<Value>> {
+) -> Result<Option<RunSessionClosed>> {
     let mut payload = SpanChange::closed_payload(span, reason);
     let mut closed_at = now.to_owned();
-    let mut work = None;
+    let mut closed = RunSessionClosed::default();
     match (read(span), times(conn, span, now)?) {
         (Ok(transcript), Some((start, now_ms))) => {
             let mut end = now_ms;
@@ -209,9 +248,26 @@ fn close(
             let millis: i64 = recorded.iter().chain(&new).map(|turn| turn.millis()).sum();
             payload["active"] = json!("recorded");
             payload["active_secs"] = json!(millis / 1000);
+            // An inferred close ends at the transcript's last record, which
+            // is the span's.
+            let tokens_end = if reason == INFERRED { end + 1 } else { end };
+            match tokens::span_usage(&transcript.records, start, tokens_end) {
+                Ok(usage) => {
+                    payload["tokens"] = usage.payload();
+                    closed.tokens = Some(usage.payload());
+                }
+                Err(code) => info!(
+                    code,
+                    version = transcript.version().unwrap_or("unknown"),
+                    "session span {} ({}): tokens not recorded, {code} (Claude Code {})",
+                    span.opened_event_id,
+                    span.kind(),
+                    transcript.version().unwrap_or("version unknown"),
+                ),
+            }
             if let Some(run_id) = run_id.filter(|_| RUN_SESSION.contains(&span.kind())) {
                 let breakdown = work_breakdown(conn, run_id, span, &transcript, start, end)?;
-                work = Some(exited_work(
+                closed.work = Some(exited_work(
                     &breakdown,
                     span.kind(),
                     &span.payload["attempt"],
@@ -230,7 +286,10 @@ fn close(
         }
     }
     insert_at(conn, task_id, run_id, SESSION_CLOSED, &payload, &closed_at)?;
-    Ok(work)
+    Ok(run_id
+        .filter(|_| RUN_SESSION.contains(&span.kind()))
+        .filter(|_| closed.work.is_some() || closed.tokens.is_some())
+        .map(|_| closed))
 }
 
 /// The work breakdown of `span` of `run_id` from `start` to `end` (unix
@@ -299,7 +358,7 @@ fn unavailable(span: &OpenSpan, unreadable: &Unreadable) {
     info!(
         code = unreadable.code,
         version = unreadable.version.as_deref().unwrap_or("unknown"),
-        "session span {} ({}): active time not recorded, {}: {} (Claude Code {})",
+        "session span {} ({}): active time and tokens not recorded, {}: {} (Claude Code {})",
         span.opened_event_id,
         span.kind(),
         unreadable.code,
@@ -1166,5 +1225,215 @@ mod tests {
             of_kind(&queue, "session_exited")[0].payload["work_breakdown"],
             work
         );
+    }
+
+    /// Every span closes with the tokens of its transcript's messages in
+    /// it: a run's session also gives them to its `session_exited` and a
+    /// resume's to its `resume_finished`, a headless job's span has its
+    /// own; a usage this reader does not know records none, and leaves the
+    /// active time and the run as they were.
+    #[test]
+    fn spans_record_the_tokens_of_their_transcripts() {
+        use crate::domain::CommitSha;
+        let dir = tempfile::tempdir().unwrap();
+        let (mut queue, task_id, run) = run_queue(dir.path());
+        let project = dir.path().join("config/projects/-wt");
+        std::fs::create_dir_all(&project).unwrap();
+        let write = |session: &str, base: i64, lines: &[(&str, i64, Value)]| {
+            let lines: Vec<String> = lines
+                .iter()
+                .map(|(kind, secs, message)| {
+                    json!({"type": kind, "timestamp": millis_text(base + secs * 1000),
+                           "sessionId": session, "version": "2.1.283", "message": message})
+                    .to_string()
+                })
+                .collect();
+            std::fs::write(project.join(format!("{session}.jsonl")), lines.join("\n")).unwrap();
+        };
+        let reply = |id: &str, input: i64, output: i64| {
+            json!({"id": id, "content": [{"type": "text"}], "usage": {
+                "input_tokens": input, "output_tokens": output,
+                "cache_read_input_tokens": 100, "cache_creation_input_tokens": 10}})
+        };
+        let go = json!({"content": "go"});
+        let record = |queue: &SqliteQueue, kind: &str, payload: Value| {
+            event(&queue.conn, task_id, Some(&run), kind, payload).unwrap();
+        };
+
+        record(&queue, "agent_started", json!({"session_id": RUN}));
+        let start = retime(&queue.conn, 0, 100);
+        write(
+            RUN,
+            start,
+            &[
+                ("user", 1, go.clone()),
+                ("assistant", 2, reply("m1", 3, 5)),
+                ("assistant", 3, reply("m1", 3, 9)),
+                ("assistant", 4, reply("m2", 2, 1)),
+            ],
+        );
+        // The review job runs in a session of its own.
+        record(
+            &queue,
+            "review_started",
+            json!({"attempt": 1, "session_id": "s-review"}),
+        );
+        // Its span opened 50 s ago; the review_started is now.
+        let now = retime(&queue.conn, latest(&queue.conn) - 1, 50);
+        write(
+            "s-review",
+            now - 50_000,
+            &[("user", 1, go.clone()), ("assistant", 2, reply("r1", 7, 4))],
+        );
+        record(&queue, "review_finished", json!({"verdict": "pass"}));
+        record(&queue, "session_exited", json!({"exit_code": 0}));
+
+        let expected = json!({"input": 5, "output": 10, "cache_read": 200,
+                              "cache_creation": 20, "messages": 2});
+        let closed = of_kind(&queue, SESSION_CLOSED);
+        let review = closed
+            .iter()
+            .find(|e| e.payload["kind"] == "review")
+            .unwrap();
+        assert_eq!(
+            review.payload["tokens"],
+            json!({"input": 7, "output": 4, "cache_read": 100, "cache_creation": 10, "messages": 1})
+        );
+        let worker = closed
+            .iter()
+            .find(|e| e.payload["kind"] == "worker")
+            .unwrap();
+        assert_eq!(worker.payload["tokens"], expected);
+        let exited = &of_kind(&queue, "session_exited")[0];
+        assert_eq!(exited.payload["tokens"], expected);
+        assert_eq!(exited.payload["exit_code"], 0);
+
+        // A resume whose session exits before it finishes: its own tokens.
+        let main = CommitSha::try_from("0123456789abcdef0123456789abcdef01234567").unwrap();
+        queue
+            .conn
+            .execute("UPDATE tasks SET status='in_progress'", [])
+            .unwrap();
+        queue
+            .conn
+            .execute(
+                "UPDATE task_runs SET status='needs_session', base_commit=?1",
+                [main.as_str()],
+            )
+            .unwrap();
+        queue
+            .begin_resume(&run, "tok", &main, None)
+            .unwrap()
+            .unwrap();
+        let before = latest(&queue.conn);
+        record(&queue, "agent_started", json!({"session_id": RUN}));
+        // Its span opened 20 s ago; begin_resume's events are now.
+        let resumed = retime(&queue.conn, before, 20) - 20_000;
+        write(
+            RUN,
+            start,
+            &[
+                ("user", 1, go.clone()),
+                ("assistant", 2, reply("m1", 3, 9)),
+                ("user", (resumed - start) / 1000 + 1, go.clone()),
+                (
+                    "assistant",
+                    (resumed - start) / 1000 + 2,
+                    reply("m3", 11, 13),
+                ),
+            ],
+        );
+        record(&queue, "session_exited", json!({"exit_code": 0}));
+        queue
+            .finish_resume(
+                &run,
+                "tok",
+                None,
+                None,
+                false,
+                json!({"outcome": "unresolved"}),
+            )
+            .unwrap();
+        let finished = &of_kind(&queue, "resume_finished")[0];
+        assert_eq!(
+            finished.payload["tokens"],
+            json!({"input": 11, "output": 13, "cache_read": 100, "cache_creation": 10, "messages": 1})
+        );
+
+        // A usage of an unknown form: no tokens, the rest as before.
+        queue
+            .conn
+            .execute("UPDATE task_runs SET status='needs_session'", [])
+            .unwrap();
+        queue
+            .begin_resume(&run, "tok", &main, None)
+            .unwrap()
+            .unwrap();
+        let before = latest(&queue.conn);
+        record(&queue, "agent_started", json!({"session_id": RUN}));
+        let again = retime(&queue.conn, before, 10) - 10_000;
+        write(
+            RUN,
+            again,
+            &[
+                ("user", 1, go),
+                (
+                    "assistant",
+                    2,
+                    json!({"id": "x", "usage": {"input_tokens": "many"}}),
+                ),
+            ],
+        );
+        record(&queue, "session_exited", json!({"exit_code": 0}));
+        let closed = of_kind(&queue, SESSION_CLOSED);
+        let last = closed.last().unwrap();
+        assert_eq!(last.payload["active"], "recorded");
+        assert!(last.payload.get("tokens").is_none());
+        let exited = of_kind(&queue, "session_exited");
+        assert!(exited.last().unwrap().payload.get("tokens").is_none());
+        assert_eq!(
+            closed_tokens(&queue.conn, &run, "resume", EventId::new(before)).unwrap(),
+            None
+        );
+    }
+
+    /// An inferred close ends at the transcript's last record, whose
+    /// message is still the span's.
+    #[test]
+    fn an_inferred_close_keeps_the_tokens_of_the_last_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let (queue, task_id, run) = run_queue(dir.path());
+        let conn = &queue.conn;
+        event(
+            conn,
+            task_id,
+            Some(&run),
+            "agent_started",
+            json!({"session_id": RUN}),
+        )
+        .unwrap();
+        let start = retime(conn, 0, 100);
+        let project = dir.path().join("config/projects/-wt");
+        std::fs::create_dir_all(&project).unwrap();
+        let line = |kind: &str, secs: i64, message: Value| {
+            json!({"type": kind, "timestamp": millis_text(start + secs * 1000),
+                   "sessionId": RUN, "version": "2.1.283", "message": message})
+            .to_string()
+        };
+        let lines = [
+            line("user", 5, json!({"content": "go"})),
+            line(
+                "assistant",
+                20,
+                json!({"id": "m", "content": [],
+                 "usage": {"input_tokens": 4, "output_tokens": 6}}),
+            ),
+        ];
+        std::fs::write(project.join(format!("{RUN}.jsonl")), lines.join("\n")).unwrap();
+        event(conn, task_id, Some(&run), "workspace_closed", json!({})).unwrap();
+        let closed = &of_kind(&queue, SESSION_CLOSED)[0];
+        assert_eq!(closed.payload["reason"], "inferred");
+        assert_eq!(closed.created_at, millis_text(start + 20_000));
+        assert_eq!(closed.payload["tokens"]["output"], 6);
     }
 }
