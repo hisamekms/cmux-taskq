@@ -10,7 +10,8 @@ use crate::domain::Ask;
 use crate::domain::{
     ANSWERED_BY_PERSON, ANSWERED_BY_RUNTIME, AskId, AskKind, AskOutcome, AskReason,
     HOLD_AFFECTED_HEADING, HoldOutcome, LANDING_OPTIONS, NewAsk, NewHold, RunId, RunStatus,
-    TRIAGE_OPTIONS, TaskId, UPDATE_FAILED_OPTIONS, UPDATE_FAILED_SUBJECT, option_index,
+    TRIAGE_OPTIONS, TaskId, UPDATE_FAILED_OPTIONS, UPDATE_FAILED_SUBJECT, check_ask_kind,
+    check_event_target, option_index,
 };
 
 pub use crate::application::AskQuery;
@@ -99,9 +100,11 @@ impl SqliteQueue {
             }
             None => {
                 let affected = vec![run];
+                let kind = AskKind::QueueHold;
+                check_ask_kind(&kind, None, None, hold.reason_category)?;
                 tx.execute(
                     "INSERT INTO asks(kind,question,options,asked_by,reason_category,subject,affected)
-                     VALUES ('queue_hold',?1,?2,?3,?4,?5,?6)",
+                     VALUES (?7,?1,?2,?3,?4,?5,?6)",
                     params![
                         NewHold::question_for(&hold.question, &affected),
                         serde_json::to_string(&hold.options)?,
@@ -109,6 +112,7 @@ impl SqliteQueue {
                         hold.reason_category.as_str(),
                         hold.subject,
                         serde_json::to_string(&affected)?,
+                        kind.as_str(),
                     ],
                 )?;
                 let id = AskId::new(tx.last_insert_rowid());
@@ -339,16 +343,18 @@ impl SqliteQueue {
             )?;
             ask_event(&tx, None, None, "ask_answered", payload)?;
         }
-        let reason = AskReason::Scope;
+        let (kind, reason) = (AskKind::Blocked, AskReason::Scope);
+        check_ask_kind(&kind, None, None, reason)?;
         tx.execute(
             "INSERT INTO asks(kind,question,options,asked_by,reason_category,subject)
-             VALUES ('blocked',?1,?2,?3,?4,?5)",
+             VALUES (?6,?1,?2,?3,?4,?5)",
             params![
                 question,
                 serde_json::to_string(options)?,
                 asked_by,
                 reason.as_str(),
-                subject
+                subject,
+                kind.as_str()
             ],
         )?;
         let id = AskId::new(tx.last_insert_rowid());
@@ -607,6 +613,7 @@ pub(super) fn insert_ask(tx: &Connection, ask: &NewAsk) -> Result<AskOutcome> {
         // `validate` admits this for a blocked ask only.
         (None, None) => None,
     };
+    check_ask_kind(&ask.kind, task_id, ask.run_id.as_ref(), ask.reason_category)?;
     if let Some(finding_id) = ask.finding_id {
         super::findings::read_finding(tx, finding_id)?;
     }
@@ -697,6 +704,7 @@ fn ask_event(
     kind: &str,
     payload: serde_json::Value,
 ) -> Result<()> {
+    check_event_target(kind, task_id, None)?;
     conn.execute(
         "INSERT INTO run_events(task_id,run_id,kind,payload) VALUES (?1,?2,?3,?4)",
         params![task_id, run_id, kind, serde_json::to_string(&payload)?],
@@ -713,7 +721,7 @@ pub(super) fn read_ask(conn: &Connection, id: AskId) -> Result<Ask> {
 pub(super) fn ask_row(row: &Row<'_>) -> rusqlite::Result<Ask> {
     Ok(Ask {
         id: row.get("id")?,
-        kind: enum_col(row, "kind")?,
+        kind: AskKind::read(&row.get::<_, String>("kind")?),
         task_id: row.get("task_id")?,
         run_id: row.get("run_id")?,
         question: row.get("question")?,

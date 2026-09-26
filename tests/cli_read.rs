@@ -538,3 +538,74 @@ fn related_prints_candidates_with_their_clues() {
     ok_as("observer", &db, &["related", "1"]);
     ok_as("reviewer", &db, &["related", "1"]);
 }
+
+#[test]
+fn status_watch_and_show_read_kinds_a_newer_binary_wrote() {
+    // ADR-0073 decision 21: a kind this binary does not know is shown, not
+    // an error; its ask is a generic one a person answers.
+    let (_dir, db) = queue();
+    ok(&db, &["add", "first"]);
+    let cursor = ok(&db, &["status"])["cursor"].as_i64().unwrap();
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    conn.execute_batch(
+        "INSERT INTO asks(kind,task_id,question,options,asked_by,reason_category)
+         VALUES ('future_kind',1,'Which way?','[\"left\",\"right\"]','supervisor','scope');
+         INSERT INTO run_events(task_id,kind,payload)
+         VALUES (1,'ask_opened','{\"ask_id\":1,\"kind\":\"future_kind\"}');
+         INSERT INTO run_events(task_id,kind,payload) VALUES (1,'future_task_event','{}');
+         INSERT INTO run_events(kind,payload) VALUES ('future_queue_event','{}');",
+    )
+    .unwrap();
+    let status = ok(&db, &["status"]);
+    assert_eq!(status["asks"][0]["kind"], "future_kind");
+    assert_eq!(status["asks"][0]["question"], "Which way?");
+    assert!(
+        status["attention"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|a| a["ask_id"] == 1 && a["next"] == "answer ask 1")
+    );
+    let watch = ok(
+        &db,
+        &["watch", "--after", &cursor.to_string(), "--timeout", "0"],
+    );
+    assert_eq!(watch["events"][0]["ask_id"], 1);
+    assert_eq!(watch["cursor"], cursor + 3);
+    let show = ok(&db, &["show", "1", "--full"]);
+    let kinds: Vec<&str> = show["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["kind"].as_str().unwrap())
+        .collect();
+    assert_eq!(kinds, ["task_created", "ask_opened", "future_task_event"]);
+    let events = ok(&db, &["events", "--after", &cursor.to_string(), "--all"]);
+    assert_eq!(events["events"][2]["kind"], "future_queue_event");
+    // Its answer is recorded for a person to read; nothing applies it.
+    ok(&db, &["answer", "1", "--text", "left"]);
+    let answered = ok(&db, &["status"]);
+    assert!(
+        answered["attention"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|a| { a["ask_id"] == 1 && a["next"] == "read the answer of ask 1 and close it" })
+    );
+
+    // A run's timeline and the stats pass an unknown event by.
+    let (_dir, db) = queue();
+    let run = run_with_events(
+        &db,
+        &[
+            (
+                "agent_started",
+                serde_json::json!({"session_id": "s"}),
+                "00:00:05",
+            ),
+            ("future_run_event", serde_json::json!({"x": 1}), "00:10:00"),
+        ],
+    );
+    ok(&db, &["timeline", &run]);
+    ok(&db, &["stats", "--full"]);
+}

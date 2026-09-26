@@ -27,7 +27,7 @@ pub const DEFAULT_MAX_WAITING: usize = 4;
 /// The asks a run in `phase` waits for (decision 1's table): the first
 /// session's `worker_question`, `answer_prompt` and `stalled`, and the
 /// `stuck_exit` and `answer_prompt` of the `/exit` after a verdict.
-pub fn waits_for(phase: WaitPhase, kind: AskKind) -> bool {
+pub fn waits_for(phase: WaitPhase, kind: &AskKind) -> bool {
     match phase {
         WaitPhase::Session => matches!(
             kind,
@@ -404,12 +404,12 @@ mod tests {
 
     #[test]
     fn the_table_and_the_causes() {
-        assert!(waits_for(WaitPhase::Session, AskKind::WorkerQuestion));
-        assert!(waits_for(WaitPhase::Session, AskKind::Stalled));
-        assert!(!waits_for(WaitPhase::Session, AskKind::StuckExit));
-        assert!(waits_for(WaitPhase::Exit, AskKind::StuckExit));
-        assert!(waits_for(WaitPhase::Exit, AskKind::AnswerPrompt));
-        assert!(!waits_for(WaitPhase::Exit, AskKind::WorkerQuestion));
+        assert!(waits_for(WaitPhase::Session, &AskKind::WorkerQuestion));
+        assert!(waits_for(WaitPhase::Session, &AskKind::Stalled));
+        assert!(!waits_for(WaitPhase::Session, &AskKind::StuckExit));
+        assert!(waits_for(WaitPhase::Exit, &AskKind::StuckExit));
+        assert!(waits_for(WaitPhase::Exit, &AskKind::AnswerPrompt));
+        assert!(!waits_for(WaitPhase::Exit, &AskKind::WorkerQuestion));
         assert_eq!(WaitPhase::Exit.as_str(), "exit");
         for cause in [
             WaitCause::Answered,

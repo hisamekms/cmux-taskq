@@ -30,6 +30,44 @@ macro_rules! string_enum {
     };
 }
 
+// The known kinds of an open-ended kind column (ADR-0073 decision 21): like
+// `string_enum!`, plus `Other` for a value a newer binary wrote. `FromStr`
+// still rejects an unknown value, for what this binary is asked to write.
+macro_rules! known_ask_kinds {
+    ($name:ident { $($(#[$meta:meta])* $variant:ident => $value:literal),+ $(,)? }) => {
+        #[derive(Debug, Clone, PartialEq, Eq)]
+        pub enum $name {
+            $($(#[$meta])* $variant,)+
+            /// A kind this binary does not know, as stored.
+            Other(String),
+        }
+
+        impl $name {
+            /// The kind as stored: a known kind's name, or an unknown one
+            /// verbatim.
+            pub fn as_str(&self) -> &str {
+                match self {
+                    $(Self::$variant => $value,)+
+                    Self::Other(value) => value,
+                }
+            }
+        }
+
+        impl std::str::FromStr for $name {
+            type Err = DomainError;
+            fn from_str(value: &str) -> Result<Self, DomainError> {
+                match value {
+                    $($value => Ok(Self::$variant)),+,
+                    _ => Err(DomainError::UnknownValue {
+                        kind: stringify!($name),
+                        value: value.to_owned(),
+                    }),
+                }
+            }
+        }
+    };
+}
+
 // `submitted` waits for plan review (ADR-0041 decision 8): only plan review,
 // a person's explicit bypass and a retry of the same task make a task
 // `ready`.
@@ -114,8 +152,10 @@ string_enum!(GoalVerdict {
 });
 
 // What an ask (ADR-0022) waits for a person to decide. Only questions that
-// need an answer are asks; a notice is an attention.
-string_enum!(AskKind {
+// need an answer are asks; a notice is an attention. The kinds are not
+// enumerated in the queue (ADR-0073 decision 19): a newer binary may write
+// one this binary does not know, which reads as `Other` (decision 21).
+known_ask_kinds!(AskKind {
     ApproveLanding => "approve_landing",
     AnswerPrompt => "answer_prompt",
     Decide => "decide",
@@ -149,6 +189,42 @@ string_enum!(AskKind {
     // are its `affected`; a run that hits the same wall joins it.
     QueueHold => "queue_hold",
 });
+
+impl AskKind {
+    /// The kind of a stored ask: never fails, since a newer binary may have
+    /// written a kind this one does not know (ADR-0073 decision 21). The
+    /// CLI parses with [`str::parse`], which accepts known kinds only
+    /// (decision 20).
+    pub fn read(value: &str) -> Self {
+        value
+            .parse()
+            .unwrap_or_else(|_| Self::Other(value.to_owned()))
+    }
+
+    /// This binary knows the kind and may act on its answer; an `Other`
+    /// ask is only shown and answered (ADR-0073 decision 21).
+    pub fn is_known(&self) -> bool {
+        !matches!(self, Self::Other(_))
+    }
+}
+
+impl fmt::Display for AskKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl Serialize for AskKind {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for AskKind {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Ok(Self::read(&String::deserialize(deserializer)?))
+    }
+}
 
 // Why an ask needs a person (ADR-0047 decision 41). Every ask carries one;
 // what fits none of them is no ask (a note, a receipt or a finding).
@@ -590,13 +666,48 @@ impl NewAsk {
         )?;
         require(
             self.finding_id.is_none() || self.kind == AskKind::Blocked,
-            || DomainError::AskFindingNotBlocked { kind: self.kind },
+            || DomainError::AskFindingNotBlocked {
+                kind: self.kind.clone(),
+            },
         )?;
         require(
             self.task_id.is_some() || self.run_id.is_some() || self.kind == AskKind::Blocked,
-            || DomainError::AskWithoutTarget { kind: self.kind },
+            || DomainError::AskWithoutTarget {
+                kind: self.kind.clone(),
+            },
         )
     }
+}
+
+/// The rules an ask's kind binds, checked where an ask is written
+/// (ADR-0073 decisions 20 and 22) since the queue no longer enumerates
+/// kinds: only a known kind is written; an ask about no task is a
+/// `blocked` or `queue_hold` ask about no run; and a `queue_hold` ask, and
+/// only it, is for authentication or cost. A reader does not check them.
+pub fn check_ask_kind(
+    kind: &AskKind,
+    task_id: Option<TaskId>,
+    run_id: Option<&RunId>,
+    reason: AskReason,
+) -> Result<(), DomainError> {
+    if let AskKind::Other(value) = kind {
+        return Err(DomainError::UnknownValue {
+            kind: "AskKind",
+            value: value.clone(),
+        });
+    }
+    require(
+        task_id.is_some()
+            || (matches!(kind, AskKind::Blocked | AskKind::QueueHold) && run_id.is_none()),
+        || DomainError::AskWithoutTarget { kind: kind.clone() },
+    )?;
+    require(
+        (*kind == AskKind::QueueHold) == reason.holds_the_queue(),
+        || DomainError::AskKindReason {
+            kind: kind.clone(),
+            reason,
+        },
+    )
 }
 
 /// An authentication or cost ask to open, or to add a run to
@@ -1127,6 +1238,47 @@ pub const ATTENTION_KINDS: &[&str] = &[
     "ask_delivery_failed",
 ];
 
+/// The event kinds that may belong to no task, goal or run: the queue's
+/// own events. The queue enumerated them in a CHECK until migration 0039;
+/// the write port checks them now (ADR-0073 decision 22).
+pub const QUEUE_EVENT_KINDS: &[&str] = &[
+    "backend_call_failed",
+    "observe_started",
+    "observe_finished",
+    "ask_opened",
+    "ask_answered",
+    "stall_config_loaded",
+    "finding_recorded",
+    "finding_updated",
+    "finding_status_changed",
+    "run_env_program_missing",
+    "run_env_program_found",
+    "session_opened",
+    "session_closed",
+    "session_turns",
+    "supervisor_started",
+    "supervisor_stopped",
+    "run_env_changed",
+    "mark_recorded",
+    "mark_retracted",
+];
+
+/// Whether an event of `kind` may be written with its task, goal and run
+/// (ADR-0073 decision 22): one on none of them is a queue event. A reader
+/// does not check it.
+pub fn check_event_target(
+    kind: &str,
+    task_id: Option<TaskId>,
+    goal_id: Option<GoalId>,
+) -> Result<(), DomainError> {
+    require(
+        task_id.is_some() || goal_id.is_some() || QUEUE_EVENT_KINDS.contains(&kind),
+        || DomainError::EventWithoutTarget {
+            kind: kind.to_owned(),
+        },
+    )
+}
+
 /// The attention kinds an ask writes (ADR-0022): about the ask, even when it
 /// names a run.
 pub const ASK_EVENT_KINDS: &[&str] = &[
@@ -1457,6 +1609,69 @@ mod attention_tests {
             }
             .to_string(),
             "read the answer of ask 4 and close it"
+        );
+    }
+
+    #[test]
+    fn unknown_ask_kinds_are_read_but_not_parsed_or_written() {
+        // ADR-0073 decisions 20 and 21.
+        let later = AskKind::read("later_kind");
+        assert_eq!(later, AskKind::Other("later_kind".into()));
+        assert!(!later.is_known() && AskKind::read("decide").is_known());
+        assert_eq!(later.as_str(), "later_kind");
+        assert_eq!(later.to_string(), "later_kind");
+        assert_eq!(json!(later), json!("later_kind"));
+        assert_eq!(
+            serde_json::from_value::<AskKind>(json!("stalled")).unwrap(),
+            AskKind::Stalled
+        );
+        assert_eq!(
+            serde_json::from_value::<AskKind>(json!("later_kind")).unwrap(),
+            later
+        );
+        assert!("later_kind".parse::<AskKind>().is_err());
+
+        let task = Some(TaskId::new(1));
+        let run = RunId::new("run-1").unwrap();
+        let scope = AskReason::Scope;
+        assert_eq!(
+            check_ask_kind(&later, task, None, scope)
+                .unwrap_err()
+                .to_string(),
+            "unknown AskKind: later_kind"
+        );
+        assert!(check_ask_kind(&AskKind::Decide, task, Some(&run), scope).is_ok());
+        assert!(check_ask_kind(&AskKind::Blocked, None, None, scope).is_ok());
+        for (kind, run) in [
+            (AskKind::Decide, None),
+            (AskKind::Blocked, Some(&run)),
+            (AskKind::QueueHold, Some(&run)),
+        ] {
+            assert!(matches!(
+                check_ask_kind(&kind, None, run, scope),
+                Err(DomainError::AskWithoutTarget { .. })
+            ));
+        }
+        assert!(check_ask_kind(&AskKind::QueueHold, None, None, AskReason::Cost).is_ok());
+        for (kind, reason) in [
+            (AskKind::QueueHold, AskReason::Scope),
+            (AskKind::Decide, AskReason::Authentication),
+        ] {
+            let error = check_ask_kind(&kind, task, None, reason).unwrap_err();
+            assert!(
+                error.to_string().contains("only a queue_hold ask is for"),
+                "{error}"
+            );
+        }
+
+        assert!(check_event_target("task_created", task, None).is_ok());
+        assert!(check_event_target("goal_closed", None, Some(GoalId::new(1))).is_ok());
+        assert!(check_event_target("mark_recorded", None, None).is_ok());
+        assert_eq!(
+            check_event_target("task_created", None, None)
+                .unwrap_err()
+                .to_string(),
+            "a task_created event needs a task, a goal or a run; it is not an event of the queue itself"
         );
     }
 

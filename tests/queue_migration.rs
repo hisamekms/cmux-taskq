@@ -451,15 +451,13 @@ fn migration_from_v6_adds_goals_and_keeps_tasks_runs_and_events() {
         raw.execute("UPDATE tasks SET goal_id=99 WHERE id=2", [])
             .is_err()
     );
-    assert!(
-        raw.execute(
-            "INSERT INTO run_events(kind,payload) VALUES ('orphan','{}')",
-            []
-        )
-        .is_err()
-    );
-    // Only a failed backend call, the observer's own events and the events
-    // of a task-less ask may belong to neither a task nor a goal.
+    // Which events may belong to neither a task nor a goal is the write
+    // port's rule since the kinds were opened (ADR-0073 decision 22).
+    raw.execute(
+        "INSERT INTO run_events(kind,payload) VALUES ('orphan','{}')",
+        [],
+    )
+    .unwrap();
     for kind in [
         "backend_call_failed",
         "observe_started",
@@ -473,40 +471,39 @@ fn migration_from_v6_adds_goals_and_keeps_tasks_runs_and_events() {
         )
         .unwrap();
     }
-    // Only a blocked ask may belong to no task, and then to no run either.
+    // Which asks may belong to no task is the write port's rule too.
     raw.execute(
         "INSERT INTO asks(kind,question,asked_by,reason_category)
          VALUES ('blocked','slots idle','observer','scope')",
         [],
     )
     .unwrap();
-    assert!(
-        raw.execute(
-            "INSERT INTO asks(kind,question,asked_by,reason_category)
-             VALUES ('decide','x','observer','recovery_failed')",
-            []
-        )
-        .is_err()
-    );
-    // 0029: every ask has a reason, and authentication and cost are the
-    // queue_hold asks' alone, about no task or run.
+    raw.execute(
+        "INSERT INTO asks(kind,question,asked_by,reason_category)
+         VALUES ('decide','x','observer','recovery_failed')",
+        [],
+    )
+    .unwrap();
+    // 0029: every ask has a reason; that authentication and cost are the
+    // queue_hold asks' alone is the write port's rule now.
     raw.execute(
         "INSERT INTO asks(kind,question,asked_by,reason_category,affected)
          VALUES ('queue_hold','log in','supervisor','authentication','[\"run-landed\"]')",
         [],
     )
     .unwrap();
-    for (kind, reason) in [
-        ("queue_hold", "scope"),
-        ("blocked", "cost"),
-        ("blocked", "bogus"),
+    for (kind, reason, accepted) in [
+        ("queue_hold", "scope", true),
+        ("blocked", "cost", true),
+        ("blocked", "bogus", false),
     ] {
-        assert!(
+        assert_eq!(
             raw.execute(
                 "INSERT INTO asks(kind,question,asked_by,reason_category) VALUES (?1,'x','observer',?2)",
                 [kind, reason]
             )
-            .is_err(),
+            .is_ok(),
+            accepted,
             "{kind} {reason}"
         );
     }
@@ -1028,4 +1025,145 @@ fn migration_adding_the_answerer_keeps_older_answers_unknown() {
     let answered = queue.answer_as(asked.id, " cancel ", "inbox").unwrap();
     assert_eq!(answered.answered_by.as_deref(), Some("inbox"));
     assert_eq!(answered.option_index, Some(1));
+}
+
+#[test]
+fn migration_opening_the_kinds_keeps_rows_and_moves_their_rules_to_the_write_port() {
+    use dagq::domain::{AskKind, AskReason, NewAsk};
+    // ADR-0073 decisions 19-23, found by what it creates so a renumbering
+    // on landing does not move it.
+    let open = MIGRATIONS
+        .iter()
+        .position(|m| m.contains("CREATE TABLE asks_v39"))
+        .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("queue.db");
+    let raw = Connection::open(&path).unwrap();
+    for migration in &MIGRATIONS[..open] {
+        raw.execute_batch(migration).unwrap();
+    }
+    raw.execute_batch(&format!(
+        "PRAGMA application_id = 1129599281; PRAGMA user_version = {open};
+         UPDATE schema_floor SET floor = {floor};
+         INSERT INTO tasks(title,description,acceptance,verification_commands,status,updated_at)
+         VALUES ('t','','a','[]','in_progress','2026-09-02T00:00:00.000Z');
+         INSERT INTO task_runs(id,task_id,status,requested_provider,actual_provider,base_commit)
+         VALUES ('run-1',1,'running','claude','claude','{BASE}');
+         INSERT INTO asks(id,kind,task_id,run_id,question,asked_by,reason_category,
+                          answer,answered_at,answered_by,option_index) VALUES
+           (7,'worker_question',1,'run-1','which?','worker','scope','a',5,'inbox',0);
+         INSERT INTO asks(id,kind,question,asked_by,reason_category,subject,affected) VALUES
+           (9,'queue_hold','log in','supervisor','authentication','login','[\"run-1\"]');
+         INSERT INTO run_events(id,kind,payload) VALUES (40,'mark_recorded','{{}}');
+         INSERT INTO run_events(id,task_id,run_id,kind,payload)
+         VALUES (41,1,'run-1','agent_started','{{}}');",
+        floor = floor_for(open as i64),
+    ))
+    .unwrap();
+    // Before it, the queue refuses a kind it does not list.
+    assert!(
+        raw.execute(
+            "INSERT INTO run_events(kind,payload) VALUES ('later','{}')",
+            []
+        )
+        .is_err()
+    );
+    SqliteQueue::migrate(&path, None, 0).unwrap();
+    let mut queue = SqliteQueue::open(&path).unwrap();
+    let kinds: Vec<(i64, String)> = raw
+        .prepare("SELECT id, kind FROM asks ORDER BY id")
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(
+        kinds,
+        [(7, "worker_question".into()), (9, "queue_hold".into())]
+    );
+    let answered = queue.read_ask(dagq::domain::AskId::new(7)).unwrap();
+    assert_eq!(
+        (answered.answered_by.as_deref(), answered.option_index),
+        (Some("inbox"), Some(0))
+    );
+    let events: Vec<i64> = raw
+        .prepare("SELECT id FROM run_events WHERE id IN (40, 41) ORDER BY id")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(events, [40, 41]);
+    let checks: i64 = raw
+        .query_row(
+            "SELECT count(*) FROM sqlite_master WHERE name IN ('asks','run_events')
+             AND (sql LIKE '%kind IN%' OR sql LIKE '%kind =%')",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(checks, 0);
+    let one_open: i64 = raw
+        .query_row(
+            "SELECT count(*) FROM sqlite_master WHERE name = 'asks_open'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(one_open, 1);
+
+    // The queue takes a kind a newer binary writes, and this one reads it.
+    raw.execute_batch(
+        "INSERT INTO asks(kind,task_id,question,asked_by,reason_category)
+         VALUES ('later_kind',1,'what now?','supervisor','scope');
+         INSERT INTO run_events(kind,payload) VALUES ('later_event','{}');",
+    )
+    .unwrap();
+    let later = queue
+        .asks(dagq::infrastructure::asks::AskQuery::default())
+        .unwrap()
+        .into_iter()
+        .find(|a| a.question == "what now?")
+        .unwrap();
+    assert_eq!(later.kind, AskKind::Other("later_kind".into()));
+    assert!(!later.kind.is_known());
+
+    // The write port keeps the rules the CHECKs held.
+    let error = queue
+        .record_queue_event("task_created", serde_json::json!({}))
+        .unwrap_err();
+    assert!(error.to_string().contains("needs a task, a goal or a run"));
+    queue
+        .record_queue_event("mark_recorded", serde_json::json!({}))
+        .unwrap();
+    let ask = |kind: AskKind, task: Option<i64>, run: Option<&str>| NewAsk {
+        kind,
+        task_id: task.map(TaskId::new),
+        run_id: run.map(|r| RunId::try_from(r).unwrap()),
+        question: "which?".into(),
+        options: vec![],
+        asked_by: "supervisor".into(),
+        reason_category: AskReason::Scope,
+        finding_id: None,
+    };
+    let refused = [
+        ask(AskKind::Other("later_kind".into()), Some(1), None),
+        ask(AskKind::QueueHold, None, None),
+        ask(AskKind::Decide, None, None),
+    ];
+    for new in refused {
+        assert!(queue.ask(new.clone()).is_err(), "{:?}", new.kind);
+    }
+    assert!(
+        queue
+            .ask(ask(AskKind::Blocked, None, None))
+            .unwrap()
+            .created
+    );
+    assert!(
+        queue
+            .ask(ask(AskKind::Decide, Some(1), None))
+            .unwrap()
+            .created
+    );
 }

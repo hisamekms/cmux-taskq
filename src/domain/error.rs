@@ -177,6 +177,17 @@ pub enum DomainError {
     AskWithoutTarget {
         kind: AskKind,
     },
+    /// A `queue_hold` ask without an authentication or cost reason, or
+    /// another ask with one (ADR-0073 decision 22).
+    AskKindReason {
+        kind: AskKind,
+        reason: AskReason,
+    },
+    /// An event on no task, goal or run whose kind is not a queue event
+    /// (ADR-0073 decision 22).
+    EventWithoutTarget {
+        kind: String,
+    },
     /// An authentication or cost ask registered like any other: those are
     /// one per queue, opened by the runtime (ADR-0047 decision 42).
     AskHoldsTheQueue {
@@ -315,6 +326,15 @@ impl fmt::Display for DomainError {
                 f,
                 "a {} ask needs a task or a run; only a blocked ask may have neither",
                 kind.as_str()
+            ),
+            Self::AskKindReason { kind, reason } => write!(
+                f,
+                "a {kind} ask may not have the reason {}: only a queue_hold ask is for authentication or cost, and it always is",
+                reason.as_str()
+            ),
+            Self::EventWithoutTarget { kind } => write!(
+                f,
+                "a {kind} event needs a task, a goal or a run; it is not an event of the queue itself"
             ),
             Self::AskHoldsTheQueue { reason } => write!(
                 f,

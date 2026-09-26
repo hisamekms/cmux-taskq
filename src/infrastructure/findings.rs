@@ -299,6 +299,7 @@ fn finding_event(
     kind: &str,
     payload: serde_json::Value,
 ) -> Result<()> {
+    crate::domain::check_event_target(kind, finding.task_id, finding.goal_id)?;
     conn.execute(
         "INSERT INTO run_events(task_id,run_id,goal_id,kind,payload) VALUES (?1,?2,?3,?4,?5)",
         params![

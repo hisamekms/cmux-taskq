@@ -782,19 +782,16 @@ impl SqliteQueue {
     ) -> Result<()> {
         match run {
             Some(id) => run_event(&self.conn, id, "backend_call_failed", payload),
-            None => {
-                self.conn.execute(
-                    "INSERT INTO run_events(kind,payload) VALUES ('backend_call_failed',?1)",
-                    [serde_json::to_string(&payload)?],
-                )?;
-                Ok(())
-            }
+            None => self
+                .record_queue_event("backend_call_failed", payload)
+                .map(drop),
         }
     }
 
     /// Record an event of the queue itself, on no task, goal or run (the
     /// observer's `observe_started` / `observe_finished`); returns its id.
     pub fn record_queue_event(&self, kind: &str, payload: serde_json::Value) -> Result<EventId> {
+        crate::domain::check_event_target(kind, None, None)?;
         let tx = self.conn.unchecked_transaction()?;
         tx.execute(
             "INSERT INTO run_events(kind,payload) VALUES (?1,?2)",

@@ -62,13 +62,11 @@ pub fn floor_for(version: i64) -> i64 {
 /// `AFTER` trigger whose body only inserts into, updates or deletes from
 /// tables the same migration creates (an older binary's write then only
 /// adds to what it does not read), none of them with a foreign key, a
-/// block comment or `RAISE`.
+/// block comment or `RAISE`. A statement with a CHECK that names a kind
+/// ([`kind_enumerations`]) is a violation too, even in a table the
+/// migration creates.
 pub fn compatibility_violations(migration: &str) -> Vec<String> {
-    let text: String = migration
-        .lines()
-        .map(|line| line.split("--").next().unwrap_or(""))
-        .collect::<Vec<_>>()
-        .join("\n");
+    let text = without_comments(migration);
     let mut created = Vec::new();
     let mut violations = Vec::new();
     for statement in statements(&text) {
@@ -105,12 +103,78 @@ pub fn compatibility_violations(migration: &str) -> Vec<String> {
         let ok = ok
             && !words
                 .iter()
-                .any(|w| w.contains("REFERENCES") || w.contains("/*"));
+                .any(|w| w.contains("REFERENCES") || w.contains("/*"))
+            && !names_a_kind(&words);
         if !ok {
             violations.push(words.join(" "));
         }
     }
     violations
+}
+
+/// The statements of `migration` that enumerate an ask's or event's kind in
+/// a CHECK, or bind a rule to a kind's value: a CHECK whose expression
+/// names a `kind` column and a string literal (ADR-0073 decision 19). Kinds
+/// are checked where they are written instead, so a kind is added without
+/// a migration; no migration after the one that dropped those CHECKs may
+/// bring one back, whatever it declares. A CHECK on a kind's form
+/// (`length(kind) > 0`) names no value and is allowed.
+pub fn kind_enumerations(migration: &str) -> Vec<String> {
+    statements(&without_comments(migration))
+        .iter()
+        .map(|statement| {
+            statement
+                .split_whitespace()
+                .map(str::to_ascii_uppercase)
+                .collect::<Vec<_>>()
+        })
+        .filter(|words| names_a_kind(words))
+        .map(|words| words.join(" "))
+        .collect()
+}
+
+/// `migration` without its line comments.
+fn without_comments(migration: &str) -> String {
+    migration
+        .lines()
+        .map(|line| line.split("--").next().unwrap_or(""))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Whether a statement (upper-cased words) has a CHECK whose expression
+/// names a `kind` column and a value of it.
+fn names_a_kind(words: &[String]) -> bool {
+    let text = words.join(" ");
+    let mut rest = text.as_str();
+    while let Some(at) = rest.find("CHECK") {
+        rest = &rest[at + "CHECK".len()..];
+        let expression = parenthesized(rest);
+        let names_kind = expression
+            .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .any(|word| word == "KIND");
+        if names_kind && expression.contains('\'') {
+            return true;
+        }
+    }
+    false
+}
+
+/// The balanced parenthesized expression `text` starts with (after
+/// whitespace), or all of `text` when it does not close.
+fn parenthesized(text: &str) -> &str {
+    let text = text.trim_start();
+    let mut depth = 0usize;
+    for (at, c) in text.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' if depth <= 1 => return &text[..=at],
+            ')' => depth -= 1,
+            _ if depth == 0 => return "",
+            _ => {}
+        }
+    }
+    text
 }
 
 /// The statements of `text`, split at `;` except inside a trigger, whose
@@ -207,6 +271,49 @@ mod tests {
             assert!(!is_compatible(migration));
         }
         const { assert!(BINARY_SCHEMA >= FLOOR_SCHEMA) };
+    }
+
+    #[test]
+    fn no_migration_after_the_open_kinds_one_names_a_kind_in_a_check() {
+        // The migration that dropped the CHECKs naming a kind (ADR-0073
+        // decision 23), found by what it creates so a renumbering on
+        // landing does not move it.
+        let open = MIGRATIONS
+            .iter()
+            .position(|migration| migration.contains("CREATE TABLE asks_v39"))
+            .expect("the migration that opens the kinds");
+        assert!(!is_compatible(MIGRATIONS[open]));
+        assert!(
+            MIGRATIONS[..open]
+                .iter()
+                .any(|migration| !kind_enumerations(migration).is_empty()),
+            "the kinds were enumerated before it"
+        );
+        for (index, migration) in MIGRATIONS.iter().enumerate().skip(open) {
+            assert_eq!(
+                kind_enumerations(migration),
+                Vec::<String>::new(),
+                "migration {} enumerates a kind",
+                index + 1
+            );
+        }
+    }
+
+    #[test]
+    fn checks_naming_a_kind_are_found_and_are_never_compatible() {
+        let sql = "-- dagq-schema: compatible
+            CREATE TABLE a (kind TEXT NOT NULL CHECK (kind IN ('x', 'y')));
+            CREATE TABLE b (task_id INTEGER, kind TEXT,
+                CHECK (task_id IS NOT NULL OR (kind = 'x' AND 1)));
+            CREATE TABLE c (kind TEXT NOT NULL CHECK (length(kind) > 0),
+                reason TEXT CHECK (reason IN ('r')), CHECK (length(kind) < 9));
+            CREATE TABLE d (kinds TEXT CHECK (kinds IN ('x')));
+            CREATE TABLE e (kind TEXT CHECK";
+        let found = kind_enumerations(sql);
+        assert_eq!(found.len(), 2, "{found:#?}");
+        assert!(found[0].starts_with("CREATE TABLE A "));
+        assert!(found[1].starts_with("CREATE TABLE B "));
+        assert_eq!(compatibility_violations(sql), found);
     }
 
     #[test]

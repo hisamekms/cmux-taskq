@@ -273,6 +273,7 @@ domainの関数は業務上の拒否を`DomainError`（`src/domain/error.rs`）�
 - **上限**: `MAX_DRAFT_PLANNERS`（3）件のplannerが決めずに終わったdraftには立てない（`draft_planner_exhausted`、`AttentionNext::DecideDraft` = `decide the draft in a planner`）。
 - **人を経ない採用の上限**: `adopt_needs_person(FollowUpFacts { goal_open, depth })`が、goalがnullか閉じている、`follow_up_depth`が`FOLLOW_UP_ASK_DEPTH`（2）以上、の順に理由を返す。runtimeのplannerのsubmitは、そのdraftへの`planner_question`（旧`follow_up`）に人が`adopt`と答えていなければこれで拒否される。
 - **深さ**: `tasks.follow_up_depth`はdomainの`Task`に持たせず、storeの列として`follow_up_depth` / `set_follow_up_depth`で読み書きする。`add`は0、`integrate`の登録は元のtask+1、runtimeのplannerが人を経ずにsubmitしたtaskはそのまま、人が開いたplannerのsubmit、人の`adopt`を経たsubmit、`ready --bypass-review`（`TaskAction::BypassReview`）は0。
+- **ask**: `AskKind`は知っているkindに加えて`Other(String)`を持つ（[ADR-0073](../adr/0073-kind-additions-are-compatible.md)の決定21）。queueから読むとき（`AskKind::read`・serde）は知らないkindを`Other`にし、`status` / `watch` / `show`は人に見せるだけの汎用のaskとして出し、`answer`は記録するがruntimeは適用しない（attentionは`read the answer`）。CLIの`parse`と書き込み口（`check_ask_kind`）は知っているkindだけを受け付ける。
 - **ask**: `AskKind::PlannerQuestion`（`planner_question`）はruntimeのplannerが人に聞くask（options `PLANNER_QUESTION_OPTIONS` = `adopt` / `cancel` / `keep_draft`）。answerの行き先（`PlannerAnswerRoute`: `Planner` / `NewPlanner` / `Close` / `Person`）はstoreが決め、`Person`以外は`runtime_delivers: true`でattentionにしない。`AskKind::FollowUp`は退役したtriageのaskで、もう作られない。
 
 

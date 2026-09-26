@@ -527,6 +527,7 @@ fn insert_at(
     payload: &Value,
     created_at: &str,
 ) -> Result<()> {
+    crate::domain::check_event_target(kind, task_id, None)?;
     conn.execute(
         "INSERT INTO run_events(task_id,run_id,kind,payload,created_at) VALUES (?1,?2,?3,?4,?5)",
         params![

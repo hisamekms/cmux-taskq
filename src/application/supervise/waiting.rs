@@ -148,7 +148,7 @@ impl Supervisor<'_> {
             .unclosed_run_asks(slot.run.id())?
             .into_iter()
             .filter(|ask| {
-                ask.is_open() && waits_for(phase, ask.kind) && !slot.consumed.contains(&ask.id)
+                ask.is_open() && waits_for(phase, &ask.kind) && !slot.consumed.contains(&ask.id)
             })
             .collect();
         if asks.is_empty()
@@ -287,18 +287,18 @@ impl Supervisor<'_> {
             }
             let ask = self.queue.read_ask(*id)?;
             if ask.answered_at.is_some() || ask.closed_at.is_some() {
-                self.end_wait(slot, WaitCause::Answered, Some((*id, *kind)))?;
+                self.end_wait(slot, WaitCause::Answered, Some((*id, kind.clone())))?;
                 return Ok(Step::Continue);
             }
         }
-        let held_kind = |kind: AskKind| held.iter().find(|(_, k)| *k == kind).copied();
+        let held_kind = |kind: AskKind| held.iter().find(|(_, k)| *k == kind).cloned();
         // A receipt the first session wrote during the wait moved it on,
         // whatever it waited for (its `SessionWatch` closes the asks).
         if let Phase::Session(watch) = &slot.phase
             && !watch.receipt_seen
             && self.files.is_file(&watch.receipt_path)
         {
-            self.end_wait(slot, WaitCause::SessionMoved, held.first().copied())?;
+            self.end_wait(slot, WaitCause::SessionMoved, held.first().cloned())?;
             return Ok(Step::Continue);
         }
         let idle_marker = run.idle_marker_path()?;
@@ -339,13 +339,13 @@ impl Supervisor<'_> {
                 return Ok(());
             };
             if !ask.is_open()
-                || !waits_for(phase, ask.kind)
+                || !waits_for(phase, &ask.kind)
                 || slot.consumed.contains(&ask.id)
                 || waiting.asks.iter().any(|(id, _)| *id == ask.id)
             {
                 continue;
             }
-            waiting.asks.push((ask.id, ask.kind));
+            waiting.asks.push((ask.id, ask.kind.clone()));
             self.queue.record_runtime_event(
                 slot.run.id(),
                 RUN_WAITING_ASK_ADDED,
@@ -427,8 +427,8 @@ impl Supervisor<'_> {
             slot.run.id(),
             RUN_WAITING_ENDED,
             json!({
-                "ask_id": ask.map(|(id, _)| id),
-                "ask_kind": ask.map(|(_, kind)| kind),
+                "ask_id": ask.as_ref().map(|(id, _)| id),
+                "ask_kind": ask.as_ref().map(|(_, kind)| kind),
                 "cause": cause.as_str(),
                 "waited_secs": now - waiting.started_at,
             }),
