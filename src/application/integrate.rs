@@ -1107,12 +1107,13 @@ fn remove_landed_worktree(queue: &mut dyn Queue, repository: &dyn Repository, ru
     }
 }
 
-/// How many resumes of the run were started, for a resume error recorded
-/// outside the resume watch; unreadable counts as the last attempt.
+/// How many resumes of the run count toward [`MAX_RESUME_ATTEMPTS`]
+/// (ADR-0047 decision 24: a resume of a run parked only by a conflict after
+/// its review passed does not); unreadable counts as the last attempt.
 pub fn resume_attempts<Q: RunStore + ?Sized>(queue: &Q, id: &RunId) -> usize {
     queue
         .run_events(id)
-        .map(|events| events.iter().filter(|e| e.kind == "resume_started").count())
+        .map(|events| crate::domain::resume::ResumeCount::of(&events).counted)
         .unwrap_or(MAX_RESUME_ATTEMPTS)
 }
 

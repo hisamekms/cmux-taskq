@@ -420,6 +420,7 @@ pub mod proposal;
 pub mod reason;
 pub mod recovery;
 pub mod related;
+pub mod resume;
 pub mod run;
 pub mod run_env;
 pub mod scope;

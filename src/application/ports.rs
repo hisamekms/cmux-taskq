@@ -825,8 +825,23 @@ pub struct ResumeCandidate {
     pub lease: Option<RunLease>,
     /// The latest session's wrapper registration.
     pub wrapper: Option<RunProcess>,
-    /// `resume_started` events so far.
-    pub attempts: usize,
+    /// Its `resume_started` events so far, counted as ADR-0047 decision
+    /// 24 says.
+    pub resumes: crate::domain::resume::ResumeCount,
+}
+
+/// How a run whose resumes are used up ends (ADR-0047 decision 24).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Exhaustion {
+    /// A person decides in this `decide` ask (`retry` / `cancel`).
+    Ask(AskId),
+    /// The task is ready again, and its next run carries this run's
+    /// `branch` over from `head` (its review passed; only conflicts kept
+    /// it from landing).
+    Inherit {
+        branch: Option<String>,
+        head: CommitSha,
+    },
 }
 
 /// What the triage does to a run once it has its verdict (ADR-0024
@@ -1094,7 +1109,6 @@ pub trait RunStore {
         token: &str,
         main: &CommitSha,
         reason: Option<&str>,
-        max_attempts: usize,
     ) -> Result<Option<(TaskRun, usize)>>;
     fn finish_resume(
         &mut self,
@@ -1114,12 +1128,12 @@ pub trait RunStore {
         main: &CommitSha,
         approved: bool,
     ) -> Result<Option<TaskRun>>;
-    /// Fail a run whose resumes are used up, naming the ask for a person.
+    /// Fail a run whose resumes are used up, naming the ask for a person
+    /// or retrying its task with its branch carried over.
     fn exhaust_resumes(
         &mut self,
         id: &RunId,
-        max_attempts: usize,
-        ask_id: AskId,
+        exhaustion: &Exhaustion,
         reason: &str,
     ) -> Result<Option<TaskRun>>;
     /// When an observation of `mode` last started or finished.

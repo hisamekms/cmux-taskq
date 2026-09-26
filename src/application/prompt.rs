@@ -19,9 +19,10 @@ use super::{
 use crate::domain::{
     Ask, CommitSha, DraftOrigin, DraftTarget, Goal, GoalId, GoalPredecessor, GoalTask,
     LintViolation, MAX_DRAFT_PLANNERS, MAX_PLAN_REVISES, MAX_RESUME_ATTEMPTS, MAX_REVISE_ATTEMPTS,
-    Predecessor, Proposal, ProposalId, Receipt, RunStatus, TRIAGE_RETRY_FAILURES, Task, TaskDetail,
-    TaskId, TaskRun,
+    Predecessor, Proposal, ProposalId, Receipt, RunEvent, RunId, RunStatus, TRIAGE_RETRY_FAILURES,
+    Task, TaskDetail, TaskId, TaskRun,
     recovery::{ProcessInfo, RecoveryAlert},
+    resume,
     stats::conflicts::ConflictHotspot,
 };
 
@@ -115,6 +116,86 @@ impl GoalPredecessorSummary {
     }
 }
 
+/// The run a retry carries over (ADR-0047 decision 24): its resumes were
+/// used up on conflicts with main after its review passed, so the next run
+/// of its task starts from its commit instead of from scratch.
+#[derive(Debug, Clone, Serialize)]
+pub struct Inheritance {
+    pub run_id: RunId,
+    /// The commit the run's own commits start after: its base, until the
+    /// caller narrows it to the merge base of the head and the current main
+    /// (a resume that rebased part of the way put main's commits under it).
+    pub base: CommitSha,
+    /// The run's head, kept under `refs/dagq/runs/<run-id>`.
+    pub head: String,
+    pub branch: Option<String>,
+    pub receipt_path: Option<String>,
+    /// Its receipt's summary, whitespace collapsed; `(receipt unavailable)`
+    /// when it cannot be read.
+    pub summary: String,
+}
+
+impl Inheritance {
+    /// What the next run of `previous`'s task inherits, when `previous` was
+    /// ended by the retry that carries its branch over
+    /// ([`crate::domain::resume::retried_with_inheritance`]): the head that
+    /// retry recorded, and the summary of its receipt.
+    pub fn of(files: &dyn RunFiles, previous: &TaskRun, events: &[RunEvent]) -> Option<Self> {
+        if !resume::retried_with_inheritance(events) {
+            return None;
+        }
+        let inherit = &events
+            .iter()
+            .rev()
+            .find(|e| resume::is_inherit_retry(e))?
+            .payload["inherit"];
+        let head = inherit["head"].as_str()?.to_owned();
+        let receipt_path = previous.receipt_path().map(str::to_owned);
+        let summary = receipt_path
+            .as_deref()
+            .and_then(|path| files.read_to_string(Path::new(path)).ok())
+            .and_then(|text| Receipt::parse(&text).ok())
+            .map(|receipt| {
+                receipt
+                    .summary
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .filter(|summary| !summary.is_empty())
+            .unwrap_or_else(|| "(receipt unavailable)".to_owned());
+        Some(Self {
+            run_id: previous.id().clone(),
+            base: previous.base_commit().clone(),
+            head,
+            branch: inherit["branch"].as_str().map(str::to_owned),
+            receipt_path,
+            summary,
+        })
+    }
+
+    /// The prompt's section on it: start from its commit, bring it onto the
+    /// current main, resolve the conflicts, verify and write the receipt.
+    fn section(&self) -> String {
+        format!(
+            "Carried over from run {run}: its review passed, but its landing kept conflicting with main until its resumes were used up, so this run starts from its work instead of from scratch. \
+             Its work is commit {head} (kept as refs/dagq/runs/{run}{branch}); its own commits are {base}..{head}. \
+             Bring them onto your base, the current main (for example `git cherry-pick {base}..{head}` in your worktree), resolve the conflicts keeping what both sides meant, rerun the verification commands, and write the receipt for your own head. \
+             Its receipt ({receipt}) summary: {summary}\n",
+            run = self.run_id,
+            head = self.head,
+            base = self.base,
+            branch = self
+                .branch
+                .as_deref()
+                .map(|branch| format!(", branch {branch}"))
+                .unwrap_or_default(),
+            receipt = self.receipt_path.as_deref().unwrap_or("no receipt path"),
+            summary = self.summary,
+        )
+    }
+}
+
 /// The other tasks a worker is told are executing alongside it: of the
 /// `in_progress` tasks (ID order), those sharing the task's goal, or all of
 /// them when the task has no goal; the task itself is never listed.
@@ -141,7 +222,8 @@ Do not run `dagq list` or `dagq show`, and skip the rest of the docs tree; open 
 /// Text of `prompt.txt`. `goal` is the task's goal as it reads at claim
 /// time, `predecessors` the task's direct dependencies, `goal_predecessors`
 /// the goals it depends on (in the Predecessor section) and `siblings` the
-/// other tasks executing at claim time (`siblings_in_progress`). The Goal,
+/// other tasks executing at claim time (`siblings_in_progress`), and
+/// `inherited` the run a retry carries over, if any. The Goal,
 /// Context, Predecessor and Sibling sections are always present, `none`
 /// when empty, so the prompt keeps one shape whether or not a task has a
 /// goal, a context, dependencies or company.
@@ -152,8 +234,10 @@ pub fn prompt(
     predecessors: &[PredecessorSummary],
     goal_predecessors: &[GoalPredecessorSummary],
     siblings: &[Task],
+    inherited: Option<&Inheritance>,
 ) -> Result<String> {
     let receipt = run.receipt_path().context("missing receipt path")?;
+    let inherited = inherited.map(Inheritance::section).unwrap_or_default();
     let goal = match goal {
         None => "Goal: none, this task stands alone\n".to_owned(),
         Some(goal) => format!(
@@ -256,7 +340,7 @@ pub fn prompt(
          Perform applicable unit tests, E2E, and subagent review. Record evidence or an explicit reason when not applicable.\n\
          Task title: {title}\nDescription:\n{description}\nAcceptance criteria:\n{acceptance}\n\
          Verification commands (run in the worktree):\n{verification}\n\
-         {evidence}{paths}{goal}{context}{predecessors}{siblings}\
+         {evidence}{paths}{goal}{context}{predecessors}{siblings}{inherited}\
          Your assignment is this task only. Do not change what a sibling task owns; if you find work outside this task, record it in the receipt as follow_ups instead of doing it.\n\
          Write a completion receipt to {receipt} using a temporary file in the same directory and atomic rename.\n\
          Receipt JSON: {{\"run_id\":\"{run_id}\",\"result\":\"succeeded or failed\",\"commit\":\"full Git SHA of the branch head\",\"tests\":{{\"status\":\"passed, failed or not_applicable\",\"evidence_or_reason\":\"...\"}},\"e2e\":{{\"status\":\"...\",\"evidence_or_reason\":\"...\"}},\"subagent_review\":{{\"status\":\"...\",\"evidence_or_reason\":\"...\"}},\"summary\":\"...\",\"follow_ups\":[{{\"title\":\"...\",\"description\":\"...\"}}]}}\n\
@@ -1405,7 +1489,7 @@ mod tests {
 
         let waiting = task(9, "downstream", TaskStatus::InProgress);
         let own_run = run(9, RunStatus::Claimed, None);
-        let text = prompt(&waiting, &own_run, None, &[], &[landed, empty], &[]).unwrap();
+        let text = prompt(&waiting, &own_run, None, &[], &[landed, empty], &[], None).unwrap();
         assert!(
             text.contains(&format!(
                 "Predecessor tasks (their changes are already in your base commit):\n\
@@ -1415,7 +1499,8 @@ mod tests {
             )),
             "{text}"
         );
-        let alone = prompt(&waiting, &own_run, None, &[], &[], &[]).unwrap();
+        let alone = prompt(&waiting, &own_run, None, &[], &[], &[], None).unwrap();
         assert!(alone.contains("Predecessor tasks: none\n"));
+        assert!(!alone.contains("Carried over from run"));
     }
 }

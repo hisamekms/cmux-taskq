@@ -16,6 +16,7 @@ pub use dagq::{
         AskId, AskKind, CommitSha, EventId, EvidenceCheck, GoalEdit, GoalId, MAX_RESUME_ATTEMPTS,
         NewAsk, NewGoal, NewTask, Priority, ReasonCode, RunId, RunStatus, SessionRole, Task,
         TaskAction, TaskId, TaskRun, TaskStatus,
+        resume::CONFLICT_ONLY_RESUME_LIMIT,
         search::{SearchKind, SearchQuery, SearchRef},
     },
     infrastructure::{
@@ -1507,6 +1508,21 @@ pub fn parked_conflict(repo: &Path, db: &Path, backend: &TestWorkspace) -> (Task
     (run, first_landed)
 }
 
+/// Make the conflict that parked the run count toward the resume attempts,
+/// as a failed verification would (ADR-0047 decision 24: a resume of a run
+/// parked only by a conflict after its landing was approved is not one of
+/// them), for tests of what happens once the attempts are used up.
+pub fn count_resumes_of_parked(db: &Path) {
+    Connection::open(db)
+        .unwrap()
+        .execute(
+            "UPDATE run_events SET payload=json_set(payload,'$.code','verification_failed')
+             WHERE kind='integration_deferred'",
+            [],
+        )
+        .unwrap();
+}
+
 pub fn payloads<'a>(detail: &'a dagq::domain::TaskDetail, kind: &str) -> Vec<&'a Value> {
     detail
         .events
@@ -1568,7 +1584,7 @@ pub fn start_run_under_dead_supervisor(
     let task = queue.show(run.task_id()).unwrap().task;
     fs::write(
         run_dir.join("prompt.txt"),
-        runtime::prompt(&task, &run, None, &[], &[], &[]).unwrap(),
+        runtime::prompt(&task, &run, None, &[], &[], &[], None).unwrap(),
     )
     .unwrap();
     repository.create_worktree(&run).unwrap();

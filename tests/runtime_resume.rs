@@ -275,7 +275,7 @@ fn approved_needs_session_run_is_resumed_until_the_runtime_lands_it() {
     assert_eq!(started.len(), 2, "{:?}", event_kinds(&detail));
     assert_eq!(
         started[0],
-        &json!({"attempt": 1, "reason": reason, "main": first_landed})
+        &json!({"attempt": 1, "counted": false, "reason": reason, "main": first_landed})
     );
     assert_eq!(started[1]["attempt"], 2);
     assert!(
@@ -527,7 +527,7 @@ fn unapproved_resumed_run_is_validated_and_reviewed_with_its_session_open() {
 fn unresolved_attempt(db: &Path, run: &TaskRun, main: &str) {
     let mut queue = SqliteQueue::open(db).unwrap();
     let (_, attempt) = queue
-        .begin_resume(run.id(), "earlier", &sha(main), None, 3)
+        .begin_resume(run.id(), "earlier", &sha(main), None)
         .unwrap()
         .unwrap();
     assert_eq!(attempt, 1);
@@ -993,6 +993,139 @@ fn a_run_missing_the_required_evidence_is_resumed() {
     );
 }
 
+/// ADR-0047 decision 24: a run whose landing was approved and that waits
+/// only because its rebase conflicts with main is resumed without using up
+/// one of the three attempts, up to the conflict-only limit. Past it, the
+/// run is not handed to a person: it fails, its head is kept under
+/// `refs/dagq/runs/<run-id>`, the task is ready again, and the next run's
+/// prompt asks to bring that commit onto the current main.
+#[test]
+fn conflict_only_resumes_are_not_counted_and_a_used_up_run_is_retried_with_its_branch() {
+    let (_dir, repo, db) = fixture();
+    let mut backend = TestWorkspace::new(&db, false, VALID_AGENT);
+    backend.resume_timeout = Duration::from_secs(1);
+    let (run, first_landed) = parked_conflict(&repo, &db, &backend);
+    let source = run.result_commit().cloned().unwrap();
+    let mut queue = SqliteQueue::open(&db).unwrap();
+    // No session resolves it: each never goes idle and exits at the /exit
+    // of the resume timeout.
+    backend.resume_script_for(2, "await_exit");
+    let outcome = supervise(&db, &repo, &backend).unwrap();
+    backend.join();
+    assert_eq!(outcome["errors"], json!([]), "{outcome}");
+
+    let detail = queue.show(TaskId::new(2)).unwrap();
+    let first = detail.runs[0].clone();
+    assert_eq!(first.id(), run.id());
+    let started: Vec<&Value> = detail
+        .events
+        .iter()
+        .filter(|e| e.kind == "resume_started" && e.run_id.as_ref() == Some(run.id()))
+        .map(|e| &e.payload)
+        .collect();
+    assert_eq!(
+        started.len(),
+        CONFLICT_ONLY_RESUME_LIMIT,
+        "{:?}",
+        event_kinds(&detail)
+    );
+    assert!(started.iter().all(|p| p["counted"] == false), "{started:?}");
+    assert_eq!(
+        started
+            .iter()
+            .map(|p| p["attempt"].clone())
+            .collect::<Vec<_>>(),
+        (1..=CONFLICT_ONLY_RESUME_LIMIT)
+            .map(|n| json!(n))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(first.status(), RunStatus::Failed);
+    let last_error = first.last_error().unwrap();
+    assert!(
+        last_error.starts_with(
+            "resumed 5 times (0 of at most 3 counted, and 5 of at most 5 for conflicts only after its review passed) and still needs a session: rebase onto main"
+        ),
+        "{last_error}"
+    );
+    // Retried by the runtime, with nobody asked.
+    let finished = payloads(&detail, "triage_finished");
+    assert_eq!(finished.len(), 1, "{:?}", event_kinds(&detail));
+    assert_eq!(finished[0]["by"], "runtime");
+    assert_eq!(finished[0]["code"], "resume_exhausted");
+    assert_eq!(finished[0]["action"], "retry_inherit");
+    assert_eq!(finished[0]["counted_resumes"], 0);
+    assert_eq!(finished[0]["conflict_only_resumes"], 5);
+    assert_eq!(finished[0]["inherit"]["head"], json!(source));
+    assert_eq!(
+        finished[0]["inherit"]["branch"],
+        json!(format!("dagq/{}", run.id()))
+    );
+    assert!(finished[0].get("ask_id").is_none());
+    let repaired = payloads(&detail, "auto_repaired");
+    assert_eq!(repaired.len(), 1, "{repaired:?}");
+    assert_eq!(repaired[0]["layer"], "runtime");
+    assert_eq!(repaired[0]["repair"], "inherit_retry");
+    assert_eq!(repaired[0]["conditions"]["review"], "pass");
+    assert_eq!(repaired[0]["conditions"]["parked"], "rebase_conflict");
+    assert!(
+        other_asks(&mut queue, true)
+            .iter()
+            .all(|ask| ask.kind != AskKind::Decide),
+        "{:?}",
+        other_asks(&mut queue, true)
+    );
+    assert_eq!(
+        git_out(
+            &repo,
+            &["rev-parse", &format!("refs/dagq/runs/{}", run.id())]
+        ),
+        source.as_str()
+    );
+
+    // The next run carries the work over.
+    assert_eq!(detail.runs.len(), 2, "{:?}", event_kinds(&detail));
+    let next = detail.runs[1].clone();
+    let inherited: Vec<&Value> = detail
+        .events
+        .iter()
+        .filter(|e| e.kind == "run_inherited")
+        .map(|e| &e.payload)
+        .collect();
+    assert_eq!(inherited.len(), 1);
+    assert_eq!(inherited[0]["inherit_from_run"], json!(run.id()));
+    assert_eq!(inherited[0]["head"], json!(source));
+    assert!(
+        detail
+            .events
+            .iter()
+            .any(|e| e.kind == "run_inherited" && e.run_id.as_ref() == Some(next.id()))
+    );
+    let prompt = fs::read_to_string(Path::new(next.run_dir().unwrap()).join("prompt.txt")).unwrap();
+    // Its own commits start at the merge base of its head and the new
+    // run's base (the landed main): here the base the first run was made on.
+    let base = run.base_commit();
+    assert!(
+        prompt.contains(&format!(
+            "Carried over from run {}: its review passed, but its landing kept conflicting with main until its resumes were used up, so this run starts from its work instead of from scratch. Its work is commit {source} (kept as refs/dagq/runs/{id}, branch dagq/{id}); its own commits are {base}..{source}. Bring them onto your base",
+            run.id(),
+            id = run.id()
+        )),
+        "{prompt}"
+    );
+    assert!(
+        prompt.contains(&format!("`git cherry-pick {base}..{source}`")),
+        "{prompt}"
+    );
+    assert!(
+        prompt.contains(&format!(
+            "Its receipt ({}) summary: ",
+            run.receipt_path().unwrap()
+        )),
+        "{prompt}"
+    );
+    assert_eq!(next.base_commit().as_str(), first_landed);
+}
+
 /// A resume that cannot start, or a session that cannot resolve the run,
 /// uses up an attempt; after the third the supervisor stops resuming it and
 /// hands it to a person (ADR-0024's Consequences): the run becomes `failed`
@@ -1001,13 +1134,15 @@ fn a_run_missing_the_required_evidence_is_resumed() {
 /// applied like a triage's. The sessions behave like Claude: they
 /// never exit by themselves, so the supervisor sends `/exit` once when one
 /// goes idle without a resolving receipt, or when one never goes idle within
-/// the resume timeout.
+/// the resume timeout. The conflict that parked the run is made to count
+/// (a conflict-only resume does not; see the test above).
 #[test]
 fn resuming_stops_after_three_attempts() {
     let (_dir, repo, db) = fixture();
     let mut backend = TestWorkspace::new(&db, false, VALID_AGENT);
     backend.resume_timeout = Duration::from_secs(1);
     let (run, _) = parked_conflict(&repo, &db, &backend);
+    count_resumes_of_parked(&db);
     let mut queue = SqliteQueue::open(&db).unwrap();
     let reason = run.last_error().unwrap().to_owned();
 
@@ -1305,6 +1440,7 @@ fn a_request_lost_twice_is_asked_to_the_inbox() {
     let (_dir, repo, db) = fixture();
     let mut backend = TestWorkspace::new(&db, false, VALID_AGENT);
     let (run, _) = parked_conflict(&repo, &db, &backend);
+    count_resumes_of_parked(&db);
     backend.start_wait = Duration::from_secs(1);
     backend.resume_timeout = Duration::from_secs(4);
     backend.dropped_texts.store(usize::MAX, Ordering::SeqCst);
@@ -1439,13 +1575,13 @@ fn a_session_nobody_watches_blocks_the_resume_until_it_ends() {
     // A supervisor started a resume, its session registered, and then the
     // supervisor died: its lease goes stale while the session lives on.
     let (_, attempt) = queue
-        .begin_resume(run.id(), "dead-supervisor", &sha(&first_landed), None, 3)
+        .begin_resume(run.id(), "dead-supervisor", &sha(&first_landed), None)
         .unwrap()
         .unwrap();
     assert_eq!(attempt, 1);
     assert!(
         queue
-            .begin_resume(run.id(), "another", &sha(&first_landed), None, 3)
+            .begin_resume(run.id(), "another", &sha(&first_landed), None)
             .unwrap()
             .is_none()
     );

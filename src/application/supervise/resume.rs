@@ -2,7 +2,10 @@
 //! resume, the resolution request and the [`ResumeWatch`] of the session.
 
 use super::*;
-use crate::domain::run::{RunWorkspace, run_workspaces};
+use crate::domain::{
+    resume::CONFLICT_ONLY_RESUME_LIMIT,
+    run::{RunWorkspace, run_workspaces},
+};
 
 impl Supervisor<'_> {
     /// Resume `needs_session` runs with attempts left (ADR-0019 decision 1),
@@ -32,7 +35,7 @@ impl Supervisor<'_> {
                 run,
                 lease,
                 wrapper,
-                attempts,
+                resumes,
             } = candidate;
             let now = self.generators.clock.now();
             let session_alive = wrapper
@@ -43,9 +46,10 @@ impl Supervisor<'_> {
             if lease.is_some_and(|lease| !self.lease_stale(&lease, now)) || session_alive {
                 continue;
             }
-            // Out of attempts: a person decides, whether or not a slot is free.
-            if attempts >= MAX_RESUME_ATTEMPTS {
-                if let Err(error) = self.exhaust_resumes(&run, attempts) {
+            // Out of attempts: the run is retried with its branch carried
+            // over, or a person decides, whether or not a slot is free.
+            if resumes.exhausted() {
+                if let Err(error) = self.exhaust_resumes(&run, resumes) {
                     warn!(run_id = %run.id(), error = %format_args!("{error:#}"), "run {}: its used-up resumes could not be handed to a person: {error:#}", run.id());
                 }
                 continue;
@@ -60,13 +64,9 @@ impl Supervisor<'_> {
                 continue;
             }
             let (reason, kind) = resume_reason(&*self.queue, &run)?;
-            let Some((run, attempt)) = self.queue.begin_resume(
-                run.id(),
-                &self.token,
-                &main,
-                reason.as_deref(),
-                MAX_RESUME_ATTEMPTS,
-            )?
+            let Some((run, attempt)) =
+                self.queue
+                    .begin_resume(run.id(), &self.token, &main, reason.as_deref())?
             else {
                 continue;
             };
@@ -77,7 +77,7 @@ impl Supervisor<'_> {
             };
             match self.start_resume(&run, attempt, &request) {
                 Ok(watch) => {
-                    info!(run_id = %run.id(), task_id = %run.task_id(), "run {} of task {} resumed (attempt {attempt} of {MAX_RESUME_ATTEMPTS}) in workspace {}", run.id(), run.task_id(), watch.workspace);
+                    info!(run_id = %run.id(), task_id = %run.task_id(), "run {} of task {} resumed (attempt {attempt}; {} of at most {MAX_RESUME_ATTEMPTS} counted before it) in workspace {}", run.id(), run.task_id(), resumes.counted, watch.workspace);
                     self.slots.push(Slot {
                         run,
                         phase: Phase::Resume(watch),
@@ -207,16 +207,19 @@ impl Supervisor<'_> {
         self.slots.push(Slot { run, phase });
         Ok(())
     }
-    /// Hand a `needs_session` run whose resumes are used up to a person
+    /// End a `needs_session` run whose resumes are used up (ADR-0047
+    /// decision 24). A run whose review passed and that waits only because
+    /// of a conflict with main is retried with its branch carried over, once
+    /// per task ([`Self::retry_inheriting`]). Otherwise a person decides
     /// through the triage's `decide` ask (ADR-0024's Consequences): no
     /// headless triage runs, since resuming is no longer an option and a
-    /// run that did not resolve in [`MAX_RESUME_ATTEMPTS`] sessions is not
-    /// retried without a person. The ask (options `retry` and `cancel`,
-    /// applied like a triage's answer) is opened first, then the run becomes
-    /// `failed` with `triage_finished` naming the ask, and the workspaces it
-    /// left open are closed as after a triage. A run of a task that moved
-    /// on is left alone.
-    pub(super) fn exhaust_resumes(&mut self, run: &TaskRun, attempts: usize) -> Result<()> {
+    /// run that did not resolve in its sessions is not retried without a
+    /// person. The ask (options `retry` and `cancel`, applied like a
+    /// triage's answer) is opened first, then the run becomes `failed` with
+    /// `triage_finished` naming the ask, and the workspaces it left open
+    /// are closed as after a triage. A run of a task that moved on is left
+    /// alone.
+    pub(super) fn exhaust_resumes(&mut self, run: &TaskRun, resumes: ResumeCount) -> Result<()> {
         let detail = self.queue.show(run.task_id())?;
         if detail.task.status() != TaskStatus::InProgress
             || detail
@@ -227,12 +230,24 @@ impl Supervisor<'_> {
             return Ok(());
         }
         let last_error = run.last_error().map(str::to_owned).unwrap_or_default();
+        let resumed = resumed_text(resumes);
         let reason = format!(
-            "resumed {attempts} times (at most {MAX_RESUME_ATTEMPTS}) and still needs a session: {}",
+            "{resumed} and still needs a session: {}",
             tail(&last_error, 500)
         );
+        if inherits_on_exhaustion(&self.queue.run_events(run.id())?, &detail.events) {
+            match self.inherited_head(run) {
+                Ok(Some(head)) => return self.retry_inheriting(run, head, &reason),
+                Ok(None) => {
+                    info!(run_id = %run.id(), "run {}: its branch has no commit to carry over; asking a person", run.id());
+                }
+                Err(error) => {
+                    warn!(run_id = %run.id(), error = %format_args!("{error:#}"), "run {}: its branch could not be kept for a retry: {error:#}; asking a person", run.id());
+                }
+            }
+        }
         let mut question = format!(
-            "Run {} of task {} ({}) was resumed {attempts} times (at most {MAX_RESUME_ATTEMPTS}) and still needs a session, so the supervisor stops resuming it.\nLast error: {}",
+            "Run {} of task {} ({}) was {resumed} and still needs a session, so the supervisor stops resuming it.\nLast error: {}",
             run.id(),
             run.task_id(),
             detail.task.title(),
@@ -262,7 +277,7 @@ impl Supervisor<'_> {
         let ask_id = AskId::new(outcome["id"].as_i64().context("ask returned no id")?);
         let Some(failed) =
             self.queue
-                .exhaust_resumes(run.id(), MAX_RESUME_ATTEMPTS, ask_id, &reason)?
+                .exhaust_resumes(run.id(), &Exhaustion::Ask(ask_id), &reason)?
         else {
             // The run changed meanwhile (another supervisor took it): an ask
             // this pass opened has nothing left to decide.
@@ -276,6 +291,52 @@ impl Supervisor<'_> {
             return Ok(());
         };
         warn!(run_id = %failed.id(), task_id = %failed.task_id(), "run {} of task {} used up its resumes; it is failed and waits for ask {ask_id}", failed.id(), failed.task_id());
+        self.close_open_workspaces(&failed, WorkspaceCloser::Triage)?;
+        self.note_triaged(&failed);
+        Ok(())
+    }
+    /// The commit of the run's branch a retry carries over: its validated
+    /// commit (the one its review passed), or without one the head of its
+    /// worktree when no rebase is stopped half way there, kept
+    /// under `refs/dagq/runs/<run-id>` so that it outlives the branch.
+    /// `None` when the branch holds nothing on top of the run's base.
+    fn inherited_head(&mut self, run: &TaskRun) -> Result<Option<CommitSha>> {
+        // The reviewed commit, not whatever an unresolved session left in
+        // the worktree (a rebase stopped half way, say).
+        let head = match (run.result_commit(), run.worktree_path().map(Path::new)) {
+            (Some(commit), _) => Some(commit.clone()),
+            (None, Some(worktree))
+                if self.files.is_dir(worktree)
+                    && !self.repository.rebase_in_progress(worktree)? =>
+            {
+                Some(self.repository.head(worktree)?)
+            }
+            _ => None,
+        };
+        let Some(head) = head.filter(|head| head != run.base_commit()) else {
+            return Ok(None);
+        };
+        self.repository
+            .update_ref(&format!("refs/dagq/runs/{}", run.id()), head.as_str())?;
+        Ok(Some(head))
+    }
+    /// Retry the task of a run whose resumes were used up on conflicts
+    /// after its review passed, with its branch carried over (ADR-0047
+    /// decision 24): the run becomes `failed`, the task `ready` without a
+    /// plan review (its content is unchanged), and the next run's prompt
+    /// asks to bring `head` onto the current main. Recorded as
+    /// `triage_finished` (`action: retry_inherit`) and `auto_repaired`
+    /// (`repair: inherit_retry`); the workspaces the run left open are
+    /// closed as after a triage.
+    fn retry_inheriting(&mut self, run: &TaskRun, head: CommitSha, reason: &str) -> Result<()> {
+        let exhaustion = Exhaustion::Inherit {
+            branch: run.branch().map(str::to_owned),
+            head: head.clone(),
+        };
+        let Some(failed) = self.queue.exhaust_resumes(run.id(), &exhaustion, reason)? else {
+            return Ok(());
+        };
+        info!(run_id = %failed.id(), task_id = %failed.task_id(), "run {} of task {} used up its resumes on conflicts after its review passed; the task is ready again and its next run carries {head} over", failed.id(), failed.task_id());
         self.close_open_workspaces(&failed, WorkspaceCloser::Triage)?;
         self.note_triaged(&failed);
         Ok(())
@@ -472,12 +533,31 @@ impl Supervisor<'_> {
                 Reason::new(ReasonCode::WorkerFailed).on(payload),
             )?,
             ResumeOutcome::Unresolved => {
-                payload["exhausted"] = json!(attempt >= MAX_RESUME_ATTEMPTS);
+                payload["exhausted"] = json!(resumes_exhausted(&*self.queue, &id));
                 self.queue
                     .finish_resume(&id, &self.token, None, None, false, payload)?
             }
         };
         Ok(Step::Done(Box::new(run)))
+    }
+}
+
+/// How often the run was resumed, for its used-up reason and ask: the
+/// counted resumes against [`MAX_RESUME_ATTEMPTS`], and the conflict-only
+/// ones (ADR-0047 decision 24) when there were any.
+fn resumed_text(resumes: ResumeCount) -> String {
+    if resumes.conflict_only == 0 {
+        format!(
+            "resumed {} times (at most {MAX_RESUME_ATTEMPTS})",
+            resumes.counted
+        )
+    } else {
+        format!(
+            "resumed {} times ({} of at most {MAX_RESUME_ATTEMPTS} counted, and {} of at most {CONFLICT_ONLY_RESUME_LIMIT} for conflicts only after its review passed)",
+            resumes.total(),
+            resumes.counted,
+            resumes.conflict_only
+        )
     }
 }
 
@@ -849,7 +929,7 @@ impl ResumeWatch {
                 // ask is only noted: the verdict stands without it.
                 let after = stuck_exit_after(
                     self.exit_for_silence,
-                    if self.attempt >= MAX_RESUME_ATTEMPTS {
+                    if resumes_exhausted(&*sv.queue, run.id()) {
                         "The run stays needs_session after its last resume attempt, and is left to the person once the session exits"
                     } else {
                         "The run stays needs_session, and the supervisor resumes it again once the session exits"

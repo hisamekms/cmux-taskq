@@ -32,6 +32,33 @@ so the run workspace opens outside it: {error:#}", self.layout.queue_hash);
             }
         }
     }
+    /// What `run` inherits from an earlier run of its task that was retried
+    /// with its branch carried over (ADR-0047 decision 24): the latest such
+    /// run, so that a run after it that failed early (and was retried by
+    /// the triage) does not lose the carried-over work. Its own commits are
+    /// counted from their merge base with `run`'s base, the current main.
+    fn inheritance(&mut self, run: &TaskRun) -> Result<Option<Inheritance>> {
+        let runs = self.queue.show(run.task_id())?.runs;
+        for previous in runs
+            .iter()
+            .take_while(|other| other.id() != run.id())
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+        {
+            let events = self.queue.run_events(previous.id())?;
+            if let Some(mut inherited) = Inheritance::of(&*self.files, previous, &events) {
+                if let Ok(Some(base)) = self
+                    .repository
+                    .merge_base(run.base_commit().as_str(), &inherited.head)
+                {
+                    inherited.base = base;
+                }
+                return Ok(Some(inherited));
+            }
+        }
+        Ok(None)
+    }
     pub(super) fn provision(&mut self, claimed: &TaskRun) -> Result<SessionWatch> {
         let state_dir = &self.layout.runs_dir;
         let paths = RunPaths::new(state_dir, claimed.id());
@@ -70,6 +97,7 @@ so the run workspace opens outside it: {error:#}", self.layout.queue_hash);
             None => None,
         };
         let siblings = siblings_in_progress(&task, self.queue.tasks_in_progress()?);
+        let inherited = self.inheritance(&run)?;
         self.files.write(
             &run_dir.join("prompt.txt"),
             prompt(
@@ -79,9 +107,18 @@ so the run workspace opens outside it: {error:#}", self.layout.queue_hash);
                 &predecessors,
                 &goal_predecessors,
                 &siblings,
+                inherited.as_ref(),
             )?
             .as_bytes(),
         )?;
+        if let Some(inherited) = &inherited {
+            self.queue.record_runtime_event(
+                run.id(),
+                "run_inherited",
+                json!({"inherit_from_run": inherited.run_id, "head": inherited.head, "branch": inherited.branch}),
+            )?;
+            info!(run_id = %run.id(), task_id = %run.task_id(), "run {} of task {} carries run {}'s work over from {}", run.id(), run.task_id(), inherited.run_id, inherited.head);
+        }
         // A running wrapper must not change when the development binary is rebuilt.
         self.files
             .copy(&self.layout.runner, &run_dir.join("runner"))

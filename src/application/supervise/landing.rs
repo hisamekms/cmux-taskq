@@ -326,7 +326,9 @@ impl Supervisor<'_> {
             .iter()
             .filter(|e| e.kind == "conflict_precheck" && e.payload["requested"] == true)
             .count();
-        let resumes = events.iter().filter(|e| e.kind == "resume_started").count();
+        // Resumes of the run parked only by a conflict after its review
+        // passed are not counted (ADR-0047 decision 24).
+        let resumes = ResumeCount::of(&events).counted;
         let attempt = requested + 1;
         let mut payload = json!({
             "code": ReasonCode::RebaseConflict,

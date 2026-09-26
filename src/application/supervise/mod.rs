@@ -41,10 +41,10 @@ use std::{
 use tracing::{error, info, warn};
 
 use super::{
-    AgentProvider, AgentSignals, CommandSpec, Generators, IdleHook, LeasedRun, MainRemote,
-    ProcessControl, Queue, QueueOpener, Repository, ResumeCandidate, RunFiles, Spawned, Spawner,
-    Streams, TRIAGE_ASKER, TriageAction, Validation, Verifier, WorkspaceBackend, WorkspaceTags,
-    ask, dependency_graph,
+    AgentProvider, AgentSignals, CommandSpec, Exhaustion, Generators, IdleHook, LeasedRun,
+    MainRemote, ProcessControl, Queue, QueueOpener, Repository, ResumeCandidate, RunFiles, Spawned,
+    Spawner, Streams, TRIAGE_ASKER, TriageAction, Validation, Verifier, WorkspaceBackend,
+    WorkspaceTags, ask, dependency_graph,
     health::{lease_health, run_health},
     integrate::{self as integration, Integration, check_receipt, resume_attempts},
     naming::{
@@ -52,8 +52,8 @@ use super::{
     },
     or_none, path_text,
     prompt::{
-        GoalPredecessorSummary, PredecessorSummary, RecoveryMaterial, ResumeKind, ResumeRequest,
-        TRIAGE_TOOLS, prompt, recovery_prompt, resume_request, review_prompt,
+        GoalPredecessorSummary, Inheritance, PredecessorSummary, RecoveryMaterial, ResumeKind,
+        ResumeRequest, TRIAGE_TOOLS, prompt, recovery_prompt, resume_request, review_prompt,
         revise_mismatch_request, revise_request, siblings_in_progress, stall_nudge, triage_prompt,
     },
     recording::{
@@ -69,6 +69,7 @@ use crate::domain::{
     SessionRole, TRIAGE_OPTIONS, TRIAGE_RETRY_FAILURES, TaskAction, TaskId, TaskRun, TaskStatus,
     TriageDecision, TriageState, TriageVerdict, heartbeat_stale,
     recovery::RecoveryDecision,
+    resume::{ResumeCount, inherits_on_exhaustion},
     run_env::RUN_ENV_PROGRAM_KINDS,
     stall::{BackgroundTask, STALL_CONFIG_LOADED, StallConfig},
     triage_state,
@@ -1031,7 +1032,7 @@ impl Supervisor<'_> {
             "outcome": "error",
             "error": message,
             "workspace_id": workspace,
-            "exhausted": attempt >= MAX_RESUME_ATTEMPTS,
+            "exhausted": resumes_exhausted(&*self.queue, run.id()),
         }));
         if let Err(error) =
             self.queue
@@ -1420,6 +1421,14 @@ fn stop_job(slot: &mut Slot) {
         Phase::Session(watch) => watch.recovery.stop_job(),
         _ => {}
     }
+}
+
+/// Whether the run's resumes are used up (ADR-0047 decision 24: its
+/// counted resumes or its conflict-only ones); unreadable counts as used up.
+fn resumes_exhausted(queue: &dyn Queue, run_id: &RunId) -> bool {
+    queue
+        .run_events(run_id)
+        .map_or(true, |events| ResumeCount::of(&events).exhausted())
 }
 
 /// Whether the run's session wrapper is registered, has not exited and has

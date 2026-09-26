@@ -20,12 +20,14 @@ use crate::domain::{
     AskId, ClaimOutcome, CommitSha, DomainError, EventFilter, EventId, GoalId, PlannerId,
     PlannerOrigin, PlannerSession, ProposalId, Reason, ReasonCode, RunEvent, RunId, RunLease,
     RunPaths, RunProcess, RunStatus, SessionRole, SupervisorMode, SupervisorRegistration, Task,
-    TaskAction, TaskId, TaskRun, run,
+    TaskAction, TaskId, TaskRun,
+    resume::{self, ResumeCount},
+    run,
 };
 
 pub use crate::application::{
-    EndedRunWorkspace, EndedRunWorktree, Landing, LeasedRun, ResumeCandidate, TRIAGE_ASKER,
-    TriageAction, Validation,
+    EndedRunWorkspace, EndedRunWorktree, Exhaustion, Landing, LeasedRun, ResumeCandidate,
+    TRIAGE_ASKER, TriageAction, Validation,
 };
 pub use crate::domain::{HEARTBEAT_TIMEOUT_SECS, RunPlan};
 
@@ -1480,31 +1482,31 @@ impl SqliteQueue {
                         process_row,
                     )
                     .optional()?;
-                let attempts = resume_attempts(&self.conn, run.id())?;
+                let resumes = resume_count(&self.conn, run.id())?;
                 Ok(ResumeCandidate {
                     run,
                     lease,
                     wrapper,
-                    attempts,
+                    resumes,
                 })
             })
             .collect()
     }
 
     /// Take a `needs_session` run for a resume: in one transaction, check
-    /// that it is still `needs_session` with fewer than `max_attempts`
-    /// resumes started, no lease but a stale one (which is replaced) and no
+    /// that it is still `needs_session` with resumes left (ADR-0047
+    /// decision 24: [`ResumeCount::exhausted`]), no lease but a stale one (which is replaced) and no
     /// session still heartbeating, lease it to `token`, clear the previous
     /// session's process rows, make `token` its supervisor and record
-    /// `resume_started` (`attempt`, `reason`, `main`). `Ok(None)` means
-    /// another process took it or it changed meanwhile.
+    /// `resume_started` (`attempt`, the number of every resume so far and
+    /// this one, `counted`, `reason`, `main`). `Ok(None)` means another
+    /// process took it or it changed meanwhile.
     pub fn begin_resume(
         &mut self,
         id: &RunId,
         token: &str,
         main: &CommitSha,
         reason: Option<&str>,
-        max_attempts: usize,
     ) -> Result<Option<(TaskRun, usize)>> {
         let tx = self
             .conn
@@ -1513,14 +1515,18 @@ impl SqliteQueue {
         let Some(run) = stored_run(&tx, id)?.filter(|run| run::check_resumable(run).is_ok()) else {
             return Ok(None);
         };
-        let attempts = resume_attempts(&tx, id)?;
-        if attempts >= max_attempts {
+        let events = run_events_of(&tx, id)?;
+        let resumes = ResumeCount::of(&events);
+        if resumes.exhausted() {
             return Ok(None);
         }
+        // A resume of a run parked only by a conflict after its review
+        // passed is not one of the counted attempts.
+        let counted = !resume::parked_for_conflict_only(&events);
         let Some(previous) = lease_parked_run(&tx, id, token, now, true)? else {
             return Ok(None);
         };
-        let attempt = attempts + 1;
+        let attempt = resumes.total() + 1;
         run_event(
             &tx,
             id,
@@ -1531,7 +1537,7 @@ impl SqliteQueue {
             &tx,
             id,
             "resume_started",
-            json!({"attempt": attempt, "reason": reason.or(run.last_error()), "main": main}),
+            json!({"attempt": attempt, "counted": counted, "reason": reason.or(run.last_error()), "main": main}),
         )?;
         tx.commit()?;
         Ok(Some((run.relocated(&self.runs_dir), attempt)))
@@ -2019,19 +2025,22 @@ impl SqliteQueue {
         Ok(result)
     }
 
-    /// Hand a `needs_session` run whose resumes are used up to a person
-    /// (ADR-0024's Consequences, in place of ADR-0019's attention): in one
-    /// transaction, check that it is still `needs_session` with at least
-    /// `max_attempts` resumes started, the latest run of an `in_progress`
+    /// End a `needs_session` run whose resumes are used up (ADR-0024's
+    /// Consequences, ADR-0047 decision 24): in one transaction, check that
+    /// it is still `needs_session` with its resumes used up
+    /// ([`ResumeCount::exhausted`]), the latest run of an `in_progress`
     /// task, and not leased but stale; make it `failed` with `reason` as
-    /// `last_error`, and record `triage_finished` with the action `ask`
-    /// (`ask_id`, `by: runtime`), so the triage takes it as decided and the
-    /// ask's answer is applied as a triage's. `Ok(None)` means it changed.
+    /// `last_error`, and record `triage_finished` (`by: runtime`), so the
+    /// triage takes it as decided. [`Exhaustion::Ask`] names the ask a
+    /// person answers like a triage's (action `ask`);
+    /// [`Exhaustion::Inherit`] makes the task `ready` again for a run that
+    /// carries this run's branch over (action `retry_inherit`, with
+    /// `auto_repaired` `repair: inherit_retry`). `Ok(None)` means it
+    /// changed.
     pub fn exhaust_resumes(
         &mut self,
         id: &RunId,
-        max_attempts: usize,
-        ask_id: AskId,
+        exhaustion: &Exhaustion,
         reason: &str,
     ) -> Result<Option<TaskRun>> {
         let tx = self
@@ -2050,7 +2059,8 @@ impl SqliteQueue {
         let Some(run) = run else {
             return Ok(None);
         };
-        let resumes = resume_attempts(&tx, id)?;
+        let events = run_events_of(&tx, id)?;
+        let resumes = ResumeCount::of(&events);
         let leased = tx
             .query_row(
                 "SELECT run_id,token,pid,heartbeat_at FROM run_leases WHERE run_id=?1",
@@ -2059,8 +2069,19 @@ impl SqliteQueue {
             )
             .optional()?
             .is_some_and(|lease| !lease_is_stale(&lease, now));
-        if resumes < max_attempts || leased {
+        if !resumes.exhausted() || leased {
             return Ok(None);
+        }
+        // Once per task, and only for a run still parked by a conflict
+        // alone: checked again here, where no other supervisor can retry it.
+        if matches!(exhaustion, Exhaustion::Inherit { .. }) {
+            let task_events: Vec<RunEvent> = tx
+                .prepare("SELECT * FROM run_events WHERE task_id=?1 ORDER BY id")?
+                .query_map([run.task_id()], event_row)?
+                .collect::<rusqlite::Result<_>>()?;
+            if !resume::inherits_on_exhaustion(&events, &task_events) {
+                return Ok(None);
+            }
         }
         tx.execute("DELETE FROM run_leases WHERE run_id=?1", [id])?;
         let result = apply(
@@ -2071,22 +2092,53 @@ impl SqliteQueue {
             || format!("run {id} changed"),
             |run| run::exhaust_resumes(run, reason.to_owned()),
         )?;
-        run_event(
-            &tx,
-            id,
-            "triage_finished",
-            json!({
-                "code": ReasonCode::ResumeExhausted,
-                "by": "runtime",
-                "verdict": "ask",
-                "action": "ask",
-                "ask_id": ask_id,
-                "reason": reason,
-                "resumes": resumes,
-                "previous_status": run.status().as_str(),
-                "status": result.status().as_str(),
-            }),
-        )?;
+        let mut payload = json!({
+            "code": ReasonCode::ResumeExhausted,
+            "by": "runtime",
+            "reason": reason,
+            "resumes": resumes.total(),
+            "counted_resumes": resumes.counted,
+            "conflict_only_resumes": resumes.conflict_only,
+            "previous_status": run.status().as_str(),
+            "status": result.status().as_str(),
+        });
+        match exhaustion {
+            Exhaustion::Ask(ask_id) => {
+                payload["verdict"] = json!("ask");
+                payload["action"] = json!("ask");
+                payload["ask_id"] = json!(ask_id);
+            }
+            Exhaustion::Inherit { branch, head } => {
+                super::sqlite::transition_task(
+                    &tx,
+                    run.task_id(),
+                    TaskAction::Ready,
+                    &self.generators.clock.timestamp(),
+                )?;
+                payload["verdict"] = json!(resume::RETRY_INHERIT);
+                payload["action"] = json!(resume::RETRY_INHERIT);
+                payload["inherit"] = json!({"branch": branch, "head": head});
+                run_event(
+                    &tx,
+                    id,
+                    "auto_repaired",
+                    json!({
+                        "layer": "runtime",
+                        "repair": "inherit_retry",
+                        "conditions": {
+                            "review": "pass",
+                            "parked": ReasonCode::RebaseConflict,
+                            "counted_resumes": resumes.counted,
+                            "conflict_only_resumes": resumes.conflict_only,
+                            "branch": branch,
+                            "head": head,
+                        },
+                        "detail": "the resumes were used up on conflicts with main; the task is ready again for a run that carries this run's branch over",
+                    }),
+                )?;
+            }
+        }
+        run_event(&tx, id, "triage_finished", payload)?;
         tx.commit()?;
         Ok(Some(result.relocated(&self.runs_dir)))
     }
@@ -2567,13 +2619,16 @@ fn lease_parked_run(
     Ok(Some(lease.map(|l| l.token)))
 }
 
-fn resume_attempts(conn: &Connection, id: &RunId) -> Result<usize> {
-    let count: i64 = conn.query_row(
-        "SELECT count(*) FROM run_events WHERE run_id=?1 AND kind='resume_started'",
-        [id],
-        |r| r.get(0),
-    )?;
-    Ok(usize::try_from(count)?)
+fn run_events_of(conn: &Connection, id: &RunId) -> Result<Vec<RunEvent>> {
+    Ok(conn
+        .prepare("SELECT * FROM run_events WHERE run_id=?1 ORDER BY id")?
+        .query_map([id], event_row)?
+        .collect::<rusqlite::Result<_>>()?)
+}
+
+/// The run's resumes, counted as ADR-0047 decision 24 says.
+fn resume_count(conn: &Connection, id: &RunId) -> Result<ResumeCount> {
+    Ok(ResumeCount::of(&run_events_of(conn, id)?))
 }
 
 fn process_row(r: &Row<'_>) -> rusqlite::Result<RunProcess> {
@@ -2897,9 +2952,8 @@ impl RunStore for SqliteQueue {
         token: &str,
         main: &CommitSha,
         reason: Option<&str>,
-        max_attempts: usize,
     ) -> Result<Option<(TaskRun, usize)>> {
-        SqliteQueue::begin_resume(self, id, token, main, reason, max_attempts)
+        SqliteQueue::begin_resume(self, id, token, main, reason)
     }
     fn finish_resume(
         &mut self,
@@ -2925,11 +2979,10 @@ impl RunStore for SqliteQueue {
     fn exhaust_resumes(
         &mut self,
         id: &RunId,
-        max_attempts: usize,
-        ask_id: AskId,
+        exhaustion: &Exhaustion,
         reason: &str,
     ) -> Result<Option<TaskRun>> {
-        SqliteQueue::exhaust_resumes(self, id, max_attempts, ask_id, reason)
+        SqliteQueue::exhaust_resumes(self, id, exhaustion, reason)
     }
     fn last_observe(&self, mode: &str) -> Result<Option<i64>> {
         SqliteQueue::last_observe(self, mode)
