@@ -65,7 +65,7 @@ ready task (dependencies completed)
                 → validate → review again (at most 2 revises)
       concern / 3rd non-pass → /exit → close → approve_landing ask
       unreadable verdict     → review once more (review_retried)
-      review failed          → /exit → close → approve_landing ask + review_failed
+      review failed          → review span closed → /exit → close → approve_landing ask + review_failed
   → release run lease               ─┘
   → integrate (by hand, one at a time, FIFO by validation):
       integrating → rebase onto main → re-validate → squash-land on main

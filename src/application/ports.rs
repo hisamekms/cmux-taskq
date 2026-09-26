@@ -1302,6 +1302,11 @@ pub trait RunStore {
     /// Record the finished transcript turns of the Claude session spans
     /// still open (ADR-0048 decision 8); returns how many spans got turns.
     fn record_session_turns(&self) -> Result<usize>;
+    /// Close the run's review span still open, as `job_finished` now: its
+    /// headless job ended (or could not start) without a verdict, and its
+    /// `review_failed` waits for the session's `/exit` (task 541); returns
+    /// how many spans it closed.
+    fn close_review_session(&self, id: &RunId) -> Result<usize>;
     /// The newest event of `kind`, on whatever task, goal or run.
     fn latest_event_of(&self, kind: &str) -> Result<Option<RunEvent>>;
     /// The newest event of the queue itself (on no run) of one of `kinds`.

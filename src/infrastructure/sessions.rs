@@ -17,7 +17,7 @@ use crate::{
     domain::{
         EventId, RunId, TaskId,
         sessions::{
-            INFERRED, JOB_FINISHED, OpenSpan, PLAN_REVIEW, RUN_SESSION, SESSION_CLOSED,
+            INFERRED, JOB_FINISHED, OpenSpan, PLAN_REVIEW, REVIEW, RUN_SESSION, SESSION_CLOSED,
             SESSION_OPENED, SESSION_TURNS, Scope, SpanChange, SpanContext, changes, scope,
         },
         stats::rfc3339_millis,
@@ -512,6 +512,32 @@ pub(super) fn close_plan_review(
         close(conn, &now(conn)?, task_id, None, &span, reason)?;
     }
     Ok(())
+}
+
+/// Close the review span of `run_id` still open, as `job_finished` now:
+/// its headless job ended without a verdict, or could not start, and the
+/// `review_failed` that would close it is recorded only after the worker's
+/// session exits (task 541). Returns how many spans it closed.
+pub(super) fn close_review(conn: &Connection, run_id: &RunId) -> Result<usize> {
+    let open = open_spans(
+        conn,
+        "o.run_id=?1 AND json_extract(o.payload,'$.kind')=?2",
+        "c.run_id=?1",
+        params![run_id, REVIEW],
+    )?;
+    if open.is_empty() {
+        return Ok(0);
+    }
+    let task_id: Option<TaskId> = conn
+        .query_row("SELECT task_id FROM task_runs WHERE id=?1", [run_id], |r| {
+            r.get(0)
+        })
+        .optional()?;
+    let now = now(conn)?;
+    for span in &open {
+        close(conn, &now, task_id, Some(run_id), span, JOB_FINISHED)?;
+    }
+    Ok(open.len())
 }
 
 /// The `session_opened` events matching `opened` that no `session_closed`

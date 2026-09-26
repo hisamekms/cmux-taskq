@@ -1214,6 +1214,15 @@ impl Supervisor<'_> {
             }
         }
     }
+    /// Close the review span of `run` when its job ended without a verdict
+    /// or could not start: `review_failed` waits for the session's `/exit`,
+    /// which is no time of the review (task 541). A failure is logged only
+    /// (ADR-0048 decision 10); the span then closes with `review_failed`.
+    pub(super) fn close_review_session(&mut self, run: &TaskRun) {
+        if let Err(error) = self.queue.close_review_session(run.id()) {
+            warn!(run_id = %run.id(), error = %format_args!("{error:#}"), "run {}: the span of its failed review could not be closed: {error:#}", run.id());
+        }
+    }
     /// Record the finished transcript turns of the open session spans when
     /// [`SESSION_TURNS_INTERVAL`] passed since the last time (at once with
     /// `now`). A failure is logged only: it changes no run (ADR-0048
@@ -1552,6 +1561,7 @@ impl Supervisor<'_> {
                     }
                     ReviewEnd::Unreadable(error) | ReviewEnd::Failed(error) => {
                         warn!(run_id = %run.id(), error = %error, "run {} review {attempt} failed: {error}; a person is asked", run.id());
+                        self.close_review_session(&run);
                         Phase::Exiting(ExitWatch::new(
                             session,
                             AfterExit::ReviewFailed {

@@ -1088,6 +1088,81 @@ fn a_review_that_could_not_start_names_no_output_of_its_own() {
     }
 }
 
+/// A failed review's span ends with its job (task 541): the job that
+/// failed, timed out, printed no readable verdict twice, or could not start
+/// closes the review span as `job_finished` when it ends, before the
+/// session's `/exit`, which here takes a second more; `review_failed` and
+/// its ask still follow the exit.
+#[test]
+fn a_failed_review_span_ends_with_its_job_not_with_the_exit() {
+    use dagq::domain::stats::rfc3339_millis;
+    let slow_exit = "commit work; receipt \"$(git rev-parse HEAD)\"; idle; await_exit; sleep 1";
+    for (scripts, timeout, reviews) in [
+        (vec!["echo broken >&2; exit 3".to_owned()], 60, 1),
+        (vec!["sleep 30".to_owned()], 1, 1),
+        (vec!["echo 'no verdict here'".to_owned()], 60, 2),
+        (vec![UNSTARTABLE_REVIEW.to_owned()], 60, 1),
+    ] {
+        let (_dir, repo, db) = fixture();
+        let backend = TestWorkspace::new(&db, false, slow_exit);
+        let mut reviewer = TestReviewer::new(&scripts);
+        reviewer.timeout = Duration::from_secs(timeout);
+        let outcome = supervise_reviewed(&db, &repo, &backend, &reviewer);
+        assert_eq!(outcome["errors"], json!([]), "{outcome}");
+        assert_eq!(outcome["runs"][0]["status"], "awaiting_integration");
+        let mut queue = SqliteQueue::open(&db).unwrap();
+        let detail = queue.show(TaskId::new(1)).unwrap();
+        let event = |kind: &str| {
+            detail
+                .events
+                .iter()
+                .rev()
+                .find(|e| e.kind == kind)
+                .unwrap_or_else(|| panic!("no {kind} in {:?}", event_kinds(&detail)))
+        };
+        let reviews_closed: Vec<_> = detail
+            .events
+            .iter()
+            .filter(|e| e.kind == "session_closed" && e.payload["kind"] == "review")
+            .collect();
+        assert_eq!(reviews_closed.len(), reviews, "{scripts:?}");
+        assert!(
+            reviews_closed
+                .iter()
+                .all(|e| e.payload["reason"] == "job_finished"),
+            "{reviews_closed:?}"
+        );
+        // Every review span is closed; none is left open.
+        assert_eq!(
+            payloads(&detail, "session_opened")
+                .iter()
+                .filter(|p| p["kind"] == "review")
+                .count(),
+            reviews
+        );
+        let closed = reviews_closed.last().unwrap();
+        let failed = event("review_failed");
+        // Closed before the /exit was even asked, and a second or more
+        // before the session exited and `review_failed` was recorded.
+        assert!(closed.id < event("exit_requested").id, "{scripts:?}");
+        let at = |e: &dagq::domain::RunEvent| rfc3339_millis(&e.created_at).unwrap();
+        assert!(
+            at(event("session_exited")) - at(closed) >= 1000,
+            "{} then {}",
+            closed.created_at,
+            event("session_exited").created_at
+        );
+        assert!(at(failed) >= at(event("session_exited")));
+        // The ask goes with the failure as before.
+        let asks = queue.asks(Default::default()).unwrap();
+        assert_eq!(asks.len(), 1, "{asks:?}");
+        assert_eq!(failed.payload["ask_id"], asks[0].id.as_i64());
+        assert_eq!(failed.payload["attempt"], reviews);
+        let kinds = event_kinds(&detail);
+        assert!(position(&kinds, "ask_opened") < position(&kinds, "review_failed"));
+    }
+}
+
 /// A review whose stdout holds no readable verdict is reviewed once more
 /// with the same input (task 328); a verdict from the retry goes on as
 /// usual, here a pass that lands without anyone asked.

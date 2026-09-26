@@ -156,6 +156,7 @@ impl Supervisor<'_> {
             Err(error) => {
                 let error = format!("the headless review could not start: {error:#}");
                 warn!(run_id = %run.id(), error = %error, "run {}: {error}", run.id());
+                self.close_review_session(run);
                 Phase::Exiting(ExitWatch::new(
                     session,
                     AfterExit::ReviewFailed {

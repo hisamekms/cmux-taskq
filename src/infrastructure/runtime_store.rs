@@ -3384,6 +3384,12 @@ impl RunStore for SqliteQueue {
     fn record_session_turns(&self) -> Result<usize> {
         super::sessions::record_open_turns(&self.conn)
     }
+    fn close_review_session(&self, id: &RunId) -> Result<usize> {
+        let tx = rusqlite::Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let closed = super::sessions::close_review(&tx, id)?;
+        tx.commit()?;
+        Ok(closed)
+    }
     fn latest_event_of(&self, kind: &str) -> Result<Option<RunEvent>> {
         SqliteQueue::latest_event_of(self, kind)
     }
