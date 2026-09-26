@@ -41,6 +41,9 @@ jobs:
       - name: ADR numbers
         run: sh scripts/check-adr-numbers.sh
 
+      - name: Migration numbers
+        run: sh scripts/check-migration-numbers.sh
+
       - name: cargo clippy
         run: cargo clippy --locked --all-targets -- -D warnings
 

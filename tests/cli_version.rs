@@ -105,20 +105,29 @@ fn migrate_is_explicit_and_older_binaries_keep_working_within_the_floor() {
     assert_eq!(check["schema_version"], 23);
     assert_eq!(check["binary_schema_version"], SqliteQueue::SCHEMA_VERSION);
     assert_eq!(check["opens"], false);
+    // Every migration after 23, up to the last one the binary lists, with
+    // its declaration (ADR-0067 decision 4).
+    let migrations = dagq::infrastructure::schema::MIGRATIONS;
+    let pending: Vec<Value> = (24..=SqliteQueue::SCHEMA_VERSION)
+        .map(|version| {
+            serde_json::json!({
+                "version": version,
+                "compatible": dagq::infrastructure::schema::is_compatible(
+                    migrations[usize::try_from(version - 1).unwrap()]
+                ),
+            })
+        })
+        .collect();
+    assert_eq!(check["pending"], Value::Array(pending));
     assert_eq!(
-        check["pending"],
+        check["pending"].as_array().unwrap()[..3],
         serde_json::json!([
             {"version": 24, "compatible": false},
             {"version": 25, "compatible": false},
-            {"version": 26, "compatible": true},
-            {"version": 27, "compatible": false},
-            {"version": 28, "compatible": false},
-            {"version": 29, "compatible": false},
-            {"version": 30, "compatible": false},
-            {"version": 31, "compatible": true},
-            {"version": 32, "compatible": false},
-            {"version": 33, "compatible": true}
+            {"version": 26, "compatible": true}
         ])
+        .as_array()
+        .unwrap()[..]
     );
     assert_eq!(version(), 23);
     let migrated = ok(&db, &["migrate"]);

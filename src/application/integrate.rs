@@ -21,6 +21,7 @@ use crate::domain::{
     heartbeat_stale,
     scope::{out_of_scope, scope_violation_reason},
 };
+use crate::migration_numbers;
 
 /// Why validation did not accept a run's receipt, with what it could
 /// verify on the way.
@@ -916,6 +917,15 @@ fn land(
             json!({"main": main, "head": rebased}),
         );
     }
+    // A migration the run adds under a number main took meanwhile would
+    // fail the build with two files of one number (ADR-0067 decision 3).
+    let rebased = match renumber_migration(queue, repository, run, worktree, main, &rebased)? {
+        Renumbering::Unchanged => rebased,
+        Renumbering::Renumbered(head) => head,
+        Renumbering::Blocked { reason, detail } => {
+            return defer(ReasonCode::MigrationNumberTaken.into(), reason, detail);
+        }
+    };
     // What lands is the squash of main..rebased, so that is the diff held to
     // the task's paths (ADR-0029): the rebase may have changed it since
     // validation, and a resumed session may have committed more.
@@ -998,6 +1008,150 @@ fn land(
         },
         receipt.follow_ups,
     ))
+}
+
+/// What [`renumber_migration`] did to a rebased run.
+enum Renumbering {
+    /// No migration the run adds has a number `main` has.
+    Unchanged,
+    /// The run's one migration moved to the next free number; its new head.
+    Renumbered(CommitSha),
+    /// A number is taken but cannot be moved mechanically; the reason for
+    /// the session, with the numbers.
+    Blocked { reason: String, detail: Value },
+}
+
+/// Renumber the migration the rebased run adds when `main` already has its
+/// number (ADR-0067 decision 3), that is when another file of the rebased
+/// tree, one the run did not add, has it: moved with `git mv` to the next number
+/// free on `main` and committed on the run branch, recorded as
+/// `migration_renumbered`. Only a run that adds exactly one migration, whose
+/// number none of the run's other changed files mentions, is moved; any
+/// other collision is left to a session with the next free number.
+fn renumber_migration(
+    queue: &mut dyn Queue,
+    repository: &dyn Repository,
+    run: &TaskRun,
+    worktree: &Path,
+    main: &CommitSha,
+    rebased: &CommitSha,
+) -> Result<Renumbering> {
+    let in_directory = |path: &str| {
+        path.strip_prefix(migration_numbers::DIRECTORY)
+            .and_then(|rest| rest.strip_prefix('/'))
+            .filter(|name| migration_numbers::number(name).is_some())
+            .map(str::to_owned)
+    };
+    let added: Vec<String> = repository
+        .added_paths(main.as_str(), rebased.as_str())?
+        .iter()
+        .filter_map(|path| in_directory(path))
+        .collect();
+    if added.is_empty() {
+        return Ok(Renumbering::Unchanged);
+    }
+    // Judged on the rebased tree, not on main's: a migration the run renames
+    // or replaces keeps its number without a collision. What else the
+    // rebased tree has came from main.
+    let kept: Vec<u32> = repository
+        .paths_in(rebased.as_str(), migration_numbers::DIRECTORY)?
+        .iter()
+        .filter_map(|path| in_directory(path))
+        .filter(|name| !added.contains(name))
+        .filter_map(|name| migration_numbers::number(&name))
+        .collect();
+    let taken: Vec<&String> = added
+        .iter()
+        .filter(|name| kept.contains(&migration_numbers::number(name).unwrap_or(0)))
+        .collect();
+    if taken.is_empty() {
+        return Ok(Renumbering::Unchanged);
+    }
+    let next = kept.iter().copied().max().unwrap_or(0) + 1;
+    let next_digits = migration_numbers::digits(next);
+    let path = |name: &str| format!("{}/{name}", migration_numbers::DIRECTORY);
+    let blocked = |why: String, extra: Value| {
+        let mut detail = json!({
+            "main": main,
+            "head": rebased,
+            "migrations": added.iter().map(|name| path(name)).collect::<Vec<_>>(),
+            "taken": taken.iter().map(|name| path(name)).collect::<Vec<_>>(),
+            "next_number": next_digits,
+        });
+        if let (Some(detail), Value::Object(extra)) = (detail.as_object_mut(), extra) {
+            detail.extend(extra);
+        }
+        Ok(Renumbering::Blocked {
+            reason: format!(
+                "{why}; main {main} already has the number of {}, and the next free number is {next_digits}: renumber the run's migrations from {next_digits} (git mv), update what refers to their numbers, rerun the verification commands, and rewrite the receipt with the new head",
+                taken
+                    .iter()
+                    .map(|name| path(name))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            detail,
+        })
+    };
+    if added.len() > 1 {
+        return blocked(
+            format!(
+                "the run adds {} migrations, which are not renumbered mechanically",
+                added.len()
+            ),
+            json!({}),
+        );
+    }
+    let name = &added[0];
+    let old = path(name);
+    let old_digits = migration_numbers::digits(migration_numbers::number(name).unwrap_or(0));
+    let others: Vec<String> = repository
+        .changed_paths(main.as_str(), rebased.as_str())?
+        .into_iter()
+        .filter(|changed| *changed != old)
+        .collect();
+    let referring = repository.paths_containing(rebased.as_str(), &old_digits, &others)?;
+    if !referring.is_empty() {
+        return blocked(
+            format!(
+                "the run's other changes mention {old_digits} ({})",
+                referring.join(", ")
+            ),
+            json!({"referring": referring}),
+        );
+    }
+    let new = path(&migration_numbers::renumbered(name, next));
+    let head = repository.rename_and_commit(
+        worktree,
+        &old,
+        &new,
+        &[
+            format!("fix: renumber migration {old_digits} to {next_digits}"),
+            format!(
+                "main {main} took number {old_digits} while the run was open, so dagq integrate moved {old} to {new} (ADR-0067)."
+            ),
+        ],
+    )?;
+    queue.record_runtime_event(
+        run.id(),
+        "migration_renumbered",
+        json!({
+            "main": main,
+            "from": old,
+            "to": new,
+            "old_number": old_digits,
+            "new_number": next_digits,
+            "head_before": rebased,
+            "head_after": head,
+        }),
+    )?;
+    info!(
+        op = "integrate",
+        run_id = %run.id(),
+        "run {}: renumbered migration {old} to {new}",
+        run.id()
+    );
+    Ok(Renumbering::Renumbered(head))
 }
 
 /// Where integrate's attempt `attempt` writes the log of its `index`th
@@ -1183,6 +1337,18 @@ mod tests {
         }
         fn changed_paths(&self, _: &str, _: &str) -> Result<Vec<String>> {
             Ok(vec!["src/lib.rs".to_owned()])
+        }
+        fn added_paths(&self, _: &str, _: &str) -> Result<Vec<String>> {
+            unimplemented!()
+        }
+        fn paths_in(&self, _: &str, _: &str) -> Result<Vec<String>> {
+            unimplemented!()
+        }
+        fn paths_containing(&self, _: &str, _: &str, _: &[String]) -> Result<Vec<String>> {
+            unimplemented!()
+        }
+        fn rename_and_commit(&self, _: &Path, _: &str, _: &str, _: &[String]) -> Result<CommitSha> {
+            unimplemented!()
         }
         fn tree_of(&self, _: &str) -> Result<String> {
             unimplemented!()

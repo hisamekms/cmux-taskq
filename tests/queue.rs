@@ -724,18 +724,14 @@ fn opening_or_initializing_an_older_queue_never_migrates_it() {
             .iter()
             .map(|m| (m.version, m.compatible))
             .collect::<Vec<_>>(),
-        vec![
-            (24, false),
-            (25, false),
-            (26, true),
-            (27, false),
-            (28, false),
-            (29, false),
-            (30, false),
-            (31, true),
-            (32, false),
-            (33, true)
-        ]
+        pending_after(23)
+    );
+    assert_eq!(
+        schema.pending[..3]
+            .iter()
+            .map(|m| (m.version, m.compatible))
+            .collect::<Vec<_>>(),
+        [(24, false), (25, false), (26, true)]
     );
     let raw = Connection::open(&path).unwrap();
     assert_eq!(
@@ -1366,21 +1362,10 @@ fn migration_from_v6_adds_goals_and_keeps_tasks_runs_and_events() {
     .unwrap();
     drop(raw);
     let mut queue = migrated(&path);
-    // 0007 (supervisors), 0008 (goals), 0009 (supervisor mode), 0010
-    // (supervisor binary version), 0011 (session workspaces), 0012
-    // (queue-level backend failures), 0013 (goal draft), 0014 (asks) and
-    // 0015 (required evidence), 0016 (observer events and task-less
-    // blocked asks), 0017 (the stuck_exit ask), 0018 (task paths), 0019
-    // (goal dependencies), 0020 (task priority), 0021 (proposals) and 0022
-    // (follow-up triage: task leases, follow_up_depth, the follow_up ask),
-    // 0023 (planner sessions), 0024 (the schema floor), 0025 (the stalled
-    // ask), 0026 (the search index), 0027 (plan review) and 0028 (draft
-    // planners: draft origins, the planner_question ask, no task leases),
-    // 0029 (ask reasons, the queue_hold ask), 0030 (findings), 0031 (the
-    // supervisor handoff), 0032 (the run env program events) and 0033 (the
-    // automatic update) are applied together.
-    assert_eq!(SqliteQueue::SCHEMA_VERSION, 33);
-    assert_eq!(queue.schema_version().unwrap(), 33);
+    // Every migration from 0007 (supervisors) on is applied together, up to
+    // the last one the binary lists (ADR-0067 decision 1).
+    assert_eq!(SqliteQueue::SCHEMA_VERSION, MIGRATIONS.len() as i64);
+    assert_eq!(queue.schema_version().unwrap(), SqliteQueue::SCHEMA_VERSION);
     assert_eq!(
         queue
             .session_workspace(dagq::domain::SessionRole::Inbox)
@@ -3231,24 +3216,29 @@ fn migration_indexes_the_existing_rows_and_landings_record_their_message() {
             .iter()
             .map(|m| (m.version, m.compatible))
             .collect::<Vec<_>>(),
+        pending_after(25)
+    );
+    assert_eq!(
+        report.applied[..6]
+            .iter()
+            .map(|m| (m.version, m.compatible))
+            .collect::<Vec<_>>(),
         [
             (26, true),
             (27, false),
             (28, false),
             (29, false),
             (30, false),
-            (31, true),
-            (32, false),
-            (33, true)
+            (31, true)
         ]
     );
     // 0027 (plan review), 0028 (draft planners), 0029 (ask reasons) and 0030
-    // (findings) are applied with it and are breaking: a copy is taken and the floor rises
-    // to the last. 0031 (the supervisor handoff) is compatible, and 0032 (the
-    // run env program events) is breaking again and raises it to itself;
-    // 0033 (the automatic update) is compatible and leaves it there.
+    // (findings) are applied with it and are breaking: a copy is taken and the
+    // floor rises to the last breaking one. 0031 (the supervisor handoff) is
+    // compatible.
     assert!(report.backup.is_some());
-    assert_eq!(report.floor, 32);
+    assert_eq!(report.floor, floor_for(SqliteQueue::SCHEMA_VERSION));
+    assert!(report.floor >= 30);
     let mut queue = SqliteQueue::open(&path).unwrap();
     assert_eq!(
         search(&queue, "古い", |_| {}),
@@ -3569,4 +3559,21 @@ fn findings_on_a_run_or_a_goal_ride_on_their_target() {
             })
             .is_err()
     );
+}
+
+/// The migrations after schema `version` as `migrate` reports them, each
+/// with whether it declares itself compatible: what a test expects without
+/// naming the latest schema version (ADR-0067 decision 4).
+fn pending_after(version: i64) -> Vec<(i64, bool)> {
+    MIGRATIONS
+        .iter()
+        .enumerate()
+        .skip(usize::try_from(version).unwrap())
+        .map(|(index, migration)| {
+            (
+                index as i64 + 1,
+                dagq::infrastructure::schema::is_compatible(migration),
+            )
+        })
+        .collect()
 }

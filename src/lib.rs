@@ -20,6 +20,7 @@ pub mod compose;
 pub mod domain;
 pub mod infrastructure;
 pub mod lifecycle;
+pub mod migration_numbers;
 pub mod observer;
 pub mod runtime;
 pub mod view;

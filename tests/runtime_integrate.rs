@@ -1816,3 +1816,297 @@ fn integrate_logs_are_kept_per_attempt_and_old_names_are_read() {
     );
     assert_eq!(runtime::next_integrate_attempt(&run_dir.join("missing")), 1);
 }
+
+/// A task that runs `script` in its worktree before committing everything
+/// and writing its receipt, verified by `verify`.
+fn add_script_task(
+    queue: &mut SqliteQueue,
+    backend: &TestWorkspace,
+    title: &str,
+    script: &str,
+    verify: &[&str],
+) -> TaskId {
+    let task = queue
+        .add(NewTask {
+            title: title.into(),
+            description: "adds a migration".into(),
+            acceptance: "works".into(),
+            verification_commands: verify.iter().map(|v| (*v).to_owned()).collect(),
+            required_evidence: Vec::new(),
+            paths: Vec::new(),
+            priority: Default::default(),
+            dependencies: vec![],
+            goal_dependencies: Vec::new(),
+            goal_id: None,
+            context: String::new(),
+        })
+        .unwrap();
+    queue
+        .transition(task.id(), TaskAction::BypassReview)
+        .unwrap();
+    backend.script_for(
+        task.id().as_i64(),
+        &format!(
+            "{script} && git add -A && git commit -q -m '{title}'; receipt \"$(git rev-parse HEAD)\""
+        ),
+    );
+    task.id()
+}
+
+/// Fails when two migration files share a number, as the build would.
+const NO_SHARED_NUMBER: &str = "test -z \"$(ls migrations | cut -c1-4 | sort | uniq -d)\"";
+
+/// A repository whose main has `migrations/0001_first.sql`.
+fn migration_fixture() -> (Fixture, PathBuf, PathBuf) {
+    let (dir, repo, db) = fixture();
+    fs::create_dir(repo.join("migrations")).unwrap();
+    fs::write(repo.join("migrations/0001_first.sql"), "-- first\n").unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-q", "-m", "first migration"]);
+    SqliteQueue::open(&db)
+        .unwrap()
+        .transition(TaskId::new(1), TaskAction::Draft)
+        .unwrap();
+    (dir, repo, db)
+}
+
+fn migrations_on(repo: &Path, commit: &str) -> Vec<String> {
+    git_out(
+        repo,
+        &["ls-tree", "--name-only", commit, "--", "migrations/"],
+    )
+    .lines()
+    .map(str::to_owned)
+    .collect()
+}
+
+/// Two runs add migration 0002 at once. The first lands; the second's
+/// rebase applies cleanly but would leave two files of number 0002, so
+/// integrate moves its migration to 0003, commits that on the run branch,
+/// records `migration_renumbered` and lands it after the verification
+/// (ADR-0067 decision 3).
+#[test]
+fn integrate_renumbers_a_migration_whose_number_main_took() {
+    let (_dir, repo, db) = migration_fixture();
+    let mut queue = SqliteQueue::open(&db).unwrap();
+    let backend = TestWorkspace::new(&db, false, VALID_AGENT);
+    let first = add_script_task(
+        &mut queue,
+        &backend,
+        "add goals",
+        "printf -- '-- goals\\n' > migrations/0002_goals.sql",
+        &[NO_SHARED_NUMBER],
+    );
+    let second = add_script_task(
+        &mut queue,
+        &backend,
+        "add asks",
+        "printf -- '-- asks\\n' > migrations/0002_asks.sql && printf 'asks\\n' > asks.txt",
+        &[NO_SHARED_NUMBER],
+    );
+    supervise(&db, &repo, &backend).unwrap();
+    backend.join();
+    assert_eq!(
+        integrate(&db, first.as_i64(), &repo).unwrap()["outcome"],
+        "integrated"
+    );
+    let main = git_out(&repo, &["rev-parse", "main"]);
+
+    let run = queue.show(second).unwrap().runs[0].clone();
+    let outcome = integrate(&db, second.as_i64(), &repo).unwrap();
+    assert_eq!(outcome["outcome"], "integrated", "{outcome}");
+    assert_eq!(
+        migrations_on(&repo, "main"),
+        [
+            "migrations/0001_first.sql",
+            "migrations/0002_goals.sql",
+            "migrations/0003_asks.sql"
+        ]
+    );
+    assert_eq!(
+        git_out(&repo, &["show", "main:migrations/0003_asks.sql"]),
+        "-- asks"
+    );
+    assert!(repo.join("asks.txt").exists());
+    let detail = queue.show(second).unwrap();
+    let renumbered = detail
+        .events
+        .iter()
+        .find(|e| e.kind == "migration_renumbered")
+        .unwrap();
+    let history = git_out(
+        &repo,
+        &["rev-parse", &format!("refs/dagq/runs/{}", run.id())],
+    );
+    assert_eq!(renumbered.payload["main"], json!(main));
+    assert_eq!(
+        renumbered.payload["from"],
+        json!("migrations/0002_asks.sql")
+    );
+    assert_eq!(renumbered.payload["to"], json!("migrations/0003_asks.sql"));
+    assert_eq!(renumbered.payload["old_number"], json!("0002"));
+    assert_eq!(renumbered.payload["new_number"], json!("0003"));
+    assert_eq!(renumbered.payload["head_after"], json!(history));
+    // The rename is its own commit on top of the rebased run.
+    assert_eq!(
+        git_out(&repo, &["rev-parse", &format!("{history}^")]),
+        renumbered.payload["head_before"].as_str().unwrap()
+    );
+    // It comes before the verification, which saw the renumbered tree.
+    let kinds = event_kinds(&detail);
+    let renumbered_at = kinds
+        .iter()
+        .position(|k| *k == "migration_renumbered")
+        .unwrap();
+    let verified_at = kinds
+        .iter()
+        .rposition(|k| *k == "verification_command")
+        .unwrap();
+    assert!(renumbered_at < verified_at, "{kinds:?}");
+    let landed = queue.show(second).unwrap().runs[0].clone();
+    assert_landed(&repo, &landed, "add asks", &main);
+}
+
+/// A migration integrate cannot move by itself: its number is mentioned by
+/// another file the run changes, or the run adds more than one migration.
+/// The run waits for a session with the next free number and the reason
+/// (`migration_number_taken`), main and the run's tree stay as they were,
+/// and once the session renumbers it, it lands.
+#[test]
+fn a_migration_that_cannot_be_renumbered_mechanically_needs_a_session() {
+    let (_dir, repo, db) = migration_fixture();
+    let mut queue = SqliteQueue::open(&db).unwrap();
+    let backend = TestWorkspace::new(&db, false, VALID_AGENT);
+    let first = add_script_task(
+        &mut queue,
+        &backend,
+        "add goals",
+        "printf -- '-- goals\\n' > migrations/0002_goals.sql",
+        &[NO_SHARED_NUMBER],
+    );
+    let referred = add_script_task(
+        &mut queue,
+        &backend,
+        "add asks",
+        "printf -- '-- asks\\n' > migrations/0002_asks.sql && printf 'migration 0002 adds asks\\n' > notes.md",
+        &[NO_SHARED_NUMBER],
+    );
+    let two = add_script_task(
+        &mut queue,
+        &backend,
+        "add two",
+        "printf -- '-- a\\n' > migrations/0002_a.sql && printf -- '-- b\\n' > migrations/0003_b.sql",
+        &[NO_SHARED_NUMBER],
+    );
+    supervise(&db, &repo, &backend).unwrap();
+    backend.join();
+    assert_eq!(
+        integrate(&db, first.as_i64(), &repo).unwrap()["outcome"],
+        "integrated"
+    );
+    let main = git_out(&repo, &["rev-parse", "main"]);
+
+    for (task, why) in [
+        (referred, "the run's other changes mention 0002 (notes.md)"),
+        (
+            two,
+            "the run adds 2 migrations, which are not renumbered mechanically",
+        ),
+    ] {
+        let run = queue.show(task).unwrap().runs[0].clone();
+        let outcome = integrate(&db, task.as_i64(), &repo).unwrap();
+        assert_eq!(outcome["outcome"], "needs_session", "{outcome}");
+        let reason = outcome["reason"].as_str().unwrap();
+        assert!(reason.contains(why), "{reason}");
+        assert!(
+            reason.contains("migrations/0002_") && reason.contains("the next free number is 0003"),
+            "{reason}"
+        );
+        let detail = queue.show(task).unwrap();
+        assert!(!event_kinds(&detail).contains(&"migration_renumbered"));
+        let deferred = detail
+            .events
+            .iter()
+            .rfind(|e| e.kind == "integration_deferred")
+            .unwrap();
+        assert_eq!(deferred.payload["code"], "migration_number_taken");
+        assert_eq!(deferred.payload["next_number"], "0003");
+        assert_eq!(
+            queue.show(task).unwrap().runs[0].status(),
+            RunStatus::NeedsSession
+        );
+        // The rebased run is left for the session, without a rename.
+        let worktree = PathBuf::from(run.worktree_path().unwrap());
+        assert_eq!(git_out(&worktree, &["rev-parse", "HEAD^"]), main);
+        assert_eq!(git_out(&worktree, &["status", "--porcelain"]), "");
+        assert_eq!(git_out(&repo, &["rev-parse", "main"]), main);
+    }
+    let deferred = queue
+        .show(referred)
+        .unwrap()
+        .events
+        .into_iter()
+        .rfind(|e| e.kind == "integration_deferred")
+        .unwrap();
+    assert_eq!(deferred.payload["referring"], json!(["notes.md"]));
+
+    // The session renumbers the migration and what mentions it.
+    let parked = queue.show(referred).unwrap().runs[0].clone();
+    let worktree = PathBuf::from(parked.worktree_path().unwrap());
+    git(
+        &worktree,
+        &["mv", "migrations/0002_asks.sql", "migrations/0003_asks.sql"],
+    );
+    fs::write(worktree.join("notes.md"), "migration 0003 adds asks\n").unwrap();
+    git(&worktree, &["commit", "-q", "-a", "-m", "renumber"]);
+    write_receipt(
+        &parked,
+        &git_out(&worktree, &["rev-parse", "HEAD"]),
+        "succeeded",
+        "renumbered to 0003",
+    );
+    let outcome = integrate(&db, referred.as_i64(), &repo).unwrap();
+    assert_eq!(outcome["outcome"], "integrated", "{outcome}");
+    assert_eq!(
+        migrations_on(&repo, "main"),
+        [
+            "migrations/0001_first.sql",
+            "migrations/0002_goals.sql",
+            "migrations/0003_asks.sql"
+        ]
+    );
+}
+
+/// A run that renames a migration main already had keeps its number: the
+/// collision is judged on the rebased tree, where no other file has it.
+#[test]
+fn a_renamed_migration_is_not_renumbered() {
+    let (_dir, repo, db) = migration_fixture();
+    let mut queue = SqliteQueue::open(&db).unwrap();
+    let backend = TestWorkspace::new(&db, false, VALID_AGENT);
+    let first = add_script_task(
+        &mut queue,
+        &backend,
+        "add goals",
+        "printf -- '-- goals\\n' > migrations/0002_goals.sql",
+        &[NO_SHARED_NUMBER],
+    );
+    let renamer = add_script_task(
+        &mut queue,
+        &backend,
+        "rename first",
+        "git mv migrations/0001_first.sql migrations/0001_initial.sql",
+        &[NO_SHARED_NUMBER],
+    );
+    supervise(&db, &repo, &backend).unwrap();
+    backend.join();
+    for task in [first, renamer] {
+        let outcome = integrate(&db, task.as_i64(), &repo).unwrap();
+        assert_eq!(outcome["outcome"], "integrated", "{outcome}");
+    }
+    assert!(!event_kinds(&queue.show(renamer).unwrap()).contains(&"migration_renumbered"));
+    assert_eq!(
+        migrations_on(&repo, "main"),
+        ["migrations/0001_initial.sql", "migrations/0002_goals.sql"]
+    );
+}

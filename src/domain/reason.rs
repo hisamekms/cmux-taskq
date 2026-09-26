@@ -66,6 +66,7 @@ reason_codes! {
     RebaseConflict => "rebase_conflict": "the run conflicts with main (the landing's rebase, or the merge-tree precheck)",
     RebaseEmpty => "rebase_empty": "no commit remains on top of main after the rebase",
     RebaseInProgress => "rebase_in_progress": "a rebase was left in progress in the worktree and was aborted",
+    MigrationNumberTaken => "migration_number_taken": "the run adds a migration whose number main already has, and it cannot be renumbered mechanically",
     VerificationFailed => "verification_failed": "a verification command exited non-zero after the rebase",
     BackendTimeout => "backend_timeout": "a cmux call timed out",
     BackendFailed => "backend_failed": "a cmux call failed",

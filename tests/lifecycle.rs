@@ -3861,9 +3861,9 @@ fn up_drains_a_supervisor_whose_agent_starts_another_binary() {
 
 /// `up` applies the queue's pending migrations first only when every one
 /// of them is compatible (ADR-0045 decision 15), and refuses a breaking one
-/// with the way to it, before it starts or touches anything. The last
-/// migration (0032) is breaking, so a queue before it is refused even when
-/// the migration it lacks first (0031) is compatible.
+/// with the way to it, before it starts or touches anything. A migration
+/// after 0031 is breaking, so a queue before it is refused even when the
+/// migration it lacks first (0031) is compatible.
 #[test]
 fn up_applies_compatible_migrations_and_refuses_breaking_ones() {
     let fixture = fixture();
@@ -3887,7 +3887,20 @@ fn up_applies_compatible_migrations_and_refuses_breaking_ones() {
         "{:#}",
         try_up(&fixture, &cmux, &launchd, &processes).unwrap_err()
     );
-    assert!(error.contains("breaking migration(s) 32"), "{error}");
+    // The breaking ones after 0031, however many came since (ADR-0067
+    // decision 4).
+    let breaking: Vec<String> = dagq::infrastructure::schema::MIGRATIONS
+        .iter()
+        .enumerate()
+        .skip(30)
+        .filter(|(_, migration)| !dagq::infrastructure::schema::is_compatible(migration))
+        .map(|(index, _)| (index + 1).to_string())
+        .collect();
+    assert!(!breaking.is_empty());
+    assert!(
+        error.contains(&format!("breaking migration(s) {}", breaking.join(", "))),
+        "{error}"
+    );
     let version: i64 = Connection::open(db)
         .unwrap()
         .pragma_query_value(None, "user_version", |r| r.get(0))
@@ -3899,17 +3912,28 @@ fn up_applies_compatible_migrations_and_refuses_breaking_ones() {
     assert_eq!(report["supervisor"]["outcome"], "started", "{report}");
     assert_eq!(report["migrated"], Value::Null, "{report}");
 
-    // Only the compatible 33 is pending: `up` applies it and goes on.
+    // Only the compatible automatic-update migration (0033) is pending: `up`
+    // applies it and goes on. Its version is looked up rather than written,
+    // so a later migration does not rewrite this test (ADR-0067 decision 4).
+    let auto_update = dagq::infrastructure::schema::MIGRATIONS
+        .iter()
+        .position(|migration| migration.contains("CREATE TABLE binary_updates"))
+        .unwrap() as i64
+        + 1;
     Connection::open(db)
         .unwrap()
-        .execute_batch(
+        .execute_batch(&format!(
             "ALTER TABLE supervisors DROP COLUMN auto_update;
              DROP TABLE binary_updates;
-             PRAGMA user_version = 32;",
-        )
+             PRAGMA user_version = {};",
+            auto_update - 1
+        ))
         .unwrap();
     let report = up(&fixture, &cmux, &launchd, &processes);
-    assert_eq!(report["migrated"]["applied"][0]["version"], 33, "{report}");
+    assert_eq!(
+        report["migrated"]["applied"][0]["version"], auto_update,
+        "{report}"
+    );
     assert_eq!(report["supervisor"]["auto_update"], false, "{report}");
 
     Connection::open(db)

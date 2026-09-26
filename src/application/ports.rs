@@ -1550,6 +1550,23 @@ pub trait Repository {
     fn conflicted_files(&self, worktree: &Path) -> Result<Vec<String>>;
     /// Paths that differ between two commits.
     fn changed_paths(&self, from: &str, to: &str) -> Result<Vec<String>>;
+    /// Paths `to` adds over `from`.
+    fn added_paths(&self, from: &str, to: &str) -> Result<Vec<String>>;
+    /// Paths of the files directly in `directory` of `commit`'s tree; none
+    /// when it has no such directory.
+    fn paths_in(&self, commit: &str, directory: &str) -> Result<Vec<String>>;
+    /// Which of `paths` contain the text `needle` in `commit`'s tree.
+    fn paths_containing(&self, commit: &str, needle: &str, paths: &[String])
+    -> Result<Vec<String>>;
+    /// Move `from` to `to` in the clean `worktree` and commit the rename on
+    /// its branch, `paragraphs` its message; the new head.
+    fn rename_and_commit(
+        &self,
+        worktree: &Path,
+        from: &str,
+        to: &str,
+        paragraphs: &[String],
+    ) -> Result<CommitSha>;
     fn tree_of(&self, commit: &str) -> Result<String>;
     /// One commit with `tree` on top of `parent`, `paragraphs` its message.
     fn commit_tree(&self, tree: &str, parent: &str, paragraphs: &[String]) -> Result<CommitSha>;

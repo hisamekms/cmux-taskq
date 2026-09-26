@@ -12,42 +12,10 @@
 const DECLARATION: &str = "-- dagq-schema:";
 
 /// The queue's migrations; the migration at index `i` brings the queue to
-/// schema version `i + 1`.
-pub const MIGRATIONS: &[&str] = &[
-    include_str!("../../migrations/0001_queue.sql"),
-    include_str!("../../migrations/0002_supervisor.sql"),
-    include_str!("../../migrations/0003_workspace_close.sql"),
-    include_str!("../../migrations/0004_integration.sql"),
-    include_str!("../../migrations/0005_run_leases.sql"),
-    include_str!("../../migrations/0006_merge_queue.sql"),
-    include_str!("../../migrations/0007_supervisors.sql"),
-    include_str!("../../migrations/0008_goals.sql"),
-    include_str!("../../migrations/0009_supervisor_mode.sql"),
-    include_str!("../../migrations/0010_supervisor_binary_version.sql"),
-    include_str!("../../migrations/0011_session_workspaces.sql"),
-    include_str!("../../migrations/0012_queue_events.sql"),
-    include_str!("../../migrations/0013_goal_draft.sql"),
-    include_str!("../../migrations/0014_asks.sql"),
-    include_str!("../../migrations/0015_task_required_evidence.sql"),
-    include_str!("../../migrations/0016_observer.sql"),
-    include_str!("../../migrations/0017_stuck_exit_ask.sql"),
-    include_str!("../../migrations/0018_task_paths.sql"),
-    include_str!("../../migrations/0019_task_goal_dependencies.sql"),
-    include_str!("../../migrations/0020_task_priority.sql"),
-    include_str!("../../migrations/0021_proposals.sql"),
-    include_str!("../../migrations/0022_follow_up_triage.sql"),
-    include_str!("../../migrations/0023_planners.sql"),
-    include_str!("../../migrations/0024_schema_floor.sql"),
-    include_str!("../../migrations/0025_stalled_ask.sql"),
-    include_str!("../../migrations/0026_search.sql"),
-    include_str!("../../migrations/0027_plan_review.sql"),
-    include_str!("../../migrations/0028_draft_planners.sql"),
-    include_str!("../../migrations/0029_ask_reasons.sql"),
-    include_str!("../../migrations/0030_findings.sql"),
-    include_str!("../../migrations/0031_supervisor_handoff.sql"),
-    include_str!("../../migrations/0032_run_env_program_events.sql"),
-    include_str!("../../migrations/0033_auto_update.sql"),
-];
+/// schema version `i + 1`. `build.rs` lists `migrations/NNNN_<name>.sql` in
+/// order of their number (ADR-0067 decision 1), so adding a migration is
+/// adding its file.
+pub const MIGRATIONS: &[&str] = include!(concat!(env!("OUT_DIR"), "/migrations.rs"));
 
 /// The schema version this binary knows: a fully migrated queue's
 /// `user_version`.
@@ -239,6 +207,25 @@ mod tests {
             assert!(!is_compatible(migration));
         }
         const { assert!(BINARY_SCHEMA >= FLOOR_SCHEMA) };
+    }
+
+    #[test]
+    fn the_migrations_are_the_files_of_the_directory_in_order_of_their_number() {
+        let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join(crate::migration_numbers::DIRECTORY);
+        let names: Vec<String> = std::fs::read_dir(&directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        let ordered = crate::migration_numbers::ordered(&names).unwrap();
+        assert_eq!(BINARY_SCHEMA, ordered.len() as i64);
+        for (migration, name) in MIGRATIONS.iter().zip(&ordered) {
+            assert_eq!(
+                *migration,
+                std::fs::read_to_string(directory.join(name)).unwrap(),
+                "{name}"
+            );
+        }
     }
 
     #[test]

@@ -1082,7 +1082,9 @@ pub fn joined<T>(thread: thread::JoinHandle<T>, what: impl Into<String>) -> T {
         .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
 }
 
-/// Poll the queue until `condition` holds or the deadline passes.
+/// Poll the queue until `condition` holds or the deadline passes; a
+/// timeout names the caller's line.
+#[track_caller]
 pub fn wait_until(
     db: &Path,
     timeout: Duration,

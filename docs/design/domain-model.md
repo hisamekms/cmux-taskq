@@ -8,6 +8,7 @@ updated: 2026-09-26
 last_verified: 2026-09-26
 scope: domain
 related:
+  - adr-0067
   - adr-0046
   - adr-0044
   - adr-0038
@@ -312,6 +313,7 @@ domainの関数は業務上の拒否を`DomainError`（`src/domain/error.rs`）�
 | `rebase_conflict` | runがmainと衝突した（着地のrebase、passの後の`git merge-tree`の事前判定） | （`conflicts`は既存） |
 | `rebase_empty` | rebaseの後にmainの上にcommitが残らない | |
 | `rebase_in_progress` | worktreeに途中のrebaseが残っていたので中止した | |
+| `migration_number_taken` | runが足したmigrationの番号がmainで埋まっていて、機械的に振り直せない（runが足したmigrationが2つ以上か、番号をrunの他の変更が含む。[ADR-0067](../adr/0067-migrations-are-listed-by-build-and-renumbered-on-landing.md)の決定3） | `migrations`、`taken`、`next_number`、（番号を含むファイルがあれば）`referring` |
 | `verification_failed` | rebaseの後の検証コマンドが非0で終わった | `index`（1始まり）、（`command` / `exit_code`は既存） |
 | `backend_timeout` | cmuxの呼び出しがtimeoutした（adapterの`did not finish within`、cmuxの`Command timed out`） | `op`（`backend_call_failed`は既存の`op`） |
 | `backend_failed` | cmuxの呼び出しが失敗した | `op` |
@@ -332,7 +334,7 @@ domainの関数は業務上の拒否を`DomainError`（`src/domain/error.rs`）�
 | `supervision_finished` | sessionの非0終了（`last_error`は`session exited with code N`） | `session_exit_code` / `session_killed`。0終了とliveの受け渡しは持たない |
 | `validation_finished` | receiptの照合の拒否（`last_error`） | `receipt_missing` / `receipt_invalid` / `worker_failed` / `evidence_failed` / `commit_mismatch` / `worktree_dirty` / `scope_violation` / `evidence_missing`。受理は持たない |
 | `scope_violation` / `evidence_missing` | validationの保留に添えるイベント | `scope_violation` / `evidence_missing`（`validation_finished`と同じコードなので`stats`の`reason_codes`は数えない。`backend_call_failed`も失敗した工程のイベントと重なるので数えない） |
-| `integration_deferred` | 着地の保留（`needs_session`） | `commit_mismatch` / `receipt_missing` / `receipt_invalid` / `worker_failed` / `evidence_failed` / `evidence_missing` / `worktree_dirty` / `rebase_conflict` / `rebase_empty` / `scope_violation` / `verification_failed` |
+| `integration_deferred` | 着地の保留（`needs_session`） | `commit_mismatch` / `receipt_missing` / `receipt_invalid` / `worker_failed` / `evidence_failed` / `evidence_missing` / `worktree_dirty` / `rebase_conflict` / `rebase_empty` / `migration_number_taken` / `scope_violation` / `verification_failed` |
 | `integration_failed` | 書き直したreceiptが`failed` | `worker_failed` |
 | `integration_error` | mainを進める前のerror（元のstatusに戻す） | `backend_*`、なければ`other` |
 | `integration_rebase_aborted` | 残っていたrebaseの中止 | `rebase_in_progress` |

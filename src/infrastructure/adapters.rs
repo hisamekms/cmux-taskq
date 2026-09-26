@@ -449,6 +449,14 @@ fn main_head(git: &Path, root: &Path) -> Result<CommitSha> {
     )
 }
 
+/// The non-empty fields of Git's NUL-separated `-z` output.
+fn split_nul(text: &str) -> Vec<String> {
+    text.split('\0')
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
 /// The commit Git printed (a full object ID, surrounded by whitespace).
 fn object_id(text: &str, field: &'static str) -> Result<CommitSha> {
     Ok(CommitSha::parse(text.trim(), field)?)
@@ -807,6 +815,115 @@ impl GitRepository {
             .collect())
     }
 
+    /// The paths `to` adds over `from` (`git diff --diff-filter=A
+    /// --no-renames`), never quoted.
+    pub fn added_paths(&self, from: &str, to: &str) -> Result<Vec<String>> {
+        let names = output(Command::new(&self.git).arg("-C").arg(&self.root).args([
+            "diff",
+            "--name-only",
+            "-z",
+            "--no-renames",
+            "--diff-filter=A",
+            "--no-ext-diff",
+            "--no-textconv",
+            from,
+            to,
+            "--",
+        ]))?;
+        Ok(split_nul(&names))
+    }
+
+    /// The paths of the files directly in `directory` of `commit`'s tree,
+    /// never quoted; none when the directory is not there.
+    pub fn paths_in(&self, commit: &str, directory: &str) -> Result<Vec<String>> {
+        let names = output(Command::new(&self.git).arg("-C").arg(&self.root).args([
+            "ls-tree",
+            "--name-only",
+            "-z",
+            commit,
+            "--",
+            &format!("{directory}/"),
+        ]))?;
+        Ok(split_nul(&names))
+    }
+
+    /// Which of `paths` contain `needle` in `commit`'s tree (`git grep -l
+    /// -F`, binary files included).
+    pub fn paths_containing(
+        &self,
+        commit: &str,
+        needle: &str,
+        paths: &[String],
+    ) -> Result<Vec<String>> {
+        if paths.is_empty() {
+            return Ok(Vec::new());
+        }
+        let (status, stdout, stderr) = capture(
+            Command::new(&self.git)
+                .arg("-C")
+                .arg(&self.root)
+                // The paths are names, not patterns.
+                .arg("--literal-pathspecs")
+                .args([
+                    "grep",
+                    "-l",
+                    "-z",
+                    "-F",
+                    "--no-color",
+                    "-e",
+                    needle,
+                    commit,
+                    "--",
+                ])
+                .args(paths),
+            OUTPUT_TIMEOUT,
+        )?;
+        // 1 is "no match".
+        match status.code() {
+            Some(0) => (),
+            Some(1) if stderr.trim().is_empty() => return Ok(Vec::new()),
+            _ => bail!("git grep failed ({status}): {stderr}"),
+        }
+        let prefix = format!("{commit}:");
+        Ok(split_nul(&stdout)
+            .into_iter()
+            .map(|path| {
+                path.strip_prefix(&prefix)
+                    .map(str::to_owned)
+                    .unwrap_or(path)
+            })
+            .collect())
+    }
+
+    /// `git mv` `from` to `to` in the clean `worktree` and commit that on its
+    /// branch with `paragraphs` as the message; the new head.
+    pub fn rename_and_commit(
+        &self,
+        worktree: &Path,
+        from: &str,
+        to: &str,
+        paragraphs: &[String],
+    ) -> Result<CommitSha> {
+        output(
+            Command::new(&self.git)
+                .arg("-C")
+                .arg(worktree)
+                .args(["mv", "--", from, to]),
+        )?;
+        // The worktree was clean before the move, so the index holds the
+        // rename alone.
+        let mut commit = Command::new(&self.git);
+        commit
+            .arg("-C")
+            .arg(worktree)
+            .args(["commit", "-q", "--no-verify"]);
+        for paragraph in paragraphs {
+            commit.arg("-m").arg(paragraph);
+        }
+        output(&mut commit)?;
+        self.head(worktree)
+    }
+
     pub fn tree_of(&self, commit: &str) -> Result<String> {
         Ok(
             output(Command::new(&self.git).arg("-C").arg(&self.root).args([
@@ -1081,6 +1198,29 @@ impl Repository for GitRepository {
     }
     fn changed_paths(&self, from: &str, to: &str) -> Result<Vec<String>> {
         GitRepository::changed_paths(self, from, to)
+    }
+    fn added_paths(&self, from: &str, to: &str) -> Result<Vec<String>> {
+        GitRepository::added_paths(self, from, to)
+    }
+    fn paths_in(&self, commit: &str, directory: &str) -> Result<Vec<String>> {
+        GitRepository::paths_in(self, commit, directory)
+    }
+    fn paths_containing(
+        &self,
+        commit: &str,
+        needle: &str,
+        paths: &[String],
+    ) -> Result<Vec<String>> {
+        GitRepository::paths_containing(self, commit, needle, paths)
+    }
+    fn rename_and_commit(
+        &self,
+        worktree: &Path,
+        from: &str,
+        to: &str,
+        paragraphs: &[String],
+    ) -> Result<CommitSha> {
+        GitRepository::rename_and_commit(self, worktree, from, to, paragraphs)
     }
     fn tree_of(&self, commit: &str) -> Result<String> {
         GitRepository::tree_of(self, commit)
