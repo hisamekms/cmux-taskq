@@ -44,7 +44,7 @@ worker の手元の test を関係する範囲に絞るのは 2026-09-26 に人�
 - unit test: 行カバレッジの合計を 80% 以上に保つ（`cargo-llvm-cov`、行基準、全体）。下回る変更は着地しない。関門のコマンドは `cargo llvm-cov nextest --locked --fail-under-lines 80`（cargo-nextest が test を 1 件ずつ別 process で、binary をまたいで並列に流す。[ADR-0076](docs/adr/0076-run-the-coverage-gate-tests-with-nextest.md)）。登録済みの task の `cargo llvm-cov --locked --fail-under-lines 80` は書き換えず、同じ関門としてそのまま有効（決定 4）。test は 1 件ずつ別 process になるので、binary の中の他の test と process の状態（static や一度だけの初期化）を共有することに頼る test を書かない。門番は task の `verification_commands`（`integrate` が rebase 後に worker の receipt を信用せず 1 回だけ実行する。validating では実行しない）と CI で、worker は手元で `cargo llvm-cov`（`cargo llvm-cov nextest` を含む）も全体の `cargo test --locked` も回さない（task の verify に含まれていても、worker が流すのは「変更後に必ず通す」の worker 向けの項目: fmt・clippy・変更に関係する test だけの `cargo test`・llvm-cov と全体の `cargo test` 以外の verify。全部の test は integrate の llvm-cov が流す。例外は `integrate` の検証が落ちて resume された run で、落ちたコマンドを再現してよい）。runtime（`src/`）を触る task を `dagq add` するときは verification に `cargo llvm-cov nextest --locked --fail-under-lines 80` を含め、`--evidence e2e` も付ける（receipt の `e2e` が evidence 付きの `passed` でない run は validating で `needs_session`（`evidence_missing`）になり、supervisor の resume が不足分を補わせる。ADR-0019 決定 5）。llvm-cov を verification に含める task では `cargo test --locked` を verification に重ねない。`cargo llvm-cov nextest`（と旧コマンドの `cargo llvm-cov`）は `cargo test` と同じ test binary 群（`src/lib.rs` の unit test と `tests/it`・`tests/e2e.rs`・`tests/plugin.rs`。この crate に doctest は無く、nextest は doctest を流さない）を全部実行し、1 件でも落ちれば失敗するので、両方を並べても integrate の直列の検証で同じ test が 2 回走る（約 100 秒）だけで検出力は増えない。llvm-cov を含めない task（docs・plugin の文書など）は、必要なら `cargo test --locked` を verification に残す。worker が手元で回すもの（「変更後に必ず通す」の worker 向けの項目。全体の `cargo test` は含まない）はこれと別
 - 変更の種類で verification を軽くしてよい。条件は `--paths` で変えてよいパスを宣言すること（[ADR-0029](docs/adr/0029-task-declares-paths-and-verification-follows-the-kind-of-change.md)）。宣言外のパスを変えた run は validating で `needs_session`（`scope_violation`）になり、`integrate` も rebase 後の差分を同じく検査して着地させないので、軽い検証のまま `src/` の変更が入ることはない。`--paths` を付けない task は今までどおり制限されない。推奨の組み合わせ（glob は repository root 起点で、`*` は 1 階層、`**` は任意の深さ。詳細は dagq skill の `reference/scope.md`）:
   - docs だけ: `--paths 'docs/**' --paths '*.md' --verify 'cargo fmt --all --check'`（fmt も要らなければ検証なし）
-  - ADR を書く（docs だけ）: 上に `--verify 'sh scripts/check-adr-numbers.sh'` を足す（「文書のルール」の ADR 番号の割り当て）
+  - ADR を書く（docs だけ）: 上に `--verify 'sh scripts/check-adr-numbers.sh'` を足す（「文書のルール」の ADR の ID の形と検査）
   - plugin の文書・skill: `--paths 'plugins/**' --paths 'docs/**' --paths '*.md' --verify 'cargo test --locked --test plugin'`（`tests/plugin.rs` が skill の大きさと参照を検査するので test を残す。plugin の文書を読む test はこれだけ）
   - runtime（`src/`・`tests/`・`migrations/`）: `--paths` なしで fmt / clippy / `cargo llvm-cov nextest --locked --fail-under-lines 80` と `--evidence e2e`（上の llvm-cov の規則どおり `cargo test --locked` は重ねない）
   - migration を足す（runtime）: 上の runtime の組み合わせに `--verify 'sh scripts/check-migration-numbers.sh'` を足す
@@ -61,15 +61,16 @@ worker の手元の test を関係する範囲に絞るのは 2026-09-26 に人�
 
 - 人の判断は ADR・Goal の記述・`Task.context`・receipt の `summary` に残す（作業記録のジャーナルは [ADR-0036](docs/adr/0036-delete-frozen-work-records.md) で削除した）
 - 決定は `docs/adr/` に追加する。既存 ADR は書き換えない
-- ADR は `accepted` だけが現在の決定で、`superseded` なら `superseded_by` を辿り、`deprecated` は後継なしの廃止（日付は `superseded_on` ではなく `deprecated_on`）。決定を変えるときは古い ADR を丸ごと置き換える統合 ADR を書く（[ADR-0042](docs/adr/0042-adr-is-superseded-whole-and-deprecation-date-is-deprecated-on.md)、索引は [docs/adr/README.md](docs/adr/README.md)）
+- ADR は `accepted` だけが現在の決定で、`superseded` なら `superseded_by` を辿り、`deprecated` は後継なしの廃止（日付は `superseded_on` ではなく `deprecated_on`）。決定を変えるときは古い ADR を丸ごと置き換える ADR を書く（決定の多い既存の ADR は下の amends で直す。[ADR-t598-1](docs/adr/2026-09-26-t598-1-adr-id-is-task-id-small-adrs-and-design-holds-current-state.md)、索引は [docs/adr/README.md](docs/adr/README.md)）
 - 実装を変えたら `docs/design/` の該当文書と `updated` / `last_verified` を更新する
 - ステップの状態が変わったら `docs/plans/current.md` を更新する
 - frontmatter は [docs/frontmatter.md](docs/frontmatter.md) に従う
-- ADR の番号は task の登録時に planner が仮に書き、plan review が検査する。並行する run が同じ番号を取ると、slug が違うので git では衝突せずに両方着地し、後続 task の番号参照もずれる（2026-09-24 に ADR-0035 が重なり、task 214 で 0036 に付け替えた）
-  - ADR を書く task を登録するときは、planner が main の `docs/adr/` の次の空きを選び、description に「ADR-NNNN（docs/adr/NNNN-slug.md）を書く」と書き、`--verify 'sh scripts/check-adr-numbers.sh'` を付ける。他の未完了の task や proposal の割り当ての棚卸しは planner が抱えず、plan review がその番号が main・未完了の task・他の submitted の proposal の割り当てと重ならないかを検査し、重なれば revise で planner に振り直させる
-  - 後続 task は ADR を番号と path で参照する
-  - worker は割り当てられた番号を使う。main でその番号がすでに埋まっていれば、自分で振り直さず `dagq ask` にする
-  - `scripts/check-adr-numbers.sh` は `docs/adr/` の番号の重複と、frontmatter の `id` が `adr-<ファイルの番号>` と食い違う ADR を検出して exit 1 にする（CI も実行する）。重複で `integrate` が落ちた run は resume され、worker が番号を振り直し、振り直した番号を receipt の summary に書く
+- ADR の ID はそれを書く task の ID と枝番の `adr-t<task ID>-<N>`（N は 1 から。1 本だけでも `-1`）、ファイル名は `docs/adr/<YYYY-MM-DD>-t<task ID>-<N>-<slug>.md` で、日付は `accepted_on`（ADR を書く task では worker が書いて accepted にした日）にする（[ADR-t598-1](docs/adr/2026-09-26-t598-1-adr-id-is-task-id-small-adrs-and-design-holds-current-state.md) 決定 1）。以前の「planner が main の次の空き番号を選ぶ」規則は、未完了の task の予約と計画時に衝突したのでやめた
+  - ADR を書く task を登録するときは、planner が description に本数と各 ID の中身を書き（自分の ID は `add` が返すまで分からないので「この task の ID で ADR-t<ID>-1 を書く」と書くか、`add` の後に draft を直す）、`--verify 'sh scripts/check-adr-numbers.sh'` を付ける。ID は task の ID から決まるので、planner も plan review も番号の割り当ての棚卸しをしない
+  - 後続 task は ADR を `ADR-t<ID>-<N>` で参照する（日付を含めないので着地前から書ける）。今どうなっているかを指すときは `docs/design/` の文書を、なぜそうしたかを指すときは ADR を指す（決定 4）
+  - 既存の 4 桁の ADR（0001〜）と、登録済みの task が予約した 4 桁の番号はそのまま使い、振り直さない。新しく登録する ADR の task は新しい形にする
+  - 1 ADR に決定 1 つ（密に結びついた数個まで）、本文はおおむね 100 行以内。ADR には変えるのに人の判断が要るものを書き、event の kind や欄名・flag の綴り・既定値や閾値の数値・関数やファイルの名前・migration の番号・test の名前は `docs/design/` に書く（決定 2・3）。決定の多い既存の ADR（0047・0044・0073 など）の一部を変えるときは、丸ごと置き換えずに小さな新しい ADR の `amends` に変える決定を書き、元の ADR に `amended_by` を足し、design を今の姿に直す（決定 5）。決定と実装が明らかなものは ADR と実装を 1 task にする（決定 12）
+  - `scripts/check-adr-numbers.sh`（名前は登録済みの task の verify が使うので変えない）は、4 桁の番号の重複と `id` が `adr-<ファイルの番号>` と食い違う ADR、新しい形のファイル名の形（枝番の欠け）・`id` が `adr-t<ID>-<N>` と食い違う ADR・`t<ID>-<N>` の重複・ファイル名の日付と `accepted_on` の食い違いを検出して exit 1 にする（CI も実行する）
 
 ## タスクを閉じるとき
 

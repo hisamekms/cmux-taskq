@@ -2,10 +2,12 @@
 id: adr-0042
 type: adr
 title: ADRは丸ごと置き換え、置き換えの日付はsuperseded_on、廃止の日付はdeprecated_onに分けてfrontmatterと本文冒頭の注記に残す
-status: accepted
+status: superseded
 created: 2026-09-25
 updated: 2026-09-25
 accepted_on: 2026-09-25
+superseded_by: adr-t598-1
+superseded_on: 2026-09-26
 supersedes:
   - adr-0035
 owners:
@@ -22,6 +24,8 @@ related:
 ---
 
 # ADR-0042: ADRは丸ごと置き換え、置き換えの日付はsuperseded_on、廃止の日付はdeprecated_onに分けてfrontmatterと本文冒頭の注記に残す
+
+> **置き換え済み（2026-09-26）**: このADRの決定は現在有効ではない。現行の決定は[ADR-t598-1](2026-09-26-t598-1-adr-id-is-task-id-small-adrs-and-design-holds-current-state.md)を読む。
 
 ## Context
 

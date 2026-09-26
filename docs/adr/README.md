@@ -13,13 +13,16 @@ tags:
 
 # Architecture decision records
 
-ADRは、将来の実装や運用に大きな影響を与える決定の理由を残す。規則は[ADR-0042](0042-adr-is-superseded-whole-and-deprecation-date-is-deprecated-on.md)に従う。
+ADRは、将来の実装や運用に大きな影響を与える決定の理由を残す。規則は[ADR-t598-1](2026-09-26-t598-1-adr-id-is-task-id-small-adrs-and-design-holds-current-state.md)に従う。
 
-- `accepted`のADRだけが現在の決定で、本文の決定はすべて現在有効である。`superseded`のADRは`superseded_by`を辿り、`accepted`に着くまで読む。
-- 決定を1つでも変えるときは、古いADRのまだ生きている決定も書き直して引き継ぐ統合ADRを書き、古いADRを丸ごと置き換える。「ADR-XXXXの決定Nを上書きする」だけの部分的なADRは書かない。
+- IDは書くtaskのIDと枝番の`adr-t<task ID>-<N>`（1本でも`-1`）、ファイル名は`<YYYY-MM-DD>-t<task ID>-<N>-<slug>.md`で、日付は`accepted_on`。参照は`ADR-t<ID>-<N>`で日付を含めない。既存の4桁の番号（0001〜）と登録済みのtaskが予約した4桁の番号はそのまま使う。
+- 1 ADRに決定1つ（密に結びついた数個まで）、本文はおおむね100行以内。書くのは変えるのに人の判断が要るもの（問題と文脈、方針・原則・境界・不変条件、退けた案、結果）で、eventやflagの名前、既定値・閾値の数値、関数やファイルの名前は[docs/design/](../design/)に書く。今の姿はdesignが、なぜそうしたかはADRが持つ。
+- `accepted`のADRだけが現在の決定で、本文の決定はすべて有効（`amended_by`を持つものは、その決定だけ後のADRが変えている）。`superseded`のADRは`superseded_by`を辿り、`accepted`に着くまで読む。
+- 新しい形の小さなADRの決定を変えるときは、新しいADRで丸ごと置き換える。決定の多い既存のADR（0047・0044・0073など）は凍結し、一部を変えるときは小さな新しいADRの`amends`に変える決定を書き、元のADRに`amended_by`を足し、同じ変更でdesignを今の姿に直す。
 - 置き換えは後継を`accepted`にする変更と同じ変更で行う。`proposed`の後継は何も置き換えない。
-- 本文はappend-onlyで、後から変えてよいのはstatus・`accepted_on`・`superseded_by`・`superseded_on`・`deprecated_on`とH1直後の注記1行だけ（`supersedes`は置き換える側のADRを書くときに本文と一緒に書く）。`superseded_on`は`superseded`にした日（後継の`accepted_on`と同じ）、`deprecated_on`は`deprecated`にした日。欄と注記の書式は[frontmatter仕様](../frontmatter.md)と[template](0000-template.md)にある。
-- ADRのstatusを変える変更は、同じ変更でこの索引の2つの表も更新する。
+- 本文はappend-onlyで、後から変えてよいのはstatus・`accepted_on`・`superseded_by`・`superseded_on`・`deprecated_on`・`amended_by`とH1直後の注記1行だけ（`supersedes`と`amends`は本文と一緒に書く）。`superseded_on`は`superseded`にした日（後継の`accepted_on`と同じ）、`deprecated_on`は`deprecated`にした日。欄と注記の書式は[frontmatter仕様](../frontmatter.md)と[template](0000-template.md)にある。
+- ADRのstatusを変える変更は、同じ変更でこの索引の2つの表も更新する。新しい形の行は4桁の行の後ろに`accepted_on`の順で並べる。
+- `sh scripts/check-adr-numbers.sh`が4桁の番号の重複とidの食い違い、新しい形のファイル名の形・idとの一致・IDの重複・日付と`accepted_on`の一致を検査する。
 
 ## Status
 
@@ -56,7 +59,6 @@ ADRは、将来の実装や運用に大きな影響を与える決定の理由�
 | [ADR-0036](0036-delete-frozen-work-records.md) | 凍結済みのdocs/journal/を削除し、今も効く手順と観測事実だけをdesign文書へ移す | 2026-09-25 |
 | [ADR-0038](0038-task-depends-on-a-goal-until-it-is-achieved.md) | taskがgoalに依存でき、依存先のgoalがachievedで閉じるまでclaimされない | 2026-09-25 |
 | [ADR-0039](0039-adopt-stale-lease-of-live-wrapper-and-renew-own-stale-lease.md) | supervisorが死んだrunは、wrapperが生きていれば次のsupervisorが引き継ぎ、自分のtokenのままstaleになったleaseは更新して続ける | 2026-09-25 |
-| [ADR-0042](0042-adr-is-superseded-whole-and-deprecation-date-is-deprecated-on.md) | ADRは丸ごと置き換え、置き換えの日付はsuperseded_on、廃止の日付はdeprecated_onに分けてfrontmatterと本文冒頭の注記に残す | 2026-09-25 |
 | [ADR-0046](0046-full-text-search-related-and-duplicate-of.md) | taskの全文検索（search）と決まった規則の関連（related）と重複の記録（cancel --duplicate-of）を持ち、plannerとplan reviewはその候補だけをLLMで判断する | 2026-09-25 |
 | [ADR-0047](0047-irregularities-in-three-layers-recovery-job-ask-reasons-and-goal-review.md) | イレギュラーをruntimeの自動修正・復旧job・inboxの3層で扱い、askに人が要る理由の分類を必須にし、自動修正を数え、goalの達成をgoal review jobが判断する（ADR-0019・ADR-0043・ADR-0044を統合） | 2026-09-26 |
 | [ADR-0048](0048-record-claude-sessions-by-kind-with-open-and-active-time.md) | dagqが使うClaude sessionをkindごとの区間としてrun_eventsに記録し、開いている時間と、transcriptのturnから導く稼働時間をstatsで集計する | 2026-09-26 |
@@ -72,6 +74,7 @@ ADRは、将来の実装や運用に大きな影響を与える決定の理由�
 | [ADR-0076](0076-run-the-coverage-gate-tests-with-nextest.md) | integrateのcoverageの関門のtestをcargo-nextestでbinaryをまたいで並列に流し（cargo llvm-cov nextest）、cargo-nextestは人がhostに入れる | 2026-09-26 |
 | [ADR-0078](0078-one-integration-test-binary.md) | e2eとplugin以外のintegration testを1つのtest binary（tests/it）にまとめ、testファイルの行数の制約はファイル単位のまま残す | 2026-09-26 |
 | [ADR-0079](0079-record-task-weight-predictions-and-trial-model-effort-selection.md) | plan reviewでtaskの重さの予測を記録し、限定の試しでworkerのmodel / effortを選び、taskに由来する失敗で段上げする | 2026-09-26 |
+| [ADR-t598-1](2026-09-26-t598-1-adr-id-is-task-id-small-adrs-and-design-holds-current-state.md) | ADRのIDを書くtaskのIDにし、1 ADR 1決定・記載の粒度・今の姿はdesign・大きなADRはamendsで直すと決める（ADR-0042を置き換え） | 2026-09-26 |
 
 ## 置き換え・廃止されたADR
 
@@ -98,6 +101,7 @@ ADRは、将来の実装や運用に大きな影響を与える決定の理由�
 | [ADR-0037](0037-follow-up-triage-job-decides-follow-up-drafts.md) | superseded | [ADR-0041](0041-on-demand-planners-proposals-submitted-and-plan-review-job.md) | 2026-09-25 |
 | [ADR-0040](0040-verify-once-review-run-env-graph-stats-and-task-priority-in-claim-order.md) | superseded | [ADR-0049](0049-share-compile-cache-across-runs-and-break-down-wait-to-land.md) | 2026-09-26 |
 | [ADR-0041](0041-on-demand-planners-proposals-submitted-and-plan-review-job.md) | superseded | [ADR-0044](0044-findings-proposals-from-findings-and-quiet-observer.md) | 2026-09-26 |
+| [ADR-0042](0042-adr-is-superseded-whole-and-deprecation-date-is-deprecated-on.md) | superseded | [ADR-t598-1](2026-09-26-t598-1-adr-id-is-task-id-small-adrs-and-design-holds-current-state.md) | 2026-09-26 |
 | [ADR-0043](0043-detect-stalled-worker-sessions-nudge-once-then-ask.md) | superseded | [ADR-0047](0047-irregularities-in-three-layers-recovery-job-ask-reasons-and-goal-review.md) | 2026-09-26 |
 | [ADR-0044](0044-findings-proposals-from-findings-and-quiet-observer.md) | superseded | [ADR-0047](0047-irregularities-in-three-layers-recovery-job-ask-reasons-and-goal-review.md) | 2026-09-26 |
 | [ADR-0045](0045-build-identifier-explicit-migrate-schema-compat-handoff-and-auto-update.md) | superseded | [ADR-0073](0073-kind-additions-are-compatible.md) | 2026-09-26 |

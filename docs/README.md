@@ -4,8 +4,8 @@ type: design
 title: Documentation guide
 status: current
 created: 2026-09-21
-updated: 2026-09-25
-last_verified: 2026-09-25
+updated: 2026-09-26
+last_verified: 2026-09-26
 tags:
   - documentation
 ---
@@ -16,7 +16,7 @@ dagqの文書は、決定、現在の設計、実装計画を分けて管理す�
 
 ## 文書の種類
 
-- `adr/`: なぜその決定をしたか。重要な決定は必ず追加し、既存のADRを書き換えない。`accepted`のADRだけが現在の決定で、`superseded`なら`superseded_by`を辿り、`deprecated`は後継なしの廃止（日付は`deprecated_on`）。決定を変えるときは古いADRを丸ごと置き換える統合ADRを書く（[ADR-0042](adr/0042-adr-is-superseded-whole-and-deprecation-date-is-deprecated-on.md)、索引は[adr/README.md](adr/README.md)）。
+- `adr/`: なぜその決定をしたか。重要な決定は必ず追加し、既存のADRを書き換えない。`accepted`のADRだけが現在の決定で、`superseded`なら`superseded_by`を辿り、`deprecated`は後継なしの廃止（日付は`deprecated_on`）。ADRのIDは書くtaskのIDと枝番（`adr-t<task ID>-<N>`）で、1 ADRに決定1つ、今の姿は`design/`が持つ。決定を変えるときは古いADRを丸ごと置き換え、決定の多い既存のADRは`amends`で一部を直す（[ADR-t598-1](adr/2026-09-26-t598-1-adr-id-is-task-id-small-adrs-and-design-holds-current-state.md)、索引は[adr/README.md](adr/README.md)）。
 - `design/`: 現在の実装がどうなっているか。コードを読む前のショートカットとして保守する。
 - `plans/`: これから何を作るか。ステップの順序と完了条件を持つ。完了した計画は`status: completed`にして残す。
 
