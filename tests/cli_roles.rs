@@ -209,9 +209,12 @@ fn ask_answer_asks_and_close_through_the_cli() {
     );
     assert_eq!(quiet["events"], serde_json::json!([]));
 
-    let answered = ok(&db, &["answer", &id_text, "--text", "0030"]);
+    let answered = ok_as("inbox", &db, &["answer", &id_text, "--text", "0030"]);
     assert_eq!(answered["answer"], "0030");
     assert!(answered["answered_at"].is_i64());
+    // Task 325: who answered (the session's role) and the option chosen.
+    assert_eq!(answered["answered_by"], "inbox");
+    assert_eq!(answered["option_index"], 1);
     assert!(
         !invoke(&db, &["answer", &id_text, "--text", "x"])
             .status
@@ -263,8 +266,29 @@ fn ask_answer_asks_and_close_through_the_cli() {
     assert_eq!(next["created"], true);
     let next_id = next["id"].to_string();
     assert!(!invoke(&db, &["ask", "close", &next_id]).status.success());
-    ok(&db, &["answer", &next_id, "--text", "withdrawn"]);
+    let withdrawn = ok(&db, &["answer", &next_id, "--text", "withdrawn"]);
+    // A plain terminal is a person; an answer no option names is free.
+    assert_eq!(withdrawn["answered_by"], "person");
+    assert!(withdrawn["option_index"].is_null());
     ok(&db, &["ask", "close", &next_id]);
+    // `stats` counts both asks by kind, asker, answerer and choice.
+    let asks = &ok(&db, &["stats", "--full"])["asks"];
+    assert_eq!(asks["opened"]["count"], 2, "{asks}");
+    assert_eq!(asks["opened"]["by_kind"]["decide"], 2, "{asks}");
+    assert_eq!(asks["opened"]["by_asked_by"]["human"], 2, "{asks}");
+    assert_eq!(
+        asks["answered"]["by_answered_by"],
+        serde_json::json!({"inbox": 1, "person": 1})
+    );
+    assert_eq!(
+        asks["answered"]["choices"]["decide"],
+        serde_json::json!({"by_option": {"0030": 1}, "free": 1, "unknown": 0})
+    );
+    // `--since` past both leaves nothing.
+    let latest = ok(&db, &["status"])["cursor"].to_string();
+    let later = &ok(&db, &["stats", "--since", &latest])["asks"];
+    assert_eq!(later["opened"]["count"], 0, "{later}");
+    assert_eq!(later["answered"]["count"], 0, "{later}");
     assert!(!invoke(&db, &["ask", "close", "99"]).status.success());
     assert_eq!(
         ok(&db, &["asks", "--role", "inbox"])["asks"],

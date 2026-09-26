@@ -8,9 +8,9 @@ use serde_json::json;
 use super::sqlite::{SqliteQueue, enum_col, json_col};
 use crate::domain::Ask;
 use crate::domain::{
-    AskId, AskKind, AskOutcome, AskReason, HOLD_AFFECTED_HEADING, HoldOutcome, LANDING_OPTIONS,
-    NewAsk, NewHold, RunId, RunStatus, TRIAGE_OPTIONS, TaskId, UPDATE_FAILED_OPTIONS,
-    UPDATE_FAILED_SUBJECT,
+    ANSWERED_BY_PERSON, ANSWERED_BY_RUNTIME, AskId, AskKind, AskOutcome, AskReason,
+    HOLD_AFFECTED_HEADING, HoldOutcome, LANDING_OPTIONS, NewAsk, NewHold, RunId, RunStatus,
+    TRIAGE_OPTIONS, TaskId, UPDATE_FAILED_OPTIONS, UPDATE_FAILED_SUBJECT, option_index,
 };
 
 pub use crate::application::AskQuery;
@@ -151,21 +151,32 @@ impl SqliteQueue {
             .optional()?)
     }
 
-    /// Write the answer of an open ask and record `ask_answered` (with the
-    /// run when the ask has one).
+    /// A person's answer from a terminal with no `DAGQ_ROLE`: see
+    /// [`Self::answer_as`].
     pub fn answer(&mut self, id: AskId, text: &str) -> Result<Ask> {
+        self.answer_as(id, text, ANSWERED_BY_PERSON)
+    }
+
+    /// Write the answer of an open ask, who gave it (`answered_by`) and the
+    /// option it chose, and record `ask_answered` (with the run when the ask
+    /// has one) carrying both.
+    pub fn answer_as(&mut self, id: AskId, text: &str, answered_by: &str) -> Result<Ask> {
         ensure!(!text.trim().is_empty(), "answer must not be blank");
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let ask = read_ask(&tx, id)?;
         ensure!(ask.is_open(), "ask {id} is not open");
-        tx.execute(
-            "UPDATE asks SET answer=?2, answered_at=?3 WHERE id=?1",
-            params![id, text, self.generators.clock.now()],
-        )?;
         let mut payload =
             json!({"ask_id": id, "kind": ask.kind, "reason_category": ask.reason_category});
+        write_answer(
+            &tx,
+            &ask,
+            text,
+            answered_by,
+            self.generators.clock.now(),
+            &mut payload,
+        )?;
         if ask.kind == AskKind::WorkerQuestion
             && let Some(run_id) = ask.run_id.as_ref()
         {
@@ -313,17 +324,20 @@ impl SqliteQueue {
             .query_map([subject], ask_row)?
             .collect::<rusqlite::Result<_>>()?;
         for ask in open {
+            let mut payload = json!({"ask_id": ask.id, "kind": ask.kind, "runtime_closed": true});
+            write_answer(
+                &tx,
+                &ask,
+                "superseded",
+                ANSWERED_BY_RUNTIME,
+                now,
+                &mut payload,
+            )?;
             tx.execute(
-                "UPDATE asks SET answer='superseded', answered_at=?2, closed_at=?2 WHERE id=?1",
+                "UPDATE asks SET closed_at=?2 WHERE id=?1",
                 params![ask.id, now],
             )?;
-            ask_event(
-                &tx,
-                None,
-                None,
-                "ask_answered",
-                json!({"ask_id": ask.id, "kind": ask.kind, "runtime_closed": true}),
-            )?;
+            ask_event(&tx, None, None, "ask_answered", payload)?;
         }
         let reason = AskReason::Scope;
         tx.execute(
@@ -549,17 +563,10 @@ impl SqliteQueue {
         let mut closed = Vec::with_capacity(unclosed.len());
         for ask in unclosed {
             if ask.is_open() {
-                tx.execute(
-                    "UPDATE asks SET answer=?2, answered_at=?3 WHERE id=?1",
-                    params![ask.id, answer, now],
-                )?;
-                ask_event(
-                    &tx,
-                    ask.task_id,
-                    Some(run_id),
-                    "ask_answered",
-                    json!({"ask_id": ask.id, "kind": ask.kind, "runtime_closed": true}),
-                )?;
+                let mut payload =
+                    json!({"ask_id": ask.id, "kind": ask.kind, "runtime_closed": true});
+                write_answer(&tx, &ask, answer, ANSWERED_BY_RUNTIME, now, &mut payload)?;
+                ask_event(&tx, ask.task_id, Some(run_id), "ask_answered", payload)?;
             }
             tx.execute(
                 "UPDATE asks SET closed_at=?2 WHERE id=?1",
@@ -652,6 +659,35 @@ pub(super) fn insert_ask(tx: &Connection, ask: &NewAsk) -> Result<AskOutcome> {
     })
 }
 
+/// Write `text` as the answer of the open `ask` at `now`, with who gave it
+/// and the option it chose (task 325), and add both to `payload`, the
+/// `ask_answered` the caller records: `answered_by`, and `option_index`
+/// with the option's text as `option` (a free answer has a null index and
+/// no `option`).
+pub(super) fn write_answer(
+    conn: &Connection,
+    ask: &Ask,
+    text: &str,
+    answered_by: &str,
+    now: i64,
+    payload: &mut serde_json::Value,
+) -> Result<()> {
+    let index = option_index(&ask.options, text);
+    conn.execute(
+        "UPDATE asks SET answer=?2, answered_at=?3, answered_by=?4, option_index=?5 WHERE id=?1",
+        params![ask.id, text, now, answered_by, index],
+    )?;
+    payload["answered_by"] = json!(answered_by);
+    payload["option_index"] = json!(index);
+    if let Some(option) = index
+        .and_then(|index| usize::try_from(index).ok())
+        .and_then(|index| ask.options.get(index))
+    {
+        payload["option"] = json!(option);
+    }
+    Ok(())
+}
+
 /// An ask's event: on its task (and run), or, for a task-less `blocked`
 /// ask, on nothing.
 fn ask_event(
@@ -691,5 +727,7 @@ pub(super) fn ask_row(row: &Row<'_>) -> rusqlite::Result<Ask> {
         answered_at: row.get("answered_at")?,
         closed_at: row.get("closed_at")?,
         finding_id: row.get("finding_id")?,
+        answered_by: row.get("answered_by")?,
+        option_index: row.get("option_index")?,
     })
 }

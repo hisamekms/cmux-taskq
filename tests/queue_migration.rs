@@ -960,3 +960,72 @@ fn migration_adding_the_task_kind_keeps_older_tasks_without_one() {
     assert_eq!(queue.show(TaskId::new(3)).unwrap().task.kind(), None);
     assert_eq!(queue.list(&Default::default()).unwrap().total, 3);
 }
+
+/// Task 325: the answerer and the chosen option of an ask are additions.
+/// An ask answered before the migration reads with both null (unknown),
+/// shown as null in its JSON, and an older binary's answer that names
+/// neither leaves them null too.
+#[test]
+fn migration_adding_the_answerer_keeps_older_answers_unknown() {
+    let at = MIGRATIONS
+        .iter()
+        .position(|migration| migration.contains("ALTER TABLE asks ADD COLUMN answered_by"))
+        .unwrap();
+    let before = i64::try_from(at).unwrap();
+    assert_eq!(floor_for(before + 1), floor_for(before));
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("queue.db");
+    let raw = Connection::open(&path).unwrap();
+    for migration in &MIGRATIONS[..at] {
+        raw.execute_batch(migration).unwrap();
+    }
+    raw.execute_batch(&format!(
+        "PRAGMA application_id = 1129599281; PRAGMA user_version = {before};
+         INSERT INTO schema_floor(singleton, floor) VALUES (1, {floor});
+         INSERT INTO tasks(title,description,acceptance,verification_commands,status)
+         VALUES ('t','','','[]','draft');
+         INSERT INTO asks(kind,task_id,question,options,asked_by,reason_category,answer,answered_at)
+         VALUES ('decide',1,'retry?','[\"retry\",\"cancel\"]','supervisor','recovery_failed','retry',1),
+                ('decide',1,'again?','[\"retry\"]','supervisor','recovery_failed',NULL,NULL);",
+        floor = floor_for(before),
+    ))
+    .unwrap();
+    drop(raw);
+    SqliteQueue::migrate(&path, None, 0).unwrap();
+    let mut queue = SqliteQueue::open(&path).unwrap();
+    let older = queue.read_ask(dagq::domain::AskId::new(1)).unwrap();
+    assert_eq!(older.answer.as_deref(), Some("retry"));
+    assert_eq!((older.answered_by, older.option_index), (None, None));
+    let json = serde_json::to_value(queue.read_ask(dagq::domain::AskId::new(1)).unwrap()).unwrap();
+    assert!(
+        json["answered_by"].is_null() && json["option_index"].is_null(),
+        "{json}"
+    );
+    // An older binary answers without naming the columns.
+    Connection::open(&path)
+        .unwrap()
+        .execute(
+            "UPDATE asks SET answer='retry', answered_at=2 WHERE id=2",
+            [],
+        )
+        .unwrap();
+    let answered = queue.read_ask(dagq::domain::AskId::new(2)).unwrap();
+    assert_eq!((answered.answered_by, answered.option_index), (None, None));
+    // This binary records both.
+    let asked = queue
+        .ask(dagq::domain::NewAsk {
+            kind: dagq::domain::AskKind::Decide,
+            task_id: Some(TaskId::new(1)),
+            run_id: None,
+            question: "which?".into(),
+            options: vec!["retry".into(), "cancel".into()],
+            asked_by: "supervisor".into(),
+            reason_category: dagq::domain::AskReason::RecoveryFailed,
+            finding_id: None,
+        })
+        .unwrap()
+        .ask;
+    let answered = queue.answer_as(asked.id, " cancel ", "inbox").unwrap();
+    assert_eq!(answered.answered_by.as_deref(), Some("inbox"));
+    assert_eq!(answered.option_index, Some(1));
+}

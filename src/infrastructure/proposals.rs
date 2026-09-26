@@ -10,8 +10,8 @@ use serde_json::json;
 
 use super::sqlite::{enum_col, event, goal_event, read_goal, transition_task};
 use crate::domain::{
-    DomainError, GoalStatus, PlannerOwner, Proposal, ProposalId, ProposalRecord, ProposalStatus,
-    Submission, TaskAction, TaskId, TaskStatus, goal, proposal,
+    ANSWERED_BY_RUNTIME, Ask, DomainError, GoalStatus, PlannerOwner, Proposal, ProposalId,
+    ProposalRecord, ProposalStatus, Submission, TaskAction, TaskId, TaskStatus, goal, proposal,
 };
 
 /// Submit `submission` inside the caller's write transaction: its tasks
@@ -266,30 +266,30 @@ pub(super) fn withdraw(
 /// Close the task's `approve_plan` asks nobody closed, answering an open
 /// one `withdrawn` first.
 fn close_plan_asks(conn: &Connection, task_id: TaskId, now: i64) -> Result<()> {
-    let unclosed: Vec<(i64, bool)> = conn
+    let unclosed: Vec<Ask> = conn
         .prepare(
-            "SELECT id, answered_at IS NULL FROM asks
+            "SELECT * FROM asks
              WHERE task_id=?1 AND kind='approve_plan' AND closed_at IS NULL ORDER BY id",
         )?
-        .query_map([task_id], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .query_map([task_id], super::asks::ask_row)?
         .collect::<rusqlite::Result<_>>()?;
-    for (ask_id, open) in unclosed {
-        if open {
-            conn.execute(
-                "UPDATE asks SET answer='withdrawn', answered_at=?2 WHERE id=?1",
-                params![ask_id, now],
-            )?;
-            event(
+    for ask in unclosed {
+        if ask.is_open() {
+            let mut payload =
+                json!({"ask_id": ask.id, "kind": "approve_plan", "runtime_closed": true});
+            super::asks::write_answer(
                 conn,
-                task_id,
-                None,
-                "ask_answered",
-                json!({"ask_id": ask_id, "kind": "approve_plan", "runtime_closed": true}),
+                &ask,
+                "withdrawn",
+                ANSWERED_BY_RUNTIME,
+                now,
+                &mut payload,
             )?;
+            event(conn, task_id, None, "ask_answered", payload)?;
         }
         conn.execute(
             "UPDATE asks SET closed_at=?2 WHERE id=?1",
-            params![ask_id, now],
+            params![ask.id, now],
         )?;
     }
     Ok(())

@@ -14,6 +14,7 @@ use super::{
     stall::{BackgroundTask, StallConfig},
 };
 
+pub mod asks;
 pub mod conflicts;
 pub mod landing;
 pub mod measures;
@@ -22,6 +23,7 @@ pub mod sessions;
 pub mod thresholds;
 pub mod work;
 
+pub use asks::{AnsweredAsks, AskStats, Choices, OpenedAsks};
 pub use conflicts::{ConflictConfig, ConflictConfigReport, ConflictHotspots, History};
 pub use landing::{LandBreakdown, LandClock, LandPhases, PhaseSummary};
 pub use measures::{
@@ -406,6 +408,10 @@ pub struct Stats {
     /// The runs that waited for a person outside the slots (ADR-0062
     /// decision 13) in the same window as `backend_failures`.
     pub waiting: super::waiting::WaitingStats,
+    /// The asks opened and answered in the same window as
+    /// `backend_failures` (task 325): by kind, by asker, by answerer and
+    /// the option each answer chose.
+    pub asks: AskStats,
     /// Pass it to `--since` to read only runs that finish later.
     pub next_cursor: EventId,
 }
@@ -762,6 +768,7 @@ pub fn stats(
     let reason_codes = reason_codes(events, window_start, next_cursor, counts);
     let duplicate_cancels = duplicate_cancels(events, window_start, next_cursor, counts);
     let landing_rechecks = landing_rechecks(events, window_start, next_cursor, counts);
+    let ask_stats = asks::asks(events, window_start, next_cursor, counts);
     let verification_commands =
         measures::verification_commands(events, window_start, next_cursor, counts);
     let waiting = super::waiting::waiting_stats(events, window_start, next_cursor, counts);
@@ -855,6 +862,7 @@ pub fn stats(
         verification_commands,
         sessions,
         waiting,
+        asks: ask_stats,
         next_cursor,
     }
 }

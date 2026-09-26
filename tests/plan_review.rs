@@ -805,6 +805,11 @@ fn a_withdrawn_proposal_closes_its_concern_and_its_drafts_are_free() {
         events(&mut queue, task, "ask_answered")[0]["runtime_closed"],
         true
     );
+    assert_eq!(closed.answered_by.as_deref(), Some("runtime"));
+    assert_eq!(
+        events(&mut queue, task, "ask_answered")[0]["answered_by"],
+        "runtime"
+    );
     assert_eq!(status(&mut queue, task), TaskStatus::Draft);
     assert!(
         queue

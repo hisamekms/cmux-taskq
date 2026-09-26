@@ -1763,7 +1763,12 @@ fn execute(cli: Cli) -> Result<Value> {
                 },
             )?
         }
-        Command::Answer { id, text } => serde_json::to_value(queue.answer(AskId::new(id), &text)?)?,
+        Command::Answer { id, text } => serde_json::to_value(queue.answer_as(
+            AskId::new(id),
+            &text,
+            // The session's role; a person at a plain terminal has none.
+            role.as_deref().unwrap_or(dagq::domain::ANSWERED_BY_PERSON),
+        )?)?,
         Command::Asks { open, role: r, all } => {
             json!({"asks": queue.asks(dagq::application::AskQuery {
             all,

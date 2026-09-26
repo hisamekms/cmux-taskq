@@ -558,6 +558,7 @@ fn the_update_job_installs_watches_restores_and_asks() {
         .unwrap();
     let older = asks.iter().find(|a| a.id.as_i64() == first_ask).unwrap();
     assert_eq!(older.answer.as_deref(), Some("superseded"));
+    assert_eq!(older.answered_by.as_deref(), Some("runtime"));
     assert!(older.closed_at.is_some());
     let open: Vec<_> = asks.iter().filter(|a| a.is_open()).collect();
     assert_eq!(open.len(), 1, "{open:?}");

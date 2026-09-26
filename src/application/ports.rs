@@ -1306,7 +1306,9 @@ pub trait AskStore {
     /// The open `queue_hold` ask that holds the run, if any.
     fn hold_of(&self, run_id: &RunId) -> Result<Option<Ask>>;
     fn read_ask(&self, id: AskId) -> Result<Ask>;
-    fn answer(&mut self, id: AskId, text: &str) -> Result<Ask>;
+    /// Write the answer of an open ask, given by `answered_by` (a role,
+    /// `person` or `runtime`).
+    fn answer_as(&mut self, id: AskId, text: &str, answered_by: &str) -> Result<Ask>;
     fn close_ask(&mut self, id: AskId) -> Result<Ask>;
     /// Answered `approve_landing` asks nobody closed.
     fn landing_answers(&self) -> Result<Vec<Ask>>;

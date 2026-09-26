@@ -508,6 +508,32 @@ pub struct Ask {
     /// The finding a `blocked` ask raises (ADR-0044 decision 23).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub finding_id: Option<FindingId>,
+    /// Who answered it (task 325): [`ANSWERED_BY_PERSON`], the `DAGQ_ROLE`
+    /// of the session that ran `answer`, or [`ANSWERED_BY_RUNTIME`]. `None`
+    /// while open, and for an answer recorded before it was kept.
+    #[serde(default)]
+    pub answered_by: Option<String>,
+    /// The index of the option the answer chose ([`option_index`]); `None`
+    /// for a free answer, an open ask, or an answer recorded before it was
+    /// kept.
+    #[serde(default)]
+    pub option_index: Option<i64>,
+}
+
+/// `answered_by` of an answer from a terminal with no `DAGQ_ROLE`.
+pub const ANSWERED_BY_PERSON: &str = "person";
+/// `answered_by` of an answer the runtime wrote itself (a withdrawn,
+/// superseded or runtime-closed ask).
+pub const ANSWERED_BY_RUNTIME: &str = "runtime";
+
+/// The 0-based index of the option `answer` chooses: the first option
+/// equal to the trimmed answer. `None` for a free answer.
+pub fn option_index(options: &[String], answer: &str) -> Option<i64> {
+    let answer = answer.trim();
+    options
+        .iter()
+        .position(|option| option.trim() == answer)
+        .and_then(|index| i64::try_from(index).ok())
 }
 
 impl Ask {
@@ -1384,6 +1410,17 @@ mod attention_tests {
     use super::*;
     use serde_json::json;
 
+    /// The answer chooses the first option equal to it once trimmed; any
+    /// other answer is free.
+    #[test]
+    fn an_answer_chooses_the_option_it_equals() {
+        let options = vec!["land".to_owned(), " send_back ".to_owned()];
+        assert_eq!(option_index(&options, "land"), Some(0));
+        assert_eq!(option_index(&options, "send_back\n"), Some(1));
+        assert_eq!(option_index(&options, "land it"), None);
+        assert_eq!(option_index(&[], "land"), None);
+    }
+
     #[test]
     fn asks_wait_for_the_inbox_until_closed() {
         let mut ask = Ask {
@@ -1400,6 +1437,8 @@ mod attention_tests {
             affected: Vec::new(),
             created_at: 0,
             answered_at: None,
+            answered_by: None,
+            option_index: None,
             closed_at: None,
             finding_id: None,
         };

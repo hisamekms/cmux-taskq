@@ -280,9 +280,10 @@ impl Supervisor<'_> {
             // The run changed meanwhile (another supervisor took it): an ask
             // this pass opened has nothing left to decide.
             if outcome["created"] == true {
-                self.queue.answer(
+                self.queue.answer_as(
                     ask_id,
                     "withdrawn: the run changed before it was handed over",
+                    crate::domain::ANSWERED_BY_RUNTIME,
                 )?;
                 self.queue.close_ask(ask_id)?;
             }

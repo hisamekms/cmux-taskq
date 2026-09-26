@@ -1376,6 +1376,9 @@ fn unanswered_exit_request_times_out_and_keeps_the_run() {
         closed.answer.as_deref(),
         Some("the session exited; closed by the runtime")
     );
+    // Recorded as the runtime's answer (task 325), no option chosen.
+    assert_eq!(closed.answered_by.as_deref(), Some("runtime"));
+    assert_eq!(closed.option_index, None);
     assert!(position("session_exited") < position("ask_answered"));
     assert!(position("ask_answered") < position("workspace_closed"));
     assert!(position("ask_answered") < position("review_failed"));
