@@ -20,17 +20,28 @@ CLI の使い方（登録・起動・監視・レビューと着地・復旧）�
 
 ## 変更後に必ず通す
 
+dagq を通さない手元の作業（人が checkout で直接変えるとき）は、この 3 本を通す。
+
 ```sh
 cargo fmt --all --check
 cargo test --locked
 cargo clippy --locked --all-targets -- -D warnings
 ```
 
-worker が手元で流すのはこの 3 本と、task の verify のうち `cargo llvm-cov` 以外（fmt・clippy・`cargo test --locked --test plugin` など）。`cargo llvm-cov`（coverage の関門）は `integrate` が rebase 後に 1 回だけ流すので、worker は流さない（`integrate` の検証が落ちて resume された run では、落ちたコマンドを手元で流して再現してよい）。runtime（`src/`）を変えた run の e2e は今までどおり worker が流す（下の「テストの制約」と「worker」）。worker の prompt は verification_commands を integrate が流すものとして見せ、手元の検証はこの文書の指示に従わせる（task 510）
+dagq の worker は全体の `cargo test --locked` を流さない。worker が手元で流すのは次のとおり。
+
+- `cargo fmt --all --check` と `cargo clippy --locked --all-targets -- -D warnings`
+- 変更に関係する test だけの `cargo test`（例: `cargo test --locked --test <変えた・関係する test ファイル>`、`cargo test --locked --lib <module>`）。選び方の目安: 変えた `src/` の module の unit test（`--lib <module のパス>`）、その機能の `tests/*.rs`（`tests/runtime_*.rs`・`tests/lifecycle_*.rs` など）、`tests/common` の helper を変えたらそれを使っている test ファイル。receipt の `tests` の evidence には流した test の範囲（コマンドと件数）を書く
+- task の verify のうち `cargo llvm-cov` と全体の `cargo test --locked` 以外（`cargo test --locked --test plugin` など）
+- runtime（`src/`）を変えた run の e2e（`cargo test --locked --test e2e -- --ignored`）は今までどおり worker が流す（下の「テストの制約」と「worker」）
+
+全部の test は `integrate` の検証（runtime の task では `cargo llvm-cov`（coverage の関門）、llvm-cov を含めない task では verify にあれば `cargo test --locked`）が rebase 後に 1 回だけ流すので、worker は `cargo llvm-cov` も流さない（`integrate` の検証が落ちて resume された run では、落ちたコマンドを手元で流して再現してよい）。worker の prompt は verification_commands を integrate が流すものとして見せ、手元の検証はこの文書の指示に従わせる（task 510）。
+
+worker の手元の test を関係する範囲に絞るのは 2026-09-26 に人が planner と決めた（task 528）。理由: worker の全体の `cargo test` は integrate の llvm-cov と同じ test を全部流すので重複で、test ファイルを分けて test binary が増えたぶん build と link が重く、host の load と worker の work 時間を押し上げていた（変更前の基準値は 2026-09-26 の `dagq stats` の直近 46 run で、work 中央値 1439 秒、startup 中央値 1172 秒、land_phases.verify 中央値 276 秒）。失敗の発見が integrate に移るコストは、task 514 の検証の重複の回数と、integrate の検証の失敗率（resume）で変更の前後を見て判断する。
 
 ## テストの制約
 
-- unit test: 行カバレッジの合計を 80% 以上に保つ（`cargo-llvm-cov`、行基準、全体）。下回る変更は着地しない。門番は task の `verification_commands`（`integrate` が rebase 後に worker の receipt を信用せず 1 回だけ実行する。validating では実行しない）と CI で、worker は手元で `cargo llvm-cov` を回さない（task の verify に含まれていても、worker が流すのは「変更後に必ず通す」の 3 本と llvm-cov 以外の verify。例外は `integrate` の検証が落ちて resume された run で、落ちたコマンドを再現してよい）。runtime（`src/`）を触る task を `dagq add` するときは verification に `cargo llvm-cov --locked --fail-under-lines 80` を含め、`--evidence e2e` も付ける（receipt の `e2e` が evidence 付きの `passed` でない run は validating で `needs_session`（`evidence_missing`）になり、supervisor の resume が不足分を補わせる。ADR-0019 決定 5）。llvm-cov を verification に含める task では `cargo test --locked` を verification に重ねない。`cargo llvm-cov` は `cargo test` と同じ test binary 群（`src/lib.rs` の unit test と `tests/*.rs`。この crate に doctest は無い）を全部実行し、1 件でも落ちれば失敗するので、両方を並べても integrate の直列の検証で同じ test が 2 回走る（約 100 秒）だけで検出力は増えない。llvm-cov を含めない task（docs・plugin の文書など）は、必要なら `cargo test --locked` を verification に残す。worker が手元で回す「変更後に必ず通す」の 3 本はこれと別で、変えない
+- unit test: 行カバレッジの合計を 80% 以上に保つ（`cargo-llvm-cov`、行基準、全体）。下回る変更は着地しない。門番は task の `verification_commands`（`integrate` が rebase 後に worker の receipt を信用せず 1 回だけ実行する。validating では実行しない）と CI で、worker は手元で `cargo llvm-cov` も全体の `cargo test --locked` も回さない（task の verify に含まれていても、worker が流すのは「変更後に必ず通す」の worker 向けの項目: fmt・clippy・変更に関係する test だけの `cargo test`・llvm-cov と全体の `cargo test` 以外の verify。全部の test は integrate の llvm-cov が流す。例外は `integrate` の検証が落ちて resume された run で、落ちたコマンドを再現してよい）。runtime（`src/`）を触る task を `dagq add` するときは verification に `cargo llvm-cov --locked --fail-under-lines 80` を含め、`--evidence e2e` も付ける（receipt の `e2e` が evidence 付きの `passed` でない run は validating で `needs_session`（`evidence_missing`）になり、supervisor の resume が不足分を補わせる。ADR-0019 決定 5）。llvm-cov を verification に含める task では `cargo test --locked` を verification に重ねない。`cargo llvm-cov` は `cargo test` と同じ test binary 群（`src/lib.rs` の unit test と `tests/*.rs`。この crate に doctest は無い）を全部実行し、1 件でも落ちれば失敗するので、両方を並べても integrate の直列の検証で同じ test が 2 回走る（約 100 秒）だけで検出力は増えない。llvm-cov を含めない task（docs・plugin の文書など）は、必要なら `cargo test --locked` を verification に残す。worker が手元で回すもの（「変更後に必ず通す」の worker 向けの項目。全体の `cargo test` は含まない）はこれと別
 - 変更の種類で verification を軽くしてよい。条件は `--paths` で変えてよいパスを宣言すること（[ADR-0029](docs/adr/0029-task-declares-paths-and-verification-follows-the-kind-of-change.md)）。宣言外のパスを変えた run は validating で `needs_session`（`scope_violation`）になり、`integrate` も rebase 後の差分を同じく検査して着地させないので、軽い検証のまま `src/` の変更が入ることはない。`--paths` を付けない task は今までどおり制限されない。推奨の組み合わせ（glob は repository root 起点で、`*` は 1 階層、`**` は任意の深さ。詳細は dagq skill の `reference/scope.md`）:
   - docs だけ: `--paths 'docs/**' --paths '*.md' --verify 'cargo fmt --all --check'`（fmt も要らなければ検証なし）
   - ADR を書く（docs だけ）: 上に `--verify 'sh scripts/check-adr-numbers.sh'` を足す（「文書のルール」の ADR 番号の割り当て）
@@ -98,7 +109,7 @@ dagq up --in-cmux --claude ~/.local/bin/claude --plugin-dir <この repository>/
 ### worker
 
 - runtime の prompt に従う。割り当てられた worktree（branch `dagq/<run-id>`）の中だけで作業し、main、queue DB、`runs/` 配下の runtime ファイル、他の run の worktree は触らない。merge も push も workspace の close もしない
-- 変更後は「変更後に必ず通す」の 3 本（fmt / test / clippy）と、タスクの verify コマンドのうち `cargo llvm-cov` 以外を worktree で実行する。`cargo llvm-cov` は `integrate` が rebase 後に 1 回だけ流すので手元では流さない（`integrate` の検証が落ちて resume された run では、落ちたコマンドを手元で流して再現してよい）。e2e と subagent review は該当するときに実行し、しないときは理由を receipt に書く。runtime（`src/`）を変えた run では e2e（`cargo test --locked --test e2e -- --ignored`）は必須で、結果を receipt の `e2e` に evidence として書く
+- 変更後は「変更後に必ず通す」の worker 向けの項目を worktree で実行する: fmt・clippy・変更に関係する test だけの `cargo test`（`--test <ファイル>` や `--lib <module>`。全体の `cargo test --locked` は流さない）と、タスクの verify コマンドのうち `cargo llvm-cov` と全体の `cargo test --locked` 以外。receipt の `tests` の evidence には流した test の範囲を書く。全部の test は `integrate` の `cargo llvm-cov` が rebase 後に 1 回だけ流すので手元では流さない（`integrate` の検証が落ちて resume された run では、落ちたコマンドを手元で流して再現してよい）。e2e と subagent review は該当するときに実行し、しないときは理由を receipt に書く。runtime（`src/`）を変えた run では e2e（`cargo test --locked --test e2e -- --ignored`）は必須で、結果を receipt の `e2e` に evidence として書く
 - コミットしてから receipt を書く。receipt の commit は run branch の clean head で、base commit の上に乗っている
 - 判断が要るときは terminal に質問を書いて待つのではなく、`dagq ask --run <run-id> --kind worker_question --question '...'` を打ち、短く報告して止まる。回答は supervisor が `answer to ask <id>: ...` として同じ terminal に送る（ADR-0022 決定 2）
 - receipt を書く前に、自分が起動した background の処理（`run_in_background` の shell、待ちループ、watch など）をすべて止める。残っていると supervisor の `/exit` が Claude Code の「Background work is running」の確認画面で止まり、`exit_request_timed_out` になる
