@@ -20,3 +20,7 @@ SCCACHE_IGNORE_SERVER_IO_ERROR = "1"
 # CARGO_BUILD_JOBS は build の job 数、RUST_TEST_THREADS は 1 つの test binary の中の並列 thread 数。
 CARGO_BUILD_JOBS = "4"
 RUST_TEST_THREADS = "4"
+# coverage の関門（cargo llvm-cov nextest）で同時に走らせる test の process 数（ADR-0076 の決定 2）。
+# nextest は RUST_TEST_THREADS を読まず既定で CPU 数だけ走らせるので、RUST_TEST_THREADS と同じ考え方で 4 に絞る。
+# .config/nextest.toml には書かない（CI と人の手元の nextest まで絞られるため）。
+NEXTEST_TEST_THREADS = "4"

@@ -33,6 +33,9 @@ jobs:
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
 
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@cargo-nextest
+
       - uses: Swatinem/rust-cache@v2
 
       - name: cargo fmt
@@ -50,10 +53,13 @@ jobs:
       - name: cargo clippy
         run: cargo clippy --locked --all-targets -- -D warnings
 
-      # cargo llvm-cov runs the same test binaries as cargo test (unit tests in
-      # src/lib.rs and tests/*.rs; the crate has no doctests) and fails if any
-      # test fails, so there is no separate cargo test step.
+      # cargo llvm-cov nextest runs the same test binaries as cargo test (unit
+      # tests in src/lib.rs and tests/*.rs; the crate has no doctests), each
+      # test in its own process and in parallel across binaries, and fails if
+      # any test fails, so there is no separate cargo test step. It is the
+      # same command integrate runs (ADR-0076); here nextest runs as many
+      # tests at once as the runner has CPUs.
       # The e2e tests in tests/e2e.rs need a running cmux, so they stay
       # #[ignore]d here and are run by the worker before integrate.
-      - name: cargo llvm-cov
-        run: cargo llvm-cov --locked --fail-under-lines 80
+      - name: cargo llvm-cov nextest
+        run: cargo llvm-cov nextest --locked --fail-under-lines 80

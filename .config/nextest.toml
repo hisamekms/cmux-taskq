@@ -1,0 +1,10 @@
+# cargo-nextest の設定（ADR-0076）。coverage の関門は `cargo llvm-cov nextest` で流す。
+# 並列度はここに書かない: integrate の検証は dagq.toml の [run.env] の
+# NEXTEST_TEST_THREADS で絞り（決定 2）、CI と人の手元は nextest の既定（CPU 数）で流す。
+# retries は既定の 0 のままにし、不安定な test を再実行で隠さない。
+
+[profile.default]
+# 60 秒を超えた test を SLOW と出すだけで、打ち切らない（決定 6）。test の上限は
+# tests/common/mod.rs の within（TEST_LIMIT 600 秒・STEP_LIMIT 300 秒）が持つので、
+# terminate-after は置かず、その上限より先に nextest が test を止めることはない。
+slow-timeout = { period = "60s" }
