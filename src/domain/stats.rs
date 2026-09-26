@@ -24,7 +24,7 @@ pub mod sessions;
 pub mod thresholds;
 pub mod work;
 
-pub use asks::{AnsweredAsks, AskStats, Choices, OpenedAsks};
+pub use asks::{AnsweredAsks, AskStats, Choices, OpenedAsks, ReasonAsks};
 pub use auto_repairs::{AutoRepairStats, DayCounts, LayerRepairs};
 pub use conflicts::{ConflictConfig, ConflictConfigReport, ConflictHotspots, History};
 pub use landing::{LandBreakdown, LandClock, LandPhases, PhaseSummary};

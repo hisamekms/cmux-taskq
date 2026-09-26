@@ -2,8 +2,10 @@
 //! which kind and by whom, and how many were answered, by whom and with
 //! which option. Derived from `ask_opened` / `ask_answered` like the rest of
 //! `stats`; an `ask_answered` recorded before its answerer was kept counts
-//! as [`UNKNOWN`].
-use std::collections::BTreeMap;
+//! as [`UNKNOWN`]. Per why a person was needed (`reason_category`,
+//! ADR-0047 decision 45, task 439), the asks opened, answered and still
+//! open in the window, next to `auto_repairs` of the same window.
+use std::collections::{BTreeMap, HashMap};
 
 use serde::Serialize;
 use serde_json::Value;
@@ -18,6 +20,22 @@ pub const UNKNOWN: &str = "unknown";
 pub struct AskStats {
     pub opened: OpenedAsks,
     pub answered: AnsweredAsks,
+    /// Per `reason_category` (ADR-0047 decision 41), the asks of the window
+    /// opened, answered and still open; `unknown` for an ask opened before
+    /// the reason was kept.
+    pub by_reason_category: BTreeMap<String, ReasonAsks>,
+}
+
+/// The asks of one `reason_category` in a window.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct ReasonAsks {
+    /// `ask_opened` in the window.
+    pub opened: i64,
+    /// `ask_answered` in the window, of an ask opened in it or before.
+    pub answered: i64,
+    /// Of those opened in the window, the ones with no `ask_answered` by
+    /// its end.
+    pub open: i64,
 }
 
 /// The `ask_opened` events of the window.
@@ -71,6 +89,27 @@ pub fn asks(
             .unwrap_or(UNKNOWN)
             .to_owned()
     };
+    // Up to the window's end, each ask's reason as `ask_opened` recorded it
+    // and whether it was answered: an answer the runtime wrote itself does
+    // not carry the reason, and an ask opened in the window may be answered
+    // after it.
+    let mut reasons: HashMap<AskKey, (String, bool)> = HashMap::new();
+    for event in events.iter().filter(|event| event.id <= upto) {
+        match event.kind.as_str() {
+            "ask_opened" => {
+                reasons.insert(
+                    ask_key(event),
+                    (text(&event.payload, "reason_category"), false),
+                );
+            }
+            "ask_answered" => {
+                if let Some((_, answered)) = reasons.get_mut(&ask_key(event)) {
+                    *answered = true;
+                }
+            }
+            _ => {}
+        }
+    }
     for event in events
         .iter()
         .filter(|event| event.id > after && event.id <= upto && counts(event.task_id))
@@ -85,12 +124,25 @@ pub fn asks(
                     .by_asked_by
                     .entry(text(payload, "asked_by"))
                     .or_default() += 1;
-                *opened
-                    .by_reason_category
-                    .entry(text(payload, "reason_category"))
-                    .or_default() += 1;
+                let reason = text(payload, "reason_category");
+                *opened.by_reason_category.entry(reason.clone()).or_default() += 1;
+                let counts = stats.by_reason_category.entry(reason).or_default();
+                counts.opened += 1;
+                if reasons
+                    .get(&ask_key(event))
+                    .is_some_and(|(_, answered)| !answered)
+                {
+                    counts.open += 1;
+                }
             }
             "ask_answered" => {
+                let reason = match payload.get("reason_category").and_then(Value::as_str) {
+                    Some(reason) => reason.to_owned(),
+                    None => reasons
+                        .get(&ask_key(event))
+                        .map_or_else(|| UNKNOWN.to_owned(), |(reason, _)| reason.clone()),
+                };
+                stats.by_reason_category.entry(reason).or_default().answered += 1;
                 let answered = &mut stats.answered;
                 let kind = text(payload, "kind");
                 answered.count += 1;
@@ -110,6 +162,23 @@ pub fn asks(
         }
     }
     stats
+}
+
+/// What pairs an `ask_answered` with its `ask_opened`: the payload's
+/// `ask_id` (or `id`), and the task and run, as `stats`' open asks do.
+type AskKey = (Option<String>, Option<TaskId>, Option<String>);
+
+fn ask_key(event: &RunEvent) -> AskKey {
+    let id = event
+        .payload
+        .get("ask_id")
+        .or_else(|| event.payload.get("id"))
+        .map(|id| id.as_str().map_or_else(|| id.to_string(), str::to_owned));
+    (
+        id,
+        event.task_id,
+        event.run_id.as_ref().map(|run| run.as_str().to_owned()),
+    )
 }
 
 #[cfg(test)]
@@ -220,5 +289,82 @@ mod tests {
         assert_eq!(task_one.opened.by_kind["decide"], 1);
         assert_eq!(task_one.answered.count, 3);
         assert!(!task_one.answered.by_kind.contains_key("stuck_exit"));
+    }
+
+    /// Per reason, the asks opened, answered and still open in the window:
+    /// a `queue_hold` ask on neither a task nor a run counts; an answer the
+    /// runtime wrote without the reason takes its `ask_opened`'s, also when
+    /// that was before the window; an ask answered after the window is
+    /// still open in it.
+    #[test]
+    fn counts_the_asks_by_reason_opened_answered_and_open() {
+        let hold = json!({"ask_id": 3, "kind": "queue_hold", "asked_by": "supervisor", "reason_category": "authentication", "affected": ["r1"]});
+        let events = [
+            event(
+                1,
+                Some(1),
+                "ask_opened",
+                json!({"ask_id": 1, "kind": "stuck_exit", "reason_category": "recovery_failed"}),
+            ),
+            event(
+                2,
+                Some(1),
+                "ask_opened",
+                json!({"ask_id": 2, "kind": "approve_landing", "reason_category": "scope"}),
+            ),
+            event(3, None, "ask_opened", hold),
+            event(
+                4,
+                Some(1),
+                "ask_answered",
+                json!({"ask_id": 1, "kind": "stuck_exit", "runtime_closed": true, "answered_by": "runtime"}),
+            ),
+            event(
+                5,
+                None,
+                "ask_answered",
+                json!({"ask_id": 3, "kind": "queue_hold", "reason_category": "authentication", "answered_by": "inbox"}),
+            ),
+            event(
+                6,
+                None,
+                "ask_opened",
+                json!({"ask_id": 4, "kind": "blocked"}),
+            ),
+            event(
+                7,
+                Some(1),
+                "ask_answered",
+                json!({"ask_id": 2, "kind": "approve_landing", "reason_category": "scope"}),
+            ),
+        ];
+        let window = asks(&events, EventId::new(1), EventId::new(6), |_| true);
+        let reason = |opened, answered, open| ReasonAsks {
+            opened,
+            answered,
+            open,
+        };
+        assert_eq!(
+            window.by_reason_category,
+            BTreeMap::from([
+                ("authentication".to_owned(), reason(1, 1, 0)),
+                ("recovery_failed".to_owned(), reason(0, 1, 0)),
+                ("scope".to_owned(), reason(1, 0, 1)),
+                (UNKNOWN.to_owned(), reason(1, 0, 1)),
+            ])
+        );
+        assert_eq!(window.opened.by_reason_category["authentication"], 1);
+
+        // With --goal a task-less ask is not counted, like the rest of `asks`.
+        let goal = asks(&events, EventId::new(0), EventId::new(7), |task| {
+            task == Some(TaskId::new(1))
+        });
+        assert_eq!(
+            goal.by_reason_category,
+            BTreeMap::from([
+                ("recovery_failed".to_owned(), reason(1, 1, 0)),
+                ("scope".to_owned(), reason(1, 1, 0)),
+            ])
+        );
     }
 }

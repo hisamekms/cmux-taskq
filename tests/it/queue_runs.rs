@@ -307,6 +307,28 @@ fn a_login_that_stops_several_runs_is_one_ask_that_lists_them() {
     // Once answered, the next login that runs out opens a new ask.
     let answered = queue.answer(first.ask.id, "done").unwrap();
     assert_eq!(answered.reason_category, AskReason::Authentication);
+    // `stats` counts the holds, on neither a task nor a run, by reason
+    // (task 439): the login answered, the two cost holds still open.
+    let latest = queue.latest_event_id().unwrap();
+    let events = queue
+        .events_between(
+            EventId::new(0),
+            latest,
+            &dagq::domain::EventFilter::default(),
+            100,
+        )
+        .unwrap();
+    let asks = dagq::domain::stats::asks::asks(&events, EventId::new(0), latest, |_| true);
+    let reasons = &asks.by_reason_category;
+    assert_eq!(
+        (
+            reasons["authentication"].opened,
+            reasons["authentication"].answered,
+            reasons["authentication"].open
+        ),
+        (1, 1, 0)
+    );
+    assert_eq!((reasons["cost"].opened, reasons["cost"].open), (2, 2));
     assert!(queue.hold_of(&runs[1]).unwrap().is_none());
     assert!(queue.hold(hold(&runs[1])).unwrap().created);
     // A hold is for authentication or cost only, and those are no other ask.

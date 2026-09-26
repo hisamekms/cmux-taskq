@@ -280,6 +280,11 @@ fn ask_answer_asks_and_close_through_the_cli() {
         asks["opened"]["by_reason_category"]["recovery_failed"], 2,
         "{asks}"
     );
+    // Per reason, next to `auto_repairs` of the same window (task 439).
+    assert_eq!(
+        asks["by_reason_category"],
+        serde_json::json!({"recovery_failed": {"opened": 2, "answered": 2, "open": 0}})
+    );
     // `auto_repairs` puts the asks opened each day next to the repairs:
     // none here.
     let repairs = &ok(&db, &["stats", "--full"])["auto_repairs"];
@@ -304,6 +309,7 @@ fn ask_answer_asks_and_close_through_the_cli() {
     let later = &ok(&db, &["stats", "--since", &latest])["asks"];
     assert_eq!(later["opened"]["count"], 0, "{later}");
     assert_eq!(later["answered"]["count"], 0, "{later}");
+    assert_eq!(later["by_reason_category"], serde_json::json!({}));
     assert!(!invoke(&db, &["ask", "close", "99"]).status.success());
     assert_eq!(
         ok(&db, &["asks", "--role", "inbox"])["asks"],
