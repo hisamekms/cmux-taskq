@@ -32,3 +32,11 @@ uuid = { version = "1.20", features = ["v4"] }
 
 [dev-dependencies]
 tempfile = "3.25"
+
+# Keep line tables so panic backtraces still point at file:line, and drop the
+# debug info of dependencies: test binaries get smaller and link faster.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
