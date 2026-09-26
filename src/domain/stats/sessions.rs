@@ -43,6 +43,9 @@ pub struct Span {
     pub work: Option<Value>,
     /// The tokens it used, recorded when it closed (task 199).
     pub tokens: Option<Value>,
+    /// The model and effort its messages mostly used, `model effort`,
+    /// recorded when it closed (task 579).
+    pub model: Option<String>,
 }
 
 impl Span {
@@ -100,6 +103,7 @@ pub fn spans(events: &[RunEvent]) -> Vec<Span> {
                     turns: Vec::new(),
                     work: None,
                     tokens: None,
+                    model: None,
                 });
             }
             SESSION_TURNS => {
@@ -141,6 +145,10 @@ pub fn spans(events: &[RunEvent]) -> Vec<Span> {
                     .get("tokens")
                     .filter(|t| t.is_object())
                     .cloned();
+                span.model = event.payload["model"].as_str().map(|model| {
+                    let effort = event.payload["effort"].as_str().unwrap_or("unknown");
+                    format!("{model} {effort}")
+                });
             }
             _ => {}
         }
@@ -211,6 +219,10 @@ pub struct KindSessions {
     /// The tokens of its spans closed in the window that recorded them
     /// (task 199).
     pub tokens: TokenTotals,
+    /// Its spans closed in the window per the model and effort their
+    /// messages mostly used, `model effort` (task 579); spans that recorded
+    /// none are not listed.
+    pub models: BTreeMap<String, usize>,
 }
 
 /// The window the sessions were counted in: the events after `after` up to
@@ -384,6 +396,9 @@ pub fn by_kind(
         if closed_in_window && let Some(tokens) = &span.tokens {
             sessions.tokens.add(tokens);
         }
+        if closed_in_window && let Some(model) = &span.model {
+            *sessions.models.entry(model.clone()).or_default() += 1;
+        }
         // Its turns that overlap the window: all of them when it closed
         // with its active time recorded, those recorded so far while open.
         let recorded = if closed_in_window {
@@ -463,6 +478,48 @@ mod tests {
             opened(10, Some("r2"), "worker", 600),
             closed(11, Some("r2"), 10, "inferred", 900),
         ]
+    }
+
+    /// The spans closed in the window are counted per the model and effort
+    /// they recorded; a span that recorded none is not listed.
+    #[test]
+    fn spans_are_counted_per_model_and_effort() {
+        let with = |id: i64, opened: i64, model: Option<&str>, effort: Option<&str>, secs: i64| {
+            event(
+                id,
+                None,
+                SESSION_CLOSED,
+                json!({"opened_event_id": opened, "reason": "job_finished",
+                       "model": model, "effort": effort}),
+                secs,
+            )
+        };
+        let events = vec![
+            opened(1, None, "plan_review", 0),
+            with(2, 1, Some("claude-opus-5-5"), Some("medium"), 10),
+            opened(3, None, "plan_review", 20),
+            with(4, 3, Some("claude-opus-5-5"), Some("medium"), 30),
+            opened(5, None, "plan_review", 40),
+            with(6, 5, Some("claude-opus-5-5"), None, 50),
+            opened(7, None, "plan_review", 60),
+            with(8, 7, None, None, 70),
+        ];
+        let spans = spans(&events);
+        let window = SessionWindow {
+            after: EventId::new(0),
+            upto: EventId::new(8),
+        };
+        let sessions = by_kind(&spans, &events, window, 80_000, |_| true);
+        let plan_review = &sessions.by_kind["plan_review"];
+        assert_eq!(plan_review.count, 4);
+        assert_eq!(
+            plan_review.models,
+            BTreeMap::from([
+                ("claude-opus-5-5 medium".to_owned(), 2),
+                ("claude-opus-5-5 unknown".to_owned(), 1),
+            ])
+        );
+        assert!(sessions.by_kind["worker"].models.is_empty());
     }
 
     /// The turns recorded of a span are its active time: whole for a run,

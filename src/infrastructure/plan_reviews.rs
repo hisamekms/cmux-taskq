@@ -8,6 +8,7 @@ use anyhow::{Context, Result, bail, ensure};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde_json::{Value, json};
 use std::path::Path;
+use tracing::warn;
 
 use super::{
     asks::{insert_ask, read_ask},
@@ -22,7 +23,9 @@ use crate::{
     domain::{
         Ask, AskId, AskKind, HEARTBEAT_TIMEOUT_SECS, PlanAnswer, PlanReviewAction,
         PlanReviewCandidate, PlanReviewDecision, PlannerId, Priority, ProposalId, ProposalStatus,
-        TaskAction, TaskId, TaskStatus, proposal, task,
+        TaskAction, TaskId, TaskStatus,
+        plan_quality::{self, ProposalFeatures},
+        proposal, task,
     },
 };
 
@@ -314,6 +317,86 @@ fn ask_proposal(conn: &Connection, ask: &Ask) -> Result<Option<ProposalId>> {
     )?)
 }
 
+/// How many follow-ups deep a draft is: 0 for none, 1 for a follow-up of a
+/// task that is none, and so on; bounded so a cycle ends.
+fn follow_up_depth(conn: &Connection, task_id: TaskId) -> Result<i64> {
+    let mut depth = 0;
+    let mut task = task_id.as_i64();
+    while depth < 32 {
+        let source: Option<Option<i64>> = conn
+            .query_row(
+                "SELECT json_extract(material, '$.source_task_id') FROM draft_origins
+                 WHERE task_id=?1 AND origin='follow_up'",
+                [task],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(source) = source else {
+            break;
+        };
+        depth += 1;
+        let Some(source) = source else {
+            break;
+        };
+        task = source;
+    }
+    Ok(depth)
+}
+
+impl SqliteQueue {
+    /// What `proposal_id` is like now (ADR-0079 decision 7): where it came
+    /// from, how deep its follow-ups go, how close its closest existing
+    /// task is (`dagq related`), and how often plan review sent it back.
+    /// `None` when it does not exist.
+    fn proposal_features(&self, proposal_id: ProposalId) -> Result<Option<ProposalFeatures>> {
+        let exists: bool = self.conn.query_row(
+            "SELECT count(*) > 0 FROM proposals WHERE id=?1",
+            [proposal_id],
+            |r| r.get(0),
+        )?;
+        if !exists {
+            return Ok(None);
+        }
+        let proposal = proposals::read(&self.conn, proposal_id)?;
+        let members = proposal.task_ids();
+        let has = |sql: &str| -> Result<bool> {
+            Ok(self.conn.query_row(sql, [proposal_id], |r| r.get(0))?)
+        };
+        let origin = plan_quality::origin(
+            has(
+                "SELECT count(*) > 0 FROM draft_origins d JOIN tasks t ON t.id = d.task_id
+                 WHERE t.proposal_id=?1 AND d.origin='follow_up'",
+            )?,
+            has(
+                "SELECT count(*) > 0 FROM draft_origins d JOIN tasks t ON t.id = d.task_id
+                 WHERE t.proposal_id=?1 AND d.origin='goal_gap'",
+            )?,
+            has("SELECT count(*) > 0 FROM findings WHERE proposal_id=?1")?,
+            proposal.owner().origin,
+        );
+        let mut follow_up = 0;
+        let mut related: Option<f64> = None;
+        for &task in members {
+            follow_up = follow_up.max(follow_up_depth(&self.conn, task)?);
+            let page = self.related(task.as_i64(), &[], members.len() + 1)?;
+            let best = page
+                .related
+                .iter()
+                .find(|other| !members.contains(&TaskId::new(other.id)))
+                .map(|other| other.score);
+            if let Some(best) = best {
+                related = Some(related.map_or(best, |kept| kept.max(best)));
+            }
+        }
+        Ok(Some(ProposalFeatures {
+            origin,
+            follow_up_depth: follow_up,
+            related_score: related,
+            revise_count: i64::from(proposal.revise_count()),
+        }))
+    }
+}
+
 impl PlanReviewStore for SqliteQueue {
     fn plan_review_candidates(&self) -> Result<Vec<PlanReviewCandidate>> {
         candidates(&self.conn)
@@ -327,6 +410,15 @@ impl PlanReviewStore for SqliteQueue {
         cwd: &Path,
     ) -> Result<Option<PlanReviewJob>> {
         let now = self.generators.clock.now();
+        // What the proposal is like, read before the write lock (task
+        // 579); a failure leaves it unrecorded, not the review undone.
+        let features = match self.proposal_features(proposal_id) {
+            Ok(features) => features.map(|features| features.payload()),
+            Err(error) => {
+                warn!("proposal {proposal_id}: features not recorded: {error:#}");
+                None
+            }
+        };
         // The spans it closes read their transcripts first (task 543).
         let _read = sessions::read_before(&self.conn, sessions::Closing::PlanReviews(None))?;
         let tx = self
@@ -389,7 +481,7 @@ impl PlanReviewStore for SqliteQueue {
             anchor,
             None,
             "plan_review_started",
-            json!({"proposal_id": proposal_id, "plan_review_id": id, "attempt": attempt, "dir": dir_text, "session_id": session_id, "cwd": cwd}),
+            json!({"proposal_id": proposal_id, "plan_review_id": id, "attempt": attempt, "dir": dir_text, "session_id": session_id, "cwd": cwd, "features": features}),
         )?;
         tx.commit()?;
         Ok(Some(PlanReviewJob {
@@ -1068,5 +1160,105 @@ mod tests {
         let opened = payload("session_opened");
         assert_eq!(opened["kind"], "plan_review");
         assert_eq!(opened["cwd"], "/repo");
+        // A person's proposal of one task close to nothing (task 579).
+        assert_eq!(
+            started["features"],
+            json!({"origin": "person", "follow_up_depth": 0, "related_score": null,
+                   "related": "low", "revise_count": 0})
+        );
+    }
+
+    fn new_task(title: &str) -> NewTask {
+        NewTask {
+            title: title.into(),
+            description: String::new(),
+            acceptance: String::new(),
+            verification_commands: Vec::new(),
+            required_evidence: Vec::new(),
+            paths: Vec::new(),
+            dependencies: Vec::new(),
+            goal_dependencies: Vec::new(),
+            priority: Default::default(),
+            goal_id: None,
+            context: String::new(),
+            kind: None,
+        }
+    }
+
+    /// A proposal of a follow-up of a follow-up is `follow_up` two deep,
+    /// and its closest task outside it scores; its own tasks do not.
+    #[test]
+    fn a_plan_review_records_what_its_proposal_is_like() {
+        use crate::domain::DraftOrigin;
+        let dir = tempfile::tempdir().unwrap();
+        let mut queue = SqliteQueue::init(dir.path().join("q.db")).unwrap();
+        let source = queue
+            .add(new_task("stats: count the widget gadgets per window"))
+            .unwrap()
+            .id();
+        let first = queue.add(new_task("widget gadgets")).unwrap().id();
+        let second = queue.add(new_task("widget gadgets again")).unwrap().id();
+        for (task, of) in [(first, source), (second, first)] {
+            queue
+                .record_draft_origin(
+                    task,
+                    DraftOrigin::FollowUp,
+                    &json!({"source_task_id": of.as_i64()}),
+                )
+                .unwrap();
+        }
+        let proposal_id = queue
+            .submit(Submission {
+                tasks: vec![first, second],
+                goals: Vec::new(),
+                proposal: None,
+                owner: PlannerOwner {
+                    origin: PlannerOrigin::Person,
+                    workspace_id: None,
+                },
+            })
+            .unwrap()
+            .id();
+        queue
+            .begin_plan_review(
+                proposal_id,
+                "token",
+                &dir.path().join("plan-reviews"),
+                Path::new("/repo"),
+            )
+            .unwrap()
+            .unwrap();
+        let text: String = queue
+            .conn
+            .query_row(
+                "SELECT payload FROM run_events WHERE kind='plan_review_started'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let features = &serde_json::from_str::<Value>(&text).unwrap()["features"];
+        assert_eq!(features["origin"], "follow_up");
+        assert_eq!(features["follow_up_depth"], 2);
+        assert_eq!(features["revise_count"], 0);
+        let best = queue.related(first.as_i64(), &[], 5).unwrap();
+        let outside = best
+            .related
+            .iter()
+            .find(|task| task.id == source.as_i64())
+            .unwrap()
+            .score;
+        let score = features["related_score"].as_f64().unwrap();
+        assert!(score >= outside, "{score} < {outside}");
+        assert_eq!(
+            features["related"],
+            crate::domain::plan_quality::related_tier(Some(score))
+        );
+        // A proposal that is gone has no features.
+        assert!(
+            queue
+                .proposal_features(ProposalId::new(99))
+                .unwrap()
+                .is_none()
+        );
     }
 }

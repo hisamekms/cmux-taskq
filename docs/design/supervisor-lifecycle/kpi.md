@@ -4,8 +4,8 @@ type: design
 title: "`kpi`"
 status: current
 created: 2026-09-26
-updated: 2026-09-26
-last_verified: 2026-09-26
+updated: 2026-09-27
+last_verified: 2026-09-27
 scope: runtime
 related:
   - design-supervisor-lifecycle
@@ -61,9 +61,24 @@ related:
 | `findings_open` / `finding_resolve_time` | 期間の終わりに`open` / `proposed`のfinding（`finding_recorded`と`finding_status_changed`から）、期間に`resolved`になったものの最初の記録からの秒。記録・解決の数は`details.findings` | `all` |
 | `improvement_proposals` | 記録が無い（ADR-0051の決定25の数え方の実装が無い）ので値はnull | `all` |
 | `session_open.<kind>` / `session_active.<kind>` / `session_active_ratio.<kind>` | worker以外のsessionの、窓に重なった時間の合計と稼働の割合（`stats`の`sessions.by_kind`） | `all` |
+| `plan.revise_rate` / `plan.duplicate_cancels_after_ready` / `plan.follow_up_canceled_after_adoption` / `plan.task_rework_rate` / `plan.follow_up_adoption_rate` | 計画の品質（下の[計画の品質](#計画の品質)） | 計画の層 |
 
 - `unavailable`は記録の無いKPIとその理由: `candidates`の`no_samples`（`candidates_sampled`を記録するsupervisorはまだ無い）、`improvement_proposals`の`not_recorded`。
 - `--goal`はそのgoalのtaskのrun・ask・findingだけを数える（`slot_usage`の分母はqueue全体のまま）。
+
+### 計画の品質
+
+[ADR-0079](../../adr/0079-record-task-weight-predictions-and-trial-model-effort-selection.md)の決定7の指標（task 579）。proposalとplan reviewを単位にし、判断したplan reviewのsessionのmodel / effortと、proposalの特徴で層別する。集計は`domain::plan_quality::plan_quality`（run_eventsだけから導く純粋関数）で、新しい表は持たない。
+
+- **proposalの特徴**: plan reviewの開始（`plan_review_started`の`features`。[plan-review](plan-review.md)）に、`origin`（`follow_up`（taskに`draft_origins`のfollow_upがある）> `goal_gap` > `observer`（findingがこのproposalを指す）> ownerの`runtime` / `person`の順で最初に当たるもの）、`follow_up_depth`（taskの`draft_origins`の`source_task_id`を辿ったfollow-upの深さの最大。無ければ0）、`related_score`（proposalの各taskの`dagq related`の結果のうちproposalの外のtaskの点数の最大。無ければnull）と`related`（`low` <3 / `mid` <6 / `high`、nullは`low`）、`revise_count`（そのときまでの差し戻しの回数）を記録する。jobの起動の前に書き込みのロックの外で読み、読めなければ`features: null`で、plan reviewは止めない。`features`の無い過去の記録の層は`unknown`
+- **判断したsession**: plan reviewの区間（`session_opened`の`plan_review_id`）の`session_closed`の`model` / `effort`（[provider-lifecycle](../provider-lifecycle.md#modelとeffort)）。記録が無ければ`unknown`。proposalを作り直したplannerは区間が無いので並べない
+- **層**: `all`、`model=`、`effort=`、`origin=`、`follow_up_depth=`、`related=`、`revise_count=`。`--by`によらず全部を出す。runの層（`kind=`など）は持たない
+- **plan reviewの単位**（`plan.revise_rate`）: 期間に`plan_review_finished`で終わったplan reviewのうち`decision: revise`の割合。そのplan reviewのsessionと開始時の特徴の層に入る
+- **proposalの単位**: 期間にtaskが最初に`ready`になったproposal（`task_submitted`の`proposal_id`で結ぶ）を、その前に始まった最後の（終わった）plan review（判断したreview。passは同じトランザクションでtaskを`ready`にしてから`plan_review_finished`を書くので、終わりではなく始まりで選ぶ）の層に入れる（reviewを一度も経ない`ready --bypass-review`などは`all`だけ）。taskのその後は期間で切らず、今までのeventで数えるので、最近の期間の値はまだ増えうる
+  - `plan.duplicate_cancels_after_ready`: そのtaskのうち`ready`になった後に重複としてcancelされたもの（`duplicate_of`のある`task_status_changed`か`task_canceled_as_duplicate`。`stats`の`duplicate_cancels`と同じ記録）の数。`n`はproposalの数
+  - `plan.follow_up_canceled_after_adoption`: そのtaskのうちfollow-up（`follow_up_registered`が指すtask）で、draftから採用された（task 470と同じく、draftから`canceled`以外へ出た）後にcancelされたものの数。`n`は採用されたfollow-upの数
+  - `plan.task_rework_rate`: そのtaskのうちrunのあるもので、taskに由来する手戻り（ADR-0079の決定1: `integration_deferred`の`verification_failed`、`review_finished`の`concern`、`revise_requested`。衝突とkillは数えない）があったものの割合
+- `plan.follow_up_adoption_rate`: `stats`の`draft_flow.by_origin.follow_up`（task 470）の`adopted` ÷ (`adopted` + `canceled`)。採らなかったdraftはproposalに入らず判断したsessionが無いので、`all`だけ。良い向きは持たない
 
 ## 目標（`targets`）
 

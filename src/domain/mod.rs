@@ -563,6 +563,7 @@ pub mod kpi;
 pub mod lint;
 pub mod marks;
 pub mod measure;
+pub mod plan_quality;
 pub mod plan_review;
 pub mod planner;
 pub mod proposal;

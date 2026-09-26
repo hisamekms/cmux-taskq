@@ -984,3 +984,165 @@ fn a_goal_keeps_only_its_runs() {
     );
     assert_eq!(result.config.min_samples, config::DEFAULT_MIN_SAMPLES);
 }
+
+/// The quality of the plans per day (ADR-0079 decision 7): the revises of
+/// plan review split by the model and effort of its session, and the
+/// proposal's tasks' rework and duplicates by the review that judged it and
+/// the proposal's features; the follow-ups adopted as `draft_flow` counts
+/// them.
+#[test]
+fn plan_quality_is_split_by_the_judging_session_and_the_proposal() {
+    let mut queue = Queue::default();
+    let tuesday = MONDAY + DAY + 10 * HOUR;
+    let features = |revise_count: i64| {
+        json!({"origin": "person", "follow_up_depth": 0, "related_score": 4.0,
+               "related": "mid", "revise_count": revise_count})
+    };
+    let review = |queue: &mut Queue, review: i64, effort: &str, decision: &str, at: i64| {
+        queue.push(
+            Some(10),
+            None,
+            "plan_review_started",
+            json!({"proposal_id": 1, "plan_review_id": review,
+                   "features": features(review - 1)}),
+            at,
+        );
+        queue.push(
+            Some(10),
+            None,
+            "session_opened",
+            json!({"kind": "plan_review", "plan_review_id": review, "marker": review}),
+            at,
+        );
+        queue.push(
+            Some(10),
+            None,
+            "plan_review_finished",
+            json!({"proposal_id": 1, "plan_review_id": review, "decision": decision}),
+            at + 60,
+        );
+        queue.push(
+            Some(10),
+            None,
+            "session_closed",
+            json!({"kind": "plan_review", "opened_marker": review,
+                   "model": "claude-opus-5-5", "effort": effort}),
+            at + 60,
+        );
+    };
+    for task in [10, 11] {
+        queue.push(
+            Some(task),
+            None,
+            "task_submitted",
+            json!({"proposal_id": 1}),
+            tuesday - 60,
+        );
+    }
+    review(&mut queue, 1, "medium", "revise", tuesday);
+    review(&mut queue, 2, "high", "pass", tuesday + HOUR);
+    // Task 10 is a follow-up draft adopted into the proposal; task 11's run
+    // is sent back to revise; 10 lands.
+    queue.push(
+        Some(9),
+        None,
+        "follow_up_registered",
+        json!({"task_id": 10}),
+        tuesday - 2 * HOUR,
+    );
+    queue.push(
+        Some(10),
+        None,
+        "task_created",
+        json!({}),
+        tuesday - 2 * HOUR,
+    );
+    queue.push(
+        Some(10),
+        None,
+        "task_status_changed",
+        json!({"from": "draft", "to": "submitted"}),
+        tuesday - HOUR,
+    );
+    let mut revised = Run::new(11, Some(TaskKind::Runtime), tuesday + 3 * HOUR, 600);
+    revised.revise = true;
+    queue.run(&revised);
+    queue.run(&Run::new(
+        10,
+        Some(TaskKind::Runtime),
+        tuesday + 3 * HOUR,
+        300,
+    ));
+    queue.sort();
+    // Link each session_closed to its session_opened by the ids sorting
+    // gave them.
+    let opened: HashMap<i64, i64> = queue
+        .events
+        .iter()
+        .filter(|e| e.kind == "session_opened")
+        .map(|e| (e.payload["marker"].as_i64().unwrap(), e.id.as_i64()))
+        .collect();
+    for event in &mut queue.events {
+        if let Some(marker) = event.payload.get("opened_marker").and_then(Value::as_i64) {
+            event.payload["opened_event_id"] = json!(opened[&marker]);
+        }
+    }
+    let kpi = queue.kpi(
+        MONDAY + 2 * DAY + HOUR,
+        &KpiConfig::default(),
+        &KpiQuery {
+            last: 2,
+            ..KpiQuery::default()
+        },
+    );
+    let day = &kpi.periods[0];
+    assert_eq!(day.label, "2026-09-22");
+    let value = |name: &str, stratum: &str| {
+        let measure = measure(day, name, stratum);
+        (measure.n, measure.value)
+    };
+    assert_eq!(value("plan.revise_rate", "all"), (2, Some(0.5)));
+    assert_eq!(value("plan.revise_rate", "effort=medium"), (1, Some(1.0)));
+    assert_eq!(value("plan.revise_rate", "effort=high"), (1, Some(0.0)));
+    assert_eq!(value("plan.revise_rate", "revise_count=0"), (1, Some(1.0)));
+    // The proposal was judged by the high review of its second submission.
+    assert_eq!(
+        value("plan.task_rework_rate", "effort=high"),
+        (2, Some(0.5))
+    );
+    assert_eq!(
+        value("plan.task_rework_rate", "model=claude-opus-5-5"),
+        (2, Some(0.5))
+    );
+    assert_eq!(
+        value("plan.task_rework_rate", "related=mid"),
+        (2, Some(0.5))
+    );
+    assert_eq!(
+        value("plan.task_rework_rate", "revise_count=1"),
+        (2, Some(0.5))
+    );
+    assert_eq!(
+        value("plan.task_rework_rate", "origin=person"),
+        (2, Some(0.5))
+    );
+    assert_eq!(value("plan.task_rework_rate", "effort=medium"), (0, None));
+    assert_eq!(
+        value("plan.duplicate_cancels_after_ready", "effort=high"),
+        (1, Some(0.0))
+    );
+    assert_eq!(
+        value("plan.follow_up_canceled_after_adoption", "effort=high"),
+        (1, Some(0.0))
+    );
+    assert_eq!(value("plan.follow_up_adoption_rate", "all"), (1, Some(1.0)));
+    // The next day has no review: its rate is null, next to the previous.
+    let next = &kpi.periods[1];
+    assert_eq!(measure(next, "plan.revise_rate", "all").value, None);
+    assert_eq!(
+        next.comparison["plan.revise_rate"]["all"].previous,
+        Some(0.5)
+    );
+    assert_eq!(direction("plan.task_rework_rate"), Some(Direction::Lower));
+    assert_eq!(direction("plan.follow_up_adoption_rate"), None);
+}

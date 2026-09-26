@@ -10,8 +10,9 @@ use serde_json::Value;
 
 use super::{ALL, Axis, KpiInput, Kpis, Measure, UNKNOWN, float};
 use crate::domain::{
-    EventId, GoalId, RunEvent, RunId, TaskId, TaskKind, event_attention,
+    DraftOrigin, EventId, GoalId, RunEvent, RunId, TaskId, TaskKind, event_attention,
     marks::{self, Mark},
+    plan_quality::plan_quality,
     stats::{
         self, Cursor, LiveSnapshot, RunStats, SlotSnapshot, StatsQuery, asks::human_waits,
         landing::PHASES, measures::verification_durations, timestamp_millis,
@@ -482,6 +483,54 @@ impl<'a> Context<'a> {
                 ),
             );
         }
+
+        // The quality of the plans (ADR-0079 decision 7): split by the
+        // judging plan review session's model and effort and by the
+        // proposal's features.
+        for (stratum, quality) in plan_quality(events, after, upto, |t| self.counts(t)) {
+            put(
+                "plan.revise_rate",
+                &stratum,
+                Measure::ratio(float(quality.revises as i64), quality.reviews),
+            );
+            put(
+                "plan.duplicate_cancels_after_ready",
+                &stratum,
+                Measure::total(
+                    Some(float(quality.duplicate_cancels_after_ready as i64)),
+                    quality.proposals,
+                ),
+            );
+            put(
+                "plan.follow_up_canceled_after_adoption",
+                &stratum,
+                Measure::total(
+                    Some(float(quality.follow_ups_canceled_after_adoption as i64)),
+                    quality.follow_ups,
+                ),
+            );
+            put(
+                "plan.task_rework_rate",
+                &stratum,
+                Measure::ratio(float(quality.tasks_reworked as i64), quality.tasks_run),
+            );
+        }
+        // The follow-ups adopted as `stats`' `draft_flow` counts them
+        // (task 470): whose plan rejected one is not recorded.
+        let follow_ups = stats
+            .draft_flow
+            .by_origin
+            .get(DraftOrigin::FollowUp.as_str())
+            .cloned()
+            .unwrap_or_default();
+        put(
+            "plan.follow_up_adoption_rate",
+            ALL,
+            Measure::ratio(
+                float(follow_ups.adopted),
+                usize::try_from(follow_ups.adopted + follow_ups.canceled).unwrap_or(0),
+            ),
+        );
 
         let breakdown = &stats.overall.land_phases;
         let tail: i64 = breakdown.phases.iter().map(|phase| phase.tail_total).sum();

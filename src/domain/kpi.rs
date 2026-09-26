@@ -430,7 +430,10 @@ pub enum Direction {
 pub fn direction(kpi: &str) -> Option<Direction> {
     match kpi {
         "landings" | "slot_usage" | "first_pass_rate" => Some(Direction::Higher),
-        "auto_repairs" | "improvement_proposals" | "candidates" => None,
+        "auto_repairs"
+        | "improvement_proposals"
+        | "candidates"
+        | "plan.follow_up_adoption_rate" => None,
         _ if kpi.starts_with("session_active") => None,
         _ if kpi.starts_with("session_open.") => {
             (kpi == "session_open.worker").then_some(Direction::Lower)

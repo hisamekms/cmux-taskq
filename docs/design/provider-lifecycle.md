@@ -4,8 +4,8 @@ type: design
 title: Agent provider lifecycle
 status: current
 created: 2026-09-21
-updated: 2026-09-26
-last_verified: 2026-09-26
+updated: 2026-09-27
+last_verified: 2026-09-27
 scope: provider
 related:
   - adr-0004
@@ -64,8 +64,8 @@ runtimeが起動するClaude sessionは、kindごとの区間（`session_opened`
 
 - **推定で閉じる（`inferred`）**: runのsessionの区間（`worker` / `resume` / `revise`）は、`session_exited`の無いまま次の`agent_started`が来たとき、`workspace_closed`・`run_recovered`・`triage_started`で閉じる（`run_recovered`と`triage_started`は開いている`review`も閉じる）。`record_runtime_event`はeventと区間を1つの書き込みトランザクション（`BEGIN IMMEDIATE`）で書く。jobの区間は、終わりのeventの無いまま同じkindの次の開始（別のsupervisorが引き継いだreviewの`review_started`、triageの`triage_started`、次の`observe_started`）で閉じ、plan reviewは行を`interrupted`で閉じたとき（supervisorが居ない行は`inferred`、proposalが動いたときは`job_finished`）に閉じる。時刻は、transcriptが読めればその最後のレコードの時刻（区間の開始と閉じたeventの時刻の間に収める）、読めなければ閉じたeventの時刻。
 - **失敗したreview**（task 541）: headlessのreviewのjobがverdictを返さずに終わった（非0・timeout・やり直しでも読めないverdict）か起動できなかったとき、`review_failed`はworkerのsessionの`/exit`の後に記録する（[review](supervisor-lifecycle/review.md)の5）ので、supervisorはjobの終わった時点で`RunStore::close_review_session`（`infrastructure::sessions::close_review`）を呼び、そのrunの開いている`review`の区間を`job_finished`で閉じる（時刻はそのとき。書くのは`session_closed`（と`session_turns`）だけで、runtimeのeventは足さない）。区間には`/exit`の待ち（`stuck_exit`を含む）が入らない。後の`review_failed`は閉じる区間が無いので何も書かない。閉じるのに失敗してもlogだけで、その区間は従来どおり`review_failed`で閉じる。過去のeventから作る区間は変わらない。
-- `session_opened`のpayloadは`kind`、`session_id`、`cwd`（runのsessionとreviewはworktree、triageはrun directory、observerは観測のdirectory、plan reviewは`plan_review_started`の`cwd`＝jobを起動したrepositoryのcheckout。`cwd`を持たない過去の`plan_review_started`からの区間はnull）、`transcript_path`（null）、`attempt`、`workspace_id`（`worker`はrunのworkspace、`revise`は`revise_requested`のもの）、plan reviewは`proposal_id`・`plan_review_id`・`goal_ids`（その時のproposalのtaskのgoal）。`session_closed`は`opened_event_id`・`kind`・`session_id`・`reason`と、稼働時間を記録したか（`active`: `recorded`なら`active_secs`、`unavailable`なら理由のコード`active_unavailable`。下の[transcriptと稼働時間](#transcriptと稼働時間)）。runのsessionの区間（`worker` / `resume` / `revise`）は、transcriptが読めれば作業の内訳`work`も持つ（下の[作業の内訳](#作業の内訳)）。どの区間も、transcriptが読めれば区間のトークン数`tokens`を持つ（下の[トークン数とコスト](#トークン数とコスト)）。1つの区間は1回だけ閉じる（閉じた区間への2回目の終了は何も書かない）。
-- inbox・planner・runtimeが立てるplannerの区間（hook）は後続taskが足す。queueのeventとして`session_opened` / `session_closed` / `session_turns`を書けるよう、migration 0035がrun_eventsのCHECKにこの3つを足した（breaking）。このADRが入る前のrunには区間が無く、埋め直さない。
+- `session_opened`のpayloadは`kind`、`session_id`、`cwd`（runのsessionとreviewはworktree、triageはrun directory、observerは観測のdirectory、plan reviewは`plan_review_started`の`cwd`＝jobを起動したrepositoryのcheckout。`cwd`を持たない過去の`plan_review_started`からの区間はnull）、`transcript_path`（null）、`attempt`、`workspace_id`（`worker`はrunのworkspace、`revise`は`revise_requested`のもの）、plan reviewは`proposal_id`・`plan_review_id`・`goal_ids`（その時のproposalのtaskのgoal）。`session_closed`は`opened_event_id`・`kind`・`session_id`・`reason`と、稼働時間を記録したか（`active`: `recorded`なら`active_secs`、`unavailable`なら理由のコード`active_unavailable`。下の[transcriptと稼働時間](#transcriptと稼働時間)）。runのsessionの区間（`worker` / `resume` / `revise`）は、transcriptが読めれば作業の内訳`work`も持つ（下の[作業の内訳](#作業の内訳)）。どの区間も、transcriptが読めれば区間のトークン数`tokens`と、使ったmodel / effort（`model`・`effort`、変わったなら`models`）を持つ（下の[トークン数とコスト](#トークン数とコスト)と[modelとeffort](#modelとeffort)）。1つの区間は1回だけ閉じる（閉じた区間への2回目の終了は何も書かない）。
+- inbox・planner・runtimeが立てるplannerの区間（hook）は後続taskが足す（人が開くplannerはtask 387）。区間が無いので、これらのsessionのmodel / effortも今は記録されない（task 579の計測の対象外）。queueのeventとして`session_opened` / `session_closed` / `session_turns`を書けるよう、migration 0035がrun_eventsのCHECKにこの3つを足した（breaking）。このADRが入る前のrunには区間が無く、埋め直さない。
 
 Claude providerはcmux内の通常セッションを起動し、実装、unit test、E2E、subagent review、完了レポートを実行させる。Codex providerはCodexの対応するセッション方式を使う。provider capabilityとしてinteractive、subagents、stream events、structured resultを表現する。
 
@@ -105,6 +105,16 @@ runのsessionの区間（`worker` / `resume` / `revise`）は、閉じるとき�
 - **eventのpayload**: `session_closed`の`tokens`（`{input, output, cache_read, cache_creation, messages}`と、あれば`cost_usd`。小数6桁）。runのsessionの区間は同じものを`session_exited`の`tokens`（その終了が閉じた区間のもの）と`resume_finished`の`tokens`（`work_breakdown`と同じく、その`resume_started`の後に開いて閉じた`resume`の区間のもの）にも載せる。区間に`assistant`のレコードが無ければ0を記録する
 - **読めない版**: transcriptが読めなければ（上のコード）記録しない。読めても、区間の`assistant`のレコードの`usage`に数値の`input_tokens`と`output_tokens`が無いか、`assistant`のレコードがあるのにどれも`usage`を持たなければ、その版の形式を知らないものとして`usage_unsupported`とし、`tokens`を書かない。どちらも理由とClaude Codeのversionを`info`のtracingに書くだけで、区間を閉じたevent・run・jobの結果は変わらない
 - Claude Code自身のtelemetry（OTLP）とは別の経路で、ここではOTLPを使わない
+
+### modelとeffort
+
+どのkindの区間も、閉じるときにトークン数と同じtranscriptから、区間のmessageを書いたmodelとeffortを記録する（task 579、[ADR-0079](../adr/0079-record-task-weight-predictions-and-trial-model-effort-selection.md)の決定7の(a)。worker以外のアクターの今の既定（medium）の基準値をためるため）。起動の引数は変えず、Claude Codeが応答ごとに書いた値を読むだけ。規則は`domain::tokens::span_models`（純粋関数）、読み取りは`domain::transcript`（`TranscriptRecord`の`model`・`effort`）。
+
+- **読むもの**: 区間（`[開始, 終わり)`、推定で閉じたときは最後のレコードを含む。トークン数と同じ範囲）の`assistant`のレコードの`message.model`と、レコードの`effort`（`low` / `medium` / `high` / `xhigh`など）。sidechain（subagent）のレコードと、`<synthetic>`（Claude Codeが自分で書いたmessage）は数えない。`message.id`が同じレコードは1つのmessageとして最初のものだけを数える
+- **eventのpayload**: `session_closed`の`model`と`effort`は、最も多くのmessageを書いた組（同数なら後に使った組）。区間の中で組が変わったら、組ごとの`{model, effort, messages}`を多い順に`models`に並べる（1組なら書かない）。`effort`を書かない版のtranscriptでは`effort`はnull
+- **対象**: `worker` / `resume` / `revise`と、headlessのjobの`review` / `triage` / `plan_review` / `observer`。復旧（`recover`）のjobは区間を持たない。人が`dagq plan`で開くplannerとruntimeが立てるplannerは区間がまだ無い（task 387が人の開くplannerの記録を足す）ので対象外
+- **読めないとき**: transcriptが読めない、またはどのmessageもmodelを持たなければ何も書かない。区間を閉じたevent・run・jobの結果は変わらず、区間は失敗にならない
+- 読み口: `stats`の`sessions.by_kind[kind].models`（[stats](supervisor-lifecycle/stats.md#claude-session)）と、plan reviewのsessionを判断したsessionとして並べる`kpi`の計画の品質（[kpi](supervisor-lifecycle/kpi.md#計画の品質)）
 
 ## Trust prompt
 

@@ -41,6 +41,11 @@ pub struct TranscriptRecord {
     /// `costUSD` of an `assistant` record, which some versions of Claude
     /// Code wrote.
     pub cost_usd: Option<f64>,
+    /// `message.model` of an `assistant` record (task 579).
+    pub model: Option<String>,
+    /// `effort` of an `assistant` record: the reasoning effort Claude Code
+    /// asked the model for (task 579).
+    pub effort: Option<String>,
     /// An `assistant` record (the model wrote it), for the work breakdown.
     pub assistant: bool,
     /// The tools an `assistant` record called (task 514).
@@ -139,6 +144,12 @@ impl TranscriptRecord {
                     .flatten(),
                 cost_usd: (kind == "assistant")
                     .then(|| line["costUSD"].as_f64())
+                    .flatten(),
+                model: (kind == "assistant")
+                    .then(|| line["message"]["model"].as_str().map(str::to_owned))
+                    .flatten(),
+                effort: (kind == "assistant")
+                    .then(|| line["effort"].as_str().map(str::to_owned))
                     .flatten(),
                 assistant: kind == "assistant",
                 tool_uses,

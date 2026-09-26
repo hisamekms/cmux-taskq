@@ -4,8 +4,8 @@ type: design
 title: "`stats`"
 status: current
 created: 2026-09-26
-updated: 2026-09-26
-last_verified: 2026-09-26
+updated: 2026-09-27
+last_verified: 2026-09-27
 scope: runtime
 related:
   - design-supervisor-lifecycle
@@ -91,7 +91,7 @@ related:
   - `times`は人の回答待ちの時間（task 468）。`by_kind`はaskのkind（`approve_landing` / `decide` / `stuck_exit` / `planner_question` / `blocked`など）、`by_asked_by`は`ask_opened`の`asked_by`ごとに`{to_answer, to_apply, answer_to_apply, open}`を出し、それぞれ`{count, median, p90, max}`（秒、`p90`は最近順位法、無ければnull）。`to_answer`は`ask_answered`がwindowにあるaskの`ask_opened`から最初の`ask_answered`まで、`to_apply`は回答の適用がwindowにあるaskの`ask_opened`から適用まで、`answer_to_apply`は同じaskの回答から適用まで。適用は、回答の後でそのaskの`ask_id`をpayloadに持つ最初のイベント（`ask_closed`（`ask close`・supervisorが答えを適用して閉じたとき）、`ask_delivered`、`integration_approved` / `triage_decided` / `stall_resolved` / `planner_answer_closed`などruntimeが適用したイベント。`ask_updated` / `ask_delivery_failed`と、回答が届いた時点で終わるrunの待ちの`run_waiting_*` / `run_slot_regained`は適用ではない。runtimeが回答済みのaskを閉じるときも`ask_closed`を書く）で、runtimeが自分で閉じた回答（`runtime_closed: true`）は回答そのもの。`open`はwindowの終わりまでに`ask_answered`の無いask（windowより前に開いたものも含む）の、windowの終わり（`--until`などで止まらなければ今）までの経過時間。`ask_opened`の時刻が読めないaskは数えない。`--goal`の絞り込みは他の`asks`と同じ。`ask_closed`を記録する前に閉じたaskは、他の適用のイベントが無ければ`to_apply`に入らない。
 - **`auto_repairs`**: `{count, by_layer: {<layer>: {count, by_repair}}, by_day: {<YYYY-MM-DD>: {auto_repaired, by_repair, asks_opened, asks_by_reason}}}`（ADR-0047の決定45、task 362）。`asks`と同じwindowと`--goal`の絞り込みで、runtimeと復旧jobが人を待たずに直した（記録の失敗はlogに書くだけでrunの進行を止めない）`auto_repaired`を`layer`（`runtime` / `recovery`）と`repair`ごとに数え、`by_day`はイベントの`created_at`のUTCの日ごとに、その日の`auto_repaired`（`repair`ごと）と`ask_opened`（`reason_category`ごと）を並べる。自動で直した件数とinboxに届いたaskの件数を日ごとに並べて、inboxに来る件数が減ったかを読む。集計は`domain::stats::auto_repairs`がrun_eventsから再導出する。記録している`repair`: `dialog_answered`（既知のダイアログ、[Prompt waiting](prompt-waiting.md#既知のダイアログ)）、`submit_enter_retry`（入力欄に残った文や`/exit`がEnterの送り直しで入力欄を離れたことを画面で確かめたとき。`conditions`に`input`・`retries`。残ったまま・ダイアログ・画面が読めないときは記録しない）、`receipt_rewrite_requested`（古いreceiptの書き直しの促しが入力欄を離れたとき。入力欄に残るかダイアログならaskの経路に進み記録しない。`conditions`に`receipt_commit`・`head`）、`conflict_resume_uncounted`（衝突だけの`needs_session`のresumeを上限に数えずに始めたとき。`resume_started`と同じトランザクション。`conditions`に数えなかった根拠の`review_passed`・`landing_approved`・`rechecked`）、`resume_adopted`（入れ替え後のsupervisorが`handoff.json`からresumeしたsessionの監視を引き継いだとき。staleなleaseの`needs_session`のrunのadoptは未実装で記録しない）、`inherit_retry`（[Needs session](needs-session.md)）、復旧jobの`stop_processes` / `send_instruction`など（`layer: recovery`）。`exit_forced_close`（cmuxの時間切れで`/exit`がどの試行でもsessionに届かず、着地するrunのreceiptがcleanなworktreeのHEADに対して成り立つので、workspaceを閉じて着地へ進めたとき。`exit_unsent`の`action: close_and_land`、task 354。`conditions`に`cause`・`attempts`）。`/exit`のcmuxの呼び出しの再試行そのもの（1回の送信の中の試行）は数えない。決定25の`exit_request_timed_out`の後に間隔を空けて`/exit`を送り直す再試行（`exit_retry`）と`disk_cleanup`は、その経路が入ったときに記録する。
 - **`draft_flow`**: `{landings, registered, adopted, canceled, kept_draft, backlog, oldest_backlog_secs, oldest_backlog_task_id, drafts_per_landing, inflow_per_outflow, by_origin: {<origin>: {registered, adopted, canceled, kept_draft, backlog, oldest_backlog_secs, oldest_backlog_task_id}}}`（task 470）。`asks`と同じwindowと`--goal`の絞り込みで、着地の数とruntimeやjobが登録したdraftの流入・流出・滞留を並べる（下の[draftの流入と流出](#draftの流入と流出)）
-- **`sessions`**: `{window: {after, upto}, by_kind: {<kind>: {count, open, active, active_ratio, open_now, inferred, active_unavailable, tokens}}}`。`backend_failures`と同じwindowと重なるClaude sessionの区間をkindごとに数える（下の[Claude session](#claude-session)）
+- **`sessions`**: `{window: {after, upto}, by_kind: {<kind>: {count, open, active, active_ratio, open_now, inferred, active_unavailable, tokens, models}}}`。`backend_failures`と同じwindowと重なるClaude sessionの区間をkindごとに数える（下の[Claude session](#claude-session)）
 
 ## 着地待ちの内訳
 
@@ -161,6 +161,7 @@ task 199で足した集計。Claude sessionの区間が閉じるとき、runtime
 - **`runs`の`tokens`**: `{sessions, input, output, cache_read, cache_creation, total, cost_usd, cost_sessions, by_kind: {<kind>: {sessions, input, output, cache_read, cache_creation, total, cost_usd, cost_sessions}}}`。そのrunの区間（`worker` / `resume` / `revise` / `review` / `triage`）の`tokens`を足したもの。windowで切らない
 - **`goals`と`overall`の`tokens`**（`kinds`も同じ形）: `{runs, input, output, cache_read, cache_creation, total, cost_usd}`で、`input`などはrunごとの値の`{count, total, median}`、`cost_usd`はコストのあるrunの`{count, total, median}`。`runs`はトークン数のあるrunの数で、無いrunは数えない
 - **`sessions.by_kind`の`tokens`**: kindごとに、windowの中で閉じた区間の`tokens`の合計（`runs`の`tokens`から`by_kind`を除いた形）。runを持たない`observer`と`plan_review`のトークン数はここで読む
+- **`sessions.by_kind`の`models`**（task 579）: kindごとに、windowの中で閉じた区間を、`session_closed`の`model`と`effort`（[provider-lifecycle](../provider-lifecycle.md#modelとeffort)）を空白でつないだ`"<model> <effort>"`（effortの無い記録は`unknown`）ごとに数えたもの。modelを記録しなかった区間は数えない。worker以外のアクターの基準値はここで読む。計画の品質（proposalごと）は[kpi](kpi.md#計画の品質)
 
 ## draftの流入と流出
 

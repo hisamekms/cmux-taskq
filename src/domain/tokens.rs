@@ -3,8 +3,10 @@
 //! message. The cost is Claude Code's own `costUSD` when every message
 //! counted has one; it is never computed from prices. Reading the file is
 //! the infrastructure's (`infrastructure::transcripts`); this is pure.
+//! The model and effort a span's messages were written with (task 579)
+//! come from the same records ([`span_models`]).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 use serde_json::{Value, json};
 
@@ -122,6 +124,83 @@ pub fn span_usage(
     Ok(usage)
 }
 
+/// The model Claude Code names for a message it made up itself (an API
+/// error, an interruption): no model wrote it.
+const SYNTHETIC_MODEL: &str = "<synthetic>";
+
+/// The model and effort of the messages of a span, and how many messages
+/// each pair wrote.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelUse {
+    pub model: String,
+    /// Absent when the records do not say (older Claude Code).
+    pub effort: Option<String>,
+    pub messages: i64,
+}
+
+/// The models and efforts of the session's own (not a subagent's)
+/// assistant messages from `start` to `end` (unix milliseconds, `[start,
+/// end)`), the pair that wrote the most messages first (the later one on a
+/// tie). A message is counted once, with its first record that names a
+/// model. Empty when no message names one.
+pub fn span_models(records: &[TranscriptRecord], start: i64, end: i64) -> Vec<ModelUse> {
+    let mut seen: HashSet<String> = HashSet::new();
+    // (model, effort) → (messages, the last message's position).
+    let mut pairs: BTreeMap<(String, Option<String>), (i64, usize)> = BTreeMap::new();
+    for (at, record) in records.iter().enumerate() {
+        if !record.assistant || record.sidechain || record.at < start || record.at >= end {
+            continue;
+        }
+        let Some(model) = record.model.as_deref().filter(|m| *m != SYNTHETIC_MODEL) else {
+            continue;
+        };
+        let key = record
+            .message_id
+            .clone()
+            .unwrap_or_else(|| format!("#{at}"));
+        if !seen.insert(key) {
+            continue;
+        }
+        let pair = pairs
+            .entry((model.to_owned(), record.effort.clone()))
+            .or_default();
+        pair.0 += 1;
+        pair.1 = at;
+    }
+    let mut uses: Vec<(ModelUse, usize)> = pairs
+        .into_iter()
+        .map(|((model, effort), (messages, last))| {
+            (
+                ModelUse {
+                    model,
+                    effort,
+                    messages,
+                },
+                last,
+            )
+        })
+        .collect();
+    uses.sort_by(|(a, a_last), (b, b_last)| b.messages.cmp(&a.messages).then(b_last.cmp(a_last)));
+    uses.into_iter().map(|(model, _)| model).collect()
+}
+
+/// What a `session_closed` records of `uses`: `model` and `effort` of the
+/// pair that wrote the most, and `models` (each pair with its `messages`)
+/// when there was more than one. Nothing when `uses` is empty.
+pub fn models_payload(uses: &[ModelUse], payload: &mut Value) {
+    let Some(main) = uses.first() else {
+        return;
+    };
+    payload["model"] = json!(main.model);
+    payload["effort"] = json!(main.effort);
+    if uses.len() > 1 {
+        payload["models"] = uses
+            .iter()
+            .map(|pair| json!({"model": pair.model, "effort": pair.effort, "messages": pair.messages}))
+            .collect();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -218,6 +297,81 @@ mod tests {
 
     fn usage_of(id: &str) -> Value {
         usage(id, 1, 1, 0, 0)
+    }
+
+    fn written(secs: i64, id: &str, model: &str, effort: Option<&str>) -> String {
+        let mut value = json!({"message": {"id": id, "model": model, "content": []}});
+        if let Some(effort) = effort {
+            value["effort"] = json!(effort);
+        }
+        line(secs, value)
+    }
+
+    /// Each message counts once for its model and effort; subagents,
+    /// synthetic messages and records outside the span do not count.
+    #[test]
+    fn a_span_records_the_models_and_efforts_its_messages_used() {
+        let opus = "claude-opus-5-5";
+        let records = records(&[
+            written(5, "m0", "claude-sonnet-5", Some("low")),
+            written(10, "m1", opus, Some("medium")),
+            written(11, "m1", opus, Some("medium")),
+            written(12, "m2", opus, Some("high")),
+            written(13, "m3", opus, Some("medium")),
+            {
+                let mut sub = json!({"isSidechain": true,
+                    "message": {"id": "s1", "model": "claude-haiku-4-5", "content": []}});
+                sub["effort"] = json!("medium");
+                line(14, sub)
+            },
+            written(15, "m4", "<synthetic>", None),
+            written(20, "m5", "claude-sonnet-5", Some("low")),
+        ]);
+        let uses = span_models(&records, 10_000, 20_000);
+        assert_eq!(
+            uses,
+            vec![
+                ModelUse {
+                    model: opus.into(),
+                    effort: Some("medium".into()),
+                    messages: 2,
+                },
+                ModelUse {
+                    model: opus.into(),
+                    effort: Some("high".into()),
+                    messages: 1,
+                },
+            ]
+        );
+        let mut payload = json!({});
+        models_payload(&uses, &mut payload);
+        assert_eq!(
+            payload,
+            json!({"model": opus, "effort": "medium", "models": [
+                {"model": opus, "effort": "medium", "messages": 2},
+                {"model": opus, "effort": "high", "messages": 1},
+            ]})
+        );
+        // One pair: no breakdown. A tie goes to the later pair; an effort
+        // the records do not name is null.
+        let tie = records_of(&[
+            written(1, "a", opus, None),
+            written(2, "b", "claude-sonnet-5", Some("medium")),
+        ]);
+        let uses = span_models(&tie, 0, 10_000);
+        assert_eq!(uses[0].model, "claude-sonnet-5");
+        let mut payload = json!({});
+        models_payload(&uses[1..], &mut payload);
+        assert_eq!(payload, json!({"model": opus, "effort": null}));
+        // No message names a model: nothing.
+        assert!(span_models(&records, 30_000, 40_000).is_empty());
+        let mut payload = json!({});
+        models_payload(&[], &mut payload);
+        assert_eq!(payload, json!({}));
+    }
+
+    fn records_of(lines: &[String]) -> Vec<TranscriptRecord> {
+        records(lines)
     }
 
     /// A usage without numeric counts, or assistant records none of which

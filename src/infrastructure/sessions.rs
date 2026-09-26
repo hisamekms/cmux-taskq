@@ -339,7 +339,8 @@ fn now(conn: &Connection) -> Result<String> {
 /// cannot be read leaves the active time unrecorded, and says why. A run's
 /// own session also gets its work breakdown (task 514), returned with the
 /// span's kind and attempt, and every span its tokens (task 199), which a
-/// run's own session also returns.
+/// run's own session also returns. Every span also gets the model and
+/// effort its messages were written with (task 579).
 fn close(
     conn: &Connection,
     now: &str,
@@ -389,6 +390,12 @@ fn close(
                     transcript.version().unwrap_or("version unknown"),
                 ),
             }
+            // The model and effort its messages used (task 579), none when
+            // no message names a model.
+            tokens::models_payload(
+                &tokens::span_models(&transcript.records, start, tokens_end),
+                &mut payload,
+            );
             if let Some(run_id) = run_id.filter(|_| RUN_SESSION.contains(&span.kind())) {
                 let breakdown = work_breakdown(conn, run_id, span, &transcript, start, end)?;
                 closed.work = Some(exited_work(
@@ -1600,6 +1607,91 @@ mod tests {
         assert_eq!(closed.payload["reason"], "inferred");
         assert_eq!(closed.created_at, millis_text(start + 20_000));
         assert_eq!(closed.payload["tokens"]["output"], 6);
+    }
+
+    /// Every span closes with the model and effort of its transcript's
+    /// messages (task 579): a headless job's and a run's own, with the
+    /// breakdown when they changed in it; a span whose transcript cannot be
+    /// read records none and still closes.
+    #[test]
+    fn spans_record_the_models_and_efforts_of_their_transcripts() {
+        let dir = tempfile::tempdir().unwrap();
+        let (queue, task_id, run) = run_queue(dir.path());
+        let project = dir.path().join("config/projects/-wt");
+        std::fs::create_dir_all(&project).unwrap();
+        let write = |session: &str, base: i64, lines: &[(i64, &str, &str, &str)]| {
+            let mut text = vec![
+                json!({"type": "user", "timestamp": millis_text(base + 1000),
+                       "sessionId": session, "message": {"content": "go"}})
+                .to_string(),
+            ];
+            text.extend(lines.iter().map(|(secs, id, model, effort)| {
+                json!({"type": "assistant", "timestamp": millis_text(base + secs * 1000),
+                       "sessionId": session, "version": "2.1.283", "effort": effort,
+                       "message": {"id": id, "model": model, "content": [],
+                                   "usage": {"input_tokens": 1, "output_tokens": 1}}})
+                .to_string()
+            }));
+            std::fs::write(project.join(format!("{session}.jsonl")), text.join("\n")).unwrap();
+        };
+        let record = |kind: &str, payload: Value| {
+            event(&queue.conn, task_id, Some(&run), kind, payload).unwrap();
+        };
+        let opus = "claude-opus-5-5";
+
+        record("agent_started", json!({"session_id": RUN}));
+        let start = retime(&queue.conn, 0, 100);
+        write(
+            RUN,
+            start,
+            &[
+                (2, "m1", opus, "medium"),
+                (3, "m2", opus, "high"),
+                (4, "m3", opus, "high"),
+            ],
+        );
+        record(
+            "review_started",
+            json!({"attempt": 1, "session_id": "s-review"}),
+        );
+        let now = retime(&queue.conn, latest(&queue.conn) - 1, 50);
+        write("s-review", now - 50_000, &[(2, "r1", opus, "medium")]);
+        record("review_finished", json!({"verdict": "pass"}));
+        // The triage's transcript is missing.
+        record(
+            "triage_started",
+            json!({"attempt": 1, "session_id": "s-gone"}),
+        );
+        record("triage_finished", json!({"decision": "retry"}));
+        record("session_exited", json!({"exit_code": 0}));
+
+        let closed = of_kind(&queue, SESSION_CLOSED);
+        let span = |kind: &str| {
+            closed
+                .iter()
+                .find(|e| e.payload["kind"] == kind)
+                .unwrap()
+                .payload
+                .clone()
+        };
+        let review = span("review");
+        assert_eq!(review["model"], opus);
+        assert_eq!(review["effort"], "medium");
+        assert!(review.get("models").is_none());
+        let worker = span("worker");
+        assert_eq!(worker["model"], opus);
+        assert_eq!(worker["effort"], "high");
+        assert_eq!(
+            worker["models"],
+            json!([
+                {"model": opus, "effort": "high", "messages": 2},
+                {"model": opus, "effort": "medium", "messages": 1},
+            ])
+        );
+        let triage = span("triage");
+        assert_eq!(triage["active"], "unavailable");
+        assert!(triage.get("model").is_none());
+        assert!(triage.get("effort").is_none());
     }
 
     /// Write the transcript of `session` of a span in `cwd`: two turns,
