@@ -339,11 +339,7 @@ impl SqliteQueue {
     /// Every registered supervisor, oldest registration first, whether its
     /// process is alive or not.
     pub fn supervisors(&self) -> Result<Vec<SupervisorRegistration>> {
-        Ok(self
-            .conn
-            .prepare("SELECT * FROM supervisors ORDER BY started_at, rowid")?
-            .query_map([], supervisor_row)?
-            .collect::<rusqlite::Result<_>>()?)
+        supervisors_of(&self.conn)
     }
 
     /// Record the cmux workspace `up` opened for `role`, replacing any
@@ -2811,6 +2807,14 @@ fn lease_row(r: &Row<'_>) -> rusqlite::Result<RunLease> {
         pid: r.get(2)?,
         heartbeat_at: r.get(3)?,
     })
+}
+
+/// Every registered supervisor on `conn`, oldest registration first.
+pub(super) fn supervisors_of(conn: &Connection) -> Result<Vec<SupervisorRegistration>> {
+    Ok(conn
+        .prepare("SELECT * FROM supervisors ORDER BY started_at, rowid")?
+        .query_map([], supervisor_row)?
+        .collect::<rusqlite::Result<_>>()?)
 }
 
 fn supervisor_row(r: &Row<'_>) -> rusqlite::Result<SupervisorRegistration> {

@@ -194,6 +194,19 @@ pub struct SupervisorRegistration {
     pub max_waiting: Option<u32>,
 }
 
+impl SupervisorRegistration {
+    /// Whether this is a live supervisor that updates its binary (ADR-0045
+    /// decision 17): `auto_update`, its pid `alive` and its heartbeat no
+    /// older than [`super::HEARTBEAT_TIMEOUT_SECS`]. The one rule by which
+    /// an answer to an `update_failed` ask is the runtime's to apply, both
+    /// when it is recorded and when `status` reports it.
+    pub fn applies_updates(&self, now: i64, alive: impl Fn(u32) -> bool) -> bool {
+        self.auto_update
+            && alive(self.pid)
+            && now - self.heartbeat_at <= super::HEARTBEAT_TIMEOUT_SECS
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "outcome", rename_all = "snake_case")]
 pub enum ClaimOutcome {

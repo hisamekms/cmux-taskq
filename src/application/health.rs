@@ -942,11 +942,9 @@ pub fn attention(
                 .answer
                 .as_deref()
                 .is_some_and(|answer| UPDATE_FAILED_OPTIONS.contains(&answer.trim()))
-            && registrations.iter().any(|registration| {
-                registration.auto_update
-                    && control.alive(registration.pid)
-                    && now - registration.heartbeat_at <= HEARTBEAT_TIMEOUT_SECS
-            })
+            && registrations
+                .iter()
+                .any(|registration| registration.applies_updates(now, |pid| control.alive(pid)))
         {
             // The supervisor that updates its binary retries or leaves the
             // update (ADR-0045 decision 17).

@@ -5,6 +5,7 @@ use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
 use serde_json::json;
 
+use super::adapters::process_alive;
 use super::sqlite::{SqliteQueue, enum_col, json_col};
 use crate::domain::Ask;
 use crate::domain::{
@@ -260,10 +261,16 @@ impl SqliteQueue {
                 json!(super::plan_reviews::plan_answer_applies(&tx, &ask, text)?);
         }
         if ask.kind == AskKind::UpdateFailed {
-            // The supervisor that updates the binary retries or leaves the
-            // update as answered (ADR-0045 decision 17); any other answer
-            // is a person's to read.
-            payload["runtime_delivers"] = json!(UPDATE_FAILED_OPTIONS.contains(&text.trim()));
+            // The live supervisor that updates the binary retries or leaves
+            // the update as answered (ADR-0045 decision 17), by the rule
+            // `status` reports it with; any other answer, or one nobody
+            // updates for, is a person's to read.
+            let now = self.generators.clock.now();
+            let applied = UPDATE_FAILED_OPTIONS.contains(&text.trim())
+                && super::runtime_store::supervisors_of(&tx)?
+                    .iter()
+                    .any(|registration| registration.applies_updates(now, process_alive));
+            payload["runtime_delivers"] = json!(applied);
         }
         ask_event(
             &tx,
@@ -783,4 +790,84 @@ pub(super) fn ask_row(row: &Row<'_>) -> rusqlite::Result<Ask> {
         answered_by: row.get("answered_by")?,
         option_index: row.get("option_index")?,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::application::health;
+    use crate::domain::AttentionNext;
+    use crate::infrastructure::adapters::SystemProcesses;
+
+    /// Open an `update_failed` ask, answer it `text`, and return whether
+    /// the answer was recorded as the runtime's and whether `status`
+    /// reports it as the runtime applying it.
+    fn answer_update_failed(queue: &mut SqliteQueue, text: &str) -> (bool, bool) {
+        let ask = queue
+            .open_update_ask(
+                AskKind::UpdateFailed,
+                "retry?",
+                UPDATE_FAILED_OPTIONS,
+                "runtime",
+            )
+            .unwrap();
+        queue.answer(ask.id, text).unwrap();
+        let payload: String = queue
+            .conn
+            .query_row(
+                "SELECT payload FROM run_events WHERE kind='ask_answered'
+                 AND json_extract(payload,'$.ask_id')=?1",
+                [ask.id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        let recorded = payload["runtime_delivers"].as_bool().unwrap();
+        let now = queue.generators.clock.now();
+        let registrations = queue.supervisors().unwrap();
+        let attention = health::attention(&*queue, &registrations, now, &SystemProcesses).unwrap();
+        let applying = attention
+            .iter()
+            .find(|a| a.ask_id == Some(ask.id))
+            .is_some_and(|a| matches!(a.next, AttentionNext::ApplyingAnswer { .. }));
+        (recorded, applying)
+    }
+
+    #[test]
+    fn an_update_answer_is_the_runtimes_only_with_a_live_auto_update_supervisor() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut queue = SqliteQueue::init(dir.path().join("q.db")).unwrap();
+        // Nobody supervises: the answer is a person's.
+        assert_eq!(answer_update_failed(&mut queue, "retry"), (false, false));
+
+        // A live supervisor without auto-update applies nothing.
+        queue
+            .register_supervisor("live", std::process::id(), 1, "0.0.1")
+            .unwrap();
+        assert_eq!(answer_update_failed(&mut queue, "retry"), (false, false));
+
+        // With auto-update it applies an option, and leaves a free answer.
+        queue.set_auto_update("live", true).unwrap();
+        assert_eq!(answer_update_failed(&mut queue, "skip"), (true, true));
+        assert_eq!(answer_update_failed(&mut queue, "later"), (false, false));
+
+        // Its heartbeat went stale: nobody applies it.
+        queue
+            .conn
+            .execute(
+                "UPDATE supervisors SET heartbeat_at=heartbeat_at-?1 WHERE token='live'",
+                [crate::domain::HEARTBEAT_TIMEOUT_SECS + 1],
+            )
+            .unwrap();
+        assert_eq!(answer_update_failed(&mut queue, "retry"), (false, false));
+        queue.deregister_supervisor("live").unwrap();
+
+        // A dead auto-update supervisor whose row is left behind.
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let dead = child.id();
+        child.wait().unwrap();
+        queue.register_supervisor("dead", dead, 1, "0.0.1").unwrap();
+        queue.set_auto_update("dead", true).unwrap();
+        assert_eq!(answer_update_failed(&mut queue, "retry"), (false, false));
+    }
 }
