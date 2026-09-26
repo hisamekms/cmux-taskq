@@ -10,6 +10,8 @@
 //! since the stuck thread cannot be stopped from outside.
 #![allow(dead_code)]
 
+pub mod cli;
+
 use std::{
     collections::HashMap,
     io::Write,
