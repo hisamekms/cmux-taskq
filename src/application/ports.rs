@@ -817,6 +817,25 @@ pub trait RunStore {
     fn release_lease(&mut self, id: &RunId, token: &str) -> Result<()>;
     /// Adoptable runs whose lease carries a token other than `token`.
     fn runs_leased_by_others(&self, token: &str) -> Result<Vec<LeasedRun>>;
+    /// Mark `token`'s registration as one that takes a handoff.
+    fn accept_handoff(&self, token: &str) -> Result<()>;
+    /// Ask the supervisor `token` to exec `binary`; `false` when it is not
+    /// registered or does not take a handoff (ADR-0045 decision 10).
+    fn request_handoff(&self, token: &str, binary: &str) -> Result<bool>;
+    /// The binary the supervisor `token` was asked to exec, if any.
+    fn handoff_request(&self, token: &str) -> Result<Option<String>>;
+    /// Withdraw a request to exec `binary` not taken yet.
+    fn cancel_handoff(&self, token: &str, binary: &str) -> Result<bool>;
+    /// Take `token`'s registration back under `binary_version` after an
+    /// exec, clearing the request.
+    fn resume_registration(
+        &mut self,
+        token: &str,
+        pid: u32,
+        binary_version: &str,
+    ) -> Result<SupervisorRegistration>;
+    /// Every run whose lease carries `token`, oldest first.
+    fn runs_leased_by(&self, token: &str) -> Result<Vec<TaskRun>>;
     /// Take over the stale lease `previous_token` holds on `id`; `None`
     /// when another process got there first or the lease is fresh again.
     fn adopt_run(

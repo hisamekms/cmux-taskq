@@ -182,6 +182,97 @@ impl SqliteQueue {
             == 1)
     }
 
+    /// Mark the registration of `token` as one that takes a handoff
+    /// (ADR-0045 decision 10): its process execs another binary when asked.
+    pub fn accept_handoff(&self, token: &str) -> Result<()> {
+        ensure!(
+            self.conn.execute(
+                "UPDATE supervisors SET handoff_accepted=1 WHERE token=?1",
+                [token],
+            )? == 1,
+            "supervisor {token} is no longer registered"
+        );
+        Ok(())
+    }
+
+    /// Ask the supervisor `token` to exec `binary` at its next pause between
+    /// short steps. `false` when it is not registered or does not take a
+    /// handoff.
+    pub fn request_handoff(&self, token: &str, binary: &str) -> Result<bool> {
+        Ok(self.conn.execute(
+            "UPDATE supervisors SET handoff_binary=?2, handoff_requested_at=?3
+             WHERE token=?1 AND handoff_accepted=1",
+            params![token, binary, self.generators.clock.now()],
+        )? == 1)
+    }
+
+    /// Withdraw the request that the supervisor `token` exec `binary`, if
+    /// it has not taken it yet; `false` when there was none.
+    pub fn cancel_handoff(&self, token: &str, binary: &str) -> Result<bool> {
+        Ok(self.conn.execute(
+            "UPDATE supervisors SET handoff_binary=NULL, handoff_requested_at=NULL
+             WHERE token=?1 AND handoff_binary=?2",
+            params![token, binary],
+        )? == 1)
+    }
+
+    /// The binary the supervisor `token` was asked to exec, if any.
+    pub fn handoff_request(&self, token: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT handoff_binary FROM supervisors WHERE token=?1",
+                [token],
+                |r| r.get(0),
+            )
+            .optional()?
+            .flatten())
+    }
+
+    /// Take the registration of `token` back after exec'ing another binary
+    /// (or after an exec that failed): the same process (`pid`) now runs
+    /// `binary_version`. Clears the request and refreshes the heartbeat, and
+    /// leaves `mode`, `workspace_id`, `started_at` and every lease alone.
+    pub fn resume_registration(
+        &mut self,
+        token: &str,
+        pid: u32,
+        binary_version: &str,
+    ) -> Result<SupervisorRegistration> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        ensure!(
+            tx.execute(
+                "UPDATE supervisors SET binary_version=?3, heartbeat_at=?4, handoff_accepted=1,
+                        handoff_binary=NULL, handoff_requested_at=NULL
+                 WHERE token=?1 AND pid=?2",
+                params![token, pid, binary_version, self.generators.clock.now()],
+            )? == 1,
+            "supervisor {token} (pid {pid}) is no longer registered; nothing to hand off to"
+        );
+        let result = tx.query_row(
+            "SELECT * FROM supervisors WHERE token=?1",
+            [token],
+            supervisor_row,
+        )?;
+        tx.commit()?;
+        Ok(result)
+    }
+
+    /// The runs whose lease carries `token`, oldest first: what a supervisor
+    /// that exec'd another binary under the same token picks up again.
+    pub fn runs_leased_by(&self, token: &str) -> Result<Vec<TaskRun>> {
+        Ok(self
+            .conn
+            .prepare(
+                "SELECT r.* FROM task_runs r JOIN run_leases l ON l.run_id=r.id
+                 WHERE l.token=?1 ORDER BY r.rowid",
+            )?
+            .query_map([token], run_row(&self.runs_dir))?
+            .collect::<rusqlite::Result<_>>()?)
+    }
+
     /// Every registered supervisor, oldest registration first, whether its
     /// process is alive or not.
     pub fn supervisors(&self) -> Result<Vec<SupervisorRegistration>> {
@@ -2330,6 +2421,8 @@ fn supervisor_row(r: &Row<'_>) -> rusqlite::Result<SupervisorRegistration> {
             .transpose()?,
         workspace_id: r.get("workspace_id")?,
         binary_version: r.get("binary_version")?,
+        handoff_accepted: r.get::<_, Option<i64>>("handoff_accepted")? == Some(1),
+        handoff_binary: r.get("handoff_binary")?,
     })
 }
 
@@ -2465,6 +2558,29 @@ impl RunStore for SqliteQueue {
     }
     fn runs_leased_by_others(&self, token: &str) -> Result<Vec<LeasedRun>> {
         SqliteQueue::runs_leased_by_others(self, token)
+    }
+    fn accept_handoff(&self, token: &str) -> Result<()> {
+        SqliteQueue::accept_handoff(self, token)
+    }
+    fn request_handoff(&self, token: &str, binary: &str) -> Result<bool> {
+        SqliteQueue::request_handoff(self, token, binary)
+    }
+    fn handoff_request(&self, token: &str) -> Result<Option<String>> {
+        SqliteQueue::handoff_request(self, token)
+    }
+    fn cancel_handoff(&self, token: &str, binary: &str) -> Result<bool> {
+        SqliteQueue::cancel_handoff(self, token, binary)
+    }
+    fn resume_registration(
+        &mut self,
+        token: &str,
+        pid: u32,
+        binary_version: &str,
+    ) -> Result<SupervisorRegistration> {
+        SqliteQueue::resume_registration(self, token, pid, binary_version)
+    }
+    fn runs_leased_by(&self, token: &str) -> Result<Vec<TaskRun>> {
+        SqliteQueue::runs_leased_by(self, token)
     }
     fn adopt_run(
         &mut self,

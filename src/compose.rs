@@ -21,6 +21,7 @@ use crate::{
     application::{
         AgentProvider, Generators, LaunchAgent, MainRemote, ProcessControl, QueueOpener,
         Repository, Spawner, WorkspaceBackend, health,
+        install::{self as installation, InstallOptions},
         integrate::{self as integration, IntegrateTarget, Integration},
         lifecycle::{
             self, DownOptions, Ports as LifecyclePorts, QUEUE_ENV, QueuePaths, REVIEWER_ROLE,
@@ -45,6 +46,7 @@ use crate::{
             ClaudeCode, GitRepository, SystemProcesses, claude_trusts_repository, load_average,
             path_text,
         },
+        binaries::LocalBinaries,
         clock,
         location::{
             QueueLocation, REPOSITORY_FILE_NAME, data_home, plan_reviews_dir, planners_dir,
@@ -103,6 +105,10 @@ pub struct SuperviseOptions {
     pub planner_timeout: Duration,
     /// The plugin directory the planners the runtime opens load.
     pub plugin_dir: Option<PathBuf>,
+    /// The token of the supervisor this process takes over after it exec'd
+    /// this binary (ADR-0045 decision 10): its registration and leases are
+    /// kept, not registered anew. `None` registers a new supervisor.
+    pub handoff_token: Option<String>,
 }
 
 impl SuperviseOptions {
@@ -121,6 +127,7 @@ impl SuperviseOptions {
             runtime_planners: 1,
             planner_timeout: PLANNER_TIMEOUT,
             plugin_dir: None,
+            handoff_token: None,
         }
     }
 
@@ -138,6 +145,7 @@ impl SuperviseOptions {
             conflicts,
             runtime_planners: self.runtime_planners,
             planner_timeout: self.planner_timeout,
+            handoff_token: self.handoff_token.clone(),
         }
     }
 }
@@ -498,15 +506,58 @@ impl OneShot {
         let claude = ClaudeCode {
             executable: options.claude.clone(),
         };
+        let migrated = self.migrate_compatible(&location.db, processes)?;
         let queues = |db: &Path| self.queues(db);
-        lifecycle::up(
+        let mut value = lifecycle::up(
             &self.lifecycle_ports(cmux, launchd, processes, &queues),
             &claude,
             &queue_paths(location),
             repo,
             environment,
             options,
-        )
+        )?;
+        value["migrated"] = serde_json::to_value(migrated)?;
+        Ok(value)
+    }
+
+    /// Apply the migrations this binary knows and the queue at `db` lacks
+    /// when every one of them is compatible, as the start of `up` and
+    /// `install` does (ADR-0045 decisions 5, 15): a supervisor and the
+    /// wrappers of an older binary go on with the migrated queue. A breaking
+    /// one is refused with the way to it; `None` when nothing was pending
+    /// (or there is no queue yet, which the use case reports).
+    pub fn migrate_compatible(
+        &self,
+        db: &Path,
+        processes: &dyn ProcessControl,
+    ) -> Result<Option<crate::infrastructure::sqlite::MigrationReport>> {
+        if !db.is_file() {
+            return Ok(None);
+        }
+        let state = SqliteQueue::schema(db)?;
+        if state.pending.is_empty() {
+            return Ok(None);
+        }
+        let breaking: Vec<String> = state
+            .pending
+            .iter()
+            .filter(|migration| !migration.compatible)
+            .map(|migration| migration.version.to_string())
+            .collect();
+        ensure!(
+            breaking.is_empty(),
+            "the queue needs breaking migration(s) {} before this binary can run it, and a \
+supervisor or run of the older binary could not open it afterwards: stop the supervisor \
+(`down --wait`), run `dagq migrate`, then `up`; or let `dagq install --allow-breaking` do the \
+same in one step",
+            breaking.join(", ")
+        );
+        let alive = |pid| processes.alive(pid);
+        Ok(Some(SqliteQueue::migrate(
+            db,
+            Some(&alive),
+            self.generators.clock.now(),
+        )?))
     }
 
     /// `down`: see [`lifecycle::down`].
@@ -522,6 +573,44 @@ impl OneShot {
         lifecycle::down(
             &self.lifecycle_ports(cmux, launchd, processes, &queues),
             &queue_paths(location),
+            options,
+        )
+    }
+
+    /// `install`: replace the fixed binary and hand the queue's supervisor
+    /// over to it (see [`installation::install`]). `cmux` stops an in-cmux
+    /// supervisor when a breaking migration needs the drain.
+    pub fn install(
+        &self,
+        location: &QueueLocation,
+        cmux: &dyn WorkspaceBackend,
+        launchd: &dyn LaunchAgent,
+        options: &InstallOptions,
+    ) -> Result<Value> {
+        let queues = |db: &Path| self.queues(db);
+        let down = || {
+            self.down(
+                location,
+                cmux,
+                launchd,
+                &SystemProcesses,
+                &DownOptions {
+                    wait: true,
+                    force: false,
+                    poll: Duration::from_secs(2),
+                },
+            )
+        };
+        installation::install(
+            &installation::Ports {
+                binaries: &LocalBinaries,
+                files: &LocalRunFiles,
+                processes: &SystemProcesses,
+                clock: &*self.generators.clock,
+                queues: &queues,
+                down: &down,
+            },
+            Some(&location.db),
             options,
         )
     }

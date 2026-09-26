@@ -125,6 +125,14 @@ failed / interrupted run (a dead run nobody leases is recovered to interrupted f
 
 - [`supervise`](supervisor-lifecycle/supervise.md)
 
+### Handoff
+
+- [Handoff](supervisor-lifecycle/handoff.md)
+
+### `install`
+
+- [`install`](supervisor-lifecycle/install.md)
+
 ### 人への通知（`cmux notify`）
 
 - [人への通知（`cmux notify`）](supervisor-lifecycle/cmux-notify.md)

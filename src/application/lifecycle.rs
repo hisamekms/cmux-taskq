@@ -16,11 +16,12 @@
 //! inside the cmux workspace `[<repo>]supervisor` instead, with no
 //! launchd involved and so nothing to restart it (ADR-0011).
 //!
-//! A supervisor is only reused while it runs this binary's own version.
+//! A supervisor is only reused while it runs this binary's own build.
 //! Every registration carries the `binary_version` its process recorded,
-//! and `up` drains a live supervisor of any other build before starting one
-//! of its own in its place, so replacing `~/.local/bin/dagq` and
-//! running `up` is the whole binary update (ADR-0014).
+//! and `up` hands a live supervisor of any other build over to this binary
+//! without waiting for its sessions (the supervisor execs it under its own
+//! pid and token), or drains one that cannot take a handoff before
+//! starting one of its own in its place (ADR-0045 decisions 10, 15).
 //!
 //! The use cases reach the queue, cmux, launchd, processes, Claude Code and
 //! the files through [`Ports`]; the entry points in [`crate::compose`]
@@ -192,6 +193,10 @@ pub struct UpOptions {
     pub claude: PathBuf,
     /// How long a started supervisor may take to register before `up` fails.
     pub startup_timeout: Duration,
+    /// How long a supervisor asked to hand off may take to come back under
+    /// this binary: its wait for the validation or landing in progress and
+    /// the exec (ADR-0045 decision 10).
+    pub handoff_timeout: Duration,
     pub poll: Duration,
 }
 
@@ -307,6 +312,7 @@ pub fn up(
             "plist": location.launch_agent,
             "log_dir": location.log_dir,
         }),
+        Some(_) if takes_handoff(&up, ports.files, &live) => hand_off_supervisors(&up, &live)?,
         Some(_) => replace_supervisors(&up, &live)?,
         None => start_supervisor(&up, &existing, false)?,
     };
@@ -707,6 +713,193 @@ once `status` shows it gone",
     object.insert("replaced".into(), json!(replaced));
     object.insert("supervisor_workspaces".into(), json!(closed));
     Ok(started)
+}
+
+/// Whether every live supervisor can be handed over to this binary rather
+/// than drained: each one takes a handoff (a supervisor of a binary before
+/// ADR-0045 does not), and a launchd one would keep running this binary
+/// after its next restart too — its agent starts this very path. An exec
+/// does not change the agent's `ProgramArguments`, so a supervisor whose
+/// agent names another binary is drained and started again by `up`, which
+/// rewrites the agent (ADR-0045 decision 12).
+fn takes_handoff(up: &Up, files: &dyn RunFiles, live: &[SupervisorRegistration]) -> bool {
+    if !live
+        .iter()
+        .all(|registration| registration.handoff_accepted)
+    {
+        return false;
+    }
+    if live
+        .iter()
+        .all(|registration| registration.mode != Some(SupervisorMode::Launchd))
+    {
+        return true;
+    }
+    let Ok(current) = path_text(&up.environment.current_exe) else {
+        return false;
+    };
+    files
+        .read_to_string(&up.location.launch_agent)
+        .is_ok_and(|plist| {
+            plist.contains(&format!(
+                "<key>ProgramArguments</key>\n\t<array>\n\t\t<string>{}</string>",
+                escape(&current)
+            ))
+        })
+}
+
+/// `up`'s replacement without a drain (ADR-0045 decision 15): every live
+/// supervisor is asked to exec this binary, and `up` reports once each of
+/// them is back under this build with its pid and token.
+fn hand_off_supervisors(up: &Up, live: &[SupervisorRegistration]) -> Result<Value> {
+    let replaced = hand_off(
+        up.queue,
+        up.processes,
+        up.clock,
+        live,
+        &up.environment.current_exe,
+        VERSION,
+        up.options.handoff_timeout,
+        up.options.poll,
+    )?;
+    let first = &live[0];
+    let previous_version = live
+        .iter()
+        .find(|registration| registration.binary_version.as_deref() != Some(VERSION))
+        .and_then(|registration| registration.binary_version.clone());
+    Ok(json!({
+        "outcome": "restarted",
+        "handoff": true,
+        "mode": first.mode.map(SupervisorMode::as_str),
+        "version": VERSION,
+        "previous_version": previous_version,
+        "pid": first.pid,
+        "token": first.token,
+        "workspace_id": first.workspace_id,
+        "plist": up.location.launch_agent,
+        "log_dir": up.location.log_dir,
+        "replaced": replaced,
+        "supervisor_workspaces": [],
+    }))
+}
+
+/// Ask each supervisor in `live` to exec `binary` (ADR-0045 decision 10)
+/// and wait until every one of them has taken its registration back under
+/// `version`, with the same pid, within `timeout`. A supervisor that stops
+/// heartbeating before it did (an exec'd binary that failed to start), that
+/// deregistered, or that came back under another build (an exec that
+/// failed, after which the old binary goes on) is an error naming it; the
+/// ones already handed over stay so.
+#[allow(clippy::too_many_arguments)]
+pub fn hand_off(
+    queue: &dyn Queue,
+    processes: &dyn ProcessControl,
+    clock: &dyn Clock,
+    live: &[SupervisorRegistration],
+    binary: &Path,
+    version: &str,
+    timeout: Duration,
+    poll: Duration,
+) -> Result<Vec<Value>> {
+    let binary_text = path_text(binary)?;
+    let result = wait_for_handoff(
+        queue,
+        processes,
+        clock,
+        live,
+        &binary_text,
+        version,
+        timeout,
+        poll,
+    );
+    if result.is_err() {
+        // A request left behind would have the supervisor exec that path
+        // later, after the caller put another binary there.
+        for registration in live {
+            let _ = queue.cancel_handoff(&registration.token, &binary_text);
+        }
+    }
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+fn wait_for_handoff(
+    queue: &dyn Queue,
+    processes: &dyn ProcessControl,
+    clock: &dyn Clock,
+    live: &[SupervisorRegistration],
+    binary_text: &str,
+    version: &str,
+    timeout: Duration,
+    poll: Duration,
+) -> Result<Vec<Value>> {
+    for registration in live {
+        ensure!(
+            queue.request_handoff(&registration.token, binary_text)?,
+            "supervisor {} (pid {}) cannot take a handoff; stop it with `down --wait` and run `up`",
+            registration.token,
+            registration.pid
+        );
+    }
+    let deadline = Instant::now() + timeout;
+    let mut pending: Vec<&SupervisorRegistration> = live.iter().collect();
+    let mut done = Vec::new();
+    loop {
+        let now = clock.now();
+        let registrations = queue.supervisors()?;
+        let mut waiting = Vec::new();
+        for registration in pending {
+            let name = format!(
+                "supervisor {} (pid {})",
+                registration.token, registration.pid
+            );
+            let Some(current) = registrations.iter().find(|r| r.token == registration.token) else {
+                bail!("{name} deregistered instead of taking the handoff to {binary_text}");
+            };
+            if current.handoff_binary.is_some() {
+                ensure!(
+                    fresh(current, processes, now),
+                    "{name} stopped heartbeating before it took the handoff to {binary_text}; \
+see its log, then `down --force` and `up`"
+                );
+                waiting.push(registration);
+                continue;
+            }
+            ensure!(
+                current.pid == registration.pid
+                    && current.binary_version.as_deref() == Some(version)
+                    && fresh(current, processes, now),
+                "{name} came back as {} (pid {}) instead of {version}: the exec of {binary_text} failed \
+and it goes on with its binary; see its log",
+                current.binary_version.as_deref().unwrap_or("(unrecorded)"),
+                current.pid
+            );
+            done.push(json!({
+                "token": registration.token,
+                "pid": registration.pid,
+                "mode": registration.mode.map(SupervisorMode::as_str),
+                "workspace_id": registration.workspace_id,
+                "version": registration.binary_version,
+            }));
+        }
+        if waiting.is_empty() {
+            return Ok(done);
+        }
+        ensure!(
+            Instant::now() < deadline,
+            "{} supervisor(s) did not take the handoff to {binary_text} within {}s: {}; they still \
+finish their validations or landings in progress, so check `status` again",
+            waiting.len(),
+            timeout.as_secs(),
+            waiting
+                .iter()
+                .map(|r| format!("{} (pid {})", r.token, r.pid))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        pending = waiting;
+        thread::sleep(poll);
+    }
 }
 
 /// Refuse, before anything is stopped, when the queue's recorded

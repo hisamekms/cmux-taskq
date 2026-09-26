@@ -29,7 +29,7 @@ related:
 1. DBのpathを正規化し、checkoutのroot、Git common directoryを取得する。DBはworktree外か、common directory配下に置く（ユーザーDIRのqueueは常に満たす）。worktreeの作成元は`repo_path`に記録したcheckout。
 2. cmux（`ping`）とClaude（`--version`）のpreflightを行う。
 3. queueをrepositoryに束縛する（`bind_repository`）。別repositoryに束縛済みなら開始しない。queue全体の排他はなく、同じqueueに別のsupervisorがいても構わない。
-4. supervisorプロセスのtoken（UUID）を作り、`supervisors`表に自分を登録する（`register_supervisor`: token、PID、`--parallel`、`started_at`）。runを1つも持たない常駐supervisorも、この登録で`status`/`doctor`に並ぶ。続けて別スレッドで2秒ごとにそのtokenの登録と全leaseのheartbeatを1トランザクションで更新する（`heartbeat(token)`）。heartbeatの失敗はループで検知し、全runに`runtime_error`を記録してleaseと登録を残したまま終了する（プロセス終了後にstaleになる）。
+4. supervisorプロセスのtoken（UUID）を作り、`supervisors`表に自分を登録し（`register_supervisor`: token、PID、`--parallel`、`started_at`）、引き継ぎを受けられる印を付ける（`accept_handoff`）。hiddenの`--handoff-token TOKEN`で起動されたとき（引き継ぎのexecの後）は新しく登録せず、そのtokenの登録を同じPIDのまま取り戻し（`resume_registration`）、そのtokenのleaseを持つrunのslotを組み立て直す（[Handoff](handoff.md#handoff)）。runを1つも持たない常駐supervisorも、この登録で`status`/`doctor`に並ぶ。続けて別スレッドで2秒ごとにそのtokenの登録と全leaseのheartbeatを1トランザクションで更新する（`heartbeat(token)`）。heartbeatの失敗はループで検知し、全runに`runtime_error`を記録してleaseと登録を残したまま終了する（プロセス終了後にstaleになる）。
 
 ループ（1秒ごと）:
 

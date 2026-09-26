@@ -173,6 +173,15 @@ pub struct SupervisorRegistration {
     /// before the column existed; `up` treats it as a version that is not
     /// its own (ADR-0014).
     pub binary_version: Option<String>,
+    /// The process takes a handoff (ADR-0045 decision 10): written by a
+    /// supervisor that execs another binary when asked to, so `up` and
+    /// `install` ask it instead of draining it. `false` for a supervisor of
+    /// an older binary.
+    #[serde(default)]
+    pub handoff_accepted: bool,
+    /// The binary this supervisor was asked to exec and has not exec'd yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handoff_binary: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]

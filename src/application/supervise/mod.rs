@@ -77,6 +77,7 @@ mod adopt;
 mod deliver;
 mod draft_planner;
 mod exit;
+mod handoff;
 mod idle;
 mod jobs;
 mod landing;
@@ -89,6 +90,7 @@ mod stall;
 mod sweep;
 mod triage;
 
+pub use self::handoff::SUPERVISOR_HANDED_OFF;
 use self::{
     deliver::*, exit::*, idle::*, jobs::*, recovery::*, resume::*, revise::*, session::*, stall::*,
     sweep::*,
@@ -150,6 +152,9 @@ pub struct LoopSettings {
     /// How long a planner a revise went to may take to submit its proposal
     /// again before the inbox is told (ADR-0041 decision 13).
     pub planner_timeout: Duration,
+    /// The token of the supervisor this process continues after an exec
+    /// (ADR-0045 decision 10); `None` registers a new one.
+    pub handoff_token: Option<String>,
 }
 
 /// Where the supervisor works and what it starts: the queue database and
@@ -306,19 +311,45 @@ pub fn supervise(ports: &Ports<'_>, settings: &LoopSettings) -> Result<Value> {
     ports.agent.preflight()?;
     let mut queue = ports.queues.open()?;
     queue.bind_repository(&path_text(&layout.common_dir)?)?;
-    let token = ports.generators.ids.uuid();
-    // Registered before the first heartbeat so the loop is visible to
-    // `status` from its first second, runs or not.
     let parallel =
         u32::try_from(settings.parallel).context("parallel does not fit a registration")?;
     let pid = layout.pid;
-    queue.register_supervisor(&token, pid, parallel, &layout.version)?;
-    info!(
-        "supervisor {token} started: version {}, pid {pid}, parallel {parallel}, db {}, repository {}",
-        layout.version,
-        layout.db.display(),
-        layout.repo_root.display()
-    );
+    let mut previous_version = None;
+    let token = match &settings.handoff_token {
+        // This process exec'd this binary under the registration it had
+        // (ADR-0045 decision 10): the same token, pid, mode and leases.
+        Some(token) => {
+            previous_version = queue
+                .supervisors()?
+                .into_iter()
+                .find(|registration| &registration.token == token)
+                .and_then(|registration| registration.binary_version);
+            queue.resume_registration(token, pid, &layout.version)?;
+            let previous = &previous_version;
+            info!(
+                "supervisor {token} handed off: version {} (was {}), pid {pid}, parallel {parallel}, db {}, repository {}",
+                layout.version,
+                previous.as_deref().unwrap_or("unrecorded"),
+                layout.db.display(),
+                layout.repo_root.display()
+            );
+            token.clone()
+        }
+        None => {
+            let token = ports.generators.ids.uuid();
+            // Registered before the first heartbeat so the loop is visible
+            // to `status` from its first second, runs or not.
+            queue.register_supervisor(&token, pid, parallel, &layout.version)?;
+            queue.accept_handoff(&token)?;
+            info!(
+                "supervisor {token} started: version {}, pid {pid}, parallel {parallel}, db {}, repository {}",
+                layout.version,
+                layout.db.display(),
+                layout.repo_root.display()
+            );
+            token
+        }
+    };
     let mut config = serde_json::to_value(settings.stall)?;
     config["supervisor"] = json!(token);
     queue.record_queue_event(STALL_CONFIG_LOADED, config)?;
@@ -360,7 +391,12 @@ pub fn supervise(ports: &Ports<'_>, settings: &LoopSettings) -> Result<Value> {
         conflicts: settings.conflicts,
         plan_review: None,
         planner_exits: Vec::new(),
+        handoff: None,
+        exec: None,
     };
+    if settings.handoff_token.is_some() {
+        supervisor.rebuild_own_runs(previous_version.as_deref())?;
+    }
     let result = supervisor.run_loop(settings);
     match &result {
         Ok(value) => info!("supervisor {} exiting: {value}", supervisor.token),
@@ -421,6 +457,12 @@ struct Supervisor<'a> {
     plan_review: Option<plan_review::PlanReviewWatch>,
     /// The runtime's planners this process asked to `/exit`, and when.
     planner_exits: Vec<(crate::domain::PlannerId, Instant)>,
+    /// The binary a handoff asked this process to exec (ADR-0045 decision
+    /// 10): no new work starts, and the loop ends once every slot rests at
+    /// a point the next process rebuilds it from.
+    handoff: Option<String>,
+    /// Set when the loop ended for that exec: the registration stays.
+    exec: Option<String>,
 }
 
 /// One executing run between provisioning and rest.
@@ -512,7 +554,8 @@ impl Supervisor<'_> {
     /// database may be unreachable), and it goes stale with the leases.
     fn run_loop(&mut self, options: &LoopSettings) -> Result<Value> {
         let result = self.drive(options);
-        if self.heartbeat.check().is_ok()
+        if self.exec.is_none()
+            && self.heartbeat.check().is_ok()
             && let Err(error) = self.queue.deregister_supervisor(&self.token)
         {
             warn!(error = %format_args!("{error:#}"), "supervisor registration could not be removed: {error:#}");
@@ -535,6 +578,41 @@ impl Supervisor<'_> {
                 return Err(error);
             }
             let stopping = options.stop.load(Ordering::SeqCst);
+            // A stop wins over a handoff: the drain goes on as before.
+            if !stopping {
+                if self.handoff.is_none() {
+                    self.handoff = self.queue.handoff_request(&self.token)?;
+                    if let Some(binary) = &self.handoff {
+                        info!(
+                            "supervisor {} asked to hand off to {binary}: no new work starts; it execs once the validations and landings in progress are done",
+                            self.token
+                        );
+                    }
+                }
+                if let Some(binary) = self.handoff.clone() {
+                    if self.slots.iter().all(|slot| slot.phase.rebuildable()) {
+                        let runs = self.prepare_handoff();
+                        info!(
+                            "supervisor {} execs {binary}, handing over {runs} run(s)",
+                            self.token
+                        );
+                        self.exec = Some(binary.clone());
+                        return Ok(json!({
+                            "outcome": "handoff",
+                            "binary": binary,
+                            "token": self.token,
+                            "runs": self.finished,
+                            "handed_over": runs,
+                            "errors": self.errors,
+                            "triaged": self.triaged,
+                        }));
+                    }
+                    self.poll_observer();
+                    self.tick(true);
+                    thread::sleep(options.tick);
+                    continue;
+                }
+            }
             if self.claiming && !stopping {
                 self.fill_slots(options.parallel, options.sweep_interval)?;
             }
@@ -557,7 +635,7 @@ impl Supervisor<'_> {
                 thread::sleep(if job { options.tick } else { options.idle_poll });
                 continue;
             }
-            self.tick();
+            self.tick(false);
             thread::sleep(options.tick);
         }
         if let Some(message) = &self.provisioning_error {
@@ -642,9 +720,15 @@ impl Supervisor<'_> {
         }
         Ok(())
     }
-    fn tick(&mut self) {
+    /// One pass over the slots; with `unsettled_only`, over the slots a
+    /// handoff waits for (their validation or landing in progress) only.
+    fn tick(&mut self, unsettled_only: bool) {
         let mut index = 0;
         while index < self.slots.len() {
+            if unsettled_only && self.slots[index].phase.rebuildable() {
+                index += 1;
+                continue;
+            }
             let mut slot = self.slots.remove(index);
             match self.step(&mut slot) {
                 Ok(Step::Continue) => {

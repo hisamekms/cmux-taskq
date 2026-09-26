@@ -1,5 +1,6 @@
 pub mod adapters;
 pub mod asks;
+pub mod binaries;
 pub mod claude;
 pub mod clock;
 pub mod draft_planners;

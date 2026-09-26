@@ -3122,7 +3122,8 @@ fn migrate_is_explicit_and_older_binaries_keep_working_within_the_floor() {
             {"version": 27, "compatible": false},
             {"version": 28, "compatible": false},
             {"version": 29, "compatible": false},
-            {"version": 30, "compatible": false}
+            {"version": 30, "compatible": false},
+            {"version": 31, "compatible": true}
         ])
     );
     assert_eq!(version(), 23);
@@ -3454,4 +3455,134 @@ fn a_wait_past_its_limit_fails_with_the_test_and_the_condition() {
         ),
         "{stderr}"
     );
+}
+
+/// `install` puts a binary in place by a rename that keeps the old one as
+/// `<name>.previous`, and hands a running supervisor over to it (ADR-0045
+/// decisions 10, 11, 14): the supervisor process execs the new file under
+/// its own pid and token and goes on. `--rollback` swaps the two back the
+/// same way; without a previous binary it refuses.
+#[test]
+fn install_hands_a_running_supervisor_over_under_its_pid_and_rolls_back() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("queue").join("queue.db");
+    ok(&db, &["init"]);
+    let repo = dir.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    for args in [
+        &["init", "-q", "-b", "main"][..],
+        &[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@example.invalid",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "seed",
+        ],
+    ] {
+        assert!(
+            Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(args)
+                .bounded_status()
+                .unwrap()
+                .success()
+        );
+    }
+    let stub = |name: &str, text: &str| {
+        let path = dir.path().join(name);
+        std::fs::write(&path, format!("#!/bin/sh\nprintf '{text}\\n'\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    };
+    let (cmux, claude) = (stub("cmux", "PONG"), stub("claude", "stub 1.0"));
+    // The fixed binary the supervisor runs, and the one `install` replaces.
+    let fixed = dir.path().join("bin").join("dagq");
+    std::fs::create_dir_all(fixed.parent().unwrap()).unwrap();
+    std::fs::copy(env!("CARGO_BIN_EXE_dagq"), &fixed).unwrap();
+    let previous = dir.path().join("bin").join("dagq.previous");
+
+    let missing = invoke(
+        &db,
+        &["install", "--rollback", "--to", fixed.to_str().unwrap()],
+    );
+    assert!(!missing.status.success());
+    assert!(
+        String::from_utf8_lossy(&missing.stderr).contains("no previous binary"),
+        "{}",
+        String::from_utf8_lossy(&missing.stderr)
+    );
+
+    let mut supervisor = Command::new(&fixed)
+        .arg("--db")
+        .arg(&db)
+        .args(["supervise", "--observe-interval", "0", "--repo"])
+        .arg(&repo)
+        .arg("--cmux")
+        .arg(&cmux)
+        .arg("--claude")
+        .arg(&claude)
+        .env_remove("DAGQ_ROLE")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let registered = || SqliteQueue::open(&db).unwrap().supervisors().unwrap();
+    let started = std::time::Instant::now();
+    while registered().is_empty() {
+        assert!(
+            started.elapsed().as_secs() < 30,
+            "the supervisor never registered"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    let token = registered()[0].token.clone();
+    assert_eq!(registered()[0].pid, supervisor.id());
+    assert!(registered()[0].handoff_accepted);
+
+    for args in [&["--from", env!("CARGO_BIN_EXE_dagq")][..], &["--rollback"]] {
+        let mut full = vec![
+            "install",
+            "--to",
+            fixed.to_str().unwrap(),
+            "--handoff-timeout",
+            "60",
+        ];
+        full.extend_from_slice(args);
+        let report = ok(&db, &full);
+        assert_eq!(report["outcome"], "installed", "{report}");
+        assert_eq!(report["version"], dagq::VERSION);
+        assert_eq!(report["previous"], previous.to_str().unwrap());
+        assert_eq!(report["migrated"], Value::Null);
+        assert_eq!(
+            report["supervisors"][0]["token"],
+            token.as_str(),
+            "{report}"
+        );
+        assert_eq!(report["supervisors"][0]["pid"], supervisor.id());
+        assert!(previous.is_file());
+        let registration = registered().remove(0);
+        assert_eq!(registration.token, token);
+        assert_eq!(registration.pid, supervisor.id());
+        assert_eq!(registration.handoff_binary, None);
+        assert_eq!(registration.binary_version.as_deref(), Some(dagq::VERSION));
+        assert!(
+            supervisor.try_wait().unwrap().is_none(),
+            "the supervisor exited"
+        );
+    }
+
+    // SIGINT drains the continued supervisor like any other.
+    unsafe { libc::kill(supervisor.id() as i32, libc::SIGINT) };
+    let exit = {
+        let _waiting = common::within(common::STEP_LIMIT, "the supervisor to drain on SIGINT");
+        supervisor.wait().unwrap()
+    };
+    assert!(exit.success());
+    assert!(registered().is_empty());
 }

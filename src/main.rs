@@ -1,5 +1,6 @@
 use std::{
     env,
+    ffi::OsString,
     io::{self, Write},
     path::PathBuf,
     process::ExitCode,
@@ -51,6 +52,39 @@ enum Command {
         /// Report the schema and what would be applied, without changing anything.
         #[arg(long)]
         check: bool,
+    },
+    /// Replace this dagq binary and hand the queue's live supervisor over to the new one without
+    /// waiting for its sessions (ADR-0045): build (or take) the binary, check its --version and a
+    /// start on a throwaway queue, apply the queue's compatible migrations, put it in place by a
+    /// rename that keeps the old one as <name>.previous, and ask the supervisor to exec it. A
+    /// failed handoff puts the old binary back.
+    Install {
+        /// A checkout to build (`cargo build --release --locked`), or a built binary. Default:
+        /// build the main checkout of the repository of the working directory.
+        #[arg(long, conflicts_with = "rollback")]
+        from: Option<PathBuf>,
+        /// The binary to replace. Default: this one.
+        #[arg(long)]
+        to: Option<PathBuf>,
+        /// Put <name>.previous back in place instead, the same way.
+        #[arg(long)]
+        rollback: bool,
+        /// When the new binary brings a breaking migration: drain the supervisor (wait for its
+        /// runs), migrate with a backup, and start it again with the new binary's `up`.
+        #[arg(long)]
+        allow_breaking: bool,
+        /// Seconds the supervisor may take to come back under the new binary.
+        #[arg(long, default_value_t = 1800)]
+        handoff_timeout: u64,
+        /// cmux executable: stops an in-cmux supervisor for the drain, and its restart uses it.
+        #[arg(long, default_value = "cmux")]
+        cmux: PathBuf,
+        /// Claude Code executable the restarted supervisor uses after a drain.
+        #[arg(long)]
+        claude: Option<PathBuf>,
+        /// Plugin directory of the restarted `up` after a drain.
+        #[arg(long)]
+        plugin_dir: Option<PathBuf>,
     },
     /// Show which queue this directory resolves to, without opening it.
     Locate,
@@ -434,6 +468,10 @@ enum Command {
         /// Claude Code plugin directory the planners the runtime opens load.
         #[arg(long)]
         plugin_dir: Option<PathBuf>,
+        /// Continue the registered supervisor with this token after it
+        /// exec'd this binary (ADR-0045 decision 10); set by the handoff.
+        #[arg(long, hide = true)]
+        handoff_token: Option<String>,
     },
     /// Run the observer job once: headless Claude under DAGQ_ROLE=observer reads stats past the
     /// cursor, the open findings, the latest notes, the open asks and the graph, and writes
@@ -456,7 +494,7 @@ enum Command {
         #[arg(long, default_value = "claude")]
         claude: PathBuf,
     },
-    /// Start the queue's runtime: a launchd-resident supervisor and the inbox's cmux workspace. Idempotent; replaces a live supervisor of another version. Opens no planner (`plan` does) and forgets the resident planner's record.
+    /// Start the queue's runtime: a launchd-resident supervisor and the inbox's cmux workspace. Idempotent; a live supervisor of another build is handed over to this binary without waiting for its sessions (or drained when it cannot take a handoff), after the queue's compatible migrations. Opens no planner (`plan` does) and forgets the resident planner's record.
     Up {
         /// Maximum number of runs the supervisor executes at once.
         #[arg(long, default_value_t = 4, value_parser = clap::value_parser!(u16).range(1..))]
@@ -466,10 +504,15 @@ enum Command {
         /// restarts it if it stops.
         #[arg(long)]
         in_cmux: bool,
-        /// Do not wait for a supervisor of another version to drain: stop
-        /// with an error instead when any run is still in flight.
+        /// Do not wait for a supervisor that cannot take a handoff to drain:
+        /// stop with an error instead when any run is still in flight.
         #[arg(long)]
         no_wait: bool,
+        /// Seconds a supervisor asked to hand off may take to come back
+        /// under this binary (it finishes a validation or landing in
+        /// progress first).
+        #[arg(long, default_value_t = 1800)]
+        handoff_timeout: u64,
         /// Claude Code plugin directory the inbox session loads (`claude --plugin-dir`).
         #[arg(long)]
         plugin_dir: Option<PathBuf>,
@@ -1068,6 +1111,63 @@ fn execute(cli: Cli) -> Result<Value> {
         value["db"] = json!(db);
         return Ok(value);
     }
+    if let Command::Install {
+        from,
+        to,
+        rollback,
+        allow_breaking,
+        handoff_timeout,
+        cmux,
+        claude,
+        plugin_dir,
+    } = cli.command
+    {
+        use dagq::application::install::{InstallOptions, Source};
+        use dagq::infrastructure::{
+            adapters::{Cmux, executable},
+            launchd::Launchctl,
+        };
+        let source = match (rollback, from) {
+            (true, _) => Source::Rollback,
+            (false, Some(from)) if from.is_file() => Source::Binary(from),
+            (false, Some(from)) => Source::Checkout(from),
+            (false, None) => {
+                let common_dir = location.git_common_dir.as_deref().context(
+                    "not in a repository: pass --from with a checkout or a built binary",
+                )?;
+                Source::Checkout(match common_dir.parent() {
+                    Some(parent) if common_dir.file_name() == Some(".git".as_ref()) => {
+                        parent.to_path_buf()
+                    }
+                    _ => cwd.clone(),
+                })
+            }
+        };
+        let cmux = executable(&cmux).unwrap_or(cmux);
+        let mut restart = vec!["--cmux".to_owned(), path_text(&cmux)?];
+        if let Some(claude) = claude {
+            restart.extend(["--claude".to_owned(), path_text(&executable(&claude)?)?]);
+        }
+        if let Some(plugin_dir) = plugin_dir {
+            restart.extend(["--plugin-dir".to_owned(), path_text(&plugin_dir)?]);
+        }
+        return one_shot.install(
+            &location,
+            &Cmux { executable: cmux },
+            &Launchctl { uid: current_uid() },
+            &InstallOptions {
+                source,
+                target: match to {
+                    Some(to) => cwd.join(to),
+                    None => env::current_exe()?,
+                },
+                allow_breaking,
+                restart,
+                handoff_timeout: Duration::from_secs(handoff_timeout),
+                poll: Duration::from_millis(500),
+            },
+        );
+    }
     // A repository queue already resolved the working directory; `--repo`
     // overrides it for a `--db` queue used from elsewhere or a moved checkout.
     let checkout = |repo: Option<PathBuf>| repo.unwrap_or_else(|| cwd.clone());
@@ -1085,7 +1185,11 @@ fn execute(cli: Cli) -> Result<Value> {
         queue.assert_repository(common_dir)?;
     }
     Ok(match cli.command {
-        Command::Init | Command::Locate | Command::Rebind { .. } | Command::Migrate { .. } => {
+        Command::Init
+        | Command::Locate
+        | Command::Rebind { .. }
+        | Command::Migrate { .. }
+        | Command::Install { .. } => {
             unreachable!()
         }
         Command::Add {
@@ -1581,6 +1685,7 @@ fn execute(cli: Cli) -> Result<Value> {
             runtime_planners,
             planner_timeout,
             plugin_dir,
+            handoff_token,
         } => {
             use dagq::compose::SuperviseOptions;
             use dagq::infrastructure::adapters::{Cmux, executable};
@@ -1597,6 +1702,7 @@ fn execute(cli: Cli) -> Result<Value> {
                 runtime_planners: usize::from(runtime_planners),
                 planner_timeout: Duration::from_secs(planner_timeout),
                 plugin_dir,
+                handoff_token,
                 ..SuperviseOptions::new(usize::from(parallel), once)
             };
             dagq::compose::supervise(
@@ -1614,6 +1720,7 @@ fn execute(cli: Cli) -> Result<Value> {
             parallel,
             in_cmux,
             no_wait,
+            handoff_timeout,
             plugin_dir,
             repo,
             cmux,
@@ -1646,6 +1753,7 @@ fn execute(cli: Cli) -> Result<Value> {
                 cmux: executable(&cmux)?,
                 claude: executable(&claude)?,
                 startup_timeout: Duration::from_secs(30),
+                handoff_timeout: Duration::from_secs(handoff_timeout),
                 poll: Duration::from_millis(500),
             };
             one_shot.up(
@@ -1872,8 +1980,62 @@ fn install_stop_signal() -> Result<Arc<AtomicBool>> {
     Ok(stop)
 }
 
+/// The arguments of this process with `--handoff-token <token>` in place
+/// of any it had: the `supervise` the handed-off binary runs.
+fn handoff_arguments(arguments: &[OsString], token: &str) -> Vec<OsString> {
+    let mut kept = Vec::with_capacity(arguments.len() + 2);
+    let mut skip = false;
+    for argument in arguments {
+        if std::mem::take(&mut skip) {
+            continue;
+        }
+        if argument == "--handoff-token" {
+            skip = true;
+            continue;
+        }
+        if argument
+            .to_str()
+            .is_some_and(|text| text.starts_with("--handoff-token="))
+        {
+            continue;
+        }
+        kept.push(argument.clone());
+    }
+    kept.push("--handoff-token".into());
+    kept.push(token.into());
+    kept
+}
+
+/// Run the command; a supervisor asked to hand off (ADR-0045 decision 10)
+/// execs the requested binary here, under this pid, once every connection
+/// of the loop is closed. When the exec itself fails, this binary takes its
+/// registration back and supervises on, so the one asking sees the version
+/// it did not ask for.
+fn run(mut arguments: Vec<OsString>) -> Result<Value> {
+    loop {
+        let value = execute(Cli::parse_from(&arguments))?;
+        if value["outcome"] != "handoff" {
+            return Ok(value);
+        }
+        let (Some(binary), Some(token)) = (value["binary"].as_str(), value["token"].as_str())
+        else {
+            bail!("a handoff without a binary or a token: {value}");
+        };
+        arguments = handoff_arguments(&arguments, token);
+        tracing::info!("supervisor {token} execs {binary}");
+        use std::os::unix::process::CommandExt;
+        let error = std::process::Command::new(binary)
+            .args(&arguments[1..])
+            .exec();
+        tracing::error!(
+            error = %error,
+            "supervisor {token} could not exec {binary}: {error}; it goes on with this binary"
+        );
+    }
+}
+
 fn main() -> ExitCode {
-    let result = execute(Cli::parse()).and_then(|value| {
+    let result = run(env::args_os().collect()).and_then(|value| {
         let mut stdout = io::stdout().lock();
         serde_json::to_writer_pretty(&mut stdout, &value)?;
         writeln!(stdout)?;

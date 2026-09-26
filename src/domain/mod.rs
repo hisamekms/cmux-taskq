@@ -1996,6 +1996,8 @@ mod attention_tests {
             heartbeat_at,
             mode: None,
             workspace_id: None,
+            handoff_accepted: false,
+            handoff_binary: None,
             binary_version: None,
         };
         let fresh =

@@ -120,6 +120,7 @@ fn fixture() -> Fixture {
             cmux,
             claude,
             startup_timeout: Duration::from_secs(5),
+            handoff_timeout: Duration::from_secs(5),
             poll: Duration::from_millis(20),
         },
         _dir: dir,
@@ -565,6 +566,7 @@ fn up_starts_the_agent_and_the_sessions_once_and_reuses_them_after() {
         [
             "doctor",
             "inbox",
+            "migrated",
             "pruned_supervisors",
             "retired_sessions",
             "supervisor",
@@ -3600,4 +3602,539 @@ fn a_planner_session_is_judged_alive_and_idle_like_a_worker() {
         listed["planners"][0]["workspace_id"],
         opened["planner"]["workspace_id"]
     );
+}
+
+/// A registration of an older build that takes a handoff (ADR-0045
+/// decision 10), with a run in flight under its token.
+fn handoff_supervisor(fixture: &Fixture, token: &str, mode: SupervisorMode) -> SqliteQueue {
+    let mut queue = SqliteQueue::open(&fixture.location.db).unwrap();
+    queue
+        .register_supervisor(token, std::process::id(), 4, "0.0.1")
+        .unwrap();
+    queue.accept_handoff(token).unwrap();
+    queue.set_supervisor_mode(token, mode, None).unwrap();
+    queue
+}
+
+/// Stand in for the supervisor `token`: once asked, it "execs" by taking
+/// its registration back under `version`, the way the exec'd binary does.
+fn take_the_handoff(fixture: &Fixture, processes: &FakeProcesses, token: &str, version: &str) {
+    let mut queue = SqliteQueue::open(&fixture.location.db).unwrap();
+    wait_until(processes, std::process::id(), || {
+        queue.handoff_request(token).unwrap().is_some()
+    });
+    assert_eq!(
+        queue.handoff_request(token).unwrap().as_deref(),
+        Some("/opt/bin/dagq")
+    );
+    queue
+        .resume_registration(token, std::process::id(), version)
+        .unwrap();
+}
+
+/// `up` hands a supervisor of another build that takes a handoff over to
+/// this binary instead of draining it (ADR-0045 decision 15): nothing is
+/// signalled, no agent or workspace is touched, the run in flight keeps
+/// its lease, and the report names the supervisor that is now this build
+/// under the same token and pid. `--no-wait` changes nothing here.
+#[test]
+fn up_hands_a_supervisor_of_another_build_over_without_draining_it() {
+    for no_wait in [false, true] {
+        let mut fixture = fixture();
+        fixture.options.in_cmux = true;
+        fixture.options.no_wait = no_wait;
+        let mut queue = handoff_supervisor(&fixture, "old", SupervisorMode::InCmux);
+        let run_id = claim_a_run(&fixture, &mut queue, "old");
+        let cmux = FakeCmux::default();
+        let launchd = FakeLaunchd::new(&fixture.location.db);
+        let processes = FakeProcesses::default();
+
+        let report = thread::scope(|scope| {
+            scope.spawn(|| take_the_handoff(&fixture, &processes, "old", VERSION));
+            up(&fixture, &cmux, &launchd, &processes)
+        });
+        let supervisor = &report["supervisor"];
+        assert_eq!(supervisor["outcome"], "restarted", "{report}");
+        assert_eq!(supervisor["handoff"], true);
+        assert_eq!(supervisor["token"], "old");
+        assert_eq!(supervisor["pid"], json!(std::process::id()));
+        assert_eq!(supervisor["mode"], "in_cmux");
+        assert_eq!(supervisor["version"], VERSION);
+        assert_eq!(supervisor["previous_version"], "0.0.1");
+        assert_eq!(supervisor["replaced"][0]["version"], "0.0.1");
+        assert_eq!(report["migrated"], Value::Null);
+        assert!(processes.terminated.lock().unwrap().is_empty());
+        assert!(processes.interrupted.lock().unwrap().is_empty());
+        assert!(launchd.uninstalls.lock().unwrap().is_empty());
+        assert!(launchd.installs.lock().unwrap().is_empty());
+        assert!(cmux.closed.lock().unwrap().is_empty());
+        let registrations = queue.supervisors().unwrap();
+        assert_eq!(registrations.len(), 1);
+        assert_eq!(registrations[0].binary_version.as_deref(), Some(VERSION));
+        assert_eq!(registrations[0].handoff_binary, None);
+        let leases = queue.run_leases().unwrap();
+        assert_eq!(leases.len(), 1);
+        assert_eq!(leases[0].run_id.as_str(), run_id);
+        assert_eq!(leases[0].token, "old");
+    }
+}
+
+/// A supervisor that comes back under its old build (the exec failed and
+/// it went on) or stops heartbeating mid-handoff fails `up` with what
+/// happened; one that never picks the request up fails it at the timeout.
+#[test]
+fn up_reports_a_handoff_that_did_not_happen() {
+    let fixture = fixture();
+    let queue = handoff_supervisor(&fixture, "old", SupervisorMode::Launchd);
+    // The agent starts this binary's path, so a launchd supervisor is
+    // handed over rather than drained.
+    let launchd = FakeLaunchd::new(&fixture.location.db);
+    fs::create_dir_all(fixture.location.launch_agent.parent().unwrap()).unwrap();
+    fs::write(
+        &fixture.location.launch_agent,
+        "<key>ProgramArguments</key>\n\t<array>\n\t\t<string>/opt/bin/dagq</string>\n",
+    )
+    .unwrap();
+    let cmux = FakeCmux::default();
+    let processes = FakeProcesses::default();
+    let error = thread::scope(|scope| {
+        scope.spawn(|| take_the_handoff(&fixture, &processes, "old", "0.0.1"));
+        format!(
+            "{:#}",
+            try_up(&fixture, &cmux, &launchd, &processes).unwrap_err()
+        )
+    });
+    assert!(error.contains("came back as 0.0.1"), "{error}");
+    assert!(
+        error.contains("the exec of /opt/bin/dagq failed"),
+        "{error}"
+    );
+
+    // Nobody takes the request, and the supervisor stops heartbeating.
+    let mut fixture = fixture;
+    fixture.options.handoff_timeout = Duration::from_millis(200);
+    let error = format!(
+        "{:#}",
+        try_up(&fixture, &cmux, &launchd, &processes).unwrap_err()
+    );
+    assert!(error.contains("did not take the handoff"), "{error}");
+    // The request is withdrawn, so the supervisor does not exec that path later.
+    assert_eq!(queue.handoff_request("old").unwrap(), None);
+    Connection::open(&fixture.location.db)
+        .unwrap()
+        .execute(
+            "UPDATE supervisors SET heartbeat_at=unixepoch()-60, binary_version='0.0.2'",
+            [],
+        )
+        .unwrap();
+    queue.request_handoff("old", "/opt/bin/dagq").unwrap();
+    let registration = queue.supervisors().unwrap().remove(0);
+    let error = format!(
+        "{:#}",
+        lifecycle::hand_off(
+            &queue,
+            &processes,
+            &dagq::infrastructure::clock::SystemClock,
+            &[registration],
+            Path::new("/opt/bin/dagq"),
+            VERSION,
+            Duration::from_secs(5),
+            Duration::from_millis(20),
+        )
+        .unwrap_err()
+    );
+    assert!(error.contains("stopped heartbeating"), "{error}");
+    queue.deregister_supervisor("old").unwrap();
+    let error = format!(
+        "{:#}",
+        lifecycle::hand_off(
+            &queue,
+            &processes,
+            &dagq::infrastructure::clock::SystemClock,
+            &[gone_registration()],
+            Path::new("/opt/bin/dagq"),
+            VERSION,
+            Duration::from_secs(5),
+            Duration::from_millis(20),
+        )
+        .unwrap_err()
+    );
+    assert!(error.contains("cannot take a handoff"), "{error}");
+}
+
+fn gone_registration() -> dagq::domain::SupervisorRegistration {
+    dagq::domain::SupervisorRegistration {
+        token: "gone".into(),
+        pid: 1,
+        parallel: 1,
+        started_at: 0,
+        heartbeat_at: 0,
+        mode: None,
+        workspace_id: None,
+        binary_version: None,
+        handoff_accepted: true,
+        handoff_binary: None,
+    }
+}
+
+/// A supervisor that cannot take a handoff (a binary before ADR-0045), or
+/// a launchd one whose agent starts another binary, is drained as before.
+#[test]
+fn up_drains_a_supervisor_whose_agent_starts_another_binary() {
+    let fixture = fixture();
+    let queue = handoff_supervisor(&fixture, "old", SupervisorMode::Launchd);
+    fs::create_dir_all(fixture.location.launch_agent.parent().unwrap()).unwrap();
+    fs::write(
+        &fixture.location.launch_agent,
+        "<key>ProgramArguments</key>\n\t<array>\n\t\t<string>/elsewhere/dagq</string>\n",
+    )
+    .unwrap();
+    let cmux = FakeCmux::default();
+    let launchd = FakeLaunchd::new(&fixture.location.db);
+    launchd.load(Some(std::process::id()));
+    let processes = FakeProcesses::default();
+    let report = thread::scope(|scope| {
+        scope.spawn(|| {
+            wait_until(&processes, std::process::id(), || {
+                !launchd.uninstalls.lock().unwrap().is_empty()
+            });
+            SqliteQueue::open(&fixture.location.db)
+                .unwrap()
+                .deregister_supervisor("old")
+                .unwrap();
+        });
+        up(&fixture, &cmux, &launchd, &processes)
+    });
+    assert_eq!(report["supervisor"]["outcome"], "restarted", "{report}");
+    assert_eq!(report["supervisor"].get("handoff"), None, "{report}");
+    assert_eq!(queue.handoff_request("old").unwrap(), None);
+}
+
+/// `up` applies the queue's pending migrations first when every one of
+/// them is compatible (ADR-0045 decision 15), and refuses a breaking one
+/// with the way to it, before it starts or touches anything.
+#[test]
+fn up_applies_compatible_migrations_and_refuses_breaking_ones() {
+    let fixture = fixture();
+    let db = &fixture.location.db;
+    // The queue as the binary before the handoff columns left it.
+    Connection::open(db)
+        .unwrap()
+        .execute_batch(
+            "ALTER TABLE supervisors DROP COLUMN handoff_accepted;
+             ALTER TABLE supervisors DROP COLUMN handoff_binary;
+             ALTER TABLE supervisors DROP COLUMN handoff_requested_at;
+             PRAGMA user_version = 30;",
+        )
+        .unwrap();
+    let cmux = FakeCmux::default();
+    let launchd = FakeLaunchd::new(db);
+    let processes = FakeProcesses::default();
+    let report = up(&fixture, &cmux, &launchd, &processes);
+    assert_eq!(report["supervisor"]["outcome"], "started", "{report}");
+    assert_eq!(report["migrated"]["previous_version"], 30, "{report}");
+    assert_eq!(
+        report["migrated"]["schema_version"],
+        SqliteQueue::SCHEMA_VERSION
+    );
+    assert_eq!(report["migrated"]["backup"], Value::Null);
+
+    Connection::open(db)
+        .unwrap()
+        .execute_batch("PRAGMA user_version = 24;")
+        .unwrap();
+    let error = format!(
+        "{:#}",
+        try_up(&fixture, &cmux, &launchd, &processes).unwrap_err()
+    );
+    assert!(error.contains("breaking migration(s) 25"), "{error}");
+    assert!(error.contains("install --allow-breaking"), "{error}");
+}
+
+/// [`Binaries`] that build, run and move nothing: what each call was, the
+/// schema it reports, and whether it answers a probe.
+struct FakeBinaries {
+    schema: dagq::application::install::SchemaCheck,
+    calls: Mutex<Vec<String>>,
+    up: Mutex<Vec<Vec<String>>>,
+}
+
+impl FakeBinaries {
+    fn new(pending: &[(i64, bool)], opens: bool) -> Self {
+        Self {
+            schema: dagq::application::install::SchemaCheck {
+                pending: pending
+                    .iter()
+                    .map(
+                        |&(version, compatible)| dagq::application::install::PendingMigration {
+                            version,
+                            compatible,
+                        },
+                    )
+                    .collect(),
+                opens,
+            },
+            calls: Mutex::default(),
+            up: Mutex::default(),
+        }
+    }
+    fn calls(&self) -> Vec<String> {
+        self.calls.lock().unwrap().clone()
+    }
+    fn note(&self, call: String) {
+        self.calls.lock().unwrap().push(call);
+    }
+}
+
+impl dagq::application::install::Binaries for FakeBinaries {
+    fn build(&self, checkout: &Path) -> Result<PathBuf> {
+        self.note(format!("build {}", checkout.display()));
+        Ok(checkout.join("target/release/dagq"))
+    }
+    fn version(&self, binary: &Path) -> Result<String> {
+        Ok(if binary.ends_with("dagq.previous") {
+            "0.0.1".into()
+        } else {
+            VERSION.into()
+        })
+    }
+    fn probe(&self, binary: &Path) -> Result<()> {
+        self.note(format!("probe {}", binary.display()));
+        Ok(())
+    }
+    fn takes_handoff(&self, binary: &Path) -> bool {
+        !binary.ends_with("old/dagq")
+    }
+    fn schema(&self, _: &Path, _: &Path) -> Result<dagq::application::install::SchemaCheck> {
+        Ok(self.schema.clone())
+    }
+    fn migrate(&self, binary: &Path, _: &Path) -> Result<Value> {
+        self.note(format!("migrate {}", binary.display()));
+        Ok(json!({"applied": self.schema.pending.len()}))
+    }
+    fn replace(&self, source: &Path, target: &Path) -> Result<()> {
+        self.note(format!("replace {} {}", source.display(), target.display()));
+        Ok(())
+    }
+    fn restore(&self, target: &Path) -> Result<()> {
+        self.note(format!("restore {}", target.display()));
+        Ok(())
+    }
+    fn run(&self, binary: &Path, arguments: &[String]) -> Result<Value> {
+        self.note(format!("run {}", binary.display()));
+        self.up.lock().unwrap().push(arguments.to_vec());
+        Ok(json!({"supervisor": {"outcome": "started"}}))
+    }
+}
+
+fn install_with(
+    fixture: &Fixture,
+    binaries: &FakeBinaries,
+    processes: &FakeProcesses,
+    down: &dyn Fn() -> Result<Value>,
+    options: &dagq::application::install::InstallOptions,
+) -> Result<Value> {
+    let queues = |db: &Path| -> std::sync::Arc<dyn dagq::application::QueueOpener> {
+        std::sync::Arc::new(dagq::infrastructure::runtime_store::SqliteOpener {
+            db: db.to_owned(),
+            generators: dagq::infrastructure::clock::system(),
+        })
+    };
+    dagq::application::install::install(
+        &dagq::application::install::Ports {
+            binaries,
+            files: &dagq::infrastructure::run_files::LocalRunFiles,
+            processes,
+            clock: &dagq::infrastructure::clock::SystemClock,
+            queues: &queues,
+            down,
+        },
+        Some(&fixture.location.db),
+        options,
+    )
+}
+
+fn install_options(
+    source: dagq::application::install::Source,
+) -> dagq::application::install::InstallOptions {
+    dagq::application::install::InstallOptions {
+        source,
+        target: "/opt/bin/dagq".into(),
+        allow_breaking: false,
+        restart: vec!["--cmux".into(), "/opt/cmux".into()],
+        handoff_timeout: Duration::from_secs(5),
+        poll: Duration::from_millis(20),
+    }
+}
+
+/// `install` builds the checkout, probes the build, applies compatible
+/// migrations with it, puts it in place and hands the live supervisors that
+/// take a handoff over to it; one of an older binary is left for `up` to
+/// drain. A handoff that fails puts the replaced binary back.
+#[test]
+fn install_migrates_replaces_and_hands_over_and_restores_on_a_failed_handoff() {
+    use dagq::application::install::Source;
+    let fixture = fixture();
+    let queue = handoff_supervisor(&fixture, "new", SupervisorMode::InCmux);
+    let mut old = SqliteQueue::open(&fixture.location.db).unwrap();
+    old.register_supervisor("older", 424_243, 1, "0.0.1")
+        .unwrap();
+    let binaries = FakeBinaries::new(&[(27, true)], false);
+    let processes = FakeProcesses::default();
+    let no_down = || -> Result<Value> { panic!("no drain for compatible migrations") };
+    let report = thread::scope(|scope| {
+        scope.spawn(|| {
+            let mut queue = SqliteQueue::open(&fixture.location.db).unwrap();
+            wait_until(&processes, std::process::id(), || {
+                queue.handoff_request("new").unwrap().is_some()
+            });
+            queue
+                .resume_registration("new", std::process::id(), VERSION)
+                .unwrap();
+        });
+        install_with(
+            &fixture,
+            &binaries,
+            &processes,
+            &no_down,
+            &install_options(Source::Checkout("/src/dagq".into())),
+        )
+        .unwrap()
+    });
+    assert_eq!(report["outcome"], "installed", "{report}");
+    assert_eq!(report["migrated"], json!({"applied": 1}));
+    assert_eq!(report["supervisors"][0]["token"], "new");
+    assert_eq!(report["not_handed_off"][0]["token"], "older");
+    assert_eq!(report["previous"], "/opt/bin/dagq.previous");
+    assert_eq!(
+        binaries.calls(),
+        [
+            "build /src/dagq",
+            "probe /src/dagq/target/release/dagq",
+            "migrate /src/dagq/target/release/dagq",
+            "replace /src/dagq/target/release/dagq /opt/bin/dagq",
+        ]
+    );
+
+    // Nobody takes this one: the handoff times out and the binary is put back.
+    let binaries = FakeBinaries::new(&[], true);
+    let mut options = install_options(Source::Binary("/built/dagq".into()));
+    options.handoff_timeout = Duration::from_millis(200);
+    let error = format!(
+        "{:#}",
+        install_with(&fixture, &binaries, &processes, &no_down, &options).unwrap_err()
+    );
+    assert!(error.contains("the handoff to"), "{error}");
+    assert!(error.contains("is back at /opt/bin/dagq"), "{error}");
+    assert_eq!(queue.handoff_request("new").unwrap(), None);
+
+    // A binary that predates the handoff would end the supervisor it is
+    // exec'd in: nothing is replaced.
+    let older = FakeBinaries::new(&[], true);
+    let error = format!(
+        "{:#}",
+        install_with(
+            &fixture,
+            &older,
+            &processes,
+            &no_down,
+            &install_options(Source::Binary("/old/dagq".into())),
+        )
+        .unwrap_err()
+    );
+    assert!(error.contains("predates the handoff"), "{error}");
+    assert_eq!(older.calls(), ["probe /old/dagq"]);
+    assert_eq!(
+        binaries.calls(),
+        [
+            "probe /built/dagq",
+            "replace /built/dagq /opt/bin/dagq",
+            "restore /opt/bin/dagq",
+        ]
+    );
+    drop(queue);
+}
+
+/// A build with a breaking migration is refused without `--allow-breaking`
+/// and replaces nothing; with it, the supervisor is drained, the queue
+/// migrated, the binary replaced and `up` run with the drained supervisor's
+/// mode and parallelism. A rollback past a breaking migration is refused,
+/// and so is one without a previous binary.
+#[test]
+fn install_drains_only_for_a_breaking_migration_when_allowed() {
+    use dagq::application::install::Source;
+    let fixture = fixture();
+    let _queue = handoff_supervisor(&fixture, "live", SupervisorMode::InCmux);
+    let processes = FakeProcesses::default();
+    let binaries = FakeBinaries::new(&[(27, true), (28, false)], false);
+    let drained = Mutex::new(0);
+    let down = || -> Result<Value> {
+        *drained.lock().unwrap() += 1;
+        Ok(json!({"outcome": "stopped"}))
+    };
+    let error = format!(
+        "{:#}",
+        install_with(
+            &fixture,
+            &binaries,
+            &processes,
+            &down,
+            &install_options(Source::Binary("/built/dagq".into())),
+        )
+        .unwrap_err()
+    );
+    assert!(error.contains("breaking migration(s) 28"), "{error}");
+    assert!(error.contains("--allow-breaking"), "{error}");
+    assert_eq!(binaries.calls(), ["probe /built/dagq"]);
+    assert_eq!(*drained.lock().unwrap(), 0);
+
+    let mut options = install_options(Source::Binary("/built/dagq".into()));
+    options.allow_breaking = true;
+    let report = install_with(&fixture, &binaries, &processes, &down, &options).unwrap();
+    assert_eq!(*drained.lock().unwrap(), 1);
+    assert_eq!(report["drained"]["outcome"], "stopped", "{report}");
+    assert_eq!(report["up"]["supervisor"]["outcome"], "started");
+    assert_eq!(
+        binaries.calls()[2..],
+        [
+            "migrate /built/dagq",
+            "replace /built/dagq /opt/bin/dagq",
+            "run /opt/bin/dagq",
+        ]
+    );
+    let db = fixture.location.db.to_str().unwrap();
+    assert_eq!(
+        binaries.up.lock().unwrap()[0],
+        [
+            "--db",
+            db,
+            "up",
+            "--parallel",
+            "4",
+            "--in-cmux",
+            "--cmux",
+            "/opt/cmux"
+        ]
+    );
+
+    let binaries = FakeBinaries::new(&[], false);
+    let dir = tempfile::tempdir().unwrap();
+    let mut options = install_options(Source::Rollback);
+    options.target = dir.path().join("dagq");
+    let error = format!(
+        "{:#}",
+        install_with(&fixture, &binaries, &processes, &down, &options).unwrap_err()
+    );
+    assert!(error.contains("no previous binary"), "{error}");
+    fs::write(dir.path().join("dagq.previous"), "").unwrap();
+    let error = format!(
+        "{:#}",
+        install_with(&fixture, &binaries, &processes, &down, &options).unwrap_err()
+    );
+    assert!(error.contains("the queue refuses 0.0.1"), "{error}");
+    assert_eq!(
+        dagq::application::install::parse_version("dagq 1.2.3\n").unwrap(),
+        "1.2.3"
+    );
+    assert!(dagq::application::install::parse_version("").is_err());
 }

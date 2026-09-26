@@ -178,6 +178,13 @@ case "$prompt" in
     git add answer.txt
     ;;
 esac
+case "$prompt" in
+  *E2E-HOLD*)
+    # Work until the test lets go: a supervisor handoff happens meanwhile.
+    printf 'holding until %s/go\n' "$add_dir"
+    while [ ! -f "$add_dir/go" ]; do sleep 0.2; done
+    ;;
+esac
 printf 'written by the stub agent for %s\n' "$session_id" > e2e.txt
 git add e2e.txt
 git commit -q -m 'feat: e2e stub change'
@@ -2492,4 +2499,181 @@ fn plan_opens_planners_side_by_side_that_submit_go_idle_and_exit() {
     assert_eq!(states[1], "idle", "{states:?}");
     assert_eq!(states.len(), 3, "{states:?}");
     send_exit(cmux, &ids[1]);
+}
+
+/// `install` hands a supervisor over to the new binary while its worker
+/// still works (ADR-0045 decision 10): the supervisor process execs the
+/// installed file under its own pid and token, the session in its cmux
+/// workspace is not touched, and the continued supervisor watches the run
+/// through its receipt, `/exit`, review and landing on main. `--rollback`
+/// hands it over again to the binary the install kept.
+#[test]
+#[ignore = "needs a running cmux; run with --ignored"]
+fn install_hands_the_supervisor_over_while_a_session_works_and_the_run_lands() {
+    let fixture = fixture();
+    let Fixture {
+        cmux, repo, env, ..
+    } = &fixture;
+    let task_id = add_ready_task_described(
+        env,
+        "e2e handoff task",
+        "Add e2e.txt to the worktree. E2E-HOLD E2E-REVIEW-PASS",
+        &[],
+        &[],
+    );
+    let mut guard = WorkspaceGuard {
+        cmux: cmux.clone(),
+        ids: Vec::new(),
+    };
+    // The fixed binary the supervisor runs and `install` replaces.
+    let fixed = fixture._dir.path().join("bin").join("dagq");
+    fs::create_dir_all(fixed.parent().unwrap()).unwrap();
+    fs::copy(BIN, &fixed).unwrap();
+    let fixed_text = fixed.to_str().unwrap();
+    let mut supervisor = ChildGuard(
+        Command::new(&fixed)
+            .current_dir(repo)
+            .env("XDG_DATA_HOME", &env.data_home)
+            .args(["supervise", "--parallel", "1", "--observe-interval", "0"])
+            .arg("--cmux")
+            .arg(cmux)
+            .arg("--claude")
+            .arg(&fixture.stub)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let stderr = reader(supervisor.0.stderr.take().unwrap());
+    let pid = supervisor.0.id();
+    let started = Instant::now();
+    let run = loop {
+        assert!(
+            supervisor.0.try_wait().unwrap().is_none(),
+            "the supervisor exited before the worker started"
+        );
+        assert!(
+            started.elapsed() < SUPERVISE_TIMEOUT,
+            "the worker did not start within {SUPERVISE_TIMEOUT:?}"
+        );
+        let detail = dagq(env, &["show", &task_id, "--full"]);
+        if let Some(run) = detail["runs"].as_array().unwrap().last()
+            && run["status"] == "running"
+        {
+            break run.clone();
+        }
+        thread::sleep(Duration::from_millis(200));
+    };
+    let run_id = run["id"].as_str().unwrap().to_owned();
+    let workspace = run["workspace_id"].as_str().unwrap().to_owned();
+    guard.ids.push(workspace.clone());
+    let run_dir = PathBuf::from(run["run_dir"].as_str().unwrap());
+
+    let installed = dagq(
+        env,
+        &[
+            "install",
+            "--from",
+            BIN,
+            "--to",
+            fixed_text,
+            "--handoff-timeout",
+            "120",
+        ],
+    );
+    eprintln!("install: {installed}");
+    assert_eq!(installed["outcome"], "installed", "{installed}");
+    assert_eq!(installed["version"], VERSION);
+    assert_eq!(installed["supervisors"][0]["pid"], pid, "{installed}");
+    let token = installed["supervisors"][0]["token"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(fixed.with_file_name("dagq.previous").is_file());
+    // The same process, the same registration; the session goes on.
+    assert!(supervisor.0.try_wait().unwrap().is_none());
+    let status = dagq(env, &["status"]);
+    let supervisors = status["supervisors"].as_array().unwrap();
+    assert_eq!(supervisors.len(), 1, "{status}");
+    assert_eq!(supervisors[0]["pid"], pid);
+    assert_eq!(supervisors[0]["binary_version"], VERSION);
+    assert_eq!(status["runs"][0]["run_id"], run_id.as_str(), "{status}");
+    assert_eq!(status["runs"][0]["status"], "running", "{status}");
+    assert!(workspace_listed(cmux, &workspace));
+
+    // Let the worker finish: the continued supervisor lands the run.
+    fs::write(run_dir.join("go"), "").unwrap();
+    let mut stderr = Some(stderr);
+    let landed = loop {
+        if started.elapsed() >= SUPERVISE_TIMEOUT * 2 {
+            let _ = supervisor.0.kill();
+            let log = stderr.take().unwrap().join().unwrap();
+            panic!("the run did not land; supervisor stderr:\n{log}");
+        }
+        let detail = dagq(env, &["show", &task_id, "--full"]);
+        if detail["task"]["status"] == "completed" {
+            break detail;
+        }
+        thread::sleep(Duration::from_millis(300));
+    };
+    let events = landed["events"].as_array().unwrap();
+    let kinds: Vec<&str> = events.iter().map(|e| e["kind"].as_str().unwrap()).collect();
+    let count = |kind: &str| kinds.iter().filter(|k| **k == kind).count();
+    assert_eq!(count("supervisor_handed_off"), 1, "{kinds:?}");
+    assert_eq!(count("run_adopted"), 0, "{kinds:?}");
+    assert_eq!(count("exit_requested"), 1, "{kinds:?}");
+    assert_eq!(count("lease_acquired"), 1, "{kinds:?}");
+    assert!(!kinds.contains(&"runtime_error"), "{kinds:?}");
+    let position = |kind: &str| kinds.iter().position(|k| *k == kind).unwrap();
+    assert!(position("supervisor_handed_off") < position("receipt_observed"));
+    assert_eq!(landed["runs"].as_array().unwrap().len(), 1);
+    assert_eq!(landed["runs"][0]["status"], "integrated");
+    assert_eq!(
+        git(repo, &["show", "main:e2e.txt"]),
+        format!("written by the stub agent for {run_id}")
+    );
+
+    // Back to the binary the install kept, the same way.
+    let rolled = dagq(
+        env,
+        &[
+            "install",
+            "--rollback",
+            "--to",
+            fixed_text,
+            "--handoff-timeout",
+            "120",
+        ],
+    );
+    assert_eq!(rolled["supervisors"][0]["pid"], pid, "{rolled}");
+    assert_eq!(rolled["supervisors"][0]["token"], token.as_str());
+    assert!(supervisor.0.try_wait().unwrap().is_none());
+
+    // SIGINT drains the continued supervisor like any other.
+    unsafe { libc::kill(pid as i32, libc::SIGINT) };
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let exit = loop {
+        if let Some(exit) = supervisor.0.try_wait().unwrap() {
+            break exit;
+        }
+        assert!(Instant::now() < deadline, "the supervisor did not stop");
+        thread::sleep(Duration::from_millis(200));
+    };
+    let stderr = stderr.take().unwrap().join().unwrap();
+    eprintln!("supervisor stderr:\n{stderr}");
+    assert!(exit.success(), "{exit}");
+    assert_eq!(
+        stderr
+            .matches(&format!("supervisor {token} handed off: version {VERSION}"))
+            .count(),
+        2
+    );
+    assert!(!stderr.contains("could not exec"), "{stderr}");
+    assert!(
+        dagq(env, &["status"])["supervisors"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
 }

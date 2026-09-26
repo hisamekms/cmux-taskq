@@ -8,6 +8,7 @@
 
 pub mod ask;
 pub mod health;
+pub mod install;
 pub mod integrate;
 pub mod lifecycle;
 #[cfg(test)]

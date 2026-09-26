@@ -843,6 +843,8 @@ mod tests {
             heartbeat_at,
             mode: Some(SupervisorMode::Launchd),
             workspace_id: None,
+            handoff_accepted: false,
+            handoff_binary: None,
             binary_version: Some("1.0.0".into()),
         }
     }

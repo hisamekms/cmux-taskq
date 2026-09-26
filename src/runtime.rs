@@ -12,7 +12,7 @@ pub use crate::application::{
     },
     rebind::REBIND_LOG,
     recording::{BACKEND_ERROR_CHARS, RecordingBackend, backend_failure_payload},
-    supervise::RunError,
+    supervise::{RunError, SUPERVISOR_HANDED_OFF},
 };
 pub use crate::compose::{
     OneShot, SuperviseOptions, ask, doctor, integrate, rebind, recover,
