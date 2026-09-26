@@ -4,8 +4,8 @@ type: design
 title: Implementation plans
 status: current
 created: 2026-09-22
-updated: 2026-09-25
-last_verified: 2026-09-25
+updated: 2026-09-26
+last_verified: 2026-09-26
 tags:
   - planning
 ---
@@ -17,3 +17,4 @@ tags:
 - [Current plan](current.md)
 - [Milestones](milestones.md)
 - [ADR 0001〜0034の棚卸しと統合ADRの組](adr-inventory.md)
+- [cargo llvm-cov nextestへの切り替え前後のintegrateのverifyの所要時間と遅いtest](nextest-measurement.md)（ADR-0076決定6の測定）
