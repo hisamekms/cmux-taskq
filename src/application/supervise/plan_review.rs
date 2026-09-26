@@ -222,6 +222,18 @@ impl Supervisor<'_> {
     /// its default window (goal 31), most conflicts first, at most
     /// [`HOTSPOT_FILES`] of those main still has.
     fn conflict_hotspots(&self) -> Result<Vec<ConflictHotspot>> {
+        Ok(self
+            .conflict_hotspot_files()?
+            .into_iter()
+            .filter(|file| file.state != "deleted")
+            .take(HOTSPOT_FILES)
+            .collect())
+    }
+
+    /// Every file the landings conflicted in, as `stats` counts them over
+    /// its default window, most conflicts first; its `alert` is judged by
+    /// the `[conflicts]` thresholds this process read.
+    pub(super) fn conflict_hotspot_files(&self) -> Result<Vec<ConflictHotspot>> {
         let events = self.queue.all_events()?;
         let live = LiveSnapshot {
             history: crate::application::stats::conflict_history(&events, &|since| {
@@ -238,13 +250,7 @@ impl Supervisor<'_> {
             &StatsQuery::default(),
             &live,
         );
-        Ok(stats
-            .conflict_hotspots
-            .files
-            .into_iter()
-            .filter(|file| file.state != "deleted")
-            .take(HOTSPOT_FILES)
-            .collect())
+        Ok(stats.conflict_hotspots.files)
     }
 
     /// Reap the job once it ended and apply its verdict, or record its

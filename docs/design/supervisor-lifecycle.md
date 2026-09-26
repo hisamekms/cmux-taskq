@@ -9,6 +9,7 @@ last_verified: 2026-09-26
 scope: runtime
 related:
   - design-supervisor-lifecycle-claim-hold
+  - design-supervisor-lifecycle-claim-defer
   - adr-0044
   - adr-0047
   - adr-0038
@@ -142,6 +143,10 @@ live session alert (long_background, stuck_exit, prompt_waiting)
 ### claimを控える（load average）
 
 - [claimを控える（load average）](supervisor-lifecycle/claim-hold.md)
+
+### claimを控える（衝突の多いファイル）
+
+- [claimを控える（衝突の多いファイル）](supervisor-lifecycle/claim-defer.md)（[ADR-0069](../adr/0069-do-not-claim-tasks-overlapping-hot-files.md)）
 
 ### 人の答えを待つrun（slotの外の待ち）
 

@@ -293,6 +293,13 @@ pub fn status(
             .filter(|_| for_role(role))
             .collect::<Vec<_>>(),
         "asks": asks,
+        // The claims deferred now on a conflict hotspot (ADR-0069): each
+        // task's open `claim_deferred`, with the files and the runs.
+        "claim_deferrals": queue
+            .latest_task_events(&crate::domain::claim_defer::DEFERRAL_KINDS)?
+            .iter()
+            .filter_map(crate::domain::claim_defer::OpenDeferral::of)
+            .collect::<Vec<_>>(),
         "proposals": queue.proposals(false)?,
         // The latest landing recheck of the waiting runs (ADR-0068
         // decision 6), with when it finished.

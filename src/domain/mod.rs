@@ -535,6 +535,7 @@ impl std::str::FromStr for Priority {
     }
 }
 
+pub mod claim_defer;
 pub mod claim_hold;
 mod error;
 pub mod finding;

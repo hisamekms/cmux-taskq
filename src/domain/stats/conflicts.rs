@@ -31,6 +31,9 @@ pub const DEFAULT_HOTSPOT_RATIO_PERCENT: i64 = 20;
 pub struct ConflictConfig {
     pub hotspot_conflicts: i64,
     pub hotspot_ratio_percent: i64,
+    /// How long a claim deferred on the alerted files lasts at most
+    /// (ADR-0069).
+    pub defer_max_secs: i64,
 }
 
 impl Default for ConflictConfig {
@@ -38,13 +41,18 @@ impl Default for ConflictConfig {
         Self {
             hotspot_conflicts: DEFAULT_HOTSPOT_CONFLICTS,
             hotspot_ratio_percent: DEFAULT_HOTSPOT_RATIO_PERCENT,
+            defer_max_secs: crate::domain::claim_defer::DEFAULT_DEFER_MAX_SECS,
         }
     }
 }
 
 impl ConflictConfig {
     /// The setting names of the `[conflicts]` table.
-    pub const KEYS: [&str; 2] = ["hotspot_conflicts", "hotspot_ratio_percent"];
+    pub const KEYS: [&str; 3] = [
+        "hotspot_conflicts",
+        "hotspot_ratio_percent",
+        "defer_max_secs",
+    ];
 
     /// The setting `key` set to `value`; `None` for a key the table does
     /// not have.
@@ -52,6 +60,7 @@ impl ConflictConfig {
         let field = match key {
             "hotspot_conflicts" => &mut self.hotspot_conflicts,
             "hotspot_ratio_percent" => &mut self.hotspot_ratio_percent,
+            "defer_max_secs" => &mut self.defer_max_secs,
             _ => return None,
         };
         *field = value;
@@ -512,6 +521,7 @@ mod tests {
             config: ConflictConfig {
                 hotspot_conflicts: 3,
                 hotspot_ratio_percent: 80,
+                ..ConflictConfig::default()
             },
             source: "file",
         };
@@ -575,12 +585,14 @@ mod tests {
         let mut config = ConflictConfig::default();
         assert_eq!(config.set("hotspot_conflicts", 5), Some(()));
         assert_eq!(config.set("hotspot_ratio_percent", 50), Some(()));
+        assert_eq!(config.set("defer_max_secs", 900), Some(()));
         assert_eq!(config.set("other", 1), None);
         assert_eq!(
             config,
             ConflictConfig {
                 hotspot_conflicts: 5,
-                hotspot_ratio_percent: 50
+                hotspot_ratio_percent: 50,
+                defer_max_secs: 900,
             }
         );
     }

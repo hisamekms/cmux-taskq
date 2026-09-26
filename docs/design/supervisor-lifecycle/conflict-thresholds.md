@@ -9,6 +9,7 @@ last_verified: 2026-09-26
 scope: runtime
 related:
   - design-supervisor-lifecycle
+  - design-supervisor-lifecycle-claim-defer
 ---
 
 # Conflict thresholds
@@ -19,6 +20,7 @@ related:
 | --- | --- | --- |
 | `hotspot_conflicts` | 3 | alertにするファイルの、window内の衝突の最少回数 |
 | `hotspot_ratio_percent` | 20 | alertにするファイルの、そのファイルを変えた着地の数に対する衝突の割合の最小（%） |
+| `defer_max_secs` | 3600 | alertのファイルで進行中のrunと重なるtaskのclaimを控える上限の秒数（[claimを控える（衝突の多いファイル）](claim-defer.md)、ADR-0069） |
 
-- `stats`はmain checkoutの`dagq.toml`の`[conflicts]`（出力の`conflict_hotspots.config.source`が`file`）、無ければ既定値（`default`）で判定する。supervisorは起動時に同じものを読み（読めなければwarnを出して既定値にし、起動は止めない）、plan reviewのpromptの衝突の多いファイルの`alert`をその値で判定する（値を変えたら`down --wait` → `up`）。
+- `stats`はmain checkoutの`dagq.toml`の`[conflicts]`（出力の`conflict_hotspots.config.source`が`file`）、無ければ既定値（`default`）で判定する。supervisorは起動時に同じものを読み（読めなければwarnを出して既定値にし、起動は止めない）、plan reviewのpromptの衝突の多いファイルの`alert`をその値で判定する。同じalertのファイルでclaimを控え、`defer_max_secs`をその上限にする（値を変えたら`down --wait` → `up`）。
 - 着地の後のlanding recheck（[Landing recheck](landing-recheck.md)）が見つけた衝突（`landing_recheck_failed`）は`conflict_hotspots`に数えない。数は`stats`の`landing_rechecks`に出る。

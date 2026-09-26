@@ -827,6 +827,25 @@ impl SqliteQueue {
         Ok(latest)
     }
 
+    /// Per task, its newest event of one of `kinds`, by task.
+    pub fn latest_task_events(&self, kinds: &[&str]) -> Result<Vec<RunEvent>> {
+        if kinds.is_empty() {
+            return Ok(Vec::new());
+        }
+        let marks = vec!["?"; kinds.len()].join(",");
+        Ok(self
+            .conn
+            .prepare(&format!(
+                "SELECT * FROM run_events WHERE id IN (
+                     SELECT MAX(id) FROM run_events
+                     WHERE task_id IS NOT NULL AND kind IN ({marks})
+                     GROUP BY task_id)
+                 ORDER BY task_id"
+            ))?
+            .query_map(rusqlite::params_from_iter(kinds), event_row)?
+            .collect::<rusqlite::Result<_>>()?)
+    }
+
     /// The id of the last event recorded before `unix` (seconds), 0 when
     /// there is none: a cursor that reads everything from that time on.
     pub fn event_id_before(&self, unix: i64) -> Result<EventId> {
@@ -2982,6 +3001,12 @@ impl RunStore for SqliteQueue {
     }
     fn all_events(&self) -> Result<Vec<RunEvent>> {
         SqliteQueue::all_events(self)
+    }
+    fn latest_task_events(&self, kinds: &[&str]) -> Result<Vec<RunEvent>> {
+        SqliteQueue::latest_task_events(self, kinds)
+    }
+    fn related_landed_commits(&self, task: TaskId, limit: usize) -> Result<Vec<String>> {
+        SqliteQueue::related_landed_commits(self, task, limit)
     }
     fn task_goals(&self) -> Result<HashMap<TaskId, Option<GoalId>>> {
         SqliteQueue::task_goals(self)

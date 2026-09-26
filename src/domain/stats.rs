@@ -421,6 +421,10 @@ pub struct Stats {
     /// The holds on new claims (task 327): those that started in the
     /// window by reason with how long they lasted, and the hold now.
     pub claim_holds: super::claim_hold::ClaimHolds,
+    /// The claims deferred on a conflict hotspot (ADR-0069): those that
+    /// started in the window with how long they lasted and how they
+    /// ended, and the deferrals now.
+    pub claim_deferrals: super::claim_defer::ClaimDeferrals,
     /// The irregularities repaired without a person (`auto_repaired`,
     /// ADR-0047 decision 45) in the same window as `asks`: by layer and
     /// repair, and per day next to the asks opened that day.
@@ -797,6 +801,8 @@ pub fn stats(
     let updates = updates::updates(events, window_start, next_cursor, counts);
     let claim_holds =
         super::claim_hold::claim_holds(events, window_start, next_cursor, window_end, counts);
+    let claim_deferrals =
+        super::claim_defer::claim_deferrals(events, window_start, next_cursor, window_end, counts);
     let verification_commands =
         measures::verification_commands(events, window_start, next_cursor, counts);
     let waiting = super::waiting::waiting_stats(events, window_start, next_cursor, counts);
@@ -862,6 +868,18 @@ pub fn stats(
             path: None,
             phase: None,
         });
+    } else if slots.free_slots > 0 && !claim_deferrals.deferred.is_empty() {
+        // Slots left free while candidates wait on a conflict hotspot
+        // (ADR-0069): `value` is the tasks deferred.
+        alerts.push(Alert {
+            kind: "claim_deferred",
+            task_id: None,
+            run_id: None,
+            value: claim_deferrals.deferred.len() as i64,
+            threshold: 0,
+            path: None,
+            phase: None,
+        });
     } else if slots.free_slots > 0 && slots.candidates == 0 && slots.ready > 0 {
         alerts.push(Alert {
             kind: "idle_slots",
@@ -896,6 +914,7 @@ pub fn stats(
         waiting,
         asks: ask_stats,
         claim_holds,
+        claim_deferrals,
         auto_repairs,
         updates,
         next_cursor,

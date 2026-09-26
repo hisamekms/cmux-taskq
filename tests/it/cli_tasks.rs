@@ -81,6 +81,8 @@ fn reads_do_not_create_a_queue_and_unknown_tasks_fail() {
             expected["landing_recheck"] = serde_json::Value::Null;
             // No run waits for a person (ADR-0062 decision 12).
             expected["waiting"] = serde_json::json!([]);
+            // No claim is deferred on a conflict hotspot (ADR-0069).
+            expected["claim_deferrals"] = serde_json::json!([]);
         } else {
             expected["schema"] = serde_json::json!({
                 "schema_version": SqliteQueue::SCHEMA_VERSION,

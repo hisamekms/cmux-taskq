@@ -124,6 +124,10 @@ pub struct SuperviseOptions {
     /// from the `dagq.toml` of the repository's main checkout (ADR-0043
     /// decision 4). Tests set them.
     pub stall: Option<StallConfig>,
+    /// The `[conflicts]` thresholds and the limit of a deferred claim
+    /// (ADR-0069); `None` reads `[conflicts]` of the main checkout's
+    /// `dagq.toml`.
+    pub conflicts: Option<crate::domain::stats::ConflictConfig>,
     /// Upper bound on the planners the runtime has open at once (ADR-0041
     /// decision 12); a person's planners do not count.
     pub runtime_planners: usize,
@@ -164,6 +168,7 @@ impl SuperviseOptions {
             sweep_interval: SWEEP_INTERVAL,
             generators: clock::system(),
             stall: None,
+            conflicts: None,
             runtime_planners: 1,
             planner_timeout: PLANNER_TIMEOUT,
             plugin_dir: None,
@@ -237,14 +242,15 @@ pub fn supervise_with_reviewer(
         Some(stall) => stall,
         None => load_stall_config(&main_checkout(&repository))?.unwrap_or_default(),
     };
-    // Only for what the plan review is told: a `[conflicts]` that cannot
-    // be read leaves the defaults rather than stopping the supervisor.
-    let conflicts = statistics::conflict_config(
+    // For the plan review's hotspots and the claims deferred on them
+    // (ADR-0069): a `[conflicts]` that cannot be read leaves the defaults
+    // rather than stopping the supervisor.
+    let conflicts = statistics::conflict_config(options.conflicts.or_else(|| {
         load_conflict_config(&main_checkout(&repository)).unwrap_or_else(|error| {
             tracing::warn!(error = %format_args!("{error:#}"), "[conflicts] of dagq.toml not read: {error:#}; using the defaults");
             None
-        }),
-    );
+        })
+    }));
     let pid = std::process::id();
     let generators = options.generators.clone();
     let layout = Layout {

@@ -26,7 +26,7 @@ related:
 
 - `load_average`: hostの1分のload average（`getloadavg`）が`supervise --max-load`（既定16.0）を超えている。等しいときは控えない。load averageが読めないときは控えない
 
-後続のtask（463・377・437）は`HoldReason`と`HoldInputs`に理由を足し、同じ判定・同じイベント・同じ`status` / `stats`の出し方を使う。
+後続のtask（377・437）は`HoldReason`と`HoldInputs`に理由を足し、同じ判定・同じイベント・同じ`status` / `stats`の出し方を使う。task 463の衝突の多いファイルの控えはqueue全体ではなく1つのtaskを飛ばすもので、taskのevent（`claim_deferred` / `claim_deferral_ended`）で記録し、`status`の`claim_deferrals`と`stats`の`claim_deferrals`に同じ形で出す（[claimを控える（衝突の多いファイル）](claim-defer.md)）。
 
 `--max-load`の既定値16.0の根拠: この queue の host は8コアで、2026-09-26の`stats --full`の`backend_failures.by_load_band`（load帯ごとの`backend_call_failed`）は`0-4`が1件、`8-16`が1件、`16-32`が56件、`32-64`が257件、`64+`が116件だった。cmuxの時間切れはloadがコア数の2倍（16）を超えたところから出始める。`--max-load 0`（0以下）で控えを無効にする。libraryの`SuperviseOptions::new`の既定は無効（`max_load: None`）で、CLIの`supervise`だけが既定16.0を渡す。`up`はまだ`--max-load`を渡さないので、`up`が起動するsupervisorは既定値で動く。
 

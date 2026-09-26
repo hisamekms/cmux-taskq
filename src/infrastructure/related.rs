@@ -8,6 +8,7 @@ use anyhow::{Context, Result, ensure};
 use rusqlite::{OptionalExtension, params};
 
 use super::sqlite::SqliteQueue;
+use crate::domain::TaskId;
 use crate::domain::related::{RelatedDoc, RelatedPage, rank};
 use crate::domain::search::TRIGRAM;
 
@@ -30,6 +31,23 @@ impl SqliteQueue {
         let search = self.title_matches(task_id, &title)?;
         rank(task_id, &docs, &search, statuses, limit)
             .with_context(|| format!("task {task_id} does not exist"))
+    }
+
+    /// The commits that landed the `limit` completed tasks most related to
+    /// `task_id`, best first (ADR-0069).
+    pub fn related_landed_commits(&self, task_id: TaskId, limit: usize) -> Result<Vec<String>> {
+        let page = self.related(task_id.as_i64(), &["completed".to_owned()], limit)?;
+        let mut commits = Vec::new();
+        for task in page.related {
+            let mut statement = self
+                .conn
+                .prepare("SELECT commit_sha FROM landed_commits WHERE task_id = ?1 ORDER BY id")?;
+            let shas = statement
+                .query_map([task.id], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            commits.extend(shas);
+        }
+        Ok(commits)
     }
 
     fn related_docs(&self) -> Result<Vec<RelatedDoc>> {

@@ -1020,6 +1020,12 @@ pub trait RunStore {
     fn all_runs(&self) -> Result<Vec<TaskRun>>;
     /// Every run event, oldest first, for `stats`.
     fn all_events(&self) -> Result<Vec<RunEvent>>;
+    /// Per task, its newest event of one of `kinds` (ADR-0069).
+    fn latest_task_events(&self, kinds: &[&str]) -> Result<Vec<RunEvent>>;
+    /// The commits that landed the `limit` completed tasks most related to
+    /// `task` (`dagq related`, ADR-0046), for the files it is expected to
+    /// touch when it declares no paths (ADR-0069).
+    fn related_landed_commits(&self, task: TaskId, limit: usize) -> Result<Vec<String>>;
     /// The goal of every task, for `stats`.
     fn task_goals(&self) -> Result<HashMap<TaskId, Option<GoalId>>>;
     /// The title of every task, for `stats`.

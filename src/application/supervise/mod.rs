@@ -82,6 +82,7 @@ use crate::domain::{
 };
 
 mod adopt;
+mod claim_defer;
 mod deliver;
 mod dialog;
 mod draft_planner;
@@ -469,6 +470,7 @@ pub fn supervise(ports: &Ports<'_>, settings: &LoopSettings) -> Result<Value> {
         load_average: ports.load_average,
         host_versions: ports.host_versions,
         loads: HashMap::new(),
+        defer: claim_defer::DeferWatch::default(),
     };
     if settings.handoff_token.is_some() {
         supervisor.rebuild_own_runs(previous_version.as_deref())?;
@@ -565,6 +567,8 @@ struct Supervisor<'a> {
     host_versions: fn(&Path, &Path) -> HostVersions,
     /// The load samples of each held run's current interval (task 197).
     loads: HashMap<RunId, LoadWindow>,
+    /// The claims deferred on conflict hotspots (ADR-0069).
+    defer: claim_defer::DeferWatch,
 }
 
 /// One executing run between provisioning and rest.
@@ -837,7 +841,9 @@ impl Supervisor<'_> {
             // Highest effective priority, then most-releasing, then lowest
             // ID (ADR-0040 decision 4); `candidates` and `graph` show the
             // same order, so it is not recorded.
-            let order = dependency_graph(self.queue.graph_input()?, None).candidates;
+            // Less the candidates deferred on a conflict hotspot (ADR-0069).
+            let graph = dependency_graph(self.queue.graph_input()?, None);
+            let order = self.claimable(&graph)?;
             if order.is_empty() {
                 break;
             }
@@ -856,6 +862,7 @@ impl Supervisor<'_> {
                 ClaimOutcome::Claimed { run } => *run,
                 ClaimOutcome::NoReadyTask => break,
             };
+            self.defer.claimed();
             // The work interval starts at the claim, with its sample.
             let mut window = LoadWindow::default();
             window.add(attributes.load_avg);
