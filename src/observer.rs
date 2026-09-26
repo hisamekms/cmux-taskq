@@ -96,7 +96,7 @@ pub fn observe(db: &Path, provider: &dyn AgentProvider, options: &ObserveOptions
         &queue,
         &db,
         &StatsQuery {
-            since,
+            since: since.map(Into::into),
             ..StatsQuery::default()
         },
         cmux.as_ref()

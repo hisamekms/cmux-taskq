@@ -16,10 +16,12 @@ use super::{
 
 pub mod conflicts;
 pub mod landing;
+pub mod retries;
 pub mod thresholds;
 
 pub use conflicts::{ConflictConfig, ConflictConfigReport, ConflictHotspots, History};
 pub use landing::{LandBreakdown, LandClock, LandPhases, PhaseSummary};
+pub use retries::{BrokenBy, ResumeAttempt, ResumeBreakdown, Retries};
 pub use thresholds::ThresholdStats;
 
 /// Runs returned without `--full`.
@@ -37,11 +39,102 @@ pub const WORK_MEDIAN_FACTOR: i64 = 2;
 /// This many `backend_call_failed` in one window is an alert.
 pub const BACKEND_FAILURES: i64 = 2;
 
+/// Where a window of `stats` starts or ends: an event id (a previous
+/// `next_cursor`) or a time, which stands for the latest event recorded at
+/// or before it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Cursor {
+    Event(EventId),
+    /// Unix milliseconds.
+    Time(i64),
+}
+
+impl From<EventId> for Cursor {
+    fn from(id: EventId) -> Self {
+        Self::Event(id)
+    }
+}
+
+impl std::str::FromStr for Cursor {
+    type Err = String;
+
+    /// An event id (digits), `@<unix seconds>` or an RFC 3339 time.
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        let text = text.trim();
+        let digits = |text: &str| !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit());
+        let parsed = if digits(text) {
+            text.parse().ok().map(|id| Self::Event(EventId::new(id)))
+        } else if let Some(secs) = text.strip_prefix('@').filter(|secs| digits(secs)) {
+            secs.parse::<i64>()
+                .ok()
+                .and_then(|secs| secs.checked_mul(1000))
+                .map(Self::Time)
+        } else {
+            rfc3339_millis(text).map(Self::Time)
+        };
+        parsed.ok_or_else(|| {
+            format!(
+                "{text:?} is not an event id, @<unix seconds> or an RFC 3339 time such as 2026-09-26T08:52:00+09:00"
+            )
+        })
+    }
+}
+
+impl Cursor {
+    /// The event id this cursor stands for among `events` (ascending id):
+    /// the id itself, or the latest event recorded at or before the time
+    /// (0 when none was).
+    pub fn event_id(self, events: &[RunEvent]) -> EventId {
+        match self {
+            Self::Event(id) => id,
+            Self::Time(millis) => events
+                .iter()
+                .filter(|event| timestamp_millis(&event.created_at).is_some_and(|at| at <= millis))
+                .map(|event| event.id)
+                .max()
+                .unwrap_or(EventId::new(0)),
+        }
+    }
+}
+
+/// Unix milliseconds of an RFC 3339 time (`2026-09-26T08:52:00+09:00`,
+/// `...Z`, with or without a fraction); `None` when it does not parse.
+pub fn rfc3339_millis(text: &str) -> Option<i64> {
+    let (local, offset) = match text.strip_suffix(['Z', 'z']) {
+        Some(local) => (local, 0),
+        None => {
+            let (local, offset) = text.split_at_checked(text.len().checked_sub(6)?)?;
+            let sign = match offset.as_bytes()[0] {
+                b'+' => 1,
+                b'-' => -1,
+                _ => return None,
+            };
+            let (hours, minutes) = offset[1..].split_once(':')?;
+            let (hours, minutes) = (hours.parse::<u8>().ok()?, minutes.parse::<u8>().ok()?);
+            if hours > 23 || minutes > 59 {
+                return None;
+            }
+            (
+                local,
+                sign * (i64::from(hours) * 60 + i64::from(minutes)) * 60_000,
+            )
+        }
+    };
+    // A four-digit year keeps the arithmetic far from overflowing.
+    let year = local.get(..5)?;
+    if !(year.ends_with('-') && year[..4].bytes().all(|b| b.is_ascii_digit())) {
+        return None;
+    }
+    Some(timestamp_millis(local)? - offset)
+}
+
 /// What `stats` looks at.
 #[derive(Debug, Clone, Default)]
 pub struct StatsQuery {
-    /// Only runs that finished after this event id (`--since`).
-    pub since: Option<EventId>,
+    /// Only runs that finished after this cursor (`--since`).
+    pub since: Option<Cursor>,
+    /// Only runs that finished at or before this cursor (`--until`).
+    pub until: Option<Cursor>,
     /// Only runs of tasks in this goal (`--goal`).
     pub goal_id: Option<GoalId>,
     /// Every finished run instead of [`DEFAULT_RUNS`] (`--full`).
@@ -85,6 +178,17 @@ pub struct RunStats {
     /// `wait_to_land` by phase, and the push after it (goal 36); null for a
     /// run that did not land.
     pub land_phases: Option<LandPhases>,
+    /// The task's title (task 466).
+    pub title: Option<String>,
+    /// When the run was claimed (`run_claimed`), first validated
+    /// (`validation_finished`) and landed (`run_integrated`).
+    pub claimed_at: Option<String>,
+    pub validated_at: Option<String>,
+    pub landed_at: Option<String>,
+    /// Its `integrate` attempts, their deferrals and the landings that
+    /// broke them, and its resumes.
+    #[serde(flatten)]
+    pub retries: Retries,
 }
 
 /// Count, sum and median of one interval over a set of runs; runs without
@@ -105,6 +209,8 @@ pub struct Intervals {
     pub startup: Summary,
     /// The landed runs' `wait_to_land` by phase, with its long tail.
     pub land_phases: LandBreakdown,
+    /// The runs' resumes, together and per reason.
+    pub resume_outcomes: ResumeBreakdown,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -369,7 +475,14 @@ pub fn stats(
     query: &StatsQuery,
     live: &LiveSnapshot,
 ) -> Stats {
+    let since = query.since.map(|cursor| cursor.event_id(events));
+    let until = query.until.map(|cursor| cursor.event_id(events));
     let latest = events.iter().map(|e| e.id).max().unwrap_or(EventId::new(0));
+    // A `--since` past `--until` leaves nothing, and the cursor does not go back.
+    let latest = until.map_or(latest, |until| {
+        let capped = until.min(latest);
+        since.map_or(capped, |since| capped.max(since.min(latest)))
+    });
     let in_goal = |task_id: TaskId| {
         query
             .goal_id
@@ -411,9 +524,8 @@ pub fn stats(
     let mut finished = finished
         .into_iter()
         .filter(|track| {
-            query
-                .since
-                .is_none_or(|since| track.stats.finished_event_id > Some(since))
+            since.is_none_or(|since| track.stats.finished_event_id > Some(since))
+                && until.is_none_or(|until| track.stats.finished_event_id <= Some(until))
         })
         .collect::<Vec<_>>();
     finished.sort_by_key(|track| track.stats.finished_event_id);
@@ -424,7 +536,7 @@ pub fn stats(
     };
     let mut next_cursor = latest;
     if finished.len() > limit {
-        if query.since.is_some() {
+        if since.is_some() {
             // Page forward: the oldest runs past the cursor, then the rest.
             finished.truncate(limit);
             next_cursor = finished
@@ -529,7 +641,7 @@ pub fn stats(
             });
         }
     }
-    let window_start = match query.since {
+    let window_start = match since {
         Some(since) => since,
         None if query.full => EventId::new(0),
         None => finished
@@ -1007,6 +1119,9 @@ fn intervals(runs: &[&RunStats]) -> Intervals {
             runs.iter()
                 .filter_map(|r| Some((r.land_phases.as_ref()?, r.wait_to_land?))),
         ),
+        resume_outcomes: retries::resume_breakdown(
+            runs.iter().flat_map(|r| &r.retries.resume_attempts),
+        ),
     }
 }
 
@@ -1058,6 +1173,11 @@ fn runs(events: &[RunEvent], goals: &HashMap<TaskId, Option<GoalId>>) -> Vec<Tra
                     needs_session: 0,
                     failed: 0,
                     land_phases: None,
+                    title: None,
+                    claimed_at: None,
+                    validated_at: None,
+                    landed_at: None,
+                    retries: Retries::default(),
                 },
                 claimed: None,
                 receipt: None,
@@ -1072,7 +1192,11 @@ fn runs(events: &[RunEvent], goals: &HashMap<TaskId, Option<GoalId>>) -> Vec<Tra
         }
         let run = &mut track.stats;
         match event.kind.as_str() {
-            "run_claimed" => track.claimed = track.claimed.or(at),
+            "run_claimed" => {
+                track.claimed = track.claimed.or(at);
+                run.claimed_at
+                    .get_or_insert_with(|| event.created_at.clone());
+            }
             "agent_started" => track.agent_started = track.agent_started.or(at),
             "first_commit_observed" if run.startup.is_none() => {
                 run.startup = seconds_between(track.agent_started, at);
@@ -1084,6 +1208,7 @@ fn runs(events: &[RunEvent], goals: &HashMap<TaskId, Option<GoalId>>) -> Vec<Tra
             "validation_finished" if track.validated.is_none() => {
                 track.validated = at;
                 track.land = at.map(|at| LandClock::start(event, at));
+                run.validated_at = Some(event.created_at.clone());
                 run.validate = seconds_between(track.receipt, at);
             }
             "integration_started" => run.status = Some("integrating".to_owned()),
@@ -1097,6 +1222,7 @@ fn runs(events: &[RunEvent], goals: &HashMap<TaskId, Option<GoalId>>) -> Vec<Tra
             }
             "run_integrated" => {
                 run.wait_to_land = seconds_between(track.validated, at);
+                run.landed_at = Some(event.created_at.clone());
                 run.status = Some("integrated".to_owned());
                 run.finished_event_id.get_or_insert(event.id);
             }
@@ -1126,10 +1252,12 @@ fn runs(events: &[RunEvent], goals: &HashMap<TaskId, Option<GoalId>>) -> Vec<Tra
             }
         }
     }
+    let mut retries = retries::retries(events);
     order
         .into_iter()
         .filter_map(|id| tracks.remove(&id))
         .map(|mut track| {
+            track.stats.retries = retries.remove(&track.stats.run_id).unwrap_or_default();
             track.stats.land_phases = track
                 .land
                 .as_ref()
@@ -1851,7 +1979,7 @@ mod tests {
         // After the first nudge only the second counts.
         let since = at(
             &StatsQuery {
-                since: Some(EventId::new(3)),
+                since: Some(EventId::new(3).into()),
                 ..StatsQuery::default()
             },
             &HashMap::new(),
@@ -1876,6 +2004,97 @@ mod tests {
         assert_eq!(
             goal.stall_thresholds["idle_without_receipt_secs"].outcomes,
             BTreeMap::from([("resolved_by_nudge".to_owned(), 1)])
+        );
+    }
+
+    #[test]
+    fn cursors_are_event_ids_unix_seconds_or_rfc3339_times() {
+        let parse = |text: &str| text.parse::<Cursor>();
+        assert_eq!(parse("42"), Ok(Cursor::Event(EventId::new(42))));
+        assert_eq!(parse("@1800000000"), Ok(Cursor::Time(T * 1000)));
+        let utc = timestamp_millis("2026-09-25T23:52:00Z").unwrap();
+        for text in [
+            "2026-09-26T08:52:00+09:00",
+            "2026-09-25T23:52:00Z",
+            "2026-09-25T23:52:00.000z",
+            "2026-09-25T20:22:00-03:30",
+        ] {
+            assert_eq!(parse(text), Ok(Cursor::Time(utc)), "{text}");
+        }
+        for bad in [
+            "",
+            "@",
+            "@-1",
+            "-1",
+            "2026-09-26T08:52:00",
+            "2026-09-26T08:52:00*09:00",
+            "2026-09-26T08:52:00+xx:00",
+            "@99999999999999999",
+            "昨日の朝九時",
+            "9223372036854775807-01-01T00:00:00Z",
+            "2026-09-26T08:52:00+24:00",
+            "2026-09-26T08:52:00+-9:00",
+        ] {
+            assert!(parse(bad).is_err(), "{bad}");
+        }
+        assert!(parse("x").unwrap_err().contains("RFC 3339"));
+    }
+
+    /// `--since` and `--until` take a time as the latest event recorded
+    /// at or before it; `--until` also caps `next_cursor`.
+    #[test]
+    fn a_window_of_times_keeps_the_runs_that_finished_in_it() {
+        let events = [
+            run_event(1, R1, "run_claimed", json!({}), T),
+            run_event(2, R1, "run_integrated", json!({}), T + 100),
+            run_event(3, R2, "run_claimed", json!({}), T + 150),
+            run_event(4, R2, "run_integrated", json!({}), T + 200),
+            run_event(5, R3, "run_claimed", json!({}), T + 250),
+            run_event(6, R3, "run_integrated", json!({}), T + 300),
+        ];
+        let window = |since: Option<Cursor>, until: Option<Cursor>| {
+            let stats = stats(
+                &events,
+                &HashMap::new(),
+                T + 1000,
+                SlotSnapshot::default(),
+                &StatsQuery {
+                    since,
+                    until,
+                    ..StatsQuery::default()
+                },
+                &LiveSnapshot::default(),
+            );
+            let runs: Vec<String> = stats
+                .runs
+                .iter()
+                .map(|run| run.run_id.as_str()[..1].to_owned())
+                .collect();
+            (runs, stats.next_cursor.as_i64())
+        };
+        let time = |secs: i64| Some(Cursor::Time(secs * 1000));
+        assert_eq!(
+            window(None, None),
+            (vec!["1".into(), "2".into(), "3".into()], 6)
+        );
+        assert_eq!(
+            window(time(T + 100), time(T + 299)),
+            (vec!["2".to_owned()], 5)
+        );
+        assert_eq!(
+            window(Some(EventId::new(2).into()), time(T + 300)),
+            (vec!["2".into(), "3".into()], 6)
+        );
+        // A time before every event is the start; past them all, the end.
+        assert_eq!(window(time(T - 1), time(T - 1)), (vec![], 0));
+        assert_eq!(window(None, Some(Cursor::Event(EventId::new(99)))).1, 6);
+        assert_eq!(
+            window(Some(EventId::new(4).into()), Some(EventId::new(2).into())),
+            (vec![], 4)
+        );
+        assert_eq!(
+            Cursor::Time(T * 1000 + 99_999).event_id(&events),
+            EventId::new(1)
         );
     }
 }

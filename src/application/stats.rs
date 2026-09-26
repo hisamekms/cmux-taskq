@@ -176,7 +176,12 @@ pub fn stats(
         history: conflict_history(&events, sources.history),
         conflicts: conflict_config((sources.conflicts_file)()?),
     };
-    Ok(aggregate(&events, &goals, now, snapshot, query, &live))
+    let mut stats = aggregate(&events, &goals, now, snapshot, query, &live);
+    let titles = queue.task_titles()?;
+    for run in &mut stats.runs {
+        run.title = titles.get(&run.task_id).cloned();
+    }
+    Ok(stats)
 }
 
 fn finished(status: RunStatus) -> bool {

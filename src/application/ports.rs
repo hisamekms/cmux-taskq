@@ -958,6 +958,8 @@ pub trait RunStore {
     fn all_events(&self) -> Result<Vec<RunEvent>>;
     /// The goal of every task, for `stats`.
     fn task_goals(&self) -> Result<HashMap<TaskId, Option<GoalId>>>;
+    /// The title of every task, for `stats`.
+    fn task_titles(&self) -> Result<HashMap<TaskId, String>>;
     /// Point the queue at `common_dir` whatever it was bound to, and return
     /// the previous binding (`rebind`, ADR-0020).
     fn rebind_repository(&mut self, common_dir: &str) -> Result<Option<String>>;

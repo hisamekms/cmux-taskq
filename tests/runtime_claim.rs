@@ -255,7 +255,7 @@ fn failed_backend_calls_are_recorded_with_the_load_and_counted_by_stats() {
     let stats = runtime::stats(
         &db,
         &dagq::domain::stats::StatsQuery {
-            since: Some(EventId::new(cursor)),
+            since: Some(EventId::new(cursor).into()),
             ..Default::default()
         },
     )

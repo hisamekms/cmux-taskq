@@ -756,10 +756,17 @@ enum Command {
     /// Per-run times in seconds (work, validate, wait_to_land, startup) and counts, per-goal and
     /// overall count/total/median, and alerts over thresholds, derived from run events. The latest
     /// 50 finished runs unless --full; pass `next_cursor` to --since for only the runs finished later.
+    /// Each run also carries its title, claim/validation/landing times, integrate attempts and
+    /// deferrals, the landings that broke it, and its resumes.
     Stats {
-        /// Event id (a previous `next_cursor`): only runs that finished after it.
+        /// Event id (a previous `next_cursor`), `@<unix seconds>` or an RFC 3339 time: only runs
+        /// that finished after it.
         #[arg(long)]
-        since: Option<i64>,
+        since: Option<dagq::domain::stats::Cursor>,
+        /// Event id, `@<unix seconds>` or an RFC 3339 time: only runs that finished at or before
+        /// it; `next_cursor` goes no further.
+        #[arg(long)]
+        until: Option<dagq::domain::stats::Cursor>,
         /// Only runs of tasks in this goal.
         #[arg(long = "goal")]
         goal_id: Option<i64>,
@@ -1952,6 +1959,7 @@ fn execute(cli: Cli) -> Result<Value> {
         Command::Review { id } => dagq::compose::review(&db, TaskId::new(id))?,
         Command::Stats {
             since,
+            until,
             goal_id,
             full,
             cmux,
@@ -1963,7 +1971,8 @@ fn execute(cli: Cli) -> Result<Value> {
                 &queue,
                 &db,
                 &dagq::domain::stats::StatsQuery {
-                    since: since.map(EventId::new),
+                    since,
+                    until,
                     goal_id: goal_id.map(GoalId::new),
                     full,
                 },

@@ -1288,6 +1288,15 @@ impl SqliteQueue {
             .collect::<rusqlite::Result<_>>()?)
     }
 
+    /// The title of every task.
+    pub fn task_titles(&self) -> Result<HashMap<TaskId, String>> {
+        Ok(self
+            .conn
+            .prepare("SELECT id, title FROM tasks")?
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?)
+    }
+
     /// Events with `after < id <= upto` that `filter` keeps, oldest first,
     /// at most `limit`. A pure read.
     pub fn events_between(
@@ -2757,6 +2766,9 @@ impl RunStore for SqliteQueue {
     }
     fn task_goals(&self) -> Result<HashMap<TaskId, Option<GoalId>>> {
         SqliteQueue::task_goals(self)
+    }
+    fn task_titles(&self) -> Result<HashMap<TaskId, String>> {
+        SqliteQueue::task_titles(self)
     }
     fn rebind_repository(&mut self, common_dir: &str) -> Result<Option<String>> {
         SqliteQueue::rebind_repository(self, common_dir)

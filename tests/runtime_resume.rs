@@ -1762,3 +1762,122 @@ fn failed_receipt_from_a_session_ends_the_run_without_landing() {
         .transition(TaskId::new(2), TaskAction::Cancel)
         .unwrap();
 }
+
+/// Task 466: `stats` ties the conflict that parked the second run to the
+/// first run's landing, whose main it was rebased onto, and counts the
+/// resumes by reason: the first resolved in its session but was deferred
+/// again, the second landed the run. A time window narrows the runs.
+#[test]
+fn stats_ties_a_deferred_landing_to_the_landing_that_broke_it() {
+    use dagq::domain::stats::{Cursor, StatsQuery};
+    let (_dir, repo, db) = fixture();
+    let backend = TestWorkspace::new(&db, false, VALID_AGENT);
+    let (run, first_landed) = parked_conflict(&repo, &db, &backend);
+    backend.resume_script_for(
+        2,
+        "await_message; mark=\"$(dirname \"$RECEIPT\")/attempted\"; if [ -f \"$mark\" ]; then resolve; else : > \"$mark\"; fi; receipt \"$(git rev-parse HEAD)\"; idle; await_exit",
+    );
+    let outcome = supervise(&db, &repo, &backend).unwrap();
+    backend.join();
+    assert_eq!(outcome["errors"], json!([]), "{outcome}");
+    let first = SqliteQueue::open(&db)
+        .unwrap()
+        .show(TaskId::new(1))
+        .unwrap()
+        .runs[0]
+        .clone();
+
+    let query = |since: Option<Cursor>, until: Option<Cursor>| {
+        runtime::stats(
+            &db,
+            &StatsQuery {
+                since,
+                until,
+                full: true,
+                ..StatsQuery::default()
+            },
+        )
+        .unwrap()
+    };
+    let stats = query(None, None);
+    let runs = stats["runs"].as_array().unwrap();
+    let row = |id: &RunId| {
+        runs.iter()
+            .find(|row| row["run_id"] == id.as_str())
+            .unwrap_or_else(|| panic!("no run {id} in {stats}"))
+    };
+    let (landing, broken) = (row(first.id()), row(run.id()));
+    assert_eq!(landing["title"], "test task");
+    assert_eq!(broken["title"], "second");
+    assert_eq!(landing["broke_runs"], 1);
+    assert_eq!(landing["integrate_attempts"], 1);
+    assert_eq!(broken["broke_runs"], 0);
+    // Deferred at the first landing and after the first resume, landed at the third.
+    assert_eq!(broken["integrate_attempts"], 3);
+    assert_eq!(broken["deferrals"], json!({"rebase_conflict": 2}));
+    assert_eq!(broken["conflict_files"], json!(["change.txt"]));
+    assert_eq!(
+        broken["broken_by"],
+        json!([{
+            "task_id": 1,
+            "run_id": first.id().as_str(),
+            "landed_at": landing["landed_at"],
+            "main": first_landed,
+            "code": "rebase_conflict",
+        }])
+    );
+    let attempts = broken["resume_attempts"].as_array().unwrap();
+    assert_eq!(
+        attempts
+            .iter()
+            .map(|a| (
+                a["attempt"].clone(),
+                a["reason"].clone(),
+                a["resolved"].clone()
+            ))
+            .collect::<Vec<_>>(),
+        [
+            (json!(1), json!("rebase_conflict"), json!(false)),
+            (json!(2), json!("rebase_conflict"), json!(true)),
+        ]
+    );
+    assert!(attempts.iter().all(|a| a["secs"].is_i64()), "{attempts:?}");
+    for row in [landing, broken] {
+        for key in ["claimed_at", "validated_at", "landed_at"] {
+            assert!(
+                row[key].as_str().is_some_and(|at| at.ends_with('Z')),
+                "{key} of {row}"
+            );
+        }
+    }
+    let outcomes = &stats["overall"]["resume_outcomes"];
+    assert_eq!(outcomes["attempts"], 2);
+    let conflict = &outcomes["by_reason"]["rebase_conflict"];
+    assert_eq!(
+        (
+            &conflict["resolved"],
+            &conflict["unresolved"],
+            &conflict["resolved_percent"]
+        ),
+        (&json!(1), &json!(1), &json!(50))
+    );
+    assert_eq!(conflict["secs"]["count"], 2);
+
+    // Up to the first landing's time only it finished; after it, only the second.
+    let landed_at: Cursor = landing["landed_at"].as_str().unwrap().parse().unwrap();
+    let ids = |stats: &Value| {
+        stats["runs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["run_id"].clone())
+            .collect::<Vec<_>>()
+    };
+    let until = query(None, Some(landed_at));
+    assert_eq!(ids(&until), [json!(first.id().as_str())]);
+    assert!(until["next_cursor"].as_i64() < stats["next_cursor"].as_i64());
+    assert_eq!(
+        ids(&query(Some(landed_at), None)),
+        [json!(run.id().as_str())]
+    );
+}

@@ -2192,6 +2192,19 @@ mod stats {
                     "resume": 0, "landing_queue": 0, "rebase": 120, "verify": 0,
                     "push": null,
                 },
+                // Task 466: the times, the landings and the resumes. The
+                // title comes from the queue, not the events.
+                "title": null,
+                "claimed_at": "2026-09-23T12:00:00.000Z",
+                "validated_at": "2026-09-23T12:12:00.000Z",
+                "landed_at": "2026-09-23T12:32:00.000Z",
+                "integrate_attempts": 1, "deferrals": {}, "conflict_files": [],
+                "broken_by": [], "broke_runs": 0,
+                "resume_attempts": [{
+                    "attempt": 1, "reason": "unknown",
+                    "started_at": "2026-09-23T12:13:00.000Z",
+                    "secs": null, "resolved": null,
+                }],
             })
         );
         // Parked three times, then the landing: the wait is the resume's.
@@ -2214,8 +2227,14 @@ mod stats {
         assert_eq!(breakdown["resume"]["tail_total"], 0);
         assert_eq!(breakdown["push"]["count"], 0);
         assert_eq!(goal_reports[1]["land_phases"]["runs"], 0);
+        assert_eq!(goal_reports[0]["resume_outcomes"]["attempts"], 1);
+        assert_eq!(
+            goal_reports[0]["resume_outcomes"]["by_reason"]["unknown"]["resolved_percent"],
+            Value::Null
+        );
         for goal in goal_reports.as_array_mut().unwrap() {
             goal.as_object_mut().unwrap().remove("land_phases");
+            goal.as_object_mut().unwrap().remove("resume_outcomes");
         }
         assert_eq!(report["overall"]["land_phases"]["runs"], 2);
         assert_eq!(
@@ -2298,7 +2317,7 @@ mod stats {
             at(120),
             SlotSnapshot::default(),
             &StatsQuery {
-                since: Some(EventId::new(runs[1]["finished_event_id"].as_i64().unwrap())),
+                since: Some(EventId::new(runs[1]["finished_event_id"].as_i64().unwrap()).into()),
                 ..Default::default()
             },
             &LiveSnapshot::default(),
@@ -2319,9 +2338,9 @@ mod stats {
             at(120),
             SlotSnapshot::default(),
             &StatsQuery {
-                since: Some(EventId::new(
-                    since["runs"][0]["finished_event_id"].as_i64().unwrap(),
-                )),
+                since: Some(
+                    EventId::new(since["runs"][0]["finished_event_id"].as_i64().unwrap()).into(),
+                ),
                 ..Default::default()
             },
             &LiveSnapshot::default(),
@@ -2398,7 +2417,7 @@ mod stats {
 
         // Past the cursor: three failures, the close is before it.
         let since = run(StatsQuery {
-            since: Some(EventId::new(cursor)),
+            since: Some(EventId::new(cursor).into()),
             ..Default::default()
         });
         assert_eq!(since["backend_failures"]["count"], 3);
@@ -2414,7 +2433,7 @@ mod stats {
         // --goal keeps only the failures of its runs; one is no alert.
         let goal = run(StatsQuery {
             goal_id: Some(GoalId::new(5)),
-            since: Some(EventId::new(cursor)),
+            since: Some(EventId::new(cursor).into()),
             ..Default::default()
         });
         assert_eq!(goal["backend_failures"]["count"], 2);
@@ -2430,7 +2449,7 @@ mod stats {
 
         // Nothing past the last event: an empty window.
         let empty = run(StatsQuery {
-            since: Some(EventId::new(events.last_id())),
+            since: Some(EventId::new(events.last_id()).into()),
             ..Default::default()
         });
         assert_eq!(empty["backend_failures"]["count"], 0);
@@ -2509,14 +2528,14 @@ mod stats {
             60
         );
         let first = run(StatsQuery {
-            since: Some(EventId::new(0)),
+            since: Some(EventId::new(0).into()),
             ..Default::default()
         });
         assert_eq!(first["runs"].as_array().unwrap().len(), 50);
         assert_eq!(first["runs"][49]["run_id"], "r50");
         assert_eq!(first["next_cursor"], 100);
         let rest = run(StatsQuery {
-            since: Some(EventId::new(100)),
+            since: Some(EventId::new(100).into()),
             ..Default::default()
         });
         assert_eq!(rest["runs"].as_array().unwrap().len(), 10);
@@ -2524,7 +2543,7 @@ mod stats {
         assert_eq!(rest["next_cursor"], events.last_id());
         assert_eq!(
             run(StatsQuery {
-                since: Some(EventId::new(events.last_id())),
+                since: Some(EventId::new(events.last_id()).into()),
                 ..Default::default()
             })["runs"],
             json!([])
