@@ -95,15 +95,6 @@ impl IdleMarker {
     }
 }
 
-/// Whether the marker shows background work the agent left running.
-pub(super) fn background_running(
-    files: &dyn RunFiles,
-    signals: &dyn AgentSignals,
-    marker: &Path,
-) -> Result<bool> {
-    Ok(IdleMarker::read(files, signals, marker)?.is_some_and(|idle| idle.background_running()))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -159,7 +150,6 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
-        assert!(!background_running(&files, &Signals, marker).unwrap());
         assert!(idle_after_receipt(&files, receipt, marker).is_none());
         files.write(receipt, b"{}").unwrap();
         let before = files.now() - Duration::from_secs(60);
@@ -167,10 +157,6 @@ mod tests {
             files.write(marker, content.as_bytes()).unwrap();
             let idle = IdleMarker::read(&files, &Signals, marker).unwrap().unwrap();
             assert_eq!(idle.background_running(), running, "{content}");
-            assert_eq!(
-                background_running(&files, &Signals, marker).unwrap(),
-                running
-            );
             assert_eq!(idle.idle_since(before), !running, "{content}");
             assert!(!idle.idle_since(files.now() + Duration::from_secs(60)));
             assert_eq!(

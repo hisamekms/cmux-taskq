@@ -3,6 +3,7 @@
 use crate::common;
 use crate::runtime_support;
 
+use dagq::domain::stats::timestamp_millis;
 use runtime_support::*;
 
 /// The worker goes idle after its receipt and never exits by itself; each
@@ -1952,8 +1953,10 @@ fn a_revise_session_that_holds_exit_back_raises_a_stuck_exit_ask() {
 
 /// Background work that never ends does not hold the run forever: past the
 /// resume timeout from the receipt the run goes on to validation (its
-/// `session_idle_observed` saying the work still ran), and past it again the
-/// `/exit` goes, where a dialog would become a `stuck_exit` ask.
+/// `session_idle_observed` saying the work still ran), and the `/exit` then
+/// goes without waiting the resume timeout again for the same work (task
+/// 242), so that a dialog becomes a `stuck_exit` ask about one resume
+/// timeout after the receipt, not two.
 #[test]
 fn background_work_that_never_ends_is_waited_for_up_to_the_resume_timeout() {
     let (_dir, repo, db) = fixture();
@@ -1962,7 +1965,8 @@ fn background_work_that_never_ends_is_waited_for_up_to_the_resume_timeout() {
         false,
         "commit work; receipt \"$(git rev-parse HEAD)\"; idle_bg; await_exit",
     );
-    backend.resume_timeout = Duration::from_secs(1);
+    let resume_timeout = Duration::from_secs(3);
+    backend.resume_timeout = resume_timeout;
     let outcome = supervise(&db, &repo, &backend).unwrap();
     backend.join();
     assert_eq!(outcome["errors"], json!([]), "{outcome}");
@@ -1977,6 +1981,18 @@ fn background_work_that_never_ends_is_waited_for_up_to_the_resume_timeout() {
     assert_eq!(idle[0]["background_running"], true);
     let kinds = event_kinds(&detail);
     assert!(position(&kinds, "session_idle_observed") < position(&kinds, "exit_requested"));
+    let at = |kind: &str| {
+        let event = detail.events.iter().find(|e| e.kind == kind).unwrap();
+        timestamp_millis(&event.created_at).unwrap()
+    };
+    let limit = i64::try_from(resume_timeout.as_millis()).unwrap();
+    let before = at("session_idle_observed") - at("receipt_observed");
+    assert!(before >= limit, "went on {before}ms after the receipt");
+    let after = at("exit_requested") - at("session_idle_observed");
+    assert!(
+        after < limit,
+        "the /exit waited {after}ms for the work already waited for"
+    );
 }
 
 /// A reviewer script that moves main in the main checkout with a change to

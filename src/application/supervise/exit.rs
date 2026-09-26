@@ -6,7 +6,10 @@ use super::*;
 /// Asks the run's session to `/exit` once (unless it ended already) and
 /// waits for its wrapper to exit; then the supervisor closes the workspace
 /// and does `then`. The `/exit` waits while the idle marker shows background
-/// work running (task 147), for at most the resume timeout. A session that
+/// work running (task 147), for at most the resume timeout, unless that
+/// marker is the one the session's supervision already waited out from the
+/// receipt (task 242): its work has run the resume timeout since, and
+/// waiting again would put the `stuck_exit` ask twice as far off. A session that
 /// holds the `/exit` back past the exit timeout is recorded as
 /// `exit_request_timed_out` and waited for, keeping the lease, as before
 /// (ADR-0027 leaves it unchanged).
@@ -132,7 +135,7 @@ impl ExitWatch {
         }
         match self.requested {
             None if self.since.elapsed() < sv.cmux.resume_timeout()
-                && background_running(&*sv.files, sv.signals, &run.idle_marker_path()?)? =>
+                && self.background_waits(sv, run)? =>
             {
                 // A /exit now would stop at the "Background work is
                 // running" dialog; Claude Code takes the turn up again when
@@ -189,6 +192,35 @@ impl ExitWatch {
             return self.recover(sv, run, &session.workspace);
         }
         Ok(false)
+    }
+
+    /// Whether the `/exit` waits for background work: the idle marker shows
+    /// work running, and it is not the marker the latest
+    /// `session_idle_observed` already reported running (the session's
+    /// supervision waited the resume timeout for it before validating). A
+    /// session that took a turn since (a revise, a resume) wrote a marker of
+    /// its own and is waited for again.
+    fn background_waits(&self, sv: &mut Supervisor<'_>, run: &TaskRun) -> Result<bool> {
+        let Some(idle) = IdleMarker::read(&*sv.files, sv.signals, &run.idle_marker_path()?)? else {
+            return Ok(false);
+        };
+        if !idle.background_running() {
+            return Ok(false);
+        }
+        let events = sv.queue.run_events(run.id())?;
+        let waited_out = events
+            .iter()
+            .rev()
+            .find(|event| event.kind == "session_idle_observed")
+            .is_some_and(|event| {
+                event.payload["background_running"] == true
+                    && event.payload["marker_modified"] == json!(unix_seconds(idle.modified()))
+            });
+        if waited_out {
+            // The /exit goes on this poll: logged once.
+            info!(run_id = %run.id(), "session of {} still has the background work it was waited for after its receipt; /exit goes without waiting again", run.id());
+        }
+        Ok(!waited_out)
     }
 
     /// The session holds its `/exit` back (or the `/exit` never reached
