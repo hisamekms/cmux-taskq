@@ -1184,6 +1184,7 @@ fn happy_path_runs_a_stub_agent_through_cmux_and_lands_on_main() {
         "exit_requested",
         "session_exited",
         "workspace_closed",
+        "landing_queued",
         "integration_started",
         "integration_rebased",
         "run_integrated",

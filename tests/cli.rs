@@ -2184,15 +2184,40 @@ mod stats {
                 "finished_event_id": 9, "work": 600, "validate": 120,
                 "wait_to_land": 1200, "startup": 180, "resumes": 1,
                 "review_verdict": "pass", "needs_session": 0, "failed": 0,
+                // Goal 36: the wait to land by phase, from the events.
+                "land_phases": {
+                    "exit": 1080, "review": 0, "revise": 0, "conflict": 0, "ask": 0,
+                    "resume": 0, "landing_queue": 0, "rebase": 120, "verify": 0,
+                    "push": null,
+                },
             })
         );
+        // Parked three times, then the landing: the wait is the resume's.
+        assert_eq!(runs[1]["land_phases"]["resume"], 180);
+        assert!(runs[2]["land_phases"].is_null());
         assert_eq!(runs[1]["needs_session"], 3);
         assert!(runs[1]["startup"].is_null());
         assert!(runs[1]["review_verdict"].is_null());
         assert_eq!(runs[2]["status"], "failed");
         assert_eq!(runs[3]["work"], Value::Null);
+        let mut goal_reports = report["goals"].clone();
+        let breakdown = goal_reports[0]["land_phases"].take();
+        assert_eq!(breakdown["runs"], 2);
+        assert_eq!(breakdown["tail_threshold"], 1200);
+        assert_eq!(breakdown["tail_runs"], 1);
         assert_eq!(
-            report["goals"],
+            breakdown["exit"],
+            json!({"count": 2, "total": 1140, "median": 570, "p90": 1080, "max": 1080, "tail_total": 1080})
+        );
+        assert_eq!(breakdown["resume"]["tail_total"], 0);
+        assert_eq!(breakdown["push"]["count"], 0);
+        assert_eq!(goal_reports[1]["land_phases"]["runs"], 0);
+        for goal in goal_reports.as_array_mut().unwrap() {
+            goal.as_object_mut().unwrap().remove("land_phases");
+        }
+        assert_eq!(report["overall"]["land_phases"]["runs"], 2);
+        assert_eq!(
+            goal_reports,
             json!([
                 {"goal_id": 7, "runs": 2,
                  "work": {"count": 2, "total": 3000, "median": 1500},
@@ -2235,6 +2260,11 @@ mod stats {
         );
         // Task 2's 40 minutes are under twice goal 7's median (2 × 25 minutes).
         assert_eq!(report["alerts"][2]["task_id"], 4);
+        // The longest phase of each wait: `a` waited on its session's exit
+        // (no `landing_queued` was recorded), `d` on the ask still open.
+        assert_eq!(report["alerts"][0]["phase"], "exit");
+        assert_eq!(report["alerts"][2]["phase"], "ask");
+        assert!(report["alerts"][1].get("phase").is_none());
         assert!(report["alerts"][5]["task_id"].is_null());
 
         // --goal keeps the runs and alerts of goal 7's tasks only.

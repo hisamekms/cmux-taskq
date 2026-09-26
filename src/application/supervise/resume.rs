@@ -199,6 +199,7 @@ impl Supervisor<'_> {
             "validating it"
         });
         let phase = if approved {
+            self.queue_landing(&run, "resume");
             Phase::AwaitingSlot
         } else {
             Phase::Validating(Some(self.validate(run.clone())), None)
@@ -437,6 +438,7 @@ impl Supervisor<'_> {
                 let run = self
                     .queue
                     .finish_resume(&id, &self.token, None, None, true, payload)?;
+                self.queue_landing(&run, "resume");
                 slot.run = run;
                 slot.phase = Phase::AwaitingSlot;
                 return Ok(Step::Continue);

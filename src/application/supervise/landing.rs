@@ -10,6 +10,21 @@ const STALE_LANDING_ASK_CLOSED: &str =
     "a later review of the run failed and asks again; closed by the runtime";
 
 impl Supervisor<'_> {
+    /// Record `landing_queued` as `run` starts to wait for the integration
+    /// slot (`Phase::AwaitingSlot`): `stats` counts the wait from there to
+    /// `integration_started` as its `landing_queue` phase (goal 36). `via`
+    /// says what sent it: `exit` (its session exited after a passed review
+    /// or with the run approved) or `resume` (an approved resolved resume).
+    /// Only `stats` reads it, so a failure to record it is only reported:
+    /// the step it follows has already changed the run.
+    pub(super) fn queue_landing(&mut self, run: &TaskRun, via: &str) {
+        if let Err(error) =
+            self.queue
+                .record_runtime_event(run.id(), "landing_queued", json!({"via": via}))
+        {
+            warn!(run_id = %run.id(), error = %format_args!("{error:#}"), "run {}: could not record landing_queued: {error:#}", run.id());
+        }
+    }
     /// Land `run`, which holds the integration slot under this token, on a
     /// thread (`previous` is where an error before `main` moved returns it).
     /// It pushes unless an approving `integrate --no-push` recorded

@@ -15,9 +15,11 @@ use super::{
 };
 
 pub mod conflicts;
+pub mod landing;
 pub mod thresholds;
 
 pub use conflicts::{ConflictConfig, ConflictConfigReport, ConflictHotspots, History};
+pub use landing::{LandBreakdown, LandClock, LandPhases, PhaseSummary};
 pub use thresholds::ThresholdStats;
 
 /// Runs returned without `--full`.
@@ -80,6 +82,9 @@ pub struct RunStats {
     pub review_verdict: Option<String>,
     pub needs_session: i64,
     pub failed: i64,
+    /// `wait_to_land` by phase, and the push after it (goal 36); null for a
+    /// run that did not land.
+    pub land_phases: Option<LandPhases>,
 }
 
 /// Count, sum and median of one interval over a set of runs; runs without
@@ -98,6 +103,8 @@ pub struct Intervals {
     pub validate: Summary,
     pub wait_to_land: Summary,
     pub startup: Summary,
+    /// The landed runs' `wait_to_land` by phase, with its long tail.
+    pub land_phases: LandBreakdown,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -117,6 +124,10 @@ pub struct Alert {
     /// The file of a `conflict_hotspot`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
+    /// The phase of the wait to land that took the most time, for an
+    /// `awaiting_integration`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub phase: Option<&'static str>,
 }
 
 /// The `backend_call_failed` events in the window: how often cmux failed or
@@ -454,12 +465,17 @@ pub fn stats(
             _ => None,
         };
         if let Some(waited) = waited.filter(|&w| w > AWAITING_INTEGRATION_SECS) {
-            alerts.push(alert(
+            let mut alert = alert(
                 "awaiting_integration",
                 run,
                 waited,
                 AWAITING_INTEGRATION_SECS,
-            ));
+            );
+            alert.phase = track
+                .land
+                .as_ref()
+                .and_then(|clock| clock.phases(now * 1000).longest());
+            alerts.push(alert);
         }
         if run.needs_session >= NEEDS_SESSION_TIMES {
             alerts.push(alert(
@@ -509,6 +525,7 @@ pub fn stats(
                 value: waited,
                 threshold: ASK_UNANSWERED_SECS,
                 path: None,
+                phase: None,
             });
         }
     }
@@ -548,6 +565,7 @@ pub fn stats(
             value: file.conflicts,
             threshold: live.conflicts.config.hotspot_conflicts,
             path: Some(file.path.clone()),
+            phase: None,
         });
     }
     if backend_failures.count >= BACKEND_FAILURES {
@@ -558,6 +576,7 @@ pub fn stats(
             value: backend_failures.count,
             threshold: BACKEND_FAILURES,
             path: None,
+            phase: None,
         });
     }
     if slots.free_slots > 0 && slots.candidates == 0 && slots.ready > 0 {
@@ -568,6 +587,7 @@ pub fn stats(
             value: slots.free_slots,
             threshold: 0,
             path: None,
+            phase: None,
         });
     }
 
@@ -951,6 +971,7 @@ fn alert(kind: &'static str, run: &RunStats, value: i64, threshold: i64) -> Aler
         value,
         threshold,
         path: None,
+        phase: None,
     }
 }
 
@@ -982,6 +1003,10 @@ fn intervals(runs: &[&RunStats]) -> Intervals {
         validate: summary(runs.iter().map(|r| r.validate)),
         wait_to_land: summary(runs.iter().map(|r| r.wait_to_land)),
         startup: summary(runs.iter().map(|r| r.startup)),
+        land_phases: landing::breakdown(
+            runs.iter()
+                .filter_map(|r| Some((r.land_phases.as_ref()?, r.wait_to_land?))),
+        ),
     }
 }
 
@@ -994,6 +1019,8 @@ struct Track {
     validated: Option<i64>,
     agent_started: Option<i64>,
     awaiting_since: Option<i64>,
+    /// The wait to land by phase, from the first `validation_finished`.
+    land: Option<LandClock>,
 }
 
 fn payload_status(payload: &Value) -> Option<&str> {
@@ -1030,14 +1057,19 @@ fn runs(events: &[RunEvent], goals: &HashMap<TaskId, Option<GoalId>>) -> Vec<Tra
                     review_verdict: None,
                     needs_session: 0,
                     failed: 0,
+                    land_phases: None,
                 },
                 claimed: None,
                 receipt: None,
                 validated: None,
                 agent_started: None,
                 awaiting_since: None,
+                land: None,
             }
         });
+        if let (Some(clock), Some(at)) = (&mut track.land, at) {
+            clock.observe(event, at);
+        }
         let run = &mut track.stats;
         match event.kind.as_str() {
             "run_claimed" => track.claimed = track.claimed.or(at),
@@ -1051,6 +1083,7 @@ fn runs(events: &[RunEvent], goals: &HashMap<TaskId, Option<GoalId>>) -> Vec<Tra
             }
             "validation_finished" if track.validated.is_none() => {
                 track.validated = at;
+                track.land = at.map(|at| LandClock::start(event, at));
                 run.validate = seconds_between(track.receipt, at);
             }
             "integration_started" => run.status = Some("integrating".to_owned()),
@@ -1096,6 +1129,14 @@ fn runs(events: &[RunEvent], goals: &HashMap<TaskId, Option<GoalId>>) -> Vec<Tra
     order
         .into_iter()
         .filter_map(|id| tracks.remove(&id))
+        .map(|mut track| {
+            track.stats.land_phases = track
+                .land
+                .as_ref()
+                .filter(|clock| clock.landed())
+                .map(|clock| clock.phases(0));
+            track
+        })
         .collect()
 }
 

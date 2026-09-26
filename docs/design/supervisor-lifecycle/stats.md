@@ -10,6 +10,7 @@ scope: runtime
 related:
   - design-supervisor-lifecycle
   - adr-0040
+  - adr-0049
   - adr-0046
   - adr-0044
   - design-domain-model
@@ -26,9 +27,11 @@ related:
   - `wait_to_land`: 最初の`validation_finished`→`run_integrated`
   - `startup`: `agent_started`→`first_commit_observed`（[最初のcommitの観測](first-commit.md#最初のcommitの観測)。記録の無いrunはnull）
   - `resumes`: `resume_started`（ADR-0019の自動resume。記録されるまでは0）の数、`review_verdict`: 最後の`review_finished`の`verdict`（goal 11のreview工程が記録するまではnull）、`needs_session` / `failed`: payloadの`status`がその値のイベントの数。`integration_error`は試行前のstatusに戻すだけなので`needs_session`に数えない
+  - `land_phases`: `wait_to_land`の工程別の内訳（下の[着地待ちの内訳](#着地待ちの内訳)）。`run_integrated`の無いrunはnull
+- **`goals`と`overall`**の`land_phases`: 着地したrun（`land_phases`と`wait_to_land`のあるrun）についての`{runs, tail_threshold, tail_runs, <工程>..., push}`。`tail_threshold`はそれらのrunの`wait_to_land`の90パーセンタイル（nearest-rank: 昇順でceil(0.9×n)番目。runが無ければnull）、`tail_runs`は`wait_to_land`がそれ以上のrun（長い裾）の数。工程ごとと`push`は`{count, total, median, p90, max, tail_total}`で、`count` / `total` / `median`は他の区間と同じ規則（工程は着地したrun全部を0も含めて数え、`push`は記録のあるrunだけ）、`p90`は上と同じ規則、`tail_total`は長い裾のrunだけの合計。どの工程が裾を作ったかは工程ごとの`tail_total`を比べて読む
 - **`goals`と`overall`**: goalごと（goal昇順、goalの無いrunは`goal_id: null`で最後）と全体で、`runs`（件数）と区間ごとの`{count, total, median}`。区間の無いrunは数えない。中央値は偶数個なら中央2つの平均の切り捨て。
 - **`alerts`**: `[{kind, task_id, run_id, value, threshold, path?}]`（`value`と`threshold`は秒か回数）。対象のrunに加えて、まだ終わっていないrunも見る。
-  - `awaiting_integration`: `wait_to_land`が15分（900秒）を超えたrun。まだ`awaiting_integration`にいるrunは最初に`awaiting_integration`になってからの経過で判定する（着地の失敗で戻っても起点は変えない）
+  - `awaiting_integration`: `wait_to_land`が15分（900秒）を超えたrun。まだ`awaiting_integration`にいるrunは最初に`awaiting_integration`になってからの経過で判定する（着地の失敗で戻っても起点は変えない）。着地待ちの内訳で最も長い工程を`phase`に添える（まだ待っているrunは今の時刻までの内訳。どの工程も0秒なら付けない）。他のalertは`phase`を持たない
   - `needs_session`: `needs_session`が3回目に達したrun
   - `ask_unanswered`: `ask_opened`から60分答えられていないask（ADR-0022。`ask_answered`とはpayloadの`ask_id`（無ければ`id`）とrun・taskで対にする）
   - `task_failed`: 同じtaskのrunの`failed`が合わせて2回。回数はpageに関係なく全runで数え、`run_id`はその最後に失敗したrunで、そのrunが対象に入るときに出す（`--since`で2回目だけが新しくても出る）
@@ -58,3 +61,25 @@ related:
   - `history`: mainの履歴を読めたら`{status: "checked", landings}`（windowの間のmainのcommit数）、読めなければ`{status: "unavailable", reason}`で、各ファイルの`landings` / `ratio`はnull、`state`は`unknown`。履歴は`StatsSources.history`（`Repository::main_history`＝`GitRepository::main_history`: `git log -z --first-parent --reverse --diff-merges=first-parent -M --name-status --max-age=<最も古いイベントの1秒前のUNIX秒> refs/heads/main`（windowの最初の衝突より前の着地も数えるため、windowに関わらずqueueの最も古いイベントから読む）と`git ls-tree -r --name-only refs/heads/main`）越しに、衝突のイベントがあるときだけ読む。main checkoutはqueueが束縛されたcommon directoryから`[stall]`と同じく決める。
   - `alert`: `state`が`deleted`でなく、`conflicts`が`[conflicts].hotspot_conflicts`（既定3）以上で、`ratio`が`[conflicts].hotspot_ratio_percent`（既定20）% 以上（`ratio`がnullなら回数だけで判定）。`config`は判定に使った2つの値と`source`（main checkoutの`dagq.toml`の`[conflicts]`なら`file`、無ければ`default`）。
   - observerは`stats`を入力に読むのでそのまま載り、plan reviewのpromptにも載る（[Plan review](plan-review.md#plan-review-supervisor)の4）。
+
+## 着地待ちの内訳
+
+`wait_to_land`（最初の`validation_finished`→`run_integrated`）を、runのイベントで工程に切り分ける（ADR-0049の決定5、goal 36）。集計は`domain::stats::landing`（`LandClock`）が行い、新しい表は持たない。最初の`validation_finished`から時計を始め、下の表のイベントが来るたびに、それまでの時間を今の工程に足して次の工程に移る。表に無いイベント（`resume_started`、`revise_finished`、`receipt_observed`、`verification_command`など）は工程を変えない。区切りは`run_integrated`で、工程の合計は`wait_to_land`に等しい（工程ごとにミリ秒を秒に切り捨てるので数秒ずれうる）。
+
+| 工程 | 始まるイベント | 中身 |
+| --- | --- | --- |
+| `exit` | 最初の工程、`validation_finished`、`review_finished`、`requested`がtrueでない`conflict_precheck` | 工程の間の受け渡しとsessionの`/exit`・closeの待ち |
+| `review` | `review_started`、`review_retried` | headlessのreview |
+| `revise` | `revise_requested` | reviseを送ってから、書き直したreceiptのvalidationまで |
+| `conflict` | `requested: true`の`conflict_precheck` | merge-treeの事前判定が見つけた衝突を、生きているsessionが解消する間 |
+| `ask` | `ask_opened`（そのrunのask。observerの`blocked`と`planner_question`はrunを止めないので除く。timelineの`holds_the_run`と同じ）、`review_failed`、`integration_error` | 人の答えを待つ間（`approve_landing`、`worker_question`、`stalled`など）。`integration_error`の後のrunはleaseを外されて`awaiting_integration`に戻り、人の`review and integrate`を待つ |
+| `resume` | payloadの`status`が`needs_session`のイベント（`integration_deferred`、`landing_decided`の`send_back`、evidenceの不足など） | `needs_session`で待つ間とresumeしたsessionの作業 |
+| `landing_queue` | `landing_queued`、runtimeが適用する`approve_landing`の`ask_answered` | 着地slotの順番待ち（他のrunの`integrate`が終わるのを待つ） |
+| `rebase` | `integration_started` | `integrate`のreceiptの照合とrebase |
+| `verify` | `integration_rebased` | `integrate`の範囲の検査、`verification_commands`、mainへのcommit |
+
+- **`needs_session`は他の規則より先**に見る（`integration_deferred`は`resume`になる）。時計を始める最初の`validation_finished`にも同じ規則を当てるので、最初のvalidationが`evidence_missing` / `scope_violation`でrunを止めたときは`resume`から始まる。
+- **askの後**: `approve_landing`の`ask_answered`（payloadの`kind`、無ければ対の`ask_opened`の`kind`）は`landing_queue`に移る（`land`はslotを待ち、`send_back` / `cancel`はすぐ次のイベントでstatusを記録する）。`runtime_delivers: false`（3つのoptionの外の答えで、inboxが読む）なら`ask`のまま。それ以外のaskは、そのrunで開いているaskがすべて答えられたら、askの前の工程に戻る（reviseの途中の`worker_question`は`revise`に戻る）。askは`ask_id`（無ければ`id`）で対にする。askの間に他の工程のイベントが来たら、開いているaskは忘れる（closeはイベントを書かないので）。
+- **`landing_queued`**（`via`: `exit`か`resume`）は、supervisorが着地slotを待つ`Phase::AwaitingSlot`に入るときに記録する（[Review](review.md#review-supervisor)の5のpass、[`needs_session`](needs-session.md#needs_session)の5）。このイベントが入る前のrunでは、slotの待ちは`exit`に入る。人の`integrate`はslotが空いていなければ拒否されるので待ちが無い。
+- **`push`**: `run_integrated`から最初の`push_finished` / `push_failed` / `push_skipped`まで（`push_main`は着地の後に走るので`wait_to_land`の外）。記録が無ければnull。
+- 時計は`run_integrated`で止まる。まだ着地していないrunの内訳は`awaiting_integration`のalertの`phase`にだけ使い、今の時刻まで今の工程を伸ばして測る。

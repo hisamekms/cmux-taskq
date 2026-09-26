@@ -1333,6 +1333,7 @@ impl Supervisor<'_> {
                 }
                 match then {
                     AfterExit::Land => {
+                        self.queue_landing(&run, "exit");
                         slot.run = run;
                         slot.phase = Phase::AwaitingSlot;
                         Ok(Step::Continue)
