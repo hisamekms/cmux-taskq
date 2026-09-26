@@ -812,7 +812,8 @@ fn hand_off_supervisors(up: &Up, live: &[SupervisorRegistration]) -> Result<Valu
 /// and wait until every one of them has taken its registration back under
 /// `version`, with the same pid, within `timeout`. A supervisor that stops
 /// heartbeating before it did (an exec'd binary that failed to start), that
-/// deregistered, or that came back under another build (an exec that
+/// deregistered without its pid registering again under `version` (which
+/// takes its place, under its new token), or that came back under another build (an exec that
 /// failed, after which the old binary goes on) is an error naming it; the
 /// ones already handed over stay so.
 #[allow(clippy::too_many_arguments)]
@@ -878,7 +879,17 @@ fn wait_for_handoff(
                 "supervisor {} (pid {})",
                 registration.token, registration.pid
             );
-            let Some(current) = registrations.iter().find(|r| r.token == registration.token) else {
+            // A token that deregistered is taken back by the same pid
+            // registering again under the new build.
+            let Some(current) = registrations
+                .iter()
+                .find(|r| r.token == registration.token)
+                .or_else(|| {
+                    registrations.iter().find(|r| {
+                        r.pid == registration.pid && r.binary_version.as_deref() == Some(version)
+                    })
+                })
+            else {
                 bail!("{name} deregistered instead of taking the handoff to {binary_text}");
             };
             if current.handoff_binary.is_some() {
@@ -900,7 +911,7 @@ and it goes on with its binary; see its log",
                 current.pid
             );
             done.push(json!({
-                "token": registration.token,
+                "token": current.token,
                 "pid": registration.pid,
                 "mode": registration.mode.map(SupervisorMode::as_str),
                 "workspace_id": registration.workspace_id,

@@ -320,7 +320,11 @@ pub fn run(ports: &JobPorts, db: &Path, options: &JobOptions) -> Result<Value> {
             Err(error) => failed(queue, options, "check", &error, json!({})),
         };
     }
-    let before = registration(&*queue, &options.token)?;
+    let registered = queue.supervisors()?;
+    let before = registered
+        .iter()
+        .find(|registration| registration.token == options.token)
+        .cloned();
     let no_drain = || -> Result<Value> { bail!("the automatic update never drains") };
     let installed = install::install(
         &install::Ports {
@@ -346,7 +350,8 @@ pub fn run(ports: &JobPorts, db: &Path, options: &JobOptions) -> Result<Value> {
         Err(error) => {
             // `install` put the old binary back itself if it had replaced
             // it; the supervisor may be gone with the new one.
-            let supervisor = bring_back(ports, &*queue, before.as_ref())?;
+            let serving = before.as_ref().map(|before| before.token.clone());
+            let supervisor = bring_back(ports, &*queue, before.as_ref(), serving.as_deref())?;
             return failed(
                 queue,
                 options,
@@ -357,9 +362,45 @@ pub fn run(ports: &JobPorts, db: &Path, options: &JobOptions) -> Result<Value> {
         }
     };
     let version = report["version"].as_str().unwrap_or_default().to_owned();
-    if let Err(error) = watch(ports, &*queue, &options.token, &version, options) {
-        let restored = restore(ports, options, report["previous_version"].as_str());
-        let supervisor = bring_back(ports, &*queue, before.as_ref())?;
+    let handed = handed_over(&report, before.as_ref());
+    let watched = watch(ports, &*queue, &handed, &version, options)?;
+    let failures: Vec<&Watched> = watched.iter().filter(|w| w.error.is_some()).collect();
+    if !failures.is_empty() {
+        // The binary is one file for every supervisor: it goes back only
+        // when none of them runs the new build, and a supervisor that does
+        // keeps it.
+        let everyone = failures.len() == watched.len();
+        let restored = if everyone {
+            restore(ports, options, report["previous_version"].as_str())
+        } else {
+            json!({
+                "restored": false,
+                "reason": format!(
+                    "{} of the {} supervisors handed over run {version}, so it stays in place",
+                    watched.len() - failures.len(),
+                    watched.len()
+                ),
+            })
+        };
+        let mut supervisors = Vec::new();
+        for watched in &watched {
+            let mut entry = json!({
+                "token": watched.token,
+                "pid": watched.pid,
+                "now": watched.now,
+                "error": watched.error,
+            });
+            if watched.error.is_some() {
+                // The registration it had before the install: by its token,
+                // or by its pid when the handoff reported a new token.
+                let before = registered
+                    .iter()
+                    .find(|r| r.token == watched.token)
+                    .or_else(|| registered.iter().find(|r| r.pid == watched.pid));
+                entry["supervisor"] = bring_back(ports, &*queue, before, Some(&watched.now))?;
+            }
+            supervisors.push(entry);
+        }
         if restored["restored"] == true {
             // A step of the job still working (it goes on to its
             // `update_failed`); it must not keep the supervisor from
@@ -375,12 +416,25 @@ pub fn run(ports: &JobPorts, db: &Path, options: &JobOptions) -> Result<Value> {
                 }),
             );
         }
+        let error = anyhow::anyhow!(
+            "{}",
+            failures
+                .iter()
+                .filter_map(|w| w.error.as_deref())
+                .collect::<Vec<_>>()
+                .join("; ")
+        );
         return failed(
             queue,
             options,
             "watch",
             &error,
-            json!({"restored": restored, "supervisor": supervisor, "version": version}),
+            json!({
+                "restored": restored,
+                "kept": !everyone,
+                "supervisors": supervisors,
+                "version": version,
+            }),
         );
     }
     let payload = json!({
@@ -424,44 +478,141 @@ fn stage(ports: &JobPorts, binary: &Path, staged: &Path) -> Result<String> {
     Ok(version)
 }
 
-/// Wait for the supervisor `token` to heartbeat on under `version` after
-/// the handoff: a heartbeat later than the one it took its registration
-/// back with, within the watch timeout (ADR-0045 decision 13).
+/// The supervisors the install handed over, by token and pid: the ones
+/// its report names, or the job's own supervisor when it names none.
+fn handed_over(report: &Value, before: Option<&SupervisorRegistration>) -> Vec<(String, u32)> {
+    let handed: Vec<(String, u32)> = report["supervisors"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|supervisor| {
+            Some((
+                supervisor["token"].as_str()?.to_owned(),
+                u32::try_from(supervisor["pid"].as_u64()?).ok()?,
+            ))
+        })
+        .collect();
+    if !handed.is_empty() {
+        return handed;
+    }
+    before
+        .map(|before| vec![(before.token.clone(), before.pid)])
+        .unwrap_or_default()
+}
+
+/// What the watch saw of one supervisor it handed over: the token it
+/// serves under now (another one when the same pid registered again under
+/// the new build) or why it failed.
+#[derive(Debug)]
+struct Watched {
+    token: String,
+    pid: u32,
+    now: String,
+    first: Option<i64>,
+    done: bool,
+    error: Option<String>,
+}
+
+/// The registration a handed-over supervisor serves under: its own token,
+/// or, once that is gone, one the same pid registered under `version`.
+fn successor<'a>(
+    registrations: &'a [SupervisorRegistration],
+    watched: &Watched,
+    version: &str,
+) -> Option<&'a SupervisorRegistration> {
+    registrations
+        .iter()
+        .find(|registration| registration.token == watched.now)
+        .or_else(|| {
+            registrations.iter().find(|registration| {
+                registration.pid == watched.pid
+                    && registration.binary_version.as_deref() == Some(version)
+            })
+        })
+}
+
+/// Wait for each supervisor in `handed` to heartbeat on under `version`
+/// after the handoff: a heartbeat later than the one it took its
+/// registration back with, within the watch timeout (ADR-0045 decision
+/// 13). A token that deregistered is followed to a registration of the same
+/// pid under `version`. Every supervisor is watched to its end, so the
+/// outcome of one does not decide another's.
 fn watch(
     ports: &JobPorts,
     queue: &dyn Queue,
-    token: &str,
+    handed: &[(String, u32)],
     version: &str,
     options: &JobOptions,
-) -> Result<()> {
+) -> Result<Vec<Watched>> {
     let deadline = Instant::now() + options.watch_timeout;
-    let mut first = None;
+    let mut watched: Vec<Watched> = handed
+        .iter()
+        .map(|(token, pid)| Watched {
+            token: token.clone(),
+            pid: *pid,
+            now: token.clone(),
+            first: None,
+            done: false,
+            error: None,
+        })
+        .collect();
     loop {
-        let Some(current) = registration(queue, token)? else {
-            bail!("supervisor {token} deregistered after it took the handoff to {version}");
-        };
-        ensure!(
-            ports.processes.alive(current.pid),
-            "supervisor {token} (pid {}) exited after it took the handoff to {version}",
-            current.pid
-        );
-        ensure!(
-            current.binary_version.as_deref() == Some(version),
-            "supervisor {token} runs {} instead of {version}",
-            current.binary_version.as_deref().unwrap_or("(unrecorded)")
-        );
-        match first {
-            None => first = Some(current.heartbeat_at),
-            Some(first) if current.heartbeat_at > first => return Ok(()),
-            Some(_) => {}
+        let registrations = queue.supervisors()?;
+        let expired = Instant::now() >= deadline;
+        for watched in watched.iter_mut().filter(|w| !w.done && w.error.is_none()) {
+            if let Err(error) = observe(ports, &registrations, watched, version, expired, options) {
+                watched.error = Some(format!("{error:#}"));
+            }
         }
-        ensure!(
-            Instant::now() < deadline,
-            "supervisor {token} did not heartbeat within {}s of taking the handoff to {version}",
-            options.watch_timeout.as_secs()
-        );
+        if watched.iter().all(|w| w.done || w.error.is_some()) {
+            return Ok(watched);
+        }
         thread::sleep(options.poll);
     }
+}
+
+/// One look at `watched`: done once it heartbeats on under `version`, an
+/// error when it cannot any more.
+fn observe(
+    ports: &JobPorts,
+    registrations: &[SupervisorRegistration],
+    watched: &mut Watched,
+    version: &str,
+    expired: bool,
+    options: &JobOptions,
+) -> Result<()> {
+    let token = watched.token.clone();
+    let Some(current) = successor(registrations, watched, version) else {
+        bail!("supervisor {token} deregistered after it took the handoff to {version}");
+    };
+    if current.token != watched.now {
+        watched.now = current.token.clone();
+        watched.first = None;
+    }
+    ensure!(
+        ports.processes.alive(current.pid),
+        "supervisor {token} (pid {}) exited after it took the handoff to {version}",
+        current.pid
+    );
+    ensure!(
+        current.binary_version.as_deref() == Some(version),
+        "supervisor {token} runs {} instead of {version}",
+        current.binary_version.as_deref().unwrap_or("(unrecorded)")
+    );
+    match watched.first {
+        None => watched.first = Some(current.heartbeat_at),
+        Some(first) if current.heartbeat_at > first => {
+            watched.done = true;
+            return Ok(());
+        }
+        Some(_) => {}
+    }
+    ensure!(
+        !expired,
+        "supervisor {token} did not heartbeat within {}s of taking the handoff to {version}",
+        options.watch_timeout.as_secs()
+    );
+    Ok(())
 }
 
 /// Put the replaced binary back at the target, only when `.previous` is the
@@ -491,16 +642,19 @@ fn restore(ports: &JobPorts, options: &JobOptions, previous_version: Option<&str
 /// queue with the binary in place: one that still heartbeats under the
 /// build it had (its exec failed and it went on) is left alone; one that
 /// lives but does not (the new binary hangs) is stopped; and one that is
-/// gone is started again ([`JobPorts::restart`]). What was found and done.
+/// gone is started again ([`JobPorts::restart`]). `serving` is the token
+/// it serves under now (another one when its pid registered again), or
+/// `before`'s. What was found and done.
 fn bring_back(
     ports: &JobPorts,
     queue: &dyn Queue,
     before: Option<&SupervisorRegistration>,
+    serving: Option<&str>,
 ) -> Result<Value> {
     let Some(before) = before else {
         return Ok(json!({"state": "not_registered"}));
     };
-    let Some(current) = registration(queue, &before.token)? else {
+    let Some(mut current) = registration(queue, serving.unwrap_or(&before.token))? else {
         return Ok(json!({"state": "deregistered"}));
     };
     let now = ports.clock.now();
@@ -521,6 +675,12 @@ fn bring_back(
         if ports.processes.alive(current.pid) {
             let _ = ports.processes.kill(current.pid);
         }
+    }
+    // A registration the same pid made again under the new build has no
+    // mode of its own: it is started again the way `up` started it.
+    if current.mode.is_none() {
+        current.mode = before.mode;
+        current.workspace_id = current.workspace_id.or_else(|| before.workspace_id.clone());
     }
     Ok(match (ports.restart)(&current) {
         Ok(restarted) => json!({"state": "restarted", "stopped": alive, "restart": restarted}),
@@ -547,6 +707,11 @@ fn failed(
     let mut situation = match stage {
         "build" => "Nothing was replaced.".to_owned(),
         "check" => "The build did not pass its check, so nothing was replaced.".to_owned(),
+        _ if details["kept"] == true => format!(
+            "The new binary stays at {}: other supervisors run it. The ones that failed are \
+brought back with it as said below.",
+            options.target.display()
+        ),
         _ => format!(
             "If the new binary had been put in place, the one it replaced is back at {} unless \
 said otherwise below.",
@@ -555,6 +720,9 @@ said otherwise below.",
     };
     if let Some(supervisor) = details.get("supervisor") {
         situation.push_str(&format!(" The supervisor: {supervisor}."));
+    }
+    if let Some(supervisors) = details.get("supervisors") {
+        situation.push_str(&format!(" The supervisors: {supervisors}."));
     }
     if let Some(restored) = details.get("restored") {
         situation.push_str(&format!(" The binary: {restored}."));

@@ -683,6 +683,43 @@ fn up_reports_a_handoff_that_did_not_happen() {
     assert!(error.contains("cannot take a handoff"), "{error}");
 }
 
+/// A supervisor whose token deregistered during the handoff but whose pid
+/// registered again under the new build took the handoff, under its new
+/// token (task 497).
+#[test]
+fn a_handoff_follows_a_pid_that_registered_again_under_the_new_build() {
+    let fixture = fixture();
+    let queue = handoff_supervisor(&fixture, "old", SupervisorMode::InCmux);
+    let registration = queue.supervisors().unwrap().remove(0);
+    let processes = FakeProcesses::default();
+    let handed = thread::scope(|scope| {
+        scope.spawn(|| {
+            let mut queue = SqliteQueue::open(&fixture.location.db).unwrap();
+            wait_until(&processes, registration.pid, || {
+                queue.handoff_request("old").unwrap().is_some()
+            });
+            queue
+                .register_supervisor("again", registration.pid, 4, VERSION)
+                .unwrap();
+            queue.deregister_supervisor("old").unwrap();
+        });
+        lifecycle::hand_off(
+            &queue,
+            &processes,
+            &dagq::infrastructure::clock::SystemClock,
+            std::slice::from_ref(&registration),
+            Path::new("/opt/bin/dagq"),
+            VERSION,
+            Duration::from_secs(5),
+            Duration::from_millis(20),
+        )
+        .unwrap()
+    });
+    assert_eq!(handed.len(), 1);
+    assert_eq!(handed[0]["token"], "again");
+    assert_eq!(handed[0]["pid"], registration.pid);
+}
+
 fn gone_registration() -> dagq::domain::SupervisorRegistration {
     dagq::domain::SupervisorRegistration {
         token: "gone".into(),

@@ -535,7 +535,10 @@ fn the_update_job_installs_watches_restores_and_asks() {
     assert_eq!(report["outcome"], "failed", "{report}");
     assert_eq!(report["stage"], "watch", "{report}");
     assert_eq!(report["restored"]["restored"], true, "{report}");
-    assert_eq!(report["supervisor"]["state"], "restarted", "{report}");
+    assert_eq!(
+        report["supervisors"][0]["supervisor"]["state"], "restarted",
+        "{report}"
+    );
     assert_eq!(*restarted.lock().unwrap(), ["auto"]);
     assert!(
         binaries
@@ -604,4 +607,153 @@ fn the_update_job_installs_watches_restores_and_asks() {
         status["auto_update"]["state"], "awaiting_approval",
         "{status}"
     );
+}
+
+/// The second supervisor of the queue in the watch tests.
+const OTHER_PID: u32 = 434_343;
+
+/// What a handed-over supervisor does after it took the handoff.
+#[derive(Clone, Copy)]
+enum Afterwards {
+    Heartbeat,
+    Die,
+    /// Deregister, the same pid registering again under the new build and
+    /// a token of its own, and heartbeat on under that.
+    Reregister,
+    /// Register again the same way, then die.
+    ReregisterAndDie,
+}
+
+fn take_as(fixture: &Fixture, processes: &FakeProcesses, token: &str, pid: u32, then: Afterwards) {
+    let mut queue = SqliteQueue::open(&fixture.location.db).unwrap();
+    wait_until(processes, pid, || {
+        queue.handoff_request(token).unwrap().is_some()
+    });
+    queue.resume_registration(token, pid, VERSION).unwrap();
+    let serving = match then {
+        Afterwards::Reregister | Afterwards::ReregisterAndDie => {
+            let again = format!("{token}-again");
+            queue.register_supervisor(&again, pid, 2, VERSION).unwrap();
+            queue.deregister_supervisor(token).unwrap();
+            again
+        }
+        _ => token.to_owned(),
+    };
+    thread::sleep(Duration::from_millis(1100));
+    match then {
+        Afterwards::Die | Afterwards::ReregisterAndDie => {
+            processes.dead.lock().unwrap().insert(pid);
+        }
+        _ => {
+            queue.heartbeat(&serving).unwrap();
+        }
+    }
+}
+
+/// Run the job with two supervisors handed over, each doing `auto` and
+/// `other` afterwards: the report, the binaries' calls and the tokens
+/// started again.
+fn update_two(auto: Afterwards, other: Afterwards) -> (Value, Vec<String>, Vec<String>, PathBuf) {
+    let fixture = fixture();
+    let mut queue = auto_supervisor(&fixture);
+    queue
+        .register_supervisor("other", OTHER_PID, 2, "0.0.1")
+        .unwrap();
+    queue.accept_handoff("other").unwrap();
+    let processes = FakeProcesses::default();
+    let restarted = Mutex::new(Vec::new());
+    let dir = fixture._dir.path();
+    let target = dir.join("bin").join("dagq");
+    fs::create_dir_all(target.parent().unwrap()).unwrap();
+    fs::write(&target, "old build").unwrap();
+    let binaries = UpdateBinaries::new(dir, false, &[]);
+    let report = thread::scope(|scope| {
+        scope.spawn(|| take_as(&fixture, &processes, "auto", UPDATED_PID, auto));
+        scope.spawn(|| take_as(&fixture, &processes, "other", OTHER_PID, other));
+        run_update_job(&fixture, &binaries, &processes, &restarted)
+    });
+    let restarted = restarted.lock().unwrap().clone();
+    (report, binaries.calls(), restarted, target)
+}
+
+/// The watch follows every supervisor the install handed over (task 497):
+/// all of them heartbeating on is an install; one failing keeps the new
+/// binary for the others and brings back only the one that failed, with
+/// the `update_failed` ask; the binary goes back only when all failed.
+#[test]
+fn the_update_job_watches_every_supervisor_it_handed_over() {
+    let (report, calls, restarted, _) = update_two(Afterwards::Heartbeat, Afterwards::Heartbeat);
+    assert_eq!(report["outcome"], "installed", "{report}");
+    assert_eq!(
+        report["supervisors"].as_array().unwrap().len(),
+        2,
+        "{report}"
+    );
+    assert!(calls.iter().all(|c| !c.starts_with("restore")), "{calls:?}");
+    assert!(restarted.is_empty());
+
+    let (report, calls, restarted, _) = update_two(Afterwards::Heartbeat, Afterwards::Die);
+    assert_eq!(report["outcome"], "failed", "{report}");
+    assert_eq!(report["stage"], "watch", "{report}");
+    assert_eq!(report["kept"], true, "{report}");
+    assert_eq!(report["restored"]["restored"], false, "{report}");
+    assert!(calls.iter().all(|c| !c.starts_with("restore")), "{calls:?}");
+    assert_eq!(restarted, ["other"]);
+    let supervisors = report["supervisors"].as_array().unwrap();
+    let auto = supervisors.iter().find(|s| s["token"] == "auto").unwrap();
+    assert_eq!(auto["error"], Value::Null, "{report}");
+    let other = supervisors.iter().find(|s| s["token"] == "other").unwrap();
+    assert!(
+        other["error"].as_str().unwrap().contains("exited"),
+        "{report}"
+    );
+    assert_eq!(other["supervisor"]["state"], "restarted", "{report}");
+    assert!(
+        !report["error"]
+            .as_str()
+            .unwrap()
+            .contains("supervisor auto"),
+        "{report}"
+    );
+
+    let (report, calls, mut restarted, target_all) = update_two(Afterwards::Die, Afterwards::Die);
+    assert_eq!(report["outcome"], "failed", "{report}");
+    assert_eq!(report["kept"], false, "{report}");
+    assert_eq!(report["restored"]["restored"], true, "{report}");
+    assert!(
+        calls.contains(&format!("restore {}", target_all.display())),
+        "{calls:?}"
+    );
+    restarted.sort();
+    assert_eq!(restarted, ["auto", "other"]);
+}
+
+/// A supervisor whose token deregistered after the handoff but whose pid
+/// registered again under the new build is handed over (task 497).
+#[test]
+fn the_update_job_follows_a_pid_that_registered_again_under_the_new_build() {
+    let (report, calls, restarted, _) = update_two(Afterwards::Heartbeat, Afterwards::Reregister);
+    assert_eq!(report["outcome"], "installed", "{report}");
+    assert!(calls.iter().all(|c| !c.starts_with("restore")), "{calls:?}");
+    assert!(restarted.is_empty());
+}
+
+/// A supervisor that registered again under the new build and then died is
+/// brought back under the registration the watch followed (task 497).
+#[test]
+fn the_update_job_brings_back_a_pid_that_registered_again_and_died() {
+    let (report, calls, restarted, _) =
+        update_two(Afterwards::Heartbeat, Afterwards::ReregisterAndDie);
+    assert_eq!(report["outcome"], "failed", "{report}");
+    assert_eq!(report["kept"], true, "{report}");
+    assert!(calls.iter().all(|c| !c.starts_with("restore")), "{calls:?}");
+    assert_eq!(restarted, ["other-again"]);
+    let other = report["supervisors"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["pid"] == OTHER_PID)
+        .unwrap();
+    assert_eq!(other["now"], "other-again", "{report}");
+    assert_eq!(other["supervisor"]["state"], "restarted", "{report}");
 }
