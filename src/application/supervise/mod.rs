@@ -56,7 +56,9 @@ use super::{
         TRIAGE_TOOLS, prompt, recovery_prompt, resume_request, review_prompt,
         revise_mismatch_request, revise_request, siblings_in_progress, stall_nudge, triage_prompt,
     },
-    recording::{RecordingBackend, reason_of_error, timed_out_maybe_sent},
+    recording::{
+        RecordingBackend, exit_unsent, reason_of_error, text_on_screen, timed_out_maybe_sent,
+    },
     tail, unix_seconds,
 };
 use crate::domain::{

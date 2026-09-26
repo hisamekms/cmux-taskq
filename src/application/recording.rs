@@ -160,6 +160,18 @@ pub fn timed_out_maybe_sent(error: &anyhow::Error) -> bool {
         .is_some_and(|failure| failure.timed_out() && !failure.effect_free)
 }
 
+/// Whether `error` is a `/exit` that timed out on every attempt with the
+/// screen showing each time that it did not get there (task 354): the
+/// session was not asked to exit.
+pub fn exit_unsent(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<BackendFailure>())
+        .is_some_and(|failure| {
+            failure.op == "send_exit" && failure.timed_out() && failure.effect_free
+        })
+}
+
 fn timed_out(error: &anyhow::Error) -> bool {
     ReasonCode::of_backend_error(&format!("{error:#}")) == ReasonCode::BackendTimeout
 }
@@ -222,8 +234,12 @@ impl<'a> RecordingBackend<'a> {
 
     /// `call`, made again after a backoff (doubled each time) up to the
     /// backend's `call_attempts` in all while it fails with a timeout that
-    /// `effect_free` says left nothing behind. Every failed attempt is
-    /// recorded with its number and the backoff that follows it.
+    /// `effect_free` says left nothing behind. `effect_free` is asked after
+    /// the backoff, right before the call is made again, so that a call
+    /// that got through late, during the backoff, is not made twice (task
+    /// 354); after the last attempt it is asked at once. Every failed
+    /// attempt is recorded with its number and the backoff that followed
+    /// it.
     fn retried<T>(
         &self,
         op: &str,
@@ -239,8 +255,13 @@ impl<'a> RecordingBackend<'a> {
                 Ok(value) => return Ok(value),
                 Err(error) => error,
             };
-            let effect_free = timed_out(&error) && effect_free();
-            let retry = effect_free && number < attempts;
+            let timed_out = timed_out(&error);
+            let waited = timed_out && number < attempts;
+            if waited {
+                thread::sleep(backoff);
+            }
+            let effect_free = timed_out && effect_free();
+            let retry = waited && effect_free;
             let attempt = Attempt {
                 number,
                 of: attempts,
@@ -250,7 +271,6 @@ impl<'a> RecordingBackend<'a> {
             if !retry {
                 return Err(BackendFailure::wrap(op, effect_free, error));
             }
-            thread::sleep(backoff);
             backoff = backoff.saturating_mul(2);
             number += 1;
         }
@@ -363,6 +383,23 @@ impl WorkspaceBackend for RecordingBackend<'_> {
     fn send_exit(&self, workspace_id: &str) -> Result<()> {
         let result = self.inner.send_exit(workspace_id);
         self.recorded("send_exit", Some(workspace_id), None, result)
+    }
+    /// A `/exit` that timed out is typed again only while the screen, read
+    /// once, shows it did not get there (`unsent`: the input box drawn, no
+    /// dialog, no trace of it), so it is never typed twice into a session
+    /// or a dialog (task 354). One that timed out on every attempt fails
+    /// as effect-free ([`exit_unsent`]).
+    fn send_exit_when(&self, workspace_id: &str, unsent: &dyn Fn(&str) -> bool) -> Result<()> {
+        self.retried(
+            "send_exit",
+            workspace_id,
+            || self.inner.send_exit(workspace_id),
+            || {
+                let screen = self.inner.capture(workspace_id);
+                self.recorded("capture", Some(workspace_id), None, screen)
+                    .is_ok_and(|screen| unsent(&screen))
+            },
+        )
     }
     fn exists(&self, workspace_id: &str) -> Result<bool> {
         self.retried(

@@ -69,7 +69,7 @@ impl ExitWatch {
     /// wrapper died without recording its exit. A session that is gone has
     /// its `stuck_exit` asks closed.
     pub(super) fn poll(&mut self, sv: &mut Supervisor<'_>, run: &TaskRun) -> Result<bool> {
-        let Some(session) = &self.session else {
+        let Some(session) = self.session.clone() else {
             return Ok(true);
         };
         let processes = sv.queue.processes(run.id())?;
@@ -141,10 +141,18 @@ impl ExitWatch {
                 )?;
                 // Ask once, the way a person would; never kill the session.
                 let workspace = session.workspace.clone();
-                submit(sv, run, &workspace, Input::Exit, "/exit")?;
-                info!(run_id = %run.id(), "exit requested for {}; waiting for session exit", run.id());
+                let submission = submit(sv, run, &workspace, Input::Exit, "/exit")?;
                 self.requested = Some(Instant::now());
                 self.exit_for_silence = matches!(pulse, WrapperPulse::Silent);
+                if submission == Submission::Unsent {
+                    // Waiting out the exit timeout would not help: the
+                    // session was never asked.
+                    if self.unsent(sv, run, &workspace)? {
+                        return Ok(true);
+                    }
+                } else {
+                    info!(run_id = %run.id(), "exit requested for {}; waiting for session exit", run.id());
+                }
             }
             Some(requested) if !self.timed_out && requested.elapsed() >= sv.cmux.exit_timeout() => {
                 let timeout = sv.cmux.exit_timeout();
@@ -164,6 +172,94 @@ impl ExitWatch {
             self.exit_asked = true;
         }
         Ok(false)
+    }
+}
+
+impl ExitWatch {
+    /// A `/exit` that cmux timed out on every attempt without it reaching
+    /// the session (task 354). A run whose landing is safe without the
+    /// session's exit (see [`landable_without_exit`]) has its workspace
+    /// closed here, which ends the session, and goes on as if its session
+    /// had exited: `true`, and the supervisor lands it. Any other run, or
+    /// one whose workspace cannot be closed, is the `stuck_exit` ask, as a
+    /// session that held its `/exit` back is. Either way `exit_unsent`
+    /// records it.
+    fn unsent(&mut self, sv: &mut Supervisor<'_>, run: &TaskRun, workspace: &str) -> Result<bool> {
+        let mut held = match &self.then {
+            AfterExit::Land => landable_without_exit(sv, run),
+            _ => Some("the run does not land after its exit".to_owned()),
+        };
+        if held.is_none()
+            && let Err(error) = sv.cmux.close(workspace)
+        {
+            held = Some(format!("its workspace could not be closed: {error:#}"));
+        }
+        let mut payload = json!({
+            "code": ReasonCode::BackendTimeout,
+            "workspace_id": workspace,
+            "attempts": sv.cmux.call_attempts().max(1),
+            "action": if held.is_none() { "close_and_land" } else { "ask" },
+        });
+        if let Some(why) = &held {
+            payload["held"] = json!(why);
+        }
+        sv.queue
+            .record_runtime_event(run.id(), "exit_unsent", payload)?;
+        let Some(why) = held else {
+            // Closed above: the supervisor closes nothing more, and a
+            // dialog ask of the session is closed as for one that exited.
+            match self.session.take().and_then(|session| session.resume) {
+                None => {
+                    sv.queue.workspace_closed(run.id(), &sv.token)?;
+                }
+                Some(attempt) => sv.queue.record_runtime_event(
+                    run.id(),
+                    "workspace_closed",
+                    json!({"workspace_id": workspace, "resume_attempt": attempt}),
+                )?,
+            }
+            close_answer_prompt_asks(sv, run, PROMPT_EXITED_CLOSED)?;
+            info!(run_id = %run.id(), "/exit could not be sent to {} in workspace {workspace}; it lands and its receipt still holds against its clean worktree, so its workspace was closed and it goes on to land", run.id());
+            return Ok(true);
+        };
+        warn!(run_id = %run.id(), "/exit could not be sent to {} in workspace {workspace} and the run cannot land without its exit ({why}); asking the inbox", run.id());
+        let timeout = sv.cmux.exit_timeout();
+        sv.queue.record_runtime_event(
+            run.id(),
+            "exit_request_timed_out",
+            json!({"code": ReasonCode::ExitTimeout, "workspace_id": workspace, "timeout_secs": timeout.as_secs(), "unsent": true}),
+        )?;
+        self.timed_out = true;
+        let after = format!("{EXIT_UNSENT} ({why}). {}", self.after(run));
+        ask_stuck_exit(sv, run, workspace, &after)?;
+        self.exit_asked = true;
+        Ok(false)
+    }
+}
+
+/// What a `stuck_exit` ask says first when the `/exit` never got there.
+pub(super) const EXIT_UNSENT: &str = "The supervisor's /exit timed out in cmux on every attempt and its screen showed each time that it had not reached the session (exit_unsent), so the session was not asked to exit and the run cannot land without it";
+
+/// Why `run` cannot land without its session's exit, `None` when it can:
+/// its receipt still stands against its worktree (the commit it names is
+/// the head of the run branch checked out there, the worktree is clean, and
+/// the evidence and scope hold, as validation checked) and that head is the
+/// commit the review passed. A check that fails to run holds it too.
+pub(super) fn landable_without_exit(sv: &mut Supervisor<'_>, run: &TaskRun) -> Option<String> {
+    let checked = sv
+        .queue
+        .show(run.task_id())
+        .and_then(|detail| check_receipt(&*sv.repository, &*sv.files, &detail.task, run));
+    match checked {
+        Ok(Ok((_, commit))) => match run.result_commit() {
+            Some(reviewed) if *reviewed == commit => None,
+            Some(reviewed) => Some(format!(
+                "the head {commit} is not the reviewed commit {reviewed}"
+            )),
+            None => Some("the run has no reviewed commit".to_owned()),
+        },
+        Ok(Err(rejection)) => Some(format!("its receipt no longer holds: {}", rejection.reason)),
+        Err(error) => Some(format!("its receipt could not be checked: {error:#}")),
     }
 }
 

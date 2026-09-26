@@ -517,6 +517,13 @@ pub trait WorkspaceBackend {
     fn pin(&self, workspace_id: &str) -> Result<()>;
     /// Ask the agent session to end the way a person would, without killing it.
     fn send_exit(&self, workspace_id: &str) -> Result<()>;
+    /// [`send_exit`](Self::send_exit), made again after a timeout while
+    /// `unsent` says from a screen read that the `/exit` did not get there
+    /// (task 354). A backend that retries nothing sends it once.
+    fn send_exit_when(&self, workspace_id: &str, unsent: &dyn Fn(&str) -> bool) -> Result<()> {
+        let _ = unsent;
+        self.send_exit(workspace_id)
+    }
     /// Whether the workspace with this stable ID is still open. Workspaces
     /// are found by the ID the queue recorded, never by their title, which
     /// people may rename (ADR-0026).

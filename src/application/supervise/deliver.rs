@@ -46,6 +46,9 @@ pub(super) enum Submission {
     Dialog(String),
     /// The input is still in the box after [`SUBMIT_RETRIES`] Enters.
     Stuck(String),
+    /// A `/exit` timed out on every attempt, the screen showing each time
+    /// that it did not get there (task 354): the session was not asked.
+    Unsent,
 }
 
 impl Submission {
@@ -54,6 +57,7 @@ impl Submission {
         match self {
             Submission::Submitted(screen) => screen.as_deref(),
             Submission::Dialog(screen) | Submission::Stuck(screen) => Some(screen),
+            Submission::Unsent => None,
         }
     }
 }
@@ -64,9 +68,12 @@ impl Submission {
 /// [`SUBMIT_RETRIES`] times. Returns the outcome and the Enters sent
 /// again. An error is a failed typing of the input; an Enter that fails
 /// after it leaves the input stuck in the box. A typing that timed out
-/// with the input maybe typed (a `/exit` is never typed again, task 326)
-/// is judged from the screen like one that returned, and so is one that
-/// failed with the input still in the box (its Enter failed, task 353).
+/// with the input maybe typed is judged from the screen like one that
+/// returned, and so is one that failed with the input still in the box
+/// (its Enter failed, task 353). A `/exit` is typed again after a timeout
+/// only while the screen shows the input box ready with no trace of it
+/// (task 354); one that timed out on every attempt that way is
+/// [`Submission::Unsent`].
 pub(super) fn submit_input(
     cmux: &dyn WorkspaceBackend,
     signals: &dyn AgentSignals,
@@ -75,10 +82,14 @@ pub(super) fn submit_input(
 ) -> Result<(Submission, usize)> {
     let typed = match input {
         Input::Text(text) => cmux.send_text(workspace, text),
-        Input::Exit => cmux.send_exit(workspace),
+        Input::Exit => cmux.send_exit_when(workspace, &|screen| exit_unsent_on(signals, screen)),
     };
     match typed {
         Ok(()) => (),
+        Err(error) if exit_unsent(&error) => {
+            warn!(error = %format_args!("{error:#}"), "/exit for workspace {workspace} timed out on every attempt without reaching the session: {error:#}");
+            return Ok((Submission::Unsent, 0));
+        }
         Err(error) if timed_out_maybe_sent(&error) => {
             warn!(error = %format_args!("{error:#}"), "{} for workspace {workspace} timed out and may have been typed; reading the screen for it: {error:#}", input.name());
         }
@@ -120,6 +131,15 @@ pub(super) fn submit_input(
         }
         retries += 1;
     }
+}
+
+/// Whether `screen` shows that a `/exit` did not get there: the input box
+/// is drawn with no dialog over it, and its last lines hold no trace of the
+/// `/exit` (typed, or submitted into the transcript).
+fn exit_unsent_on(signals: &dyn AgentSignals, screen: &str) -> bool {
+    signals.input_ready(screen)
+        && signals.detect_prompt(screen).is_none()
+        && !text_on_screen(screen, Input::Exit.text())
 }
 
 /// [`submit_input`] into `run`'s session, `what` naming the input in the
@@ -682,12 +702,37 @@ mod tests {
     }
 
     #[test]
-    fn an_exit_that_timed_out_is_never_typed_again_and_does_not_fail() {
+    fn an_exit_that_timed_out_but_got_there_is_never_typed_again_and_does_not_fail() {
+        // Its trace on the screen, or a dialog over the box: not typed again.
+        for (screens, expected) in [
+            (
+                &["pending:/exit", "ready"][..],
+                Submission::Submitted(Some("ready".into())),
+            ),
+            (&["dialog"][..], Submission::Dialog("dialog".into())),
+        ] {
+            let mut backend = Backend::new(screens);
+            backend.exit_times_out = true;
+            let (submission, _) = submitted_through(&backend, Input::Exit).unwrap();
+            assert_eq!(submission, expected);
+            assert_eq!(backend.sent().iter().filter(|s| *s == "/exit").count(), 1);
+        }
+        // Nor on a screen that cannot be read.
+        let mut backend = Backend::new(&[]);
+        backend.exit_times_out = true;
+        let (submission, _) = submitted_through(&backend, Input::Exit).unwrap();
+        assert_eq!(submission, Submission::Submitted(None));
+        assert_eq!(backend.sent(), ["/exit"]);
+    }
+
+    #[test]
+    fn an_exit_that_timed_out_before_getting_there_is_typed_again_up_to_the_attempts() {
         let mut backend = Backend::new(&["ready"]);
         backend.exit_times_out = true;
         let (submission, retries) = submitted_through(&backend, Input::Exit).unwrap();
-        assert_eq!(submission, Submission::Submitted(Some("ready".into())));
-        assert_eq!((retries, backend.sent()), (0, vec!["/exit".to_owned()]));
+        assert_eq!((submission, retries), (Submission::Unsent, 0));
+        assert_eq!(backend.sent(), ["/exit", "/exit", "/exit"]);
+        assert_eq!(Submission::Unsent.screen(), None);
     }
 
     #[test]
@@ -745,6 +790,9 @@ mod tests {
             "application/supervise/deliver.rs",
             // The recording wrapper hands it to the backend.
             "application/recording.rs",
+            // `send_exit_when`'s default, which submit_input calls (task
+            // 354), hands it to a backend that retries nothing.
+            "application/ports.rs",
         ];
         let stray: Vec<_> = found
             .iter()

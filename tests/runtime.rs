@@ -574,6 +574,15 @@ struct TestWorkspace {
     hidden: Mutex<Vec<String>>,
     /// This many captures time out, as `cmux read-screen` does under load.
     capture_timeouts: AtomicUsize,
+    /// This many `send_exit` calls time out before the `/exit` reaches the
+    /// session (task 354).
+    exit_unsent: AtomicUsize,
+    /// `close` ends the session in the workspace, as closing a cmux
+    /// workspace kills its terminal, instead of requiring it gone.
+    close_ends_session: bool,
+    /// `close` times out and leaves the workspace and its session as they
+    /// are, as cmux does under load.
+    close_times_out: bool,
 }
 impl TestWorkspace {
     fn new(db: &Path, fail: bool, script: &str) -> Self {
@@ -611,6 +620,9 @@ impl TestWorkspace {
             listed: Mutex::new(Vec::new()),
             hidden: Mutex::new(Vec::new()),
             capture_timeouts: AtomicUsize::new(0),
+            exit_unsent: AtomicUsize::new(0),
+            close_ends_session: false,
+            close_times_out: false,
         }
     }
     /// Let cmux list `workspace` as if an earlier supervisor opened it.
@@ -866,6 +878,10 @@ impl WorkspaceBackend for TestWorkspace {
         Duration::from_millis(10)
     }
     fn close(&self, workspace_id: &str) -> Result<()> {
+        ensure!(
+            !self.close_times_out,
+            "cmux close-workspace failed: Command timed out"
+        );
         // The session must have exited (or died, its wrapper's pid gone)
         // before the supervisor gives up the workspace. A workspace this
         // backend did not create (an orphan's) has no session here.
@@ -877,6 +893,23 @@ impl WorkspaceBackend for TestWorkspace {
             .find(|(id, _)| id == workspace_id)
             .map(|(_, s)| s.run_id.clone());
         let connection = Connection::open(&self.db)?;
+        if self.close_ends_session
+            && let Some(run_id) = &run_id
+        {
+            fs::write(exit_request_path(&self.session_run_dir(workspace_id)), "")?;
+            let started = Instant::now();
+            while !connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM run_processes WHERE run_id=?1 AND role='wrapper' AND exited_at IS NOT NULL)",
+                [run_id],
+                |r| r.get::<_, bool>(0),
+            )? {
+                ensure!(
+                    started.elapsed() < Duration::from_secs(30),
+                    "session did not end with its workspace"
+                );
+                thread::sleep(Duration::from_millis(20));
+            }
+        }
         if let Some(run_id) = &run_id {
             let exited: bool = connection.query_row(
                 "SELECT EXISTS(SELECT 1 FROM run_processes WHERE run_id=?1 AND role='wrapper' AND exited_at IS NOT NULL)",
@@ -912,9 +945,18 @@ impl WorkspaceBackend for TestWorkspace {
     }
     fn send_exit(&self, workspace_id: &str) -> Result<()> {
         self.exits_sent.fetch_add(1, Ordering::SeqCst);
+        if self
+            .exit_unsent
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+            .is_ok()
+        {
+            bail!("\"cmux\" send did not finish within 30s");
+        }
         let run_dir = self.session_run_dir(workspace_id);
         fs::write(exit_request_path(&run_dir), "")?;
         if self.send_times_out {
+            // The /exit got there: the transcript shows it.
+            *self.screen.lock().unwrap() = format!("❯ /exit\n{READY_SCREEN}");
             bail!("\"cmux\" send did not finish within 30s");
         }
         if self.exit_returns_after_session {
@@ -2846,13 +2888,16 @@ fn failed_backend_calls_are_recorded_with_the_load_and_counted_by_stats() {
     );
     // cmux's timeout is told apart from its other failures.
     assert_eq!(failures[0].payload["code"], "backend_timeout");
+    // One of up to three attempts, not made again: the screen shows the
+    // /exit got there (task 354).
     assert_eq!(failures[0].payload["attempt"], 1);
-    assert_eq!(failures[0].payload["max_attempts"], 1);
+    assert_eq!(failures[0].payload["max_attempts"], 3);
     assert_eq!(failures[0].payload["retry_after_ms"], Value::Null);
     assert!(!detail.events.iter().any(|e| e.kind == "runtime_error"));
 
     // capture: a timeout is read again after a backoff, each failed
     // attempt recorded with its number and the backoff that followed.
+    *backend.screen.lock().unwrap() = READY_SCREEN.into();
     backend.capture_timeouts.store(2, Ordering::SeqCst);
     let recording = runtime::RecordingBackend::new(&backend, db.clone(), None);
     assert_eq!(recording.capture(WORKSPACE_ID).unwrap(), READY_SCREEN);
@@ -10724,6 +10769,257 @@ fn revising_agent(revises: usize) -> String {
            receipt \"$(git rev-parse HEAD)\"; idle; \
          done; await_exit"
     )
+}
+
+/// The `send_exit` attempts that failed, as (attempt, max_attempts,
+/// retry_after_ms).
+fn exit_attempts(detail: &dagq::domain::TaskDetail) -> Vec<(Value, Value, Value)> {
+    backend_failures(detail)
+        .into_iter()
+        .filter(|e| e.payload["op"] == "send_exit")
+        .map(|e| {
+            (
+                e.payload["attempt"].clone(),
+                e.payload["max_attempts"].clone(),
+                e.payload["retry_after_ms"].clone(),
+            )
+        })
+        .collect()
+}
+
+/// A `/exit` that cmux timed out before it reached the session (the screen
+/// shows the input box and no trace of it) is sent again after a backoff,
+/// and the run goes on without being given up (task 354).
+#[test]
+fn an_exit_that_timed_out_before_reaching_the_session_is_sent_again() {
+    let (_dir, repo, db) = fixture();
+    let backend = TestWorkspace::new(&db, false, IDLE_AGENT);
+    backend.exit_unsent.store(1, Ordering::SeqCst);
+    let reviewer = TestReviewer::new(&[verdict("pass", &[], "meets the acceptance")]);
+    let outcome = supervise_reviewed(&db, &repo, &backend, &reviewer);
+    assert_eq!(outcome["errors"], json!([]), "{outcome}");
+    assert_eq!(outcome["runs"][0]["status"], "integrated", "{outcome}");
+    assert_eq!(backend.exits_sent.load(Ordering::SeqCst), 2);
+    let detail = SqliteQueue::open(&db)
+        .unwrap()
+        .show(TaskId::new(1))
+        .unwrap();
+    assert_eq!(exit_attempts(&detail), [(json!(1), json!(3), json!(10))]);
+    let kinds = event_kinds(&detail);
+    // The session exited on the second /exit: nothing more to record.
+    assert!(position(&kinds, "exit_requested") < position(&kinds, "session_exited"));
+    for kind in ["exit_unsent", "exit_request_timed_out", "runtime_error"] {
+        assert!(!kinds.contains(&kind), "{kinds:?}");
+    }
+}
+
+/// A `/exit` that never got there on any attempt leaves a run whose review
+/// passed and whose receipt still holds against a clean worktree to land:
+/// the workspace is closed instead of waiting on a session that was never
+/// asked, and `exit_unsent` records it (task 354).
+#[test]
+fn an_exit_that_never_got_there_closes_a_sound_passed_run_and_lands_it() {
+    let (_dir, repo, db) = fixture();
+    let base = git_out(&repo, &["rev-parse", "main"]);
+    let mut backend = TestWorkspace::new(&db, false, IDLE_AGENT);
+    backend.exit_unsent.store(usize::MAX, Ordering::SeqCst);
+    backend.close_ends_session = true;
+    let reviewer = TestReviewer::new(&[verdict("pass", &[], "meets the acceptance")]);
+    let outcome = supervise_reviewed(&db, &repo, &backend, &reviewer);
+    assert_eq!(outcome["errors"], json!([]), "{outcome}");
+    assert_eq!(outcome["runs"][0]["status"], "integrated", "{outcome}");
+    // Typed once and twice again, never more.
+    assert_eq!(backend.exits_sent.load(Ordering::SeqCst), 3);
+    let mut queue = SqliteQueue::open(&db).unwrap();
+    let detail = queue.show(TaskId::new(1)).unwrap();
+    assert_eq!(detail.task.status(), TaskStatus::Completed);
+    assert_landed(&repo, &detail.runs[0], "test task", &base);
+    assert_eq!(
+        exit_attempts(&detail),
+        [
+            (json!(1), json!(3), json!(10)),
+            (json!(2), json!(3), json!(20)),
+            (json!(3), json!(3), Value::Null),
+        ]
+    );
+    assert_eq!(
+        payloads(&detail, "exit_unsent"),
+        [
+            &json!({"code": "backend_timeout", "workspace_id": WORKSPACE_ID, "attempts": 3, "action": "close_and_land"})
+        ]
+    );
+    let kinds = event_kinds(&detail);
+    for (earlier, later) in [
+        ("review_finished", "exit_requested"),
+        ("exit_requested", "exit_unsent"),
+        ("exit_unsent", "workspace_closed"),
+        ("workspace_closed", "run_integrated"),
+    ] {
+        assert!(
+            position(&kinds, earlier) < position(&kinds, later),
+            "{earlier} before {later}: {kinds:?}"
+        );
+    }
+    for kind in ["exit_request_timed_out", "runtime_error"] {
+        assert!(!kinds.contains(&kind), "{kinds:?}");
+    }
+    assert!(queue.asks(AskQuery::default()).unwrap().is_empty());
+    assert_eq!(backend.closed(), vec![WORKSPACE_ID.to_owned()]);
+}
+
+/// A `/exit` that never got there leaves a run that does not land on its
+/// own (here its review failed) to the person, as a session that held its
+/// `/exit` back is: the `stuck_exit` ask, at once, and the run kept (task
+/// 354).
+#[test]
+fn an_exit_that_never_got_there_asks_for_a_run_that_cannot_land() {
+    let (_dir, repo, db) = fixture();
+    let backend = TestWorkspace::new(&db, false, IDLE_AGENT);
+    backend.exit_unsent.store(usize::MAX, Ordering::SeqCst);
+    let backend = Arc::new(backend);
+    let supervisor = {
+        let (db, repo, backend) = (db.clone(), repo.clone(), backend.clone());
+        thread::spawn(move || supervise(&db, &repo, &backend))
+    };
+    wait_until(&db, Duration::from_secs(30), |queue| {
+        !queue.asks(AskQuery::default()).unwrap().is_empty()
+    });
+    let mut queue = SqliteQueue::open(&db).unwrap();
+    let detail = queue.show(TaskId::new(1)).unwrap();
+    let run = detail.runs[0].clone();
+    assert_eq!(run.status(), RunStatus::AwaitingIntegration);
+    assert!(queue.run_lease(run.id()).unwrap().is_some());
+    assert_eq!(
+        payloads(&detail, "exit_unsent"),
+        [&json!({
+            "code": "backend_timeout", "workspace_id": WORKSPACE_ID, "attempts": 3,
+            "action": "ask", "held": "the run does not land after its exit",
+        })]
+    );
+    assert_eq!(
+        payloads(&detail, "exit_request_timed_out"),
+        [
+            &json!({"code": "exit_timeout", "workspace_id": WORKSPACE_ID, "timeout_secs": 120, "unsent": true})
+        ]
+    );
+    let asks = queue.asks(AskQuery::default()).unwrap();
+    assert_eq!(asks.len(), 1, "{asks:?}");
+    assert_eq!(asks[0].kind, AskKind::StuckExit);
+    assert!(
+        asks[0].question.contains("(exit_unsent)"),
+        "{}",
+        asks[0].question
+    );
+    // The person has the session exit; the run goes on as before.
+    fs::write(exit_request_path(run.run_dir().unwrap()), "").unwrap();
+    let outcome = joined(supervisor, "the supervisor thread to return").unwrap();
+    backend.join();
+    assert_eq!(outcome["errors"], json!([]), "{outcome}");
+    assert_eq!(backend.exits_sent.load(Ordering::SeqCst), 3);
+    let detail = queue.show(TaskId::new(1)).unwrap();
+    let kinds = event_kinds(&detail);
+    assert!(position(&kinds, "exit_unsent") < position(&kinds, "session_exited"));
+    assert!(position(&kinds, "session_exited") < position(&kinds, "review_failed"));
+    assert!(!kinds.contains(&"runtime_error"), "{kinds:?}");
+    assert!(queue.read_ask(asks[0].id).unwrap().closed_at.is_some());
+}
+
+/// A sound passed run whose workspace cannot be closed either is not
+/// landed with its session alive: the `stuck_exit` ask says why (task 354).
+#[test]
+fn an_exit_that_never_got_there_asks_when_the_workspace_cannot_be_closed() {
+    let (_dir, repo, db) = fixture();
+    let mut backend = TestWorkspace::new(&db, false, IDLE_AGENT);
+    backend.exit_unsent.store(usize::MAX, Ordering::SeqCst);
+    backend.close_times_out = true;
+    let backend = Arc::new(backend);
+    let reviewer = Arc::new(TestReviewer::new(&[verdict(
+        "pass",
+        &[],
+        "meets the acceptance",
+    )]));
+    let supervisor = {
+        let (db, repo, backend, reviewer) =
+            (db.clone(), repo.clone(), backend.clone(), reviewer.clone());
+        thread::spawn(move || {
+            let _waiting = common::within(common::STEP_LIMIT, "supervise to return");
+            runtime::supervise_with_reviewer(
+                &db,
+                &repo,
+                &*backend,
+                &claude_stub(&db),
+                &*reviewer,
+                Path::new(env!("CARGO_BIN_EXE_dagq")),
+                &supervise_options(4, true),
+            )
+        })
+    };
+    wait_until(&db, Duration::from_secs(30), |queue| {
+        !queue.asks(AskQuery::default()).unwrap().is_empty()
+    });
+    let mut queue = SqliteQueue::open(&db).unwrap();
+    let detail = queue.show(TaskId::new(1)).unwrap();
+    let run = detail.runs[0].clone();
+    let unsent = payloads(&detail, "exit_unsent");
+    assert_eq!(unsent[0]["action"], "ask", "{unsent:?}");
+    assert!(
+        unsent[0]["held"]
+            .as_str()
+            .unwrap()
+            .starts_with("its workspace could not be closed"),
+        "{unsent:?}"
+    );
+    assert!(run.workspace_closed_at().is_none());
+    // The person has the session exit; the run lands without a close.
+    fs::write(exit_request_path(run.run_dir().unwrap()), "").unwrap();
+    let outcome = joined(supervisor, "the supervisor thread to return").unwrap();
+    backend.join();
+    assert_eq!(outcome["runs"][0]["status"], "integrated", "{outcome}");
+}
+
+/// A passed run whose worktree changed after its review does not land
+/// without its session's exit: the `/exit` that never got there is the
+/// `stuck_exit` ask, saying why (task 354).
+#[test]
+fn an_exit_that_never_got_there_asks_for_a_passed_run_whose_worktree_changed() {
+    let (_dir, repo, db) = fixture();
+    let backend = TestWorkspace::new(&db, false, IDLE_AGENT);
+    backend.exit_unsent.store(usize::MAX, Ordering::SeqCst);
+    let backend = Arc::new(backend);
+    // The review runs in the worktree; this one leaves a file behind.
+    let reviewer = Arc::new(TestReviewer::new(&[format!(
+        "printf 'x\\n' > stray.txt; {}",
+        verdict("pass", &[], "meets the acceptance")
+    )]));
+    let supervisor = {
+        let (db, repo, backend, reviewer) =
+            (db.clone(), repo.clone(), backend.clone(), reviewer.clone());
+        thread::spawn(move || supervise_reviewed(&db, &repo, &backend, &reviewer))
+    };
+    wait_until(&db, Duration::from_secs(30), |queue| {
+        !queue.asks(AskQuery::default()).unwrap().is_empty()
+    });
+    let mut queue = SqliteQueue::open(&db).unwrap();
+    let detail = queue.show(TaskId::new(1)).unwrap();
+    let run = detail.runs[0].clone();
+    let unsent = payloads(&detail, "exit_unsent");
+    assert_eq!(unsent.len(), 1, "{unsent:?}");
+    assert_eq!(unsent[0]["action"], "ask");
+    let held = unsent[0]["held"].as_str().unwrap();
+    assert!(
+        held.starts_with("its receipt no longer holds: worktree is not clean"),
+        "{held}"
+    );
+    let asks = queue.asks(AskQuery::default()).unwrap();
+    assert_eq!(asks[0].kind, AskKind::StuckExit);
+    assert!(asks[0].question.contains(held), "{}", asks[0].question);
+    // The person cleans up and has the session exit: the run lands.
+    fs::remove_file(Path::new(run.worktree_path().unwrap()).join("stray.txt")).unwrap();
+    fs::write(exit_request_path(run.run_dir().unwrap()), "").unwrap();
+    let outcome = joined(supervisor, "the supervisor thread to return");
+    assert_eq!(outcome["errors"], json!([]), "{outcome}");
+    assert_eq!(outcome["runs"][0]["status"], "integrated", "{outcome}");
+    assert_eq!(backend.exits_sent.load(Ordering::SeqCst), 3);
 }
 
 /// A receipt accepted with the session still open is reviewed before the
