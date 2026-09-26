@@ -133,6 +133,9 @@ pub struct SuperviseOptions {
     /// this binary (ADR-0045 decision 10): its registration and leases are
     /// kept, not registered anew. `None` registers a new supervisor.
     pub handoff_token: Option<String>,
+    /// How `up` started this process (`supervise --mode`), for its start
+    /// mark; `None` for a supervisor started by hand.
+    pub mode: Option<SupervisorMode>,
     /// The automatic update of the supervisor's binary (ADR-0045 decision
     /// 17): off unless `supervise --auto-update`.
     pub update: UpdateSettings,
@@ -155,6 +158,7 @@ impl SuperviseOptions {
             planner_timeout: PLANNER_TIMEOUT,
             plugin_dir: None,
             handoff_token: None,
+            mode: None,
             update: UpdateSettings::default(),
         }
     }
@@ -174,6 +178,7 @@ impl SuperviseOptions {
             runtime_planners: self.runtime_planners,
             planner_timeout: self.planner_timeout,
             handoff_token: self.handoff_token.clone(),
+            mode: self.mode,
             update: self.update.clone(),
         }
     }
@@ -1179,4 +1184,70 @@ pub fn rebind(db: &Path, repo: &Path) -> Result<Value> {
 /// `stats` on the system clock without cmux: see [`OneShot::stats`].
 pub fn stats(db: &Path, query: &StatsQuery) -> Result<Value> {
     OneShot::system().stats(db, query, None)
+}
+
+/// `dagq mark <label>`: record a person's or a planner's change mark
+/// (ADR-0051 decision 12), `at` the time the change took effect when it is
+/// marked afterwards. Returns the mark as `marks` lists it.
+pub fn record_mark(
+    queue: &SqliteQueue,
+    label: &str,
+    note: Option<&str>,
+    at: Option<crate::domain::stats::Cursor>,
+    by: &str,
+) -> Result<Value> {
+    use crate::domain::marks::{self, MARK_RECORDED};
+    let events = queue.all_events()?;
+    let at = at
+        .map(|cursor| {
+            marks::cursor_time(cursor, &events)
+                .context("--at names an event id this queue does not have")
+        })
+        .transpose()?;
+    if let Some(at) = &at {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_millis();
+        ensure!(
+            crate::domain::stats::timestamp_millis(at)
+                .is_some_and(|at| i128::from(at) <= now as i128),
+            "--at {at} is in the future; a mark stands for a change already made"
+        );
+    }
+    let payload = marks::mark_payload(label, note, at, by).map_err(anyhow::Error::msg)?;
+    let id = queue.record_queue_event(MARK_RECORDED, payload)?;
+    recorded_mark(queue, id)
+}
+
+/// `dagq mark --retract <id>`: record that the mark `target` was no change
+/// (ADR-0051 decision 12); the mark stays, retracted.
+pub fn retract_mark(
+    queue: &SqliteQueue,
+    target: crate::domain::EventId,
+    by: &str,
+) -> Result<Value> {
+    use crate::domain::marks::{self, MARK_RETRACTED};
+    let payload =
+        marks::retraction_payload(&queue.all_events()?, target, by).map_err(anyhow::Error::msg)?;
+    let id = queue.record_queue_event(MARK_RETRACTED, payload)?;
+    recorded_mark(queue, id)
+}
+
+fn recorded_mark(queue: &SqliteQueue, id: crate::domain::EventId) -> Result<Value> {
+    let mark = crate::domain::marks::marks(&queue.all_events()?, None, None)
+        .into_iter()
+        .find(|mark| mark.id == Some(id))
+        .context("the recorded mark is not listed")?;
+    Ok(serde_json::to_value(mark)?)
+}
+
+/// `dagq marks`: the recorded and derived change marks that took effect
+/// after `since` and at or before `until`, oldest first.
+pub fn marks(
+    queue: &SqliteQueue,
+    since: Option<crate::domain::stats::Cursor>,
+    until: Option<crate::domain::stats::Cursor>,
+) -> Result<Value> {
+    let marks = crate::domain::marks::marks(&queue.all_events()?, since, until);
+    Ok(json!({ "marks": marks }))
 }

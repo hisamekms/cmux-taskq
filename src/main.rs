@@ -338,6 +338,38 @@ enum Command {
         #[arg(long, default_value_t = 20, value_parser = clap::value_parser!(u32).range(1..))]
         limit: u32,
     },
+    /// Record a change mark (ADR-0051 decision 12): a change the KPIs should be compared
+    /// before and after (a setting, the operation, the host). With --retract, record that an
+    /// earlier mark (a `dagq mark` or a `[run.env]` change) was none. Prints the mark. Not for
+    /// the observer or a job.
+    #[command(group = clap::ArgGroup::new("mark").required(true))]
+    Mark {
+        /// Short name of the change, e.g. "parallel 4→3" or "host arm64".
+        #[arg(group = "mark")]
+        label: Option<String>,
+        /// What changed and why.
+        #[arg(long, conflicts_with = "retract")]
+        note: Option<String>,
+        /// When the change took effect, for a mark made afterwards: an event id, `@<unix
+        /// seconds>` or an RFC 3339 time. The mark itself is recorded now.
+        #[arg(long, conflicts_with = "retract")]
+        at: Option<dagq::domain::stats::Cursor>,
+        /// Event id of the mark to retract.
+        #[arg(long, group = "mark")]
+        retract: Option<i64>,
+    },
+    /// List the change marks oldest first by when they took effect (ADR-0051 decision 12): the
+    /// recorded ones (supervisor start, handoff and stop, `[run.env]` changes, `dagq mark` and
+    /// its retractions) and the ones derived from the claims (`derived:dagq_version`,
+    /// `derived:claude_version`, `derived:parallel`, `derived:toolchain`). Reads only.
+    Marks {
+        /// Event id, `@<unix seconds>` or an RFC 3339 time: only marks after it.
+        #[arg(long)]
+        since: Option<dagq::domain::stats::Cursor>,
+        /// Event id, `@<unix seconds>` or an RFC 3339 time: only marks at or before it.
+        #[arg(long)]
+        until: Option<dagq::domain::stats::Cursor>,
+    },
     /// Record a finding (ADR-0044 decision 18), or resolve or dismiss one.
     Finding {
         #[command(subcommand)]
@@ -480,6 +512,10 @@ enum Command {
         /// exec'd this binary (ADR-0045 decision 10); set by the handoff.
         #[arg(long, hide = true)]
         handoff_token: Option<String>,
+        /// How `up` started this process (launchd or in_cmux), for its start mark (ADR-0051
+        /// decision 10); set by `up`.
+        #[arg(long, hide = true)]
+        mode: Option<String>,
         /// Register with the automatic update on: build and install the runtime of every landing
         /// on main that changes it (ADR-0045 decision 17). `up --auto-update` starts it so.
         #[arg(long)]
@@ -1014,6 +1050,7 @@ fn reads_only(command: &Command) -> bool {
             | Command::Stats { .. }
             | Command::Doctor { .. }
             | Command::Notes { .. }
+            | Command::Marks { .. }
             | Command::Findings { .. }
             | Command::Search { .. }
             | Command::Related { .. }
@@ -1063,6 +1100,7 @@ fn observer_access(command: &Command) -> ObserverAccess {
         | Command::Stats { .. }
         | Command::Doctor { .. }
         | Command::Notes { .. }
+        | Command::Marks { .. }
         | Command::Findings { .. }
         | Command::Finding {
             command: FindingCommand::Record { .. } | FindingCommand::Resolve { .. },
@@ -1551,6 +1589,25 @@ fn execute(cli: Cli) -> Result<Value> {
             since: since.map(EventId::new),
             limit: usize::try_from(limit)?,
         })?)?,
+        Command::Mark {
+            label,
+            note,
+            at,
+            retract,
+        } => {
+            let by = role.unwrap_or_else(|| "human".into());
+            match retract {
+                Some(id) => dagq::compose::retract_mark(&queue, EventId::new(id), &by)?,
+                None => dagq::compose::record_mark(
+                    &queue,
+                    label.as_deref().unwrap_or_default(),
+                    note.as_deref(),
+                    at,
+                    &by,
+                )?,
+            }
+        }
+        Command::Marks { since, until } => dagq::compose::marks(&queue, since, until)?,
         Command::Finding {
             command:
                 FindingCommand::Record {
@@ -1763,6 +1820,7 @@ fn execute(cli: Cli) -> Result<Value> {
             planner_timeout,
             plugin_dir,
             handoff_token,
+            mode,
             auto_update,
             update_interval,
             update_build_command,
@@ -1784,6 +1842,7 @@ fn execute(cli: Cli) -> Result<Value> {
                 planner_timeout: Duration::from_secs(planner_timeout),
                 plugin_dir,
                 handoff_token,
+                mode: mode.map(|mode| mode.parse()).transpose()?,
                 update: dagq::application::supervise::UpdateSettings {
                     register: auto_update,
                     interval: Duration::from_secs(update_interval),
@@ -2103,8 +2162,15 @@ fn install_stop_signal() -> Result<Arc<AtomicBool>> {
     Ok(stop)
 }
 
+/// The options a handoff drops from this process's arguments: its own
+/// token, and `--mode`, which the handed-off binary may predate (the
+/// handoff probe asks only for `--handoff-token`) and does not need, since
+/// the registration it takes over already has `up`'s mode.
+const HANDOFF_DROPPED: [&str; 2] = ["--handoff-token", "--mode"];
+
 /// The arguments of this process with `--handoff-token <token>` in place
-/// of any it had: the `supervise` the handed-off binary runs.
+/// of any it had and without `--mode`: the `supervise` the handed-off
+/// binary runs.
 fn handoff_arguments(arguments: &[OsString], token: &str) -> Vec<OsString> {
     let mut kept = Vec::with_capacity(arguments.len() + 2);
     let mut skip = false;
@@ -2112,14 +2178,15 @@ fn handoff_arguments(arguments: &[OsString], token: &str) -> Vec<OsString> {
         if std::mem::take(&mut skip) {
             continue;
         }
-        if argument == "--handoff-token" {
+        if HANDOFF_DROPPED.iter().any(|option| argument == *option) {
             skip = true;
             continue;
         }
-        if argument
-            .to_str()
-            .is_some_and(|text| text.starts_with("--handoff-token="))
-        {
+        if argument.to_str().is_some_and(|text| {
+            HANDOFF_DROPPED
+                .iter()
+                .any(|option| text.starts_with(&format!("{option}=")))
+        }) {
             continue;
         }
         kept.push(argument.clone());
@@ -2177,5 +2244,41 @@ fn main() -> ExitCode {
             eprintln!("{}", json!({"error": format!("{error:#}")}));
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_handoff_replaces_the_token_and_drops_the_mode() {
+        let arguments: Vec<OsString> = [
+            "dagq",
+            "supervise",
+            "--mode",
+            "in_cmux",
+            "--handoff-token",
+            "old",
+            "--parallel",
+            "3",
+            "--mode=launchd",
+            "--handoff-token=older",
+        ]
+        .into_iter()
+        .map(OsString::from)
+        .collect();
+        assert_eq!(
+            handoff_arguments(&arguments, "new"),
+            [
+                "dagq",
+                "supervise",
+                "--parallel",
+                "3",
+                "--handoff-token",
+                "new"
+            ]
+            .map(OsString::from)
+        );
     }
 }

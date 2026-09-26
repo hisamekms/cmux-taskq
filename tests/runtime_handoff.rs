@@ -139,6 +139,32 @@ fn a_handoff_leaves_the_session_running_and_the_next_process_drives_it_on() {
     assert_eq!(handed[0]["version"], VERSION);
     // The continued supervisor ended like any other and removed its row.
     assert!(queue.supervisors().unwrap().is_empty());
+    // The change marks (ADR-0051 decision 10): the start, the handoff and
+    // one stop; the process that exec'd records no stop of its own.
+    let marks: Vec<(String, Value)> = queue
+        .all_events()
+        .unwrap()
+        .into_iter()
+        .filter(|event| event.kind.starts_with("supervisor_") && event.task_id.is_none())
+        .map(|event| (event.kind, event.payload))
+        .collect();
+    let kinds: Vec<&str> = marks.iter().map(|(kind, _)| kind.as_str()).collect();
+    assert_eq!(
+        kinds,
+        [
+            "supervisor_started",
+            "supervisor_started",
+            "supervisor_stopped"
+        ]
+    );
+    assert_eq!(marks[0].1["handoff"], json!(false));
+    assert_eq!(marks[1].1["handoff"], json!(true));
+    assert_eq!(marks[1].1["previous_version"], VERSION);
+    assert!(
+        marks
+            .iter()
+            .all(|(_, payload)| payload["supervisor"] == json!(token))
+    );
 }
 
 /// A run rejected by validation waits for its session to take the `/exit`;

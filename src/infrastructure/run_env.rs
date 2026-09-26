@@ -274,6 +274,62 @@ pub fn load_run_env(
         .collect())
 }
 
+/// `[run.env]` of the `dagq.toml` in `root` as written, values unexpanded;
+/// `None` without the file.
+pub fn load_run_env_table(root: &Path) -> Result<Option<Vec<(String, String)>>> {
+    let path = root.join(CONFIG_FILE_NAME);
+    let Some(text) = read_config(&path)? else {
+        return Ok(None);
+    };
+    parse_run_env(&text)
+        .map(Some)
+        .with_context(|| format!("parse {}", path.display()))
+}
+
+/// The file in the queue's directory holding its `[run.env]` hash salt.
+pub const RUN_ENV_SALT_FILE: &str = "run-env-salt";
+
+/// The salt in `<queue_dir>/run-env-salt`, made (random, owner-only) when
+/// there is none. It is written to a temporary file and linked into place,
+/// so the file is never seen empty, and two processes making it at once
+/// keep the first one's. A lost file gets a new salt, and the next
+/// `run_env_changed` names every key once.
+pub fn run_env_salt(queue_dir: &Path) -> Result<String> {
+    use std::{io::Write, os::unix::fs::OpenOptionsExt};
+    let path = queue_dir.join(RUN_ENV_SALT_FILE);
+    let read = || -> Result<String> {
+        let salt = fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+        ensure!(!salt.trim().is_empty(), "{} is empty", path.display());
+        Ok(salt.trim().to_owned())
+    };
+    if path.exists() {
+        return read();
+    }
+    let salt = format!(
+        "{}{}",
+        uuid::Uuid::new_v4().simple(),
+        uuid::Uuid::new_v4().simple()
+    );
+    let temporary = queue_dir.join(format!(
+        ".{RUN_ENV_SALT_FILE}.{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    let made = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&temporary)
+        .and_then(|mut file| file.write_all(salt.as_bytes()))
+        .with_context(|| format!("write {}", temporary.display()))
+        .and_then(|()| match fs::hard_link(&temporary, &path) {
+            Ok(()) => Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+            Err(error) => Err(error).with_context(|| format!("link {}", path.display())),
+        });
+    let _ = fs::remove_file(&temporary);
+    if made? { Ok(salt) } else { read() }
+}
+
 /// Where `value` resolves as a program: a value with a `/` is that path, one
 /// without is looked up in each directory of `path` in order, like a shell
 /// does; either must be an executable file.
@@ -432,6 +488,18 @@ impl Verifier for ShellVerifier {
         )
     }
 
+    fn run_env_table(&self) -> Result<Option<Vec<(String, String)>>> {
+        load_run_env_table(&self.checkout)
+    }
+
+    fn run_env_salt(&self) -> Result<String> {
+        let queue_dir = self
+            .db
+            .parent()
+            .context("queue database has no directory")?;
+        run_env_salt(queue_dir)
+    }
+
     fn recheck_command(&self) -> Result<Option<String>> {
         load_recheck_command(&self.checkout)
     }
@@ -450,6 +518,22 @@ impl Verifier for ShellVerifier {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_run_env_salt_is_made_once_and_kept_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let salt = run_env_salt(dir.path()).unwrap();
+        assert_eq!(salt.len(), 64);
+        assert_eq!(run_env_salt(dir.path()).unwrap(), salt);
+        let file = dir.path().join(RUN_ENV_SALT_FILE);
+        let mode = fs::metadata(&file).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+        fs::write(&file, "").unwrap();
+        assert!(run_env_salt(dir.path()).is_err());
+        fs::remove_file(&file).unwrap();
+        assert_ne!(run_env_salt(dir.path()).unwrap(), salt);
+    }
 
     fn pairs(items: &[(&str, &str)]) -> Vec<(String, String)> {
         items

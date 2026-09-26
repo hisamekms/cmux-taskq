@@ -800,18 +800,29 @@ impl SqliteQueue {
 
     /// The newest event of the queue itself (on no task, goal or run) of one
     /// of `kinds`.
+    /// One lookup per kind, so each walks `events_by_kind` from its newest
+    /// row: the supervisor reads these on every pass, and a kind list made
+    /// SQLite walk every goal-less event instead.
     pub fn latest_queue_event(&self, kinds: &[&str]) -> Result<Option<RunEvent>> {
-        Ok(self
-            .conn
-            .query_row(
-                "SELECT * FROM run_events
-                 WHERE run_id IS NULL AND task_id IS NULL AND goal_id IS NULL
-                   AND kind IN (SELECT value FROM json_each(?1))
-                 ORDER BY id DESC LIMIT 1",
-                [serde_json::to_string(kinds)?],
-                event_row,
-            )
-            .optional()?)
+        let mut latest: Option<RunEvent> = None;
+        for kind in kinds {
+            let event = self
+                .conn
+                .query_row(
+                    "SELECT * FROM run_events
+                     WHERE kind=?1 AND run_id IS NULL AND task_id IS NULL AND goal_id IS NULL
+                     ORDER BY id DESC LIMIT 1",
+                    [kind],
+                    event_row,
+                )
+                .optional()?;
+            if let Some(event) = event
+                && latest.as_ref().is_none_or(|latest| latest.id < event.id)
+            {
+                latest = Some(event);
+            }
+        }
+        Ok(latest)
     }
 
     /// The id of the last event recorded before `unix` (seconds), 0 when

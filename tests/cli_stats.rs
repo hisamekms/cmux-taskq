@@ -805,3 +805,102 @@ mod stats {
         assert!(!invoke(&db, &["stats", "--since", "x"]).status.success());
     }
 }
+
+/// `dagq mark` records a person's or a planner's mark, `--retract` a
+/// retraction, and `dagq marks` lists them with the marks derived from the
+/// claims: a change of the host's toolchain between two claims is a
+/// `derived:toolchain` mark and writes no event (ADR-0051 decisions 10, 12).
+#[test]
+fn marks_are_recorded_retracted_and_derived_from_the_claims() {
+    use dagq::domain::{ClaimOutcome, CommitSha};
+    use dagq::infrastructure::sqlite::SqliteQueue;
+    use serde_json::json;
+    let (_dir, db) = queue();
+    ok(&db, &["add", "first"]);
+    ok(&db, &["add", "second"]);
+    ok(&db, &["ready", "1", "--bypass-review"]);
+    ok(&db, &["ready", "2", "--bypass-review"]);
+    let mut queue = SqliteQueue::open(&db).unwrap();
+    let base = CommitSha::try_from("0123456789abcdef0123456789abcdef01234567").unwrap();
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    for (host, at) in [
+        ("x86_64-apple-darwin", "01"),
+        ("aarch64-apple-darwin", "02"),
+    ] {
+        let ClaimOutcome::Claimed { run } = queue.claim_for_supervisor(&base, "t").unwrap() else {
+            panic!("nothing to claim");
+        };
+        // The attributes a supervisor's claim records (task 197).
+        conn.execute(
+            "UPDATE run_events SET created_at=?3, payload=json_set(payload,
+               '$.dagq_version','v1','$.parallel',3,'$.rustc_release','1.90.0','$.rustc_host',?2)
+             WHERE run_id=?1 AND kind='run_claimed'",
+            [
+                run.id().as_str(),
+                host,
+                &format!("2026-09-26T{at}:00:00.000Z"),
+            ],
+        )
+        .unwrap();
+    }
+    let events_before = ok(&db, &["events", "--after", "0", "--all"])["cursor"].clone();
+
+    let marked = ok_as(
+        "planner",
+        &db,
+        &[
+            "mark",
+            "parallel 4→3",
+            "--note",
+            "load",
+            "--at",
+            "2026-09-26T09:30:00+09:00",
+        ],
+    );
+    assert_eq!(marked["kind"], "mark_recorded");
+    assert_eq!(marked["label"], "parallel 4→3");
+    assert_eq!(marked["at"], "2026-09-26T00:30:00.000Z");
+    assert_eq!(marked["detail"]["by"], "planner");
+    assert_eq!(marked["detail"]["note"], "load");
+    let id = marked["id"].as_i64().unwrap();
+    assert_eq!(id, events_before.as_i64().unwrap() + 1);
+
+    let listed = ok(&db, &["marks"])["marks"].clone();
+    let kinds: Vec<&str> = listed
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|mark| mark["kind"].as_str().unwrap())
+        .collect();
+    assert_eq!(kinds, ["mark_recorded", "derived:toolchain"]);
+    assert_eq!(listed[1]["id"], serde_json::Value::Null);
+    assert_eq!(listed[1]["at"], "2026-09-26T02:00:00.000Z");
+    assert_eq!(listed[1]["detail"]["from"], "1.90.0 x86_64-apple-darwin");
+    assert_eq!(listed[1]["detail"]["to"], "1.90.0 aarch64-apple-darwin");
+    assert_eq!(
+        ok(&db, &["marks", "--since", "2026-09-26T01:00:00Z"])["marks"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+
+    let retracted = ok(&db, &["mark", "--retract", &id.to_string()]);
+    assert_eq!(retracted["kind"], "mark_retracted");
+    assert_eq!(retracted["detail"]["mark"], json!(id));
+    assert_eq!(retracted["detail"]["by"], "human");
+    let listed = ok(&db, &["marks"])["marks"].clone();
+    assert_eq!(listed[0]["retracted_by"], retracted["id"]);
+    assert!(refused(&db, &["mark", "--retract", &id.to_string()]).contains("already retracted"));
+    assert!(refused(&db, &["mark", "--retract", "1"]).contains("not a mark"));
+    assert!(refused(&db, &["mark", " "]).contains("needs a label"));
+    assert!(
+        refused(&db, &["mark", "later", "--at", "2999-01-01T00:00:00Z"]).contains("in the future")
+    );
+
+    // The observer and the jobs read marks but may not record one.
+    for role in ["observer", "reviewer"] {
+        assert!(!invoke_as(Some(role), &db, &["mark", "x"]).status.success());
+        assert_eq!(ok_as(role, &db, &["marks"])["marks"], listed);
+    }
+}

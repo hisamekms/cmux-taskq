@@ -223,3 +223,135 @@ fn a_repository_without_dagq_toml_checks_no_program() {
         assert_eq!(doctor.get("run_env"), None, "{doctor}");
     }
 }
+
+#[test]
+fn supervisor_starts_and_run_env_changes_are_recorded_as_marks_once() {
+    use dagq::domain::marks::{RUN_ENV_CHANGED, SUPERVISOR_STARTED, SUPERVISOR_STOPPED, marks};
+    let (_dir, repo, db) = fixture();
+    let backend = TestWorkspace::new(&db, false, VALID_AGENT);
+    let events = |kind: &str| -> Vec<Value> {
+        SqliteQueue::open(&db)
+            .unwrap()
+            .all_events()
+            .unwrap()
+            .into_iter()
+            .filter(|event| event.kind == kind)
+            .inspect(|event| assert!(event.task_id.is_none() && event.run_id.is_none()))
+            .map(|event| event.payload)
+            .collect()
+    };
+
+    // A queue without `[run.env]` gets the start and stop marks only. The
+    // start carries the mode `up` passed (`supervise --mode`).
+    supervise_with(
+        &db,
+        &repo,
+        &backend,
+        &SuperviseOptions {
+            mode: Some(dagq::domain::SupervisorMode::InCmux),
+            ..supervise_options(4, true)
+        },
+    )
+    .unwrap();
+    let started = events(SUPERVISOR_STARTED);
+    assert_eq!(started.len(), 1);
+    assert_eq!(started[0]["mode"], json!("in_cmux"));
+    assert_eq!(started[0]["dagq_version"], json!(dagq::VERSION));
+    assert_eq!(started[0]["parallel"], json!(4));
+    assert_eq!(started[0]["handoff"], json!(false));
+    assert_eq!(started[0]["auto_update"], json!(false));
+    let stopped = events(SUPERVISOR_STOPPED);
+    assert_eq!(stopped.len(), 1);
+    assert_eq!(stopped[0]["outcome"], json!("stopped"));
+    assert_eq!(stopped[0]["supervisor"], started[0]["supervisor"]);
+    assert!(events(RUN_ENV_CHANGED).is_empty());
+
+    // Adding `[run.env]` records one mark naming the keys, not the values.
+    fs::write(
+        repo.join("dagq.toml"),
+        "[run.env]\nCARGO_BUILD_JOBS = '4'\nSCCACHE_DIR = 'secret-dir'\n\n[stall]\nsend_confirm_secs = 5\n",
+    )
+    .unwrap();
+    supervise(&db, &repo, &backend).unwrap();
+    let changes = events(RUN_ENV_CHANGED);
+    assert_eq!(changes.len(), 1, "{changes:?}");
+    assert_eq!(
+        changes[0]["changed"],
+        json!(["CARGO_BUILD_JOBS", "SCCACHE_DIR"])
+    );
+    assert_eq!(changes[0]["previous_hash"], Value::Null);
+    assert!(!changes[0].to_string().contains("secret-dir"));
+    // The hashes are keyed with the queue's salt (outside the events), so
+    // guessing a value and hashing it finds nothing.
+    let salt = fs::read_to_string(db.parent().unwrap().join("run-env-salt")).unwrap();
+    let plain = |text: &str| {
+        use sha2::Digest;
+        format!("{:x}", sha2::Sha256::digest(text.as_bytes()))[..16].to_owned()
+    };
+    let payload = changes[0].to_string();
+    for guess in [
+        "CARGO_BUILD_JOBS=4",
+        "SCCACHE_DIR=secret-dir",
+        "CARGO_BUILD_JOBS=4\nSCCACHE_DIR=secret-dir\n",
+    ] {
+        assert!(!payload.contains(&plain(guess)), "{payload}");
+    }
+    assert!(!payload.contains(salt.trim()));
+
+    // The same table, or another table changed, records nothing more, however
+    // often the supervisor starts again with the same build and parallel.
+    fs::write(
+        repo.join("dagq.toml"),
+        "[stall]\nsend_confirm_secs = 9\n\n[run.env]\nSCCACHE_DIR = 'secret-dir'\nCARGO_BUILD_JOBS = '4'\n",
+    )
+    .unwrap();
+    supervise(&db, &repo, &backend).unwrap();
+    supervise(&db, &repo, &backend).unwrap();
+    assert_eq!(events(RUN_ENV_CHANGED).len(), 1);
+    assert_eq!(events(SUPERVISOR_STARTED).len(), 4);
+
+    // A changed value is one more mark, naming that key.
+    fs::write(
+        repo.join("dagq.toml"),
+        "[run.env]\nSCCACHE_DIR = 'secret-dir'\nCARGO_BUILD_JOBS = '2'\n",
+    )
+    .unwrap();
+    supervise(&db, &repo, &backend).unwrap();
+    let changes = events(RUN_ENV_CHANGED);
+    assert_eq!(changes.len(), 2);
+    assert_eq!(changes[1]["changed"], json!(["CARGO_BUILD_JOBS"]));
+    assert_eq!(changes[1]["previous_hash"], changes[0]["hash"]);
+
+    // A missing file (a checkout rewriting it) records nothing; an empty
+    // table is the change that removes the keys.
+    fs::remove_file(repo.join("dagq.toml")).unwrap();
+    supervise(&db, &repo, &backend).unwrap();
+    assert_eq!(events(RUN_ENV_CHANGED).len(), 2);
+    fs::write(repo.join("dagq.toml"), "[run.env]\n").unwrap();
+    supervise(&db, &repo, &backend).unwrap();
+    let changes = events(RUN_ENV_CHANGED);
+    assert_eq!(changes.len(), 3);
+    assert_eq!(
+        changes[2]["changed"],
+        json!(["CARGO_BUILD_JOBS", "SCCACHE_DIR"])
+    );
+
+    // They are listed as marks; restarts with the same build derive none.
+    let listed = marks(
+        &SqliteQueue::open(&db).unwrap().all_events().unwrap(),
+        None,
+        None,
+    );
+    let kinds: Vec<&str> = listed.iter().map(|mark| mark.kind.as_str()).collect();
+    assert_eq!(
+        kinds
+            .iter()
+            .filter(|kind| **kind == RUN_ENV_CHANGED)
+            .count(),
+        3
+    );
+    assert!(
+        kinds.iter().all(|kind| !kind.starts_with("derived:")),
+        "{kinds:?}"
+    );
+}

@@ -281,6 +281,10 @@ failed / interrupted run (a dead run nobody leases is recovered to interrupted f
 
 - [`stats`](supervisor-lifecycle/stats.md)（Claude sessionの区間のkindごとの開いている時間とtranscriptのturnから導く稼働時間の集計`sessions`を含む。[ADR-0048](../adr/0048-record-claude-sessions-by-kind-with-open-and-active-time.md)）
 
+### `mark` / `marks`
+
+- [変更の印（`mark` / `marks`）](supervisor-lifecycle/marks.md)
+
 ### `doctor`
 
 - [`doctor`](supervisor-lifecycle/doctor.md)

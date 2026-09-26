@@ -1716,6 +1716,13 @@ pub trait Verifier {
         &self,
         run_dir: Option<&Path>,
     ) -> Result<crate::domain::run_env::RunEnvCheck>;
+    /// `[run.env]` of the main checkout's `dagq.toml` as written (values
+    /// unexpanded), `None` without the file: what the supervisor hashes for
+    /// the `run_env_changed` mark (ADR-0051 decision 11).
+    fn run_env_table(&self) -> Result<Option<Vec<(String, String)>>>;
+    /// The queue's secret salt of the `[run.env]` hashes, made on first use
+    /// and kept outside the events (ADR-0051 decision 11).
+    fn run_env_salt(&self) -> Result<String>;
     /// The command the landing recheck runs on main's tree with a waiting
     /// run merged in (`[recheck] command` of `dagq.toml`, ADR-0068 decision
     /// 2); `None` checks the merge only.

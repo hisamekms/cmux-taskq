@@ -1098,19 +1098,24 @@ pub fn supervise_command(
         db,
         environment,
         options,
+        SupervisorMode::InCmux,
     )?))
 }
 
 /// `<this binary> --db <db> supervise --parallel N --log-dir <queue logs>
-/// --cmux <resolved> --claude <resolved> [--plugin-dir <dir>]`: what keeps a
-/// supervisor of this queue going, in either mode. The executables are
-/// absolute so neither launchd's PATH nor the terminal's decides which ones
-/// run; the plugin directory is what the planners the runtime opens load.
+/// --cmux <resolved> --claude <resolved> --mode <mode> [--plugin-dir <dir>]`:
+/// what keeps a supervisor of this queue going, in either mode. The
+/// executables are absolute so neither launchd's PATH nor the terminal's
+/// decides which ones run; the plugin directory is what the planners the
+/// runtime opens load. `--mode` is what its start mark records (ADR-0051
+/// decision 10): `up` writes the registration's mode only after it sees the
+/// registration.
 fn supervise_arguments(
     location: &QueuePaths,
     db: &Path,
     environment: &UpEnvironment,
     options: &UpOptions,
+    mode: SupervisorMode,
 ) -> Result<Vec<String>> {
     let mut arguments = vec![
         path_text(&environment.current_exe)?,
@@ -1125,6 +1130,8 @@ fn supervise_arguments(
         path_text(&options.cmux)?,
         "--claude".into(),
         path_text(&options.claude)?,
+        "--mode".into(),
+        mode.as_str().into(),
     ];
     if let Some(dir) = &options.plugin_dir {
         arguments.push("--plugin-dir".into());
@@ -1211,7 +1218,13 @@ pub fn launch_agent_spec(
     Ok(LaunchAgentSpec {
         label: location.label.clone(),
         plist: location.launch_agent.clone(),
-        program_arguments: supervise_arguments(location, db, environment, options)?,
+        program_arguments: supervise_arguments(
+            location,
+            db,
+            environment,
+            options,
+            SupervisorMode::Launchd,
+        )?,
         working_directory: path_text(repo_root)?,
         environment: SupervisorEnvironment {
             path: environment.path.clone(),

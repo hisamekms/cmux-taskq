@@ -30,6 +30,7 @@ related:
 2. cmux（`ping`）とClaude（`--version`）のpreflightを行う。
 3. queueをrepositoryに束縛する（`bind_repository`）。別repositoryに束縛済みなら開始しない。queue全体の排他はなく、同じqueueに別のsupervisorがいても構わない。
 4. supervisorプロセスのtoken（UUID）を作り、`supervisors`表に自分を登録し（`register_supervisor`: token、PID、`--parallel`、`started_at`）、引き継ぎを受けられる印を付ける（`accept_handoff`）。hiddenの`--handoff-token TOKEN`で起動されたとき（引き継ぎのexecの後）は新しく登録せず、そのtokenの登録を同じPIDのまま取り戻し（`resume_registration`）、そのtokenのleaseを持つrunのslotを組み立て直す（[Handoff](handoff.md#handoff)）。runを1つも持たない常駐supervisorも、この登録で`status`/`doctor`に並ぶ。続けて別スレッドで2秒ごとにそのtokenの登録と全leaseのheartbeatを1トランザクションで更新する（`heartbeat(token)`）。heartbeatの失敗はループで検知し、全runに`runtime_error`を記録してleaseと登録を残したまま終了する（プロセス終了後にstaleになる）。
+   登録の後、`stall_config_loaded`に続けて変更の印`supervisor_started`（build識別子・`parallel`・`mode`（`up`が渡すhiddenの`--mode`）・`auto_update`・`handoff`）を1件記録する。loopが終わって登録を消すとき（execするときを除く）は`supervisor_stopped`を記録する。ループの各passでは`[run.env]`のプログラムの検査に続けて、main checkoutの`[run.env]`の正規化したhashがqueueの最新の`run_env_changed`と違えば`run_env_changed`を記録する（`Verifier::run_env_table`、hashの鍵はqueueのsaltの`Verifier::run_env_salt`。[変更の印](marks.md)、ADR-0051の決定10・11）。
 
 ループ（1秒ごと）:
 

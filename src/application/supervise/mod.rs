@@ -70,6 +70,7 @@ use crate::domain::{
     ReviewDecision, ReviewVerdict, RunId, RunLease, RunPaths, RunPlan, RunProcess, RunStatus,
     SessionRole, TRIAGE_OPTIONS, TRIAGE_RETRY_FAILURES, TaskAction, TaskId, TaskRun, TaskStatus,
     TriageDecision, TriageState, TriageVerdict, heartbeat_stale,
+    marks::{RUN_ENV_CHANGED, SUPERVISOR_STARTED, SUPERVISOR_STOPPED, run_env_digest},
     measure::{ClaimAttributes, HostVersions, LoadSummary, LoadWindow},
     recovery::RecoveryDecision,
     resume::{ResumeCount, inherits_on_exhaustion},
@@ -169,6 +170,10 @@ pub struct LoopSettings {
     /// The token of the supervisor this process continues after an exec
     /// (ADR-0045 decision 10); `None` registers a new one.
     pub handoff_token: Option<String>,
+    /// How `up` started this process (`supervise --mode`): what its start
+    /// mark records, since `up` writes the registration's mode only after
+    /// it sees the registration (ADR-0051 decision 10).
+    pub mode: Option<crate::domain::SupervisorMode>,
     /// The automatic update of this supervisor's binary (ADR-0045
     /// decision 17).
     pub update: UpdateSettings,
@@ -377,6 +382,27 @@ pub fn supervise(ports: &Ports<'_>, settings: &LoopSettings) -> Result<Value> {
     let mut config = serde_json::to_value(settings.stall)?;
     config["supervisor"] = json!(token);
     queue.record_queue_event(STALL_CONFIG_LOADED, config)?;
+    // The mark of this start or handoff (ADR-0051 decision 10): the mode
+    // `up` passed, else the registration's (a handoff keeps it).
+    let registration = queue
+        .supervisors()?
+        .into_iter()
+        .find(|registration| registration.token == token);
+    queue.record_queue_event(
+        SUPERVISOR_STARTED,
+        json!({
+            "supervisor": token,
+            "dagq_version": layout.version,
+            "parallel": parallel,
+            "mode": settings
+                .mode
+                .or(registration.as_ref().and_then(|r| r.mode))
+                .map(|mode| mode.as_str()),
+            "auto_update": registration.as_ref().is_some_and(|r| r.auto_update),
+            "handoff": settings.handoff_token.is_some(),
+            "previous_version": previous_version,
+        }),
+    )?;
     let heartbeat = Heartbeat::start(ports.queues.clone(), token.clone());
     let cmux = RecordingBackend::over(
         ports.cmux,
@@ -605,11 +631,20 @@ impl Supervisor<'_> {
     /// database may be unreachable), and it goes stale with the leases.
     fn run_loop(&mut self, options: &LoopSettings) -> Result<Value> {
         let result = self.drive(options);
-        if self.exec.is_none()
-            && self.heartbeat.check().is_ok()
-            && let Err(error) = self.queue.deregister_supervisor(&self.token)
-        {
-            warn!(error = %format_args!("{error:#}"), "supervisor registration could not be removed: {error:#}");
+        if self.exec.is_none() && self.heartbeat.check().is_ok() {
+            // The mark of the stop (ADR-0051 decision 10); an exec leaves it
+            // to the next process's handoff mark.
+            let stopped = json!({
+                "supervisor": self.token,
+                "dagq_version": self.layout.version,
+                "outcome": if result.is_ok() { "stopped" } else { "failed" },
+            });
+            if let Err(error) = self.queue.record_queue_event(SUPERVISOR_STOPPED, stopped) {
+                warn!(error = %format_args!("{error:#}"), "the supervisor's stop could not be recorded: {error:#}");
+            }
+            if let Err(error) = self.queue.deregister_supervisor(&self.token) {
+                warn!(error = %format_args!("{error:#}"), "supervisor registration could not be removed: {error:#}");
+            }
         }
         result
     }
@@ -632,6 +667,7 @@ impl Supervisor<'_> {
             // Every pass, draining or not, so a hold on landings ends as soon
             // as the program is found (ADR-0049 decision 9).
             self.check_run_env_programs()?;
+            self.mark_run_env_change()?;
             self.draining = stopping || !self.claiming || self.handoff.is_some();
             // A stop wins over a handoff: the drain goes on as before.
             if !stopping {
@@ -838,6 +874,42 @@ impl Supervisor<'_> {
             }
         }
         self.run_env_missing = !check.missing().is_empty();
+        Ok(())
+    }
+    /// Record `run_env_changed` when the normalized `[run.env]` of the main
+    /// checkout hashes differently from the latest one on the queue
+    /// (ADR-0051 decision 11), so a restarted supervisor does not repeat
+    /// it. A `dagq.toml` that cannot be read records nothing: provisioning
+    /// and `integrate` report that file themselves. Neither does a missing
+    /// one, which may only be a checkout rewriting it; an empty `[run.env]`
+    /// is the change that removes the table.
+    fn mark_run_env_change(&mut self) -> Result<()> {
+        let table = match self.verifier.run_env_table() {
+            Ok(Some(table)) => table,
+            Ok(None) => return Ok(()),
+            Err(error) => {
+                warn!(error = %format_args!("{error:#}"), "[run.env] could not be read for its change mark: {error:#}");
+                return Ok(());
+            }
+        };
+        let salt = match self.verifier.run_env_salt() {
+            Ok(salt) => salt,
+            Err(error) => {
+                warn!(error = %format_args!("{error:#}"), "the salt of the [run.env] hashes could not be read: {error:#}");
+                return Ok(());
+            }
+        };
+        let last = self.queue.latest_queue_event(&[RUN_ENV_CHANGED])?;
+        if let Some(mut payload) =
+            run_env_digest(&table, &salt).transition(last.as_ref().map(|event| &event.payload))
+        {
+            info!(
+                "[run.env] changed ({}): recorded as a change mark",
+                payload["changed"]
+            );
+            payload["supervisor"] = json!(self.token);
+            self.queue.record_queue_event(RUN_ENV_CHANGED, payload)?;
+        }
         Ok(())
     }
     /// What `run_claimed` records of a claim made now (task 197): this

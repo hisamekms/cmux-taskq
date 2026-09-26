@@ -152,6 +152,9 @@ fn up_starts_the_agent_and_the_sessions_once_and_reuses_them_after() {
         fixture.options.cmux.to_str().unwrap(),
         "--claude",
         fixture.options.claude.to_str().unwrap(),
+        // What the start mark records (ADR-0051 decision 10).
+        "--mode",
+        "launchd",
         "--plugin-dir",
         plugin_dir.to_str().unwrap(),
     ]
