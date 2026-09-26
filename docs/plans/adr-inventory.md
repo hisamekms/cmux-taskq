@@ -376,6 +376,8 @@ goal 1で実装済みなので、この棚卸しで`status: accepted`にした�
 
 ### B: queueの場所と移動（0006、0017、0020）
 
+置き換え済み（→ [ADR-0053](../adr/0053-queue-in-data-dir-run-paths-from-queue-and-rebind.md)、2026-09-26）。
+
 引き継ぐ決定:
 
 - queueは`$XDG_DATA_HOME/dagq/<hash>/queue.db`、hashと`repository`ファイル、`runs/<run-id>/`、cwdからの解決と`--db` / `--repo`のoverride、`init`での束縛と検査（`rebind`だけが例外）、`locate`と`DAGQ_DB`（0006）。

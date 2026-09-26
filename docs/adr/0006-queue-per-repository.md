@@ -2,10 +2,12 @@
 id: adr-0006
 type: adr
 title: repositoryごとに1つのqueueをユーザーのデータディレクトリに置き、cwdから解決する
-status: accepted
+status: superseded
 created: 2026-09-22
 updated: 2026-09-22
 accepted_on: 2026-09-22
+superseded_by: adr-0053
+superseded_on: 2026-09-26
 owners:
   - hisamekms
 tags:
@@ -21,6 +23,8 @@ related:
 ---
 
 # ADR-0006: repositoryごとに1つのqueueをユーザーのデータディレクトリに置き、cwdから解決する
+
+> **置き換え済み（2026-09-26）**: このADRの決定は現在有効ではない。現行の決定は[ADR-0053](0053-queue-in-data-dir-run-paths-from-queue-and-rebind.md)を読む。
 
 ## Context
 
