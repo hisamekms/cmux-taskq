@@ -9,7 +9,7 @@ dagq runs development tasks in cmux workspaces and isolated Git worktrees. This 
 
 A goal is the problem several tasks solve together; a task is one unit of work a session executes in its own worktree. Registering, submitting and closing belong to a planner session (`dagq-planner`); the supervisor runs a headless plan review of each submitted proposal, then runs and lands the queue; its asks and attention go to the inbox (`dagq-inbox`); what a person does by hand (up / down, recovery, a review by hand) is `dagq-recover`.
 
-Reference files, read only when needed: `${CLAUDE_PLUGIN_ROOT}/skills/dagq/reference/locate.md` (install, version warnings, missing or moved queue), `reference/inspect.md` (inspect commands, fields, statuses, `graph`, priority, editing) and `reference/goal-close.md` (closing a goal), all in the same directory.
+Reference files, read only when needed: `${CLAUDE_PLUGIN_ROOT}/skills/dagq/reference/locate.md` (install, version warnings, missing or moved queue), `reference/inspect.md` (inspect commands, fields, statuses, `graph`, `search` / `related`, priority, editing) and `reference/goal-close.md` (closing a goal), all in the same directory.
 
 ## 1. Locate the binary and the queue
 
@@ -27,9 +27,9 @@ The queue is per repository, resolved from the current directory: run the launch
 
 ## 2. Register a goal and decompose it into tasks
 
-Hear the problem → `goal add` → decompose it into tasks, each registered with `add --goal` → `lint` and `submit` them for plan review, which makes them `ready`. Each task's prompt shows the goal, its dependencies' receipt summaries and landed commits, and siblings in progress, so siblings agree on names and boundaries.
+Hear the problem → `goal add` → decompose it into tasks, each registered with `add --goal` → `lint` and `submit` them for plan review, which makes them `ready`. Look for duplicates and done work with `search` before `add` and `related ID` before `submit`; cancel one with `--duplicate-of X` (`reference/inspect.md`). Each task's prompt shows the goal, its dependencies' receipt summaries and landed commits, and siblings in progress, so siblings agree on names and boundaries.
 
-Skip the goal only for a one-shot task that finishes the problem by itself (a typo fix, a clippy warning, a version bump). If a second task will exist, or a later task needs to know what this one decided (a name, a boundary, a format), register a goal. When unsure, register it.
+Skip the goal only for a one-shot task that finishes the problem by itself (a typo fix, a clippy warning). If a second task will exist, or a later task needs to know what this one decided (a name, a boundary, a format), register a goal. When unsure, register it.
 
 ### Register the goal
 
@@ -55,13 +55,13 @@ Split the goal into tasks one session finishes in one worktree. Collect per task
 "$DAGQ" candidates
 ```
 
-A one-shot task omits `--goal`. `add` registers a `draft`, never claimed. `submit` (which refuses what `lint` rejects) makes the tasks `submitted`, one proposal owned by this session; nothing claims them. The supervisor's plan review job checks each proposal in turn: `pass` makes its tasks `ready`, `revise` returns them to `draft` with reasons for their planner to fix and `submit --proposal ID` again, `concern` asks the person through the inbox. `proposal list` / `proposal show ID` read proposals. Only plan review readies a task; `ready --bypass-review` skips it on a person's explicit word. `candidates` lists ready tasks whose dependencies are all `completed`; a ready task missing from it is blocked (see `show ID`). `edit` changes a draft or submitted task, `draft ID` takes a ready or submitted task back, `cancel ID` drops it, `dependency add|remove TASK PREDECESSOR` changes prerequisites. `set-goal`, `goal edit`, `edit`: `reference/inspect.md`; `set-paths`: `reference/scope.md`.
+A one-shot task omits `--goal`. `add` makes a `draft`, never claimed. `submit` (which refuses what `lint` rejects) makes the tasks `submitted`, one proposal owned by this session; nothing claims them. The supervisor's plan review job checks each proposal in turn: `pass` makes its tasks `ready`, `revise` returns them to `draft` with reasons for their planner to fix and `submit --proposal ID` again, `concern` asks the person through the inbox. `proposal list` / `proposal show ID` read proposals. Only plan review readies a task; `ready --bypass-review` skips it on a person's explicit word. `candidates` lists ready tasks whose dependencies are all `completed`; a ready task missing from it is blocked (see `show ID`). `edit` changes a draft or submitted task, `draft ID` takes a ready or submitted task back, `cancel ID` drops it, `dependency add|remove TASK PREDECESSOR` changes prerequisites. `set-goal`, `goal edit`, `edit`: `reference/inspect.md`; `set-paths`: `reference/scope.md`.
 
 `--priority LEVEL` (default `normal`; `set-priority TASK LEVEL` while `draft` or `ready`) orders claiming: `interrupt` (a rare cut-in, never routine), `urgent` (a defect stopping operation), `high` (a prerequisite of other work), `normal`, `low` (deferred). Claim order: effective priority (own, or higher from ready tasks waiting on it), `unblocks`, ID. Never mark urgency by drafting tasks or bending dependencies (`reference/inspect.md`).
 
 ## 3. Inspect
 
-`goal list`, `goal show ID`, `list` (unfinished tasks, paged: `--before NEXT` while `next` is not null), `show ID`, `graph [--goal ID]` (what waits on what, `critical`, claim order), `notes` / `note` (observations) and `stats` (time per run and goal, `alerts`). `show`, `goal show` and `doctor` cut long texts; `--full` gives them whole. Flags, fields and statuses: `reference/inspect.md`.
+`goal list`, `goal show ID`, `list` (unfinished tasks, paged: `--before NEXT` while `next` is not null), `show ID`, `graph [--goal ID]` (what waits on what, `critical`, claim order), `search` / `related`, `notes` / `note` (observations) and `stats` (time per run and goal, `alerts`). `show`, `goal show` and `doctor` cut long texts; `--full` gives them whole. Flags, fields and statuses: `reference/inspect.md`.
 
 ## 4. Report results
 
