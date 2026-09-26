@@ -92,9 +92,10 @@ worker の手元の test を関係する範囲に絞るのは 2026-09-26 に人�
 cold start は repository の中で1行。`up` は supervisor と inbox だけを開き、planner は開かない（ADR-0044 の決定 6）。planner は計画ごとに人が `dagq plan --plugin-dir <この repository>/plugins/claude-dagq` で開く（打つたびに新しい `[dagq]planner#<id>` を開き、複数同時に開ける。`dagq planners` で一覧）。当面は in-cmux mode で運用する（cmux の socket password を設定していないので launchd mode は preflight で止まる。[ADR-0011](docs/adr/0011-cmux-socket-password-and-in-cmux-fallback.md)）。`up` / `down` / `plan` / 固定バイナリの更新は、人が inbox か planner の session から打つ（手順は plugin の `dagq-recover` skill の section 5）。
 
 ```sh
-dagq up --in-cmux --claude ~/.local/bin/claude --plugin-dir <この repository>/plugins/claude-dagq
+dagq up --in-cmux --claude ~/.local/bin/claude --plugin-dir <この repository>/plugins/claude-dagq --parallel 3
 ```
 
+- `--parallel 3` を明示するのは、`up` の `--parallel` の既定が 4 で、`dagq.toml` の `[run.env]` の値が `--parallel 3` を前提にしているため（「作業中」の `dagq.toml` の項、task 427）。`CARGO_BUILD_JOBS = "4"` は worker 3 本と `integrate` 1 本が同時に cargo を回して合計 16 並列程度に収まるように決めたので、`--parallel` を付けずに打ち直すと既定の 4 で起動して約 20 並列になる。test の並列度（`RUST_TEST_THREADS` / `NEXTEST_TEST_THREADS`）も同じ運用の load を見て決めている。`--parallel` を変えるなら、`dagq.toml` の `[run.env]` の値と合わせて見直す
 - `--claude` を明示するのは、cmux の terminal の PATH では session ごとの shim（`$TMPDIR/cmux-cli-shims/<surface id>/claude`）が先に解決され、`up` がそれを supervisor の `--claude` に固定してしまうため。`up` は path を実体（`~/.local/share/claude/versions/<version>`）に解決して固定するので、Claude Code を更新したら `down --wait` → 同じ `up` で解決し直す
 - in-cmux mode に自動再起動はない。supervisor が止まると inbox の `watch` が `restart supervisor`（`supervisor_stopped`）として人に知らせる。`[dagq]supervisor` workspace の画面を読んで閉じ、同じ `up` を打ち直す（`down --wait` は drain の後に workspace を閉じるところまで行う）
 - `up` が開くのは `[dagq]inbox`（と in-cmux mode の `[dagq]supervisor`）。inbox の session の中から `up` を打てば inbox は `skipped`、それ以外からなら開くか `reused`、生きている supervisor は `reused` になる。`down` は inbox も planner も閉じない。旧バイナリの `up` が開いた常駐の `[dagq]planner` は、新しい `up` が `session_workspaces` の行を忘れるだけなので、人が unpin して閉じる
