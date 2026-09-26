@@ -18,3 +18,4 @@ tags:
 - [Milestones](milestones.md)
 - [ADR 0001〜0034の棚卸しと統合ADRの組](adr-inventory.md)
 - [cargo llvm-cov nextestへの切り替え前後のintegrateのverifyの所要時間と遅いtest](nextest-measurement.md)（ADR-0076決定6の測定）
+- [スパイク：過去の run の再現で task の重さと手戻りの予測の担い手を比べる](spike-predictor-replay.md)
