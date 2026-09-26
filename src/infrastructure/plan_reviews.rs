@@ -102,6 +102,22 @@ fn reviewable(conn: &Connection, proposal_id: ProposalId) -> Result<bool> {
     )
 }
 
+/// The tasks of the proposal edited since the job started (ADR-0041
+/// decision 9): its verdict is of their old contents. Event ids order the
+/// edits against the job's `plan_review_started`.
+fn edited_during(conn: &Connection, job: &PlanReviewJob) -> Result<Vec<TaskId>> {
+    Ok(conn
+        .prepare(
+            "SELECT DISTINCT e.task_id FROM run_events e JOIN tasks t ON t.id = e.task_id
+             WHERE e.kind='task_edited' AND t.proposal_id=?1 AND e.id > (
+                 SELECT id FROM run_events WHERE task_id=?2 AND kind='plan_review_started'
+                 AND json_extract(payload,'$.plan_review_id')=?3)
+             ORDER BY e.task_id",
+        )?
+        .query_map(params![job.proposal_id, job.anchor, job.id], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?)
+}
+
 /// Check an action against the proposal before anything is applied: it
 /// changes a submitted task of the proposal, a dependency names another
 /// task, a priority only goes down, and a duplicate is of another task
@@ -412,6 +428,47 @@ impl PlanReviewStore for SqliteQueue {
                 Some("the proposal moved on during its review"),
             )?;
             sessions::close_plan_review(&tx, job.id, false)?;
+            tx.commit()?;
+            return Ok(PlanReviewApplied {
+                stale: true,
+                ..PlanReviewApplied::default()
+            });
+        }
+        let edited = edited_during(&tx, job)?;
+        if !edited.is_empty() {
+            // The proposal stays submitted and unheld: the next pass
+            // reviews the edited tasks.
+            let error = format!(
+                "task {} of the proposal was edited during its review",
+                edited
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            finish_row(
+                &tx,
+                job.id,
+                now,
+                "interrupted",
+                Some(&verdict_json),
+                Some(&error),
+            )?;
+            sessions::close_plan_review(&tx, job.id, false)?;
+            event(
+                &tx,
+                job.anchor,
+                None,
+                "plan_review_discarded",
+                json!({
+                    "proposal_id": job.proposal_id,
+                    "plan_review_id": job.id,
+                    "attempt": job.attempt,
+                    "verdict": apply.verdict.verdict,
+                    "edited": edited,
+                    "error": error,
+                }),
+            )?;
             tx.commit()?;
             return Ok(PlanReviewApplied {
                 stale: true,

@@ -330,7 +330,7 @@ impl Supervisor<'_> {
             },
         )?;
         if applied.stale {
-            info!(task_id = %job.anchor, "proposal {proposal} moved on during its plan review; the verdict is not applied");
+            info!(task_id = %job.anchor, "proposal {proposal} moved on or had a task edited during its plan review; the verdict is not applied");
             return Ok(());
         }
         info!(task_id = %job.anchor, "proposal {proposal} plan review {}: {} ({})", job.attempt, decision.as_str(), verdict.summary);

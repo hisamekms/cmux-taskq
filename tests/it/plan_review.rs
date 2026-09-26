@@ -16,7 +16,8 @@ use dagq::{
     },
     domain::{
         AskKind, DraftOrigin, NewAsk, NewGoal, NewTask, PlannerOrigin, PlannerOwner, Priority,
-        ProposalId, ProposalStatus, Submission, Task, TaskAction, TaskId, TaskRun, TaskStatus,
+        ProposalId, ProposalStatus, Submission, Task, TaskAction, TaskEdit, TaskId, TaskRun,
+        TaskStatus,
     },
     infrastructure::{
         clock,
@@ -131,6 +132,9 @@ fn submit(queue: &mut SqliteQueue, tasks: &[TaskId], workspace: Option<&str>) ->
 struct StubReviewer {
     verdicts: Mutex<Vec<String>>,
     prompts: Mutex<Vec<String>>,
+    /// A task the first job's run edits through the queue at `.0`, as
+    /// `dagq edit` would while the job runs.
+    edit: Mutex<Option<(PathBuf, TaskId)>>,
 }
 
 impl StubReviewer {
@@ -138,13 +142,20 @@ impl StubReviewer {
         Self {
             verdicts: Mutex::new(verdicts.iter().map(Value::to_string).collect()),
             prompts: Mutex::new(Vec::new()),
+            edit: Mutex::new(None),
         }
+    }
+    /// The first job edits `task` of the queue at `db` while it runs.
+    fn editing(self, db: &Path, task: TaskId) -> Self {
+        *self.edit.lock().unwrap() = Some((db.to_owned(), task));
+        self
     }
     /// A job that fails: it exits non-zero.
     fn failing() -> Self {
         Self {
             verdicts: Mutex::new(vec!["FAIL".into()]),
             prompts: Mutex::new(Vec::new()),
+            edit: Mutex::new(None),
         }
     }
     fn prompts(&self) -> Vec<String> {
@@ -165,6 +176,16 @@ impl AgentProvider for StubReviewer {
     fn headless_command(&self, cwd: &Path, prompt: &str, tools: &[&str]) -> Result<CommandSpec> {
         assert_eq!(tools, ["Read", "Grep", "Glob"]);
         self.prompts.lock().unwrap().push(prompt.into());
+        // The job has started: its row and its event are in the queue.
+        if let Some((db, task)) = self.edit.lock().unwrap().take() {
+            SqliteQueue::open(&db)?.edit_task(
+                task,
+                TaskEdit {
+                    description: Some("edited while its review ran".into()),
+                    ..TaskEdit::default()
+                },
+            )?;
+        }
         let mut verdicts = self.verdicts.lock().unwrap();
         let verdict = if verdicts.len() > 1 {
             verdicts.remove(0)
@@ -1416,4 +1437,112 @@ fn a_planner_question_answer_is_typed_into_its_planner_or_carried_by_a_new_one()
     assert_eq!(opened[0]["ask_id"], json!(asked.id.as_i64() - 1));
     assert_eq!(events(&mut queue, second, "planner_answer_closed").len(), 1);
     assert!(queue.asks(Default::default()).unwrap().is_empty());
+}
+
+#[test]
+fn a_verdict_on_a_task_edited_during_its_review_is_not_applied_and_the_review_runs_again() {
+    for first in [
+        json!({"verdict": "pass", "reasons": [], "summary": "sound", "actions": []}),
+        json!({"verdict": "revise", "reasons": ["split it"], "summary": "too big"}),
+        json!({"verdict": "concern", "reasons": ["maybe done"], "summary": "doubtful"}),
+    ] {
+        let fx = fixture();
+        let mut queue = SqliteQueue::open(&fx.db).unwrap();
+        let blocker = TaskId::new(1);
+        let two = add(&mut queue, "two", &[blocker], Priority::Normal);
+        let three = add(&mut queue, "three", &[blocker], Priority::Normal);
+        let proposal = submit(&mut queue, &[two, three], None);
+        let reviewer = StubReviewer::new(&[
+            first.clone(),
+            json!({"verdict": "pass", "reasons": [], "summary": "fine now", "actions": []}),
+        ])
+        .editing(&fx.db, three);
+        let backend = PlanWorkspace::default();
+        let outcome = supervise(&fx, &backend, &reviewer);
+        assert_eq!(outcome["errors"], json!([]), "{outcome}");
+        // The first verdict is dropped with why; the second job reads the
+        // edited task and its pass is applied.
+        let prompts = reviewer.prompts();
+        assert_eq!(prompts.len(), 2, "{first}");
+        assert!(!prompts[0].contains("edited while its review ran"));
+        assert!(
+            prompts[1].contains("edited while its review ran"),
+            "{}",
+            prompts[1]
+        );
+        let discarded = events(&mut queue, two, "plan_review_discarded");
+        assert_eq!(discarded.len(), 1, "{first}");
+        assert_eq!(discarded[0]["verdict"], first["verdict"]);
+        assert_eq!(discarded[0]["edited"], json!([three]));
+        let finished = events(&mut queue, two, "plan_review_finished");
+        assert_eq!(finished.len(), 1, "{first}");
+        assert_eq!(finished[0]["summary"], "fine now");
+        assert_eq!(finished[0]["attempt"], 1);
+        assert_eq!(status(&mut queue, two), TaskStatus::Ready);
+        assert_eq!(status(&mut queue, three), TaskStatus::Ready);
+        assert_eq!(
+            queue.show_proposal(proposal).unwrap().status(),
+            ProposalStatus::Accepted
+        );
+        assert!(queue.asks(Default::default()).unwrap().is_empty());
+        let (outcome, error): (String, String) = Connection::open(&fx.db)
+            .unwrap()
+            .query_row(
+                "SELECT outcome, error FROM plan_reviews ORDER BY id LIMIT 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(outcome, "interrupted");
+        assert!(error.contains(&format!("task {three}")), "{error}");
+    }
+}
+
+#[test]
+fn edits_before_a_review_or_to_another_proposal_leave_its_verdict_applied() {
+    let fx = fixture();
+    let mut queue = SqliteQueue::open(&fx.db).unwrap();
+    let blocker = TaskId::new(1);
+    let early = add(&mut queue, "early", &[blocker], Priority::Normal);
+    let other = add(&mut queue, "other", &[blocker], Priority::Normal);
+    let reviewed = submit(&mut queue, &[early], None);
+    let later = submit(&mut queue, &[other], None);
+    // Edited before its review: the review reads the new contents.
+    queue
+        .edit_task(
+            early,
+            TaskEdit {
+                description: Some("edited before its review".into()),
+                ..TaskEdit::default()
+            },
+        )
+        .unwrap();
+    // The first job (of `reviewed`) edits the task of `later`.
+    let reviewer = StubReviewer::new(&[
+        json!({"verdict": "pass", "reasons": [], "summary": "sound", "actions": []}),
+    ])
+    .editing(&fx.db, other);
+    let backend = PlanWorkspace::default();
+    let outcome = supervise(&fx, &backend, &reviewer);
+    assert_eq!(outcome["errors"], json!([]), "{outcome}");
+    let prompts = reviewer.prompts();
+    assert_eq!(prompts.len(), 2);
+    assert!(
+        prompts[0].contains("edited before its review"),
+        "{}",
+        prompts[0]
+    );
+    assert!(
+        prompts[1].contains("edited while its review ran"),
+        "{}",
+        prompts[1]
+    );
+    for (task, proposal) in [(early, reviewed), (other, later)] {
+        assert_eq!(status(&mut queue, task), TaskStatus::Ready);
+        assert_eq!(
+            queue.show_proposal(proposal).unwrap().status(),
+            ProposalStatus::Accepted
+        );
+        assert!(events(&mut queue, task, "plan_review_discarded").is_empty());
+    }
 }
