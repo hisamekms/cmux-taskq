@@ -1721,9 +1721,14 @@ fn failing_verification_command_passes_validation_and_needs_a_session_at_integra
     assert_eq!(deferred[0]["code"], "verification_failed");
     assert_eq!(deferred[0]["index"], 1);
     assert_eq!(deferred[0]["exit_code"], 1);
+    // With nothing in the log it is `unknown` (task 467).
+    let unknown = json!({"class": "unknown", "evidence": "exit 1 with an empty log"});
+    assert_eq!(deferred[0]["failure"], unknown);
+    assert_eq!(deferred[0]["signal"], Value::Null);
     let verifications = integration_verifications(&detail);
     assert_eq!(verifications.len(), 1, "{verifications:?}");
     assert_eq!(verifications[0]["exit_code"], 1);
+    assert_eq!(verifications[0]["failure"], unknown);
     assert_eq!(verifications[0]["attempt"], 1);
     // Nothing landed.
     assert_eq!(git_out(&repo, &["rev-parse", "main"]), main);
@@ -1789,6 +1794,72 @@ fn failing_verification_command_passes_validation_and_needs_a_session_at_integra
         review.contains(&format!("latest attempt: {}", second.display())),
         "{review}"
     );
+}
+
+/// A failed verification command is put down to a class from its exit and
+/// its log, recorded on the command's event and the deferral, and named in
+/// the reason (task 467): here a build error, then a kill.
+#[test]
+fn a_failed_verification_is_classified_in_its_events() {
+    let (_dir, db, detail) = run_agent(
+        "echo a > a.txt && git add a.txt && git commit -q -m a; receipt \"$(git rev-parse HEAD)\"",
+    );
+    assert_eq!(detail.runs[0].status(), RunStatus::AwaitingIntegration);
+    let repo = Path::new(&db).parent().unwrap().join("repo's directory");
+    let build_error = r#"echo '   Compiling dagq'; echo 'error[E0063]: missing field `finding_id` in initializer of `NewAsk`'; echo '  --> src/recovery.rs:12:5'; echo 'error: could not compile `dagq`'; exit 101"#;
+    let set_commands = |commands: Value| {
+        Connection::open(&db)
+            .unwrap()
+            .execute(
+                "UPDATE tasks SET verification_commands=?1 WHERE id=1",
+                [commands.to_string()],
+            )
+            .unwrap();
+    };
+    set_commands(json!(["true", build_error]));
+    let outcome = integrate(&db, 1, &repo).unwrap();
+    assert_eq!(outcome["outcome"], "needs_session", "{outcome}");
+    let evidence = "error[E0063]: missing field `finding_id` in initializer of `NewAsk` --> src/recovery.rs:12:5";
+    assert!(
+        outcome["reason"]
+            .as_str()
+            .unwrap()
+            .contains(&format!("(build_error: {evidence})")),
+        "{outcome}"
+    );
+    let detail = SqliteQueue::open(&db)
+        .unwrap()
+        .show(TaskId::new(1))
+        .unwrap();
+    let failure = json!({"class": "build_error", "evidence": evidence});
+    let deferred = payloads(&detail, "integration_deferred");
+    assert_eq!(deferred[0]["code"], "verification_failed");
+    assert_eq!(deferred[0]["index"], 2);
+    assert_eq!(deferred[0]["failure"], failure);
+    let verifications = integration_verifications(&detail);
+    assert_eq!(verifications[0]["failure"], Value::Null);
+    assert_eq!(verifications[1]["exit_code"], 101);
+    assert_eq!(verifications[1]["failure"], failure);
+    // The duration and load of task 197 are still there, next to it.
+    assert!(verifications[1]["duration_secs"].is_number());
+    assert!(verifications[1].get("load_avg_mean").is_some());
+
+    // A shell killed by a signal has no exit code: the signal says why.
+    set_commands(json!(["kill -TERM $$"]));
+    let outcome = integrate(&db, 1, &repo).unwrap();
+    assert_eq!(outcome["outcome"], "needs_session", "{outcome}");
+    let detail = SqliteQueue::open(&db)
+        .unwrap()
+        .show(TaskId::new(1))
+        .unwrap();
+    let killed = json!({"class": "killed", "evidence": "killed by signal 15 (SIGTERM)"});
+    let deferred = payloads(&detail, "integration_deferred");
+    assert_eq!(deferred[1]["failure"], killed);
+    assert_eq!(deferred[1]["signal"], 15);
+    assert_eq!(deferred[1]["exit_code"], 128);
+    let verifications = integration_verifications(&detail);
+    assert_eq!(verifications[2]["failure"], killed);
+    assert_eq!(verifications[2]["signal"], 15);
 }
 
 /// Integrate's verification logs are numbered per attempt; a run directory

@@ -167,13 +167,14 @@ mod stats {
             42,
             json!({"op": "capture", "load_avg": null}),
         );
-        events.push(
-            2,
-            Some("b"),
-            "verification_command",
-            50,
-            verify("cargo llvm-cov", 100.0, 101),
-        );
+        events.push(2, Some("b"), "verification_command", 50, {
+            // Task 467: why it failed.
+            let mut failed = verify("cargo llvm-cov", 100.0, 101);
+            failed["attempt"] = json!(1);
+            failed["index"] = json!(3);
+            failed["failure"] = json!({"class": "timeout", "evidence": "test x timed out"});
+            failed
+        });
         events.push(
             2,
             Some("b"),
@@ -216,6 +217,14 @@ mod stats {
         assert_eq!(a["load_band"], "4-8");
         // Only the claim's load: the band is its.
         assert_eq!(runs[1]["load_band"], "64+");
+        assert_eq!(a["verify_failures"], json!([]));
+        assert_eq!(
+            runs[1]["verify_failures"],
+            json!([{
+                "attempt": 1, "index": 3, "command": "cargo llvm-cov",
+                "class": "timeout", "evidence": "test x timed out",
+            }])
+        );
         assert_eq!(runs[1]["load"]["work"], Value::Null);
         // A run claimed without any of it.
         let c = &runs[2];
@@ -274,6 +283,10 @@ mod stats {
                 {"command": "cargo fmt --all --check", "count": 1, "failed": 0, "total_secs": 2.0, "median_secs": 2.0},
                 {"command": "cargo llvm-cov", "count": 3, "failed": 1, "total_secs": 600.0, "median_secs": 200.0},
             ])
+        );
+        assert_eq!(
+            report["verification_failures"],
+            json!([{"class": "timeout", "count": 1, "runs": 1}])
         );
     }
 
@@ -388,6 +401,8 @@ mod stats {
                 "claim_parallel": null, "claim_slots": null, "claim_load_avg": null,
                 "load": {"work": null, "validate": null, "verify": null},
                 "load_band": null,
+                // Task 467: no verification command failed.
+                "verify_failures": [],
                 // ADR-0048: the run's Claude sessions per kind; these
                 // events recorded none.
                 "sessions": {},

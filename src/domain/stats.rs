@@ -35,8 +35,8 @@ pub use auto_repairs::{AutoRepairStats, DayCounts, LayerRepairs};
 pub use conflicts::{ConflictConfig, ConflictConfigReport, ConflictHotspots, History};
 pub use landing::{LandBreakdown, LandClock, LandPhases, PhaseSummary};
 pub use measures::{
-    BandCount, CommandStats, IntervalLoad, LoadBandStats, RunLoad, RunMeasures, VersionStats,
-    Versions,
+    BandCount, CommandStats, FailureClassStats, IntervalLoad, LoadBandStats, RunLoad, RunMeasures,
+    RunVerifyFailure, VersionStats, Versions,
 };
 pub use predictions::{RunActual, RunPrediction};
 pub use retries::{BrokenBy, ResumeAttempt, ResumeBreakdown, Retries};
@@ -424,6 +424,9 @@ pub struct Stats {
     /// The time each verification command of `integrate` took, in the same
     /// window as `backend_failures` (task 197).
     pub verification_commands: Vec<CommandStats>,
+    /// The verification commands of `integrate` that failed, per class of
+    /// their failure, in the same window as `backend_failures` (task 467).
+    pub verification_failures: Vec<FailureClassStats>,
     /// The Claude sessions per kind (ADR-0048 decision 12) that overlap the
     /// same window as `backend_failures`, their time cut to it. With
     /// `--goal`, only that goal's runs' sessions and its proposals' plan
@@ -863,6 +866,8 @@ pub fn stats(
         super::claim_defer::claim_deferrals(events, window_start, next_cursor, window_end, counts);
     let verification_commands =
         measures::verification_commands(events, window_start, next_cursor, counts);
+    let verification_failures =
+        measures::verification_failures(events, window_start, next_cursor, counts);
     let waiting = super::waiting::waiting_stats(events, window_start, next_cursor, counts);
     let stall_thresholds = thresholds::thresholds(
         &thresholds::detections(events, now * 1000),
@@ -968,6 +973,7 @@ pub fn stats(
         versions,
         load_bands,
         verification_commands,
+        verification_failures,
         sessions,
         waiting,
         asks: ask_stats,

@@ -26,6 +26,7 @@ use crate::domain::{
     heartbeat_stale,
     measure::{LoadSummary, LoadWindow},
     scope::{out_of_scope, scope_violation_reason},
+    verify_failure,
 };
 use crate::migration_numbers;
 
@@ -991,7 +992,15 @@ fn land(
         let duration_secs = (started.elapsed().as_secs_f64() * 1000.0).round() / 1000.0;
         let status = status?;
         let exit_code = status.code.unwrap_or(128);
-        let output = files.read_to_string(&log).unwrap_or_default();
+        // Lossy: a log cut off by a kill or a full disk may end mid-character,
+        // and its marks still count.
+        let output = files
+            .read(&log)
+            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+            .unwrap_or_default();
+        // Why it failed, from its exit and its log (task 467).
+        let failure = (exit_code != 0)
+            .then(|| verify_failure::classify(command, status.code, status.signal, &output));
         queue.record_runtime_event(
             run.id(),
             "verification_command",
@@ -1001,6 +1010,8 @@ fn land(
                 "index": index + 1,
                 "command": command,
                 "exit_code": exit_code,
+                "signal": status.signal,
+                "failure": failure.as_ref().map(|failure| failure.to_json()),
                 "duration_secs": duration_secs,
                 "load_avg_mean": load.load_avg_mean,
                 "load_avg_max": load.load_avg_max,
@@ -1008,14 +1019,23 @@ fn land(
                 "output_tail": tail(&output, 2000),
             }),
         )?;
-        if exit_code != 0 {
+        if let Some(failure) = failure {
             return defer(
                 Reason::new(ReasonCode::VerificationFailed).with("index", index + 1),
                 format!(
-                    "verification command {command:?} exited with {exit_code} after the rebase onto {main}; see {}",
+                    "verification command {command:?} exited with {exit_code} after the rebase onto {main} ({}: {}); see {}",
+                    failure.class.as_str(),
+                    failure.evidence,
                     log.display()
                 ),
-                json!({"main": main, "head": rebased, "command": command, "exit_code": exit_code}),
+                json!({
+                    "main": main,
+                    "head": rebased,
+                    "command": command,
+                    "exit_code": exit_code,
+                    "signal": status.signal,
+                    "failure": failure.to_json(),
+                }),
             );
         }
     }

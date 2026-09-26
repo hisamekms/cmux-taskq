@@ -4,8 +4,9 @@
 //! (`validation_finished`) and its verification commands
 //! (`verification_command` of `integrate`); and the aggregates over them:
 //! the runs per version and per load band, and the time each verification
-//! command takes.
-use std::collections::BTreeMap;
+//! command takes; and why the verification commands of `integrate` failed
+//! (their `failure`, task 467), per run and per class.
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::Serialize;
 use serde_json::Value;
@@ -67,6 +68,40 @@ pub struct RunMeasures {
     pub claim_load_avg: Option<f64>,
     pub load: RunLoad,
     pub load_band: Option<&'static str>,
+    /// The verification commands of its `integrate` attempts that failed,
+    /// with the class of the failure (task 467), in order; those recorded
+    /// before the class was are left out.
+    pub verify_failures: Vec<RunVerifyFailure>,
+}
+
+/// One failed verification command of a run's `integrate`: its attempt,
+/// its place in the task's commands, and its `failure`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RunVerifyFailure {
+    pub attempt: Option<i64>,
+    pub index: Option<i64>,
+    pub command: Option<String>,
+    pub class: String,
+    pub evidence: Option<String>,
+}
+
+impl RunVerifyFailure {
+    /// The failure a `verification_command` of `integrate` records, if any.
+    fn of(event: &RunEvent) -> Option<Self> {
+        let payload = &event.payload;
+        if event.kind != "verification_command" || payload["phase"] != "integration" {
+            return None;
+        }
+        let failure = &payload["failure"];
+        let text = |value: &Value| value.as_str().map(str::to_owned);
+        Some(Self {
+            attempt: payload["attempt"].as_i64(),
+            index: payload["index"].as_i64(),
+            command: text(&payload["command"]),
+            class: text(&failure["class"])?,
+            evidence: text(&failure["evidence"]),
+        })
+    }
 }
 
 /// The measures of one run as its events come in.
@@ -108,6 +143,7 @@ impl MeasureTrack {
                 measures.load.validate = IntervalLoad::of(payload);
             }
             "verification_command" if payload["phase"] == "integration" => {
+                measures.verify_failures.extend(RunVerifyFailure::of(event));
                 let Some(load) = IntervalLoad::of(payload) else {
                     return;
                 };
@@ -326,6 +362,51 @@ pub(super) fn verification_commands(
         .collect()
 }
 
+/// The failed verification commands of `integrate` of one class.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct FailureClassStats {
+    pub class: String,
+    /// The commands that failed so.
+    pub count: usize,
+    /// The runs they belong to.
+    pub runs: usize,
+}
+
+/// The failed verification commands of `integrate` with `after < id <=
+/// upto` whose task `counts` accepts, per class of their `failure` (task
+/// 467): the most frequent first, then by name.
+pub(super) fn verification_failures(
+    events: &[RunEvent],
+    after: EventId,
+    upto: EventId,
+    counts: impl Fn(Option<TaskId>) -> bool,
+) -> Vec<FailureClassStats> {
+    let mut by_class: BTreeMap<String, (usize, BTreeSet<&str>)> = BTreeMap::new();
+    for event in events
+        .iter()
+        .filter(|event| event.id > after && event.id <= upto && counts(event.task_id))
+    {
+        let Some(failure) = RunVerifyFailure::of(event) else {
+            continue;
+        };
+        let entry = by_class.entry(failure.class).or_default();
+        entry.0 += 1;
+        if let Some(run) = &event.run_id {
+            entry.1.insert(run.as_str());
+        }
+    }
+    let mut classes: Vec<FailureClassStats> = by_class
+        .into_iter()
+        .map(|(class, (count, runs))| FailureClassStats {
+            class,
+            count,
+            runs: runs.len(),
+        })
+        .collect();
+    classes.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.class.cmp(&b.class)));
+    classes
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -370,6 +451,73 @@ mod tests {
             (summary[0].count, summary[0].failed, summary[1].count),
             (2, 1, 1)
         );
+    }
+
+    /// A failed command of `integrate` with its class is on its run's row
+    /// and counted per class, by run; a pass, another phase and a failure
+    /// recorded before the class are not.
+    #[test]
+    fn verification_failures_are_per_run_and_per_class() {
+        let command = |id: i64, run: &str, phase: &str, class: Option<&str>| {
+            let mut event = event(
+                id,
+                "verification_command",
+                json!({
+                    "phase": phase, "attempt": 1, "index": 2, "command": "cargo llvm-cov",
+                    "exit_code": if class.is_some() { 1 } else { 0 },
+                    "failure": class.map(|class| json!({"class": class, "evidence": format!("{class} line")})),
+                }),
+            );
+            event.run_id = Some(crate::domain::RunId::new(run).unwrap());
+            event
+        };
+        let events = [
+            command(1, "a", "integration", Some("disk_full")),
+            command(2, "a", "integration", Some("test_failure")),
+            command(3, "b", "integration", Some("test_failure")),
+            command(4, "b", "integration", None),
+            command(5, "b", "recheck", Some("build_error")),
+            event(
+                6,
+                "verification_command",
+                json!({"phase": "integration", "exit_code": 1}),
+            ),
+            command(7, "c", "integration", Some("killed")),
+        ];
+        let mut track = MeasureTrack::default();
+        for event in &events[..2] {
+            track.observe(event);
+        }
+        track.observe(&events[5]);
+        assert_eq!(
+            track.finish().verify_failures,
+            vec![
+                RunVerifyFailure {
+                    attempt: Some(1),
+                    index: Some(2),
+                    command: Some("cargo llvm-cov".to_owned()),
+                    class: "disk_full".to_owned(),
+                    evidence: Some("disk_full line".to_owned()),
+                },
+                RunVerifyFailure {
+                    attempt: Some(1),
+                    index: Some(2),
+                    command: Some("cargo llvm-cov".to_owned()),
+                    class: "test_failure".to_owned(),
+                    evidence: Some("test_failure line".to_owned()),
+                },
+            ]
+        );
+        let classes = verification_failures(&events, EventId::new(0), EventId::new(6), |_| true);
+        assert_eq!(
+            json!(classes),
+            json!([
+                {"class": "test_failure", "count": 2, "runs": 2},
+                {"class": "disk_full", "count": 1, "runs": 1},
+            ])
+        );
+        let none = verification_failures(&events, EventId::new(0), EventId::new(7), |_| false);
+        assert!(none.is_empty());
     }
 
     #[test]

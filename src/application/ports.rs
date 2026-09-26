@@ -242,11 +242,13 @@ pub enum Streams<'a> {
 }
 
 /// How a process ended: `description` as the operating system words it
-/// (`exit status: 1`), `code` absent when a signal ended it.
+/// (`exit status: 1`), `code` absent when a signal ended it, and `signal`
+/// the signal then.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Exit {
     pub success: bool,
     pub code: Option<i32>,
+    pub signal: Option<i32>,
     pub description: String,
 }
 

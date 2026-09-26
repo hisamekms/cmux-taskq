@@ -46,6 +46,7 @@ related:
   - `load`: 区間ごとの`{mean, max, band}`（`band`は`mean`の帯）。`work`は最初の`receipt_observed`、`validate`は最初の`validation_finished`の`load_avg_mean` / `load_avg_max`、`verify`は`integrate`の`verification_command`（`phase: integration`、全試行）の`load_avg_mean`を`duration_secs`で重み付けした平均（`duration_secs`の無いものは1秒）と`load_avg_max`の最大。記録の無い区間はnull
   - `prediction` / `actual`: そのtaskの重さの予測と、runの実績を並べたもの（ADR-0079の決定2。下の[重さの予測と実績](#重さの予測と実績)）。予測の無いrunは`prediction`がnull
   - `load_band`: `load.work.band`、無ければ`claim_load_avg`の帯（どちらも無ければnull）。帯は`0-4` / `4-8` / `8-16` / `16-32` / `32-64` / `64+`（下限を含む。`domain::measure::load_band`）。集計は`domain::stats::measures`
+  - `verify_failures`: そのrunの`integrate`の`verification_command`（`phase: integration`、全試行）のうち`failure`を持つもの（失敗したもの）を記録順に`{attempt, index, command, class, evidence}`（task 467。分類は[`integrate`](integrate.md)の5）。`failure`を記録する前の失敗は含めない。無ければ空の配列
   - `sessions`: そのrunのClaude sessionの区間のkindごとの`{count, open, active}`（下の[Claude session](#claude-session)）
 - **`goals`と`overall`**の`land_phases`: 着地したrun（`land_phases`と`wait_to_land`のあるrun）についての`{runs, tail_threshold, tail_runs, <工程>..., push}`。`tail_threshold`はそれらのrunの`wait_to_land`の90パーセンタイル（nearest-rank: 昇順でceil(0.9×n)番目。runが無ければnull）、`tail_runs`は`wait_to_land`がそれ以上のrun（長い裾）の数。工程ごとと`push`は`{count, total, median, p90, max, tail_total}`で、`count` / `total` / `median`は他の区間と同じ規則（工程は着地したrun全部を0も含めて数え、`push`は記録のあるrunだけ）、`p90`は上と同じ規則、`tail_total`は長い裾のrunだけの合計。どの工程が裾を作ったかは工程ごとの`tail_total`を比べて読む
 - **`goals`と`overall`**の`resume_outcomes`: それらのrunの`resume_attempts`全部の`{attempts, resolved, unresolved, resolved_percent, secs}`と、理由ごとの同じ形の`by_reason`（下の[着地の延期とresume](#着地の延期とresume)）
@@ -137,6 +138,7 @@ goal 21（task 197）で足した集計。runごとの値は上の`runs`の`dagq
 - **`versions`**: `{dagq, claude, rustc}`。対象のrunを`dagq_version`・`claude_version`・`rustc`（`<rustc_release> <rustc_host>`。片方だけ無ければ`unknown`）ごとに分け、それぞれ名前の昇順（記録の無いrunは`version: null`で最後）に`{version, runs, work, validate, wait_to_land, startup, land_phases, resume_outcomes}`（`goals`と同じ形）。バイナリの入替やtoolchainの変更の前後を比べるためのもの
 - **`load_bands`**: 対象のrunを`load_band`ごと（軽い帯から、帯の無いrunは`band: null`で最後）に分けた`{band, runs, ...}`（`goals`と同じ形）
 - **`verification_commands`**: `backend_failures`と同じwindowと`--goal`の絞り込みで、`integrate`の`verification_command`（`phase: integration`）のうち`duration_secs`を持つものをコマンドごと（コマンド文字列の昇順）に`{command, count, failed, total_secs, median_secs}`。`failed`は`exit_code`が0でないものの数、`median_secs`は偶数個なら中央2つの平均（小数3桁）
+- **`verification_failures`**: `verification_commands`と同じwindowと`--goal`の絞り込みで、`integrate`の`verification_command`（`phase: integration`）のうち`failure`を持つものを`failure.class`ごとに`{class, count, runs}`（task 467）。`count`はコマンドの数、`runs`はそれが属するrunの数。`count`の多い順、同数なら`class`の昇順。`duration_secs`の有無は問わない。集計は`domain::stats::measures::verification_failures`
 - job（review・triage・observer・plan review）の所要時間はここでは数えない（ADR-0048のsessionの記録が持つ）
 
 ## Claude session

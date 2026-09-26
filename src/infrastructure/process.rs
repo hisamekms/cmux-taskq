@@ -43,6 +43,7 @@ pub fn exit(status: ExitStatus) -> Exit {
     Exit {
         success: status.success(),
         code: status.code(),
+        signal: std::os::unix::process::ExitStatusExt::signal(&status),
         description: status.to_string(),
     }
 }
