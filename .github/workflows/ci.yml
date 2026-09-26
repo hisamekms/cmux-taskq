@@ -54,7 +54,8 @@ jobs:
         run: cargo clippy --locked --all-targets -- -D warnings
 
       # cargo llvm-cov nextest runs the same test binaries as cargo test (unit
-      # tests in src/lib.rs and tests/*.rs; the crate has no doctests), each
+      # tests in src/lib.rs, the integration tests in the one binary tests/it
+      # (ADR-0078), tests/e2e.rs and tests/plugin.rs; no doctests), each
       # test in its own process and in parallel across binaries, and fails if
       # any test fails, so there is no separate cargo test step. It is the
       # same command integrate runs (ADR-0076); here nextest runs as many

@@ -16,6 +16,9 @@ keywords = ["task-queue", "dag", "git-worktree", "cmux", "claude"]
 categories = ["command-line-utilities", "development-tools"]
 # Only what builds the binary: migrations are embedded with include_str!,
 # and build.rs embeds the build identifier.
+# The integration tests are listed below instead of one binary per tests/*.rs
+# file (ADR-0078).
+autotests = false
 include = ["/build.rs", "/src/**", "/migrations/**", "/Cargo.toml", "/Cargo.lock", "/README.md", "/LICENSE"]
 
 [dependencies]
@@ -32,6 +35,21 @@ uuid = { version = "1.20", features = ["v4"] }
 
 [dev-dependencies]
 tempfile = "3.25"
+
+# One test binary for the integration tests (tests/it), so tests/common is
+# compiled and the binary linked once; e2e and plugin stay separate because
+# they are run by name (ADR-0078).
+[[test]]
+name = "it"
+path = "tests/it/main.rs"
+
+[[test]]
+name = "e2e"
+path = "tests/e2e.rs"
+
+[[test]]
+name = "plugin"
+path = "tests/plugin.rs"
 
 # Keep line tables so panic backtraces still point at file:line, and drop the
 # debug info of dependencies: test binaries get smaller and link faster.

@@ -69,6 +69,7 @@ ADRは、将来の実装や運用に大きな影響を与える決定の理由�
 | [ADR-0068](0068-recheck-waiting-runs-after-each-landing.md) | 着地のたびに着地待ちのrunをmerge-treeと軽い検査で先回りして確かめ、着地しなくなったrunは人の回答や着地の順番を待たずにresumeする | 2026-09-26 |
 | [ADR-0073](0073-kind-additions-are-compatible.md) | 固定バイナリをbuild識別子で見分け、queueを開いただけではmigrateせず、互換の範囲のschemaを受け入れ、askとeventのkindの追加を互換として扱い、supervisorを待たずに引き継ぎで入れ替え、up --auto-updateで着地のたびに自動で更新する（ADR-0045を統合） | 2026-09-26 |
 | [ADR-0076](0076-run-the-coverage-gate-tests-with-nextest.md) | integrateのcoverageの関門のtestをcargo-nextestでbinaryをまたいで並列に流し（cargo llvm-cov nextest）、cargo-nextestは人がhostに入れる | 2026-09-26 |
+| [ADR-0078](0078-one-integration-test-binary.md) | e2eとplugin以外のintegration testを1つのtest binary（tests/it）にまとめ、testファイルの行数の制約はファイル単位のまま残す | 2026-09-26 |
 
 ## 置き換え・廃止されたADR
 

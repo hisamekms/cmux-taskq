@@ -1,8 +1,10 @@
 #!/bin/sh
-# Check that no test file under tests/ (tests/*.rs and tests/common/*.rs) has
-# more than 3,000 lines, so the files split by feature do not grow back into
-# one file that every runtime task appends to and conflicts in. src/ is not
-# checked yet.
+# Check that no test file under tests/ (every .rs file at any depth:
+# tests/*.rs, tests/common/*.rs, tests/it/*.rs and tests/it/runtime_support/*.rs)
+# has more than 3,000 lines, so the files split by feature do not grow back
+# into one file that every runtime task appends to and conflicts in. The
+# integration tests share one test binary (tests/it, ADR-0078), but the limit
+# stays per file. src/ is not checked yet.
 #
 # Meant to be run from the repository root (`sh scripts/check-test-file-lines.sh`).
 # When run from anywhere else it changes to the repository root found from the
@@ -24,8 +26,7 @@ fi
 
 status=0
 
-for f in tests/*.rs tests/common/*.rs; do
-  [ -e "$f" ] || continue
+for f in $(find tests -type f -name '*.rs' | sort); do
   lines=$(wc -l < "$f" | tr -d '[:space:]')
   if [ "$lines" -gt "$limit" ]; then
     echo "check-test-file-lines: $f has $lines lines, more than $limit; split it into files by feature" >&2
