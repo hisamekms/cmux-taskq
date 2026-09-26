@@ -146,6 +146,8 @@ fn reads_do_not_create_a_queue_and_unknown_tasks_fail() {
             expected["asks"] = serde_json::json!([]);
             expected["proposals"] = serde_json::json!([]);
             expected["cursor"] = serde_json::json!(0);
+            expected["version"] = serde_json::json!(dagq::VERSION);
+            expected["auto_update"] = serde_json::json!({"enabled": false, "state": "idle"});
         } else {
             expected["schema"] = serde_json::json!({
                 "schema_version": SqliteQueue::SCHEMA_VERSION,
@@ -3162,7 +3164,8 @@ fn migrate_is_explicit_and_older_binaries_keep_working_within_the_floor() {
             {"version": 29, "compatible": false},
             {"version": 30, "compatible": false},
             {"version": 31, "compatible": true},
-            {"version": 32, "compatible": false}
+            {"version": 32, "compatible": false},
+            {"version": 33, "compatible": true}
         ])
     );
     assert_eq!(version(), 23);
@@ -3649,4 +3652,196 @@ fn install_hands_a_running_supervisor_over_under_its_pid_and_rolls_back() {
     };
     assert!(exit.success());
     assert!(registered().is_empty());
+}
+
+/// `supervise --auto-update` builds and installs the runtime of every
+/// landing on main that changes it (ADR-0045 decision 17): its job builds
+/// the commit in the queue's own checkout (a stub build copies a binary),
+/// puts it in place like `install` and hands the supervisor over to it
+/// under its pid and token. A commit that changes no runtime path starts
+/// no job. A build whose supervisor dies at its start puts the old binary
+/// back and opens the `update_failed` ask; `status` shows each step.
+#[test]
+fn auto_update_installs_each_runtime_landing_and_puts_a_broken_build_back() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("queue").join("queue.db");
+    ok(&db, &["init"]);
+    let repo = dir.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    let git = |args: &[&str]| {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["-c", "user.name=t", "-c", "user.email=t@example.invalid"])
+            .args(args)
+            .bounded_output()
+            .unwrap();
+        assert!(output.status.success(), "git {args:?}: {output:?}");
+        String::from_utf8_lossy(&output.stdout).trim().to_owned()
+    };
+    let commit = |path: &str| {
+        let file = repo.join(path);
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, path).unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", path]);
+        git(&["rev-parse", "HEAD"])
+    };
+    git(&["init", "-q", "-b", "main"]);
+    let seed = commit("seed.txt");
+    let stub = |name: &str, text: &str| {
+        let path = dir.path().join(name);
+        std::fs::write(&path, text).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    };
+    let cmux = stub("cmux", "#!/bin/sh\nprintf 'PONG\\n'\n");
+    let claude = stub("claude", "#!/bin/sh\nprintf 'stub 1.0\\n'\n");
+    let bin = env!("CARGO_BIN_EXE_dagq");
+    // Like the real binary for every check `install` makes, but a
+    // supervisor it runs dies at once.
+    let broken = stub(
+        "broken-dagq",
+        &format!(
+            "#!/bin/sh\ncase \" $* \" in *\" --handoff-token probe \"*) exec '{bin}' \"$@\";; esac\n\
+for a in \"$@\"; do if [ \"$a\" = supervise ]; then echo 'broken build' >&2; exit 3; fi; done\n\
+exec '{bin}' \"$@\"\n"
+        ),
+    );
+    let build = format!(
+        "mkdir -p \"$CARGO_TARGET_DIR/release\" && if [ -f src/broken ]; then cp '{}' \
+\"$CARGO_TARGET_DIR/release/dagq\"; else cp '{bin}' \"$CARGO_TARGET_DIR/release/dagq\"; fi",
+        broken.display()
+    );
+    let fixed = dir.path().join("bin").join("dagq");
+    std::fs::create_dir_all(fixed.parent().unwrap()).unwrap();
+    std::fs::copy(bin, &fixed).unwrap();
+    let mut supervisor = Command::new(&fixed)
+        .arg("--db")
+        .arg(&db)
+        .args(["supervise", "--observe-interval", "0", "--repo"])
+        .arg(&repo)
+        .arg("--cmux")
+        .arg(&cmux)
+        .arg("--claude")
+        .arg(&claude)
+        .args(["--auto-update", "--update-interval", "1"])
+        .arg("--update-build-command")
+        .arg(&build)
+        .env_remove("DAGQ_ROLE")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let registered = || SqliteQueue::open(&db).unwrap().supervisors().unwrap();
+    let wait = |what: &str, done: &mut dyn FnMut() -> bool| {
+        let started = std::time::Instant::now();
+        while !done() {
+            assert!(
+                started.elapsed().as_secs() < 90,
+                "{what} did not happen within 90s; status: {}",
+                ok(&db, &["status"])
+            );
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+    };
+    wait("the registration", &mut || !registered().is_empty());
+    let token = registered()[0].token.clone();
+    assert!(registered()[0].auto_update);
+    let updates = || SqliteQueue::open(&db).unwrap().binary_updates(100).unwrap();
+    let installed = |sha: &str| {
+        updates()
+            .iter()
+            .any(|u| u.kind == "update_installed" && u.commit.as_deref() == Some(sha))
+    };
+
+    // The test binary names a commit this repository does not have, so the
+    // first look builds main's head.
+    wait("the update to the seed", &mut || installed(&seed));
+    let status = ok(&db, &["status"]);
+    assert_eq!(status["auto_update"]["enabled"], true, "{status}");
+    assert_eq!(status["auto_update"]["state"], "installed", "{status}");
+    assert_eq!(status["auto_update"]["commit"], seed.as_str(), "{status}");
+    assert_eq!(status["supervisors"][0]["auto_update"], true, "{status}");
+    assert_eq!(status["version"], dagq::VERSION);
+    assert!(fixed.with_file_name("dagq.previous").is_file());
+    let registration = registered().remove(0);
+    assert_eq!(
+        (registration.token.as_str(), registration.pid),
+        (token.as_str(), supervisor.id())
+    );
+    assert!(
+        supervisor.try_wait().unwrap().is_none(),
+        "the supervisor exited"
+    );
+    let checkout = db.parent().unwrap().join("update").join("checkout");
+    assert!(checkout.join("seed.txt").is_file());
+
+    // Documentation changes no runtime path: no job.
+    let started = |sha: &str| {
+        updates()
+            .iter()
+            .any(|u| u.kind == "update_started" && u.commit.as_deref() == Some(sha))
+    };
+    let docs = commit("docs/notes.md");
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    assert!(!started(&docs), "{:?}", updates());
+
+    let source = commit("src/lib.rs");
+    wait("the update to the source change", &mut || {
+        installed(&source)
+    });
+    assert!(
+        supervisor.try_wait().unwrap().is_none(),
+        "the supervisor exited"
+    );
+    assert_eq!(registered()[0].pid, supervisor.id());
+
+    // A build whose supervisor dies at its start: the binary it replaced
+    // is put back and the inbox is asked.
+    let broken_commit = commit("src/broken");
+    wait("the failed update", &mut || {
+        // Reaps the supervisor once the broken build's exec ended it.
+        let _ = supervisor.try_wait();
+        updates().iter().any(|u| {
+            u.kind == "update_failed" && u.commit.as_deref() == Some(broken_commit.as_str())
+        })
+    });
+    let failed = updates()
+        .into_iter()
+        .find(|u| u.kind == "update_failed")
+        .unwrap();
+    assert_eq!(failed.payload["stage"], "install", "{failed:?}");
+    assert_eq!(
+        failed.payload["supervisor"]["state"], "stopped",
+        "{failed:?}"
+    );
+    assert_eq!(
+        std::fs::read(&fixed).unwrap(),
+        std::fs::read(bin).unwrap(),
+        "the binary in place is not the one the broken build replaced"
+    );
+    let status = ok(&db, &["status"]);
+    assert_eq!(status["auto_update"]["state"], "failed", "{status}");
+    let asks = ok(&db, &["asks"]);
+    let ask = asks["asks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|ask| ask["subject"] == "update_failed")
+        .unwrap_or_else(|| panic!("no update_failed ask: {asks}"));
+    assert_eq!(ask["kind"], "blocked");
+    assert_eq!(ask["options"], serde_json::json!(["retry", "skip"]));
+    assert!(
+        ask["question"]
+            .as_str()
+            .unwrap()
+            .contains("failed at its install")
+    );
+    let exit = {
+        let _waiting = common::within(common::STEP_LIMIT, "the broken supervisor to exit");
+        supervisor.wait().unwrap()
+    };
+    assert_eq!(exit.code(), Some(3));
 }

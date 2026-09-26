@@ -472,6 +472,52 @@ enum Command {
         /// exec'd this binary (ADR-0045 decision 10); set by the handoff.
         #[arg(long, hide = true)]
         handoff_token: Option<String>,
+        /// Register with the automatic update on: build and install the runtime of every landing
+        /// on main that changes it (ADR-0045 decision 17). `up --auto-update` starts it so.
+        #[arg(long)]
+        auto_update: bool,
+        /// Seconds between two looks at main for the automatic update.
+        #[arg(long, default_value_t = 30)]
+        update_interval: u64,
+        /// A shell command the automatic update runs in place of `cargo build --release --locked`
+        /// (tests); it must leave the binary at $CARGO_TARGET_DIR/release/dagq.
+        #[arg(long, hide = true)]
+        update_build_command: Option<String>,
+    },
+    /// The automatic update's job (ADR-0045 decision 17), which the supervisor starts: build
+    /// main's COMMIT in the queue's update checkout, check it, put it in place of --to like
+    /// `install` and watch the supervisor take it; on a failure put the old binary back, start the
+    /// supervisor again when it is gone, and open the `update_failed` ask.
+    #[command(hide = true)]
+    AutoUpdate {
+        #[arg(long)]
+        commit: String,
+        /// The supervisor that started the job.
+        #[arg(long)]
+        token: String,
+        /// The fixed binary to replace.
+        #[arg(long)]
+        to: PathBuf,
+        /// A checkout of the repository.
+        #[arg(long)]
+        repo: PathBuf,
+        /// Where the build's output is appended.
+        #[arg(long)]
+        log: PathBuf,
+        #[arg(long)]
+        build_command: Option<String>,
+        #[arg(long, default_value = "cmux")]
+        cmux: PathBuf,
+        #[arg(long, default_value = "claude")]
+        claude: PathBuf,
+        #[arg(long)]
+        plugin_dir: Option<PathBuf>,
+        /// Seconds the supervisor may take to exec the new binary.
+        #[arg(long, default_value_t = 1800)]
+        handoff_timeout: u64,
+        /// Seconds the new supervisor may take to heartbeat on.
+        #[arg(long, default_value_t = 60)]
+        watch_timeout: u64,
     },
     /// Run the observer job once: headless Claude under DAGQ_ROLE=observer reads stats past the
     /// cursor, the open findings, the latest notes, the open asks and the graph, and writes
@@ -525,6 +571,11 @@ enum Command {
         /// Claude Code executable; a bare name is resolved on PATH.
         #[arg(long, default_value = "claude")]
         claude: PathBuf,
+        /// Have the supervisor build and install the runtime of every landing on main that changes
+        /// it, in the queue's own checkout, and hand itself over to it (ADR-0045 decision 17). Kept
+        /// on the registration; an `up` without it turns it off.
+        #[arg(long)]
+        auto_update: bool,
     },
     /// Open a new planner session in a cmux workspace `[<repo>]planner#<id>`, next to any planner
     /// already open; every call opens another. Prints the planner, its workspace and directory.
@@ -1692,9 +1743,13 @@ fn execute(cli: Cli) -> Result<Value> {
             planner_timeout,
             plugin_dir,
             handoff_token,
+            auto_update,
+            update_interval,
+            update_build_command,
         } => {
             use dagq::compose::SuperviseOptions;
             use dagq::infrastructure::adapters::{Cmux, executable};
+            let cmux = executable(&cmux)?;
             let options = SuperviseOptions {
                 stop: install_stop_signal()?,
                 // A one-shot pass observes only when asked to.
@@ -1709,14 +1764,18 @@ fn execute(cli: Cli) -> Result<Value> {
                 planner_timeout: Duration::from_secs(planner_timeout),
                 plugin_dir,
                 handoff_token,
+                update: dagq::application::supervise::UpdateSettings {
+                    register: auto_update,
+                    interval: Duration::from_secs(update_interval),
+                    build_command: update_build_command,
+                    cmux: Some(cmux.clone()),
+                },
                 ..SuperviseOptions::new(usize::from(parallel), once)
             };
             dagq::compose::supervise(
                 &db,
                 &checkout(repo),
-                &Cmux {
-                    executable: executable(&cmux)?,
-                },
+                &Cmux { executable: cmux },
                 &executable(&claude)?,
                 &env::current_exe()?,
                 &options,
@@ -1731,6 +1790,7 @@ fn execute(cli: Cli) -> Result<Value> {
             repo,
             cmux,
             claude,
+            auto_update,
         } => {
             use dagq::application::lifecycle::{QUEUE_ENV, ROLE_ENV, UpEnvironment, UpOptions};
             use dagq::infrastructure::adapters::{SOCKET_PASSWORD_ENV, claude_global_config};
@@ -1760,6 +1820,7 @@ fn execute(cli: Cli) -> Result<Value> {
                 claude: executable(&claude)?,
                 startup_timeout: Duration::from_secs(30),
                 handoff_timeout: Duration::from_secs(handoff_timeout),
+                auto_update,
                 poll: Duration::from_millis(500),
             };
             one_shot.up(
@@ -1772,6 +1833,38 @@ fn execute(cli: Cli) -> Result<Value> {
                 &SystemProcesses,
                 &environment,
                 &options,
+            )?
+        }
+        Command::AutoUpdate {
+            commit,
+            token,
+            to,
+            repo,
+            log,
+            build_command,
+            cmux,
+            claude,
+            plugin_dir,
+            handoff_timeout,
+            watch_timeout,
+        } => {
+            use dagq::infrastructure::adapters::executable;
+            drop(queue);
+            one_shot.auto_update(
+                &location,
+                &dagq::compose::AutoUpdateJob {
+                    commit,
+                    token,
+                    target: to,
+                    repository: repo,
+                    log,
+                    build_command,
+                    cmux: executable(&cmux).unwrap_or(cmux),
+                    claude: executable(&claude).unwrap_or(claude),
+                    plugin_dir,
+                    handoff_timeout: Duration::from_secs(handoff_timeout),
+                    watch_timeout: Duration::from_secs(watch_timeout),
+                },
             )?
         }
         Command::Plan {
@@ -1945,6 +2038,7 @@ fn install_telemetry(command: &Command, location: &QueueLocation) {
         Command::Observe { .. } => Some(("observe", location.log_dir.clone())),
         Command::Session { .. } => Some(("session", location.log_dir.clone())),
         Command::PlannerSession { .. } => Some(("planner-session", location.log_dir.clone())),
+        Command::AutoUpdate { .. } => Some(("auto-update", location.log_dir.clone())),
         _ => None,
     };
     let telemetry = match file {

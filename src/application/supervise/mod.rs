@@ -91,8 +91,10 @@ mod session;
 mod stall;
 mod sweep;
 mod triage;
+mod update;
 
 pub use self::handoff::SUPERVISOR_HANDED_OFF;
+pub use self::update::{UPDATE_INTERVAL, UpdateSettings};
 use self::{
     deliver::*, dialog::*, exit::*, idle::*, jobs::*, recovery::*, resume::*, revise::*,
     session::*, stall::*, sweep::*,
@@ -157,6 +159,9 @@ pub struct LoopSettings {
     /// The token of the supervisor this process continues after an exec
     /// (ADR-0045 decision 10); `None` registers a new one.
     pub handoff_token: Option<String>,
+    /// The automatic update of this supervisor's binary (ADR-0045
+    /// decision 17).
+    pub update: UpdateSettings,
 }
 
 /// Where the supervisor works and what it starts: the queue database and
@@ -343,6 +348,9 @@ pub fn supervise(ports: &Ports<'_>, settings: &LoopSettings) -> Result<Value> {
             // to `status` from its first second, runs or not.
             queue.register_supervisor(&token, pid, parallel, &layout.version)?;
             queue.accept_handoff(&token)?;
+            if settings.update.register {
+                queue.set_auto_update(&token, true)?;
+            }
             info!(
                 "supervisor {token} started: version {}, pid {pid}, parallel {parallel}, db {}, repository {}",
                 layout.version,
@@ -397,6 +405,7 @@ pub fn supervise(ports: &Ports<'_>, settings: &LoopSettings) -> Result<Value> {
         exec: None,
         run_env_missing: false,
         draining: false,
+        update: update::UpdateWatch::default(),
     };
     if settings.handoff_token.is_some() {
         supervisor.rebuild_own_runs(previous_version.as_deref())?;
@@ -474,6 +483,8 @@ struct Supervisor<'a> {
     /// This pass drains (a stop, a handoff, or claiming stopped after a
     /// provisioning failure): nothing may wait for the program to appear.
     draining: bool,
+    /// The automatic update's look at main (ADR-0045 decision 17).
+    update: update::UpdateWatch,
 }
 
 /// One executing run between provisioning and rest.
@@ -634,9 +645,10 @@ impl Supervisor<'_> {
             }
             self.poll_observer();
             // A supervisor that stopped claiming is draining, not observing
-            // nor starting plan reviews.
+            // nor starting plan reviews, nor updating itself.
             if !stopping && self.claiming {
                 self.start_observer_when_due(options);
+                self.auto_update_pass(options);
             }
             // A plan review that just readied tasks is followed by one more
             // pass, which claims them.

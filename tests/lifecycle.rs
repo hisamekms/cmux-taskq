@@ -121,6 +121,7 @@ fn fixture() -> Fixture {
             claude,
             startup_timeout: Duration::from_secs(5),
             handoff_timeout: Duration::from_secs(5),
+            auto_update: false,
             poll: Duration::from_millis(20),
         },
         _dir: dir,
@@ -3821,6 +3822,7 @@ fn gone_registration() -> dagq::domain::SupervisorRegistration {
         binary_version: None,
         handoff_accepted: true,
         handoff_binary: None,
+        auto_update: false,
     }
 }
 
@@ -3873,6 +3875,8 @@ fn up_applies_compatible_migrations_and_refuses_breaking_ones() {
             "ALTER TABLE supervisors DROP COLUMN handoff_accepted;
              ALTER TABLE supervisors DROP COLUMN handoff_binary;
              ALTER TABLE supervisors DROP COLUMN handoff_requested_at;
+             ALTER TABLE supervisors DROP COLUMN auto_update;
+             DROP TABLE binary_updates;
              PRAGMA user_version = 30;",
         )
         .unwrap();
@@ -3894,6 +3898,19 @@ fn up_applies_compatible_migrations_and_refuses_breaking_ones() {
     let report = up(&fixture, &cmux, &launchd, &processes);
     assert_eq!(report["supervisor"]["outcome"], "started", "{report}");
     assert_eq!(report["migrated"], Value::Null, "{report}");
+
+    // Only the compatible 33 is pending: `up` applies it and goes on.
+    Connection::open(db)
+        .unwrap()
+        .execute_batch(
+            "ALTER TABLE supervisors DROP COLUMN auto_update;
+             DROP TABLE binary_updates;
+             PRAGMA user_version = 32;",
+        )
+        .unwrap();
+    let report = up(&fixture, &cmux, &launchd, &processes);
+    assert_eq!(report["migrated"]["applied"][0]["version"], 33, "{report}");
+    assert_eq!(report["supervisor"]["auto_update"], false, "{report}");
 
     Connection::open(db)
         .unwrap()
@@ -4193,4 +4210,297 @@ fn install_drains_only_for_a_breaking_migration_when_allowed() {
         "1.2.3"
     );
     assert!(dagq::application::install::parse_version("").is_err());
+}
+
+/// [`Binaries`] for the automatic update's job: the build leaves a real
+/// file (or fails), everything under `old` (the fixed binary and its
+/// `.previous`) is the old build `0.0.1`, anything else this build.
+struct UpdateBinaries {
+    old: PathBuf,
+    built: PathBuf,
+    build_fails: bool,
+    pending: Vec<(i64, bool)>,
+    calls: Mutex<Vec<String>>,
+}
+
+impl UpdateBinaries {
+    fn new(dir: &Path, build_fails: bool, pending: &[(i64, bool)]) -> Self {
+        let built = dir.join("built").join("dagq");
+        fs::create_dir_all(built.parent().unwrap()).unwrap();
+        fs::write(&built, "new build").unwrap();
+        Self {
+            old: dir.join("bin"),
+            built,
+            build_fails,
+            pending: pending.to_vec(),
+            calls: Mutex::default(),
+        }
+    }
+    fn note(&self, call: String) {
+        self.calls.lock().unwrap().push(call);
+    }
+    fn calls(&self) -> Vec<String> {
+        self.calls.lock().unwrap().clone()
+    }
+}
+
+impl dagq::application::install::Binaries for UpdateBinaries {
+    fn build(&self, _: &Path) -> Result<PathBuf> {
+        bail!("the job builds into its own target")
+    }
+    fn version(&self, binary: &Path) -> Result<String> {
+        Ok(if binary.starts_with(&self.old) {
+            "0.0.1".into()
+        } else {
+            VERSION.into()
+        })
+    }
+    fn probe(&self, _: &Path) -> Result<()> {
+        Ok(())
+    }
+    fn takes_handoff(&self, _: &Path) -> bool {
+        true
+    }
+    fn schema(&self, _: &Path, _: &Path) -> Result<dagq::application::install::SchemaCheck> {
+        Ok(dagq::application::install::SchemaCheck {
+            pending: self
+                .pending
+                .iter()
+                .map(
+                    |&(version, compatible)| dagq::application::install::PendingMigration {
+                        version,
+                        compatible,
+                    },
+                )
+                .collect(),
+            opens: self.pending.is_empty(),
+        })
+    }
+    fn migrate(&self, _: &Path, _: &Path) -> Result<Value> {
+        self.note("migrate".into());
+        Ok(json!({"applied": self.pending.len()}))
+    }
+    fn replace(&self, _: &Path, target: &Path) -> Result<()> {
+        self.note(format!("replace {}", target.display()));
+        Ok(())
+    }
+    fn restore(&self, target: &Path) -> Result<()> {
+        self.note(format!("restore {}", target.display()));
+        Ok(())
+    }
+    fn run(&self, _: &Path, _: &[String]) -> Result<Value> {
+        bail!("the job runs no binary")
+    }
+    fn checkout(&self, _: &Path, checkout: &Path, commit: &str) -> Result<()> {
+        self.note(format!("checkout {} {commit}", checkout.display()));
+        Ok(())
+    }
+    fn build_into(&self, _: &Path, target: &Path, _: Option<&str>, _: &Path) -> Result<PathBuf> {
+        self.note(format!("build {}", target.display()));
+        if self.build_fails {
+            bail!("cargo build failed");
+        }
+        Ok(self.built.clone())
+    }
+}
+
+/// The supervisor the job updates: registered under a pid of its own, which
+/// the fake process control keeps alive until the test says otherwise.
+const UPDATED_PID: u32 = 424_242;
+
+fn run_update_job(
+    fixture: &Fixture,
+    binaries: &UpdateBinaries,
+    processes: &FakeProcesses,
+    restarted: &Mutex<Vec<String>>,
+) -> Value {
+    use dagq::application::update;
+    let queues = |db: &Path| -> std::sync::Arc<dyn dagq::application::QueueOpener> {
+        std::sync::Arc::new(dagq::infrastructure::runtime_store::SqliteOpener {
+            db: db.to_owned(),
+            generators: dagq::infrastructure::clock::system(),
+        })
+    };
+    let restart = |registration: &dagq::domain::SupervisorRegistration| -> Result<Value> {
+        restarted.lock().unwrap().push(registration.token.clone());
+        Ok(json!({"by": "test"}))
+    };
+    let dir = fixture._dir.path();
+    update::run(
+        &update::JobPorts {
+            binaries,
+            files: &dagq::infrastructure::run_files::LocalRunFiles,
+            processes,
+            clock: &dagq::infrastructure::clock::SystemClock,
+            queues: &queues,
+            restart: &restart,
+        },
+        &fixture.location.db,
+        &update::JobOptions {
+            commit: "c0ffee".repeat(6) + "c0ff",
+            token: "auto".into(),
+            target: dir.join("bin").join("dagq"),
+            repository: fixture.repo.clone(),
+            paths: update::UpdatePaths::under(&dir.join("queue-dir")),
+            log: dir.join("build.log"),
+            build_command: None,
+            restart: vec!["--cmux".into(), "/opt/cmux".into()],
+            handoff_timeout: Duration::from_secs(5),
+            watch_timeout: Duration::from_secs(5),
+            poll: Duration::from_millis(20),
+            pid: 7,
+        },
+    )
+    .unwrap()
+}
+
+fn auto_supervisor(fixture: &Fixture) -> SqliteQueue {
+    let mut queue = SqliteQueue::open(&fixture.location.db).unwrap();
+    queue
+        .register_supervisor("auto", UPDATED_PID, 2, "0.0.1")
+        .unwrap();
+    queue.accept_handoff("auto").unwrap();
+    queue.set_auto_update("auto", true).unwrap();
+    queue
+        .set_supervisor_mode("auto", SupervisorMode::InCmux, Some("ws-auto"))
+        .unwrap();
+    queue
+}
+
+/// Take the handoff the way the exec'd binary does, and heartbeat on
+/// (`alive`) or die a moment later.
+fn take_and_heartbeat(fixture: &Fixture, processes: &FakeProcesses, alive: bool) {
+    let mut queue = SqliteQueue::open(&fixture.location.db).unwrap();
+    wait_until(processes, UPDATED_PID, || {
+        queue.handoff_request("auto").unwrap().is_some()
+    });
+    queue
+        .resume_registration("auto", UPDATED_PID, VERSION)
+        .unwrap();
+    thread::sleep(Duration::from_millis(1100));
+    if alive {
+        queue.heartbeat("auto").unwrap();
+    } else {
+        processes.dead.lock().unwrap().insert(UPDATED_PID);
+    }
+}
+
+/// The automatic update's job (ADR-0045 decisions 13, 17): a build that
+/// the supervisor takes and heartbeats on is installed; one it dies on is
+/// put back and the supervisor started again; a failed build replaces
+/// nothing; each failure opens the `update_failed` ask, a newer one
+/// superseding the older; a breaking migration waits in `approve_update`.
+#[test]
+fn the_update_job_installs_watches_restores_and_asks() {
+    let fixture = fixture();
+    let queue = auto_supervisor(&fixture);
+    let processes = FakeProcesses::default();
+    let restarted = Mutex::new(Vec::new());
+    let dir = fixture._dir.path();
+    let target = dir.join("bin").join("dagq");
+    fs::create_dir_all(target.parent().unwrap()).unwrap();
+    fs::write(&target, "old build").unwrap();
+
+    let binaries = UpdateBinaries::new(dir, false, &[(40, true)]);
+    let report = thread::scope(|scope| {
+        scope.spawn(|| take_and_heartbeat(&fixture, &processes, true));
+        run_update_job(&fixture, &binaries, &processes, &restarted)
+    });
+    assert_eq!(report["outcome"], "installed", "{report}");
+    assert_eq!(report["version"], VERSION);
+    assert_eq!(
+        binaries.calls(),
+        [
+            format!(
+                "checkout {} {}",
+                dir.join("queue-dir/update/checkout").display(),
+                "c0ffee".repeat(6) + "c0ff"
+            ),
+            format!("build {}", dir.join("queue-dir/update/target").display()),
+            "migrate".to_owned(),
+            format!("replace {}", target.display()),
+        ]
+    );
+    let kinds = |queue: &SqliteQueue| {
+        queue
+            .binary_updates(10)
+            .unwrap()
+            .into_iter()
+            .map(|u| u.kind)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(kinds(&queue), ["update_installed", "update_built"]);
+
+    // The new binary dies after it took the handoff: back to the old one,
+    // and the gone in-cmux supervisor is started again.
+    let binaries = UpdateBinaries::new(dir, false, &[]);
+    let report = thread::scope(|scope| {
+        scope.spawn(|| take_and_heartbeat(&fixture, &processes, false));
+        run_update_job(&fixture, &binaries, &processes, &restarted)
+    });
+    assert_eq!(report["outcome"], "failed", "{report}");
+    assert_eq!(report["stage"], "watch", "{report}");
+    assert_eq!(report["restored"]["restored"], true, "{report}");
+    assert_eq!(report["supervisor"]["state"], "restarted", "{report}");
+    assert_eq!(*restarted.lock().unwrap(), ["auto"]);
+    assert!(
+        binaries
+            .calls()
+            .contains(&format!("restore {}", target.display()))
+    );
+    let first_ask = report["ask_id"].as_i64().unwrap();
+
+    // A failed build replaces nothing, and its ask replaces the older one.
+    processes.dead.lock().unwrap().clear();
+    let binaries = UpdateBinaries::new(dir, true, &[]);
+    let report = run_update_job(&fixture, &binaries, &processes, &restarted);
+    assert_eq!(report["stage"], "build", "{report}");
+    assert!(binaries.calls().iter().all(|c| !c.starts_with("replace")));
+    let asks = queue
+        .asks(dagq::application::AskQuery {
+            all: true,
+            ..Default::default()
+        })
+        .unwrap();
+    let older = asks.iter().find(|a| a.id.as_i64() == first_ask).unwrap();
+    assert_eq!(older.answer.as_deref(), Some("superseded"));
+    assert!(older.closed_at.is_some());
+    let open: Vec<_> = asks.iter().filter(|a| a.is_open()).collect();
+    assert_eq!(open.len(), 1, "{open:?}");
+    assert_eq!(open[0].subject.as_deref(), Some("update_failed"));
+    assert_eq!(open[0].options, ["retry", "skip"]);
+    assert!(
+        open[0].question.contains("failed at its build"),
+        "{}",
+        open[0].question
+    );
+
+    // A breaking migration: kept for a person, nothing replaced.
+    let binaries = UpdateBinaries::new(dir, false, &[(40, true), (41, false)]);
+    let report = run_update_job(&fixture, &binaries, &processes, &restarted);
+    assert_eq!(report["outcome"], "awaiting_approval", "{report}");
+    assert_eq!(report["migrations"], json!([41]));
+    let staged = dir.join("queue-dir/update/staged/dagq");
+    assert_eq!(fs::read_to_string(&staged).unwrap(), "new build");
+    assert!(
+        report["command"]
+            .as_str()
+            .unwrap()
+            .contains("--allow-breaking --cmux /opt/cmux")
+    );
+    assert!(binaries.calls().iter().all(|c| !c.starts_with("replace")));
+    let asks = queue.asks(dagq::application::AskQuery::default()).unwrap();
+    let approve = asks
+        .iter()
+        .find(|a| a.subject.as_deref() == Some("approve_update"))
+        .unwrap();
+    assert_eq!(approve.options, ["install", "skip"]);
+    assert_eq!(kinds(&queue)[0], "update_awaiting_approval");
+
+    // `status` reads where the update stands.
+    let status = dagq::compose::status(&fixture.location.db).unwrap();
+    assert_eq!(
+        status["auto_update"]["state"], "awaiting_approval",
+        "{status}"
+    );
 }

@@ -202,6 +202,11 @@ pub struct UpOptions {
     /// this binary: its wait for the validation or landing in progress and
     /// the exec (ADR-0045 decision 10).
     pub handoff_timeout: Duration,
+    /// Have the supervisor update its own binary on every landing that
+    /// changes the runtime (ADR-0045 decision 17): the started one runs
+    /// `supervise --auto-update`, and the registration of one reused or
+    /// handed over gets it; `false` turns it off on those.
+    pub auto_update: bool,
     pub poll: Duration,
 }
 
@@ -328,6 +333,7 @@ pub fn up(
         Some(_) => replace_supervisors(&up, &live)?,
         None => start_supervisor(&up, &existing, false)?,
     };
+    let supervisor = set_auto_update(queue, supervisor, &live, options.auto_update)?;
 
     let sessions = Sessions {
         queue,
@@ -1126,11 +1132,44 @@ fn supervise_arguments(
             &dir.canonicalize().unwrap_or_else(|_| dir.clone()),
         )?);
     }
+    if options.auto_update {
+        arguments.push("--auto-update".into());
+    }
     Ok(arguments)
 }
 
 fn fresh(registration: &SupervisorRegistration, processes: &dyn ProcessControl, now: i64) -> bool {
     processes.alive(registration.pid) && now - registration.heartbeat_at <= HEARTBEAT_TIMEOUT_SECS
+}
+
+/// Write `up`'s `--auto-update` (or its absence) on the registrations of
+/// the supervisors it leaves serving the queue (ADR-0045 decision 17): the
+/// live ones it reused or handed over, or the one it started (which
+/// registered with it already, from `supervise --auto-update`). Reported
+/// as the supervisor's `auto_update`.
+fn set_auto_update(
+    queue: &dyn Queue,
+    mut supervisor: Value,
+    live: &[SupervisorRegistration],
+    enabled: bool,
+) -> Result<Value> {
+    let kept = supervisor["outcome"] == "reused" || supervisor["handoff"] == true;
+    let tokens: Vec<String> = if kept {
+        live.iter()
+            .map(|registration| registration.token.clone())
+            .collect()
+    } else {
+        supervisor["token"]
+            .as_str()
+            .map(str::to_owned)
+            .into_iter()
+            .collect()
+    };
+    for token in &tokens {
+        queue.set_auto_update(token, enabled)?;
+    }
+    supervisor["auto_update"] = json!(enabled);
+    Ok(supervisor)
 }
 
 /// The registration the supervisor `up` has just started writes for

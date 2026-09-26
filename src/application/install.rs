@@ -59,6 +59,26 @@ pub trait Binaries {
     fn restore(&self, target: &Path) -> Result<()>;
     /// Run `binary` with `arguments`; what it printed.
     fn run(&self, binary: &Path, arguments: &[String]) -> Result<Value>;
+    /// Point the automatic update's `checkout` at `commit`: a detached
+    /// worktree of the repository `repository` belongs to, added when
+    /// missing (ADR-0045 decision 17).
+    fn checkout(&self, repository: &Path, checkout: &Path, commit: &str) -> Result<()> {
+        let _ = (repository, checkout, commit);
+        bail!("these binaries cannot check a commit out")
+    }
+    /// Build `checkout` for release into `target_dir`, running `command`
+    /// (a shell command) in place of `cargo build --release --locked` when
+    /// given, with what it prints appended to `log`; the binary built.
+    fn build_into(
+        &self,
+        checkout: &Path,
+        target_dir: &Path,
+        command: Option<&str>,
+        log: &Path,
+    ) -> Result<PathBuf> {
+        let _ = (checkout, target_dir, command, log);
+        bail!("these binaries cannot build a checkout")
+    }
 }
 
 /// Where the binary `install` puts in place comes from.

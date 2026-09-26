@@ -133,6 +133,10 @@ failed / interrupted run (a dead run nobody leases is recovered to interrupted f
 
 - [`install`](supervisor-lifecycle/install.md)
 
+### Auto-update
+
+- [Auto-update](supervisor-lifecycle/auto-update.md)
+
 ### 人への通知（`cmux notify`）
 
 - [人への通知（`cmux notify`）](supervisor-lifecycle/cmux-notify.md)

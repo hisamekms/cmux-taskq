@@ -166,4 +166,96 @@ impl Binaries for LocalBinaries {
         let arguments: Vec<&str> = arguments.iter().map(String::as_str).collect();
         json_output(binary, &arguments)
     }
+
+    fn checkout(&self, repository: &Path, checkout: &Path, commit: &str) -> Result<()> {
+        let git = |dir: &Path, arguments: &[&str]| -> Result<()> {
+            let output = Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(arguments)
+                .stdin(Stdio::null())
+                .output()
+                .context("run git")?;
+            ensure!(
+                output.status.success(),
+                "git {} in {} exited with {}: {}",
+                arguments.join(" "),
+                dir.display(),
+                output.status,
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+            Ok(())
+        };
+        if checkout.join(".git").exists() {
+            git(
+                checkout,
+                &["checkout", "--quiet", "--detach", "--force", commit],
+            )?;
+            return git(checkout, &["clean", "--quiet", "-fdx"]);
+        }
+        if let Some(parent) = checkout.parent() {
+            fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+        }
+        // A checkout whose directory was removed is still registered.
+        git(repository, &["worktree", "prune"])?;
+        git(
+            repository,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "--detach",
+                "--force",
+                text(checkout)?,
+                commit,
+            ],
+        )
+    }
+
+    fn build_into(
+        &self,
+        checkout: &Path,
+        target_dir: &Path,
+        command: Option<&str>,
+        log: &Path,
+    ) -> Result<PathBuf> {
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(log)
+            .with_context(|| format!("open {}", log.display()))?;
+        let mut build = match command {
+            Some(command) => {
+                let mut shell = Command::new("/bin/sh");
+                shell.args(["-c", command]);
+                shell
+            }
+            None => {
+                let mut cargo =
+                    Command::new(env::var_os("CARGO").unwrap_or_else(|| "cargo".into()));
+                cargo.args(["build", "--release", "--locked"]);
+                cargo
+            }
+        };
+        let status = build
+            .current_dir(checkout)
+            .env("CARGO_TARGET_DIR", target_dir)
+            .stdin(Stdio::null())
+            .stdout(file.try_clone()?)
+            .stderr(file)
+            .status()
+            .context("run the build")?;
+        ensure!(
+            status.success(),
+            "the build exited with {status}; see {}",
+            log.display()
+        );
+        let binary = target_dir.join("release").join("dagq");
+        ensure!(
+            binary.is_file(),
+            "the build left no binary at {}",
+            binary.display()
+        );
+        Ok(binary)
+    }
 }

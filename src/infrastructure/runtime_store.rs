@@ -11,7 +11,8 @@ use serde_json::json;
 use super::{
     adapters::process_alive,
     sqlite::{
-        SqliteQueue, claim_task, enum_col, event, event_row, read_task, run_row, stored_run_row,
+        SqliteQueue, claim_task, enum_col, event, event_row, json_col, read_task, run_row,
+        stored_run_row,
     },
 };
 use crate::application::{AskStore, Generators, RunStore, timestamp, unix_seconds};
@@ -270,6 +271,55 @@ impl SqliteQueue {
                  WHERE l.token=?1 ORDER BY r.rowid",
             )?
             .query_map([token], run_row(&self.runs_dir))?
+            .collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Turn the automatic update of the supervisor `token` on or off
+    /// (ADR-0045 decision 17).
+    pub fn set_auto_update(&self, token: &str, enabled: bool) -> Result<()> {
+        ensure!(
+            self.conn.execute(
+                "UPDATE supervisors SET auto_update=?2 WHERE token=?1",
+                params![token, i64::from(enabled)],
+            )? == 1,
+            "supervisor {token} is no longer registered"
+        );
+        Ok(())
+    }
+
+    /// Append one step of the automatic update to `binary_updates`.
+    pub fn record_binary_update(
+        &self,
+        kind: &str,
+        commit: Option<&str>,
+        payload: serde_json::Value,
+    ) -> Result<i64> {
+        self.conn.execute(
+            "INSERT INTO binary_updates(kind,commit_sha,payload,created_at) VALUES (?1,?2,?3,?4)",
+            params![
+                kind,
+                commit,
+                serde_json::to_string(&payload)?,
+                self.generators.clock.now()
+            ],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// The latest `limit` steps of the automatic update, newest first.
+    pub fn binary_updates(&self, limit: usize) -> Result<Vec<crate::domain::BinaryUpdate>> {
+        Ok(self
+            .conn
+            .prepare("SELECT * FROM binary_updates ORDER BY id DESC LIMIT ?1")?
+            .query_map([i64::try_from(limit).unwrap_or(i64::MAX)], |r| {
+                Ok(crate::domain::BinaryUpdate {
+                    id: r.get("id")?,
+                    kind: r.get("kind")?,
+                    commit: r.get("commit_sha")?,
+                    payload: json_col(r, "payload")?,
+                    created_at: r.get("created_at")?,
+                })
+            })?
             .collect::<rusqlite::Result<_>>()?)
     }
 
@@ -2439,6 +2489,7 @@ fn supervisor_row(r: &Row<'_>) -> rusqlite::Result<SupervisorRegistration> {
         binary_version: r.get("binary_version")?,
         handoff_accepted: r.get::<_, Option<i64>>("handoff_accepted")? == Some(1),
         handoff_binary: r.get("handoff_binary")?,
+        auto_update: r.get::<_, Option<i64>>("auto_update")? == Some(1),
     })
 }
 
@@ -2597,6 +2648,20 @@ impl RunStore for SqliteQueue {
     }
     fn runs_leased_by(&self, token: &str) -> Result<Vec<TaskRun>> {
         SqliteQueue::runs_leased_by(self, token)
+    }
+    fn set_auto_update(&self, token: &str, enabled: bool) -> Result<()> {
+        SqliteQueue::set_auto_update(self, token, enabled)
+    }
+    fn record_binary_update(
+        &self,
+        kind: &str,
+        commit: Option<&str>,
+        payload: serde_json::Value,
+    ) -> Result<i64> {
+        SqliteQueue::record_binary_update(self, kind, commit, payload)
+    }
+    fn binary_updates(&self, limit: usize) -> Result<Vec<crate::domain::BinaryUpdate>> {
+        SqliteQueue::binary_updates(self, limit)
     }
     fn adopt_run(
         &mut self,
@@ -2974,6 +3039,18 @@ impl RunStore for SqliteQueue {
 }
 
 impl AskStore for SqliteQueue {
+    fn open_update_ask(
+        &mut self,
+        subject: &str,
+        question: &str,
+        options: &[&str],
+        asked_by: &str,
+    ) -> Result<crate::domain::Ask> {
+        SqliteQueue::open_update_ask(self, subject, question, options, asked_by)
+    }
+    fn update_answers(&self, subject: &str) -> Result<Vec<crate::domain::Ask>> {
+        SqliteQueue::update_answers(self, subject)
+    }
     fn asks(&self, query: crate::application::AskQuery) -> Result<Vec<crate::domain::Ask>> {
         SqliteQueue::asks(self, query)
     }

@@ -2678,3 +2678,159 @@ fn install_hands_the_supervisor_over_while_a_session_works_and_the_run_lands() {
             .is_empty()
     );
 }
+
+/// `supervise --auto-update` (ADR-0045 decision 17) with a real cmux worker
+/// at work: a commit that changes the runtime lands on main, the supervisor's
+/// job builds it in the queue's own checkout (a stub build copies the
+/// binary under test), puts it in place and hands the supervisor over under
+/// its pid and token, and the worker's run goes on and lands.
+#[test]
+#[ignore = "needs a running cmux; run with --ignored"]
+fn auto_update_hands_the_supervisor_over_while_a_session_works_and_the_run_lands() {
+    let fixture = fixture();
+    let Fixture {
+        cmux,
+        repo,
+        env,
+        db,
+        ..
+    } = &fixture;
+    let task_id = add_ready_task_described(
+        env,
+        "e2e auto-update task",
+        "Add e2e.txt to the worktree. E2E-HOLD E2E-REVIEW-PASS",
+        &[],
+        &[],
+    );
+    let mut guard = WorkspaceGuard {
+        cmux: cmux.clone(),
+        ids: Vec::new(),
+    };
+    let fixed = fixture._dir.path().join("bin").join("dagq");
+    fs::create_dir_all(fixed.parent().unwrap()).unwrap();
+    fs::copy(BIN, &fixed).unwrap();
+    let build = format!(
+        "mkdir -p \"$CARGO_TARGET_DIR/release\" && cp '{BIN}' \"$CARGO_TARGET_DIR/release/dagq\""
+    );
+    let mut supervisor = ChildGuard(
+        Command::new(&fixed)
+            .current_dir(repo)
+            .env("XDG_DATA_HOME", &env.data_home)
+            .args(["supervise", "--parallel", "1", "--observe-interval", "0"])
+            .arg("--cmux")
+            .arg(cmux)
+            .arg("--claude")
+            .arg(&fixture.stub)
+            .args(["--auto-update", "--update-interval", "1"])
+            .arg("--update-build-command")
+            .arg(&build)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let stderr = reader(supervisor.0.stderr.take().unwrap());
+    let pid = supervisor.0.id();
+    let updates = || {
+        dagq::infrastructure::sqlite::SqliteQueue::open(db)
+            .unwrap()
+            .binary_updates(100)
+            .unwrap()
+    };
+    let installed = |sha: &str| {
+        updates()
+            .iter()
+            .any(|u| u.kind == "update_installed" && u.commit.as_deref() == Some(sha))
+    };
+    let started = Instant::now();
+    let run = loop {
+        assert!(
+            supervisor.0.try_wait().unwrap().is_none(),
+            "the supervisor exited before the worker started"
+        );
+        assert!(
+            started.elapsed() < SUPERVISE_TIMEOUT,
+            "the worker did not start within {SUPERVISE_TIMEOUT:?}"
+        );
+        let detail = dagq(env, &["show", &task_id, "--full"]);
+        if let Some(run) = detail["runs"].as_array().unwrap().last()
+            && run["status"] == "running"
+        {
+            break run.clone();
+        }
+        thread::sleep(Duration::from_millis(200));
+    };
+    let run_id = run["id"].as_str().unwrap().to_owned();
+    let workspace = run["workspace_id"].as_str().unwrap().to_owned();
+    guard.ids.push(workspace.clone());
+    let run_dir = PathBuf::from(run["run_dir"].as_str().unwrap());
+
+    // A change of the runtime lands on main while the worker works.
+    fs::create_dir_all(repo.join("src")).unwrap();
+    fs::write(repo.join("src").join("lib.rs"), "// landed\n").unwrap();
+    git(repo, &["add", "src/lib.rs"]);
+    git(repo, &["commit", "-q", "-m", "runtime change"]);
+    let landed = git(repo, &["rev-parse", "main"]).trim().to_owned();
+    let mut stderr = Some(stderr);
+    while !installed(&landed) {
+        if started.elapsed() >= SUPERVISE_TIMEOUT {
+            let _ = supervisor.0.kill();
+            let log = stderr.take().unwrap().join().unwrap();
+            panic!(
+                "{landed} was not installed: {:?}\nsupervisor stderr:\n{log}",
+                updates()
+            );
+        }
+        thread::sleep(Duration::from_millis(300));
+    }
+    assert!(fixed.with_file_name("dagq.previous").is_file());
+    assert!(supervisor.0.try_wait().unwrap().is_none());
+    let status = dagq(env, &["status"]);
+    assert_eq!(status["auto_update"]["state"], "installed", "{status}");
+    assert_eq!(status["auto_update"]["commit"], landed.as_str(), "{status}");
+    let supervisors = status["supervisors"].as_array().unwrap();
+    assert_eq!(supervisors.len(), 1, "{status}");
+    assert_eq!(supervisors[0]["pid"], pid);
+    assert_eq!(supervisors[0]["auto_update"], true);
+    assert_eq!(status["runs"][0]["run_id"], run_id.as_str(), "{status}");
+    assert_eq!(status["runs"][0]["status"], "running", "{status}");
+    assert!(workspace_listed(cmux, &workspace));
+
+    // The worker finishes; the continued supervisor lands its run.
+    fs::write(run_dir.join("go"), "").unwrap();
+    let detail = loop {
+        if started.elapsed() >= SUPERVISE_TIMEOUT * 2 {
+            let _ = supervisor.0.kill();
+            let log = stderr.take().unwrap().join().unwrap();
+            panic!("the run did not land; supervisor stderr:\n{log}");
+        }
+        let detail = dagq(env, &["show", &task_id, "--full"]);
+        if detail["task"]["status"] == "completed" {
+            break detail;
+        }
+        thread::sleep(Duration::from_millis(300));
+    };
+    let kinds: Vec<&str> = detail["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["kind"].as_str().unwrap())
+        .collect();
+    assert!(kinds.contains(&"supervisor_handed_off"), "{kinds:?}");
+    assert!(!kinds.contains(&"run_adopted"), "{kinds:?}");
+    assert_eq!(detail["runs"][0]["status"], "integrated");
+
+    unsafe { libc::kill(pid as i32, libc::SIGINT) };
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let exit = loop {
+        if let Some(exit) = supervisor.0.try_wait().unwrap() {
+            break exit;
+        }
+        assert!(Instant::now() < deadline, "the supervisor did not stop");
+        thread::sleep(Duration::from_millis(200));
+    };
+    let stderr = stderr.take().unwrap().join().unwrap();
+    assert!(exit.success(), "{exit}\n{stderr}");
+    assert!(!stderr.contains("could not exec"), "{stderr}");
+}

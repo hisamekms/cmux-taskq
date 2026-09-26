@@ -221,3 +221,137 @@ fn after_a_handoff_a_run_without_state_gives_its_lease_back() {
         "{error:#}"
     );
 }
+
+/// The supervisor's look at main for the automatic update (ADR-0045
+/// decision 17): with `auto_update` on its registration it starts the
+/// update job for main's head when the commits since the last update
+/// change the runtime, not for documentation alone, and builds the same
+/// head again when the `update_failed` ask is answered `retry`. The stub
+/// build fails, so nothing is ever replaced.
+#[test]
+fn auto_update_builds_runtime_landings_and_retries_on_the_answer() {
+    let (_fixture, repo, db) = fixture();
+    SqliteQueue::open(&db)
+        .unwrap()
+        .transition(TaskId::new(1), TaskAction::Cancel)
+        .unwrap();
+    let options = SuperviseOptions {
+        update: dagq::application::supervise::UpdateSettings {
+            register: true,
+            interval: Duration::ZERO,
+            build_command: Some("echo no build here >&2; exit 1".into()),
+            cmux: None,
+        },
+        ..supervise_options(1, true)
+    };
+    let backend = TestWorkspace::new(&db, false, VALID_AGENT);
+    let head = |repo: &Path| {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["rev-parse", "main"])
+            .bounded_output()
+            .unwrap();
+        String::from_utf8_lossy(&output.stdout).trim().to_owned()
+    };
+    let commit = |path: &str| {
+        let file = repo.join(path);
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::write(&file, path).unwrap();
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-m", path]);
+        head(&repo)
+    };
+    let updates = || SqliteQueue::open(&db).unwrap().binary_updates(100).unwrap();
+    let of = |kind: &str, sha: &str| {
+        updates()
+            .iter()
+            .filter(|u| u.kind == kind && u.commit.as_deref() == Some(sha))
+            .count()
+    };
+    let wait_failed = |sha: &str, times: usize| {
+        let started = Instant::now();
+        while of("update_failed", sha) < times {
+            assert!(
+                started.elapsed() < Duration::from_secs(60),
+                "the job for {sha} did not fail: {:?}",
+                updates()
+            );
+            thread::sleep(Duration::from_millis(100));
+        }
+    };
+
+    // This build names a commit the repository does not have: main's head
+    // is built once.
+    let seed = head(&repo);
+    supervise_with(&db, &repo, &backend, &options).unwrap();
+    assert_eq!(of("update_started", &seed), 1, "{:?}", updates());
+    wait_failed(&seed, 1);
+    let failed = updates()
+        .into_iter()
+        .find(|u| u.kind == "update_failed")
+        .unwrap();
+    assert_eq!(failed.payload["stage"], "build", "{failed:?}");
+    let status = runtime::status(&db).unwrap();
+    assert_eq!(status["auto_update"]["state"], "failed", "{status}");
+    assert_eq!(status["auto_update"]["enabled"], false, "{status}");
+
+    // Nothing new on main, then documentation only: no job.
+    supervise_with(&db, &repo, &backend, &options).unwrap();
+    let docs = commit("docs/notes.md");
+    supervise_with(&db, &repo, &backend, &options).unwrap();
+    assert_eq!(of("update_started", &seed), 1);
+    assert_eq!(of("update_started", &docs), 0, "{:?}", updates());
+
+    // `retry` builds main's head again, whatever it changed.
+    let mut queue = SqliteQueue::open(&db).unwrap();
+    let ask = queue
+        .asks(AskQuery::default())
+        .unwrap()
+        .into_iter()
+        .find(|ask| ask.subject.as_deref() == Some("update_failed"))
+        .unwrap();
+    queue.answer(ask.id, "retry").unwrap();
+    supervise_with(&db, &repo, &backend, &options).unwrap();
+    assert_eq!(of("update_started", &docs), 1, "{:?}", updates());
+    assert!(queue.read_ask(ask.id).unwrap().closed_at.is_some());
+    assert!(updates().iter().any(|u| u.kind == "update_retry"));
+    wait_failed(&docs, 1);
+
+    // A change of the runtime starts the job for it.
+    let source = commit("src/lib.rs");
+    supervise_with(&db, &repo, &backend, &options).unwrap();
+    assert_eq!(of("update_started", &source), 1, "{:?}", updates());
+    wait_failed(&source, 1);
+
+    // A job that died without recording how it ended is reported, not
+    // rebuilt on its own; an answer row does not hide a running job.
+    let queue = SqliteQueue::open(&db).unwrap();
+    queue
+        .record_binary_update(
+            "update_started",
+            Some(&source),
+            json!({"pid": 999_999_999u32}),
+        )
+        .unwrap();
+    supervise_with(&db, &repo, &backend, &options).unwrap();
+    let latest = updates().remove(0);
+    assert_eq!(latest.kind, "update_failed", "{latest:?}");
+    assert_eq!(latest.payload["stage"], "interrupted", "{latest:?}");
+    assert_eq!(of("update_started", &source), 2);
+    queue
+        .record_binary_update(
+            "update_started",
+            Some(&source),
+            json!({"pid": std::process::id()}),
+        )
+        .unwrap();
+    queue
+        .record_binary_update("update_retry", None, json!({}))
+        .unwrap();
+    supervise_with(&db, &repo, &backend, &options).unwrap();
+    assert_eq!(of("update_started", &source), 3, "{:?}", updates());
+    let status = runtime::status(&db).unwrap();
+    assert_eq!(status["auto_update"]["state"], "building", "{status}");
+    backend.join();
+}

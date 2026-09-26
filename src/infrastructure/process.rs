@@ -23,6 +23,18 @@ pub fn command(spec: &CommandSpec) -> Command {
     if let Some(dir) = spec.get_current_dir() {
         command.current_dir(dir);
     }
+    if spec.get_new_session() {
+        use std::os::unix::process::CommandExt;
+        // SAFETY: setsid(2) is async-signal-safe and touches no memory.
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
     command
 }
 
@@ -126,5 +138,29 @@ mod tests {
                 .spawn(&CommandSpec::new("/nonexistent/program"), Streams::Inherit)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn a_new_session_child_leads_its_own_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let (out, err) = (dir.path().join("out"), dir.path().join("err"));
+        let mut spec = CommandSpec::new("/bin/sh");
+        spec.args(["-c", "ps -o sess= -o pgid= -p $$"])
+            .new_session();
+        let mut child = LocalSpawner
+            .spawn(
+                &spec,
+                Streams::Files {
+                    stdout: &out,
+                    stderr: &err,
+                },
+            )
+            .unwrap();
+        let pid = child.id();
+        assert!(child.wait().unwrap().success);
+        // The child is the leader of its process group (setsid(2) made it).
+        let fields = fs::read_to_string(&out).unwrap();
+        let pgid = fields.split_whitespace().last().unwrap();
+        assert_eq!(pgid, pid.to_string(), "{fields}");
     }
 }

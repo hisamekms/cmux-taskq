@@ -120,6 +120,10 @@ pub struct CommandSpec {
     /// In the order given; `None` removes the variable.
     envs: Vec<(OsString, Option<OsString>)>,
     current_dir: Option<PathBuf>,
+    /// Start it in a session and process group of its own, so neither a
+    /// signal to the starter's group nor the close of its terminal reaches
+    /// it (the automatic update's job, ADR-0045 decision 13).
+    new_session: bool,
 }
 
 impl CommandSpec {
@@ -173,6 +177,17 @@ impl CommandSpec {
     pub fn current_dir(&mut self, dir: impl AsRef<Path>) -> &mut Self {
         self.current_dir = Some(dir.as_ref().to_owned());
         self
+    }
+
+    /// See [`Self::get_new_session`].
+    pub fn new_session(&mut self) -> &mut Self {
+        self.new_session = true;
+        self
+    }
+
+    /// Whether the process starts in a session of its own.
+    pub fn get_new_session(&self) -> bool {
+        self.new_session
     }
 
     pub fn get_program(&self) -> &OsStr {
@@ -681,6 +696,13 @@ pub trait ProcessControl {
     fn interrupt(&self, pid: u32) -> Result<()>;
     /// End the process immediately (SIGKILL).
     fn kill(&self, pid: u32) -> Result<()>;
+    /// Collect the exit of `pid` if it is an ended child of this process,
+    /// so it no longer counts as alive: a child the process started before
+    /// it exec'd another binary (the automatic update's job, ADR-0045
+    /// decision 17) has no other reaper. Nothing for any other process.
+    fn reap(&self, pid: u32) {
+        let _ = pid;
+    }
     /// This user's processes with their parents, ages, commands and
     /// working directories, for the recovery job (ADR-0047 decision 39).
     fn list(&self) -> Result<Vec<crate::domain::recovery::ProcessInfo>> {
@@ -881,6 +903,18 @@ pub trait RunStore {
     ) -> Result<SupervisorRegistration>;
     /// Every run whose lease carries `token`, oldest first.
     fn runs_leased_by(&self, token: &str) -> Result<Vec<TaskRun>>;
+    /// Turn the automatic update of the supervisor `token` on or off
+    /// (ADR-0045 decision 17).
+    fn set_auto_update(&self, token: &str, enabled: bool) -> Result<()>;
+    /// Append one step of the automatic update to its log.
+    fn record_binary_update(
+        &self,
+        kind: &str,
+        commit: Option<&str>,
+        payload: serde_json::Value,
+    ) -> Result<i64>;
+    /// The latest `limit` steps of the automatic update, newest first.
+    fn binary_updates(&self, limit: usize) -> Result<Vec<crate::domain::BinaryUpdate>>;
     /// Take over the stale lease `previous_token` holds on `id`; `None`
     /// when another process got there first or the lease is fresh again.
     fn adopt_run(
@@ -1155,6 +1189,18 @@ pub trait RunStore {
 
 /// The questions the runtime and its sessions put to a person (ADR-0022).
 pub trait AskStore {
+    /// Open the task-less `blocked` ask of the automatic update with this
+    /// subject, closing an older open one of it (ADR-0045 decision 17).
+    fn open_update_ask(
+        &mut self,
+        subject: &str,
+        question: &str,
+        options: &[&str],
+        asked_by: &str,
+    ) -> Result<crate::domain::Ask>;
+    /// The answered, unclosed `blocked` asks of the automatic update with
+    /// this subject, oldest first.
+    fn update_answers(&self, subject: &str) -> Result<Vec<crate::domain::Ask>>;
     /// Asks matching `query`, oldest first.
     fn asks(&self, query: AskQuery) -> Result<Vec<Ask>>;
     /// Whether the run has an ask of `kind` nobody closed, answered or not.

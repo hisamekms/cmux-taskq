@@ -46,6 +46,7 @@ pub const MIGRATIONS: &[&str] = &[
     include_str!("../../migrations/0030_findings.sql"),
     include_str!("../../migrations/0031_supervisor_handoff.sql"),
     include_str!("../../migrations/0032_run_env_program_events.sql"),
+    include_str!("../../migrations/0033_auto_update.sql"),
 ];
 
 /// The schema version this binary knows: a fully migrated queue's

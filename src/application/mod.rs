@@ -23,6 +23,7 @@ pub mod review;
 pub mod session;
 pub mod stats;
 pub mod supervise;
+pub mod update;
 
 pub use ports::*;
 pub use recording::reason_of_error;

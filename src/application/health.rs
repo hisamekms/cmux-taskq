@@ -15,7 +15,8 @@ use crate::domain::{
     ASK_EVENT_KINDS, AskId, AskKind, Attention, AttentionNext, HEARTBEAT_TIMEOUT_SECS,
     LANDING_OPTIONS, ReasonCode, RunEvent, RunId, RunLease, RunProcess, RunStatus, SessionRole,
     SupervisorMode, SupervisorPulse, SupervisorRegistration, TRIAGE_OPTIONS, TaskId, TaskRun,
-    TriageState, event_attention, heartbeat_stale, reason, run_attention,
+    TriageState, UPDATE_FAILED_OPTIONS, UPDATE_FAILED_SUBJECT, event_attention, heartbeat_stale,
+    reason, run_attention,
     run_env::{RUN_ENV_PROGRAM_KINDS, RUN_ENV_PROGRAM_MISSING, RunEnvCheck},
     supervisor_attention, triage_state,
 };
@@ -169,6 +170,9 @@ pub struct SupervisorHealth {
     /// the column (ADR-0014).
     pub binary_version: Option<String>,
     pub parallel: Option<u32>,
+    /// It updates its own binary on every landing that changes the runtime
+    /// (ADR-0045 decision 17).
+    pub auto_update: bool,
     pub started_at: Option<i64>,
     pub heartbeat_at: i64,
     pub heartbeat_age_secs: i64,
@@ -186,6 +190,7 @@ impl SupervisorHealth {
             "mode": self.mode,
             "workspace_id": self.workspace_id,
             "binary_version": self.binary_version,
+            "auto_update": self.auto_update,
             "heartbeat_age_secs": self.heartbeat_age_secs,
             "stale": self.stale,
             "run_ids": self.run_ids,
@@ -281,6 +286,16 @@ pub fn status(
             .collect::<Vec<_>>(),
         "asks": asks,
         "proposals": queue.proposals(false)?,
+        // The build identifier this `status` runs, and the automatic update
+        // of the supervisors' binary (ADR-0045 decision 17); each
+        // supervisor's own build is its `binary_version`.
+        "version": crate::VERSION,
+        "auto_update": super::update::status(
+            &registrations,
+            &queue.binary_updates(20)?,
+            control,
+            now,
+        ),
         "cursor": cursor,
     }))
 }
@@ -432,6 +447,7 @@ pub fn supervisors(
             workspace_id: registration.and_then(|r| r.workspace_id.clone()),
             binary_version: registration.and_then(|r| r.binary_version.clone()),
             parallel: registration.map(|r| r.parallel),
+            auto_update: registration.is_some_and(|r| r.auto_update),
             started_at: registration.map(|r| r.started_at),
             heartbeat_at,
             heartbeat_age_secs: age,
@@ -787,6 +803,25 @@ pub fn attention(
                 "ask_answered",
                 AttentionNext::ApplyingAnswer { ask_id: ask.id },
             )
+        } else if ask.kind == AskKind::Blocked
+            && ask.subject.as_deref() == Some(UPDATE_FAILED_SUBJECT)
+            && ask
+                .answer
+                .as_deref()
+                .is_some_and(|answer| UPDATE_FAILED_OPTIONS.contains(&answer.trim()))
+            && registrations.iter().any(|registration| {
+                registration.auto_update
+                    && control.alive(registration.pid)
+                    && now - registration.heartbeat_at <= HEARTBEAT_TIMEOUT_SECS
+            })
+        {
+            // The supervisor that updates its binary retries or leaves the
+            // update (ADR-0045 decision 17).
+            (
+                "answered",
+                "ask_answered",
+                AttentionNext::ApplyingAnswer { ask_id: ask.id },
+            )
         } else if ask.kind == AskKind::ApprovePlan && queue.applies_plan_answer(&ask)? {
             // The supervisor readies, sends back or cancels the proposal
             // (ADR-0041 decision 11).
@@ -898,6 +933,7 @@ mod tests {
             workspace_id: None,
             handoff_accepted: false,
             handoff_binary: None,
+            auto_update: false,
             binary_version: Some("1.0.0".into()),
         }
     }

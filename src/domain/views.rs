@@ -182,6 +182,24 @@ pub struct SupervisorRegistration {
     /// The binary this supervisor was asked to exec and has not exec'd yet.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub handoff_binary: Option<String>,
+    /// The supervisor builds and installs the runtime of every landing that
+    /// changes it (ADR-0045 decision 17): written by `up --auto-update` or a
+    /// `supervise --auto-update` that registers, cleared by a plain `up`.
+    #[serde(default)]
+    pub auto_update: bool,
+}
+
+/// One step of the automatic update of the fixed binary (ADR-0045 decision
+/// 17), as `binary_updates` keeps it: `kind` is one of the `UPDATE_*`
+/// kinds of [`crate::application::update`], `commit` the main commit it is
+/// about. Times are unix seconds.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BinaryUpdate {
+    pub id: i64,
+    pub kind: String,
+    pub commit: Option<String>,
+    pub payload: serde_json::Value,
+    pub created_at: i64,
 }
 
 #[derive(Debug, Clone, Serialize)]

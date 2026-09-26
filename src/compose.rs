@@ -8,8 +8,8 @@
 //! return; `runtime` and `lifecycle` re-export them under the names the
 //! tests use.
 
-use anyhow::{Context, Result, ensure};
-use serde_json::Value;
+use anyhow::{Context, Result, bail, ensure};
+use serde_json::{Value, json};
 use std::{
     io::IsTerminal,
     path::{Path, PathBuf},
@@ -21,7 +21,7 @@ use crate::{
     application::{
         AgentProvider, Generators, LaunchAgent, MainRemote, ProcessControl, QueueOpener,
         Repository, Spawner, Verifier, WorkspaceBackend, health,
-        install::{self as installation, InstallOptions},
+        install::{self as installation, Binaries, InstallOptions},
         integrate::{self as integration, IntegrateTarget, Integration},
         lifecycle::{
             self, DownOptions, Ports as LifecyclePorts, QUEUE_ENV, QueuePaths, REVIEWER_ROLE,
@@ -34,17 +34,19 @@ use crate::{
         review::{self as reviewing, Review},
         session::{self as wrapper, Session},
         stats::{self as statistics, StatsSources, WorkspaceListing},
-        supervise::{self as supervisor, Heartbeat, Layout, LoopSettings, Ports},
+        supervise::{self as supervisor, Heartbeat, Layout, LoopSettings, Ports, UpdateSettings},
+        update,
     },
     domain::{
-        IntegrationOutcome, NewAsk, PlannerId, RunId, SessionRole, TaskDetail, TaskId, TaskRun,
+        IntegrationOutcome, NewAsk, PlannerId, RunId, SessionRole, SupervisorMode,
+        SupervisorRegistration, TaskDetail, TaskId, TaskRun,
         stall::StallConfig,
         stats::{ConflictConfigReport, StatsQuery},
     },
     infrastructure::{
         adapters::{
-            ClaudeCode, GitRepository, SystemProcesses, claude_trusts_repository, load_average,
-            path_text,
+            ClaudeCode, Cmux, GitRepository, SystemProcesses, claude_trusts_repository,
+            load_average, path_text,
         },
         binaries::LocalBinaries,
         clock,
@@ -67,6 +69,28 @@ const SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 /// The default planner timeout: an hour, like a run's resume timeout
 /// (ADR-0041 decision 13).
 pub const PLANNER_TIMEOUT: Duration = Duration::from_secs(3600);
+
+/// The automatic update's job as the supervisor starts it (`auto-update`,
+/// ADR-0045 decision 17).
+#[derive(Debug, Clone)]
+pub struct AutoUpdateJob {
+    pub commit: String,
+    /// The supervisor that started it.
+    pub token: String,
+    /// The fixed binary to replace.
+    pub target: PathBuf,
+    /// A checkout of the repository.
+    pub repository: PathBuf,
+    /// Where the build's output is appended.
+    pub log: PathBuf,
+    pub build_command: Option<String>,
+    /// What an in-cmux supervisor started again uses.
+    pub cmux: PathBuf,
+    pub claude: PathBuf,
+    pub plugin_dir: Option<PathBuf>,
+    pub handoff_timeout: Duration,
+    pub watch_timeout: Duration,
+}
 
 /// How the supervisor loop is driven. `stop` is the graceful drain switch
 /// (SIGINT in the CLI): no more claims, exit once every active run rests.
@@ -109,6 +133,9 @@ pub struct SuperviseOptions {
     /// this binary (ADR-0045 decision 10): its registration and leases are
     /// kept, not registered anew. `None` registers a new supervisor.
     pub handoff_token: Option<String>,
+    /// The automatic update of the supervisor's binary (ADR-0045 decision
+    /// 17): off unless `supervise --auto-update`.
+    pub update: UpdateSettings,
 }
 
 impl SuperviseOptions {
@@ -128,6 +155,7 @@ impl SuperviseOptions {
             planner_timeout: PLANNER_TIMEOUT,
             plugin_dir: None,
             handoff_token: None,
+            update: UpdateSettings::default(),
         }
     }
 
@@ -146,6 +174,7 @@ impl SuperviseOptions {
             runtime_planners: self.runtime_planners,
             planner_timeout: self.planner_timeout,
             handoff_token: self.handoff_token.clone(),
+            update: self.update.clone(),
         }
     }
 }
@@ -654,6 +683,85 @@ same in one step",
             },
             Some(&location.db),
             options,
+        )
+    }
+
+    /// The automatic update's job (see [`update::run`]): build
+    /// `job.commit` in the queue's update checkout and put it in place of
+    /// `job.target`, handing the supervisor `job.token` over to it. An
+    /// in-cmux supervisor that is gone afterwards is started again with the
+    /// binary in place, through its `up --in-cmux --auto-update`; launchd
+    /// restarts one of its own.
+    pub fn auto_update(&self, location: &QueueLocation, job: &AutoUpdateJob) -> Result<Value> {
+        let db = location
+            .db
+            .canonicalize()
+            .context("queue must already be initialized")?;
+        let queues = |db: &Path| self.queues(db);
+        let mut restart_arguments = vec![
+            "--cmux".to_owned(),
+            path_text(&job.cmux)?,
+            "--claude".to_owned(),
+            path_text(&job.claude)?,
+        ];
+        if let Some(dir) = &job.plugin_dir {
+            restart_arguments.extend(["--plugin-dir".to_owned(), path_text(dir)?]);
+        }
+        let cmux = Cmux {
+            executable: job.cmux.clone(),
+        };
+        let restart = |registration: &SupervisorRegistration| -> Result<Value> {
+            match registration.mode {
+                Some(SupervisorMode::Launchd) => Ok(json!({
+                    "by": "launchd",
+                    "note": "its LaunchAgent starts the binary in place again",
+                })),
+                Some(SupervisorMode::InCmux) => {
+                    if let Some(id) = &registration.workspace_id {
+                        let _ = cmux.close(id);
+                    }
+                    let mut arguments = vec![
+                        "--db".to_owned(),
+                        path_text(&db)?,
+                        "up".to_owned(),
+                        "--in-cmux".to_owned(),
+                        "--auto-update".to_owned(),
+                        "--parallel".to_owned(),
+                        registration.parallel.to_string(),
+                    ];
+                    arguments.extend(restart_arguments.iter().cloned());
+                    let started = LocalBinaries.run(&job.target, &arguments)?;
+                    Ok(json!({"by": "up --in-cmux", "up": started["supervisor"]}))
+                }
+                None => bail!(
+                    "it was started by hand rather than by `up`, so it is not started again; start it the same way"
+                ),
+            }
+        };
+        update::run(
+            &update::JobPorts {
+                binaries: &LocalBinaries,
+                files: &LocalRunFiles,
+                processes: &SystemProcesses,
+                clock: &*self.generators.clock,
+                queues: &queues,
+                restart: &restart,
+            },
+            &db,
+            &update::JobOptions {
+                commit: job.commit.clone(),
+                token: job.token.clone(),
+                target: job.target.clone(),
+                repository: job.repository.clone(),
+                paths: update::UpdatePaths::under(&location.queue_dir),
+                log: job.log.clone(),
+                build_command: job.build_command.clone(),
+                restart: restart_arguments.clone(),
+                handoff_timeout: job.handoff_timeout,
+                watch_timeout: job.watch_timeout,
+                poll: Duration::from_millis(500),
+                pid: std::process::id(),
+            },
         )
     }
 

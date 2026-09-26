@@ -451,7 +451,7 @@ pub use reason::{Reason, ReasonCode};
 pub use run::TaskRun;
 pub use task::{Task, TaskAction};
 pub use views::{
-    ClaimOutcome, EventFilter, GoalDetail, GoalPredecessor, GoalSummary, GoalTask,
+    BinaryUpdate, ClaimOutcome, EventFilter, GoalDetail, GoalPredecessor, GoalSummary, GoalTask,
     IntegrationOutcome, Predecessor, Receipt, ReceiptCheck, RegisteredFollowUp, RunEvent, RunLease,
     RunPaths, RunProcess, SupervisorRegistration, TaskDetail, TaskStatusCounts,
     evidence_missing_reason,
@@ -605,6 +605,20 @@ pub const HOLD_AFFECTED_HEADING: &str = "Affected runs: ";
 /// decision 42): `done` once the person logged in or the limit is back,
 /// `cancel_affected` to throw the held runs away.
 pub const HOLD_OPTIONS: &[&str] = &["done", "cancel_affected"];
+
+/// The `subject` of the `blocked` ask the automatic update opens when a
+/// build, its check or its handoff failed (ADR-0045 decisions 13, 17): the
+/// supervisor applies its answer, one of [`UPDATE_FAILED_OPTIONS`].
+pub const UPDATE_FAILED_SUBJECT: &str = "update_failed";
+/// `retry` builds main's head again at the supervisor's next check;
+/// `skip` waits for the next landing that changes the runtime.
+pub const UPDATE_FAILED_OPTIONS: &[&str] = &["retry", "skip"];
+/// The `subject` of the `blocked` ask the automatic update opens instead of
+/// installing a build with a breaking migration (ADR-0045 decision 17,
+/// `approve_update`): a person installs it with the drain (`install`, by
+/// running the command the question names) or leaves it (`skip`).
+pub const APPROVE_UPDATE_SUBJECT: &str = "approve_update";
+pub const APPROVE_UPDATE_OPTIONS: &[&str] = &["install", "skip"];
 
 /// What [`NewHold`] did: opened the ask (`created`), added the run to the
 /// open one (`joined`), or found the run already in it (neither).
@@ -1171,13 +1185,16 @@ pub fn event_attention(kind: &str, payload: &serde_json::Value) -> Option<Attent
             }
         }
         // An answer the supervisor applies itself: an `approve_landing` one,
-        // a triage's `decide` one, or a plan review's `approve_plan` one.
+        // a triage's `decide` one, a plan review's `approve_plan` one, or
+        // that of the automatic update's failure (`blocked`, subject
+        // `update_failed`).
         ("ask_answered", _)
             if matches!(
                 payload.get("kind").and_then(serde_json::Value::as_str),
                 Some(kind) if kind == AskKind::ApproveLanding.as_str()
                     || kind == AskKind::Decide.as_str()
                     || kind == AskKind::ApprovePlan.as_str()
+                    || kind == AskKind::Blocked.as_str()
             ) && payload.get("runtime_delivers") == Some(&serde_json::Value::Bool(true)) =>
         {
             None
@@ -2018,6 +2035,7 @@ mod attention_tests {
             workspace_id: None,
             handoff_accepted: false,
             handoff_binary: None,
+            auto_update: false,
             binary_version: None,
         };
         let fresh =

@@ -148,6 +148,16 @@ impl ProcessControl for SystemProcesses {
         signal(pid, libc::SIGKILL)
     }
 
+    fn reap(&self, pid: u32) {
+        let Ok(pid) = libc::pid_t::try_from(pid) else {
+            return;
+        };
+        let mut status = 0;
+        // SAFETY: waitpid(2) with WNOHANG only reads the child table; for a
+        // pid that is not our child it fails with ECHILD, which is ignored.
+        unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+    }
+
     fn list(&self) -> Result<Vec<ProcessInfo>> {
         // SAFETY: getuid(2) has no failure and no memory effects.
         let uid = unsafe { libc::getuid() }.to_string();

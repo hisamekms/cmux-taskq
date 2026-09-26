@@ -1,0 +1,41 @@
+---
+id: design-supervisor-lifecycle-auto-update
+type: design
+title: "Auto-update"
+status: current
+created: 2026-09-26
+updated: 2026-09-26
+last_verified: 2026-09-26
+scope: runtime
+related:
+  - design-supervisor-lifecycle
+  - design-supervisor-lifecycle-handoff
+  - design-supervisor-lifecycle-install
+  - design-supervisor-lifecycle-up-down
+  - adr-0045
+  - design-persistence
+---
+
+# Auto-update
+
+[ADR-0045](../../adr/0045-build-identifier-explicit-migrate-schema-compat-handoff-and-auto-update.md)の決定13・17。`up --auto-update`のsupervisorは、runtimeを変えるcommitがmainに着地するたびに、queueのdirの下でそのcommitをビルドし、[`install`](install.md#install)と同じ手順で固定バイナリを置き換えて自分を[引き継ぎ](handoff.md#handoff)で入れ替える。走っているsessionは止まらない。supervisor側は`src/application/supervise/update.rs`、ビルドから見張りまでのjobは`src/application/update.rs`（`run`）、CLIは隠しコマンド`dagq auto-update`、配線は`src/compose.rs`の`OneShot::auto_update`。
+
+- **有効にする**: `up --auto-update`は、起動するsupervisorを`supervise --auto-update`で起動し（登録の直後に`supervisors.auto_update`を1にする。launchdの再起動でも同じ引数なので残る）、reuseや引き継ぎで残すliveな登録には`set_auto_update`で1を書く。`--auto-update`の無い`up`は同じ登録の`auto_update`を0にする。結果の`supervisor.auto_update`に出る。execの引き継ぎは登録の行を変えないので、設定は残る。この repository は`dagq.toml`を置かないので、設定ファイルではなく`up`のフラグにした（ADR-0045のAlternatives）。
+- **きっかけ**（`auto_update_pass`）: supervisorはループの各passで、前に見てから`--update-interval`（既定30秒）経っていて、自分の登録の`auto_update`が1なら、mainを見る。停止要求の後、claimを止めた後、引き継ぎの要求を受けた後は見ない。
+  1. まず`update_failed`のaskの答え（下記）を適用する。
+  2. 自分が起動したjobが生きているか、jobが書いた最新の行（askの答えの`update_answered` / `update_retry`は飛ばす）が`update_started` / `update_built`でそのjobのpidが生きていれば、何もしない（同時に1つ。execの後の新しいプロセスもDBの行で判定する）。execの前に起動したjobはexec後のプロセスの子のままで他に回収する者がいないので、そのpidを`waitpid(WNOHANG)`で回収してから生死を見る（`ProcessControl::reap`）。その行のjobが死んでいれば（kill、再起動）、どこまで進んだか分からないので自分ではやり直さず、`update_failed`（`stage: interrupted`）を書いて`update_failed`のaskを開く。
+  3. mainのhead（`refs/heads/main`）と、比べる元（`base`）を決める。`base`は最新の`update_started`のcommit、無ければ自分のbuild識別子が名乗るcommit（`X.Y.Z-dev+<commit>[.dirty]`の`<commit>`）、それも無ければ（リリースのビルド、`+unknown`）このプロセスが最初に見たmain。headが`base`と同じなら何もしない。
+  4. `git diff --name-only <base> <head>`のどれかが`src/`・`migrations/`・`Cargo.toml`・`Cargo.lock`・`build.rs`（`RUNTIME_PATHS`。`build.rs`はbuild識別子を埋め込む）なら、headのjobを起動する。変えていなければそのheadを覚えて見直さない。`base`をGitが知らない（別のcloneのビルド）ときは、headを1回ビルドして、それが次の`base`になる。`update_retry`（`retry`の答え）が最新の`update_started`より新しければ、差分を見ずにheadをビルドする。
+  - supervisorの着地でも、人が手で打った`integrate`でも、mainが進めば同じように拾う。ビルド中に次の着地があっても積まず、jobが終わった後の最初の見直しで、そのときのheadを1回ビルドする。
+- **job**（`dagq --db <db> auto-update --commit <head> --token <supervisor> --to <supervisorのbinary> --repo <checkout> --log <build log> --claude … [--cmux …] [--plugin-dir …]`）: supervisorが自分のbinary（`current_exe`）で起動する。setsidで新しいsessionとprocess groupに入れる（supervisorのexecにも、in-cmuxのworkspaceが閉じられることにも巻き込まれないため）。stdoutは`<queue dir>/logs/update-<unix時刻>-<commit 12桁>.json`（結果）、stderrは同じ名前の`.log`、ビルドの出力は`.build.log`、jobのtracingは`auto-update-*.jsonl`。起動したら、supervisorが`update_started`（`pid`・`base`・`supervisor`・`version`・logのpath）を書く。
+  1. **ビルド**: `<queue dir>/update/checkout`をheadに合わせる（無ければ`git worktree add --detach --force`、あれば`checkout --detach --force`と`clean -fdx`）。`CARGO_TARGET_DIR=<queue dir>/update/target`で`cargo build --release --locked`を走らせる（`--update-build-command`で渡したshellのコマンドに置き換えられる。testが使う）。人のmainのcheckoutと`target/`は使わない。成功すれば`update_built`。
+  2. **非互換のmigration**: 新しいbinaryの`migrate --check`に非互換のmigrationがあれば、`install`と同じ確認（`--version`と使い捨てのqueueでの起動）をして`<queue dir>/update/staged/dagq`にcopyし、`approve_update`のask（下記）を開いて`update_awaiting_approval`（`version`・`migrations`・`binary`・`command`）で終わる。何も置き換えない。
+  3. **入れ替え**: それ以外は`install::install`（`Source::Binary`、drainはしない）を呼ぶ: 確認、互換のmigration、renameでの差し替え（`.previous`を残す）、このqueueのliveなsupervisorへの引き継ぎの要求と、同じpidとtokenで戻るまでの待ち（`--handoff-timeout`、既定1800秒。execしたプロセスが死ねばheartbeatが止まった時点で失敗）。失敗すれば`install`がfileを戻す。
+  4. **見張り**（決定13）: 引き継ぎの後、同じtokenの登録が新しいbuild識別子のまま、取り戻したときより後のheartbeatを`--watch-timeout`（既定60秒）の内に書くのを待つ。PIDが死んだ、登録が消えた、build識別子が違う、heartbeatが進まない、のどれかで失敗にし、`.previous`が置き換えた前のbuild識別子と同じときだけ`restore`で戻す（違えば戻さず、その旨をaskに書く）。
+  5. **supervisorを戻す**（`bring_back`）: 3・4の失敗の後、その登録が前のbuild識別子のままheartbeatしていれば（execが失敗して前のbinaryが続けた）何もしない。PIDが生きていてheartbeatしていなければSIGTERM（10秒で止まらなければSIGKILL）で止め、止めたか死んでいた登録を起動し直す: launchd modeは`KeepAlive`が戻したbinaryで起動し直すので任せ、in-cmux modeは記録したworkspaceを閉じてから戻したbinaryの`up --in-cmux --auto-update --parallel <登録のparallel> --cmux … --claude … [--plugin-dir …]`を打つ。手で起動した（modeの無い）supervisorは起動し直さない。jobはcmuxの端末の子孫なので、supervisorが生きている間に起動したjobの`up --in-cmux`はcmuxに受け入れられる。supervisorが死んだ後は親がlaunchdに付け替わるので、socket passwordの無いcmuxは`up`を拒みうる。そのときは`update_failed`のaskと`supervisor_stopped`で人に知らせ、人が`up --in-cmux`を打つ。
+  6. 成功すれば`update_installed`（`version`・`previous_version`・`migrated`・`supervisors`）。失敗は`update_failed`（`stage`は`build` / `check` / `install` / `watch`、`error`、`restored`、`supervisor`、`ask_id`）で、`update_failed`のaskを開く。
+- **inboxに知らせる**: `run_events`のkindはCHECKで固定されていて、新しいkindやaskのkindを足すと古いbinaryが読めない非互換のmigrationになる（決定6）。そこで自動更新の経過は自分の表`binary_updates`（schema v33、互換）に置き、inboxにはtaskの無い`blocked`のaskで知らせる（askは`ask_opened`を書くので`watch --role inbox`が起きる）。askの`subject`で区別し、同じsubjectの開いたaskは古いビルドのものなので、新しいaskを開く前に`superseded`と答えて閉じる（`open_update_ask`）。`reason_category`は`scope`、`asked_by`は`supervisor`。
+  - `update_failed`（options `retry` / `skip`）: 何が失敗し、binaryとsupervisorがどうなったかとlogを問う。答えはsupervisorが適用する（`answer`は`runtime_delivers: true`を書き、`status`は`applying the answer`にする。`auto_update`のliveな登録が居るときだけ）: `retry`は`update_retry`を書いて次の見直しでheadをビルドし直し、`skip`は`update_answered`を書いて次のruntimeの着地を待つ。どちらもaskを閉じる。
+  - `approve_update`（options `install` / `skip`）: 非互換のmigrationを含むビルドのversionとmigrationを示す。drainはsupervisor自身を止め、in-cmux modeの起動し直しは人のcmuxの端末からでないと通らないので、runtimeは適用しない。`install`なら人がinboxから問いに書かれた`dagq --db <db> install --from <queue dir>/update/staged/dagq --to <binary> --allow-breaking --cmux … --claude …`を打つ（[`install`](install.md#install)の6）。どちらもinboxが閉じる。
+- **status**: `status`は`version`（打った`dagq`のbuild識別子）と`auto_update`（`enabled`: liveな登録のどれかが有効か、`state`: `idle` / `building` / `installing` / `interrupted`（jobが途中で死んだ）/ `installed` / `failed` / `awaiting_approval` / `retry_requested` / `skipped`、`commit`、`at`、`last`: 最新の行のpayload）を出し、`supervisors[].auto_update`に登録ごとの設定を出す。supervisorごとの今のbuild識別子は従来どおり`supervisors[].binary_version`。
+- **test**: `src/application/update.rs`のunit testがruntimeのpathの判定とbuild識別子のcommitを、`tests/lifecycle.rs`がjobの各分岐（成功、非互換のask、ビルドの失敗、見張りの失敗での`restore`とsupervisorの起動し直し）をfakeのbinaryで、`tests/runtime.rs`がin-processのsupervisorのきっかけ（docsだけのcommitでは起動せず、runtimeのcommitで起動し、`retry`の答えで同じheadをビルドし直す）を、`tests/cli.rs`の`auto_update_installs_each_runtime_landing_and_puts_a_broken_build_back`が実プロセスのsupervisorで、着地のたびの入れ替え（同じpidとtoken）と、起動で死ぬビルドの`restore`と`update_failed`のaskを、`tests/e2e.rs`の`auto_update_hands_the_supervisor_over_while_a_session_works_and_the_run_lands`が実cmuxのworkerの作業中にruntimeのcommitが着地して自動で入れ替わり、そのrunが着地することを確かめる。

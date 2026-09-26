@@ -1095,6 +1095,7 @@ fn killed_supervisor_registration_is_reported_stale_and_never_deleted() {
         keys,
         [
             "alive",
+            "auto_update",
             "binary_version",
             "heartbeat_age_secs",
             "mode",

@@ -6,9 +6,11 @@ use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
 use serde_json::json;
 
 use super::sqlite::{SqliteQueue, enum_col, json_col};
+use crate::domain::Ask;
 use crate::domain::{
-    Ask, AskId, AskKind, AskOutcome, HOLD_AFFECTED_HEADING, HoldOutcome, LANDING_OPTIONS, NewAsk,
-    NewHold, RunId, RunStatus, TRIAGE_OPTIONS, TaskId,
+    AskId, AskKind, AskOutcome, AskReason, HOLD_AFFECTED_HEADING, HoldOutcome, LANDING_OPTIONS,
+    NewAsk, NewHold, RunId, RunStatus, TRIAGE_OPTIONS, TaskId, UPDATE_FAILED_OPTIONS,
+    UPDATE_FAILED_SUBJECT,
 };
 
 pub use crate::application::AskQuery;
@@ -228,6 +230,12 @@ impl SqliteQueue {
             payload["runtime_delivers"] =
                 json!(super::plan_reviews::plan_answer_applies(&tx, &ask, text)?);
         }
+        if ask.kind == AskKind::Blocked && ask.subject.as_deref() == Some(UPDATE_FAILED_SUBJECT) {
+            // The supervisor that updates the binary retries or leaves the
+            // update as answered (ADR-0045 decision 17); any other answer
+            // is a person's to read.
+            payload["runtime_delivers"] = json!(UPDATE_FAILED_OPTIONS.contains(&text.trim()));
+        }
         ask_event(
             &tx,
             ask.task_id,
@@ -277,6 +285,89 @@ impl SqliteQueue {
             .into_iter()
             .filter(|ask| query.role.is_none() || ask.waits_for() == query.role)
             .collect())
+    }
+
+    /// Open the task-less `blocked` ask of the automatic update with this
+    /// `subject` (ADR-0045 decision 17): `update_failed` or
+    /// `approve_update`. One of the same subject still open is about an
+    /// older build, so it is answered `superseded` and closed first (by the
+    /// runtime, which writes `ask_answered` with `runtime_closed`). Writes
+    /// `ask_opened` like any ask.
+    pub fn open_update_ask(
+        &mut self,
+        subject: &str,
+        question: &str,
+        options: &[&str],
+        asked_by: &str,
+    ) -> Result<Ask> {
+        ensure!(!question.trim().is_empty(), "question must not be blank");
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let now = self.generators.clock.now();
+        let open: Vec<Ask> = tx
+            .prepare(
+                "SELECT * FROM asks WHERE kind='blocked' AND task_id IS NULL AND subject=?1
+                 AND answered_at IS NULL AND closed_at IS NULL ORDER BY id",
+            )?
+            .query_map([subject], ask_row)?
+            .collect::<rusqlite::Result<_>>()?;
+        for ask in open {
+            tx.execute(
+                "UPDATE asks SET answer='superseded', answered_at=?2, closed_at=?2 WHERE id=?1",
+                params![ask.id, now],
+            )?;
+            ask_event(
+                &tx,
+                None,
+                None,
+                "ask_answered",
+                json!({"ask_id": ask.id, "kind": ask.kind, "runtime_closed": true}),
+            )?;
+        }
+        let reason = AskReason::Scope;
+        tx.execute(
+            "INSERT INTO asks(kind,question,options,asked_by,reason_category,subject)
+             VALUES ('blocked',?1,?2,?3,?4,?5)",
+            params![
+                question,
+                serde_json::to_string(options)?,
+                asked_by,
+                reason.as_str(),
+                subject
+            ],
+        )?;
+        let id = AskId::new(tx.last_insert_rowid());
+        ask_event(
+            &tx,
+            None,
+            None,
+            "ask_opened",
+            json!({
+                "ask_id": id,
+                "kind": AskKind::Blocked,
+                "asked_by": asked_by,
+                "reason_category": reason,
+                "subject": subject,
+            }),
+        )?;
+        let opened = read_ask(&tx, id)?;
+        tx.commit()?;
+        Ok(opened)
+    }
+
+    /// The task-less `blocked` asks of the automatic update with this
+    /// `subject` that were answered and nobody closed yet, oldest first:
+    /// answers the supervisor still has to apply.
+    pub fn update_answers(&self, subject: &str) -> Result<Vec<Ask>> {
+        Ok(self
+            .conn
+            .prepare(
+                "SELECT * FROM asks WHERE kind='blocked' AND task_id IS NULL AND subject=?1
+                 AND answered_at IS NOT NULL AND closed_at IS NULL ORDER BY id",
+            )?
+            .query_map([subject], ask_row)?
+            .collect::<rusqlite::Result<_>>()?)
     }
 
     /// The answered `worker_question` asks of a run that nobody closed yet,

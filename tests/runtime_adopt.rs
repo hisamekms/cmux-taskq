@@ -13,8 +13,19 @@ fn independent_tasks_run_concurrently_and_a_dependent_starts_after_integration()
     let mut queue = SqliteQueue::open(&db).unwrap();
     add_ready_task(&mut queue, "independent", &[]);
     add_ready_task(&mut queue, "dependent", &[TaskId::new(1)]);
-    let backend = Arc::new(TestWorkspace::new(&db, false, IDLE_AGENT));
+    // Each session works until the test lets it finish (`$EXIT.go`): a
+    // session that finished at once let its run reach validation before the
+    // other one started under a loaded host, and the two were never seen
+    // running together.
+    let backend = Arc::new(TestWorkspace::new(&db, false, PROMPTED_AGENT));
     let options = supervise_options(4, false);
+    let finish = |run: &TaskRun| {
+        fs::write(
+            Path::new(run.run_dir().unwrap()).join("exit-requested.go"),
+            "",
+        )
+        .unwrap();
+    };
     let supervisor = {
         let (db, repo, backend, options) =
             (db.clone(), repo.clone(), backend.clone(), options.clone());
@@ -22,9 +33,9 @@ fn independent_tasks_run_concurrently_and_a_dependent_starts_after_integration()
     };
 
     // Both independent runs are alive at once; the dependent has none. The
-    // wait is as long as the later ones: under a loaded host (parallel
-    // `cargo llvm-cov` runs) starting two runs took longer than 20 seconds.
-    wait_until(&db, Duration::from_secs(30), |queue| {
+    // waits are long: under a loaded host (parallel `cargo llvm-cov` runs
+    // and integrates) starting two runs took longer than 20 seconds.
+    wait_until(&db, Duration::from_secs(60), |queue| {
         let running: Vec<TaskRun> = queue
             .active_runs()
             .unwrap()
@@ -57,10 +68,13 @@ fn independent_tasks_run_concurrently_and_a_dependent_starts_after_integration()
             .iter()
             .all(|r| r["recoverable"] == false)
     );
+    for run in queue.active_runs().unwrap() {
+        finish(&run);
+    }
 
     // Accepted and past the supervisor's review (the stand-in `claude`
     // prints no verdict, so each waits for a review by hand).
-    wait_until(&db, Duration::from_secs(30), |queue| {
+    wait_until(&db, Duration::from_secs(60), |queue| {
         [1, 2].iter().all(|task| {
             queue.show(TaskId::new(*task)).unwrap().runs[0].status()
                 == RunStatus::AwaitingIntegration
@@ -86,12 +100,12 @@ fn independent_tasks_run_concurrently_and_a_dependent_starts_after_integration()
             .map(CommitSha::as_str),
         Some(landed.as_str())
     );
-    wait_until(&db, Duration::from_secs(30), |queue| {
-        queue
-            .show(TaskId::new(3))
-            .unwrap()
-            .runs
-            .first()
+    wait_until(&db, Duration::from_secs(60), |queue| {
+        let runs = queue.show(TaskId::new(3)).unwrap().runs;
+        if let Some(run) = runs.first().filter(|r| r.run_dir().is_some()) {
+            finish(run);
+        }
+        runs.first()
             .is_some_and(|r| r.status() == RunStatus::AwaitingIntegration)
     });
     let third = queue.show(TaskId::new(3)).unwrap().runs[0].clone();
