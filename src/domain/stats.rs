@@ -17,6 +17,7 @@ use super::{
 pub mod asks;
 pub mod auto_repairs;
 pub mod conflicts;
+pub mod drafts;
 pub mod landing;
 pub mod measures;
 pub mod retries;
@@ -442,6 +443,10 @@ pub struct Stats {
     /// ADR-0073 decision 17) in the same window as `asks`: by kind, the
     /// failures by stage and the builds installed. Empty with `--goal`.
     pub updates: UpdateStats,
+    /// The landings of the same window as `asks` next to the drafts the
+    /// runtime and its jobs registered (task 470): by origin, how they were
+    /// settled, the backlog at the window's end and the drafts per landing.
+    pub draft_flow: drafts::DraftFlow,
     /// Pass it to `--since` to read only runs that finish later.
     pub next_cursor: EventId,
 }
@@ -572,6 +577,9 @@ pub struct LiveSnapshot {
     pub history: History,
     /// The thresholds of the `conflict_hotspot` alert.
     pub conflicts: ConflictConfigReport,
+    /// Where each draft the runtime or a job registered came from
+    /// (`draft_origins`), for `draft_flow`.
+    pub draft_origins: HashMap<TaskId, crate::domain::DraftOrigin>,
 }
 
 impl Default for LiveSnapshot {
@@ -589,6 +597,7 @@ impl Default for LiveSnapshot {
             },
             history: History::default(),
             conflicts: ConflictConfigReport::default(),
+            draft_origins: HashMap::new(),
         }
     }
 }
@@ -813,6 +822,14 @@ pub fn stats(
     let ask_stats = asks::asks(events, window_start, next_cursor, window_end, counts);
     let auto_repairs = auto_repairs::auto_repairs(events, window_start, next_cursor, counts);
     let updates = updates::updates(events, window_start, next_cursor, counts);
+    let draft_flow = drafts::draft_flow(
+        events,
+        &live.draft_origins,
+        window_start,
+        next_cursor,
+        window_end,
+        counts,
+    );
     let claim_holds =
         super::claim_hold::claim_holds(events, window_start, next_cursor, window_end, counts);
     let claim_deferrals =
@@ -931,6 +948,7 @@ pub fn stats(
         claim_deferrals,
         auto_repairs,
         updates,
+        draft_flow,
         next_cursor,
     }
 }

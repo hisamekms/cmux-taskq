@@ -1657,6 +1657,19 @@ fn integrate_registers_the_landed_follow_ups_as_draft_tasks_of_the_goal_once() {
     );
     assert_eq!(queue.list(&Default::default()).unwrap().total, 2);
     assert_eq!(events_of(&db, run.id(), "follow_up_registered").len(), 4);
+    // `stats` puts the drafts next to the landing that registered them,
+    // and counts one canceled (task 470).
+    crate::common::cli::ok(&db, &["cancel", "3"]);
+    let flow = &crate::common::cli::ok(&db, &["stats", "--full"])["draft_flow"];
+    assert_eq!(flow["landings"], 1, "{flow}");
+    assert_eq!(flow["registered"], 2, "{flow}");
+    assert_eq!(flow["canceled"], 1, "{flow}");
+    assert_eq!(flow["drafts_per_landing"], 2.0, "{flow}");
+    assert_eq!(flow["inflow_per_outflow"], 2.0, "{flow}");
+    let follow_up = &flow["by_origin"]["follow_up"];
+    assert_eq!(follow_up["backlog"], 1, "{flow}");
+    assert_eq!(follow_up["oldest_backlog_task_id"], 2, "{flow}");
+    assert!(follow_up["oldest_backlog_secs"].as_i64().unwrap() >= 0);
 
     // A closed goal takes no task: a new follow-up is registered without it.
     queue

@@ -180,6 +180,7 @@ pub fn stats(
         config,
         history: conflict_history(&events, sources.history),
         conflicts: conflict_config((sources.conflicts_file)()?),
+        draft_origins: queue.draft_origins()?,
     };
     let mut stats = aggregate(&events, &goals, now, snapshot, query, &live);
     let titles = queue.task_titles()?;

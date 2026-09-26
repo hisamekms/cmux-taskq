@@ -6,6 +6,8 @@
 //! what such a planner submits without a person. Opening a planner is one
 //! write transaction that re-checks the draft first, so two supervisors
 //! never open one for the same draft.
+use std::collections::HashMap;
+
 use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde_json::{Value, json};
@@ -75,6 +77,19 @@ impl SqliteQueue {
 
     pub fn draft_origin(&self, task: TaskId) -> Result<Option<(DraftOrigin, Value)>> {
         draft_origin(&self.conn, task)
+    }
+
+    /// Where every draft with an origin came from; an origin this binary
+    /// does not know is left out.
+    pub fn draft_origins(&self) -> Result<HashMap<TaskId, DraftOrigin>> {
+        Ok(self
+            .conn
+            .prepare("SELECT task_id, origin FROM draft_origins")?
+            .query_map([], |r| Ok((r.get(0)?, r.get::<_, String>(1)?)))?
+            .collect::<rusqlite::Result<Vec<(TaskId, String)>>>()?
+            .into_iter()
+            .filter_map(|(task, origin)| Some((task, origin.parse().ok()?)))
+            .collect())
     }
 
     pub fn planner_drafts(&self) -> Result<Vec<DraftTarget>> {

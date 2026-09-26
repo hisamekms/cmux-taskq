@@ -3037,6 +3037,9 @@ impl RunStore for SqliteQueue {
     fn task_titles(&self) -> Result<HashMap<TaskId, String>> {
         SqliteQueue::task_titles(self)
     }
+    fn draft_origins(&self) -> Result<HashMap<TaskId, crate::domain::DraftOrigin>> {
+        SqliteQueue::draft_origins(self)
+    }
     fn rebind_repository(&mut self, common_dir: &str) -> Result<Option<String>> {
         SqliteQueue::rebind_repository(self, common_dir)
     }

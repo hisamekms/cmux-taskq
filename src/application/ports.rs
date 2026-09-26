@@ -1039,6 +1039,9 @@ pub trait RunStore {
     fn task_titles(&self) -> Result<HashMap<TaskId, String>>;
     /// The kind of every task (none for a task without one), for `stats`.
     fn task_kinds(&self) -> Result<HashMap<TaskId, Option<TaskKind>>>;
+    /// Where every draft the runtime or a job registered came from, for
+    /// `stats`' `draft_flow`.
+    fn draft_origins(&self) -> Result<HashMap<TaskId, DraftOrigin>>;
     /// Point the queue at `common_dir` whatever it was bound to, and return
     /// the previous binding (`rebind`, ADR-0020).
     fn rebind_repository(&mut self, common_dir: &str) -> Result<Option<String>>;
