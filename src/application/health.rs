@@ -15,8 +15,7 @@ use crate::domain::{
     ASK_EVENT_KINDS, AskId, AskKind, Attention, AttentionNext, HEARTBEAT_TIMEOUT_SECS,
     LANDING_OPTIONS, ReasonCode, RunEvent, RunId, RunLease, RunProcess, RunStatus, SessionRole,
     SupervisorMode, SupervisorPulse, SupervisorRegistration, TaskId, TaskRun, TriageState,
-    UPDATE_FAILED_OPTIONS, UPDATE_FAILED_SUBJECT, event_attention, heartbeat_stale, reason,
-    recheck, run_attention,
+    UPDATE_FAILED_OPTIONS, event_attention, heartbeat_stale, reason, recheck, run_attention,
     run_env::{RUN_ENV_PROGRAM_KINDS, RUN_ENV_PROGRAM_MISSING, RunEnvCheck},
     supervisor_attention, triage_state,
     waiting::WaitState,
@@ -310,7 +309,7 @@ pub fn status(
         "version": crate::VERSION,
         "auto_update": super::update::status(
             &registrations,
-            &queue.binary_updates(20)?,
+            &queue.update_events(20)?,
             control,
             now,
         ),
@@ -601,8 +600,9 @@ pub fn truncate_reason(text: &str) -> String {
 }
 
 /// One event as the inbox reads it: the row's ids and kind, and from the
-/// payload only `status`, `exit_code`, the reason `code` and a truncated `reason` (from
-/// `reason`, `message` or `error`). Paths and receipts are left out.
+/// payload only `status`, `exit_code`, the reason `code`, a truncated `reason` (from
+/// `reason`, `message` or `error`) and, for a step of the automatic update,
+/// its `commit`, `version` and `stage`. Paths and receipts are left out.
 /// An attention event also carries its `next`.
 pub fn compact_event(event: &RunEvent) -> Value {
     let mut value = json!({"id": event.id, "kind": event.kind});
@@ -628,6 +628,15 @@ pub fn compact_event(event: &RunEvent) -> Value {
     }
     if let Some(reason) = payload.get("reason_category") {
         object.insert("reason_category".into(), reason.clone());
+    }
+    if crate::domain::UPDATE_EVENT_KINDS.contains(&event.kind.as_str()) {
+        // Which build a step of the automatic update is about, and where
+        // a failure happened.
+        for key in ["commit", "version", "stage"] {
+            if let Some(value) = payload.get(key) {
+                object.insert(key.into(), value.clone());
+            }
+        }
     }
     if let Some(code) = payload.get(reason::CODE_KEY) {
         object.insert(reason::CODE_KEY.into(), code.clone());
@@ -903,8 +912,7 @@ pub fn attention(
                 "ask_answered",
                 AttentionNext::ApplyingAnswer { ask_id: ask.id },
             )
-        } else if ask.kind == AskKind::Blocked
-            && ask.subject.as_deref() == Some(UPDATE_FAILED_SUBJECT)
+        } else if ask.kind == AskKind::UpdateFailed
             && ask
                 .answer
                 .as_deref()

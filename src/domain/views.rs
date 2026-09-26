@@ -194,19 +194,6 @@ pub struct SupervisorRegistration {
     pub max_waiting: Option<u32>,
 }
 
-/// One step of the automatic update of the fixed binary (ADR-0045 decision
-/// 17), as `binary_updates` keeps it: `kind` is one of the `UPDATE_*`
-/// kinds of [`crate::application::update`], `commit` the main commit it is
-/// about. Times are unix seconds.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct BinaryUpdate {
-    pub id: i64,
-    pub kind: String,
-    pub commit: Option<String>,
-    pub payload: serde_json::Value,
-    pub created_at: i64,
-}
-
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "outcome", rename_all = "snake_case")]
 pub enum ClaimOutcome {

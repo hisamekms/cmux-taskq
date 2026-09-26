@@ -517,7 +517,7 @@ fn the_update_job_installs_watches_restores_and_asks() {
     );
     let kinds = |queue: &SqliteQueue| {
         queue
-            .binary_updates(10)
+            .update_events(10)
             .unwrap()
             .into_iter()
             .map(|u| u.kind)
@@ -543,6 +543,11 @@ fn the_update_job_installs_watches_restores_and_asks() {
             .contains(&format!("restore {}", target.display()))
     );
     let first_ask = report["ask_id"].as_i64().unwrap();
+    // The rollback is a step of its own, before the failure it explains.
+    assert_eq!(
+        kinds(&queue)[..3],
+        ["update_failed", "update_restored", "update_built"]
+    );
 
     // A failed build replaces nothing, and its ask replaces the older one.
     processes.dead.lock().unwrap().clear();
@@ -562,7 +567,8 @@ fn the_update_job_installs_watches_restores_and_asks() {
     assert!(older.closed_at.is_some());
     let open: Vec<_> = asks.iter().filter(|a| a.is_open()).collect();
     assert_eq!(open.len(), 1, "{open:?}");
-    assert_eq!(open[0].subject.as_deref(), Some("update_failed"));
+    assert_eq!(open[0].kind, dagq::domain::AskKind::UpdateFailed);
+    assert_eq!(open[0].subject, None);
     assert_eq!(open[0].options, ["retry", "skip"]);
     assert!(
         open[0].question.contains("failed at its build"),
@@ -587,7 +593,7 @@ fn the_update_job_installs_watches_restores_and_asks() {
     let asks = queue.asks(dagq::application::AskQuery::default()).unwrap();
     let approve = asks
         .iter()
-        .find(|a| a.subject.as_deref() == Some("approve_update"))
+        .find(|a| a.kind == dagq::domain::AskKind::ApproveUpdate)
         .unwrap();
     assert_eq!(approve.options, ["install", "skip"]);
     assert_eq!(kinds(&queue)[0], "update_awaiting_approval");

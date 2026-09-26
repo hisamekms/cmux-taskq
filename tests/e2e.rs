@@ -2747,13 +2747,13 @@ fn auto_update_hands_the_supervisor_over_while_a_session_works_and_the_run_lands
     let updates = || {
         dagq::infrastructure::sqlite::SqliteQueue::open(db)
             .unwrap()
-            .binary_updates(100)
+            .update_events(100)
             .unwrap()
     };
     let installed = |sha: &str| {
         updates()
             .iter()
-            .any(|u| u.kind == "update_installed" && u.commit.as_deref() == Some(sha))
+            .any(|u| u.kind == "update_installed" && u.payload["commit"] == sha)
     };
     let started = Instant::now();
     let run = loop {
@@ -2832,6 +2832,17 @@ fn auto_update_hands_the_supervisor_over_while_a_session_works_and_the_run_lands
     assert!(kinds.contains(&"supervisor_handed_off"), "{kinds:?}");
     assert!(!kinds.contains(&"run_adopted"), "{kinds:?}");
     assert_eq!(detail["runs"][0]["status"], "integrated");
+    // The run's timeline shows the update that happened while it worked
+    // (ADR-0073 decision 17, task 496).
+    let timeline = dagq(env, &["timeline", &run_id]);
+    assert!(
+        timeline["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["kind"] == "update_installed" && e["commit"] == landed.as_str()),
+        "{timeline}"
+    );
 
     unsafe { libc::kill(pid as i32, libc::SIGINT) };
     let deadline = Instant::now() + Duration::from_secs(30);

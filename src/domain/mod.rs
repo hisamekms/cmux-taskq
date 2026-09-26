@@ -188,6 +188,14 @@ known_ask_kinds!(AskKind {
     // queue, reason and subject, about no task or run. The runs it holds
     // are its `affected`; a run that hits the same wall joins it.
     QueueHold => "queue_hold",
+    // The automatic update of the fixed binary failed (ADR-0073 decisions
+    // 13 and 17): about no task or run, one open at a time; the supervisor
+    // applies its answer, one of [`UPDATE_FAILED_OPTIONS`].
+    UpdateFailed => "update_failed",
+    // A build of the automatic update brings a breaking migration and was
+    // not installed (ADR-0073 decision 17): about no task or run, one open
+    // at a time; a person installs it with the drain or leaves it.
+    ApproveUpdate => "approve_update",
 });
 
 impl AskKind {
@@ -205,6 +213,12 @@ impl AskKind {
     /// ask is only shown and answered (ADR-0073 decision 21).
     pub fn is_known(&self) -> bool {
         !matches!(self, Self::Other(_))
+    }
+
+    /// An ask of the automatic update (ADR-0073 decision 17): about the
+    /// queue's binary, never a task or a run.
+    pub fn is_update(&self) -> bool {
+        matches!(self, Self::UpdateFailed | Self::ApproveUpdate)
     }
 }
 
@@ -528,7 +542,7 @@ pub use reason::{Reason, ReasonCode};
 pub use run::TaskRun;
 pub use task::{Task, TaskAction};
 pub use views::{
-    BinaryUpdate, ClaimOutcome, EventFilter, GoalDetail, GoalPredecessor, GoalSummary, GoalTask,
+    ClaimOutcome, EventFilter, GoalDetail, GoalPredecessor, GoalSummary, GoalTask,
     IntegrationOutcome, Predecessor, Receipt, ReceiptCheck, RegisteredFollowUp, RunEvent, RunLease,
     RunPaths, RunProcess, SupervisorRegistration, TaskDetail, TaskStatusCounts,
     evidence_missing_reason,
@@ -663,8 +677,10 @@ impl NewAsk {
 /// The rules an ask's kind binds, checked where an ask is written
 /// (ADR-0073 decisions 20 and 22) since the queue no longer enumerates
 /// kinds: only a known kind is written; an ask about no task is a
-/// `blocked` or `queue_hold` ask about no run; and a `queue_hold` ask, and
-/// only it, is for authentication or cost. A reader does not check them.
+/// `blocked`, `queue_hold` or update ask about no run; an update ask
+/// (`update_failed`, `approve_update`) is about no task; and a `queue_hold`
+/// ask, and only it, is for authentication or cost. A reader does not
+/// check them.
 pub fn check_ask_kind(
     kind: &AskKind,
     task_id: Option<TaskId>,
@@ -679,9 +695,13 @@ pub fn check_ask_kind(
     }
     require(
         task_id.is_some()
-            || (matches!(kind, AskKind::Blocked | AskKind::QueueHold) && run_id.is_none()),
+            || ((matches!(kind, AskKind::Blocked | AskKind::QueueHold) || kind.is_update())
+                && run_id.is_none()),
         || DomainError::AskWithoutTarget { kind: kind.clone() },
     )?;
+    require(!kind.is_update() || task_id.is_none(), || {
+        DomainError::UpdateAskWithTarget { kind: kind.clone() }
+    })?;
     require(
         (*kind == AskKind::QueueHold) == reason.holds_the_queue(),
         || DomainError::AskKindReason {
@@ -744,18 +764,13 @@ pub const HOLD_AFFECTED_HEADING: &str = "Affected runs: ";
 /// `cancel_affected` to throw the held runs away.
 pub const HOLD_OPTIONS: &[&str] = &["done", "cancel_affected"];
 
-/// The `subject` of the `blocked` ask the automatic update opens when a
-/// build, its check or its handoff failed (ADR-0045 decisions 13, 17): the
-/// supervisor applies its answer, one of [`UPDATE_FAILED_OPTIONS`].
-pub const UPDATE_FAILED_SUBJECT: &str = "update_failed";
-/// `retry` builds main's head again at the supervisor's next check;
-/// `skip` waits for the next landing that changes the runtime.
+/// The options of the [`AskKind::UpdateFailed`] ask: `retry` builds
+/// main's head again at the supervisor's next check; `skip` waits for the
+/// next landing that changes the runtime.
 pub const UPDATE_FAILED_OPTIONS: &[&str] = &["retry", "skip"];
-/// The `subject` of the `blocked` ask the automatic update opens instead of
-/// installing a build with a breaking migration (ADR-0045 decision 17,
-/// `approve_update`): a person installs it with the drain (`install`, by
-/// running the command the question names) or leaves it (`skip`).
-pub const APPROVE_UPDATE_SUBJECT: &str = "approve_update";
+/// The options of the [`AskKind::ApproveUpdate`] ask: a person installs
+/// the build with the drain (`install`, by running the command the question
+/// names) or leaves it (`skip`).
 pub const APPROVE_UPDATE_OPTIONS: &[&str] = &["install", "skip"];
 
 /// What [`NewHold`] did: opened the ask (`created`), added the run to the
@@ -1152,6 +1167,10 @@ pub enum AttentionNext {
     /// it or has a task take it out of `dagq.toml`; the supervisor claims
     /// nothing and lands nothing until then.
     InstallTool,
+    /// The automatic update put a new binary in place of the supervisor's
+    /// (`update_installed`, ADR-0073 decision 17): a notice the inbox
+    /// passes on to the person, who acts on nothing.
+    ReportUpdate,
 }
 
 /// How many times the supervisor resumes one `needs_session` run (one
@@ -1191,6 +1210,7 @@ impl fmt::Display for AttentionNext {
             Self::CheckPlanner => f.write_str("check the planner"),
             Self::DecideDraft => f.write_str("decide the draft in a planner"),
             Self::InstallTool => f.write_str("install tool"),
+            Self::ReportUpdate => f.write_str("report the update"),
         }
     }
 }
@@ -1220,9 +1240,50 @@ pub const ATTENTION_KINDS: &[&str] = &[
     "planner_unresponsive",
     "draft_planner_exhausted",
     run_env::RUN_ENV_PROGRAM_MISSING,
+    UPDATE_INSTALLED,
     "ask_opened",
     "ask_answered",
     "ask_delivery_failed",
+];
+
+/// The steps of the automatic update of the fixed binary (ADR-0073
+/// decision 17), queue events in `run_events` (task 496): the supervisor
+/// started the job for a commit (`pid`, `base`, `supervisor`, `version`,
+/// the logs).
+pub const UPDATE_STARTED: &str = "update_started";
+/// The job built the commit (`pid`, `binary`, `log`).
+pub const UPDATE_BUILT: &str = "update_built";
+/// The supervisor runs the new binary (`version`, `previous_version`,
+/// `migrated`, `supervisors`).
+pub const UPDATE_INSTALLED: &str = "update_installed";
+/// The build, its check, the install or the watch failed, or the job died
+/// (`stage`, `error`, `restored`, `supervisor`, `ask_id` of the
+/// `update_failed` ask).
+pub const UPDATE_FAILED: &str = "update_failed";
+/// The job put the replaced binary back after a failed watch (`version`,
+/// `restored_version`): the rollback, before its `update_failed`.
+pub const UPDATE_RESTORED: &str = "update_restored";
+/// The build brings a breaking migration and waits for a person
+/// (`version`, `migrations`, `binary`, `command`, `ask_id` of the
+/// `approve_update` ask).
+pub const UPDATE_AWAITING_APPROVAL: &str = "update_awaiting_approval";
+/// The supervisor applied a `skip` answer of an `update_failed` ask
+/// (`ask_id`, `answer`).
+pub const UPDATE_ANSWERED: &str = "update_answered";
+/// A `retry` answer: the next check builds main's head again.
+pub const UPDATE_RETRY: &str = "update_retry";
+
+/// Every step of the automatic update, each with `commit` (the main commit
+/// it is about) in its payload but for the answers.
+pub const UPDATE_EVENT_KINDS: &[&str] = &[
+    UPDATE_STARTED,
+    UPDATE_BUILT,
+    UPDATE_INSTALLED,
+    UPDATE_FAILED,
+    UPDATE_RESTORED,
+    UPDATE_AWAITING_APPROVAL,
+    UPDATE_ANSWERED,
+    UPDATE_RETRY,
 ];
 
 /// The event kinds that may belong to no task, goal or run: the queue's
@@ -1249,6 +1310,14 @@ pub const QUEUE_EVENT_KINDS: &[&str] = &[
     "run_env_changed",
     "mark_recorded",
     "mark_retracted",
+    UPDATE_STARTED,
+    UPDATE_BUILT,
+    UPDATE_INSTALLED,
+    UPDATE_FAILED,
+    UPDATE_RESTORED,
+    UPDATE_AWAITING_APPROVAL,
+    UPDATE_ANSWERED,
+    UPDATE_RETRY,
 ];
 
 /// Whether an event of `kind` may be written with its task, goal and run
@@ -1345,6 +1414,9 @@ pub fn event_attention(kind: &str, payload: &serde_json::Value) -> Option<Attent
         ("draft_planner_exhausted", _) => Some(AttentionNext::DecideDraft),
         ("push_failed", _) => Some(AttentionNext::PushMain),
         (run_env::RUN_ENV_PROGRAM_MISSING, _) => Some(AttentionNext::InstallTool),
+        // The failure and the breaking build of the automatic update reach
+        // the inbox as their asks; only the replaced binary is a notice.
+        (UPDATE_INSTALLED, _) => Some(AttentionNext::ReportUpdate),
         ("runtime_error", _)
             if payload.get("lease_released") == Some(&serde_json::Value::Bool(true)) =>
         {
@@ -1378,15 +1450,14 @@ pub fn event_attention(kind: &str, payload: &serde_json::Value) -> Option<Attent
         }
         // An answer the supervisor applies itself: an `approve_landing` one,
         // a triage's `decide` one, a plan review's `approve_plan` one, or
-        // that of the automatic update's failure (`blocked`, subject
-        // `update_failed`).
+        // that of the automatic update's failure (`update_failed`).
         ("ask_answered", _)
             if matches!(
                 payload.get("kind").and_then(serde_json::Value::as_str),
                 Some(kind) if kind == AskKind::ApproveLanding.as_str()
                     || kind == AskKind::Decide.as_str()
                     || kind == AskKind::ApprovePlan.as_str()
-                    || kind == AskKind::Blocked.as_str()
+                    || kind == AskKind::UpdateFailed.as_str()
             ) && payload.get("runtime_delivers") == Some(&serde_json::Value::Bool(true)) =>
         {
             None
@@ -1645,6 +1716,28 @@ mod attention_tests {
             ));
         }
         assert!(check_ask_kind(&AskKind::QueueHold, None, None, AskReason::Cost).is_ok());
+        // The asks of the automatic update are about the queue's binary
+        // (ADR-0073 decision 17): no task, no run.
+        for kind in [AskKind::UpdateFailed, AskKind::ApproveUpdate] {
+            assert!(kind.is_update() && kind.is_known());
+            assert_eq!(AskKind::read(kind.as_str()), kind);
+            assert!(check_ask_kind(&kind, None, None, scope).is_ok());
+            assert!(matches!(
+                check_ask_kind(&kind, None, Some(&run), scope),
+                Err(DomainError::AskWithoutTarget { .. })
+            ));
+            let error = check_ask_kind(&kind, task, None, scope).unwrap_err();
+            assert!(matches!(error, DomainError::UpdateAskWithTarget { .. }));
+            assert!(
+                error.to_string().contains("names no task or run"),
+                "{error}"
+            );
+        }
+        assert!(!AskKind::Blocked.is_update());
+        assert_eq!(
+            "update_failed".parse::<AskKind>().unwrap(),
+            AskKind::UpdateFailed
+        );
         for (kind, reason) in [
             (AskKind::QueueHold, AskReason::Scope),
             (AskKind::Decide, AskReason::Authentication),
@@ -1659,6 +1752,10 @@ mod attention_tests {
         assert!(check_event_target("task_created", task, None).is_ok());
         assert!(check_event_target("goal_closed", None, Some(GoalId::new(1))).is_ok());
         assert!(check_event_target("mark_recorded", None, None).is_ok());
+        for kind in UPDATE_EVENT_KINDS {
+            assert!(QUEUE_EVENT_KINDS.contains(kind), "{kind}");
+            assert!(check_event_target(kind, None, None).is_ok());
+        }
         assert_eq!(
             check_event_target("task_created", None, None)
                 .unwrap_err()
@@ -2066,6 +2163,29 @@ mod attention_tests {
                 }),
             ),
             ("validation_finished", json!({}), None),
+            (
+                "update_installed",
+                json!({"commit": "abc", "version": "0.4.0-dev+abc"}),
+                Some(ReportUpdate),
+            ),
+            ("update_started", json!({"commit": "abc"}), None),
+            (
+                "update_failed",
+                json!({"stage": "build", "ask_id": 3}),
+                None,
+            ),
+            (
+                "ask_answered",
+                json!({"ask_id": 3, "kind": "update_failed", "runtime_delivers": true}),
+                None,
+            ),
+            (
+                "ask_answered",
+                json!({"ask_id": 3, "kind": "update_failed", "runtime_delivers": false}),
+                Some(ReadAnswer {
+                    ask_id: AskId::new(3),
+                }),
+            ),
         ];
         for (kind, payload, expected) in cases {
             assert_eq!(
@@ -2089,6 +2209,7 @@ mod attention_tests {
         assert_eq!(RecoverRun.to_string(), "recover run");
         assert_eq!(PushMain.to_string(), "push main");
         assert_eq!(InstallTool.to_string(), "install tool");
+        assert_eq!(ReportUpdate.to_string(), "report the update");
         assert_eq!(
             DeliveringAnswer {
                 ask_id: AskId::new(2)

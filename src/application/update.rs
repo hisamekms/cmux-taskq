@@ -14,16 +14,22 @@
 //! supervisor again when it is gone) and opens the `update_failed` ask for
 //! the inbox; a build whose migrations would break the old binary is not
 //! installed, and waits in the `approve_update` ask for a person to drain
-//! and install it. Every step is a row of `binary_updates`; the job's own
-//! output goes to the queue's `logs/`.
+//! and install it. Every step is an `update_*` event of the queue in
+//! `run_events` (ADR-0073 decision 17, task 496), with the commit it is
+//! about in its payload, so `events`, `watch`, `timeline` and `stats` see
+//! it; the job's own output goes to the queue's `logs/`.
 
 use super::{
     Clock, ProcessControl, Queue, QueueOpener, RunFiles,
     install::{self, Binaries, InstallOptions, Source, previous_path},
 };
 use crate::domain::{
-    APPROVE_UPDATE_OPTIONS, APPROVE_UPDATE_SUBJECT, BinaryUpdate, HEARTBEAT_TIMEOUT_SECS,
-    SupervisorRegistration, UPDATE_FAILED_OPTIONS, UPDATE_FAILED_SUBJECT,
+    APPROVE_UPDATE_OPTIONS, AskKind, EventId, HEARTBEAT_TIMEOUT_SECS, RunEvent,
+    SupervisorRegistration, UPDATE_FAILED_OPTIONS,
+};
+pub use crate::domain::{
+    UPDATE_ANSWERED, UPDATE_AWAITING_APPROVAL, UPDATE_BUILT, UPDATE_FAILED, UPDATE_INSTALLED,
+    UPDATE_RESTORED, UPDATE_RETRY, UPDATE_STARTED,
 };
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Value, json};
@@ -34,23 +40,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-/// The supervisor started the job for `commit_sha` (`pid`, `log`, `base`).
-pub const UPDATE_STARTED: &str = "update_started";
-/// The job built the commit (`binary`).
-pub const UPDATE_BUILT: &str = "update_built";
-/// The supervisor runs the new binary (`version`, `previous_version`).
-pub const UPDATE_INSTALLED: &str = "update_installed";
-/// The build, its check or the handoff failed (`stage`, `error`, `restored`,
-/// `supervisor`, `ask_id`).
-pub const UPDATE_FAILED: &str = "update_failed";
-/// The build brings a breaking migration and waits for a person
-/// (`version`, `migrations`, `binary`, `ask_id`).
-pub const UPDATE_AWAITING_APPROVAL: &str = "update_awaiting_approval";
-/// The supervisor applied the answer of an `update_failed` ask
-/// (`ask_id`, `answer`).
-pub const UPDATE_ANSWERED: &str = "update_answered";
-/// A `retry` answer: the next check builds main's head again.
-pub const UPDATE_RETRY: &str = "update_retry";
 /// `asked_by` of the update's asks.
 pub const UPDATE_ASKER: &str = "supervisor";
 
@@ -110,24 +99,47 @@ impl UpdatePaths {
     }
 }
 
-/// Whether `update` is a step of a job still working: it is
-/// `update_started` or `update_built` and the job's process lives.
-pub fn in_progress(update: &BinaryUpdate, processes: &dyn ProcessControl) -> bool {
-    matches!(update.kind.as_str(), UPDATE_STARTED | UPDATE_BUILT)
+/// Record one step of the automatic update: the queue event `kind` with
+/// `commit` (the main commit it is about) in its payload.
+pub fn record(
+    queue: &dyn Queue,
+    kind: &str,
+    commit: Option<&str>,
+    mut payload: Value,
+) -> Result<EventId> {
+    if let (Some(commit), Some(object)) = (commit, payload.as_object_mut()) {
+        object.insert("commit".into(), json!(commit));
+    }
+    queue.record_queue_event(kind, payload)
+}
+
+/// The main commit a step is about, if it names one.
+pub fn step_commit(update: &RunEvent) -> Option<&str> {
+    update.payload.get("commit").and_then(Value::as_str)
+}
+
+/// The steps a job writes before the one that ends it: a job whose latest
+/// step is one of these and whose process is gone was interrupted.
+pub const JOB_STEPS: &[&str] = &[UPDATE_STARTED, UPDATE_BUILT, UPDATE_RESTORED];
+
+/// Whether `update` is a step of a job still working: one of
+/// [`JOB_STEPS`] and the job's process lives.
+pub fn in_progress(update: &RunEvent, processes: &dyn ProcessControl) -> bool {
+    JOB_STEPS.contains(&update.kind.as_str())
         && job_pid(update).is_some_and(|pid| processes.alive(pid))
 }
 
 /// The newest step a job wrote (`updates` newest first): the answers of
 /// the asks (`update_answered`, `update_retry`) are skipped, so an answer
 /// written while a job still works does not hide it.
-pub fn latest_job_step(updates: &[BinaryUpdate]) -> Option<&BinaryUpdate> {
+pub fn latest_job_step(updates: &[RunEvent]) -> Option<&RunEvent> {
     updates
         .iter()
         .find(|update| !matches!(update.kind.as_str(), UPDATE_ANSWERED | UPDATE_RETRY))
 }
 
 /// The pid of the job that wrote `update`, if it recorded one.
-pub fn job_pid(update: &BinaryUpdate) -> Option<u32> {
+pub fn job_pid(update: &RunEvent) -> Option<u32> {
     update
         .payload
         .get("pid")
@@ -142,7 +154,7 @@ pub fn job_pid(update: &BinaryUpdate) -> Option<u32> {
 /// ran), with its commit, time and details. `updates` is newest first.
 pub fn status(
     registrations: &[SupervisorRegistration],
-    updates: &[BinaryUpdate],
+    updates: &[RunEvent],
     processes: &dyn ProcessControl,
     now: i64,
 ) -> Value {
@@ -161,7 +173,8 @@ pub fn status(
     let state = match latest.kind.as_str() {
         UPDATE_STARTED if in_progress(latest, processes) => "building",
         UPDATE_BUILT if in_progress(latest, processes) => "installing",
-        UPDATE_STARTED | UPDATE_BUILT => "interrupted",
+        UPDATE_RESTORED if in_progress(latest, processes) => "restoring",
+        UPDATE_STARTED | UPDATE_BUILT | UPDATE_RESTORED => "interrupted",
         UPDATE_INSTALLED => "installed",
         UPDATE_FAILED => "failed",
         UPDATE_AWAITING_APPROVAL => "awaiting_approval",
@@ -171,11 +184,12 @@ pub fn status(
     };
     // The commit is the one the latest job worked on; an answer's row
     // names none.
-    let commit = updates.iter().find_map(|update| update.commit.clone());
+    let commit = updates.iter().find_map(step_commit);
     json!({
         "enabled": enabled,
         "state": state,
         "commit": commit,
+        "event_id": latest.id,
         "at": latest.created_at,
         "last": latest.payload,
     })
@@ -196,22 +210,19 @@ pub enum Trigger {
 /// The commit an update is measured from: the one the latest job worked
 /// on, else the commit this build names, else `fallback` (main when the
 /// supervisor first looked).
-pub fn base_commit(
-    updates: &[BinaryUpdate],
-    version: &str,
-    fallback: Option<&str>,
-) -> Option<String> {
+pub fn base_commit(updates: &[RunEvent], version: &str, fallback: Option<&str>) -> Option<String> {
     updates
         .iter()
         .find(|update| update.kind == UPDATE_STARTED)
-        .and_then(|update| update.commit.clone())
+        .and_then(step_commit)
+        .map(str::to_owned)
         .or_else(|| build_commit(version).map(str::to_owned))
         .or_else(|| fallback.map(str::to_owned))
 }
 
 /// Whether the latest word in the log is a `retry` answer after the latest
 /// job: build main's head again whatever it changed.
-pub fn retry_requested(updates: &[BinaryUpdate]) -> bool {
+pub fn retry_requested(updates: &[RunEvent]) -> bool {
     updates
         .iter()
         .find(|update| matches!(update.kind.as_str(), UPDATE_STARTED | UPDATE_RETRY))
@@ -263,7 +274,7 @@ pub struct JobPorts<'a> {
 }
 
 /// Build `options.commit` and put it in place of the supervisor's binary
-/// (see the module). Every outcome is a row of `binary_updates` and the
+/// (see the module). Every outcome is an `update_*` event and the
 /// value returned: `installed`, `awaiting_approval` or `failed`; an error
 /// is only a queue that could not be written.
 pub fn run(ports: &JobPorts, db: &Path, options: &JobOptions) -> Result<Value> {
@@ -287,7 +298,8 @@ pub fn run(ports: &JobPorts, db: &Path, options: &JobOptions) -> Result<Value> {
         Ok(binary) => binary,
         Err(error) => return failed(queue, options, "build", &error, json!({})),
     };
-    queue.record_binary_update(
+    record(
+        &*queue,
         UPDATE_BUILT,
         Some(commit),
         json!({"pid": pid, "binary": binary, "log": options.log}),
@@ -348,6 +360,21 @@ pub fn run(ports: &JobPorts, db: &Path, options: &JobOptions) -> Result<Value> {
     if let Err(error) = watch(ports, &*queue, &options.token, &version, options) {
         let restored = restore(ports, options, report["previous_version"].as_str());
         let supervisor = bring_back(ports, &*queue, before.as_ref())?;
+        if restored["restored"] == true {
+            // A step of the job still working (it goes on to its
+            // `update_failed`); it must not keep the supervisor from
+            // being brought back or the ask from opening.
+            let _ = record(
+                &*queue,
+                UPDATE_RESTORED,
+                Some(commit),
+                json!({
+                    "pid": pid,
+                    "version": version,
+                    "restored_version": restored["version"],
+                }),
+            );
+        }
         return failed(
             queue,
             options,
@@ -364,7 +391,7 @@ pub fn run(ports: &JobPorts, db: &Path, options: &JobOptions) -> Result<Value> {
         "supervisors": report["supervisors"],
         "log": options.log,
     });
-    queue.record_binary_update(UPDATE_INSTALLED, Some(commit), payload.clone())?;
+    record(&*queue, UPDATE_INSTALLED, Some(commit), payload.clone())?;
     let mut value = payload;
     value["outcome"] = json!("installed");
     value["commit"] = json!(commit);
@@ -541,7 +568,7 @@ no supervisor serves the queue now, `up` starts one.",
     );
     let ask = queue
         .open_update_ask(
-            UPDATE_FAILED_SUBJECT,
+            AskKind::UpdateFailed,
             &question,
             UPDATE_FAILED_OPTIONS,
             UPDATE_ASKER,
@@ -557,7 +584,7 @@ no supervisor serves the queue now, `up` starts one.",
     if let (Some(object), Value::Object(details)) = (payload.as_object_mut(), details) {
         object.extend(details);
     }
-    queue.record_binary_update(UPDATE_FAILED, Some(commit), payload.clone())?;
+    record(&*queue, UPDATE_FAILED, Some(commit), payload.clone())?;
     payload["outcome"] = json!("failed");
     payload["commit"] = json!(commit);
     Ok(payload)
@@ -600,7 +627,7 @@ leave it. The build is kept at {}.",
     );
     let ask = queue
         .open_update_ask(
-            APPROVE_UPDATE_SUBJECT,
+            AskKind::ApproveUpdate,
             &question,
             APPROVE_UPDATE_OPTIONS,
             UPDATE_ASKER,
@@ -614,7 +641,12 @@ leave it. The build is kept at {}.",
         "command": command,
         "ask_id": ask,
     });
-    queue.record_binary_update(UPDATE_AWAITING_APPROVAL, Some(commit), payload.clone())?;
+    record(
+        &*queue,
+        UPDATE_AWAITING_APPROVAL,
+        Some(commit),
+        payload.clone(),
+    )?;
     let mut value = payload;
     value["outcome"] = json!("awaiting_approval");
     value["commit"] = json!(commit);

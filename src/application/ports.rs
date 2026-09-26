@@ -991,15 +991,9 @@ pub trait RunStore {
     fn set_max_waiting(&self, token: &str, max_waiting: u32) -> Result<()>;
     /// The unclosed asks of the run, answered or not, oldest first.
     fn unclosed_run_asks(&self, run_id: &RunId) -> Result<Vec<crate::domain::Ask>>;
-    /// Append one step of the automatic update to its log.
-    fn record_binary_update(
-        &self,
-        kind: &str,
-        commit: Option<&str>,
-        payload: serde_json::Value,
-    ) -> Result<i64>;
-    /// The latest `limit` steps of the automatic update, newest first.
-    fn binary_updates(&self, limit: usize) -> Result<Vec<crate::domain::BinaryUpdate>>;
+    /// The latest `limit` steps of the automatic update (its `update_*`
+    /// queue events), newest first.
+    fn update_events(&self, limit: usize) -> Result<Vec<RunEvent>>;
     /// Take over the stale lease `previous_token` holds on `id`; `None`
     /// when another process got there first or the lease is fresh again.
     fn adopt_run(
@@ -1303,18 +1297,19 @@ pub trait RunStore {
 
 /// The questions the runtime and its sessions put to a person (ADR-0022).
 pub trait AskStore {
-    /// Open the task-less `blocked` ask of the automatic update with this
-    /// subject, closing an older open one of it (ADR-0045 decision 17).
+    /// Open the ask of the automatic update of `kind` (`update_failed` or
+    /// `approve_update`), closing an older open one of it (ADR-0073
+    /// decision 17).
     fn open_update_ask(
         &mut self,
-        subject: &str,
+        kind: crate::domain::AskKind,
         question: &str,
         options: &[&str],
         asked_by: &str,
     ) -> Result<crate::domain::Ask>;
-    /// The answered, unclosed `blocked` asks of the automatic update with
-    /// this subject, oldest first.
-    fn update_answers(&self, subject: &str) -> Result<Vec<crate::domain::Ask>>;
+    /// The answered, unclosed asks of the automatic update of `kind`,
+    /// oldest first.
+    fn update_answers(&self, kind: &crate::domain::AskKind) -> Result<Vec<crate::domain::Ask>>;
     /// Asks matching `query`, oldest first.
     fn asks(&self, query: AskQuery) -> Result<Vec<Ask>>;
     /// Whether the run has an ask of `kind` nobody closed, answered or not.

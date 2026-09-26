@@ -22,6 +22,7 @@ pub mod measures;
 pub mod retries;
 pub mod sessions;
 pub mod thresholds;
+pub mod updates;
 pub mod work;
 
 pub use asks::{
@@ -37,6 +38,7 @@ pub use measures::{
 pub use retries::{BrokenBy, ResumeAttempt, ResumeBreakdown, Retries};
 pub use sessions::{GoalKindSessions, KindSessions, RunKindSessions, SessionWindow, Sessions};
 pub use thresholds::ThresholdStats;
+pub use updates::UpdateStats;
 pub use work::{CategoryShare, CommandCount, RunWork, WorkShares};
 
 /// Runs returned without `--full`.
@@ -420,6 +422,10 @@ pub struct Stats {
     /// ADR-0047 decision 45) in the same window as `asks`: by layer and
     /// repair, and per day next to the asks opened that day.
     pub auto_repairs: AutoRepairStats,
+    /// The steps of the automatic update of the fixed binary (`update_*`,
+    /// ADR-0073 decision 17) in the same window as `asks`: by kind, the
+    /// failures by stage and the builds installed. Empty with `--goal`.
+    pub updates: UpdateStats,
     /// Pass it to `--since` to read only runs that finish later.
     pub next_cursor: EventId,
 }
@@ -785,6 +791,7 @@ pub fn stats(
     };
     let ask_stats = asks::asks(events, window_start, next_cursor, window_end, counts);
     let auto_repairs = auto_repairs::auto_repairs(events, window_start, next_cursor, counts);
+    let updates = updates::updates(events, window_start, next_cursor, counts);
     let verification_commands =
         measures::verification_commands(events, window_start, next_cursor, counts);
     let waiting = super::waiting::waiting_stats(events, window_start, next_cursor, counts);
@@ -873,6 +880,7 @@ pub fn stats(
         waiting,
         asks: ask_stats,
         auto_repairs,
+        updates,
         next_cursor,
     }
 }

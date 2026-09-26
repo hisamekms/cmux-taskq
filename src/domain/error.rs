@@ -177,6 +177,11 @@ pub enum DomainError {
     AskWithoutTarget {
         kind: AskKind,
     },
+    /// An ask of the automatic update names a task (ADR-0073 decision 17):
+    /// it is about the queue's binary.
+    UpdateAskWithTarget {
+        kind: AskKind,
+    },
     /// A `queue_hold` ask without an authentication or cost reason, or
     /// another ask with one (ADR-0073 decision 22).
     AskKindReason {
@@ -326,6 +331,10 @@ impl fmt::Display for DomainError {
                 f,
                 "a {} ask needs a task or a run; only a blocked ask may have neither",
                 kind.as_str()
+            ),
+            Self::UpdateAskWithTarget { kind } => write!(
+                f,
+                "a {kind} ask is about the queue's binary and names no task or run"
             ),
             Self::AskKindReason { kind, reason } => write!(
                 f,

@@ -346,11 +346,11 @@ fn auto_update_builds_runtime_landings_and_retries_on_the_answer() {
         git(&repo, &["commit", "-m", path]);
         head(&repo)
     };
-    let updates = || SqliteQueue::open(&db).unwrap().binary_updates(100).unwrap();
+    let updates = || SqliteQueue::open(&db).unwrap().update_events(100).unwrap();
     let of = |kind: &str, sha: &str| {
         updates()
             .iter()
-            .filter(|u| u.kind == kind && u.commit.as_deref() == Some(sha))
+            .filter(|u| u.kind == kind && u.payload["commit"] == sha)
             .count()
     };
     let wait_failed = |sha: &str, times: usize| {
@@ -393,7 +393,7 @@ fn auto_update_builds_runtime_landings_and_retries_on_the_answer() {
         .asks(AskQuery::default())
         .unwrap()
         .into_iter()
-        .find(|ask| ask.subject.as_deref() == Some("update_failed"))
+        .find(|ask| ask.kind == dagq::domain::AskKind::UpdateFailed)
         .unwrap();
     queue.answer(ask.id, "retry").unwrap();
     supervise_with(&db, &repo, &backend, &options).unwrap();
@@ -412,10 +412,9 @@ fn auto_update_builds_runtime_landings_and_retries_on_the_answer() {
     // rebuilt on its own; an answer row does not hide a running job.
     let queue = SqliteQueue::open(&db).unwrap();
     queue
-        .record_binary_update(
+        .record_queue_event(
             "update_started",
-            Some(&source),
-            json!({"pid": 999_999_999u32}),
+            json!({"pid": 999_999_999u32, "commit": source}),
         )
         .unwrap();
     supervise_with(&db, &repo, &backend, &options).unwrap();
@@ -423,16 +422,25 @@ fn auto_update_builds_runtime_landings_and_retries_on_the_answer() {
     assert_eq!(latest.kind, "update_failed", "{latest:?}");
     assert_eq!(latest.payload["stage"], "interrupted", "{latest:?}");
     assert_eq!(of("update_started", &source), 2);
+    // So is one that died after it put the old binary back.
     queue
-        .record_binary_update(
-            "update_started",
-            Some(&source),
-            json!({"pid": std::process::id()}),
+        .record_queue_event(
+            "update_restored",
+            json!({"pid": 999_999_999u32, "commit": source}),
         )
         .unwrap();
+    supervise_with(&db, &repo, &backend, &options).unwrap();
+    let latest = updates().remove(0);
+    assert_eq!(latest.kind, "update_failed", "{latest:?}");
+    assert_eq!(latest.payload["after"], "update_restored", "{latest:?}");
+    assert_eq!(of("update_started", &source), 2);
     queue
-        .record_binary_update("update_retry", None, json!({}))
+        .record_queue_event(
+            "update_started",
+            json!({"pid": std::process::id(), "commit": source}),
+        )
         .unwrap();
+    queue.record_queue_event("update_retry", json!({})).unwrap();
     supervise_with(&db, &repo, &backend, &options).unwrap();
     assert_eq!(of("update_started", &source), 3, "{:?}", updates());
     let status = runtime::status(&db).unwrap();

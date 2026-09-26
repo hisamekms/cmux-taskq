@@ -10,7 +10,8 @@ pub use crate::application::health::compact_event;
 use crate::{
     application::health::{for_role, pulses, supervisors},
     domain::{
-        ATTENTION_KINDS, EventFilter, EventId, RunEvent, RunId, SessionRole, event_attention,
+        ATTENTION_KINDS, EventFilter, EventId, RunEvent, RunId, SessionRole, UPDATE_EVENT_KINDS,
+        event_attention,
         timeline::{self, Gap},
     },
     infrastructure::{adapters::SystemProcesses, sqlite::SqliteQueue},
@@ -26,6 +27,9 @@ use std::{
 /// At most this many attention events come back from one `watch`; the
 /// cursor then points at the last one returned.
 const WATCH_LIMIT: usize = 100;
+
+/// At most this many steps of the automatic update show in one `timeline`.
+const TIMELINE_UPDATES_LIMIT: usize = 200;
 
 /// An event as `events` and `timeline` print it: compact (ADR-0016) or,
 /// with `full`, every field with its whole payload.
@@ -195,12 +199,35 @@ pub fn timeline_in(queue: &SqliteQueue, run: &RunId, gap_secs: i64, full: bool) 
     let now_ms = moving.then(|| queue.generators().clock.now() * 1000);
     let gaps: Vec<Gap> = timeline::gaps(&events, gap_secs, now_ms);
     let waited: i64 = gaps.iter().map(|gap| gap.secs).sum();
+    // The steps of the automatic update from the run's first event to its
+    // last (to now while it moves on) show among its events: a handoff
+    // explains a pause of the supervisor. The gaps are the run's own.
+    let shown_events = match (events.first(), events.last()) {
+        (Some(first), Some(last)) => {
+            let upto = if moving {
+                queue.latest_event_id()?
+            } else {
+                last.id
+            };
+            let updates = queue.events_between(
+                EventId::new(first.id.as_i64() - 1),
+                upto,
+                &EventFilter {
+                    kinds: Some(UPDATE_EVENT_KINDS.iter().map(|&k| k.to_owned()).collect()),
+                    ..EventFilter::default()
+                },
+                TIMELINE_UPDATES_LIMIT,
+            )?;
+            timeline::merged(&events, &updates)
+        }
+        _ => events.clone(),
+    };
     Ok(json!({
         "run_id": run,
         "task_id": task_run.task_id(),
         "status": task_run.status(),
         "gap_secs": gap_secs,
-        "events": events.iter().map(|event| shown(event, full)).collect::<Vec<_>>(),
+        "events": shown_events.iter().map(|event| shown(event, full)).collect::<Vec<_>>(),
         "gaps": gaps,
         "gap_total_secs": waited,
         "commands": timeline::heavy_commands(&events),

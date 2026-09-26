@@ -10,7 +10,7 @@ use crate::domain::Ask;
 use crate::domain::{
     ANSWERED_BY_PERSON, ANSWERED_BY_RUNTIME, AskId, AskKind, AskOutcome, AskReason,
     HOLD_AFFECTED_HEADING, HoldOutcome, LANDING_OPTIONS, NewAsk, NewHold, RunId, RunStatus, TaskId,
-    UPDATE_FAILED_OPTIONS, UPDATE_FAILED_SUBJECT, check_ask_kind, check_event_target, option_index,
+    UPDATE_FAILED_OPTIONS, check_ask_kind, check_event_target, option_index,
 };
 
 pub use crate::application::AskQuery;
@@ -245,7 +245,7 @@ impl SqliteQueue {
             payload["runtime_delivers"] =
                 json!(super::plan_reviews::plan_answer_applies(&tx, &ask, text)?);
         }
-        if ask.kind == AskKind::Blocked && ask.subject.as_deref() == Some(UPDATE_FAILED_SUBJECT) {
+        if ask.kind == AskKind::UpdateFailed {
             // The supervisor that updates the binary retries or leaves the
             // update as answered (ADR-0045 decision 17); any other answer
             // is a person's to read.
@@ -311,30 +311,36 @@ impl SqliteQueue {
             .collect())
     }
 
-    /// Open the task-less `blocked` ask of the automatic update with this
-    /// `subject` (ADR-0045 decision 17): `update_failed` or
-    /// `approve_update`. One of the same subject still open is about an
-    /// older build, so it is answered `superseded` and closed first (by the
-    /// runtime, which writes `ask_answered` with `runtime_closed`). Writes
-    /// `ask_opened` like any ask.
+    /// Open the ask of the automatic update of `kind` (ADR-0073 decision
+    /// 17): `update_failed` or `approve_update`, about no task or run. One
+    /// of the same kind still open is about an older build, so it is
+    /// answered `superseded` and closed first (by the runtime, which writes
+    /// `ask_answered` with `runtime_closed`). Writes `ask_opened` like any
+    /// ask.
     pub fn open_update_ask(
         &mut self,
-        subject: &str,
+        kind: AskKind,
         question: &str,
         options: &[&str],
         asked_by: &str,
     ) -> Result<Ask> {
         ensure!(!question.trim().is_empty(), "question must not be blank");
+        ensure!(
+            kind.is_update(),
+            "a {kind} ask is not one of the automatic update"
+        );
+        let reason = AskReason::Scope;
+        check_ask_kind(&kind, None, None, reason)?;
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let now = self.generators.clock.now();
         let open: Vec<Ask> = tx
             .prepare(
-                "SELECT * FROM asks WHERE kind='blocked' AND task_id IS NULL AND subject=?1
+                "SELECT * FROM asks WHERE kind=?1 AND task_id IS NULL
                  AND answered_at IS NULL AND closed_at IS NULL ORDER BY id",
             )?
-            .query_map([subject], ask_row)?
+            .query_map([kind.as_str()], ask_row)?
             .collect::<rusqlite::Result<_>>()?;
         for ask in open {
             let mut payload = json!({"ask_id": ask.id, "kind": ask.kind, "runtime_closed": true});
@@ -352,17 +358,14 @@ impl SqliteQueue {
             )?;
             ask_event(&tx, None, None, "ask_answered", payload)?;
         }
-        let (kind, reason) = (AskKind::Blocked, AskReason::Scope);
-        check_ask_kind(&kind, None, None, reason)?;
         tx.execute(
-            "INSERT INTO asks(kind,question,options,asked_by,reason_category,subject)
-             VALUES (?6,?1,?2,?3,?4,?5)",
+            "INSERT INTO asks(kind,question,options,asked_by,reason_category)
+             VALUES (?5,?1,?2,?3,?4)",
             params![
                 question,
                 serde_json::to_string(options)?,
                 asked_by,
                 reason.as_str(),
-                subject,
                 kind.as_str()
             ],
         )?;
@@ -374,10 +377,9 @@ impl SqliteQueue {
             "ask_opened",
             json!({
                 "ask_id": id,
-                "kind": AskKind::Blocked,
+                "kind": kind,
                 "asked_by": asked_by,
                 "reason_category": reason,
-                "subject": subject,
             }),
         )?;
         let opened = read_ask(&tx, id)?;
@@ -385,17 +387,17 @@ impl SqliteQueue {
         Ok(opened)
     }
 
-    /// The task-less `blocked` asks of the automatic update with this
-    /// `subject` that were answered and nobody closed yet, oldest first:
-    /// answers the supervisor still has to apply.
-    pub fn update_answers(&self, subject: &str) -> Result<Vec<Ask>> {
+    /// The asks of the automatic update of `kind` that were answered and
+    /// nobody closed yet, oldest first: answers the supervisor still has to
+    /// apply.
+    pub fn update_answers(&self, kind: &AskKind) -> Result<Vec<Ask>> {
         Ok(self
             .conn
             .prepare(
-                "SELECT * FROM asks WHERE kind='blocked' AND task_id IS NULL AND subject=?1
+                "SELECT * FROM asks WHERE kind=?1 AND task_id IS NULL
                  AND answered_at IS NOT NULL AND closed_at IS NULL ORDER BY id",
             )?
-            .query_map([subject], ask_row)?
+            .query_map([kind.as_str()], ask_row)?
             .collect::<rusqlite::Result<_>>()?)
     }
 

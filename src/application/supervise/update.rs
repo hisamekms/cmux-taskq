@@ -9,10 +9,11 @@
 
 use super::*;
 use crate::application::update::{
-    UPDATE_ANSWERED, UPDATE_ASKER, UPDATE_FAILED, UPDATE_RETRY, UPDATE_STARTED, base_commit,
-    changes_runtime, in_progress, job_pid, latest_job_step, retry_requested,
+    JOB_STEPS, UPDATE_ANSWERED, UPDATE_ASKER, UPDATE_FAILED, UPDATE_RETRY, UPDATE_STARTED,
+    base_commit, changes_runtime, in_progress, job_pid, latest_job_step, record, retry_requested,
+    step_commit,
 };
-use crate::domain::{UPDATE_FAILED_OPTIONS, UPDATE_FAILED_SUBJECT};
+use crate::domain::{AskKind, RunEvent, UPDATE_FAILED_OPTIONS};
 
 /// How often the supervisor looks at main for an update by default.
 pub const UPDATE_INTERVAL: Duration = Duration::from_secs(30);
@@ -94,7 +95,7 @@ impl Supervisor<'_> {
         if self.update.job.is_some() {
             return Ok(());
         }
-        let updates = self.queue.binary_updates(50)?;
+        let updates = self.queue.update_events(50)?;
         if let Some(step) = latest_job_step(&updates) {
             // A job this process started before it exec'd is its child
             // with no other reaper: collect it once it ended.
@@ -104,10 +105,7 @@ impl Supervisor<'_> {
             if in_progress(step, &*self.processes) {
                 return Ok(());
             }
-            if matches!(
-                step.kind.as_str(),
-                UPDATE_STARTED | crate::application::update::UPDATE_BUILT
-            ) {
+            if JOB_STEPS.contains(&step.kind.as_str()) {
                 return self.job_interrupted(step);
             }
         }
@@ -147,8 +145,8 @@ impl Supervisor<'_> {
     /// A job that died before it recorded how it ended (killed, a reboot):
     /// record `update_failed` for its commit and ask the inbox, so the
     /// update is neither lost nor retried on its own.
-    fn job_interrupted(&mut self, step: &crate::domain::BinaryUpdate) -> Result<()> {
-        let commit = step.commit.clone().unwrap_or_default();
+    fn job_interrupted(&mut self, step: &RunEvent) -> Result<()> {
+        let commit = step_commit(step).unwrap_or_default().to_owned();
         let question = format!(
             "The automatic update's job for main's {} (pid {}) ended without recording how, at \
 its {}; nothing tells whether the binary was replaced. Its logs are in the queue's logs/ \
@@ -159,14 +157,15 @@ to wait for the next landing that changes the runtime.",
             step.kind
         );
         let ask = self.queue.open_update_ask(
-            UPDATE_FAILED_SUBJECT,
+            AskKind::UpdateFailed,
             &question,
             UPDATE_FAILED_OPTIONS,
             UPDATE_ASKER,
         )?;
-        self.queue.record_binary_update(
+        record(
+            &*self.queue,
             UPDATE_FAILED,
-            step.commit.as_deref(),
+            step_commit(step),
             json!({"stage": "interrupted", "after": step.kind, "ask_id": ask.id, "supervisor": self.token}),
         )?;
         warn!(
@@ -180,14 +179,15 @@ to wait for the next landing that changes the runtime.",
     /// to build main's head again, `skip` waits for the next landing. Any
     /// other answer is left for the inbox to read.
     fn apply_update_answers(&mut self) -> Result<()> {
-        for ask in self.queue.update_answers(UPDATE_FAILED_SUBJECT)? {
+        for ask in self.queue.update_answers(&AskKind::UpdateFailed)? {
             let answer = ask.answer.as_deref().map(str::trim).unwrap_or_default();
             let kind = match answer {
                 "retry" => UPDATE_RETRY,
                 "skip" => UPDATE_ANSWERED,
                 _ => continue,
             };
-            self.queue.record_binary_update(
+            record(
+                &*self.queue,
                 kind,
                 None,
                 json!({"ask_id": ask.id, "answer": answer, "supervisor": self.token}),
@@ -254,7 +254,8 @@ to wait for the next landing that changes the runtime.",
                 stderr: &log,
             },
         )?;
-        self.queue.record_binary_update(
+        record(
+            &*self.queue,
             UPDATE_STARTED,
             Some(head),
             json!({

@@ -502,11 +502,11 @@ exec '{bin}' \"$@\"\n"
     wait("the registration", &mut || !registered().is_empty());
     let token = registered()[0].token.clone();
     assert!(registered()[0].auto_update);
-    let updates = || SqliteQueue::open(&db).unwrap().binary_updates(100).unwrap();
+    let updates = || SqliteQueue::open(&db).unwrap().update_events(100).unwrap();
     let installed = |sha: &str| {
         updates()
             .iter()
-            .any(|u| u.kind == "update_installed" && u.commit.as_deref() == Some(sha))
+            .any(|u| u.kind == "update_installed" && u.payload["commit"] == sha)
     };
 
     // The test binary names a commit this repository does not have, so the
@@ -535,7 +535,7 @@ exec '{bin}' \"$@\"\n"
     let started = |sha: &str| {
         updates()
             .iter()
-            .any(|u| u.kind == "update_started" && u.commit.as_deref() == Some(sha))
+            .any(|u| u.kind == "update_started" && u.payload["commit"] == sha)
     };
     let docs = commit("docs/notes.md");
     std::thread::sleep(std::time::Duration::from_secs(3));
@@ -557,9 +557,9 @@ exec '{bin}' \"$@\"\n"
     wait("the failed update", &mut || {
         // Reaps the supervisor once the broken build's exec ended it.
         let _ = supervisor.try_wait();
-        updates().iter().any(|u| {
-            u.kind == "update_failed" && u.commit.as_deref() == Some(broken_commit.as_str())
-        })
+        updates()
+            .iter()
+            .any(|u| u.kind == "update_failed" && u.payload["commit"] == broken_commit.as_str())
     });
     let failed = updates()
         .into_iter()
@@ -582,9 +582,9 @@ exec '{bin}' \"$@\"\n"
         .as_array()
         .unwrap()
         .iter()
-        .find(|ask| ask["subject"] == "update_failed")
+        .find(|ask| ask["kind"] == "update_failed")
         .unwrap_or_else(|| panic!("no update_failed ask: {asks}"));
-    assert_eq!(ask["kind"], "blocked");
+    assert!(ask.get("subject").is_none_or(|s| s.is_null()), "{ask}");
     assert_eq!(ask["options"], serde_json::json!(["retry", "skip"]));
     assert!(
         ask["question"]
@@ -592,6 +592,52 @@ exec '{bin}' \"$@\"\n"
             .unwrap()
             .contains("failed at its install")
     );
+
+    // The steps are queue events (ADR-0073 decision 17): `events` shows
+    // them by kind with their commit, an install is an attention `watch`
+    // wakes on, `stats` counts them, and `binary_updates` stays empty.
+    let steps = ok(
+        &db,
+        &[
+            "events",
+            "--kind",
+            "update_installed",
+            "--kind",
+            "update_failed",
+        ],
+    );
+    let steps = steps["events"].as_array().unwrap();
+    assert!(
+        steps
+            .iter()
+            .any(|e| e["kind"] == "update_installed" && e["commit"] == source.as_str()),
+        "{steps:?}"
+    );
+    assert!(
+        steps.iter().any(|e| e["kind"] == "update_failed"
+            && e["commit"] == broken_commit.as_str()
+            && e["stage"] == "install"),
+        "{steps:?}"
+    );
+    let watched = ok(&db, &["watch", "--after", "0", "--timeout", "1"]);
+    let installs: Vec<_> = watched["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["kind"] == "update_installed")
+        .collect();
+    assert_eq!(installs.len(), 2, "{watched}");
+    assert_eq!(installs[0]["next"], "report the update", "{watched}");
+    let stats = ok(&db, &["stats", "--full"]);
+    let updates_stats = &stats["updates"];
+    assert_eq!(updates_stats["by_kind"]["update_installed"], 2, "{stats}");
+    assert_eq!(updates_stats["failed_by_stage"]["install"], 1, "{stats}");
+    assert!(updates_stats["by_kind"]["update_started"].as_i64() >= Some(3));
+    let rows: i64 = rusqlite::Connection::open(&db)
+        .unwrap()
+        .query_row("SELECT count(*) FROM binary_updates", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(rows, 0);
     let exit = {
         let _waiting = common::within(common::STEP_LIMIT, "the broken supervisor to exit");
         supervisor.wait().unwrap()

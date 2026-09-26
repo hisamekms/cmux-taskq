@@ -26,6 +26,10 @@
 //!   validation or review.
 //! - `unknown`.
 //!
+//! The events `timeline` shows also hold the steps of the automatic update
+//! (`update_*`, queue events) in the run's span ([`merged`]); the gaps are
+//! the run's own.
+//!
 //! Next to the gaps, `commands` lists the heavy commands (e2e, llvm-cov,
 //! test, build/clippy, chains) the run's sessions ran, from the `work` their
 //! `session_closed` recorded (task 514).
@@ -201,6 +205,15 @@ fn holds_the_run(payload: &Value) -> bool {
     )
 }
 
+/// A run's `events` with the queue's `others` (the steps of the automatic
+/// update in its span) among them, by id; an event in both shows once.
+pub fn merged(events: &[RunEvent], others: &[RunEvent]) -> Vec<RunEvent> {
+    let mut all: Vec<RunEvent> = events.iter().chain(others).cloned().collect();
+    all.sort_by_key(|event| event.id);
+    all.dedup_by_key(|event| event.id);
+    all
+}
+
 /// The gaps of at least `min_secs` between consecutive `events` of one run
 /// (ascending id), with their reasons. With `now_ms`, the run is not
 /// finished and the time from its last event to now is a gap too.
@@ -309,6 +322,26 @@ mod tests {
         gaps.iter()
             .map(|gap| (gap.after_event.as_i64(), gap.reason))
             .collect()
+    }
+
+    #[test]
+    fn the_queue_s_update_steps_show_among_the_run_s_events_by_id() {
+        let run = events(&[
+            ("run_claimed", json!({}), "00:00:00.000"),
+            ("agent_started", json!({}), "00:01:00.000"),
+        ]);
+        let mut update = run[0].clone();
+        update.id = EventId::new(2);
+        update.run_id = None;
+        update.task_id = None;
+        update.kind = "update_installed".into();
+        let mut run = run;
+        run[1].id = EventId::new(3);
+        let all = merged(&run, &[update.clone(), run[0].clone()]);
+        let ids: Vec<i64> = all.iter().map(|event| event.id.as_i64()).collect();
+        assert_eq!(ids, [1, 2, 3]);
+        assert_eq!(all[1].kind, "update_installed");
+        assert_eq!(merged(&run, &[]).len(), 2);
     }
 
     #[test]
