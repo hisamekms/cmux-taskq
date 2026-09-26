@@ -14,6 +14,7 @@ related:
   - design-supervisor-lifecycle-stats
   - design-supervisor-lifecycle-handoff
   - adr-0062
+  - adr-0071
   - adr-0039
   - adr-0045
   - design-persistence
@@ -21,7 +22,7 @@ related:
 
 # 人の答えを待つrun（slotの外の待ち）
 
-[ADR-0062](../../adr/0062-runs-waiting-for-a-person-leave-the-slot.md)の実装。生きているsessionを持つrunが人の答えか人の操作だけを待っているあいだ、そのrunを`--parallel`のslotから外し（**待ち**）、空いたslotで他のtaskをclaimする。use caseは`src/application/supervise/waiting.rs`、イベントからの状態の導出と`stats`の集計は`src/domain/waiting.rs`。
+[ADR-0062](../../adr/0062-runs-waiting-for-a-person-leave-the-slot.md)の実装（決定は[ADR-0071](../../adr/0071-runs-waiting-in-revise-and-resume-leave-the-slot.md)が置き換えて引き継いだ）。生きているsessionを持つrunが人の答えか人の操作だけを待っているあいだ、そのrunを`--parallel`のslotから外し（**待ち**）、空いたslotで他のtaskをclaimする。use caseは`src/application/supervise/waiting.rs`、イベントからの状態の導出と`stats`の集計は`src/domain/waiting.rs`。
 
 ## 待ちの出入り
 
@@ -38,6 +39,8 @@ related:
   8. `answer_prompt`を持つ`Session`のrunは、`watch_prompt`と同じ間隔で画面を読み、ログインの切れなら`raise_auth`して`queue_hold`、ダイアログが無ければ`prompt_cleared`を記録してaskを閉じ、`dialog_cleared`で終える。
 - **終わり**（`end_wait`）: `run_waiting_ended`（`ask_id`、`ask_kind`、`cause`、`waited_secs`）を記録し、持っていたaskを`consumed`に足す。`answered`と`session_exited`は戻り待ちになり、それ以外（`dialog_cleared` / `session_moved` / `queue_hold` / `wrapper_silent` / `phase_changed`）はその場でslotに戻す（`run_slot_regained`の`over_parallel`は戻った後のslotの数が`--parallel`を超えたか）。
 - **戻す**（`return_waiting_runs`）: `drive`のループの毎回、引き継ぎの判定と`fill_slots`より前に（claimを止めていても、drain中も）、戻り待ちのrunを終わった順に、`used_slots()`が`--parallel`未満のあいだslotへ戻し、`run_slot_regained`（`slot_wait_secs`、`over_parallel`）を記録する。戻ったrunは今のphaseのとおり進む（`worker_question`なら答えの配送、`stuck_exit`なら`ExitWatch`がsessionの終了を見て画面を保存し、`AfterExit`のとおり着地・`approve_landing`のask・`review_failed`へ）。
+
+次の3点はADR-0062の文言から外れていたが、[ADR-0071](../../adr/0071-runs-waiting-in-revise-and-resume-leave-the-slot.md)（ADR-0062を置き換え）が実装どおりに決定として取り込んだ（決定2・5・6・7）: `cause`の`wrapper_silent`と`phase_changed`、`lease_lost` / `run_ended`を書かずにlease系のイベントで待ちを終えること、戻り待ちも`--max-waiting`に数えること、`Session`の待ちのあいだのreceiptで待ちを終えること。ADR-0071の決定のうち、`Revise` / `Resume`の待ち（決定1・15）、`Resume`の段の答えの配送とダイアログの検知と`worker_question`のあいだidleで段を終えないこと（決定16・17。`Revise`の側はtask 238で入っている）と、`status`の`waiting.count`に戻り待ちを含めること（決定12）はまだ実装されていない。
 
 ADR-0062の決定2の`cause`に、この実装は`wrapper_silent`（`Session`でwrapperが黙った。slotで`/exit`を送る）と`phase_changed`（引き継ぎやadoptで待てないphaseに組み立て直した、またはadoptで上限を超えた）を足している。`lease_lost`と`run_ended`は書かない（leaseを失ったプロセスは書かない。adoptした側がイベントから同じ待ちを続けるので、書くとその待ちを消してしまう）。代わりに`WaitState::of`は、`run_waiting_started`の後に`lease_acquired` / `lease_released` / `run_recovered` / `runtime_error`があれば待ちは無いとみなす（待ちを持っていたsupervisorがrunを失った。adoptと引き継ぎはこれらを書かない）。
 

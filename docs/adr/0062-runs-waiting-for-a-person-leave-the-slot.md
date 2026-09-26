@@ -2,10 +2,12 @@
 id: adr-0062
 type: adr
 title: 人の答えを待つrunをslotから外し、leaseを持ったまま軽く見張り、待ちの数に上限を付け、待ちが終わったrunを新しいclaimより先にslotへ戻す
-status: accepted
+status: superseded
 created: 2026-09-26
 updated: 2026-09-26
 accepted_on: 2026-09-26
+superseded_by: adr-0071
+superseded_on: 2026-09-26
 owners:
   - hisamekms
 tags:
@@ -28,6 +30,8 @@ related:
 ---
 
 # ADR-0062: 人の答えを待つrunをslotから外し、leaseを持ったまま軽く見張り、待ちの数に上限を付け、待ちが終わったrunを新しいclaimより先にslotへ戻す
+
+> **置き換え済み（2026-09-26）**: このADRの決定は現在有効ではない。現行の決定は[ADR-0071](0071-runs-waiting-in-revise-and-resume-leave-the-slot.md)を読む。
 
 ## Context
 
