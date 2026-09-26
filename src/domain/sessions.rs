@@ -11,6 +11,9 @@ use super::EventId;
 
 pub const SESSION_OPENED: &str = "session_opened";
 pub const SESSION_CLOSED: &str = "session_closed";
+/// The transcript's turns of a span, recorded while it is open and when it
+/// closes (ADR-0048 decision 8).
+pub const SESSION_TURNS: &str = "session_turns";
 
 pub const WORKER: &str = "worker";
 pub const RESUME: &str = "resume";

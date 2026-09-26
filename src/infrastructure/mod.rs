@@ -21,3 +21,4 @@ mod sessions;
 pub mod sql_ids;
 pub mod sqlite;
 pub mod telemetry;
+pub mod transcripts;

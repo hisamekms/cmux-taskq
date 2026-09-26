@@ -344,6 +344,15 @@ fn a_passing_review_exits_the_live_session_and_lands_it() {
         .map(|p| (p["kind"].as_str().unwrap(), p["reason"].as_str().unwrap()))
         .collect();
     assert_eq!(closed, [("review", "job_finished"), ("worker", "exited")]);
+    // No transcript of either session exists: their active time is not
+    // recorded, and the run lands all the same (ADR-0048 decision 10).
+    for closed in payloads(&detail, "session_closed") {
+        assert_eq!(closed["active"], "unavailable", "{closed}");
+        assert_eq!(
+            closed["active_unavailable"], "transcript_missing",
+            "{closed}"
+        );
+    }
     let finished = payloads(&detail, "review_finished");
     assert_eq!(finished.len(), 1);
     assert_eq!(finished[0]["verdict"], "pass");

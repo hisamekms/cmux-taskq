@@ -3216,6 +3216,9 @@ impl RunStore for SqliteQueue {
     fn record_queue_event(&self, kind: &str, payload: serde_json::Value) -> Result<EventId> {
         SqliteQueue::record_queue_event(self, kind, payload)
     }
+    fn record_session_turns(&self) -> Result<usize> {
+        super::sessions::record_open_turns(&self.conn)
+    }
     fn latest_event_of(&self, kind: &str) -> Result<Option<RunEvent>> {
         SqliteQueue::latest_event_of(self, kind)
     }

@@ -1,18 +1,21 @@
 //! The Claude sessions of `stats` (ADR-0048 decisions 3, 11 and 12): the
 //! spans `session_opened` / `session_closed` recorded, their open time
 //! (wall-clock, in seconds) per kind over the window, per run and per goal.
-//! Active time is the transcript's, which a later task records; until then
-//! no span has it and its summaries are empty.
+//! Active time is the sum of the span's transcript turns (decision 5): the
+//! `session_turns` recorded while it was open and when it closed, cut to
+//! the window like the open time; `active_ratio` is the active time over
+//! the open time of the spans that have it.
 
 use std::collections::{BTreeMap, HashMap};
 
-use serde::Serialize;
+use serde::{Serialize, Serializer};
 use serde_json::Value;
 
-use super::{Summary, landing::p90, median, timestamp_millis};
+use super::{Summary, landing::p90, median, rfc3339_millis, timestamp_millis};
 use crate::domain::{
     EventId, GoalId, RunEvent, RunId, TaskId,
-    sessions::{INFERRED, KINDS, SESSION_CLOSED, SESSION_OPENED},
+    sessions::{INFERRED, KINDS, SESSION_CLOSED, SESSION_OPENED, SESSION_TURNS},
+    transcript::Turn,
 };
 
 /// One span as its events recorded it.
@@ -29,10 +32,12 @@ pub struct Span {
     pub start: i64,
     pub end: Option<i64>,
     pub inferred: bool,
-    /// The seconds the transcript's turns took, when they were recorded.
+    /// The seconds the transcript's turns took, recorded when it closed.
     pub active: Option<i64>,
     /// The span closed without its active time.
     pub active_unavailable: bool,
+    /// Its transcript turns recorded so far (unix milliseconds).
+    pub turns: Vec<Turn>,
 }
 
 impl Span {
@@ -42,6 +47,15 @@ impl Span {
         let start = from.map_or(self.start, |from| self.start.max(from));
         let end = self.end.map_or(to, |end| end.min(to));
         (end - start).max(0) / 1000
+    }
+
+    /// Seconds active, whole: as recorded when it closed, the turns
+    /// recorded so far while it is open; `None` when it has none.
+    fn active_secs(&self) -> Option<i64> {
+        if self.closed.is_some() {
+            return self.active;
+        }
+        (!self.turns.is_empty()).then(|| self.turns.iter().map(|t| t.millis()).sum::<i64>() / 1000)
     }
 }
 
@@ -78,7 +92,25 @@ pub fn spans(events: &[RunEvent]) -> Vec<Span> {
                     inferred: false,
                     active: None,
                     active_unavailable: false,
+                    turns: Vec::new(),
                 });
+            }
+            SESSION_TURNS => {
+                let opened = event.payload["opened_event_id"].as_i64().map(EventId::new);
+                let Some(span) = opened
+                    .and_then(|opened| index.get(&opened))
+                    .and_then(|&at| spans.get_mut(at))
+                else {
+                    continue;
+                };
+                let turns = event.payload["turns"].as_array().into_iter().flatten();
+                span.turns.extend(turns.filter_map(|turn| {
+                    let time = |at: usize| turn.get(at)?.as_str().and_then(rfc3339_millis);
+                    Some(Turn {
+                        start: time(0)?,
+                        end: time(1)?,
+                    })
+                }));
             }
             SESSION_CLOSED => {
                 let opened = event.payload["opened_event_id"].as_i64().map(EventId::new);
@@ -126,6 +158,28 @@ impl TimeSummary {
     }
 }
 
+/// Active time over open time, to three places; serialized as a number.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Ratio(i64);
+
+impl Ratio {
+    /// `part / whole`; `None` when `whole` is not positive.
+    pub fn of(part: i64, whole: i64) -> Option<Self> {
+        (whole > 0).then(|| Self((part * 1000 + whole / 2) / whole))
+    }
+
+    pub fn thousandths(self) -> i64 {
+        self.0
+    }
+}
+
+impl Serialize for Ratio {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        #[allow(clippy::cast_precision_loss)]
+        serializer.serialize_f64(self.0 as f64 / 1000.0)
+    }
+}
+
 /// One kind's spans in the window.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct KindSessions {
@@ -133,6 +187,8 @@ pub struct KindSessions {
     pub open: TimeSummary,
     /// Only the spans whose active time was recorded.
     pub active: TimeSummary,
+    /// `active.total` over the open time of those spans; null without one.
+    pub active_ratio: Option<Ratio>,
     /// Spans not closed yet, counted open to the window's end.
     pub open_now: usize,
     /// Spans the runtime closed because nothing recorded their end.
@@ -171,6 +227,8 @@ pub struct GoalKindSessions {
     pub count: usize,
     pub open: Summary,
     pub active: Summary,
+    /// `active.total` over the open time of the spans that have it.
+    pub active_ratio: Option<Ratio>,
 }
 
 /// A span of a run as the per-goal summaries use it: its kind, seconds
@@ -191,7 +249,7 @@ pub fn run_spans(spans: &[Span], run: &RunId, now: i64) -> Vec<RunSpan> {
         .map(|span| RunSpan {
             kind: span.kind.clone(),
             open: span.open_secs(None, now),
-            active: span.active,
+            active: span.active_secs(),
         })
         .collect()
 }
@@ -214,24 +272,29 @@ pub fn per_run(spans: &[RunSpan]) -> BTreeMap<String, RunKindSessions> {
 pub fn per_goal<'a>(
     spans: impl Iterator<Item = &'a RunSpan>,
 ) -> BTreeMap<String, GoalKindSessions> {
-    let mut values: BTreeMap<String, (Vec<i64>, Vec<i64>)> = BTreeMap::new();
+    let mut values: BTreeMap<String, (Vec<i64>, Vec<i64>, i64)> = BTreeMap::new();
     for span in spans {
-        let (open, active) = values.entry(span.kind.clone()).or_default();
+        let (open, active, open_of_active) = values.entry(span.kind.clone()).or_default();
         open.push(span.open);
         active.extend(span.active);
+        if span.active.is_some() {
+            *open_of_active += span.open;
+        }
     }
     values
         .into_iter()
-        .map(|(kind, (mut open, mut active))| {
+        .map(|(kind, (mut open, mut active, open_of_active))| {
             let summary = |values: &mut Vec<i64>| Summary {
                 count: values.len(),
                 total: values.iter().sum(),
                 median: median(values),
             };
+            let active = summary(&mut active);
             let sessions = GoalKindSessions {
                 count: open.len(),
                 open: summary(&mut open),
-                active: summary(&mut active),
+                active_ratio: Ratio::of(active.total, open_of_active),
+                active,
             };
             (kind, sessions)
         })
@@ -258,7 +321,10 @@ pub fn by_kind(
                 .and_then(|event| timestamp_millis(&event.created_at))
         })
         .flatten();
-    let mut by_kind: BTreeMap<&'static str, (KindSessions, Vec<i64>, Vec<i64>)> = KINDS
+    // Per kind: its sessions, the open and active seconds of its spans, and
+    // the open seconds of the spans that have their active time.
+    type Tally = (KindSessions, Vec<i64>, Vec<i64>, i64);
+    let mut by_kind: BTreeMap<&'static str, Tally> = KINDS
         .iter()
         .map(|&kind| (kind, Default::default()))
         .collect();
@@ -267,7 +333,8 @@ pub fn by_kind(
             && span.closed.is_none_or(|closed| closed > window.after)
             && counts(span)
     }) {
-        let Some((sessions, open, active)) = by_kind.get_mut(span.kind.as_str()) else {
+        let Some((sessions, open, active, open_of_active)) = by_kind.get_mut(span.kind.as_str())
+        else {
             continue;
         };
         sessions.count += 1;
@@ -284,24 +351,39 @@ pub fn by_kind(
             end: span_end,
             ..span.clone()
         };
-        open.push(clipped.open_secs(from, end));
+        let open_secs = clipped.open_secs(from, end);
+        open.push(open_secs);
         if inferred {
             sessions.inferred += 1;
         }
         if unavailable {
             sessions.active_unavailable += 1;
         }
-        if closed_in_window {
-            active.extend(span.active);
+        // Its turns that overlap the window: all of them when it closed
+        // with its active time recorded, those recorded so far while open.
+        let recorded = if closed_in_window {
+            span.active.is_some()
+        } else {
+            !span.turns.is_empty()
+        };
+        if recorded {
+            let millis: i64 = span
+                .turns
+                .iter()
+                .map(|turn| turn.overlap(from.unwrap_or(i64::MIN), end))
+                .sum();
+            active.push(millis / 1000);
+            *open_of_active += open_secs;
         }
     }
     Sessions {
         window,
         by_kind: by_kind
             .into_iter()
-            .map(|(kind, (mut sessions, open, active))| {
+            .map(|(kind, (mut sessions, open, active, open_of_active))| {
                 sessions.open = TimeSummary::of(open);
                 sessions.active = TimeSummary::of(active);
+                sessions.active_ratio = Ratio::of(sessions.active.summary.total, open_of_active);
                 (kind, sessions)
             })
             .collect(),
@@ -356,6 +438,83 @@ mod tests {
             opened(10, Some("r2"), "worker", 600),
             closed(11, Some("r2"), 10, "inferred", 900),
         ]
+    }
+
+    /// The turns recorded of a span are its active time: whole for a run,
+    /// cut to the window per kind; an open span has the turns recorded so
+    /// far, and one closed without its active time has none.
+    #[test]
+    fn active_time_is_the_turns_cut_to_the_window() {
+        let run = Some("r1");
+        let turns = |id: i64, opened: i64, turns: Value, secs: i64| {
+            event(
+                id,
+                run,
+                SESSION_TURNS,
+                json!({"opened_event_id": opened, "turns": turns}),
+                secs,
+            )
+        };
+        let t = |secs: i64| format!("1970-01-01T00:{:02}:{:02}.000Z", secs / 60, secs % 60);
+        let events = vec![
+            opened(1, run, "worker", 0),
+            turns(2, 1, json!([[t(10), t(40)], ["bad"]]), 50),
+            turns(3, 1, json!([[t(60), t(90)]]), 100),
+            event(
+                4,
+                run,
+                SESSION_CLOSED,
+                json!({"opened_event_id": 1, "reason": "exited", "active": "recorded", "active_secs": 60}),
+                100,
+            ),
+            opened(5, run, "review", 100),
+            turns(6, 5, json!([[t(110), t(130)]]), 140),
+            opened(7, run, "triage", 200),
+            event(
+                8,
+                run,
+                SESSION_CLOSED,
+                json!({"opened_event_id": 7, "reason": "job_finished", "active": "unavailable",
+                       "active_unavailable": "transcript_missing"}),
+                210,
+            ),
+            // Turns of no span are ignored.
+            turns(9, 99, json!([[t(0), t(1)]]), 220),
+        ];
+        let spans = spans(&events);
+        assert_eq!(spans[0].turns.len(), 2);
+        let run_spans = run_spans(&spans, &RunId::new("r1").unwrap(), 300_000);
+        let run = per_run(&run_spans);
+        assert_eq!(run["worker"].active, Some(60));
+        assert_eq!(run["review"].active, Some(20));
+        assert_eq!(run["triage"].active, None);
+        let goal = per_goal(run_spans.iter());
+        assert_eq!(goal["worker"].active_ratio, Ratio::of(60, 100));
+        assert_eq!(goal["triage"].active_ratio, None);
+
+        let window = |after: i64, upto: i64, end: i64| {
+            let window = SessionWindow {
+                after: EventId::new(after),
+                upto: EventId::new(upto),
+            };
+            by_kind(&spans, &events, window, end, |_| true)
+        };
+        let all = window(0, 9, 300_000);
+        assert_eq!(all.by_kind["worker"].active.summary.total, 60);
+        assert_eq!(
+            all.by_kind["worker"].active_ratio.unwrap().thousandths(),
+            600
+        );
+        // The review is still open: its turns so far.
+        assert_eq!(all.by_kind["review"].active.summary.total, 20);
+        assert_eq!(all.by_kind["triage"].active.summary.count, 0);
+        assert_eq!(all.by_kind["triage"].active_unavailable, 1);
+        // From event 2 (50 s) to 75 s: the worker's turns 10..40 and 60..90
+        // overlap it by 15 seconds; the worker is open in it.
+        let cut = window(2, 3, 75_000);
+        assert_eq!(cut.by_kind["worker"].active.summary.total, 15);
+        assert_eq!(cut.by_kind["worker"].open.summary.total, 25);
+        assert_eq!(serde_json::to_value(Ratio::of(1, 3)).unwrap(), json!(0.333));
     }
 
     #[test]
@@ -450,6 +609,7 @@ mod tests {
         assert_eq!(open.by_kind["revise"].open_now, 1);
         assert_eq!(open.by_kind["revise"].open.summary.total, 10);
         let none = by_kind(&spans, &events, early, 110_000, |_| false);
+        assert_eq!(none.by_kind["worker"].active_ratio, None);
         assert_eq!(none.by_kind["worker"].count, 0);
         assert_eq!(
             serde_json::to_value(none.window).unwrap(),

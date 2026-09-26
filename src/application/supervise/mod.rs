@@ -106,6 +106,10 @@ use self::{
     session::*, stale::*, stall::*, sweep::*,
 };
 
+/// How often the supervisor records the finished transcript turns of the
+/// session spans still open (ADR-0048 decision 8).
+pub const SESSION_TURNS_INTERVAL: Duration = Duration::from_secs(600);
+
 /// How far back the daily observation reads.
 pub const DAILY_WINDOW_SECS: i64 = 24 * 60 * 60;
 
@@ -404,6 +408,7 @@ pub fn supervise(ports: &Ports<'_>, settings: &LoopSettings) -> Result<Value> {
         observer: None,
         observers_launched: Vec::new(),
         last_sweep: None,
+        last_turns: None,
         sweep_failures: Vec::new(),
         triaged: Vec::new(),
         generators: ports.generators.clone(),
@@ -468,6 +473,9 @@ struct Supervisor<'a> {
     /// When this process last swept the workspaces of ended runs
     /// (`LoopSettings::sweep_interval`); `None` until the first pass sweeps.
     last_sweep: Option<Instant>,
+    /// When this process last recorded the transcript turns of the open
+    /// session spans (ADR-0048 decision 8); `None` until the first pass.
+    last_turns: Option<Instant>,
     /// The workspaces the sweep could not close: retried on every sweep,
     /// their `cleanup_failed` recorded once per process.
     sweep_failures: Vec<String>,
@@ -672,6 +680,7 @@ impl Supervisor<'_> {
                 self.fill_slots(options.parallel, options.sweep_interval)?;
             }
             self.poll_observer();
+            self.record_session_turns(false);
             let rechecked = self.recheck_pass();
             // A supervisor that stopped claiming is draining, not observing
             // nor starting plan reviews, nor updating itself.
@@ -1008,6 +1017,8 @@ impl Supervisor<'_> {
                 return;
             }
         };
+        // The observer reads the active time of the spans still open too.
+        self.record_session_turns(true);
         self.observers_launched
             .retain(|(launched, _)| *launched != mode);
         self.observers_launched.push((mode, Instant::now()));
@@ -1032,6 +1043,27 @@ impl Supervisor<'_> {
             }
             Err(error) => {
                 warn!(error = %format_args!("{error:#}"), "observer ({}) could not start: {error:#}", mode.as_str())
+            }
+        }
+    }
+    /// Record the finished transcript turns of the open session spans when
+    /// [`SESSION_TURNS_INTERVAL`] passed since the last time (at once with
+    /// `now`). A failure is logged only: it changes no run (ADR-0048
+    /// decision 10), and the next time reads the transcripts again.
+    fn record_session_turns(&mut self, now: bool) {
+        if !now
+            && self
+                .last_turns
+                .is_some_and(|last| last.elapsed() < SESSION_TURNS_INTERVAL)
+        {
+            return;
+        }
+        self.last_turns = Some(Instant::now());
+        match self.queue.record_session_turns() {
+            Ok(0) => {}
+            Ok(spans) => info!("recorded the transcript turns of {spans} open session span(s)"),
+            Err(error) => {
+                warn!(error = %format_args!("{error:#}"), "transcript turns could not be recorded: {error:#}")
             }
         }
     }

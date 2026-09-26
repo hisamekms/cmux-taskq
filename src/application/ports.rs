@@ -385,6 +385,30 @@ pub trait AgentProvider {
     }
 }
 
+/// Where the transcript of a Claude session span is: the span's session id,
+/// the directory the session ran in and the path recorded for it, if any.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TranscriptSource {
+    pub session_id: Option<String>,
+    pub cwd: Option<String>,
+    pub transcript_path: Option<String>,
+}
+
+/// The transcripts of the agent's sessions (ADR-0048 decision 9): the one
+/// place that knows where they are and what they hold. The runtime reads a
+/// span's active time from it, and task 199 its token counts. A transcript
+/// that cannot be read (missing, of a format this build does not know, of
+/// another session) is `Err`, and nothing is recorded from it.
+pub trait Transcripts {
+    fn read(
+        &self,
+        source: &TranscriptSource,
+    ) -> std::result::Result<
+        crate::domain::transcript::Transcript,
+        crate::domain::transcript::Unreadable,
+    >;
+}
+
 /// What the agent of a planner session is started with: the planner's
 /// directory (its prompt, settings, log and idle marker), the directory it
 /// works in (the repository's checkout), its first message and the plugin
@@ -1243,6 +1267,9 @@ pub trait RunStore {
     -> Result<()>;
     /// Record an event of the queue itself, on no task, goal or run.
     fn record_queue_event(&self, kind: &str, payload: serde_json::Value) -> Result<EventId>;
+    /// Record the finished transcript turns of the Claude session spans
+    /// still open (ADR-0048 decision 8); returns how many spans got turns.
+    fn record_session_turns(&self) -> Result<usize>;
     /// The newest event of `kind`, on whatever task, goal or run.
     fn latest_event_of(&self, kind: &str) -> Result<Option<RunEvent>>;
     /// The newest event of the queue itself (on no run) of one of `kinds`.

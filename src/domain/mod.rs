@@ -444,6 +444,7 @@ pub mod stall;
 pub mod stats;
 pub mod task;
 pub mod timeline;
+pub mod transcript;
 mod views;
 
 pub use error::DomainError;

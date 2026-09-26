@@ -2388,7 +2388,12 @@ mod tests {
             opened(2, R1, "worker", T),
             closed(3, R1, 2, "next_span", T + 100),
             opened(4, R1, "revise", T + 100),
-            closed(5, R1, 4, "exited", T + 160),
+            // The revise's transcript turns: 20 of its 60 seconds.
+            RunEvent {
+                payload: json!({"opened_event_id": 4, "active": "recorded", "active_secs": 20,
+                                "reason": "exited"}),
+                ..closed(5, R1, 4, "exited", T + 160)
+            },
             run_event(6, R1, "run_integrated", json!({}), T + 200),
             RunEvent {
                 task_id: Some(TaskId::new(2)),
@@ -2426,6 +2431,13 @@ mod tests {
                     json!({"opened_event_id": 11, "reason": "inferred"}),
                 )
             },
+            run_event(
+                13,
+                R1,
+                "session_turns",
+                json!({"opened_event_id": 4, "turns": [[at(T + 110), at(T + 130)]]}),
+                T + 160,
+            ),
         ];
         let goals = HashMap::from([
             (TaskId::new(1), Some(GoalId::new(5))),
@@ -2451,7 +2463,7 @@ mod tests {
             json["runs"][0]["sessions"],
             json!({
                 "worker": {"count": 1, "open": 100, "active": null},
-                "revise": {"count": 1, "open": 60, "active": null},
+                "revise": {"count": 1, "open": 60, "active": 20},
             })
         );
         assert_eq!(
@@ -2459,11 +2471,20 @@ mod tests {
             json!({
                 "count": 1,
                 "open": {"count": 1, "total": 60, "median": 60},
-                "active": {"count": 0, "total": 0, "median": null},
+                "active": {"count": 1, "total": 20, "median": 20},
+                "active_ratio": 0.333,
             })
         );
         assert_eq!(all.goals[0].intervals.sessions["worker"].open.total, 100);
-        assert_eq!(json["sessions"]["window"], json!({"after": 0, "upto": 12}));
+        assert_eq!(json["sessions"]["window"], json!({"after": 0, "upto": 13}));
+        let revise = &json["sessions"]["by_kind"]["revise"];
+        assert_eq!(revise["active"]["total"], 20);
+        assert_eq!(revise["active"]["median"], 20);
+        assert_eq!(revise["active_ratio"], 0.333);
+        assert_eq!(
+            json["sessions"]["by_kind"]["worker"]["active_ratio"],
+            Value::Null
+        );
         assert_eq!(json["sessions"]["by_kind"].as_object().unwrap().len(), 10);
         let worker = &all.sessions.by_kind["worker"];
         assert_eq!((worker.count, worker.open_now), (2, 1));
