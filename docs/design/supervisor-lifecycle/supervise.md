@@ -1,0 +1,48 @@
+---
+id: design-supervisor-lifecycle-supervise
+type: design
+title: "`supervise`"
+status: current
+created: 2026-09-26
+updated: 2026-09-26
+last_verified: 2026-09-26
+scope: runtime
+related:
+  - design-supervisor-lifecycle
+  - adr-0013
+  - adr-0012
+  - adr-0007
+  - adr-0006
+  - adr-0039
+  - adr-0040
+  - design-persistence
+---
+
+# `supervise`
+
+ユースケースの本体はapplication層の`src/application/supervise/`にある（`mod.rs`がループとslotの`Phase`・`step`、phaseごとのwatchとその処理が`session.rs`・`exit.rs`・`jobs.rs`・`landing.rs`・`revise.rs`・`resume.rs`・`triage.rs`・`adopt.rs`、idle markerの判定が`idle.rs`。review・triageのpromptとsessionに打ち込む依頼文は`src/application/prompt.rs`）（[ADR-0013](../../adr/0013-layered-architecture-and-type-function-style.md)の方針1と8）。`supervise(&Ports, &LoopSettings)`が下の起動時の1〜4とループを行い、外のものにはすべて`Ports`のport越しに触れる: queueは`Queue`（`TaskStore + RunStore + AskStore`）で、ループ自身の接続とheartbeat・検証・着地の各threadの接続を`QueueOpener`が開く。Gitは`Repository`（worktreeの作成、`merge-tree`の衝突判定、着地したtaskの`Dagq-Task` trailerの読み取りを含む）と`MainRemote`、`[run.env]`と検証コマンドは`Verifier`、cmuxは`WorkspaceBackend`、agentは`AgentProvider`（sessionのagentとheadlessのreview / triageのコマンドをapplicationの`CommandSpec`で返す）、agentの画面のダイアログの判定とidle markerの内容の読み取りは`AgentSignals`（Claude Code固有の形式なので実装は`infrastructure::claude`）、子プロセス（observer、review、triage）の起動は`Spawner`（標準入出力の行き先は`Streams`で指定）、pidの生死は`ProcessControl`、run directory・prompt・receipt・idle markerの読み書きとファイルの時刻と比べる壁時計は`RunFiles`、時刻とIDは`Generators`（進行メッセージはportを通さず`tracing`で出す。[Logs](logs.md#logs)）。path（DB、`runs/`、repositoryのrootとcommon dir、`claude`、runner）とworker / job / observerの環境変数は`Layout`として値で渡す。`runtime::supervise`は`SqliteOpener`（`infrastructure::runtime_store`）、`GitRepository`、`ShellVerifier`、`LocalSpawner`（`infrastructure::process`）、`LocalRunFiles`（`infrastructure::run_files`）、`SystemProcesses`を組み立てて呼ぶ入口だけで、公開API（`SuperviseOptions`、`supervise`、`supervise_with_reviewer`）は変わらない。askの登録と通知は`application::ask`、doctor・`recover`と同じrunのhealth判定は`application::health`、workspaceの名前付けとshellの引用は`application::naming`にある。stale leaseのadopt（[ADR-0012](../../adr/0012-adopt-stale-lease-of-live-wrapper.md)）とrun単位のleaseとheartbeat（[ADR-0007](../../adr/0007-run-level-leases-parallel-execution.md)）の振る舞いは移す前と同じ。
+
+`dagq supervise [--parallel N] [--once] [--log-dir DIR] [--observe-interval SECS] [--observe-daily BOOL]`はrepository内で実行する常駐ループ（通常は`up`がlaunchdで起動する。手で専用ターミナルから起動してもよい）で、依存が解けたtaskを上限N（既定4）まで同時に実行する。queueはcwdから解決し（[persistence](../persistence.md)のQueue location）、repositoryのcheckoutもcwdを使う。`--db PATH`と`--repo REPO`はそれぞれの明示override（[ADR-0006](../../adr/0006-queue-per-repository.md)）。
+
+起動時:
+
+1. DBのpathを正規化し、checkoutのroot、Git common directoryを取得する。DBはworktree外か、common directory配下に置く（ユーザーDIRのqueueは常に満たす）。worktreeの作成元は`repo_path`に記録したcheckout。
+2. cmux（`ping`）とClaude（`--version`）のpreflightを行う。
+3. queueをrepositoryに束縛する（`bind_repository`）。別repositoryに束縛済みなら開始しない。queue全体の排他はなく、同じqueueに別のsupervisorがいても構わない。
+4. supervisorプロセスのtoken（UUID）を作り、`supervisors`表に自分を登録する（`register_supervisor`: token、PID、`--parallel`、`started_at`）。runを1つも持たない常駐supervisorも、この登録で`status`/`doctor`に並ぶ。続けて別スレッドで2秒ごとにそのtokenの登録と全leaseのheartbeatを1トランザクションで更新する（`heartbeat(token)`）。heartbeatの失敗はループで検知し、全runに`runtime_error`を記録してleaseと登録を残したまま終了する（プロセス終了後にstaleになる）。
+
+ループ（1秒ごと）:
+
+5. **adopt**（[ADR-0039](../../adr/0039-adopt-stale-lease-of-live-wrapper-and-renew-own-stale-lease.md)の決定1〜4）: active runが上限未満なら、claimの前に、他のtokenのleaseを持つ`running` / `validating` / `awaiting_integration`のrunを`runs_leased_by_others`で読み、leaseがstale（pidが死んでいるかheartbeatが30秒より古い）で、wrapperが生きていてheartbeatが30秒以内か`exited_at`が記録済みのもの、または`awaiting_integration`のもの（wrapperを問わない。reviewはheadlessでsessionを要らず、wrapperが終了を記録せずに死んだsessionは終わったsessionとして扱う。task 236）を`adopt_run`で引き継ぐ。`adopt_run`は`BEGIN IMMEDIATE`の中でstatusとstaleを再検査し、lease行の`token` / `pid` / `heartbeat_at`と`task_runs.supervisor_token`を自分のものにして`run_adopted`を書く（同じrunを2つのsupervisorが取ろうとしても1つしか通らない。負けた方は何もしない）。引き継いだrunのslotはDBから組み立てる: pathは`run_planned`のもの、`receipt_seen`はreceiptファイルと`receipt_observed`イベントの有無、`exit_requested`イベントがあれば`/exit`を再送せずtimeoutをいまから数え直し（`exit_request_timed_out`が記録済みなら再記録しない）、wrapperの登録待ちは持たない。`validating`のrunは9の検証をはじめから行う。`claimed` / `starting`（wrapperの登録にclaimしたtokenが要る）、leaseのないrun（abandon済み・`recover`済み）、`integrating`、wrapperが死んでいるか黙っている`running` / `validating`のrunは引き継がず、[`recover`](recover.md#recover-run_id)に残す（leaseのpidが死んでいてprocessが止まっていれば12の自動recoverが拾う）。引き継ぎはlogに1行で残す。
+   **claim**: 続けて、`graph_input`から`dependency_graph`でcandidatesをclaim順（効く優先度`effective_priority`の降順 → 解放数`unblocks`の降順 → IDの昇順。[ADR-0040](../../adr/0040-verify-once-review-run-env-graph-stats-and-task-priority-in-claim-order.md)の決定4、`candidates`・`graph`と同じ順。効く優先度は自分と、自分を推移的に待っている`ready`のtask（draftのgoalのものを除く）の優先度の最大値）に並べ、空でなければ`refs/heads/main`を読み直してbase commitにし、`claim_for_supervisor_in_order`でその順の先頭からまだclaim可能なtaskを取り、run・`supervisor_token`・lease行を1トランザクションで作る。順序は`graph`で再現できるので`claim_reordered`は記録しない。`integrate`で依存が解けたtaskは次のループで、先行taskを含む`main`から始まる。
+6. **provision**: run管理領域（DBと同じdirの`runs/<run-id>/`）のpath、branch `dagq/<run-id>`、worktree（`runs/<run-id>/worktree`）、receipt、logのpathを`run_planned`として先にDBへ保存し、ディレクトリ、`prompt.txt`、runtimeバイナリのスナップショット`runner`、worktreeを作り、cmux workspaceを`--name "[<repo>]worker#<task-id> - <task title>" --description "dagq role=worker queue=<queue hash> run=<run-id> task=<id>" --env DAGQ_ROLE=worker --env DAGQ_QUEUE=<db> [--group <queueのgroup>] --command '<runner> --db ... session --run ... --lease <token> --claude ...' --focus false --cwd worktree`で作成して、`identify`で解決したUUIDを`workspace_created`として保存する。wrapperにはDBのpathを`--db`で明示的に渡す。provisioningの失敗は環境要因とみなし、そのrunをabandon（下記）した上で以後のclaimを止め、active runをdrainしてから非0で終了する。`prompt.txt`の内容は下記[Prompt](prompt.md#prompt)。
+7. **監視**: 各tickの先頭で、そのrunのlease行がまだ自分のtokenであることを確認する。なければ（別のsupervisorが引き継いだ、または`recover`された）そのrunをslotから外し、DBには何も書かず結果の`errors`に載せる。tickの途中でleaseを失ってlease付きの書き込みが失敗した場合も同じで、abandonしない（`last_error`を書かない）。「leaseを失った」はlease行が無いか他のtokenに変わったことで、heartbeatが古いことではない: lease付きの書き込みは同じトランザクションの中で自分のtokenのlease行の`heartbeat_at`を条件付きのUPDATEで更新してから書くので、ホストのsleepやsupervisorの一時停止でheartbeatが30秒より古くなっていても、誰にも引き継がれていなければそのrunをそのまま続ける（[ADR-0039](../../adr/0039-adopt-stale-lease-of-live-wrapper-and-renew-own-stale-lease.md)の決定7。引き継がれていれば更新が0行になり、上のとおり退く）。検証threadが動いていればそのまま終わらせる（結果は記録されない。引き継いだ側が検証をやり直す）。続けてrunごとの`SessionWatch`が、wrapperの登録（45秒以内）、wrapper heartbeat（30秒以内）、receiptファイルの出現、idle marker、wrapperの終了を確認する。receiptの出現は`receipt_observed`（`validated: false`）として記録するだけで、セッション終了とは別に扱う。receipt観測後にidle markerがreceiptより新しければ`session_idle_observed`を記録し、`exit_requested`を記録してから`WorkspaceBackend::send_exit`で一度だけ終了を要求する（下記）。wrapperが`exited_at`を記録済みのsession（自分で終わった、人が`/exit`を打った、引き継ぐ前に終わっていた）には終了を要求しない。
+8. wrapper終了後に画面を`terminal-final.txt`へ保存し、`supervision_finished`でrunを終了コード0なら`validating`、それ以外なら`failed`にする。非0のときは同じトランザクションで`last_error`に`session exited with code N`を書き、`show`だけで理由が分かるようにする。Taskは`in_progress`のまま残す。
+9. `validating`のrunはreceipt検証（下記）をrunごとのthread（専用SQLite接続）で行い、ループは完了を待ちながら他のrunを監視し続ける。完了したら`validation_finished`でrunを`awaiting_integration`または`failed`にする。
+10. `awaiting_integration`になったrunだけ`cmux workspace close <workspace_id>`でworkspaceを閉じ、`OK workspace:N`の応答を確認して`workspace_closed`（`task_runs.workspace_closed_at`）を記録する。worktreeとbranchは統合まで残す。closeが失敗したら`cleanup_failed`イベントと`last_error`に記録し、runは`awaiting_integration`、`workspace_closed_at`はnullのままにする。
+11. `awaiting_integration`または`failed`になったrunのleaseを解放する（`lease_released`）。
+12. **recoverとtriage**（[Triage (supervisor)](triage.md#triage-supervisor)）: fill passの中で、adoptの後に、`claimed` / `starting` / `running` / `validating`のrunのうち、leaseが無いか、leaseのpidが死んでいて5のadoptの対象にならないもので、processが1つも生きていないもの（`doctor`の`blockers`が空）を`recover`と同じ手順で`interrupted`にする（slotは使わない）。回答済みのtriageの`decide`のaskを適用し、`needs_session`のresume（試行を使い切ったrunは`failed`にして`decide`のaskにする）の後、空いたslotで`failed` / `interrupted`のrunのtriageを始める。
+13. **observer**: 停止要求が無くclaimを止めていなければ、observationの期日が来ていて走っているobserverが無いときに`dagq observe`を子プロセスで起動する（[Observer](observer.md#observer)）。run slotは使わない。
+14. active runも走っているobserverもなく、`--once`か停止要求（下記）か、provisioning失敗でclaimを止めていればループを抜ける（走っているobserverは自分のtimeoutまでで終わるので、runと同じく待つ）。それ以外はactive runがない間2秒ごとに`candidates`を見る。ループを抜けたら（claimやGitのエラーで抜ける場合も含む）自分の登録を消す（`deregister_supervisor`）。heartbeat失敗で終わるときだけは消さない。
+
+結果は`{"outcome": "finished" | "stopped", "runs": [休止したrun], "errors": [{run_id, task_id, message}], "triaged": [{run_id, task_id, status}]}`（`triaged`はこのプロセスがtriageを終えたrunとその後のstatus）。SIGINT/SIGTERMは1回目でclaimを止めてactive runの終了を待ち（graceful drain）、2回目で既定の動作（即終了）になる。即終了した（killされた）supervisorのleaseはPIDが死んだ時点で（遅くともheartbeatの30秒で）staleになり、wrapperが生きているrunは次のfill passで別のsupervisorが引き継ぐ（5）。登録はPIDが死んだ時点から`stale`として`status`/`doctor`に残る。`status` / `doctor` / `recover` / `integrate`は登録を消さず、次の`up`がPIDの死んだ登録だけを消す（[`up` / `down`](up-down.md#up--down)）。

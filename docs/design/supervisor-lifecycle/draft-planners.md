@@ -1,0 +1,28 @@
+---
+id: design-supervisor-lifecycle-draft-planners
+type: design
+title: "Draft planners (supervisor)"
+status: current
+created: 2026-09-26
+updated: 2026-09-26
+last_verified: 2026-09-26
+scope: runtime
+related:
+  - design-supervisor-lifecycle
+  - adr-0044
+  - adr-0037
+  - design-persistence
+---
+
+# Draft planners (supervisor)
+
+[ADR-0044](../../adr/0044-findings-proposals-from-findings-and-quiet-observer.md)の決定13・16（task 282）。runtimeやjobが作ったdraft 1件ごとに、supervisorがruntimeのplannerを1つ立て、plannerが採用・不採用・askのどれかを選ぶ。人の決定（2026-09-25）で、対象はfollow_upのdraftに限らず、runtimeやjobが作ったdraft全般（follow_up、goalの判断jobのgap）にした。goal 22のfollow-up triage job（[ADR-0037](../../adr/0037-follow-up-triage-job-decides-follow-up-drafts.md)、task 205）はこれに置き換え、jobのverdictと適用、`follow_up`のaskのanswerの適用、`task_leases`を消した（`follow_up_depth`と、人の判断を経ずにsubmitしない上限は残す）。use caseは`src/application/supervise/draft_planner.rs`、storeは`src/infrastructure/draft_planners.rs`（port `DraftPlannerStore`）、規則と型は`src/domain/follow_up.rs`、promptは`application::prompt::draft_planner_prompt`。run slotは使わず、[Plan review (supervisor)](plan-review.md#plan-review-supervisor)の`tend_planners`の中で、reviseの配送の後に進める（drain中は立てない）。
+
+1. **出どころ**（schema v28、`migrations/0028_draft_planners.sql`）: runtimeやjobがdraftを作るときに`draft_origins`の行（`task_id`、`origin` = `follow_up` / `goal_gap`、`material`（JSON object）、`created_at`）を`record_draft_origin`で書く。`integrate`の`register_follow_ups`はfollow_upのdraftに`{"source_task_id", "source_run_id", "index"}`を書く。`goal_gap`は、goalを判断するjobがgapから作るdraftに、goalと照合の結果を書く（そのjobは後続のtaskが作る。storeとpromptは受け付ける）。人が`add`で作ったdraftとobserverのdraft goalのtaskには行が無く、plannerは立たない。migrationは導入前の`follow_up_registered`（`task_id`のあるもの）から行を埋めるので、導入前のfollow_upのdraftも対象になる。
+2. **対象**（`planner_drafts`、ID昇順）: statusが`draft`でproposalに入っておらず、`draft_origins`の行があり、閉じていないruntimeのplanner（`planners.draft_task_id`）が無く、closeされていない`planner_question`のaskが無く、answerが`keep_draft`のask（旧`follow_up`を含む）が無く、`draft_planner_exhausted`の無いdraft。
+3. **立てる**（`open_draft_planners`）: runtimeが立てたplannerで生きているものが`--runtime-planners`（reviseのplannerと共有、run slotとは別、人が開いたplannerは数えない）未満のあいだ、古いdraftから`open_draft_planner`で立てる。storeは`BEGIN IMMEDIATE`で対象の条件を再検査してから`planners`の行（`origin: runtime`、`draft_task_id`）と`draft_planner_opened`（`planner_id`、`attempt`、`origin`、`ask_id`、`goal_id`）を書くので、2つのsupervisorが同じdraftに立てない。workspaceは`[<repo>]planner#<id> - draft task <task-id>`で、初期prompt（`prompt.txt`）は`draft_planner_prompt`: draftのtitle・description・context、出どころ（follow_upなら元のtaskのtitle・description・acceptance・verification・paths・evidenceと、元のrunの`integration_receipt`のreceiptの`summary`と`follow_ups`。goal_gapならmaterialのJSON）、goal（title・description・acceptance・constraints・doc、閉じているか）と同じgoalの他のtask、3択の手順（採用: `dagq edit`でacceptance・verify・paths・evidence・contextの冒頭の出自を補い、依存を足し、`dagq lint`してから`dagq submit`。不採用: `dagq cancel`と`dagq note --task`で理由。判断できない: `dagq ask --task ID --kind planner_question --option adopt --option cancel --option keep_draft`して止まり、answerに従う）、`dagq search`で重複と実装済みを探すこと、AGENTS.mdの規則を読むこと、自動でsubmitできない上限。
+4. **3回まで**: plannerがdraftを決めずに終わった（sessionが終わった、idleで`/exit`された）draftは次のpassで再び対象になり、次のplannerが立つ。`draft_planner_opened`が`MAX_DRAFT_PLANNERS`（3）件あるdraftは（人のanswerを運ぶとき以外は）立てずに`draft_planner_exhausted`（`planners`、`ask_id`、`reason`）を記録する。attentionは`decide the draft in a planner`（`status`でもdraftのまま残っているあいだ出る）で、人が開いたplannerで決める。
+5. **planner_question**（ADR-0044の決定13）: askのkindに`planner_question`を足した（CLIの`ask --kind`で作れる）。`answer`は`planner_answer_route`で行き先を決め、`Person`以外なら`ask_answered`に`runtime_delivers: true`を書いてattentionにしない（`status`は`delivering the answer of ask N (runtime)`）。行き先は、(a) そのtaskで働く閉じていないruntimeのplanner（draftのplannerか、taskのproposalのplanner）: supervisorがplannerの`idle`（idle markerがaskより新しい）を待って`answer to ask <id>: <answer>`を`submit_input`で打ち込み、`ask_delivered`でaskを閉じる。打ち込みの失敗は`ask_delivery_failed`（taskに記録）でinboxに任せる。(b) plannerが居ないdraft: 上限の中で新しいplannerを立て、初期promptに元の質問とanswerを載せ（`draft_planner_opened`の`ask_id`）、askを閉じる。(c) `keep_draft`のanswerでplannerが居ない、またはdraftが先に進んだ（submit、cancel）: supervisorが`planner_answer_closed`（`ask_id`、`reason`）でaskを閉じる。(d) それ以外（出どころの無いtask、使い切ったdraft）: inboxが届ける（`send the answer of ask N to the worker and close it`）。closeされていない`planner_question`があるplannerと、そのworkspaceに打ち込んだanswer（`ask_delivered`）の後にまだidleになっていないplannerには`/exit`を送らない（打ち込まずに閉じたaskは引き止めない）。plannerが自分で作ったaskはplannerがaskの後に止まってから、他の人が作ったaskはplannerがidleなら打ち込む。
+6. **採用の記録と上限**（`submit`の中、[persistence](../persistence.md)）: submitが`draft_origins`のあるdraftを初めて出すとき`follow_up_adopted`（goal_gapは`draft_adopted`。`task_id`、`origin`、`source_task_id`、`source_run_id`、`by: "planner" | "person"`、`ask_id`、`depth`）を書く。runtimeのplanner（`DAGQ_PLANNER_ORIGIN=runtime`）は、goalが閉じているか無い、または`follow_up_depth`が2以上のfollow_upのdraftを、そのdraftへの`planner_question`（旧`follow_up`）に人が`adopt`と答えていなければsubmitできない（errorで`planner_question`を促す）。人が開いたplannerのsubmit、人の`adopt`を経たsubmit、`ready --bypass-review`は深さを0に戻す。
+7. **終わり**: runtimeのplannerはdraftをsubmitしたか、cancelしたか、`keep_draft`で残したら、idleになったところで`/exit`され、終わったworkspaceは閉じられる（[Plan review (supervisor)](plan-review.md#plan-review-supervisor)の`end_runtime_planners`）。submitしたproposalはplan reviewを通り、reviseは持ち主（閉じていれば新しいruntimeのplanner）に返る。
+8. **test**: `tests/plan_review.rs`がcmuxのdoubleで、follow_upとgoal_gapのdraftに上限の中で古い順にplannerが立ち、人のdraftには立たないこと、promptの中身、決めたplannerの`/exit`、決めずに終わったplannerの後に次のplannerが立ち3回で`draft_planner_exhausted`とattentionになること、`planner_question`のanswerが生きているplannerに打ち込まれ、plannerの居ないdraftでは新しいplannerがanswerを持って立ち、`keep_draft`は閉じられること、を確かめる。`tests/runtime.rs`は`register_follow_ups`の出どころ、runtimeのplannerのsubmitの上限と人の`adopt`の後のsubmit、`status`の表示を、`tests/queue.rs`は導入前のfollow_upのdraftがmigrationで対象になることを確かめる。
