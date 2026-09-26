@@ -17,10 +17,15 @@ SCCACHE_IGNORE_SERVER_IO_ERROR = "1"
 # timeout が 400 件を超え、run の startup の中央値が約 1100 秒になった（goal 36 の note 8718）。
 # 値の決め方: supervisor の --parallel を 3 に下げ、worker 3 本と integrate 1 本が同時に cargo を回しても
 # 合計 16 並列（コア数 8 の 2 倍）程度に収まるようにする。--parallel や host を変えたら合わせて見直す。
-# CARGO_BUILD_JOBS は build の job 数、RUST_TEST_THREADS は 1 つの test binary の中の並列 thread 数。
+# CARGO_BUILD_JOBS は build の job 数で、この値で絞る。
 CARGO_BUILD_JOBS = "4"
-RUST_TEST_THREADS = "4"
+# test の並列度は build と分けて考え、8 にする（2026-09-26 に人が planner と決めた。task 566）。
+# test は待ちが中心で CPU をあまり使わない（task 537 の測定で test の process 4 本の CPU は 0.1〜0.4 コア、
+# 関門の test 段は per-test の時間の合計 ÷ 並列数で律速する。docs/plans/nextest-measurement.md）ので、
+# 並列度を上げても host の負荷は小さく、integrate の test 段が縮む。
+# RUST_TEST_THREADS は 1 つの test binary の中の並列 thread 数。
+RUST_TEST_THREADS = "8"
 # coverage の関門（cargo llvm-cov nextest）で同時に走らせる test の process 数（ADR-0076 の決定 2）。
-# nextest は RUST_TEST_THREADS を読まず既定で CPU 数だけ走らせるので、RUST_TEST_THREADS と同じ考え方で 4 に絞る。
+# nextest は RUST_TEST_THREADS を読まず既定で CPU 数だけ走らせるので、RUST_TEST_THREADS と同じ値にする。
 # .config/nextest.toml には書かない（CI と人の手元の nextest まで絞られるため）。
-NEXTEST_TEST_THREADS = "4"
+NEXTEST_TEST_THREADS = "8"
