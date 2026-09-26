@@ -844,6 +844,99 @@ fn a_revise_for_an_adopted_run_whose_wrapper_died_asks_a_person() {
     assert!(queue.run_leases().unwrap().is_empty());
 }
 
+/// Leave `run` the way a supervisor that died right after opening the
+/// `approve_landing` ask of its failed review leaves it (task 424): review
+/// 1 started, its session closed, the ask open and no `review_failed`.
+/// Returns the ask's ID.
+fn failed_review_asked_before_death(db: &Path, run: &TaskRun) -> AskId {
+    let mut queue = SqliteQueue::open(db).unwrap();
+    queue
+        .record_runtime_event(
+            run.id(),
+            "review_started",
+            json!({"attempt": 1, "workspace_id": null, "session_live": false, "session_id": "s"}),
+        )
+        .unwrap();
+    queue
+        .ask(NewAsk {
+            kind: AskKind::ApproveLanding,
+            task_id: None,
+            run_id: Some(run.id().clone()),
+            question: "The supervisor's headless review of run r (task 1) failed and gave no verdict (review 1): exit status 3\nReview material: r/review.md".into(),
+            options: vec!["land".into(), "send_back".into(), "cancel".into()],
+            asked_by: "supervisor".into(),
+            reason_category: dagq::domain::AskReason::Scope,
+            finding_id: None,
+        })
+        .unwrap()
+        .ask
+        .id
+}
+
+/// A supervisor that died between the `approve_landing` ask of a failed
+/// review and its `review_failed` (task 424): the next one adopts the run
+/// without reviewing it again, records the `review_failed` with the ask and
+/// gives the lease back, and the ask stays open for the person.
+#[test]
+fn an_adopted_run_whose_failed_review_was_asked_waits_for_the_ask() {
+    let (_dir, repo, db) = fixture();
+    let run = orphan_run(&repo, &db, "dead-supervisor", dead_pid(), dead_pid());
+    validated_orphan(&db, &run);
+    let ask = failed_review_asked_before_death(&db, &run);
+    kill_supervisor_and_wrapper(&db, &run);
+    let backend = TestWorkspace::new(&db, false, VALID_AGENT);
+    let reviewer = TestReviewer::new(&[verdict("pass", &[], "meets the acceptance")]);
+    let outcome = supervise_reviewed(&db, &repo, &backend, &reviewer);
+    assert_eq!(outcome["errors"], json!([]), "{outcome}");
+    assert!(reviewer.prompts().is_empty());
+    let mut queue = SqliteQueue::open(&db).unwrap();
+    assert_eq!(
+        queue.run(run.id()).unwrap().status(),
+        RunStatus::AwaitingIntegration
+    );
+    let detail = queue.show(TaskId::new(1)).unwrap();
+    assert_eq!(adoption_events(&detail).len(), 1);
+    assert_eq!(payloads(&detail, "review_started").len(), 1);
+    let failed = payloads(&detail, "review_failed");
+    assert_eq!(failed.len(), 1, "{failed:?}");
+    assert_eq!(failed[0]["ask_id"], json!(ask));
+    assert_eq!(failed[0]["attempt"], 1);
+    assert_eq!(failed[0]["error"], "exit status 3");
+    let asks = queue.asks(AskQuery::default()).unwrap();
+    assert_eq!(asks.len(), 1, "{asks:?}");
+    assert_eq!(asks[0].id, ask);
+    assert!(asks[0].answer.is_none());
+    assert!(queue.run_leases().unwrap().is_empty());
+    assert_eq!(backend.exits_sent.load(Ordering::SeqCst), 0);
+}
+
+/// Such an ask answered before the adoption has its answer applied, as for
+/// a run nobody leases, and is still not reviewed again.
+#[test]
+fn an_adopted_run_whose_failed_review_ask_was_answered_has_the_answer_applied() {
+    let (_dir, repo, db) = fixture();
+    let run = orphan_run(&repo, &db, "dead-supervisor", dead_pid(), dead_pid());
+    validated_orphan(&db, &run);
+    let ask = failed_review_asked_before_death(&db, &run);
+    SqliteQueue::open(&db)
+        .unwrap()
+        .answer(ask, "cancel")
+        .unwrap();
+    kill_supervisor_and_wrapper(&db, &run);
+    let backend = TestWorkspace::new(&db, false, VALID_AGENT);
+    let reviewer = TestReviewer::new(&[verdict("pass", &[], "meets the acceptance")]);
+    let outcome = supervise_reviewed(&db, &repo, &backend, &reviewer);
+    assert_eq!(outcome["errors"], json!([]), "{outcome}");
+    assert!(reviewer.prompts().is_empty());
+    let mut queue = SqliteQueue::open(&db).unwrap();
+    assert_eq!(queue.run(run.id()).unwrap().status(), RunStatus::Failed);
+    let detail = queue.show(TaskId::new(1)).unwrap();
+    assert_eq!(detail.task.status(), TaskStatus::Canceled);
+    assert_eq!(payloads(&detail, "review_failed")[0]["ask_id"], json!(ask));
+    assert!(queue.read_ask(ask).unwrap().closed_at.is_some());
+    assert!(queue.run_leases().unwrap().is_empty());
+}
+
 /// Make the live wrapper of `run_id` go silent the way a wrapper whose
 /// heartbeat stopped does while its process lives on: its row names another
 /// live process (`stand_in`, so the in-test wrapper's heartbeats no longer

@@ -265,6 +265,11 @@ impl Supervisor<'_> {
         let Some(anchor) = crate::domain::review_anchor(&events) else {
             return self.start_review(run, session);
         };
+        if anchor.kind == "review_started"
+            && let Some(phase) = self.adopt_failed_review_ask(run, &session, &events, anchor)?
+        {
+            return Ok(phase);
+        }
         let then = match anchor.kind.as_str() {
             "revise_requested" => {
                 if let Some(live) = session.clone()
@@ -393,6 +398,73 @@ impl Supervisor<'_> {
         // before is not asked again (as for a running run, task 104).
         watch.exit_asked = !watch.timed_out || self.queue.has_stuck_exit_ask(run.id())?;
         Ok(Phase::Exiting(watch))
+    }
+    /// The failed review whose `approve_landing` ask was opened before the
+    /// supervisor died (task 424): an ask the supervisor opened after the
+    /// run's last `review_started`, not closed since, is that review's
+    /// failure, since a review that gave a verdict records
+    /// `review_finished` first. The run waits for the ask rather than being
+    /// reviewed again: its `review_failed` (with the ask) is recorded if it
+    /// was not, and the lease is given back once the session is gone, so
+    /// an answer given or to come is applied as any other (ADR-0027).
+    /// `None` when there is no such ask.
+    fn adopt_failed_review_ask(
+        &mut self,
+        run: &TaskRun,
+        session: &Option<SessionRef>,
+        events: &[crate::domain::RunEvent],
+        started: &crate::domain::RunEvent,
+    ) -> Result<Option<Phase>> {
+        let opened = events.iter().rev().find(|e| {
+            e.id > started.id
+                && e.kind == "ask_opened"
+                && e.payload["kind"] == AskKind::ApproveLanding.as_str()
+                && e.payload["asked_by"] == "supervisor"
+        });
+        let Some(ask_id) = opened.and_then(|e| e.payload["ask_id"].as_i64()) else {
+            return Ok(None);
+        };
+        let ask = self.queue.read_ask(AskId::new(ask_id))?;
+        if ask.closed_at.is_some() {
+            return Ok(None);
+        }
+        let after = |kind: &str| events.iter().any(|e| e.id > started.id && e.kind == kind);
+        if !after("review_failed") {
+            let attempt = started.payload["attempt"].as_u64().unwrap_or(1);
+            // The failure is in the ask's first line (`open_failed_review_ask`),
+            // and a `send_back` names it to the resumed session.
+            let error = ask
+                .question
+                .lines()
+                .next()
+                .and_then(|line| line.split_once("): "))
+                .map_or_else(
+                    || format!("review {attempt} failed and ask {} was opened for it before the supervisor stopped", ask.id),
+                    |(_, error)| error.to_owned(),
+                );
+            self.queue.record_runtime_event(
+                run.id(),
+                "review_failed",
+                json!({
+                    "code": ReasonCode::JobFailed,
+                    "attempt": attempt,
+                    "error": error,
+                    "status": run.status().as_str(),
+                    "ask_id": ask.id,
+                    "adopted": true,
+                }),
+            )?;
+        }
+        info!(run_id = %run.id(), ask_id = %ask.id, "run {} waits for a person in ask {} about its failed review, opened before the supervisor stopped; it is not reviewed again", run.id(), ask.id);
+        let mut watch = ExitWatch::new(session.clone(), AfterExit::Rest { close: true });
+        // The failed review's /exit was requested before the ask: never a
+        // second one.
+        if after("exit_requested") {
+            watch.requested = Some(Instant::now());
+        }
+        watch.timed_out = after("exit_request_timed_out");
+        watch.exit_asked = !watch.timed_out || self.queue.has_stuck_exit_ask(run.id())?;
+        Ok(Some(Phase::Exiting(watch)))
     }
     /// Whether a lease no longer has a working process behind it: its pid
     /// is dead or its heartbeat is older than `HEARTBEAT_TIMEOUT_SECS`.
