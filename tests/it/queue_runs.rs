@@ -318,7 +318,7 @@ fn a_login_that_stops_several_runs_is_one_ask_that_lists_them() {
             100,
         )
         .unwrap();
-    let asks = dagq::domain::stats::asks::asks(&events, EventId::new(0), latest, |_| true);
+    let asks = dagq::domain::stats::asks::asks(&events, EventId::new(0), latest, 0, |_| true);
     let reasons = &asks.by_reason_category;
     assert_eq!(
         (

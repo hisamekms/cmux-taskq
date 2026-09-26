@@ -24,7 +24,9 @@ pub mod sessions;
 pub mod thresholds;
 pub mod work;
 
-pub use asks::{AnsweredAsks, AskStats, Choices, OpenedAsks, ReasonAsks};
+pub use asks::{
+    AnsweredAsks, AskStats, AskTimes, AskWaits, Choices, OpenedAsks, ReasonAsks, Spread,
+};
 pub use auto_repairs::{AutoRepairStats, DayCounts, LayerRepairs};
 pub use conflicts::{ConflictConfig, ConflictConfigReport, ConflictHotspots, History};
 pub use landing::{LandBreakdown, LandClock, LandPhases, PhaseSummary};
@@ -774,7 +776,14 @@ pub fn stats(
     let reason_codes = reason_codes(events, window_start, next_cursor, counts);
     let duplicate_cancels = duplicate_cancels(events, window_start, next_cursor, counts);
     let landing_rechecks = landing_rechecks(events, window_start, next_cursor, counts);
-    let ask_stats = asks::asks(events, window_start, next_cursor, counts);
+    // The window ends now unless it stops at an earlier event.
+    let window_end = match events.iter().find(|event| event.id == next_cursor) {
+        Some(event) if until.is_some() || next_cursor < latest_event => {
+            timestamp_millis(&event.created_at).unwrap_or(now * 1000)
+        }
+        _ => now * 1000,
+    };
+    let ask_stats = asks::asks(events, window_start, next_cursor, window_end, counts);
     let auto_repairs = auto_repairs::auto_repairs(events, window_start, next_cursor, counts);
     let verification_commands =
         measures::verification_commands(events, window_start, next_cursor, counts);
@@ -794,13 +803,6 @@ pub fn stats(
         &live.history,
         live.conflicts,
     );
-    // The window ends now unless it stops at an earlier event.
-    let window_end = match events.iter().find(|event| event.id == next_cursor) {
-        Some(event) if until.is_some() || next_cursor < latest_event => {
-            timestamp_millis(&event.created_at).unwrap_or(now * 1000)
-        }
-        _ => now * 1000,
-    };
     let sessions = sessions::by_kind(
         &spans,
         events,

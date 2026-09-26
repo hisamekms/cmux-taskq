@@ -304,6 +304,25 @@ fn ask_answer_asks_and_close_through_the_cli() {
         asks["answered"]["choices"]["decide"],
         serde_json::json!({"by_option": {"0030": 1}, "free": 1, "unknown": 0})
     );
+    // Per kind and asker, how long the asks waited for their answer and
+    // for its application, here `ask close` (task 468); none is open.
+    for group in [
+        &asks["times"]["by_kind"]["decide"],
+        &asks["times"]["by_asked_by"]["human"],
+    ] {
+        for wait in ["to_answer", "to_apply", "answer_to_apply"] {
+            assert_eq!(group[wait]["count"], 2, "{wait}: {asks}");
+            assert!(group[wait]["median"].as_i64().unwrap() >= 0, "{asks}");
+            assert!(
+                group[wait]["p90"].as_i64() <= group[wait]["max"].as_i64(),
+                "{asks}"
+            );
+        }
+        assert_eq!(
+            group["open"],
+            serde_json::json!({"count": 0, "median": null, "p90": null, "max": null})
+        );
+    }
     // `--since` past both leaves nothing.
     let latest = ok(&db, &["status"])["cursor"].to_string();
     let later = &ok(&db, &["stats", "--since", &latest])["asks"];
@@ -337,6 +356,56 @@ fn ask_answer_asks_and_close_through_the_cli() {
     assert_eq!(unsent["created"], true);
     assert_eq!(unsent["notified"], false);
     assert!(unsent["notify_error"].is_string());
+}
+
+/// `stats` times an ask still open up to the window's end, also one
+/// opened before `--since`, and an answered ask closed by `ask close`
+/// records `ask_closed` (task 468).
+#[test]
+fn stats_times_the_open_asks_up_to_the_window_end() {
+    let (_dir, db) = queue();
+    ok(&db, &["add", "first"]);
+    let ask = |question: &str| {
+        ok(
+            &db,
+            &[
+                "ask",
+                "--kind",
+                "decide",
+                "--because",
+                "scope",
+                "--question",
+                question,
+                "--task",
+                "1",
+            ],
+        )["id"]
+            .to_string()
+    };
+    let open = ask("still open?");
+    let since = ok(&db, &["status"])["cursor"].to_string();
+    let times = &ok(&db, &["stats", "--since", &since])["asks"]["times"];
+    let decide = &times["by_kind"]["decide"];
+    assert_eq!(decide["open"]["count"], 1, "{times}");
+    assert!(decide["open"]["max"].as_i64().unwrap() >= 0, "{times}");
+    assert_eq!(decide["to_answer"]["count"], 0, "{times}");
+    assert_eq!(times["by_asked_by"]["human"]["open"]["count"], 1, "{times}");
+
+    ok(&db, &["answer", &open, "--text", "yes"]);
+    ok(&db, &["ask", "close", &open]);
+    let closed = ok(&db, &["events", "--all", "--after", &since]);
+    let kinds: Vec<_> = closed["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|event| event["kind"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(kinds, ["ask_answered", "ask_closed"], "{closed}");
+    let times = &ok(&db, &["stats", "--since", &since])["asks"]["times"];
+    let decide = &times["by_kind"]["decide"];
+    assert_eq!(decide["open"]["count"], 0, "{times}");
+    assert_eq!(decide["to_answer"]["count"], 1, "{times}");
+    assert_eq!(decide["to_apply"]["count"], 1, "{times}");
 }
 
 #[test]

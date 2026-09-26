@@ -263,7 +263,9 @@ impl SqliteQueue {
         Ok(answered)
     }
 
-    /// Mark an answered ask read (by the inbox, once the person acted on it). Writes no event. An
+    /// Mark an answered ask read (by the inbox, once the person acted on it,
+    /// or by the supervisor, once it applied the answer), and record
+    /// `ask_closed`, which `stats` reads as the answer applied (task 468). An
     /// open ask cannot be closed: `ask_answered` is the one event that ends
     /// an ask in `run_events` (what `stats` pairs with `ask_opened`), so an
     /// ask is withdrawn by answering it.
@@ -280,6 +282,13 @@ impl SqliteQueue {
         tx.execute(
             "UPDATE asks SET closed_at=?2 WHERE id=?1",
             params![id, self.generators.clock.now()],
+        )?;
+        ask_event(
+            &tx,
+            ask.task_id,
+            ask.run_id.as_ref(),
+            "ask_closed",
+            json!({"ask_id": id, "kind": ask.kind}),
         )?;
         let closed = read_ask(&tx, id)?;
         tx.commit()?;
@@ -573,6 +582,15 @@ impl SqliteQueue {
                     json!({"ask_id": ask.id, "kind": ask.kind, "runtime_closed": true});
                 write_answer(&tx, &ask, answer, ANSWERED_BY_RUNTIME, now, &mut payload)?;
                 ask_event(&tx, ask.task_id, Some(run_id), "ask_answered", payload)?;
+            } else {
+                // An answer given before is applied by this close.
+                ask_event(
+                    &tx,
+                    ask.task_id,
+                    Some(run_id),
+                    "ask_closed",
+                    json!({"ask_id": ask.id, "kind": ask.kind}),
+                )?;
             }
             tx.execute(
                 "UPDATE asks SET closed_at=?2 WHERE id=?1",

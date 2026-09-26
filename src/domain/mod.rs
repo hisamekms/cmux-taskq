@@ -1234,6 +1234,7 @@ pub const QUEUE_EVENT_KINDS: &[&str] = &[
     "observe_finished",
     "ask_opened",
     "ask_answered",
+    "ask_closed",
     "stall_config_loaded",
     "finding_recorded",
     "finding_updated",
@@ -1273,6 +1274,7 @@ pub const ASK_EVENT_KINDS: &[&str] = &[
     "ask_answered",
     "ask_delivered",
     "ask_delivery_failed",
+    "ask_closed",
 ];
 
 /// Whether a run event is a transition that stops at a person's judgment,
